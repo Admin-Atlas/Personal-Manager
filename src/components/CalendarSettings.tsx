@@ -1,0 +1,381 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { useCallback, useEffect, useState } from "react";
+import {
+  addIcsFeed,
+  calendarStatus,
+  clearGoogleClient,
+  connectGoogle,
+  disconnectGoogle,
+  listGoogleCalendars,
+  listIcsFeeds,
+  removeIcsFeed,
+  setGoogleCalendarIds,
+  setGoogleClient,
+  syncCalendar,
+} from "../lib/ipc";
+import type { CalendarStatus, GoogleCalendar, IcsFeedInfo } from "../lib/types";
+
+/**
+ * The read-only calendar connector (Step 6). Two paths:
+ *  - **iCal feeds (default)** — paste a calendar's private "secret address in iCal
+ *    format". No sign-in, no Google Cloud project, and it works even on accounts in
+ *    Google's Advanced Protection Program (which blocks unverified OAuth apps).
+ *  - **Google sign-in (advanced)** — full OAuth with your own client credentials.
+ *
+ * Either way PM mirrors events locally and uses them for the agenda, chat context,
+ * and the focus view's "Due soon" status. Tokens/feed URLs live in the keychain.
+ */
+export function CalendarSettings() {
+  const [status, setStatus] = useState<CalendarStatus | null>(null);
+  const [feeds, setFeeds] = useState<IcsFeedInfo[]>([]);
+  const [feedLabel, setFeedLabel] = useState("");
+  const [feedUrl, setFeedUrl] = useState("");
+  const [showFeedGuide, setShowFeedGuide] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // OAuth (advanced) state.
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [calendars, setCalendars] = useState<GoogleCalendar[] | null>(null);
+
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [s, f] = await Promise.all([calendarStatus(), listIcsFeeds()]);
+      setStatus(s);
+      setFeeds(f);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const loadCalendars = useCallback(async () => {
+    try {
+      setCalendars(await listGoogleCalendars());
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (status?.oauth_connected) void loadCalendars();
+  }, [status?.oauth_connected, loadCalendars]);
+
+  async function run(label: string, fn: () => Promise<void>) {
+    setBusy(label);
+    setError(null);
+    setNote(null);
+    try {
+      await fn();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const active = (status?.ics_feeds ?? 0) > 0 || (status?.oauth_connected ?? false);
+
+  // --- iCal feeds ---
+  const addFeed = () =>
+    run("add-feed", async () => {
+      await addIcsFeed(feedLabel.trim(), feedUrl.trim());
+      setFeedLabel("");
+      setFeedUrl("");
+      await refresh();
+      setNote("Calendar feed added and synced.");
+    });
+
+  const removeFeed = (id: string) =>
+    run("remove-feed", async () => {
+      await removeIcsFeed(id);
+      await refresh();
+    });
+
+  const sync = () =>
+    run("sync", async () => {
+      const n = await syncCalendar();
+      setNote(`Synced ${n} event${n === 1 ? "" : "s"}.`);
+      await refresh();
+    });
+
+  // --- Google OAuth (advanced) ---
+  const saveCreds = () =>
+    run("save", async () => {
+      await setGoogleClient(clientId.trim(), clientSecret.trim());
+      setClientId("");
+      setClientSecret("");
+      await refresh();
+    });
+
+  const connect = () =>
+    run("connect", async () => {
+      await connectGoogle();
+      await refresh();
+      await loadCalendars();
+      const n = await syncCalendar().catch(() => 0);
+      setNote(`Connected. Synced ${n} event${n === 1 ? "" : "s"}.`);
+      await refresh();
+    });
+
+  const toggleCalendar = (id: string, on: boolean) =>
+    run("select", async () => {
+      const prev = calendars;
+      const next = (calendars ?? []).map((c) => (c.id === id ? { ...c, selected: on } : c));
+      setCalendars(next);
+      try {
+        await setGoogleCalendarIds(next.filter((c) => c.selected).map((c) => c.id));
+      } catch (e) {
+        setCalendars(prev); // roll back the optimistic toggle the backend rejected
+        throw e;
+      }
+      const n = await syncCalendar().catch(() => 0);
+      setNote(`Synced ${n} event${n === 1 ? "" : "s"}.`);
+      await refresh();
+    });
+
+  const disconnect = () =>
+    run("disconnect", async () => {
+      await disconnectGoogle();
+      setCalendars(null);
+      await refresh();
+    });
+
+  const forgetCreds = () =>
+    run("forget", async () => {
+      await clearGoogleClient();
+      setCalendars(null);
+      await refresh();
+    });
+
+  return (
+    <div className="mt-5 border-t border-neutral-800 pt-4" data-help="settings-calendar">
+      <label className="block text-sm font-medium text-neutral-300">Calendar</label>
+      <p className="mt-1 text-xs text-neutral-500">
+        Read-only. Powers your agenda, schedule questions in chat, and the “Due soon” status when
+        an event names a project. Everything stays in your keychain / local store.
+      </p>
+
+      {/* iCal feeds — the simple default path. */}
+      <div className="mt-3 rounded-lg border border-neutral-800 p-3">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium text-neutral-200">Calendar feed (iCal)</span>
+          <span className="rounded bg-emerald-900/50 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-emerald-300">
+            recommended
+          </span>
+        </div>
+        <p className="mt-1 text-xs text-neutral-500">
+          Paste a calendar’s private “secret address in iCal format”. No sign-in — works even with
+          Advanced Protection.
+        </p>
+        <button
+          onClick={() => setShowFeedGuide((s) => !s)}
+          className="mt-1 text-xs text-sky-400 hover:text-sky-300"
+        >
+          {showFeedGuide ? "Hide" : "Where do I find this? →"}
+        </button>
+        {showFeedGuide && <FeedGuide />}
+
+        {feeds.length > 0 && (
+          <ul className="mt-2 divide-y divide-neutral-800 rounded-lg border border-neutral-800">
+            {feeds.map((f) => (
+              <li key={f.id} className="flex items-center justify-between px-3 py-1.5 text-sm text-neutral-200">
+                <span className="truncate">{f.label}</span>
+                <button
+                  onClick={() => removeFeed(f.id)}
+                  disabled={busy != null}
+                  className="shrink-0 rounded px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-red-300"
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <div className="mt-2 space-y-2">
+          <input
+            type="text"
+            value={feedLabel}
+            onChange={(e) => setFeedLabel(e.target.value)}
+            placeholder="Label (optional, e.g. Work)"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
+          />
+          <input
+            type="text"
+            autoComplete="off"
+            value={feedUrl}
+            onChange={(e) => setFeedUrl(e.target.value)}
+            placeholder="https://calendar.google.com/calendar/ical/…/basic.ics"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
+          />
+          <button
+            onClick={addFeed}
+            disabled={busy != null || !feedUrl.trim()}
+            className="rounded-lg border border-neutral-700 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
+          >
+            {busy === "add-feed" ? "Adding…" : "Add feed"}
+          </button>
+        </div>
+      </div>
+
+      {/* Shared sync + last-sync line. */}
+      {active && (
+        <div className="mt-3 flex items-center justify-between">
+          <p className="text-xs text-neutral-600">
+            {status?.last_sync
+              ? `Last synced ${formatWhen(status.last_sync)} · ${status.window_days} days ahead`
+              : `Not synced yet · ${status?.window_days ?? 21} days ahead`}
+          </p>
+          <button
+            onClick={sync}
+            disabled={busy != null}
+            className="rounded-md border border-neutral-700 px-2 py-1 text-xs text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
+          >
+            {busy === "sync" || busy === "select" ? "Syncing…" : "Sync now"}
+          </button>
+        </div>
+      )}
+
+      {/* Google sign-in — advanced/optional path. */}
+      <div className="mt-4">
+        <button
+          onClick={() => setShowAdvanced((s) => !s)}
+          className="text-xs text-neutral-400 hover:text-neutral-200"
+        >
+          {showAdvanced ? "▾" : "▸"} Advanced: connect with Google sign-in (OAuth)
+        </button>
+        {showAdvanced && (
+          <div className="mt-2 rounded-lg border border-neutral-800 p-3">
+            <p className="text-xs text-neutral-500">
+              Full OAuth with your own Google “Desktop app” credentials. Note: if your account uses
+              Advanced Protection, Google blocks this — use a calendar feed above instead.
+            </p>
+
+            {!status?.oauth_client_configured ? (
+              <div className="mt-2 space-y-2">
+                <input
+                  type="text"
+                  autoComplete="off"
+                  value={clientId}
+                  onChange={(e) => setClientId(e.target.value)}
+                  placeholder="Client ID (…apps.googleusercontent.com)"
+                  className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
+                />
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={clientSecret}
+                  onChange={(e) => setClientSecret(e.target.value)}
+                  placeholder="Client secret"
+                  className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
+                />
+                <button
+                  onClick={saveCreds}
+                  disabled={busy != null || !clientId.trim() || !clientSecret.trim()}
+                  className="rounded-lg border border-neutral-700 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
+                >
+                  {busy === "save" ? "Saving…" : "Save credentials"}
+                </button>
+              </div>
+            ) : !status.oauth_connected ? (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  onClick={connect}
+                  disabled={busy != null}
+                  className="rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-40"
+                >
+                  {busy === "connect" ? "Waiting for Google…" : "Connect Google Calendar"}
+                </button>
+                <button
+                  onClick={forgetCreds}
+                  disabled={busy != null}
+                  className="rounded px-2 py-1.5 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-neutral-300"
+                >
+                  Change credentials
+                </button>
+              </div>
+            ) : (
+              <div className="mt-2 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="inline-flex items-center gap-1.5 text-xs text-emerald-400">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> Connected
+                  </span>
+                  <button
+                    onClick={disconnect}
+                    disabled={busy != null}
+                    className="rounded px-2 py-1 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-neutral-300"
+                  >
+                    Disconnect
+                  </button>
+                </div>
+                {calendars == null ? (
+                  <p className="text-xs text-neutral-600">Loading calendars…</p>
+                ) : (
+                  <ul className="max-h-40 overflow-y-auto rounded-lg border border-neutral-800">
+                    {calendars.map((c) => (
+                      <li key={c.id} className="flex items-center gap-2 px-3 py-1.5 text-sm text-neutral-200">
+                        <input
+                          type="checkbox"
+                          checked={c.selected}
+                          disabled={busy != null}
+                          onChange={(e) => toggleCalendar(c.id, e.target.checked)}
+                          className="accent-emerald-500"
+                        />
+                        <span className="truncate">{c.summary}</span>
+                        {c.primary && <span className="text-[10px] text-neutral-500">primary</span>}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {note && <p className="mt-2 text-xs text-emerald-400">{note}</p>}
+      {error && <p className="mt-2 rounded-lg bg-red-950/60 px-3 py-2 text-xs text-red-300">{error}</p>}
+    </div>
+  );
+}
+
+/** How to find a Google Calendar's private iCal address. */
+function FeedGuide() {
+  return (
+    <ol className="mt-2 space-y-1 rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-xs text-neutral-400">
+      <li>
+        1. Open{" "}
+        <a
+          href="https://calendar.google.com/"
+          target="_blank"
+          rel="noreferrer"
+          className="text-sky-400 underline hover:text-sky-300"
+        >
+          Google Calendar
+        </a>{" "}
+        on the web.
+      </li>
+      <li>2. Hover the calendar in the left list → ⋮ → <span className="text-neutral-300">Settings and sharing</span>.</li>
+      <li>
+        3. Scroll to <span className="text-neutral-300">Integrate calendar</span> → copy the{" "}
+        <span className="text-neutral-300">Secret address in iCal format</span>.
+      </li>
+      <li>4. Paste it below. (Keep it private — anyone with the link can read that calendar.)</li>
+    </ol>
+  );
+}
+
+function formatWhen(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}

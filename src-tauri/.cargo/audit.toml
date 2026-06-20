@@ -1,0 +1,20 @@
+# cargo-audit configuration (run `cargo audit` from `src-tauri/`).
+#
+# Every id below is a *transitive*, non-exploitable advisory — unmaintained or
+# unsound crates pulled in by Tauri's gtk-rs stack (Linux WebKit backend only; PM
+# ships Windows/macOS and never calls the affected APIs) or a build-time/unicode
+# tree, with no patched version reachable until upstream bumps. Ignoring them keeps
+# `cargo audit` green *and intentional*, so a real advisory still fails the run.
+# See the 2026-06-17 DECISIONS entry (glib) for the full rationale; re-evaluate
+# when Tauri adopts gtk-rs 0.20 and the unic-* tree is updated.
+[advisories]
+ignore = [
+    "RUSTSEC-2025-0098", # glib VariantStrIter unsound (gtk-rs stack; API never called)
+    "RUSTSEC-2024-0429", # gtk-rs bindings unsound (Linux WebKit backend only)
+    "RUSTSEC-2024-0419", # proc-macro-error unmaintained (build-time macro only)
+    "RUSTSEC-2024-0370", # unic-char-property unmaintained (transitive unicode tree)
+    "RUSTSEC-2025-0081", # unic-* unmaintained
+    "RUSTSEC-2025-0075", # unic-* unmaintained
+    "RUSTSEC-2025-0080", # unic-* unmaintained
+    "RUSTSEC-2025-0100", # unic-* unmaintained
+]

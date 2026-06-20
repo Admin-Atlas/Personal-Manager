@@ -1,0 +1,20 @@
+# PM document sidecar dependencies. Pinned so the managed venv is reproducible
+# and a change here invalidates the `.ready` marker (the Rust side hashes this
+# file). Keep this list minimal — it is installed on the user's machine.
+#
+#   markitdown     — convert PDFs, Office docs, HTML, images (OCR), CSV/JSON to Markdown
+#   fastembed      — local on-device ONNX embeddings (BAAI/bge-small-en-v1.5, 384-d)
+#   faster-whisper — local on-device speech-to-text for voice input (base.en)
+#
+# We pin markitdown's document extras explicitly rather than `[all]`: `[all]`
+# also pulls youtube-transcript-api (~=1.0.0, no Python 3.14 wheel — breaks the
+# install) and audio transcription (needs ffmpeg), neither of which this
+# document pipeline uses.
+#
+# faster-whisper decodes its own audio via the bundled `av` (PyAV) wheel, so no
+# system ffmpeg is needed; it shares onnxruntime/tokenizers/numpy with fastembed
+# (they co-resolve to single versions — verified on the user's Python 3.14). The
+# base.en weights (~145 MB) download once on first use, like the embedding model.
+markitdown[pdf,docx,pptx,xlsx,xls,outlook]==0.1.6
+fastembed==0.8.0
+faster-whisper==1.2.1

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Bobby Yu -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!--
+  macOS bundle Info.plist additions. Tauri merges this into the app's Info.plist.
+  NSMicrophoneUsageDescription is required for getUserMedia (voice input) to work
+  on macOS — without it the OS denies microphone access. Windows/WebView2 needs no
+  such manifest entry.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>PM uses the microphone only to transcribe your voice into the chat box, entirely on your device.</string>
+</dict>
+</plist>

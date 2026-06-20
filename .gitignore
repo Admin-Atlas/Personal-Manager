@@ -1,0 +1,61 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# --- PM: never commit personal data or secrets (spec §7) ---
+# Local data directory (the Markdown vault + encrypted SQLite store + the managed
+# Python venv) lives outside the repo at runtime; these guard against an
+# accidentally-placed local copy (e.g. PM_DATA_DIR pointed inside the repo).
+/data
+/runtime
+/vault
+*.sqlite
+*.sqlite-*
+.env
+.env.*
+
+# Python sidecar runtime artifacts (the script + requirements are committed).
+__pycache__/
+*.pyc
+sidecar/.venv/
+
+# Claude Code: the shared project settings.json is committed; the per-developer
+# settings.local.json (personal permission overrides) stays local.
+.claude/settings.local.json
+
+# Local security-review reports (may quote secret-adjacent code paths); keep out
+# of the future-public history.
+security-review-*.md
+
+# Internal handoff/context notes for AI agents and developers — never published.
+# Lives only in local working copies (carried manually between machines); the
+# rule is committed so it keeps being ignored even on the public repo.
+V1 overview/
+
+# Internal publish runbook (the move to the public repo) — never published.
+PUBLISH.md
+
+# Docs are excluded from the repo move; they'll be re-added to the new repo
+# after the code is moved. Kept on disk locally, just untracked here.
+/docs

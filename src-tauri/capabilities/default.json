@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window — least-privilege: only the dialog/process actions the app actually calls (open a file picker; restart to apply an update).",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open", "updater:default", "process:allow-restart"]
+}

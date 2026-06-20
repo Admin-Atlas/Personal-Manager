@@ -1,0 +1,71 @@
+[package]
+name = "pm"
+version = "0.8.6-alpha"
+description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
+authors = ["Bobby"]
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin name (required on Windows).
+name = "pm_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+# Silent background auto-update + app relaunch after install (desktop only).
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Content hashing for document dedupe + stable vault filenames.
+sha2 = "0.10"
+# Best-effort wipe of raw key material (the DB key) from memory after use. The OS
+# keychain stays the real secret boundary; this just shrinks the in-memory window.
+zeroize = "1"
+# Random-named, RAII-deleted temp files (the voice clip, written inside the data dir).
+tempfile = "3"
+
+# Encrypted store (SQLCipher / AES-256) + vectors (sqlite-vec) + keyword (FTS5),
+# all in one bundled, vendored connection — no system SQLite needed.
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl", "functions", "backup"] }
+sqlite-vec = "0.1"
+
+# Random bytes for the generated DB encryption key + the OAuth PKCE verifier/state.
+getrandom = "0.2"
+hex = "0.4"
+# base64url for the PKCE S256 code challenge (Step 6 Google OAuth).
+base64 = "0.22"
+# Open the system browser for the OAuth consent screen (handles per-OS URL quirks).
+open = "5"
+
+# Calendar feed (.ics) parsing — the no-OAuth path (Step 6). chrono/chrono-tz give
+# correct timezone handling for event times; rrule expands recurring events within
+# the agenda window.
+chrono = "0.4"
+chrono-tz = "0.10"
+rrule = "0.13"
+
+# OpenRouter streaming chat client. rustls keeps TLS independent of SQLCipher's crypto.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+futures-util = "0.3"
+tauri-plugin-single-instance = "2"
+
+# OS keychain for all secrets (API key, DB key). Per-platform native backends;
+# Linux uses kernel keyutils only for local dev (Windows/macOS are the real targets).
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native"] }
+

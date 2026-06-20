@@ -1,0 +1,143 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// In-app changelog shown in the "What's New" view. The app auto-opens it once
+// after updating to a version the user hasn't seen yet (see App.tsx), and it's
+// always reachable from the sidebar.
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ RELEASE CHECKLIST: add a new entry at the TOP for every release, with the │
+// │ version matching package.json / tauri.conf.json / Cargo.toml. Newest      │
+// │ first. See docs/RELEASING.md.                                             │
+// └─────────────────────────────────────────────────────────────────────────┘
+
+export interface ChangelogEntry {
+  version: string; // matches the released app version, no leading "v"
+  date: string; // YYYY-MM-DD
+  highlights: string[]; // short user-facing bullet points
+}
+
+export const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "0.8.6-alpha",
+    date: "2026-06-20",
+    highlights: [
+      "Housekeeping ahead of the move to a single public home — the docs now live in one place alongside the code and releases. No change to your data or how you use PM.",
+    ],
+  },
+  {
+    version: "0.8.5-alpha",
+    date: "2026-06-20",
+    highlights: [
+      "Reliability pass from a full code review: switching chats while a reply is still streaming no longer shows that reply under the wrong conversation, and confirming a sorting review is now all-or-nothing — an interrupted confirm can’t leave some documents half-filed.",
+      "Sturdier importing and calendar handling — a huge or unusual document, a long voice clip, or an oddly-scheduled calendar event can no longer balloon memory or stall the app — plus clearer messaging when your store is briefly locked (e.g. by antivirus) instead of it looking like corruption.",
+      "Under-the-hood tidying ahead of going open-source. No change to your data or how you use PM.",
+    ],
+  },
+  {
+    version: "0.8.4-alpha",
+    date: "2026-06-20",
+    highlights: [
+      "PM now wears an “Alpha” label — in the app, in its window title, and in its version number — to make its stage clear as it heads toward a public release. It’s feature-complete for v1 and usable day to day, but still under active development, so expect the occasional rough edge.",
+      "No change to your data or how you use PM.",
+    ],
+  },
+  {
+    version: "0.8.3",
+    date: "2026-06-20",
+    highlights: [
+      "Defence-in-depth hardening ahead of going open-source: sensible limits everywhere so a hostile file, calendar feed, or huge pasted message can’t hog memory or run up your model bill, and PM now asks your system for only the permissions it actually uses.",
+      "Your encryption key is now wiped from memory right after the store is unlocked, the store’s encryption settings are pinned so future updates can always reopen your data, and each update step is all-or-nothing so an interrupted update can’t leave it half-changed.",
+      "Housekeeping for the move to a public home — no change to how you use PM.",
+    ],
+  },
+  {
+    version: "0.8.2",
+    date: "2026-06-20",
+    highlights: [
+      "Security hardening from a full security review: calendar feeds now must use a secure https link and can’t point at a private or local address — so a feed link can’t be turned into a way to probe your own network, and it’s never sent in the clear.",
+      "Plus under-the-hood robustness — a large or malformed document can no longer balloon memory while it’s being imported — with no change to how you use PM.",
+    ],
+  },
+  {
+    version: "0.8.1",
+    date: "2026-06-19",
+    highlights: [
+      "Reliability polish: replies that include emoji, accents, or other languages now come through cleanly as they stream; the microphone always switches off the moment you stop recording or leave the chat; and your edits in Review are no longer overwritten by an AI suggestion that lands a split second later.",
+      "A downloaded update now stays one click away after you choose “Later”, chat answers come back a little quicker, and a calendar that fails to sync no longer pretends it succeeded — plus a batch of smaller fixes from a full code review.",
+    ],
+  },
+  {
+    version: "0.8.0",
+    date: "2026-06-19",
+    highlights: [
+      "Voice input: there’s now a microphone button in the chat box — click it, speak, and PM turns your words into text you can edit before sending. It works in both your main chat and a project’s chat.",
+      "Private by design: your voice is transcribed entirely on your device — no audio ever leaves it. The first time you use it, PM downloads a small speech model once (about 145 MB), then it works fully offline.",
+    ],
+  },
+  {
+    version: "0.7.0",
+    date: "2026-06-19",
+    highlights: [
+      "Daily briefing: your Focus screen now opens with a short “here’s your picture today” summary — what’s due soon, quick wins you could knock out, anything that’s gone quiet, and what’s on your calendar — written for you and grounded in your real projects.",
+      "It refreshes itself about once a day when you open Focus, and there’s a Refresh button to rebuild it from your current state any time. It learns your voice from the same profile that powers PM’s suggestions.",
+      "Everything stays on your device — the briefing is built from data PM already has, and only the model call leaves.",
+    ],
+  },
+  {
+    version: "0.6.0",
+    date: "2026-06-19",
+    highlights: [
+      "Calendars (read-only): connect a calendar to see an Upcoming agenda on your Focus screen and ask chat things like “what’s on this afternoon?”. Everything stays on your device — only the fetch to your calendar leaves.",
+      "Two easy ways to connect: paste a calendar’s private iCal feed URL (simplest — no sign-in, and it works even with Google Advanced Protection), or use full Google sign-in with your own credentials under Settings → Advanced.",
+      "Due soon, automatically: when an upcoming event’s title names one of your projects, that project flips to “Due soon” and shows the event — no need to set a deadline by hand.",
+      "You stay in control: feed URLs and any tokens live only in your OS keychain, and removing a feed or disconnecting wipes its synced events.",
+    ],
+  },
+  {
+    version: "0.5.0",
+    date: "2026-06-19",
+    highlights: [
+      "Command palette: press Ctrl+K (⌘K on a Mac) — or click Search in the sidebar — to jump straight to any project, file, or past conversation. Just start typing.",
+      "Pick a file and PM opens its project with that file highlighted; pick a project, a chat, or a 'Go to' destination and it takes you there — no clicking through the sidebar.",
+    ],
+  },
+  {
+    version: "0.4.0",
+    date: "2026-06-18",
+    highlights: [
+      "Focus view: your new home screen shows every project on one page, each with a single honest status — Due soon, Quick win, Take a look, Blocked, Part of, or On track — so you can pick the one right thing to look at.",
+      "Triage your projects: give a project a size, a deadline, a blocker, or a parent — by hand, or let the AI suggest them and just confirm. The status updates to match.",
+      "Per-project view: click a project to narrow everything to just it — its files alongside a chat that answers only from that project's documents.",
+    ],
+  },
+  {
+    version: "0.3.0",
+    date: "2026-06-18",
+    highlights: [
+      "Pick any model: the model picker now lists every model on OpenRouter — search by name, see each one's input/output price, sort by price, and read at-a-glance tags (Free, Reasoning, Vision, Coding, Long context…).",
+      "Separate chat and background models: choose one model for your chats and a different one for behind-the-scenes work (sorting and learning) — handy for pairing a strong chat model with cheap or free background models.",
+      "Auto-switch on limits: give each a ranked list of models and PM falls through to the next when one hits its daily limit, so you're never stuck mid-task.",
+      "A models tag in the sidebar shows which chat and background models you're using right now, without opening Settings.",
+      "Organise & Review: PM proposes a project, tags, and an importance level for each new document; your corrections are remembered.",
+      "Learning You: a short, readable profile distilled from those corrections, fed back into PM's suggestions and chat so it gets more like you.",
+      "Document map: a visual graph of your documents grouped by project, plus a Help mode that explains any part of the app on hover.",
+    ],
+  },
+  {
+    version: "0.2.0",
+    date: "2026-06-17",
+    highlights: [
+      "Automatic updates: PM now updates itself in the background and offers a one-click restart when a new version is ready — no manual reinstalls.",
+      "This “What's New” view, so you can always see what changed since your last version.",
+    ],
+  },
+  {
+    version: "0.1.0",
+    date: "2026-06-15",
+    highlights: [
+      "Encrypted local store and streaming chat through OpenRouter.",
+      "The Archivist: drag files or folders into Documents to convert, embed, and index them locally, with a rebuildable Markdown vault as the source of truth.",
+    ],
+  },
+];

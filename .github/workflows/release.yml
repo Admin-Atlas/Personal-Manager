@@ -1,0 +1,154 @@
+name: Release
+
+# Cut a release by pushing a version tag:
+#   npm version <patch|minor|major> --no-git-tag-version   # bumps package.json
+#   # bump src-tauri/tauri.conf.json + Cargo.toml to match, commit, then:
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# This builds + signs the desktop apps here, then publishes the installers and the
+# updater manifest (latest.json) to a separate public releases repo so every
+# desktop can fetch updates.
+#
+# NOTE (account move): RELEASES_REPO below, the updater endpoint in
+# tauri.conf.json, and the CI secrets still point at the old BBYU26 account.
+# Re-point them to the new account at publish (with a public source repo, releases
+# may also just attach to it). Keep the same minisign key for update continuity —
+# see docs/RELEASING.md and the internal publish checklist.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build/publish (e.g. v0.2.0)"
+        required: true
+
+env:
+  RELEASES_REPO: BBYU26/PM-Releases
+
+# Least privilege for the default GITHUB_TOKEN: the build job only needs to read
+# the source, and the cross-repo publish uses RELEASES_REPO_TOKEN (a PAT), not
+# GITHUB_TOKEN — so nothing here needs write on the source repo.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: ""
+          - os: macos-latest
+            args: "--target universal-apple-darwin"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Build + sign
+        run: npm run tauri build -- ${{ matrix.args }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Stage Windows artifacts
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p staged
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe staged/
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe.sig staged/
+
+      - name: Stage macOS artifacts
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          mkdir -p staged
+          base=src-tauri/target/universal-apple-darwin/release/bundle
+          cp "$base"/macos/*.app.tar.gz staged/
+          cp "$base"/macos/*.app.tar.gz.sig staged/
+          cp "$base"/dmg/*.dmg staged/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.os }}
+          path: staged/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        # Bind the (attacker-influenceable) dispatch input through env — never
+        # inline ${{ }} expansion into the script body — and reject anything that
+        # isn't a plain vX.Y.Z tag, so it can't be used for shell injection on the
+        # runner that holds the signing key.
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          TAG="$RAW_TAG"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Refusing to build from an unexpected tag: $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build updater manifest
+        env:
+          ARTIFACTS_DIR: artifacts
+          RELEASES_REPO: ${{ env.RELEASES_REPO }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          NOTES: "PM ${{ steps.ver.outputs.tag }}"
+          OUT: artifacts/latest.json
+        run: node scripts/build-updater-manifest.mjs
+
+      - name: Publish to public releases repo
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        shell: bash
+        run: |
+          # Upload the installers (.exe/.dmg), the updater bundle (.app.tar.gz),
+          # and latest.json — but not the raw .sig files (folded into latest.json).
+          mapfile -t ASSETS < <(find artifacts -type f ! -name '*.sig' ! -name 'latest.json')
+          gh release create "$TAG" \
+            --repo "$RELEASES_REPO" \
+            --title "PM $TAG" \
+            --notes "Automated release for $TAG." \
+            "${ASSETS[@]}" \
+            artifacts/latest.json
