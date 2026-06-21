@@ -20,4 +20,4 @@ export { StatusBadge, STATUS_LABEL, type StatusBadgeProps } from "./StatusBadge"
 export { Modal, type ModalProps } from "./Modal";
 export { NavItem, type NavItemProps } from "./NavItem";
 export { Skeleton, type SkeletonProps } from "./Skeleton";
-export { TitleBar, type TitleBarProps } from "./TitleBar";
+export { TitleBar } from "./TitleBar";
