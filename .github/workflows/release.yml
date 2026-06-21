@@ -5,15 +5,9 @@ name: Release
 #   # bump src-tauri/tauri.conf.json + Cargo.toml to match, commit, then:
 #   git tag v0.2.0 && git push origin v0.2.0
 #
-# This builds + signs the desktop apps here, then publishes the installers and the
-# updater manifest (latest.json) to a separate public releases repo so every
-# desktop can fetch updates.
-#
-# NOTE (account move): RELEASES_REPO below, the updater endpoint in
-# tauri.conf.json, and the CI secrets still point at the old BBYU26 account.
-# Re-point them to the new account at publish (with a public source repo, releases
-# may also just attach to it). Keep the same minisign key for update continuity —
-# see docs/RELEASING.md and the internal publish checklist.
+# This builds + signs the desktop apps here, then attaches the installers and the
+# updater manifest (latest.json) to this repo's own Releases (via GITHUB_TOKEN) so
+# every desktop can fetch updates.
 
 on:
   push:
@@ -26,13 +20,13 @@ on:
         required: true
 
 env:
-  RELEASES_REPO: BBYU26/PM-Releases
+  # Releases attach to this repo; github.repository resolves to <owner>/<name>.
+  RELEASES_REPO: ${{ github.repository }}
 
-# Least privilege for the default GITHUB_TOKEN: the build job only needs to read
-# the source, and the cross-repo publish uses RELEASES_REPO_TOKEN (a PAT), not
-# GITHUB_TOKEN — so nothing here needs write on the source repo.
+# The publish job creates a Release on this repo, so GITHUB_TOKEN needs write
+# access here. Both jobs inherit this; there is no job-level override.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -46,19 +40,24 @@ jobs:
             args: "--target universal-apple-darwin"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      # Actions are SHA-pinned; the trailing "# vX.Y.Z" is the human-readable
+      # version (and what Dependabot reads). Keep it.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # @stable is a moving branch ref, not a version tag; pinned to its tip with
+        # an explicit toolchain so the SHA pin still selects stable.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust)
         with:
+          toolchain: stable
           targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
 
@@ -88,7 +87,7 @@ jobs:
           cp "$base"/macos/*.app.tar.gz.sig staged/
           cp "$base"/dmg/*.dmg staged/ || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bundle-${{ matrix.os }}
           path: staged/*
@@ -98,13 +97,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
           merge-multiple: true
@@ -137,9 +136,9 @@ jobs:
           OUT: artifacts/latest.json
         run: node scripts/build-updater-manifest.mjs
 
-      - name: Publish to public releases repo
+      - name: Publish release
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.ver.outputs.tag }}
         shell: bash
         run: |
