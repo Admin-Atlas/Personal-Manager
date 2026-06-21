@@ -221,7 +221,7 @@ fn pkce() -> Result<(String, String)> {
 /// `n` random bytes, hex-encoded — used for the PKCE verifier and the CSRF state.
 fn random_token(n: usize) -> Result<String> {
     let mut bytes = vec![0u8; n];
-    getrandom::getrandom(&mut bytes).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
+    getrandom::fill(&mut bytes).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
     Ok(hex::encode(bytes))
 }
 

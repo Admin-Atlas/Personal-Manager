@@ -2810,7 +2810,7 @@ dependencies = [
  "chrono",
  "chrono-tz 0.10.4",
  "futures-util",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "hex",
  "keyring",
  "open",
