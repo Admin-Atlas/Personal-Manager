@@ -34,7 +34,7 @@ tempfile = "3"
 
 # Encrypted store (SQLCipher / AES-256) + vectors (sqlite-vec) + keyword (FTS5),
 # all in one bundled, vendored connection — no system SQLite needed.
-rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl", "functions", "backup"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl", "functions", "backup"] }
 sqlite-vec = "0.1"
 
 # Random bytes for the generated DB encryption key + the OAuth PKCE verifier/state.
