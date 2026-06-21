@@ -16,6 +16,7 @@ import {
   syncCalendar,
 } from "../lib/ipc";
 import type { CalendarStatus, GoogleCalendar, IcsFeedInfo } from "../lib/types";
+import { Button, Input } from "./ui";
 
 /**
  * The read-only calendar connector (Step 6). Two paths:
@@ -158,91 +159,93 @@ export function CalendarSettings() {
     });
 
   return (
-    <div className="mt-5 border-t border-neutral-800 pt-4" data-help="settings-calendar">
-      <label className="block text-sm font-medium text-neutral-300">Calendar</label>
-      <p className="mt-1 text-xs text-neutral-500">
+    <div className="mt-5 border-t border-border pt-4" data-help="settings-calendar">
+      <label className="block text-sm font-medium text-ink2">Calendar</label>
+      <p className="mt-1 text-xs text-ink4">
         Read-only. Powers your agenda, schedule questions in chat, and the “Due soon” status when
         an event names a project. Everything stays in your keychain / local store.
       </p>
 
       {/* iCal feeds — the simple default path. */}
-      <div className="mt-3 rounded-lg border border-neutral-800 p-3">
+      <div className="mt-3 rounded-[var(--radius)] border border-border p-3">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-neutral-200">Calendar feed (iCal)</span>
-          <span className="rounded bg-emerald-900/50 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-emerald-300">
+          <span className="text-sm font-medium text-ink">Calendar feed (iCal)</span>
+          <span
+            className="rounded-[var(--radius-sm)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-st-quick"
+            style={{ background: "color-mix(in oklab, var(--st-quick) 18%, transparent)" }}
+          >
             recommended
           </span>
         </div>
-        <p className="mt-1 text-xs text-neutral-500">
+        <p className="mt-1 text-xs text-ink4">
           Paste a calendar’s private “secret address in iCal format”. No sign-in — works even with
           Advanced Protection.
         </p>
         <button
           onClick={() => setShowFeedGuide((s) => !s)}
-          className="mt-1 text-xs text-sky-400 hover:text-sky-300"
+          className="mt-1 text-xs text-accent-text hover:brightness-110"
         >
           {showFeedGuide ? "Hide" : "Where do I find this? →"}
         </button>
         {showFeedGuide && <FeedGuide />}
 
         {feeds.length > 0 && (
-          <ul className="mt-2 divide-y divide-neutral-800 rounded-lg border border-neutral-800">
+          <ul className="mt-2 divide-y divide-rule rounded-[var(--radius)] border border-border">
             {feeds.map((f) => (
-              <li key={f.id} className="flex items-center justify-between px-3 py-1.5 text-sm text-neutral-200">
+              <li key={f.id} className="flex items-center justify-between px-3 py-1.5 text-sm text-ink">
                 <span className="truncate">{f.label}</span>
-                <button
+                <Button
+                  variant="tertiary"
                   onClick={() => removeFeed(f.id)}
                   disabled={busy != null}
-                  className="shrink-0 rounded px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-red-300"
+                  className="shrink-0 px-2 py-0.5 text-xs hover:text-st-due"
                 >
                   Remove
-                </button>
+                </Button>
               </li>
             ))}
           </ul>
         )}
 
         <div className="mt-2 space-y-2">
-          <input
+          <Input
             type="text"
             value={feedLabel}
             onChange={(e) => setFeedLabel(e.target.value)}
             placeholder="Label (optional, e.g. Work)"
-            className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
           />
-          <input
+          <Input
             type="text"
             autoComplete="off"
             value={feedUrl}
             onChange={(e) => setFeedUrl(e.target.value)}
             placeholder="https://calendar.google.com/calendar/ical/…/basic.ics"
-            className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
           />
-          <button
+          <Button
             onClick={addFeed}
             disabled={busy != null || !feedUrl.trim()}
-            className="rounded-lg border border-neutral-700 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
+            className="disabled:opacity-40"
           >
             {busy === "add-feed" ? "Adding…" : "Add feed"}
-          </button>
+          </Button>
         </div>
       </div>
 
       {/* Shared sync + last-sync line. */}
       {active && (
         <div className="mt-3 flex items-center justify-between">
-          <p className="text-xs text-neutral-600">
+          <p className="text-xs text-ink4">
             {status?.last_sync
               ? `Last synced ${formatWhen(status.last_sync)} · ${status.window_days} days ahead`
               : `Not synced yet · ${status?.window_days ?? 21} days ahead`}
           </p>
-          <button
+          <Button
             onClick={sync}
             disabled={busy != null}
-            className="rounded-md border border-neutral-700 px-2 py-1 text-xs text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
+            className="px-2 py-1 text-xs disabled:opacity-40"
           >
             {busy === "sync" || busy === "select" ? "Syncing…" : "Sync now"}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -250,89 +253,90 @@ export function CalendarSettings() {
       <div className="mt-4">
         <button
           onClick={() => setShowAdvanced((s) => !s)}
-          className="text-xs text-neutral-400 hover:text-neutral-200"
+          className="text-xs text-ink3 hover:text-ink"
         >
           {showAdvanced ? "▾" : "▸"} Advanced: connect with Google sign-in (OAuth)
         </button>
         {showAdvanced && (
-          <div className="mt-2 rounded-lg border border-neutral-800 p-3">
-            <p className="text-xs text-neutral-500">
+          <div className="mt-2 rounded-[var(--radius)] border border-border p-3">
+            <p className="text-xs text-ink4">
               Full OAuth with your own Google “Desktop app” credentials. Note: if your account uses
               Advanced Protection, Google blocks this — use a calendar feed above instead.
             </p>
 
             {!status?.oauth_client_configured ? (
               <div className="mt-2 space-y-2">
-                <input
+                <Input
                   type="text"
                   autoComplete="off"
                   value={clientId}
                   onChange={(e) => setClientId(e.target.value)}
                   placeholder="Client ID (…apps.googleusercontent.com)"
-                  className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
                 />
-                <input
+                <Input
                   type="password"
                   autoComplete="off"
                   value={clientSecret}
                   onChange={(e) => setClientSecret(e.target.value)}
                   placeholder="Client secret"
-                  className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
                 />
-                <button
+                <Button
                   onClick={saveCreds}
                   disabled={busy != null || !clientId.trim() || !clientSecret.trim()}
-                  className="rounded-lg border border-neutral-700 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
+                  className="disabled:opacity-40"
                 >
                   {busy === "save" ? "Saving…" : "Save credentials"}
-                </button>
+                </Button>
               </div>
             ) : !status.oauth_connected ? (
               <div className="mt-2 flex flex-wrap items-center gap-2">
-                <button
+                <Button
+                  variant="primary"
                   onClick={connect}
                   disabled={busy != null}
-                  className="rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-40"
+                  className="disabled:opacity-40"
                 >
                   {busy === "connect" ? "Waiting for Google…" : "Connect Google Calendar"}
-                </button>
-                <button
+                </Button>
+                <Button
+                  variant="tertiary"
                   onClick={forgetCreds}
                   disabled={busy != null}
-                  className="rounded px-2 py-1.5 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-neutral-300"
+                  className="px-2 py-1.5 text-xs"
                 >
                   Change credentials
-                </button>
+                </Button>
               </div>
             ) : (
               <div className="mt-2 space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="inline-flex items-center gap-1.5 text-xs text-emerald-400">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> Connected
+                  <span className="inline-flex items-center gap-1.5 text-xs text-st-quick">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--st-quick)]" /> Connected
                   </span>
-                  <button
+                  <Button
+                    variant="tertiary"
                     onClick={disconnect}
                     disabled={busy != null}
-                    className="rounded px-2 py-1 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-neutral-300"
+                    className="px-2 py-1 text-xs"
                   >
                     Disconnect
-                  </button>
+                  </Button>
                 </div>
                 {calendars == null ? (
-                  <p className="text-xs text-neutral-600">Loading calendars…</p>
+                  <p className="text-xs text-ink4">Loading calendars…</p>
                 ) : (
-                  <ul className="max-h-40 overflow-y-auto rounded-lg border border-neutral-800">
+                  <ul className="max-h-40 overflow-y-auto rounded-[var(--radius)] border border-border">
                     {calendars.map((c) => (
-                      <li key={c.id} className="flex items-center gap-2 px-3 py-1.5 text-sm text-neutral-200">
+                      <li key={c.id} className="flex items-center gap-2 px-3 py-1.5 text-sm text-ink">
                         <input
                           type="checkbox"
                           checked={c.selected}
                           disabled={busy != null}
                           onChange={(e) => toggleCalendar(c.id, e.target.checked)}
-                          className="accent-emerald-500"
+                          className="accent-[var(--accent)]"
                         />
                         <span className="truncate">{c.summary}</span>
-                        {c.primary && <span className="text-[10px] text-neutral-500">primary</span>}
+                        {c.primary && <span className="font-mono text-[10px] text-ink4">primary</span>}
                       </li>
                     ))}
                   </ul>
@@ -343,8 +347,15 @@ export function CalendarSettings() {
         )}
       </div>
 
-      {note && <p className="mt-2 text-xs text-emerald-400">{note}</p>}
-      {error && <p className="mt-2 rounded-lg bg-red-950/60 px-3 py-2 text-xs text-red-300">{error}</p>}
+      {note && <p className="mt-2 text-xs text-st-quick">{note}</p>}
+      {error && (
+        <p
+          className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
+          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+        >
+          {error}
+        </p>
+      )}
     </div>
   );
 }
@@ -352,23 +363,23 @@ export function CalendarSettings() {
 /** How to find a Google Calendar's private iCal address. */
 function FeedGuide() {
   return (
-    <ol className="mt-2 space-y-1 rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-xs text-neutral-400">
+    <ol className="mt-2 space-y-1 rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink3">
       <li>
         1. Open{" "}
         <a
           href="https://calendar.google.com/"
           target="_blank"
           rel="noreferrer"
-          className="text-sky-400 underline hover:text-sky-300"
+          className="text-accent-text underline hover:brightness-110"
         >
           Google Calendar
         </a>{" "}
         on the web.
       </li>
-      <li>2. Hover the calendar in the left list → ⋮ → <span className="text-neutral-300">Settings and sharing</span>.</li>
+      <li>2. Hover the calendar in the left list → ⋮ → <span className="text-ink2">Settings and sharing</span>.</li>
       <li>
-        3. Scroll to <span className="text-neutral-300">Integrate calendar</span> → copy the{" "}
-        <span className="text-neutral-300">Secret address in iCal format</span>.
+        3. Scroll to <span className="text-ink2">Integrate calendar</span> → copy the{" "}
+        <span className="text-ink2">Secret address in iCal format</span>.
       </li>
       <li>4. Paste it below. (Keep it private — anyone with the link can read that calendar.)</li>
     </ol>

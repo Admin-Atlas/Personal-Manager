@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { ModelPicker } from "./ModelPicker";
+import { Button } from "./ui";
 
 interface Props {
   label: string;
@@ -47,57 +48,57 @@ export function ModelListEditor({
 
   return (
     <div data-help={helpId}>
-      <label className="block text-sm font-medium text-neutral-300">{label}</label>
-      {description && <p className="mt-0.5 text-xs text-neutral-500">{description}</p>}
+      <label className="block text-sm font-medium text-ink2">{label}</label>
+      {description && <p className="mt-0.5 text-xs text-ink4">{description}</p>}
 
       <div className="mt-2 space-y-1.5">
         {models.length === 0 && (
-          <p className="rounded-lg border border-dashed border-neutral-800 px-3 py-2 text-xs text-neutral-500">
+          <p className="rounded-[var(--radius-sm)] border border-dashed border-border px-3 py-2 text-xs text-ink4">
             No model chosen — the default will be used.
           </p>
         )}
         {models.map((id, i) => (
           <div
             key={id}
-            className="flex items-center gap-2 rounded-lg border border-neutral-800 bg-neutral-950 px-2.5 py-1.5"
+            className="flex items-center gap-2 rounded-[var(--radius-sm)] border border-border bg-surface px-2.5 py-1.5"
           >
-            <span className="min-w-0 flex-1 truncate text-sm text-neutral-200" title={id}>
+            <span className="min-w-0 flex-1 truncate text-sm text-ink" title={id}>
               {id}
             </span>
             {i === 0 ? (
-              <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
+              <span className="shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent-text">
                 Primary
               </span>
             ) : (
-              <span className="shrink-0 text-[10px] text-neutral-600">fallback {i}</span>
+              <span className="shrink-0 text-[10px] text-faint">fallback {i}</span>
             )}
-            <div className="flex shrink-0 items-center text-neutral-500">
-              <button
-                type="button"
+            <div className="flex shrink-0 items-center">
+              <Button
+                variant="tertiary"
                 onClick={() => move(i, -1)}
                 disabled={i === 0}
                 title="Move up"
-                className="rounded px-1.5 py-0.5 hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-30"
+                className="px-1.5 py-0.5 disabled:opacity-30"
               >
                 ↑
-              </button>
-              <button
-                type="button"
+              </Button>
+              <Button
+                variant="tertiary"
                 onClick={() => move(i, 1)}
                 disabled={i === models.length - 1}
                 title="Move down"
-                className="rounded px-1.5 py-0.5 hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-30"
+                className="px-1.5 py-0.5 disabled:opacity-30"
               >
                 ↓
-              </button>
-              <button
-                type="button"
+              </Button>
+              <Button
+                variant="tertiary"
                 onClick={() => remove(id)}
                 title="Remove"
-                className="rounded px-1.5 py-0.5 hover:bg-red-950/60 hover:text-red-300"
+                className="px-1.5 py-0.5 hover:text-st-blocked"
               >
                 ×
-              </button>
+              </Button>
             </div>
           </div>
         ))}
@@ -108,8 +109,8 @@ export function ModelListEditor({
 
       <div className="mt-2 flex items-start justify-between gap-3">
         <div>
-          <span className="text-xs font-medium text-neutral-300">Auto-switch on limit</span>
-          <p className="text-[11px] text-neutral-500">
+          <span className="text-xs font-medium text-ink2">Auto-switch on limit</span>
+          <p className="text-[11px] text-ink4">
             When the active model hits its limit, automatically fall through to the next in the
             list. Add a second model to use it.
           </p>
@@ -120,11 +121,11 @@ export function ModelListEditor({
           aria-checked={autoSwitch}
           onClick={() => onAutoSwitchChange(!autoSwitch)}
           className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-            autoSwitch ? "bg-amber-500" : "bg-neutral-700"
+            autoSwitch ? "bg-accent" : "bg-border2"
           }`}
         >
           <span
-            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+            className={`inline-block h-4 w-4 transform rounded-full bg-panel transition-transform ${
               autoSwitch ? "translate-x-4" : "translate-x-0.5"
             }`}
           />

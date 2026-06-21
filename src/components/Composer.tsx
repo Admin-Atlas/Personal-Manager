@@ -3,6 +3,7 @@
 
 import { useRef, useState } from "react";
 import { useRecorder } from "../lib/useRecorder";
+import { Button, Textarea } from "./ui";
 
 interface Props {
   disabled: boolean;
@@ -41,7 +42,7 @@ export function Composer({ disabled, onSend }: Props) {
       : "Record voice (transcribed on your device)";
 
   return (
-    <div className="border-t border-neutral-800 p-4">
+    <div className="border-t border-border p-4">
       <div className="mx-auto max-w-3xl" data-help="chat-composer">
         <div className="flex items-end gap-2">
           <button
@@ -51,16 +52,24 @@ export function Composer({ disabled, onSend }: Props) {
             title={micTitle}
             aria-label={micTitle}
             data-help="composer-mic"
-            className={`flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-xl border text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+            className={`flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-[var(--radius-sm)] border text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
               recording
-                ? "animate-pulse border-red-700 bg-red-950/60 text-red-300"
-                : "border-neutral-700 bg-neutral-900 text-neutral-300 hover:border-neutral-500 hover:text-neutral-100"
+                ? "animate-pulse"
+                : "border-border2 text-ink3 hover:text-ink2"
             }`}
+            style={
+              recording
+                ? {
+                    color: "var(--st-due)",
+                    background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+                  }
+                : undefined
+            }
           >
             {transcribing ? <SpinnerIcon /> : recording ? <StopIcon /> : <MicIcon />}
           </button>
 
-          <textarea
+          <Textarea
             ref={textareaRef}
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -72,26 +81,33 @@ export function Composer({ disabled, onSend }: Props) {
             }}
             rows={1}
             placeholder="Ask anything…  (Enter to send, Shift+Enter for a new line)"
-            className="max-h-40 flex-1 resize-none rounded-xl border border-neutral-700 bg-neutral-900 px-4 py-3 text-sm text-neutral-100 outline-none focus:border-neutral-500"
+            className="max-h-40 flex-1 px-4 py-3"
           />
-          <button
+          <Button
+            variant="primary"
             onClick={submit}
             disabled={disabled || !text.trim()}
-            className="rounded-xl bg-neutral-100 px-4 py-3 text-sm font-medium text-neutral-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
+            className="px-4 py-3"
           >
             Send
-          </button>
+          </Button>
         </div>
 
         {recording && (
-          <p className="mt-2 text-xs text-red-300/80">Recording… click the mic to stop.</p>
+          <p className="mt-2 text-xs" style={{ color: "var(--st-due)" }}>
+            Recording… click the mic to stop.
+          </p>
         )}
         {transcribing && (
-          <p className="mt-2 text-xs text-neutral-500">
+          <p className="mt-2 text-xs text-ink4">
             Transcribing on your device… the first time also downloads the voice model.
           </p>
         )}
-        {recorder.error && <p className="mt-2 text-xs text-red-400">{recorder.error}</p>}
+        {recorder.error && (
+          <p className="mt-2 text-xs" style={{ color: "var(--st-due)" }}>
+            {recorder.error}
+          </p>
+        )}
       </div>
     </div>
   );

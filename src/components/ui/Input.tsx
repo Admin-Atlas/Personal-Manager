@@ -4,11 +4,11 @@
 // Token-driven text input (DESIGN_TOKENS.md §7). Terminal flavour: mono + accent caret.
 // (The ❯ prompt adornment is applied at call sites that want it, e.g. the composer/palette.)
 
-import type { InputHTMLAttributes } from "react";
+import type { ComponentPropsWithRef } from "react";
 import { useTheme } from "../../theme";
 import { cn } from "./cn";
 
-export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputElement>) {
+export function Input({ className, ...rest }: ComponentPropsWithRef<"input">) {
   const { system } = useTheme();
   return (
     <input

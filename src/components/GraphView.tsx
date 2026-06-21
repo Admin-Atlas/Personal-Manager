@@ -16,6 +16,8 @@ import {
 import { listDocuments } from "../lib/ipc";
 import { formatDate } from "../lib/format";
 import type { Document } from "../lib/types";
+import { graphColor, useTheme, useDepth } from "../theme";
+import type { Mode } from "../theme";
 
 /**
  * A force-directed map of the store: every project is a hub node, and each
@@ -29,12 +31,6 @@ import type { Document } from "../lib/types";
 
 const WIDTH = 960;
 const HEIGHT = 640;
-
-// A readable categorical palette; projects are assigned a colour by index.
-const PALETTE = [
-  "#60a5fa", "#34d399", "#f472b6", "#fbbf24", "#a78bfa",
-  "#22d3ee", "#fb923c", "#4ade80", "#f87171", "#c084fc",
-];
 
 interface GNode extends SimulationNodeDatum {
   id: string;
@@ -63,6 +59,7 @@ interface Layout {
 }
 
 export function GraphView() {
+  const { mode } = useTheme();
   const [documents, setDocuments] = useState<Document[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<Document | null>(null);
@@ -73,14 +70,14 @@ export function GraphView() {
       .catch((e) => setError(String(e)));
   }, []);
 
-  const layout = useMemo<Layout | null>(() => buildLayout(documents), [documents]);
+  const layout = useMemo<Layout | null>(() => buildLayout(documents, mode), [documents, mode]);
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between border-b border-neutral-800 px-6 py-3">
+      <header className="flex items-center justify-between border-b border-border px-6 py-3">
         <div data-help="nav-graph">
-          <h1 className="text-sm font-semibold text-neutral-100">Map</h1>
-          <p className="text-xs text-neutral-500">
+          <h1 className="text-sm font-semibold font-head text-ink">Map</h1>
+          <p className="text-xs text-ink3">
             {documents.length} document{documents.length === 1 ? "" : "s"} across{" "}
             {layout?.projects.length ?? 0} project
             {layout && layout.projects.length === 1 ? "" : "s"} · hover a node for details
@@ -89,7 +86,7 @@ export function GraphView() {
         {layout && (
           <div className="flex max-w-[60%] flex-wrap justify-end gap-x-3 gap-y-1">
             {layout.projects.map((p) => (
-              <span key={p.name} className="inline-flex items-center gap-1.5 text-xs text-neutral-400">
+              <span key={p.name} className="inline-flex items-center gap-1.5 text-xs text-ink2">
                 <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: p.color }} />
                 {p.name}
               </span>
@@ -100,13 +97,20 @@ export function GraphView() {
 
       <div className="relative flex-1 overflow-hidden" data-help="graph-canvas">
         {error && (
-          <div className="absolute left-4 top-4 z-10 rounded-lg border border-red-900 bg-red-950/60 px-3 py-2 text-sm text-red-300">
+          <div
+            className="absolute left-4 top-4 z-10 rounded-[var(--radius-sm)] border px-3 py-2 text-sm"
+            style={{
+              borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
+              background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+              color: "var(--st-due)",
+            }}
+          >
             {error}
           </div>
         )}
 
         {!layout ? (
-          <div className="flex h-full items-center justify-center text-sm text-neutral-600">
+          <div className="flex h-full items-center justify-center text-sm text-ink4">
             No documents yet. Ingest some in the Documents view and they'll appear here.
           </div>
         ) : (
@@ -118,7 +122,7 @@ export function GraphView() {
                 y1={e.sy}
                 x2={e.tx}
                 y2={e.ty}
-                stroke="#404040"
+                stroke="var(--border)"
                 strokeWidth={0.6}
               />
             ))}
@@ -130,8 +134,7 @@ export function GraphView() {
                     x={n.x}
                     y={(n.y ?? 0) - n.radius - 4}
                     textAnchor="middle"
-                    className="fill-neutral-200"
-                    style={{ fontSize: 11, fontWeight: 600 }}
+                    style={{ fontSize: 11, fontWeight: 600, fill: "var(--ink2)" }}
                   >
                     {n.label}
                   </text>
@@ -144,7 +147,7 @@ export function GraphView() {
                   r={n.radius}
                   fill={n.color}
                   fillOpacity={hovered?.id === n.doc?.id ? 1 : 0.85}
-                  stroke={n.doc && !n.doc.reviewed ? "#fbbf24" : "#0a0a0a"}
+                  stroke={n.doc && !n.doc.reviewed ? "var(--st-look)" : "var(--bg)"}
                   strokeWidth={n.doc && !n.doc.reviewed ? 1.5 : hovered?.id === n.doc?.id ? 2 : 1}
                   strokeDasharray={n.doc && !n.doc.reviewed ? "2 2" : undefined}
                   style={{ cursor: "pointer" }}
@@ -163,9 +166,10 @@ export function GraphView() {
 }
 
 function DetailCard({ doc }: { doc: Document }) {
+  const { showPower } = useDepth();
   return (
-    <div className="absolute right-4 top-4 z-10 w-72 rounded-xl border border-neutral-700 bg-neutral-900/95 p-4 shadow-2xl backdrop-blur">
-      <div className="text-sm font-semibold text-neutral-100" title={doc.title}>
+    <div className="absolute right-4 top-4 z-10 w-72 rounded-[var(--radius)] border border-border2 bg-surface p-4 shadow-2xl backdrop-blur">
+      <div className="text-sm font-semibold text-ink" title={doc.title}>
         {doc.title}
       </div>
       <dl className="mt-2 space-y-1.5 text-xs">
@@ -173,19 +177,19 @@ function DetailCard({ doc }: { doc: Document }) {
         <Row label="Importance" value={doc.importance ?? "—"} capitalize />
         <Row label="Chunks" value={String(doc.chunk_count)} />
         <Row label="Reviewed" value={doc.reviewed ? "yes" : "awaiting review"} />
-        <Row label="Ingested" value={formatDate(doc.ingested_at)} />
+        {showPower && <Row label="Ingested" value={formatDate(doc.ingested_at)} />}
       </dl>
       {doc.tags.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1">
           {doc.tags.map((t) => (
-            <span key={t} className="rounded-full bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">
+            <span key={t} className="rounded-[var(--radius-sm)] bg-bg px-2 py-0.5 text-xs text-ink2">
               {t}
             </span>
           ))}
         </div>
       )}
-      {doc.source_path && (
-        <div className="mt-2 truncate text-xs text-neutral-600" title={doc.source_path}>
+      {showPower && doc.source_path && (
+        <div className="mt-2 truncate text-xs text-ink4" title={doc.source_path}>
           {doc.source_path}
         </div>
       )}
@@ -196,18 +200,18 @@ function DetailCard({ doc }: { doc: Document }) {
 function Row({ label, value, capitalize }: { label: string; value: string; capitalize?: boolean }) {
   return (
     <div className="flex justify-between gap-3">
-      <dt className="text-neutral-500">{label}</dt>
-      <dd className={`text-neutral-300 ${capitalize ? "capitalize" : ""}`}>{value}</dd>
+      <dt className="text-ink3">{label}</dt>
+      <dd className={`text-ink2 ${capitalize ? "capitalize" : ""}`}>{value}</dd>
     </div>
   );
 }
 
 /** Run the force simulation to completion and project it into render-ready data. */
-function buildLayout(documents: Document[]): Layout | null {
+function buildLayout(documents: Document[], mode: Mode): Layout | null {
   if (documents.length === 0) return null;
 
   const projectNames = Array.from(new Set(documents.map((d) => d.project || "Unsorted")));
-  const colorFor = (project: string) => PALETTE[projectNames.indexOf(project) % PALETTE.length];
+  const colorFor = (project: string) => graphColor(projectNames.indexOf(project), mode);
 
   const projectNodes: GNode[] = projectNames.map((name) => ({
     id: `project:${name}`,

@@ -4,7 +4,7 @@
 // Token-driven button (DESIGN_TOKENS.md §7). Three variants; the terminal System wraps the
 // label in brackets and forces mono. Never style a button instance directly — use this.
 
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import type { ComponentPropsWithRef, ReactNode } from "react";
 import { useTheme } from "../../theme";
 import { cn } from "./cn";
 
@@ -18,7 +18,7 @@ const VARIANT: Record<ButtonVariant, string> = {
   tertiary: "bg-transparent text-ink4 hover:text-ink2 disabled:text-faint",
 };
 
-export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+export interface ButtonProps extends ComponentPropsWithRef<"button"> {
   variant?: ButtonVariant;
   children?: ReactNode;
 }

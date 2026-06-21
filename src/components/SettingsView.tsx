@@ -19,6 +19,8 @@ import { useHelp } from "../lib/help";
 import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import type { LearningProfile } from "../lib/types";
+import { useTheme, ACCENTS } from "../theme";
+import { Button, Input, SegmentedControl } from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -28,6 +30,7 @@ interface Props {
 
 export function SettingsView({ onClose, onboarding }: Props) {
   const help = useHelp();
+  const { system, setSystem, mode, setMode, depth, setDepth, accent, setAccent } = useTheme();
   const [key, setKey] = useState("");
   const [bgKey, setBgKey] = useState("");
   const [chatModels, setChatModelsState] = useState<string[]>([]);
@@ -102,69 +105,132 @@ export function SettingsView({ onClose, onboarding }: Props) {
 
   return (
     <div className="flex h-full items-center justify-center p-6">
-      <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-neutral-800 bg-neutral-900 p-6 shadow-xl">
+      <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-[var(--radius)] border border-border bg-panel p-6 shadow-xl">
         <div className="flex items-center gap-2">
-          <h1 className="text-lg font-semibold text-neutral-100">
+          <h1 className="font-head text-lg font-semibold text-ink">
             {onboarding ? "Welcome to PM" : "Settings"}
           </h1>
           {onboarding && (
             <span
               title="PM is in alpha — under active development; expect rough edges and changes between updates."
-              className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300"
+              className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wide text-accent-text"
             >
               Alpha
             </span>
           )}
         </div>
-        <p className="mt-1 text-sm text-neutral-400">
+        <p className="mt-1 text-sm text-ink3">
           {onboarding
             ? "Add your OpenRouter API key to start chatting. It's stored in your OS keychain, never on disk or in the repo."
             : "Your API key lives in the OS keychain. The model is swappable anytime."}
         </p>
 
-        <label className="mt-5 block text-sm font-medium text-neutral-300">
+        {!onboarding && (
+          <div className="mt-5 border-t border-border pt-4" data-help="settings-appearance">
+            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+              Appearance
+            </label>
+            <p className="mt-1 text-xs text-ink4">
+              Applies instantly and is remembered on this device.
+            </p>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-sm text-ink2">System</span>
+              <SegmentedControl
+                value={system}
+                onChange={setSystem}
+                options={[
+                  { value: "editorial", label: "Editorial" },
+                  { value: "slate", label: "Slate" },
+                  { value: "terminal", label: "Terminal" },
+                ]}
+              />
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-sm text-ink2">Mode</span>
+              <SegmentedControl
+                value={mode}
+                onChange={setMode}
+                options={[
+                  { value: "dark", label: "Dark" },
+                  { value: "light", label: "Light" },
+                ]}
+              />
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-sm text-ink2">Depth</span>
+              <SegmentedControl
+                value={depth}
+                onChange={setDepth}
+                options={[
+                  { value: "min", label: "Min" },
+                  { value: "standard", label: "Standard" },
+                  { value: "power", label: "Power" },
+                ]}
+              />
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-sm text-ink2">Accent</span>
+              <div className="flex items-center gap-1.5">
+                {ACCENTS[system].map((hex) => (
+                  <button
+                    key={hex}
+                    type="button"
+                    aria-label={`Accent ${hex}`}
+                    onClick={() => setAccent(hex)}
+                    style={{ background: hex }}
+                    className={`h-5 w-5 rounded-full transition ${
+                      accent === hex ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]" : ""
+                    }`}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <label className="mt-5 block text-sm font-medium text-ink2">
           OpenRouter API key
         </label>
-        <input
+        <Input
           type="password"
           autoComplete="off"
           data-help="settings-api-key"
           value={key}
           onChange={(e) => setKey(e.target.value)}
           placeholder={keyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-          className="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
+          className="mt-1"
         />
         <a
           href="https://openrouter.ai/keys"
           target="_blank"
           rel="noreferrer"
-          className="mt-1 inline-block text-xs text-neutral-500 hover:text-neutral-300"
+          className="mt-1 inline-block text-xs text-ink4 hover:text-ink2"
         >
           Get a key at openrouter.ai/keys →
         </a>
 
         {!onboarding && (
           <>
-            <label className="mt-4 block text-sm font-medium text-neutral-300">
+            <label className="mt-4 block text-sm font-medium text-ink2">
               Background API key
             </label>
-            <input
+            <Input
               type="password"
               autoComplete="off"
               data-help="settings-background-key"
               value={bgKey}
               onChange={(e) => setBgKey(e.target.value)}
               placeholder={bgKeyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-              className="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-500"
+              className="mt-1"
             />
-            <p className="mt-1 text-xs text-neutral-500">
+            <p className="mt-1 text-xs text-ink4">
               Used for background work (sorting proposals, learning). Lets you track that
               spend separately. Falls back to your main key if blank.
             </p>
           </>
         )}
 
-        <div className="mt-5 space-y-5 border-t border-neutral-800 pt-4">
+        <div className="mt-5 space-y-5 border-t border-border pt-4">
           <ModelListEditor
             label="Chat model"
             description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
@@ -186,27 +252,27 @@ export function SettingsView({ onClose, onboarding }: Props) {
         </div>
 
         {!onboarding && (
-          <div className="mt-5 border-t border-neutral-800 pt-4" data-help="settings-learning">
+          <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
             <div className="flex items-center justify-between">
-              <label className="block text-sm font-medium text-neutral-300">Learning You</label>
-              <button
+              <label className="block text-sm font-medium text-ink2">Learning You</label>
+              <Button
+                variant="tertiary"
                 onClick={refreshProfile}
                 disabled={refreshing}
-                className="rounded-md px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-40"
               >
                 {refreshing ? "Refreshing…" : "Refresh now"}
-              </button>
+              </Button>
             </div>
-            <p className="mt-1 text-xs text-neutral-500">
+            <p className="mt-1 text-xs text-ink4">
               What PM has learned about how you organise, distilled from your review corrections,
               and fed into its suggestions and chat.
             </p>
-            <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-xs text-neutral-300">
+            <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink2">
               {profile?.profile?.trim()
                 ? profile.profile
                 : "Nothing learned yet — it builds up as you correct the AI's proposals in Review."}
             </div>
-            <p className="mt-1 text-xs text-neutral-600">
+            <p className="mt-1 text-xs text-faint">
               {profile ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"} logged` : ""}
               {profile?.updated_at ? ` · updated ${formatWhen(profile.updated_at)}` : ""}
             </p>
@@ -216,10 +282,10 @@ export function SettingsView({ onClose, onboarding }: Props) {
         {!onboarding && <CalendarSettings />}
 
         {!onboarding && (
-          <div className="mt-4 flex items-start justify-between gap-3 border-t border-neutral-800 pt-4" data-help="settings-help-mode">
+          <div className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4" data-help="settings-help-mode">
             <div>
-              <label className="block text-sm font-medium text-neutral-300">Help mode</label>
-              <p className="mt-1 text-xs text-neutral-500">
+              <label className="block text-sm font-medium text-ink2">Help mode</label>
+              <p className="mt-1 text-xs text-ink4">
                 When on, hovering any highlighted section shows a short explanation of what it does.
               </p>
             </div>
@@ -228,11 +294,11 @@ export function SettingsView({ onClose, onboarding }: Props) {
               aria-checked={help.enabled}
               onClick={() => help.setEnabled(!help.enabled)}
               className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                help.enabled ? "bg-amber-500" : "bg-neutral-700"
+                help.enabled ? "bg-accent" : "bg-surface"
               }`}
             >
               <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
                   help.enabled ? "translate-x-4" : "translate-x-0.5"
                 }`}
               />
@@ -241,14 +307,14 @@ export function SettingsView({ onClose, onboarding }: Props) {
         )}
 
         {!onboarding && (
-          <div className="mt-5 border-t border-neutral-800 pt-4 text-xs leading-relaxed text-neutral-500" data-help="settings-license">
+          <div className="mt-5 border-t border-border pt-4 text-xs leading-relaxed text-ink4" data-help="settings-license">
             <p>
               PM is free software, licensed under the{" "}
               <a
                 href="https://www.gnu.org/licenses/agpl-3.0.html"
                 target="_blank"
                 rel="noreferrer"
-                className="text-neutral-400 underline hover:text-neutral-200"
+                className="text-ink3 underline hover:text-ink"
               >
                 GNU Affero General Public License v3
               </a>
@@ -260,7 +326,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 href="https://github.com/Admin-Atlas/Personal-Manager"
                 target="_blank"
                 rel="noreferrer"
-                className="text-neutral-400 underline hover:text-neutral-200"
+                className="text-ink3 underline hover:text-ink"
               >
                 github.com/Admin-Atlas/Personal-Manager
               </a>
@@ -269,27 +335,23 @@ export function SettingsView({ onClose, onboarding }: Props) {
         )}
 
         {error && (
-          <p className="mt-3 rounded-lg bg-red-950/60 px-3 py-2 text-sm text-red-300">
+          <p
+            className="mt-3 rounded-[var(--radius)] px-3 py-2 text-sm text-st-due"
+            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+          >
             {error}
           </p>
         )}
 
         <div className="mt-6 flex justify-end gap-2">
           {!onboarding && (
-            <button
-              onClick={onClose}
-              className="rounded-lg px-4 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
-            >
+            <Button variant="tertiary" onClick={onClose}>
               Cancel
-            </button>
+            </Button>
           )}
-          <button
-            onClick={save}
-            disabled={!canSave}
-            className="rounded-lg bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
-          >
+          <Button variant="primary" onClick={save} disabled={!canSave}>
             {saving ? "Saving…" : "Save"}
-          </button>
+          </Button>
         </div>
       </div>
     </div>

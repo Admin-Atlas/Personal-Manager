@@ -21,21 +21,13 @@ import type {
   ProjectStatus,
 } from "../lib/types";
 import { formatDate } from "../lib/format";
+import { Button, Card, Input, Select, StatusBadge } from "./ui";
+import { useDepth } from "../theme";
 
 interface Props {
   /** Open the per-project scoped view. */
   onOpenProject: (project: string) => void;
 }
-
-/** Badge colour + label per status (spec §4.1). `part_of` shows its parent name. */
-const STATUS_META: Record<ProjectStatus, { label: string; cls: string }> = {
-  due_soon: { label: "Due soon", cls: "bg-red-500/15 text-red-300 border-red-500/30" },
-  blocked: { label: "Blocked", cls: "bg-rose-500/15 text-rose-300 border-rose-500/30" },
-  quick_win: { label: "Quick win", cls: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" },
-  take_a_look: { label: "Take a look", cls: "bg-amber-500/15 text-amber-300 border-amber-500/30" },
-  part_of: { label: "Part of", cls: "bg-sky-500/15 text-sky-300 border-sky-500/30" },
-  on_track: { label: "On track", cls: "bg-neutral-700/40 text-neutral-300 border-neutral-600/50" },
-};
 
 /** Surface the most action-worthy first, mirroring the backend status precedence. */
 const STATUS_ORDER: ProjectStatus[] = [
@@ -158,37 +150,43 @@ export function FocusView({ onOpenProject }: Props) {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between border-b border-neutral-800 px-6 py-3">
+      <header className="flex items-center justify-between border-b border-border px-6 py-3">
         <div data-help="focus-header">
-          <h1 className="text-sm font-semibold text-neutral-100">Focus</h1>
-          <p className="text-xs text-neutral-500">
+          <h1 className="font-head text-sm font-semibold text-ink">Focus</h1>
+          <p className="text-xs text-ink3">
             Every project, one status — what to look at right now.
           </p>
         </div>
-        <button
+        <Button
+          variant="secondary"
           onClick={suggestAll}
           disabled={proposing || projects.length === 0}
           data-help="focus-suggest"
           title="Let the AI propose a size, parent, blocker and deadline for each project"
-          className="rounded-lg border border-neutral-700 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
         >
           {proposing ? "Suggesting…" : "Suggest attributes (AI)"}
-        </button>
+        </Button>
       </header>
 
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-3xl px-6 py-6">
           {error && (
-            <div className="mb-4 rounded-lg border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
+            <div
+              className="mb-4 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
+              style={{
+                borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
+                background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
+              }}
+            >
               {error}
             </div>
           )}
           <Briefing briefing={briefing} busy={briefingBusy} onRefresh={regenerateBriefing} />
           {events.length > 0 && <Agenda events={events} />}
           {loading ? (
-            <p className="text-sm text-neutral-600">Loading…</p>
+            <p className="text-sm text-ink4">Loading…</p>
           ) : projects.length === 0 ? (
-            <p className="text-sm text-neutral-600">
+            <p className="text-sm text-ink4">
               No projects yet. Ingest some documents and sort them in Review.
             </p>
           ) : (
@@ -233,54 +231,62 @@ function ProjectCard({
   onOpen: () => void;
   onSaved: () => void;
 }) {
-  const meta = STATUS_META[project.status];
-  const label = project.status === "part_of" && project.parent ? `Part of ${project.parent}` : meta.label;
+  const { minimal, showMeta } = useDepth();
+  const badge = (
+    <StatusBadge
+      status={project.status}
+      label={project.status === "part_of" && project.parent ? `Part of ${project.parent}` : undefined}
+    />
+  );
 
   return (
-    <li className="rounded-xl border border-neutral-800 bg-neutral-900/40" data-help="focus-card">
-      <div className="flex items-center justify-between gap-3 px-4 py-3">
-        <button onClick={onOpen} className="min-w-0 flex-1 text-left">
-          <div className="flex items-center gap-2">
-            <span
-              className={`shrink-0 rounded-md border px-2 py-0.5 text-xs font-medium ${meta.cls}`}
-              data-help="focus-status-badge"
-            >
-              {label}
-            </span>
-            <span className="truncate text-sm font-medium text-neutral-100">{project.name}</span>
-          </div>
-          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-neutral-500">
-            <span>
-              {project.doc_count} doc{project.doc_count === 1 ? "" : "s"}
-            </span>
-            {project.importance && <span className="capitalize">{project.importance} importance</span>}
-            {project.size && <span>{project.size}</span>}
-            {project.deadline && <span>due {project.deadline.slice(0, 10)}</span>}
-            {project.blocked_by && <span>blocked by {project.blocked_by}</span>}
-            {project.last_activity && <span>active {formatDate(project.last_activity)}</span>}
-          </div>
-          {project.calendar_event && (
-            <div className="mt-1 truncate text-xs text-sky-300/80">
-              📅 {project.calendar_event.summary} · {formatEventWhen(project.calendar_event.start)}
+    <li data-help="focus-card">
+      <Card className="overflow-hidden">
+        <div className="flex items-center justify-between gap-3 px-4 py-3">
+          <button onClick={onOpen} className="min-w-0 flex-1 text-left">
+            <div className="flex items-center gap-2">
+              <span className="shrink-0" data-help="focus-status-badge">
+                {badge}
+              </span>
+              <span className={`truncate font-medium text-ink ${minimal ? "text-base" : "text-sm"}`}>
+                {project.name}
+              </span>
             </div>
-          )}
-        </button>
-        <button
-          onClick={onEdit}
-          className="shrink-0 rounded-md px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
-        >
-          {editing ? "Close" : "Triage"}
-        </button>
-      </div>
+            {showMeta && (
+              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-xs text-ink4">
+                <span>
+                  {project.doc_count} doc{project.doc_count === 1 ? "" : "s"}
+                </span>
+                {project.importance && <span className="capitalize">{project.importance} importance</span>}
+                {project.size && <span>{project.size}</span>}
+                {project.deadline && <span>due {formatDate(project.deadline.slice(0, 10))}</span>}
+                {project.blocked_by && <span>blocked by {project.blocked_by}</span>}
+                {project.last_activity && <span>active {formatDate(project.last_activity)}</span>}
+              </div>
+            )}
+            {showMeta && project.calendar_event && (
+              <div className="mt-1 truncate text-xs text-accent-text">
+                📅 {project.calendar_event.summary} · {formatEventWhen(project.calendar_event.start)}
+              </div>
+            )}
+          </button>
+          <button
+            onClick={onEdit}
+            className="shrink-0 rounded-[var(--radius-sm)] px-2 py-1 text-xs text-ink3 transition hover:bg-surface hover:text-ink2"
+          >
+            {editing ? "Close" : "Triage"}
+          </button>
+        </div>
 
-      {editing && (
-        <MetaEditor
-          project={project}
-          otherProjects={otherProjects}
-          proposal={proposal}
-          onSaved={onSaved}
-        />
-      )}
+        {editing && (
+          <MetaEditor
+            project={project}
+            otherProjects={otherProjects}
+            proposal={proposal}
+            onSaved={onSaved}
+          />
+        )}
+      </Card>
     </li>
   );
 }
@@ -328,44 +334,52 @@ function MetaEditor({
   }
 
   return (
-    <div className="border-t border-neutral-800 px-4 py-3" data-help="focus-triage">
+    <div className="border-t border-border px-4 py-3" data-help="focus-triage">
       {proposal && (
-        <div className="mb-3 rounded-lg border border-sky-900/50 bg-sky-950/30 px-3 py-2 text-xs text-sky-200">
+        <div
+          className="mb-3 rounded-[var(--radius-sm)] border px-3 py-2 text-xs text-accent-text"
+          style={{
+            borderColor: "color-mix(in oklab, var(--accent) 35%, transparent)",
+            background: "color-mix(in oklab, var(--accent) 10%, transparent)",
+          }}
+        >
           <div className="mb-1 flex items-center justify-between">
             <span className="font-medium">AI suggestion</span>
-            <button onClick={applyProposal} className="rounded px-2 py-0.5 text-sky-300 hover:bg-sky-900/40">
+            <button
+              onClick={applyProposal}
+              className="rounded-[var(--radius-sm)] px-2 py-0.5 text-accent-text transition hover:bg-accent-soft"
+            >
               Use it
             </button>
           </div>
-          <p className="text-sky-300/80">
+          <p className="text-ink3">
             {proposal.size ? `size ${proposal.size}` : "no size"}
             {proposal.parent ? ` · part of ${proposal.parent}` : ""}
             {proposal.blocked_by ? ` · blocked by ${proposal.blocked_by}` : ""}
-            {proposal.deadline ? ` · due ${proposal.deadline.slice(0, 10)}` : ""}
+            {proposal.deadline ? ` · due ${formatDate(proposal.deadline.slice(0, 10))}` : ""}
           </p>
-          {proposal.reasoning && <p className="mt-1 text-sky-300/60">{proposal.reasoning}</p>}
+          {proposal.reasoning && <p className="mt-1 text-ink4">{proposal.reasoning}</p>}
         </div>
       )}
 
       <div className="grid grid-cols-2 gap-3">
         <Field label="Size (Quick win = quick)">
-          <select
+          <Select
             value={size ?? ""}
             onChange={(e) => setSize((e.target.value || null) as ProjectSize)}
-            className="w-full rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-100"
+            className="w-full"
           >
             <option value="">—</option>
             <option value="quick">quick</option>
             <option value="standard">standard</option>
             <option value="large">large</option>
-          </select>
+          </Select>
         </Field>
         <Field label="Deadline (Due soon)">
-          <input
+          <Input
             type="date"
             value={deadline}
             onChange={(e) => setDeadline(e.target.value)}
-            className="w-full rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-100"
           />
         </Field>
         <Field label="Blocked by">
@@ -377,13 +391,9 @@ function MetaEditor({
       </div>
 
       <div className="mt-3 flex justify-end gap-2">
-        <button
-          onClick={save}
-          disabled={saving}
-          className="rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-medium text-neutral-900 hover:bg-white disabled:opacity-40"
-        >
+        <Button variant="primary" onClick={save} disabled={saving}>
           {saving ? "Saving…" : "Save"}
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -392,7 +402,7 @@ function MetaEditor({
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-1">
-      <span className="text-xs text-neutral-500">{label}</span>
+      <span className="text-xs text-ink3">{label}</span>
       {children}
     </label>
   );
@@ -408,18 +418,14 @@ function ProjectSelect({
   onChange: (v: string) => void;
 }) {
   return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className="w-full rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-100"
-    >
+    <Select value={value} onChange={(e) => onChange(e.target.value)} className="w-full">
       <option value="">—</option>
       {options.map((o) => (
         <option key={o} value={o}>
           {o}
         </option>
       ))}
-    </select>
+    </Select>
   );
 }
 
@@ -439,30 +445,28 @@ function Briefing({
   if (!text && !busy) return null;
 
   return (
-    <section
-      className="mb-5 rounded-xl border border-neutral-800 bg-neutral-900/40 px-4 py-3"
-      data-help="focus-briefing"
-    >
+    <Card className="mb-5 px-4 py-3" data-help="focus-briefing">
       <div className="mb-2 flex items-center justify-between">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-neutral-500">Today</h2>
-        <button
+        <h2 className="font-mono text-xs font-semibold uppercase tracking-wide text-ink3">Today</h2>
+        <Button
+          variant="tertiary"
           onClick={onRefresh}
           disabled={busy}
           title="Regenerate today's briefing from your current projects and calendar"
-          className="rounded-md px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40"
+          className="px-2 py-0.5 text-xs"
         >
           {busy ? "Refreshing…" : "Refresh"}
-        </button>
+        </Button>
       </div>
       {text ? (
-        <div className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-200">{text}</div>
+        <div className="whitespace-pre-wrap text-sm leading-relaxed text-ink2">{text}</div>
       ) : (
-        <p className="text-sm text-neutral-600">Putting together your briefing…</p>
+        <p className="text-sm text-ink4">Putting together your briefing…</p>
       )}
       {text && briefing?.updated_at && (
-        <p className="mt-2 text-xs text-neutral-600">Updated {formatDate(briefing.updated_at)}</p>
+        <p className="mt-2 text-xs text-ink4">Updated {formatDate(briefing.updated_at)}</p>
       )}
-    </section>
+    </Card>
   );
 }
 
@@ -470,21 +474,21 @@ function Briefing({
 function Agenda({ events }: { events: CalendarEvent[] }) {
   const shown = events.slice(0, 8);
   return (
-    <section className="mb-5 rounded-xl border border-neutral-800 bg-neutral-900/40 px-4 py-3" data-help="focus-agenda">
-      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">Upcoming</h2>
+    <Card className="mb-5 px-4 py-3" data-help="focus-agenda">
+      <h2 className="mb-2 font-mono text-xs font-semibold uppercase tracking-wide text-ink3">Upcoming</h2>
       <ul className="flex flex-col gap-1.5">
         {shown.map((e) => (
           <li key={e.id} className="flex items-baseline gap-3 text-sm">
-            <span className="w-32 shrink-0 text-xs text-neutral-500">{formatEventWhen(e.start, e.all_day)}</span>
-            <span className="truncate text-neutral-200">{e.summary}</span>
-            {e.location && <span className="truncate text-xs text-neutral-600">{e.location}</span>}
+            <span className="w-32 shrink-0 font-mono text-xs text-ink3">{formatEventWhen(e.start, e.all_day)}</span>
+            <span className="truncate text-ink2">{e.summary}</span>
+            {e.location && <span className="truncate text-xs text-ink4">{e.location}</span>}
           </li>
         ))}
       </ul>
       {events.length > shown.length && (
-        <p className="mt-2 text-xs text-neutral-600">+{events.length - shown.length} more</p>
+        <p className="mt-2 text-xs text-ink4">+{events.length - shown.length} more</p>
       )}
-    </section>
+    </Card>
   );
 }
 
@@ -492,7 +496,7 @@ function Agenda({ events }: { events: CalendarEvent[] }) {
 function formatEventWhen(start: string, allDay?: boolean): string {
   const d = new Date(start);
   if (Number.isNaN(d.getTime())) return start.slice(0, 16);
-  const date = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+  const date = formatDate(start);
   // All-day events have a plain date with no time component.
   if (allDay || !start.includes("T")) return date;
   return `${date} ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;

@@ -1,17 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { SelectHTMLAttributes, ReactNode } from "react";
+import type { ComponentPropsWithRef } from "react";
 import { useTheme } from "../../theme";
 import { cn } from "./cn";
 
 // Token-driven wrapper over the native <select>. color-scheme (set by applyTheme) makes the
 // native dropdown follow light/dark automatically.
-export function Select({
-  className,
-  children,
-  ...rest
-}: SelectHTMLAttributes<HTMLSelectElement> & { children?: ReactNode }) {
+export function Select({ className, children, ...rest }: ComponentPropsWithRef<"select">) {
   const { system } = useTheme();
   return (
     <select
