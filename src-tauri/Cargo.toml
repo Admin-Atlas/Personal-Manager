@@ -38,7 +38,7 @@ rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl",
 sqlite-vec = "0.1"
 
 # Random bytes for the generated DB encryption key + the OAuth PKCE verifier/state.
-getrandom = "0.2"
+getrandom = "0.4"
 hex = "0.4"
 # base64url for the PKCE S256 code challenge (Step 6 Google OAuth).
 base64 = "0.22"
