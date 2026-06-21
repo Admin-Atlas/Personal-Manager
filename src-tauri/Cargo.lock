@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "pm"
-version = "0.8.6-alpha"
+version = "1.0.0-alpha"
 dependencies = [
  "base64 0.22.1",
  "chrono",

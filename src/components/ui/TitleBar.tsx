@@ -123,14 +123,23 @@ export function TitleBar() {
 
       {!IS_MAC && (
         <div className={cn("flex items-stretch", system === "terminal" && "font-mono")}>
+          {/* Icons are CSS shapes (not glyphs) so minimize/maximize match the close weight
+              and size consistently across fonts. */}
           <CaptionButton label="Minimize" onClick={minimize}>
-            {"−"}
+            <span className="block h-px w-3 bg-current" />
           </CaptionButton>
           <CaptionButton label={maximized ? "Restore" : "Maximize"} onClick={toggleMaximize}>
-            {maximized ? "❐" : "□"}
+            {maximized ? (
+              <span className="relative block h-3 w-3">
+                <span className="absolute bottom-0 left-0 block h-2 w-2 border border-current" />
+                <span className="absolute right-0 top-0 block h-2 w-2 border border-current" />
+              </span>
+            ) : (
+              <span className="block h-3 w-3 border border-current" />
+            )}
           </CaptionButton>
           <CaptionButton label="Close" onClick={close} danger>
-            {"✕"}
+            <span className="text-base leading-none">✕</span>
           </CaptionButton>
         </div>
       )}
