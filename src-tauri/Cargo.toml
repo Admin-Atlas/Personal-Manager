@@ -50,7 +50,7 @@ open = "5"
 # the agenda window.
 chrono = "0.4"
 chrono-tz = "0.10"
-rrule = "0.13"
+rrule = "0.14"
 
 # OpenRouter streaming chat client. rustls keeps TLS independent of SQLCipher's crypto.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
