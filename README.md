@@ -5,8 +5,8 @@
 > [!WARNING]
 > **PM is in alpha.** It's feature-complete for v1 and usable day to day, but
 > still under active development — expect rough edges and changes between
-> versions. Releases carry a semver pre-release tag (e.g. `0.8.6-alpha`), which
-> sorts below a future stable `0.8.6`.
+> versions. Releases carry a semver pre-release tag (e.g. `1.0.0-alpha`), which
+> sorts below a future stable `1.0.0`.
 
 A local-first desktop app that **archives your knowledge so you can find and use
 it** and **gives you one clean view of everything you have going on**. Your data

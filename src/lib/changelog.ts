@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.0.0-alpha",
+    date: "2026-06-21",
+    highlights: [
+      "A whole new look. PM has been rebuilt on a proper design system, so every screen now shares one calm, consistent visual language — the same features you already use, freshly dressed.",
+      "Make it yours: a new Appearance section in Settings lets you switch between three visual styles, light or dark mode, an accent colour, and a density from minimal to power-user — and PM remembers your choice on this device.",
+      "A custom window frame replaces the stock title bar for a more polished, app-like feel, and dates now read consistently as day-month. No change to your data or how PM works.",
+    ],
+  },
+  {
     version: "0.8.6-alpha",
     date: "2026-06-20",
     highlights: [
