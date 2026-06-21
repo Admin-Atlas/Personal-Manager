@@ -91,6 +91,47 @@ plus the deliberate cuts (Google Tasks, and everything in spec §10).
   MarkItDown conversion + `fastembed` ONNX embeddings (bge-small-en-v1.5, 384-d).
   The venv and downloaded model are runtime artifacts, never committed.
 
+## Design system (V2)
+
+PM's visual design is a **presentation layer** — design tokens + a small set of styled
+primitives — that the existing app wears without changing what it *does*. The chosen direction
+came out of a Claude Design session; the full reference lives in
+[`design-system-docs/`](design-system-docs/) (`DESIGN_TOKENS.md` is the authoritative token
+recipe; `README.md` covers per-surface intent; `PM.dc.html` is the visual source of truth).
+
+**Four orthogonal, runtime-switchable axes** (state lives in `src/theme/`, persisted in
+localStorage, never IPC): **System** (`editorial` / `slate` / `terminal` — three full layout
+languages, all shippable), **Mode** (`dark` / `light`), **Accent** (per-system palette whose
+OKLab hue tints every neutral), **Depth** (`min` / `standard` / `power` — the spec's three
+presets; shows/hides optional fields, **never** forks layout).
+
+**Three non-negotiables (these override visual fidelity):**
+
+1. **Design never owns functionality.** Style component *types* via tokens and primitives
+   (`Button`, `Card`, `ListRow`, `StatusBadge`, `Modal`, `Input`, `NavItem`, `Skeleton`), never
+   a specific instance. A feature added next month must look right *for free*. If design and
+   behaviour conflict, **behaviour wins.**
+2. **No placeholder content in the codebase.** Every name/date/email/model-id/amount in the
+   prototypes is an illustrative sketch — wire each surface to **real** data and build **real**
+   empty/loading states. Never seed the repo with mock data.
+3. **No secrets / personal data** (this just restates the rules below for the design layer).
+
+**Tokens are the single source of truth.** `themeVars(system, mode, accent)`
+(`src/theme/tokens.ts`, ported from `DESIGN_TOKENS.md`) computes CSS custom properties set on
+the document root; **components read only `var(--…)` (or the Tailwind utilities mapped to them),
+never a hex literal.** Role vocabulary: neutrals `--bg --panel --surface --border --border2
+--rule --ink --ink2 --ink3 --ink4 --faint`; accent `--accent --accent-text --accent-ink
+--accent-soft`; status `--st-due --st-blocked --st-quick --st-look --st-part --st-track`; type
+`--head --ui --mono`; corners `--radius --radius-sm`. The only documented hex exceptions are the
+GraphView categorical node palette (`src/theme/graphPalette.ts`) and the fixed modal scrim tint.
+
+**Fonts are self-hosted** (Newsreader / Hanken Grotesk / JetBrains Mono) — bundled, never a
+font CDN (privacy + offline + CSP `default-src 'self'`).
+
+**One hard, real design rule (not placeholder):** all user-facing dates render `DD-MM-YYYY`,
+dropping the `-YYYY` when the date is in the current year (`21-06` this year, `21-06-2027`
+otherwise). Implemented in `src/lib/format.ts`.
+
 ## Non-negotiable rules (spec §7, §8.7)
 
 1. **Never commit personal data or secrets.** Code lives in Git; the user's data

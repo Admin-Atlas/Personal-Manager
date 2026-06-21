@@ -71,6 +71,10 @@ release. What works today:
 - **Store:** one bundled SQLite connection — SQLCipher encryption + `sqlite-vec`
   (vectors) + FTS5 (keyword), all vendored (no system libs)
 - **Secrets:** OS keychain (`keyring`) · **Model gateway:** OpenRouter (streaming)
+- **Design system:** a token-driven, accent-driven OKLCH theme (`src/theme/`) with
+  switchable System / Mode / Accent / Depth axes and self-hosted fonts. The full design
+  reference lives in [`design-system-docs/`](design-system-docs/); the rules for working with
+  it are in [`AGENTS.md`](AGENTS.md#design-system-v2).
 
 ## Prerequisites
 
