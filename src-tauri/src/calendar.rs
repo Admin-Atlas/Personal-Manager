@@ -308,7 +308,7 @@ async fn read_capped(resp: reqwest::Response, max: usize) -> Result<String> {
 
 fn new_feed_id() -> Result<String> {
     let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
+    getrandom::fill(&mut bytes).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
     Ok(format!("ics:{}", hex::encode(bytes)))
 }
 

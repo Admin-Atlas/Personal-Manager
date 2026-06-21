@@ -133,7 +133,7 @@ pub fn get_or_create_db_key() -> Result<Zeroizing<String>> {
         return Ok(Zeroizing::new(key));
     }
     let mut bytes = Zeroizing::new([0u8; 32]);
-    getrandom::getrandom(bytes.as_mut_slice()).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
+    getrandom::fill(bytes.as_mut_slice()).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
     let key = Zeroizing::new(hex::encode(&*bytes));
     set(DB_KEY, &key)?;
     // Defence-in-depth against a first-run race (belt-and-braces with the
