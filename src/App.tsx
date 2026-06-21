@@ -202,7 +202,7 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="flex h-full items-center justify-center text-sm text-neutral-500">
+      <div className="flex h-full items-center justify-center bg-bg text-sm text-ink3">
         Loading…
       </div>
     );
@@ -222,7 +222,7 @@ export default function App() {
 
   return (
     <HelpContext.Provider value={{ enabled: helpMode, setEnabled: updateHelpMode }}>
-      <div className={`flex h-full flex-col ${helpMode ? "help-mode" : ""}`}>
+      <div className={`flex h-full flex-col bg-bg text-ink ${helpMode ? "help-mode" : ""}`}>
         <UpdateBanner update={update} />
         <div className="relative flex flex-1 overflow-hidden">
           <Sidebar
@@ -281,7 +281,12 @@ export default function App() {
           ) : (
             <main className="flex h-full flex-1 flex-col">
               {chat.error && (
-                <div className="border-b border-red-900 bg-red-950/60 px-4 py-2 text-sm text-red-300">
+                <div
+                  className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
+                  style={{
+                    background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+                  }}
+                >
                   {chat.error}
                 </div>
               )}
@@ -291,7 +296,7 @@ export default function App() {
           )}
 
           {showSettings && (
-            <div className="absolute inset-0 z-10 bg-neutral-950/80">
+            <div className="absolute inset-0 z-10" style={{ background: "rgba(8,6,4,0.5)" }}>
               <SettingsView
                 onboarding={false}
                 onClose={() => {
@@ -303,7 +308,7 @@ export default function App() {
           )}
 
           {showWhatsNew && (
-            <div className="absolute inset-0 z-20 bg-neutral-950/80">
+            <div className="absolute inset-0 z-20" style={{ background: "rgba(8,6,4,0.5)" }}>
               <WhatsNew onClose={closeWhatsNew} currentVersion={appVersion} />
             </div>
           )}

@@ -122,6 +122,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Learning You",
     body: "A short, readable profile of how you organise — distilled from the corrections you make in Review. PM injects it into its suggestions and chat so it gets more like you over time. 'Refresh now' rebuilds it from your latest corrections.",
   },
+  "settings-appearance": {
+    title: "Appearance",
+    body: "Switch the visual System (Editorial / Slate / Terminal), Light or Dark mode, the accent colour, and Depth (how much detail is shown). Changes apply instantly and are remembered on this device.",
+  },
   "settings-help-mode": {
     title: "Help mode",
     body: "The switch you're using right now. While it's on, hovering any highlighted section shows an explanation like this one.",

@@ -7,6 +7,8 @@ import { Composer } from "./Composer";
 import { createConversation, getMessages, listDocuments } from "../lib/ipc";
 import { useChatStream } from "../lib/useChatStream";
 import type { Document } from "../lib/types";
+import { Button } from "./ui";
+import { useDepth } from "../theme";
 
 interface Props {
   project: string;
@@ -30,6 +32,7 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
   /** The file the palette jumped to — flashed briefly, then cleared. */
   const [flashId, setFlashId] = useState<number | null>(null);
   const filesRef = useRef<HTMLUListElement>(null);
+  const { showMeta } = useDepth();
 
   useEffect(() => {
     // Reset chat when switching projects (also abandons any in-flight reply).
@@ -79,17 +82,13 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center gap-3 border-b border-neutral-800 px-6 py-3">
-        <button
-          onClick={onBack}
-          className="rounded-md px-2 py-1 text-sm text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
-          title="Back to Focus"
-        >
+      <header className="flex items-center gap-3 border-b border-border bg-panel px-6 py-3">
+        <Button variant="tertiary" onClick={onBack} title="Back to Focus">
           ← Focus
-        </button>
+        </Button>
         <div className="min-w-0">
-          <h1 className="truncate text-sm font-semibold text-neutral-100">{project}</h1>
-          <p className="text-xs text-neutral-500">
+          <h1 className="truncate font-head text-sm font-semibold text-ink">{project}</h1>
+          <p className="font-mono text-xs text-ink4">
             {documents.length} document{documents.length === 1 ? "" : "s"} · chat scoped to this project
           </p>
         </div>
@@ -98,7 +97,14 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
       <div className="flex flex-1 overflow-hidden">
         <main className="flex min-w-0 flex-1 flex-col" data-help="project-chat">
           {chat.error && (
-            <div className="border-b border-red-900 bg-red-950/60 px-4 py-2 text-sm text-red-300">
+            <div
+              className="border-b px-4 py-2 text-sm"
+              style={{
+                color: "var(--st-due)",
+                borderColor: "color-mix(in oklab, var(--st-due) 40%, transparent)",
+                background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
+              }}
+            >
               {chat.error}
             </div>
           )}
@@ -107,31 +113,35 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
         </main>
 
         <aside
-          className="w-80 shrink-0 overflow-y-auto border-l border-neutral-800 bg-neutral-950"
+          className="w-80 shrink-0 overflow-y-auto border-l border-border bg-panel"
           data-help="project-files"
         >
-          <p className="px-4 pb-1 pt-3 text-xs uppercase tracking-wide text-neutral-600">Files</p>
+          <p className="px-4 pb-1 pt-3 font-mono text-xs uppercase tracking-wide text-ink4">Files</p>
           {documents.length === 0 ? (
-            <p className="px-4 py-2 text-xs text-neutral-600">No documents in this project.</p>
+            <p className="px-4 py-2 text-xs text-ink4">No documents in this project.</p>
           ) : (
             <ul ref={filesRef} className="flex flex-col gap-0.5 px-2 pb-4">
               {documents.map((d) => (
                 <li
                   key={d.id}
                   data-doc-id={d.id}
-                  className={`rounded-md px-2 py-1.5 transition-colors hover:bg-neutral-900 ${
-                    flashId === d.id ? "bg-neutral-800 ring-1 ring-sky-500/50" : ""
+                  className={`rounded-[var(--radius-sm)] px-2 py-1.5 transition-colors hover:bg-surface ${
+                    flashId === d.id
+                      ? "bg-surface ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]"
+                      : ""
                   }`}
                 >
-                  <div className="truncate text-sm text-neutral-200" title={d.title}>
+                  <div className="truncate font-head text-sm text-ink2" title={d.title}>
                     {d.title}
                   </div>
-                  <div className="flex gap-2 text-xs text-neutral-600">
-                    {d.importance && <span className="capitalize">{d.importance}</span>}
-                    <span>
-                      {d.chunk_count} chunk{d.chunk_count === 1 ? "" : "s"}
-                    </span>
-                  </div>
+                  {showMeta && (
+                    <div className="flex gap-2 font-mono text-xs text-ink4">
+                      {d.importance && <span className="capitalize">{d.importance}</span>}
+                      <span>
+                        {d.chunk_count} chunk{d.chunk_count === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                  )}
                 </li>
               ))}
             </ul>

@@ -3,6 +3,7 @@
 
 import { useEffect, useRef } from "react";
 import type { Citation, Message } from "../lib/types";
+import { useDepth } from "../theme";
 
 interface Props {
   messages: Message[];
@@ -15,13 +16,13 @@ function Bubble({ role, content }: { role: string; content: string }) {
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
-        className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+        className={`max-w-[80%] whitespace-pre-wrap rounded-[var(--radius)] px-4 py-2.5 text-sm leading-relaxed ${
           isUser
-            ? "bg-neutral-100 text-neutral-900"
-            : "bg-neutral-800 text-neutral-100"
+            ? "bg-accent text-accent-ink"
+            : "bg-surface text-ink"
         }`}
       >
-        {content || <span className="text-neutral-500">…</span>}
+        {content || <span className="text-ink4">…</span>}
       </div>
     </div>
   );
@@ -31,12 +32,12 @@ function Bubble({ role, content }: { role: string; content: string }) {
 function Sources({ citations }: { citations: Citation[] }) {
   return (
     <div className="flex justify-start" data-help="chat-sources">
-      <div className="max-w-[80%] text-xs text-neutral-500">
-        <span className="mr-2 font-medium text-neutral-400">Sources</span>
+      <div className="max-w-[80%] text-xs text-ink4">
+        <span className="mr-2 font-medium text-ink3">Sources</span>
         <ol className="mt-1 flex flex-col gap-0.5">
           {citations.map((c, i) => (
             <li key={`${c.document_id}-${i}`} title={c.source_path ?? c.vault_path}>
-              <span className="text-neutral-600">[{i + 1}]</span> {c.title}
+              <span className="text-faint">[{i + 1}]</span> {c.title}
             </li>
           ))}
         </ol>
@@ -47,6 +48,7 @@ function Sources({ citations }: { citations: Citation[] }) {
 
 export function ChatView({ messages, streaming }: Props) {
   const endRef = useRef<HTMLDivElement>(null);
+  const { atLeast } = useDepth();
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -58,16 +60,17 @@ export function ChatView({ messages, streaming }: Props) {
     <div className="flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-6">
         {empty && (
-          <div className="mt-24 text-center text-neutral-600">
+          <div className="mt-24 text-center text-ink3">
             <p className="text-sm">Start a conversation.</p>
           </div>
         )}
         {messages.map((m) => (
           <div key={m.id} className="flex flex-col gap-1.5">
             <Bubble role={m.role} content={m.content} />
-            {m.role === "assistant" && m.citations && m.citations.length > 0 && (
-              <Sources citations={m.citations} />
-            )}
+            {atLeast("standard") &&
+              m.role === "assistant" &&
+              m.citations &&
+              m.citations.length > 0 && <Sources citations={m.citations} />}
           </div>
         ))}
         {streaming !== null && <Bubble role="assistant" content={streaming} />}

@@ -3,8 +3,10 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listConversations, listDocuments, listProjectOverviews } from "../lib/ipc";
-import type { Conversation, Document, ProjectOverview, ProjectStatus } from "../lib/types";
+import type { Conversation, Document, ProjectOverview } from "../lib/types";
 import type { View } from "./Sidebar";
+import { STATUS_LABEL } from "./ui";
+import { useDepth } from "../theme";
 
 interface Props {
   onClose: () => void;
@@ -44,15 +46,6 @@ const KIND_BADGE: Record<ItemKind, string> = {
 /** Display/grouping order — entities first (spec §4), navigation last. */
 const KIND_ORDER: ItemKind[] = ["project", "file", "conversation", "goto"];
 
-const STATUS_LABEL: Record<ProjectStatus, string> = {
-  due_soon: "Due soon",
-  blocked: "Blocked",
-  quick_win: "Quick win",
-  take_a_look: "Take a look",
-  part_of: "Part of",
-  on_track: "On track",
-};
-
 const NAV_DESTS: { label: string; view: View }[] = [
   { label: "Focus", view: "focus" },
   { label: "Chat", view: "chat" },
@@ -73,6 +66,7 @@ export function CommandPalette({
   onNavigate,
   onOpenSettings,
 }: Props) {
+  const { showPower } = useDepth();
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const [projects, setProjects] = useState<ProjectOverview[]>([]);
@@ -226,11 +220,12 @@ export function CommandPalette({
 
   return (
     <div
-      className="absolute inset-0 z-30 flex justify-center bg-neutral-950/70 pt-[12vh]"
+      className="absolute inset-0 z-30 flex justify-center pt-[12vh]"
+      style={{ background: "rgba(8,6,4,0.5)" }}
       onMouseDown={onClose}
     >
       <div
-        className="flex h-fit max-h-[70vh] w-full max-w-xl flex-col overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900 shadow-2xl"
+        className="flex h-fit max-h-[70vh] w-full max-w-xl flex-col overflow-hidden rounded-[var(--radius)] border border-border bg-surface shadow-2xl"
         data-help="command-palette"
         onMouseDown={(e) => e.stopPropagation()}
       >
@@ -243,16 +238,16 @@ export function CommandPalette({
           }}
           onKeyDown={onKeyDown}
           placeholder="Jump to a project, file, conversation…"
-          className="w-full border-b border-neutral-800 bg-transparent px-4 py-3 text-sm text-neutral-100 placeholder:text-neutral-600 focus:outline-none"
+          className="w-full border-b border-border bg-transparent px-4 py-3 text-sm text-ink placeholder:text-ink4 focus:outline-none"
         />
 
         <div ref={listRef} className="flex-1 overflow-y-auto py-1">
           {flat.length === 0 ? (
-            <p className="px-4 py-6 text-center text-sm text-neutral-600">No matches.</p>
+            <p className="px-4 py-6 text-center text-sm text-ink4">No matches.</p>
           ) : (
             groups.map((group) => (
               <div key={group.kind}>
-                <p className="px-3 pb-1 pt-2 text-xs uppercase tracking-wide text-neutral-600">
+                <p className="px-3 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-ink4">
                   {KIND_HEADING[group.kind]}
                 </p>
                 {group.items.map((item) => {
@@ -265,17 +260,17 @@ export function CommandPalette({
                       onMouseMove={() => setActive(idx)}
                       onClick={item.activate}
                       className={`flex w-full items-center gap-3 px-3 py-2 text-left ${
-                        idx === active ? "bg-neutral-800" : "hover:bg-neutral-900"
+                        idx === active ? "bg-accent-soft" : "hover:bg-surface"
                       }`}
                     >
-                      <span className="w-12 shrink-0 text-[10px] uppercase tracking-wide text-neutral-600">
+                      <span className="w-12 shrink-0 font-mono text-[10px] uppercase tracking-wide text-ink4">
                         {KIND_BADGE[item.kind]}
                       </span>
-                      <span className="min-w-0 flex-1 truncate text-sm text-neutral-100" title={item.label}>
+                      <span className="min-w-0 flex-1 truncate text-sm text-ink" title={item.label}>
                         {item.label}
                       </span>
                       {item.sublabel && (
-                        <span className="shrink-0 truncate text-xs text-neutral-500" title={item.sublabel}>
+                        <span className="shrink-0 truncate text-xs text-ink3" title={item.sublabel}>
                           {item.sublabel}
                         </span>
                       )}
@@ -287,11 +282,13 @@ export function CommandPalette({
           )}
         </div>
 
-        <div className="flex items-center gap-3 border-t border-neutral-800 px-3 py-1.5 text-[11px] text-neutral-600">
-          <span>↑↓ navigate</span>
-          <span>↵ open</span>
-          <span>esc close</span>
-        </div>
+        {showPower && (
+          <div className="flex items-center gap-3 border-t border-border px-3 py-1.5 text-[11px] text-ink4">
+            <span>↑↓ navigate</span>
+            <span>↵ open</span>
+            <span>esc close</span>
+          </div>
+        )}
       </div>
     </div>
   );

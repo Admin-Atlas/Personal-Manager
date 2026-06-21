@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { AppUpdate } from "../lib/useUpdater";
+import { Button } from "./ui";
 
 /**
  * Slim banner shown once a new version has been downloaded in the background.
@@ -17,20 +18,17 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
   // isn't lost for the session — the user can still restart whenever they like.
   if (!installing && update.dismissed) {
     return (
-      <div className="flex items-center justify-end gap-2 border-b border-emerald-900/50 bg-emerald-950/40 px-4 py-1 text-xs text-emerald-300/80">
+      <div className="flex items-center justify-end gap-2 border-b border-border bg-accent-soft px-4 py-1 text-xs text-ink3">
         <span>{update.version ? `Version ${update.version} ready` : "Update ready"}</span>
-        <button
-          onClick={update.restart}
-          className="rounded px-2 py-0.5 font-medium text-emerald-200 hover:bg-emerald-800/50"
-        >
+        <Button variant="tertiary" onClick={update.restart} className="px-2 py-0.5">
           Restart to update
-        </button>
+        </Button>
       </div>
     );
   }
 
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-emerald-900 bg-emerald-950/60 px-4 py-2 text-sm text-emerald-200">
+    <div className="flex items-center justify-between gap-3 border-b border-border bg-accent-soft px-4 py-2 text-sm text-ink2">
       <span>
         {installing
           ? "Installing update…"
@@ -40,18 +38,12 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
       </span>
       {!installing && (
         <span className="flex shrink-0 items-center gap-2">
-          <button
-            onClick={update.restart}
-            className="rounded bg-emerald-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-600"
-          >
+          <Button variant="primary" onClick={update.restart} className="px-2.5 py-1 text-xs">
             Restart now
-          </button>
-          <button
-            onClick={update.dismiss}
-            className="rounded px-2 py-1 text-xs text-emerald-300/80 hover:text-emerald-200"
-          >
+          </Button>
+          <Button variant="tertiary" onClick={update.dismiss} className="px-2 py-1 text-xs">
             Later
-          </button>
+          </Button>
         </span>
       )}
     </div>

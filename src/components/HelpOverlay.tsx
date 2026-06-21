@@ -3,6 +3,7 @@
 
 import { useEffect, useState } from "react";
 import { HELP, useHelp, type HelpEntry } from "../lib/help";
+import { Button } from "./ui";
 
 /**
  * When help mode is on (Step 4b), this listens for the section the user is
@@ -34,25 +35,26 @@ export function HelpOverlay() {
 
   return (
     <>
-      <div className="pointer-events-none fixed left-1/2 top-3 z-40 -translate-x-1/2 rounded-full border border-amber-700/60 bg-amber-950/70 px-3 py-1 text-xs text-amber-200 shadow-lg">
+      <div className="pointer-events-none fixed left-1/2 top-3 z-40 -translate-x-1/2 rounded-full border border-border2 bg-surface px-3 py-1 text-xs text-ink2 shadow-lg">
         Help mode on — hover a highlighted section. Turn off in Settings.
       </div>
 
       {entry && (
-        <div className="pointer-events-none fixed bottom-4 left-1/2 z-40 w-[28rem] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-xl border border-amber-800/60 bg-neutral-900/95 p-4 shadow-2xl backdrop-blur">
-          <p className="text-sm font-semibold text-amber-200">{entry.title}</p>
-          <p className="mt-1 text-sm leading-relaxed text-neutral-300">{entry.body}</p>
+        <div className="pointer-events-none fixed bottom-4 left-1/2 z-40 w-[28rem] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-[var(--radius)] border border-border2 bg-surface p-4 shadow-2xl backdrop-blur">
+          <p className="text-sm font-semibold text-accent-text">{entry.title}</p>
+          <p className="mt-1 text-sm leading-relaxed text-ink2">{entry.body}</p>
         </div>
       )}
 
       {/* An always-available way out, in case the user lands somewhere with no
           Settings button in view. */}
-      <button
+      <Button
+        variant="secondary"
         onClick={() => setEnabled(false)}
-        className="fixed bottom-4 right-4 z-40 rounded-lg border border-neutral-700 bg-neutral-900/90 px-3 py-1.5 text-xs text-neutral-300 shadow-lg hover:bg-neutral-800"
+        className="fixed bottom-4 right-4 z-40 text-xs shadow-lg"
       >
         Exit help mode
-      </button>
+      </Button>
     </>
   );
 }

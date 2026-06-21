@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { TextareaHTMLAttributes } from "react";
+import type { ComponentPropsWithRef } from "react";
 import { useTheme } from "../../theme";
 import { cn } from "./cn";
 
-// Token-driven multiline input — same surface/border/focus treatment as Input.
-export function Textarea({ className, ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+// Token-driven multiline input — same surface/border/focus treatment as Input. Uses
+// ComponentPropsWithRef so callers (e.g. Composer's focus ref) can forward a ref.
+export function Textarea({ className, ...rest }: ComponentPropsWithRef<"textarea">) {
   const { system } = useTheme();
   return (
     <textarea

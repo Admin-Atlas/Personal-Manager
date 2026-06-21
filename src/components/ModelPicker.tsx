@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listModels } from "../lib/ipc";
 import type { ModelInfo } from "../lib/types";
+import { Button, Input } from "./ui";
 
 interface Props {
   /** The currently selected model id (e.g. "anthropic/claude-sonnet-4.6"). */
@@ -102,43 +103,43 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center justify-between gap-2 rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-left text-sm text-neutral-100 outline-none hover:border-neutral-600 focus:border-neutral-500"
+        className="flex w-full items-center justify-between gap-2 rounded-[var(--radius-sm)] border border-border2 bg-surface px-3 py-2 text-left text-sm text-ink2 outline-none transition hover:border-accent focus:border-accent"
       >
         <span className="min-w-0 flex-1 truncate">
           {selected ? selected.name : value || triggerLabel}
           {selected && (
-            <span className="ml-2 text-xs text-neutral-500">{selected.id}</span>
+            <span className="ml-2 font-mono text-xs text-ink4">{selected.id}</span>
           )}
         </span>
-        <span className="shrink-0 text-neutral-500">{open ? "▴" : "▾"}</span>
+        <span className="shrink-0 text-ink4">{open ? "▴" : "▾"}</span>
       </button>
 
       {open && (
-        <div className="absolute z-20 mt-1 w-full overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900 shadow-2xl">
-          <div className="border-b border-neutral-800 p-2">
-            <input
+        <div className="absolute z-20 mt-1 w-full overflow-hidden rounded-[var(--radius)] border border-border bg-panel shadow-2xl">
+          <div className="border-b border-rule p-2">
+            <Input
               autoFocus
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search models…"
-              className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-sm text-neutral-100 outline-none focus:border-neutral-500"
+              className="py-1.5"
             />
           </div>
 
           {/* Count, a price-sort toggle, and the column hint for the prices. */}
           {models && !error && (
-            <div className="flex items-center gap-2 px-3 py-1 text-[10px] uppercase tracking-wide text-neutral-600">
+            <div className="flex items-center gap-2 px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-faint">
               <span>{filtered.length} model{filtered.length === 1 ? "" : "s"}</span>
-              <button
-                type="button"
+              <Button
+                variant="tertiary"
                 onClick={() =>
                   setSort((s) => (s === "default" ? "asc" : s === "asc" ? "desc" : "default"))
                 }
                 title="Sort by input price"
-                className="rounded px-1.5 py-0.5 normal-case tracking-normal text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+                className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] normal-case tracking-normal hover:bg-surface"
               >
                 Sort: {sort === "asc" ? "price ↑" : sort === "desc" ? "price ↓" : "default"}
-              </button>
+              </Button>
               <span className="ml-auto normal-case tracking-normal">
                 price / 1M tokens · in → out
               </span>
@@ -147,12 +148,12 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
 
           <div className="max-h-72 overflow-y-auto">
             {loading && (
-              <div className="px-3 py-6 text-center text-sm text-neutral-500">
+              <div className="px-3 py-6 text-center text-sm text-ink4">
                 Loading models…
               </div>
             )}
             {error && (
-              <div className="px-3 py-4 text-sm text-red-300">
+              <div className="px-3 py-4 text-sm text-st-due">
                 Couldn't load models ({error}). You can still type a model id below.
               </div>
             )}
@@ -163,45 +164,45 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
                   key={m.id}
                   type="button"
                   onClick={() => pick(m.id)}
-                  className={`flex w-full items-start gap-3 px-3 py-2 text-left hover:bg-neutral-800 ${
-                    m.id === value ? "bg-neutral-800/60" : ""
+                  className={`flex w-full items-start gap-3 px-3 py-2 text-left transition hover:bg-surface ${
+                    m.id === value ? "bg-surface" : ""
                   }`}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
-                      <span className="truncate text-sm text-neutral-100">{m.name}</span>
+                      <span className="truncate text-sm text-ink">{m.name}</span>
                       {m.id === value && (
-                        <span className="shrink-0 text-xs text-emerald-400">✓</span>
+                        <span className="shrink-0 text-xs text-st-quick">✓</span>
                       )}
                     </div>
-                    <div className="truncate text-xs text-neutral-500">{m.id}</div>
+                    <div className="truncate font-mono text-xs text-ink4">{m.id}</div>
                     <div className="mt-1 flex flex-wrap gap-1">
                       {modelTags(m).map((t) => (
                         <span
                           key={t.label}
-                          className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${t.cls}`}
+                          className={`rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] font-medium ${t.cls}`}
                         >
                           {t.label}
                         </span>
                       ))}
                     </div>
                   </div>
-                  <div className="shrink-0 whitespace-nowrap pt-0.5 text-right text-xs text-neutral-300">
+                  <div className="shrink-0 whitespace-nowrap pt-0.5 text-right font-mono text-xs text-ink3">
                     {fmtPerM(m.prompt_price)}
-                    <span className="text-neutral-600"> → </span>
+                    <span className="text-ink4"> → </span>
                     {fmtPerM(m.completion_price)}
                   </div>
                 </button>
               ))}
 
             {!loading && !error && filtered.length > MAX_SHOWN && (
-              <div className="px-3 py-2 text-center text-xs text-neutral-600">
+              <div className="px-3 py-2 text-center text-xs text-faint">
                 {filtered.length - MAX_SHOWN} more — keep typing to narrow it down.
               </div>
             )}
 
             {!loading && !error && filtered.length === 0 && !customAvailable && (
-              <div className="px-3 py-6 text-center text-sm text-neutral-500">
+              <div className="px-3 py-6 text-center text-sm text-ink4">
                 No models match “{query}”.
               </div>
             )}
@@ -210,10 +211,10 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
               <button
                 type="button"
                 onClick={() => pick(trimmed)}
-                className="flex w-full items-center gap-2 border-t border-neutral-800 px-3 py-2 text-left text-sm text-neutral-300 hover:bg-neutral-800"
+                className="flex w-full items-center gap-2 border-t border-rule px-3 py-2 text-left text-sm text-ink3 transition hover:bg-surface"
               >
                 Use custom model id:
-                <span className="font-mono text-neutral-100">{trimmed}</span>
+                <span className="font-mono text-ink">{trimmed}</span>
               </button>
             )}
           </div>
@@ -237,19 +238,41 @@ function modelTags(m: ModelInfo): Tag[] {
   const free = (m.prompt_price ?? 0) === 0 && (m.completion_price ?? 0) === 0;
   const tags: Tag[] = [];
 
-  if (free) tags.push({ label: "Free", cls: "bg-emerald-500/15 text-emerald-300" });
+  if (free)
+    tags.push({
+      label: "Free",
+      cls: "bg-[color-mix(in_oklab,var(--st-quick)_15%,transparent)] text-[var(--st-quick)]",
+    });
   if (/(?:^|[/\-])(?:o[134]|r1|qwq)|reason|think/.test(hay))
-    tags.push({ label: "Reasoning", cls: "bg-violet-500/15 text-violet-300" });
+    tags.push({
+      label: "Reasoning",
+      cls: "bg-[color-mix(in_oklab,var(--st-blocked)_15%,transparent)] text-[var(--st-blocked)]",
+    });
   if (/cod(?:e|er|ing)/.test(hay))
-    tags.push({ label: "Coding", cls: "bg-sky-500/15 text-sky-300" });
+    tags.push({
+      label: "Coding",
+      cls: "bg-[color-mix(in_oklab,var(--st-part)_15%,transparent)] text-[var(--st-part)]",
+    });
   if (m.input_modalities?.includes("image"))
-    tags.push({ label: "Vision", cls: "bg-amber-500/15 text-amber-300" });
+    tags.push({
+      label: "Vision",
+      cls: "bg-[color-mix(in_oklab,var(--st-look)_15%,transparent)] text-[var(--st-look)]",
+    });
   if ((m.context_length ?? 0) >= 200_000)
-    tags.push({ label: "Long context", cls: "bg-teal-500/15 text-teal-300" });
+    tags.push({
+      label: "Long context",
+      cls: "bg-[color-mix(in_oklab,var(--st-track)_15%,transparent)] text-[var(--st-track)]",
+    });
   if (!free && promptPerM > 0 && promptPerM <= 1)
-    tags.push({ label: "Budget", cls: "bg-green-500/15 text-green-300" });
+    tags.push({
+      label: "Budget",
+      cls: "bg-[color-mix(in_oklab,var(--st-quick)_15%,transparent)] text-[var(--st-quick)]",
+    });
   else if (!free && promptPerM >= 10)
-    tags.push({ label: "Premium", cls: "bg-rose-500/15 text-rose-300" });
+    tags.push({
+      label: "Premium",
+      cls: "bg-[color-mix(in_oklab,var(--st-due)_15%,transparent)] text-[var(--st-due)]",
+    });
 
   return tags.slice(0, 3);
 }
