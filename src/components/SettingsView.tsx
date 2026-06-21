@@ -257,12 +257,12 @@ export function SettingsView({ onClose, onboarding }: Props) {
             <p className="mt-1">
               Source code:{" "}
               <a
-                href="https://github.com/BBYU26/PM"
+                href="https://github.com/Admin-Atlas/Personal-Manager"
                 target="_blank"
                 rel="noreferrer"
                 className="text-neutral-400 underline hover:text-neutral-200"
               >
-                github.com/BBYU26/PM
+                github.com/Admin-Atlas/Personal-Manager
               </a>
             </p>
           </div>
