@@ -42,7 +42,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFBNTJCODVCNUNENERDQkMKUldTODNOUmNXN2hTR2tXNXFicnk2SC9QdzVRQkM1MU5BZU5HSXZBS2g3QlNDTXpOTjNubjd0M2wK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIyMDhGQjU1MzM3NUYzNUQKUldSZDgzVXpWZnNJc3QwcWN1dFQyY3NLWWd3d2F4bkE3UFRHdlAwcnc2bWdGZlEvLy9sZTAzSkwK",
       "endpoints": [
         "https://github.com/Admin-Atlas/Personal-Manager/releases/latest/download/latest.json"
       ],
