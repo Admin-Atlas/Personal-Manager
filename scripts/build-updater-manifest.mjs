@@ -6,13 +6,14 @@
 // file, compares `version` against the running app, and — if newer — downloads
 // the matching platform `url` and verifies it against the embedded `.sig`.
 //
-// We build it ourselves (instead of letting tauri-action publish) because the
-// release lives in a SEPARATE public repo (releases) from the private source
-// repo, so every download URL must point at the public repo.
+// We assemble it ourselves from the matrix build artifacts in the publish job. Every
+// download URL points at this repo's own Releases (`RELEASES_REPO` resolves to
+// `github.repository` in CI), where the signed installers are attached.
 //
 // Env:
 //   ARTIFACTS_DIR  directory to scan recursively for installers + .sig files
-//   RELEASES_REPO  owner/name of the public releases repo (e.g. BBYU26/PM-Releases)
+//   RELEASES_REPO  owner/name of the repo whose Releases host the assets
+//                  (in CI this is github.repository)
 //   TAG            git tag of this release (e.g. v0.2.0)
 //   VERSION        semver without leading "v" (e.g. 0.2.0)
 //   NOTES          optional release notes string

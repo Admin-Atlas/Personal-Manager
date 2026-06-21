@@ -2,7 +2,7 @@
 name = "pm"
 version = "0.8.6-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
-authors = ["Bobby"]
+authors = ["Bobby Yu"]
 edition = "2021"
 license = "AGPL-3.0-or-later"
 

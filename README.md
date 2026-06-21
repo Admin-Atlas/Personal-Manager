@@ -6,7 +6,7 @@
 > **PM is in alpha.** It's feature-complete for v1 and usable day to day, but
 > still under active development — expect rough edges and changes between
 > versions. Releases carry a semver pre-release tag (e.g. `0.8.6-alpha`), which
-> sorts below a future stable `0.8.5`.
+> sorts below a future stable `0.8.6`.
 
 A local-first desktop app that **archives your knowledge so you can find and use
 it** and **gives you one clean view of everything you have going on**. Your data
@@ -14,13 +14,12 @@ stays on your device, encrypted; the only traffic that leaves is the model API
 call (and, if you connect one, a read-only calendar fetch).
 
 This repo is the **application code**. Your personal data is never committed — it
-lives in a git-ignored local data directory (see below). See
-[`docs/PM_v1_Spec.md`](docs/PM_v1_Spec.md) for the full spec and
-[`docs/DECISIONS.md`](docs/DECISIONS.md) for the decision log.
+lives in a git-ignored local data directory (see below). The full product spec and
+the decision log live in the `docs/` folder.
 
 ## Features
 
-Built in steps (see [`docs/PM_v1_Spec.md`](docs/PM_v1_Spec.md) §8); the in-app
+Built in steps (see the spec in the `docs/` folder); the in-app
 **What's New** view and [`src/lib/changelog.ts`](src/lib/changelog.ts) track each
 release. What works today:
 
@@ -48,7 +47,7 @@ release. What works today:
 - **Command palette.** Ctrl/Cmd+K to jump to any project, file, or past conversation.
 - **Read-only calendar.** Connect a private iCal feed (or Google sign-in) for an
   upcoming agenda, schedule answers in chat, and an automatic "Due soon" when an
-  event names a project. See [`docs/GOOGLE_CALENDAR_SETUP.md`](docs/GOOGLE_CALENDAR_SETUP.md).
+  event names a project. See the calendar setup guide in the `docs/` folder.
 - **Model picker.** Choose any OpenRouter model, with separate chat/background models
   and auto-switch fallback on rate limits.
 - **Voice input.** A microphone button in the chat box records a short clip and
