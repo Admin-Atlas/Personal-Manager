@@ -10,6 +10,7 @@ import { DocumentsView } from "./components/DocumentsView";
 import { FocusView } from "./components/FocusView";
 import { GraphView } from "./components/GraphView";
 import { HelpOverlay } from "./components/HelpOverlay";
+import { PinboardView } from "./components/PinboardView";
 import { ProjectView } from "./components/ProjectView";
 import { ReviewView } from "./components/ReviewView";
 import { Sidebar, type View } from "./components/Sidebar";
@@ -293,6 +294,10 @@ export default function App() {
           ) : view === "graph" ? (
             <main className="flex h-full flex-1 flex-col">
               <GraphView />
+            </main>
+          ) : view === "pinboard" ? (
+            <main className="flex h-full flex-1 flex-col">
+              <PinboardView />
             </main>
           ) : (
             <main className="flex h-full flex-1 flex-col">

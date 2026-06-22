@@ -36,6 +36,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Map",
     body: "A visual graph of your documents grouped by project. Each project is a hub; the documents around it are its files. Hover any document node to see its details.",
   },
+  "nav-pinboard": {
+    title: "Pinboard",
+    body: "A free-form planning board: pin sticky notes and simple timelines, drag them around, and resize them. It's a scratch space for thinking — saved on this device, separate from your documents.",
+  },
   "conversations-list": {
     title: "Conversations",
     body: "Your past chats. Click one to reopen it; '+ New' starts a fresh conversation.",
