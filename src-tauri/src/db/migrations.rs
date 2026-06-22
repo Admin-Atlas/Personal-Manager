@@ -180,6 +180,24 @@ const MIGRATIONS: &[&str] = &[
         fetched_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
     "#,
+    // v8: cache the model **recommender**'s per-model signals next to the price cache
+    // (spec §6). The cost logger's daily refresh already pulls the public catalogue, so
+    // we store a few more of its columns on `model_pricing` rather than building a second
+    // fetch/scheduler — the recommender then reads from the same cache and still works
+    // offline (it recommends from the last-good list and flags staleness). `cache_read_price`
+    // is the prompt-cache read rate (effective-cost weighting); `supported_parameters` /
+    // `input_modalities` are JSON arrays; `intelligence_index` is the Artificial-Analysis
+    // capability signal (NULL for the ~6 in 7 models without it). All additive and nullable
+    // — older stores and unbenchmarked models just carry NULLs and the existing usage×pricing
+    // cost join is untouched (rule #3).
+    r#"
+    ALTER TABLE model_pricing ADD COLUMN name                 TEXT;
+    ALTER TABLE model_pricing ADD COLUMN context_length       INTEGER;
+    ALTER TABLE model_pricing ADD COLUMN cache_read_price     REAL;
+    ALTER TABLE model_pricing ADD COLUMN supported_parameters TEXT;
+    ALTER TABLE model_pricing ADD COLUMN input_modalities     TEXT;
+    ALTER TABLE model_pricing ADD COLUMN intelligence_index   REAL;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

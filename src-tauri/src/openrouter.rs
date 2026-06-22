@@ -61,10 +61,33 @@ pub struct ModelInfo {
     pub input_modalities: Vec<String>,
 }
 
-/// Fetch the full OpenRouter model catalogue. This endpoint is public (no API key
-/// required), but we still go through Rust for it so the webview never has to talk
-/// to OpenRouter directly. Sorted newest-first by OpenRouter; we preserve order.
-pub async fn list_models() -> Result<Vec<ModelInfo>> {
+/// The fuller per-model record the model **recommender** (spec §6) reasons over and
+/// that the daily price refresh caches. On top of pricing it carries the prompt-cache
+/// read rate (PM reuses stable prompt prefixes, so cache reads dominate effective cost),
+/// the model's `supported_parameters` (the structured-output / tool-calling reliability
+/// check), and the Artificial-Analysis `intelligence_index` from the catalogue's
+/// `benchmarks` block — a *general-capability* signal, NOT a faithfulness metric (see
+/// [`crate::recommend`]). Every field is optional because the catalogue is sparse: most
+/// models carry no benchmarks, and some report no price.
+#[derive(Clone, Debug, Default)]
+pub struct ModelDetail {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub context_length: Option<u64>,
+    pub prompt_price: Option<f64>,
+    pub completion_price: Option<f64>,
+    pub cache_read_price: Option<f64>,
+    pub input_modalities: Vec<String>,
+    pub supported_parameters: Vec<String>,
+    pub intelligence_index: Option<f64>,
+}
+
+/// Fetch the full OpenRouter model catalogue as the richer [`ModelDetail`] the
+/// recommender + price cache need. This endpoint is public (no API key required), but we
+/// still go through Rust so the webview never talks to OpenRouter directly. Sorted
+/// newest-first by OpenRouter; we preserve order.
+pub async fn fetch_catalogue() -> Result<Vec<ModelDetail>> {
     #[derive(Deserialize)]
     struct Resp {
         data: Vec<RawModel>,
@@ -82,12 +105,20 @@ pub async fn list_models() -> Result<Vec<ModelInfo>> {
         pricing: Option<RawPricing>,
         #[serde(default)]
         architecture: Option<RawArch>,
+        #[serde(default)]
+        supported_parameters: Vec<String>,
+        // Sparse and schema-loose across models (present on ~1 in 7), so parsed as a free
+        // Value and probed defensively rather than against a fixed struct.
+        #[serde(default)]
+        benchmarks: Option<serde_json::Value>,
     }
     #[derive(Deserialize)]
     struct RawPricing {
         // OpenRouter sends prices as decimal strings, e.g. "0.000003".
         prompt: Option<String>,
         completion: Option<String>,
+        // The prompt-cache read rate, where the model supports prompt caching.
+        input_cache_read: Option<String>,
     }
     #[derive(Deserialize)]
     struct RawArch {
@@ -117,28 +148,87 @@ pub async fn list_models() -> Result<Vec<ModelInfo>> {
         .data
         .into_iter()
         .map(|m| {
-            let (prompt_price, completion_price) = match m.pricing {
-                Some(p) => (parse_price(p.prompt), parse_price(p.completion)),
-                None => (None, None),
+            let (prompt_price, completion_price, cache_read_price) = match m.pricing {
+                Some(p) => (
+                    parse_price(p.prompt),
+                    parse_price(p.completion),
+                    parse_price(p.input_cache_read),
+                ),
+                None => (None, None, None),
             };
-            ModelInfo {
+            let intelligence_index = parse_intelligence_index(m.benchmarks.as_ref());
+            ModelDetail {
                 id: m.id,
                 name: m.name,
                 description: m.description,
                 context_length: m.context_length,
                 prompt_price,
                 completion_price,
+                cache_read_price,
                 input_modalities: m.architecture.map(|a| a.input_modalities).unwrap_or_default(),
+                supported_parameters: m.supported_parameters,
+                intelligence_index,
             }
         })
         .collect();
     Ok(models)
 }
 
+/// Pull the Artificial-Analysis `intelligence_index` out of a model's sparse `benchmarks`
+/// block, tolerating absence and non-numeric values (→ None). A general-capability proxy
+/// only — the API has no faithfulness metric (see [`crate::recommend`]).
+fn parse_intelligence_index(benchmarks: Option<&serde_json::Value>) -> Option<f64> {
+    benchmarks
+        .and_then(|b| b.get("artificial_analysis"))
+        .and_then(|aa| aa.get("intelligence_index"))
+        .and_then(|v| v.as_f64())
+}
+
+/// Fetch the catalogue trimmed to the [`ModelInfo`] the Settings model picker shows.
+pub async fn list_models() -> Result<Vec<ModelInfo>> {
+    Ok(fetch_catalogue()
+        .await?
+        .into_iter()
+        .map(|m| ModelInfo {
+            id: m.id,
+            name: m.name,
+            description: m.description,
+            context_length: m.context_length,
+            prompt_price: m.prompt_price,
+            completion_price: m.completion_price,
+            input_modalities: m.input_modalities,
+        })
+        .collect())
+}
+
 /// Parse a price string ("0.000003") into a float, discarding anything that isn't
 /// a real non-negative number (OpenRouter uses "-1" / absent for "not priced").
 fn parse_price(s: Option<String>) -> Option<f64> {
     s.and_then(|s| s.parse::<f64>().ok()).filter(|v| *v >= 0.0)
+}
+
+/// Turn a failed chat-completions response into an error, adding an actionable hint when
+/// the failure looks like "no provider meets PM's zero-data-retention requirement". PM
+/// enforces ZDR on every request (see `chat_body`), so a model with no compliant endpoint
+/// fails here rather than leaking data — but without the hint the user would see only an
+/// opaque 404/no-endpoints string and not realise the *model* (not PM) is the problem.
+fn request_error(status: reqwest::StatusCode, detail: &str) -> Error {
+    let lower = detail.to_lowercase();
+    let zdr_related = lower.contains("data policy")
+        || lower.contains("data_collection")
+        || lower.contains("no endpoints")
+        || lower.contains("no allowed providers")
+        || lower.contains("zero data")
+        || lower.contains("zdr");
+    if zdr_related {
+        Error::Other(format!(
+            "OpenRouter request failed ({status}): {detail}. PM enforces zero-data-retention on \
+             every request, so this model may have no compliant provider — pick another model, or \
+             turn on auto-switch with a compliant fallback."
+        ))
+    } else {
+        Error::Other(format!("OpenRouter request failed ({status}): {detail}"))
+    }
 }
 
 /// Build the request body, picking single-model vs. fallback-routing form. With
@@ -159,6 +249,17 @@ fn chat_body(models: &[String], messages: &[ChatMessage], stream: bool) -> serde
     } else {
         body["models"] = serde_json::json!(models);
     }
+    // PRIVACY (spec §6) — enforce Zero-Data-Retention on EVERY request, not just on
+    // recommended models. `zdr: true` keeps the request on endpoints that don't retain
+    // prompts; `data_collection: "deny"` blocks providers that train on / store data.
+    // OpenRouter combines these with the account-level policy using OR semantics — a
+    // per-request flag can only *add* enforcement, never weaken it — so this is safe
+    // regardless of the user's account config and is the real privacy boundary: the
+    // public catalogue exposes no per-model data-policy field (verified against /models
+    // and /models/:id/endpoints, neither carries one). If no compliant endpoint exists
+    // for a model the request fails closed (privacy-preserving) and auto-switch falls
+    // through to the next model in the list.
+    body["provider"] = serde_json::json!({ "zdr": true, "data_collection": "deny" });
     body
 }
 
@@ -192,7 +293,7 @@ where
     if !response.status().is_success() {
         let status = response.status();
         let detail = crate::error::truncate_detail(&response.text().await.unwrap_or_default());
-        return Err(Error::Other(format!("OpenRouter request failed ({status}): {detail}")));
+        return Err(request_error(status, &detail));
     }
 
     // Untrusted model output (rule #6): bound both the assembled reply and any
@@ -315,6 +416,25 @@ mod tests {
         let n = parse_usage(&plain);
         assert!(n.prompt_tokens.is_none() && n.completion_tokens.is_none());
     }
+
+    #[test]
+    fn chat_body_enforces_zdr_and_keeps_model_routing() {
+        // Single model: the "model" field, the ZDR provider object, and the streaming
+        // usage opt-in. chat_body is PM's only ZDR enforcement point, so this guards it.
+        let one = chat_body(&["a/b".to_string()], &[], true);
+        assert_eq!(one["provider"]["zdr"], serde_json::json!(true));
+        assert_eq!(one["provider"]["data_collection"], serde_json::json!("deny"));
+        assert_eq!(one["model"], serde_json::json!("a/b"));
+        assert!(one.get("models").is_none());
+        assert_eq!(one["stream_options"]["include_usage"], serde_json::json!(true));
+        // Several models: the ordered "models" fallback list, still ZDR-enforced, no "model"
+        // and (non-streaming) no usage opt-in.
+        let many = chat_body(&["a/b".to_string(), "c/d".to_string()], &[], false);
+        assert_eq!(many["models"], serde_json::json!(["a/b", "c/d"]));
+        assert!(many.get("model").is_none());
+        assert_eq!(many["provider"]["zdr"], serde_json::json!(true));
+        assert!(many.get("stream_options").is_none());
+    }
 }
 
 /// A single non-streaming chat completion — used for background work (sorting
@@ -338,7 +458,7 @@ pub async fn complete(api_key: &str, models: &[String], messages: &[ChatMessage]
     if !response.status().is_success() {
         let status = response.status();
         let detail = crate::error::truncate_detail(&response.text().await.unwrap_or_default());
-        return Err(Error::Other(format!("OpenRouter request failed ({status}): {detail}")));
+        return Err(request_error(status, &detail));
     }
 
     let value: serde_json::Value = response.json().await?;

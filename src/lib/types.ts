@@ -67,6 +67,32 @@ export interface CostSummary {
   pricing_updated_at: string | null;
 }
 
+/** One recommended model (spec §6) — proposed, not applied; the user assigns it to a
+ *  role and Saves. `effective_cost_per_mtok` is cache-weighted USD per million tokens. */
+export interface ModelRecommendation {
+  model: string;
+  name: string;
+  why: string;
+  effective_cost_per_mtok: number | null;
+  context_length: number | null;
+  /** The live Artificial-Analysis capability index, when the catalogue had one (Advanced). */
+  intelligence_index: number | null;
+  /** True when the model is also on PM's curated faithfulness list. */
+  curated: boolean;
+}
+
+/** PM's two model recommendations for the Settings cards. A pick is null when the cache
+ *  can't yet produce one (offline before any fetch). `zdr_enforced` is always true — PM
+ *  sends Zero-Data-Retention on every request; `stale` flags a cache older than the daily
+ *  refresh window. */
+export interface ModelRecommendations {
+  day_to_day: ModelRecommendation | null;
+  advanced: ModelRecommendation | null;
+  denylist: string[];
+  zdr_enforced: boolean;
+  stale: boolean;
+}
+
 /** The distilled Learning-You profile shown in Settings (Step 4b, spec §4.5). */
 export interface LearningProfile {
   profile: string;
