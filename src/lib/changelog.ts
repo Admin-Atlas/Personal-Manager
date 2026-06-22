@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.1.1-alpha",
+    date: "2026-06-22",
+    highlights: [
+      "Polish: the document Map no longer flashes “No documents yet” while it's loading — it shows a gentle placeholder until your map is ready.",
+    ],
+  },
+  {
     version: "1.1.0-alpha",
     date: "2026-06-22",
     highlights: [

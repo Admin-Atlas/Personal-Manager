@@ -15,6 +15,7 @@ import {
 } from "d3-force";
 import { listDocuments } from "../lib/ipc";
 import { formatDate } from "../lib/format";
+import { Skeleton } from "./ui";
 import type { Document } from "../lib/types";
 import { graphColor, useTheme, useDepth } from "../theme";
 import type { Mode } from "../theme";
@@ -63,11 +64,15 @@ export function GraphView() {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<Document | null>(null);
+  // Distinguish "still loading" from "genuinely empty": without this the view would
+  // flash "No documents yet" on every open (documents starts []), before the fetch lands.
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     listDocuments()
       .then(setDocuments)
-      .catch((e) => setError(String(e)));
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoading(false));
   }, []);
 
   const layout = useMemo<Layout | null>(() => buildLayout(documents, mode), [documents, mode]);
@@ -77,11 +82,15 @@ export function GraphView() {
       <header className="flex items-center justify-between border-b border-border px-6 py-3">
         <div data-help="nav-graph">
           <h1 className="text-sm font-semibold font-head text-ink">Map</h1>
-          <p className="text-xs text-ink3">
-            {documents.length} document{documents.length === 1 ? "" : "s"} across{" "}
-            {layout?.projects.length ?? 0} project
-            {layout && layout.projects.length === 1 ? "" : "s"} · hover a node for details
-          </p>
+          {loading ? (
+            <Skeleton className="mt-1 h-3 w-56" />
+          ) : (
+            <p className="text-xs text-ink3">
+              {documents.length} document{documents.length === 1 ? "" : "s"} across{" "}
+              {layout?.projects.length ?? 0} project
+              {layout && layout.projects.length === 1 ? "" : "s"} · hover a node for details
+            </p>
+          )}
         </div>
         {layout && (
           <div className="flex max-w-[60%] flex-wrap justify-end gap-x-3 gap-y-1">
@@ -109,7 +118,24 @@ export function GraphView() {
           </div>
         )}
 
-        {!layout ? (
+        {loading ? (
+          // A node-cluster shimmer that mirrors the map's shape, so the load reads as
+          // "your map is coming" rather than "you have nothing".
+          <div className="flex h-full items-center justify-center">
+            <div className="flex flex-col items-center gap-8" aria-hidden>
+              <div className="flex items-end gap-10">
+                <Skeleton className="h-9 w-9" style={{ borderRadius: "9999px" }} />
+                <Skeleton className="h-16 w-16" style={{ borderRadius: "9999px" }} />
+                <Skeleton className="h-11 w-11" style={{ borderRadius: "9999px" }} />
+              </div>
+              <div className="flex items-center gap-12">
+                <Skeleton className="h-7 w-7" style={{ borderRadius: "9999px" }} />
+                <Skeleton className="h-14 w-14" style={{ borderRadius: "9999px" }} />
+                <Skeleton className="h-8 w-8" style={{ borderRadius: "9999px" }} />
+              </div>
+            </div>
+          </div>
+        ) : !layout ? (
           <div className="flex h-full items-center justify-center text-sm text-ink4">
             No documents yet. Ingest some in the Documents view and they'll appear here.
           </div>
