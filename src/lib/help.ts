@@ -154,6 +154,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Calendar",
     body: "Connect a calendar (read-only) so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. Two ways: paste a calendar's private iCal feed URL (simplest — no sign-in, works with Advanced Protection), or use Google sign-in with your own OAuth credentials (advanced). Feed URLs and tokens live only in your keychain.",
   },
+  "settings-data": {
+    title: "Data",
+    body: "Everything you keep in PM lives in one folder named 'Personal Manager' — the Markdown vault of your documents plus the encrypted store (settings, pinboard, and the search index). 'Open data folder' reveals it in your file manager so you can copy or back it up by hand. 'Export all data' bundles the vault and the store into a single .zip you choose where to save; the regenerable runtime (the local model environment) is left out, and the store stays encrypted inside the archive.",
+  },
   "settings-license": {
     title: "License",
     body: "PM is free and open-source software under the GNU AGPL v3 — you're free to use, study, share, and modify it, and any networked version must offer its source. The link opens the full project source on GitHub.",

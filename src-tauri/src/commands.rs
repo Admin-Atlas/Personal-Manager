@@ -1814,6 +1814,100 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     })
 }
 
+// --- data folder: reveal + export ---
+
+/// Reveal the data folder (the encrypted store + the Markdown vault) in the OS file
+/// manager — Explorer on Windows, Finder on macOS — so the user can find, back up,
+/// or copy it. Uses the same `open` crate that launches the OAuth browser.
+#[tauri::command]
+pub fn open_data_folder(app: AppHandle) -> Result<()> {
+    let dir = paths::data_dir(&app)?;
+    open::that(dir).map_err(Error::from)
+}
+
+/// Bundle the user's data into a single `.zip` at `dest_path`: the encrypted store
+/// plus the Markdown vault. The regenerable `runtime/` (the Python venv + model
+/// cache) is deliberately excluded.
+///
+/// The live `pm.sqlite` is never copied directly — WAL means freshly committed pages
+/// can still live in the `-wal` sidecar — so we `VACUUM INTO` a consistent snapshot
+/// first (which preserves SQLCipher encryption and folds in all WAL pages) under the
+/// DB lock, then archive that snapshot as `pm.sqlite`. The lock is released before the
+/// slower zip walk. The exported store stays encrypted with the same key, so it opens
+/// only on a machine whose keychain holds this app's DB key.
+#[tauri::command]
+pub async fn export_all_data(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dest_path: String,
+) -> Result<()> {
+    // A temp *directory* (not file) so `VACUUM INTO` writes a fresh file into an empty
+    // dir — it refuses a pre-existing target. The dir (and snapshot) is removed on drop.
+    let tmp = tempfile::Builder::new().prefix("pm-export-").tempdir()?;
+    let snapshot = tmp.path().join("pm.sqlite");
+    {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| Error::Other("database lock poisoned".into()))?;
+        // VACUUM INTO takes a literal SQL string, not a bound parameter; escape any
+        // single quote in the (tool-generated) path so it can't break out.
+        let escaped = snapshot.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+    }
+    let data_dir = paths::data_dir(&app)?;
+    let dest = dest_path;
+    tokio::task::spawn_blocking(move || write_export_zip(&data_dir, &snapshot, std::path::Path::new(&dest)))
+        .await
+        .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
+}
+
+/// Write the export archive: the DB snapshot as `pm.sqlite`, then the vault tree.
+fn write_export_zip(
+    data_dir: &std::path::Path,
+    db_snapshot: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<()> {
+    let file = std::fs::File::create(dest)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("pm.sqlite", opts)?;
+    let mut snap = std::fs::File::open(db_snapshot)?;
+    std::io::copy(&mut snap, &mut zip)?;
+
+    let vault = data_dir.join("vault");
+    if vault.is_dir() {
+        add_dir_to_zip(&mut zip, &vault, "vault", opts)?;
+    }
+    zip.finish()?;
+    Ok(())
+}
+
+/// Recursively add `dir` to the archive under `prefix`, preserving relative paths.
+fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    dir: &std::path::Path,
+    prefix: &str,
+    opts: zip::write::SimpleFileOptions,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let zip_path = format!("{prefix}/{}", name.to_string_lossy());
+        if path.is_dir() {
+            add_dir_to_zip(zip, &path, &zip_path, opts)?;
+        } else {
+            zip.start_file(zip_path, opts)?;
+            let mut f = std::fs::File::open(&path)?;
+            std::io::copy(&mut f, zip)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

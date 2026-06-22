@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "1.1.1-alpha"
+version = "1.1.2-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -29,8 +29,11 @@ sha2 = "0.11"
 # Best-effort wipe of raw key material (the DB key) from memory after use. The OS
 # keychain stays the real secret boundary; this just shrinks the in-memory window.
 zeroize = "1"
-# Random-named, RAII-deleted temp files (the voice clip, written inside the data dir).
+# Random-named, RAII-deleted temp files (the voice clip; the export DB snapshot).
 tempfile = "3"
+# Bundle the data folder (store snapshot + Markdown vault) into one .zip for the
+# "Export all data" button. default-features off keeps it to deflate (no bzip2/zstd/aes).
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 # Encrypted store (SQLCipher / AES-256) + vectors (sqlite-vec) + keyword (FTS5),
 # all in one bundled, vendored connection — no system SQLite needed.

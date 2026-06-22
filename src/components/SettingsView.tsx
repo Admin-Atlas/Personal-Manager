@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useState } from "react";
+import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   appLockStatus,
   costSummary,
+  exportAllData,
   getLearningProfile,
   getSettings,
   hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
+  openDataFolder,
   refreshLearningProfile,
   refreshPricing,
   setAppLock,
@@ -55,6 +58,8 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [refreshingPrices, setRefreshingPrices] = useState(false);
   const [appLock, setAppLockState] = useState<AppLockStatus | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -134,6 +139,40 @@ export function SettingsView({ onClose, onboarding }: Props) {
       setError(String(e));
     } finally {
       setRefreshingPrices(false);
+    }
+  }
+
+  async function revealDataFolder() {
+    setError(null);
+    try {
+      await openDataFolder();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function exportData() {
+    setError(null);
+    setExportMsg(null);
+    let dest: string | null;
+    try {
+      dest = await saveFileDialog({
+        defaultPath: "personal-manager-export.zip",
+        filters: [{ name: "Zip archive", extensions: ["zip"] }],
+      });
+    } catch (e) {
+      setError(String(e));
+      return;
+    }
+    if (!dest) return; // the user cancelled the dialog
+    setExporting(true);
+    try {
+      await exportAllData(dest);
+      setExportMsg(`Exported to ${dest}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -536,6 +575,30 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 }`}
               />
             </button>
+          </div>
+        )}
+
+        {!onboarding && (
+          <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
+            <label className="block text-sm font-medium text-ink2">Data</label>
+            <p className="mt-1 text-xs text-ink4">
+              Your documents and the encrypted store live in one folder
+              (<span className="font-medium">Personal Manager</span>). Open it to back it up by
+              hand, or export everything to a single <span className="font-medium">.zip</span> —
+              the Markdown vault plus the encrypted store (the regenerable runtime is left out).
+              The store stays encrypted in the archive.
+            </p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button variant="tertiary" onClick={revealDataFolder}>
+                Open data folder
+              </Button>
+              <Button variant="tertiary" onClick={exportData} disabled={exporting}>
+                {exporting ? "Exporting…" : "Export all data…"}
+              </Button>
+            </div>
+            {exportMsg && (
+              <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>
+            )}
           </div>
         )}
 
