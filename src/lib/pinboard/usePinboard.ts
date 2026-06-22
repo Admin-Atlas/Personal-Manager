@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The Pinboard's state + persistence. Board layout is arrangement state, so it lives in
-// localStorage (the same seam as the theme in ThemeContext) — non-secret, reads synchronously
-// for a flicker-free first paint, and the read/write here can later move to IPC without
-// touching the view. localStorage can throw in locked-down webviews, so every access is guarded.
+// The Pinboard's state + persistence. The board is user content (notes, timelines), so it
+// lives in the encrypted `settings` table via `get_pref`/`set_pref` — it travels with the data
+// folder on backup/transfer and is encrypted at rest, rather than sitting in the webview's
+// localStorage. It already loaded asynchronously on mount, so reading it over IPC is no
+// regression; the persist effect is gated on the initial load so the empty default can't
+// clobber a stored board before it arrives.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getPref, setPref } from "../ipc";
 import { clampRect, findFreeRect } from "./grid";
 import {
   BOARD_VERSION,
@@ -17,7 +20,8 @@ import {
   type Widget,
 } from "./types";
 
-const STORAGE_KEY = "pm:pinboard";
+// The settings-table key (must match the backend `set_pref` allowlist).
+const PREF_KEY = "pinboard";
 
 /** A stable unique id; `crypto.randomUUID` in the webview, with a cheap fallback. */
 function makeId(): string {
@@ -46,10 +50,9 @@ function isValidWidget(w: unknown): w is Widget {
   );
 }
 
-function loadBoard(): Board {
+function parseBoard(raw: string | null): Board {
+  if (!raw) return EMPTY_BOARD;
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return EMPTY_BOARD;
     const parsed = JSON.parse(raw) as Board;
     // Discard anything that isn't the current shape rather than rendering garbage — both the
     // envelope and each widget, clamping rects back in-bounds for safety.
@@ -65,20 +68,36 @@ function loadBoard(): Board {
   }
 }
 
-function saveBoard(board: Board): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(board));
-  } catch {
-    /* ignore — the board just won't persist */
-  }
-}
-
-/** Board state + the mutators the view needs. Every change re-persists synchronously. */
+/** Board state + the mutators the view needs. Loads once from the store on mount and
+ *  re-persists every change. */
 export function usePinboard() {
-  const [board, setBoard] = useState<Board>(loadBoard);
+  const [board, setBoard] = useState<Board>(EMPTY_BOARD);
+  const loaded = useRef(false);
+
+  // Load the stored board once. Until this resolves, `loaded` stays false so the persist
+  // effect below won't write the empty default over a real board.
+  useEffect(() => {
+    let cancelled = false;
+    getPref(PREF_KEY)
+      .then((raw) => {
+        if (!cancelled) setBoard(parseBoard(raw));
+      })
+      .catch(() => {
+        /* store not ready — keep the empty board */
+      })
+      .finally(() => {
+        loaded.current = true;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
-    saveBoard(board);
+    if (!loaded.current) return;
+    setPref(PREF_KEY, JSON.stringify(board)).catch(() => {
+      /* ignore — the board just won't persist this change */
+    });
   }, [board]);
 
   const addNote = useCallback(() => {
