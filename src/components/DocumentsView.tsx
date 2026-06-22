@@ -14,7 +14,7 @@ import {
 import type { Document, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
-import { Button, Card } from "./ui";
+import { Button, Card, Collapsible, ConfirmDialog, Progress } from "./ui";
 
 type ItemStatus = "working" | "done" | "skipped" | "failed";
 interface ProgressItem {
@@ -43,6 +43,7 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [items, setItems] = useState<ProgressItem[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [confirmRebuild, setConfirmRebuild] = useState(false);
   const { showPower } = useDepth();
 
   // `busy` inside the drag-drop listener would be stale; read it via a ref.
@@ -212,7 +213,7 @@ export function DocumentsView({ onReviewClick }: Props) {
           </Button>
           <Button
             variant="tertiary"
-            onClick={doRebuild}
+            onClick={() => setConfirmRebuild(true)}
             disabled={busy}
             data-help="documents-rebuild"
             title="Drop the index and rebuild it from the Markdown vault"
@@ -280,20 +281,25 @@ export function DocumentsView({ onReviewClick }: Props) {
 
           {(prep || items.length > 0 || summary) && (
             <Card className="mt-4 p-3">
+              {busy && <Progress className="mb-2" label="Ingesting documents" />}
               {prep && <p className="px-1 py-1 text-sm text-ink3">{prep}</p>}
-              <ul className="flex flex-col gap-1">
-                {items.map((item, i) => (
-                  <li
-                    key={i}
-                    className="flex items-center justify-between gap-3 px-1 py-0.5 text-sm"
-                  >
-                    <span className="truncate text-ink2">{item.name}</span>
-                    <span className={`shrink-0 text-xs ${statusColor(item.status)}`}>
-                      {statusLabel(item)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
+              {items.length > 0 && (
+                <Collapsible title="Activity" meta={`${items.length}`}>
+                  <ul className="flex flex-col gap-1 pt-1">
+                    {items.map((item, i) => (
+                      <li
+                        key={i}
+                        className="flex items-center justify-between gap-3 px-1 py-0.5 text-sm"
+                      >
+                        <span className="truncate text-ink2">{item.name}</span>
+                        <span className={`shrink-0 text-xs ${statusColor(item.status)}`}>
+                          {statusLabel(item)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </Collapsible>
+              )}
               {summary && (
                 <p className="mt-2 border-t border-rule px-1 pt-2 text-xs text-ink3">
                   Done — {summary.ingested} ingested, {summary.skipped} skipped,{" "}
@@ -364,6 +370,21 @@ export function DocumentsView({ onReviewClick }: Props) {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmRebuild}
+        title="Rebuild the index?"
+        danger
+        confirmLabel="Rebuild"
+        onConfirm={() => {
+          setConfirmRebuild(false);
+          void doRebuild();
+        }}
+        onClose={() => setConfirmRebuild(false)}
+      >
+        This drops the search index and rebuilds it from the Markdown vault. Your documents
+        aren&apos;t deleted, but rebuilding can take a while on a large library.
+      </ConfirmDialog>
     </div>
   );
 }

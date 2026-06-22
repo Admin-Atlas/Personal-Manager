@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window — least-privilege: the dialog/process actions the app calls (open a file picker; restart to apply an update) plus the window controls the custom titlebar drives (drag, minimize, maximize/restore, close) since native decorations are off.",
+  "description": "Capability for the main window — least-privilege: the dialog/process actions the app calls (open a file picker; restart to apply an update) plus the window controls the custom titlebar drives (drag, minimize, maximize/restore, fullscreen, close) since native decorations are off.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -11,6 +11,8 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "core:window:allow-is-maximized",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen",
     "dialog:allow-open",
     "updater:default",
     "process:allow-restart"

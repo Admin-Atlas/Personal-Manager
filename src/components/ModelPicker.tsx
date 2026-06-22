@@ -4,7 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listModels } from "../lib/ipc";
 import type { ModelInfo } from "../lib/types";
-import { Button, Input } from "./ui";
+import { Button, Input, Skeleton } from "./ui";
 
 interface Props {
   /** The currently selected model id (e.g. "anthropic/claude-sonnet-4.6"). */
@@ -148,8 +148,10 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
 
           <div className="max-h-72 overflow-y-auto">
             {loading && (
-              <div className="px-3 py-6 text-center text-sm text-ink4">
-                Loading models…
+              <div className="flex flex-col gap-1 px-3 py-3">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <Skeleton key={i} className="h-9 w-full" />
+                ))}
               </div>
             )}
             {error && (
