@@ -21,7 +21,7 @@ import type {
   ProjectStatus,
 } from "../lib/types";
 import { formatDate } from "../lib/format";
-import { Button, Card, Input, Select, StatusBadge } from "./ui";
+import { Button, Card, Input, Select, Skeleton, StatusBadge } from "./ui";
 import { useDepth } from "../theme";
 
 interface Props {
@@ -184,7 +184,13 @@ export function FocusView({ onOpenProject }: Props) {
           <Briefing briefing={briefing} busy={briefingBusy} onRefresh={regenerateBriefing} />
           {events.length > 0 && <Agenda events={events} />}
           {loading ? (
-            <p className="text-sm text-ink4">Loading…</p>
+            <ul className="flex flex-col gap-2">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <li key={i}>
+                  <Skeleton className="h-16 w-full" />
+                </li>
+              ))}
+            </ul>
           ) : projects.length === 0 ? (
             <p className="text-sm text-ink4">
               No projects yet. Ingest some documents and sort them in Review.

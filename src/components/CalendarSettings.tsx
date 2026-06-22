@@ -16,7 +16,11 @@ import {
   syncCalendar,
 } from "../lib/ipc";
 import type { CalendarStatus, GoogleCalendar, IcsFeedInfo } from "../lib/types";
-import { Button, Input } from "./ui";
+import { Button, ConfirmDialog, Input, Skeleton } from "./ui";
+
+type Confirm =
+  | { kind: "disconnect" }
+  | { kind: "remove-feed"; id: string; label: string };
 
 /**
  * The read-only calendar connector (Step 6). Two paths:
@@ -44,6 +48,7 @@ export function CalendarSettings() {
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<Confirm | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -196,7 +201,7 @@ export function CalendarSettings() {
                 <span className="truncate">{f.label}</span>
                 <Button
                   variant="tertiary"
-                  onClick={() => removeFeed(f.id)}
+                  onClick={() => setConfirm({ kind: "remove-feed", id: f.id, label: f.label })}
                   disabled={busy != null}
                   className="shrink-0 px-2 py-0.5 text-xs hover:text-st-due"
                 >
@@ -315,7 +320,7 @@ export function CalendarSettings() {
                   </span>
                   <Button
                     variant="tertiary"
-                    onClick={disconnect}
+                    onClick={() => setConfirm({ kind: "disconnect" })}
                     disabled={busy != null}
                     className="px-2 py-1 text-xs"
                   >
@@ -323,7 +328,11 @@ export function CalendarSettings() {
                   </Button>
                 </div>
                 {calendars == null ? (
-                  <p className="text-xs text-ink4">Loading calendars…</p>
+                  <div className="flex flex-col gap-1.5 py-1">
+                    {Array.from({ length: 3 }).map((_, i) => (
+                      <Skeleton key={i} className="h-7 w-full" />
+                    ))}
+                  </div>
                 ) : (
                   <ul className="max-h-40 overflow-y-auto rounded-[var(--radius)] border border-border">
                     {calendars.map((c) => (
@@ -356,6 +365,29 @@ export function CalendarSettings() {
           {error}
         </p>
       )}
+
+      <ConfirmDialog
+        open={confirm != null}
+        title={confirm?.kind === "disconnect" ? "Disconnect Google Calendar?" : "Remove this calendar feed?"}
+        danger
+        confirmLabel={confirm?.kind === "disconnect" ? "Disconnect" : "Remove"}
+        onConfirm={() => {
+          const c = confirm;
+          setConfirm(null);
+          if (c?.kind === "disconnect") void disconnect();
+          else if (c?.kind === "remove-feed") void removeFeed(c.id);
+        }}
+        onClose={() => setConfirm(null)}
+      >
+        {confirm?.kind === "disconnect" ? (
+          "This signs out of Google and clears the mirrored events. Your saved credentials are kept, so you can reconnect without re-entering them."
+        ) : (
+          <>
+            This removes “{confirm?.kind === "remove-feed" ? confirm.label : "this feed"}” and its
+            mirrored events. You can re-add the feed URL anytime.
+          </>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }

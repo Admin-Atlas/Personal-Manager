@@ -16,6 +16,7 @@ import { Sidebar, type View } from "./components/Sidebar";
 import { SettingsView } from "./components/SettingsView";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { WhatsNew } from "./components/WhatsNew";
+import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { useChatStream } from "./lib/useChatStream";
 import { useUpdater } from "./lib/useUpdater";
@@ -201,9 +202,24 @@ export default function App() {
   }
 
   if (loading) {
+    // A wireframe of the app shell (sidebar + content) rather than a bare spinner, so
+    // the first paint already has PM's shape.
     return (
-      <div className="flex h-full items-center justify-center bg-bg text-sm text-ink3">
-        Loading…
+      <div className="flex h-full bg-bg">
+        <div className="flex w-60 shrink-0 flex-col gap-2 border-r border-border p-3">
+          <Skeleton className="h-7 w-28" />
+          <div className="mt-3 flex flex-col gap-1.5">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-7 w-full" />
+            ))}
+          </div>
+        </div>
+        <div className="flex flex-1 flex-col gap-3 p-6">
+          <Skeleton className="h-8 w-48" />
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-5 w-3/4" />
+          <Skeleton className="h-5 w-2/3" />
+        </div>
       </div>
     );
   }
