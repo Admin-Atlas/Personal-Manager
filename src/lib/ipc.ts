@@ -7,6 +7,7 @@ import type {
   CalendarStatus,
   ChatEvent,
   Conversation,
+  CostSummary,
   DailyBriefing,
   Document,
   GoogleCalendar,
@@ -62,6 +63,18 @@ export const setBackgroundAutoSwitch = (enabled: boolean) =>
 
 /** The OpenRouter model catalogue (id, name, pricing) for the Settings picker. */
 export const listModels = () => invoke<ModelInfo[]>("list_models");
+
+// --- Cost logger (spec §11.2 / §17.1) ---
+
+/** Per-model token spend + totals; refreshes the daily price cache on read. */
+export const costSummary = () => invoke<CostSummary>("cost_summary");
+
+/** Force a re-pull of OpenRouter pricing; returns the refreshed summary. */
+export const refreshPricing = () => invoke<CostSummary>("refresh_pricing");
+
+/** The recommended model preset for a role (the cost logger's sensible defaults). */
+export const recommendedModels = (role: "chat" | "background") =>
+  invoke<string[]>("recommended_models", { role });
 
 /** Toggle the UI help/explain mode (Step 4b). */
 export const setHelpMode = (enabled: boolean) =>

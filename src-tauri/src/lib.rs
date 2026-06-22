@@ -5,6 +5,7 @@ mod briefing;
 mod calendar;
 mod clock;
 mod commands;
+mod cost;
 mod db;
 mod error;
 mod google;
@@ -117,6 +118,9 @@ pub fn run() {
             commands::list_calendar_events,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
+            commands::cost_summary,
+            commands::refresh_pricing,
+            commands::recommended_models,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

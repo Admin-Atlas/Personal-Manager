@@ -276,17 +276,20 @@ pub enum ProjectProposalEvent {
 /// a model/parse failure yields an empty fallback, never an error. `samples` are
 /// short excerpts from the project's documents; `other_projects` lets the model
 /// pick a real parent/blocker rather than inventing one.
+/// Returns the proposal plus, on a successful call, the served model + token usage
+/// for the cost logger. The usage is `None` on the best-effort fallback path, so a
+/// failed call logs nothing (not even a phantom zero-token request).
 pub async fn propose(
     api_key: &str,
     models: &[String],
     project: &str,
     samples: &[String],
     other_projects: &[String],
-) -> ProjectProposal {
+) -> (ProjectProposal, Option<(openrouter::Usage, Option<String>)>) {
     let messages = build_messages(project, samples, other_projects);
     match openrouter::complete(api_key, models, &messages).await {
-        Ok(reply) => parse_proposal(&reply, project),
-        Err(e) => ProjectProposal::fallback(format!("Proposal request failed: {e}")),
+        Ok(c) => (parse_proposal(&c.text, project), Some((c.usage, c.model))),
+        Err(e) => (ProjectProposal::fallback(format!("Proposal request failed: {e}")), None),
     }
 }
 

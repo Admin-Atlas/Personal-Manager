@@ -70,6 +70,9 @@ pub struct ReviewDecision {
 /// a model/parse failure yields a fallback proposal, never an error. `profile` is
 /// the distilled Learning-You preamble (Step 4b) biasing the proposal toward how
 /// this user already files things; `None` before any profile exists.
+/// Returns the proposal plus, on a successful call, the served model + token usage
+/// for the cost logger. The usage is `None` on the best-effort fallback path, so a
+/// failed call logs nothing (not even a phantom zero-token request).
 pub async fn propose(
     api_key: &str,
     models: &[String],
@@ -77,11 +80,11 @@ pub async fn propose(
     body: &str,
     existing_projects: &[String],
     profile: Option<&str>,
-) -> Proposal {
+) -> (Proposal, Option<(openrouter::Usage, Option<String>)>) {
     let messages = build_messages(title, body, existing_projects, profile);
     match openrouter::complete(api_key, models, &messages).await {
-        Ok(reply) => parse_proposal(&reply),
-        Err(e) => Proposal::fallback(format!("Proposal request failed: {e}")),
+        Ok(c) => (parse_proposal(&c.text), Some((c.usage, c.model))),
+        Err(e) => (Proposal::fallback(format!("Proposal request failed: {e}")), None),
     }
 }
 

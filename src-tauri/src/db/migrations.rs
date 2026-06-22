@@ -156,6 +156,30 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_calendar_events_start ON calendar_events(start);
     "#,
+    // v7: the Cost Logger (spec §11.2 / §17.1). `usage_log` records token usage per
+    // model call (chat vs background), append-only, so spend can be attributed to the
+    // model that actually ran — never read as a source of truth. `model_pricing`
+    // caches OpenRouter's public price list (fetched ~once a day over plain HTTP, no
+    // model call), so spend is a plain usage × pricing join. Both are derived /
+    // regenerable and additive — older stores just start with empty tables (rule #3).
+    r#"
+    CREATE TABLE usage_log (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        model             TEXT NOT NULL,
+        kind              TEXT NOT NULL CHECK (kind IN ('chat','background')),
+        prompt_tokens     INTEGER,
+        completion_tokens INTEGER,
+        created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_usage_log_model_created ON usage_log(model, created_at);
+
+    CREATE TABLE model_pricing (
+        model            TEXT PRIMARY KEY,
+        prompt_price     REAL,
+        completion_price REAL,
+        fetched_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

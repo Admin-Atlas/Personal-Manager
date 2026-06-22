@@ -18,11 +18,20 @@ use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
-use crate::{briefing, clock, db, learning, openrouter, paths, secrets, AppState};
+use crate::{briefing, clock, cost, db, learning, openrouter, paths, secrets, AppState};
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
 /// stored as a plain string (spec §6 — never locked into a model).
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.6";
+
+/// Recommended model presets offered in Settings — the "sensible defaults" half of
+/// the Cost Logger (spec §17.1): cheap/fast for high-volume background work, stronger
+/// for chat. Consumed ONLY as the "use recommended" suggestion (and applied by the
+/// user, who then Saves) — never by `effective_models`, which always reads the user's
+/// stored list (spec §6: nothing hardcoded into the engine). `DEFAULT_CHAT_MODELS[0]`
+/// stays == `DEFAULT_MODEL`. These are swappable strings, not pinned ids.
+const DEFAULT_CHAT_MODELS: &[&str] = &["anthropic/claude-sonnet-4.6", "anthropic/claude-haiku-4.5"];
+const DEFAULT_BACKGROUND_MODELS: &[&str] = &["anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4.6"];
 
 /// Settings keys for the two model roles. Each holds a JSON array of model ids
 /// (ordered, first = primary); the `*_AUTO_SWITCH` keys hold "true"/"false".
@@ -377,8 +386,8 @@ pub async fn send_message(
     })
     .await;
 
-    let (reply, served) = match result {
-        Ok(pair) => pair,
+    let completion = match result {
+        Ok(c) => c,
         Err(e) => {
             let _ = on_event.send(ChatEvent::Error {
                 message: e.to_string(),
@@ -386,9 +395,13 @@ pub async fn send_message(
             return Err(e);
         }
     };
+    let reply = completion.text;
+    let usage = completion.usage;
     // Record the model that actually answered — the served one (so a fallback is
     // reflected), falling back to the requested primary if it wasn't reported.
-    let used_model = served.unwrap_or_else(|| models.first().cloned().unwrap_or_default());
+    let used_model = completion
+        .model
+        .unwrap_or_else(|| models.first().cloned().unwrap_or_default());
 
     // Persist the assistant turn with the documents it cited (JSON, or NULL).
     let citations_json = if citations.is_empty() {
@@ -404,6 +417,7 @@ pub async fn send_message(
             params![conversation_id, reply, used_model, citations_json],
         )?;
         let id = conn.last_insert_rowid();
+        log_usage(&conn, "chat", Some(&used_model), &usage);
         conn.execute(
             "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?1",
             params![conversation_id],
@@ -677,12 +691,17 @@ pub async fn propose_metadata(
     };
 
     let mut proposed = 0;
+    let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
     for p in pending {
-        let proposal =
+        let (proposal, usage_info) =
             review::propose(&api_key, &models, &p.title, &p.body, &projects, profile.as_deref()).await;
+        if let Some((usage, served)) = usage_info {
+            usage_rows.push((served, usage));
+        }
         let _ = on_event.send(ReviewEvent::Proposed { document_id: p.id, proposal });
         proposed += 1;
     }
+    log_background_usage(&app, &models, &usage_rows);
     let _ = on_event.send(ReviewEvent::Finished { proposed });
     Ok(())
 }
@@ -889,15 +908,21 @@ pub async fn propose_project_metadata(
     };
 
     let mut proposed = 0;
+    let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
     for t in targets {
         let others: Vec<String> = all_projects.iter().filter(|p| **p != t.name).cloned().collect();
-        let proposal = projects::propose(&api_key, &models, &t.name, &t.samples, &others).await;
+        let (proposal, usage_info) =
+            projects::propose(&api_key, &models, &t.name, &t.samples, &others).await;
+        if let Some((usage, served)) = usage_info {
+            usage_rows.push((served, usage));
+        }
         let _ = on_event.send(ProjectProposalEvent::Proposed {
             project: t.name,
             proposal,
         });
         proposed += 1;
     }
+    log_background_usage(&app, &models, &usage_rows);
     let _ = on_event.send(ProjectProposalEvent::Finished { proposed });
     Ok(())
 }
@@ -1159,11 +1184,12 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
         return Ok(());
     }
 
-    let updated = learning::distill(&api_key, &models, &current, &corrections).await?;
+    let (updated, usage, served) = learning::distill(&api_key, &models, &current, &corrections).await?;
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
     let conn = state.db.lock().unwrap();
+    log_usage(&conn, "background", served.as_deref().or_else(|| models.first().map(String::as_str)), &usage);
     learning::save_profile(&conn, &updated, &now)
 }
 
@@ -1208,13 +1234,218 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         return briefing::get_briefing(&conn);
     };
 
-    let text = briefing::generate(&api_key, &models, &snapshot, profile.as_deref()).await?;
+    let (text, usage, served) =
+        briefing::generate(&api_key, &models, &snapshot, profile.as_deref()).await?;
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
     let conn = state.db.lock().unwrap();
+    log_usage(&conn, "background", served.as_deref().or_else(|| models.first().map(String::as_str)), &usage);
     briefing::save_briefing(&conn, &text, &now)?;
     briefing::get_briefing(&conn)
+}
+
+// --- cost logger (spec §11.2 / §17.1) ---
+
+/// Spend for one model over a window. `cost_usd` is `None` when the model isn't in
+/// the price cache yet — surfaced as "—", never an understated $0.
+#[derive(Serialize)]
+pub struct ModelSpend {
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub request_count: i64,
+    pub cost_usd: Option<f64>,
+}
+
+/// The Settings "Usage & cost" payload: per-model spend over two windows + totals,
+/// plus when the cached pricing was last refreshed.
+#[derive(Serialize)]
+pub struct CostSummary {
+    pub last_30d: Vec<ModelSpend>,
+    pub all_time: Vec<ModelSpend>,
+    pub total_30d_usd: Option<f64>,
+    pub total_all_time_usd: Option<f64>,
+    pub pricing_updated_at: Option<String>,
+}
+
+/// Per-model spend (trailing 30 days + all time) joined against the cached OpenRouter
+/// prices. CHECK-ON-READ: if the price cache is empty or older than a day, refresh it
+/// from the public catalogue first (no key, no model call, no scheduler — mirrors the
+/// briefing's staleness rule). Read-mostly; safe on every Settings open.
+#[tauri::command]
+pub async fn cost_summary(app: AppHandle) -> Result<CostSummary> {
+    // Best-effort refresh: if it fails (offline, etc.) still return the summary —
+    // token counts come from the local log and need no network; only the priced
+    // costs fall back to "unknown". The explicit "Refresh prices" button surfaces
+    // the error instead.
+    let _ = ensure_pricing_fresh(&app).await;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    build_cost_summary(&conn)
+}
+
+/// Force a re-pull of OpenRouter's public pricing into the cache, then return the
+/// refreshed summary (the Settings "Refresh prices" action).
+#[tauri::command]
+pub async fn refresh_pricing(app: AppHandle) -> Result<CostSummary> {
+    refresh_pricing_now(&app).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    build_cost_summary(&conn)
+}
+
+/// The recommended model preset for a role ("chat" | "background") — the cost
+/// logger's "sensible defaults". The UI pre-fills the model editor with these and the
+/// user Saves, so nothing is applied without confirmation (spec §6: swappable).
+#[tauri::command]
+pub fn recommended_models(role: String) -> Result<Vec<String>> {
+    let list = match role.as_str() {
+        "chat" => DEFAULT_CHAT_MODELS,
+        "background" => DEFAULT_BACKGROUND_MODELS,
+        _ => return Err(Error::Other(format!("unknown model role: {role}"))),
+    };
+    Ok(list.iter().map(|s| s.to_string()).collect())
+}
+
+/// Append a `usage_log` row — best-effort: cost logging must never fail a model call,
+/// so errors are swallowed. `model = None` is allowed (an unreported served model).
+fn log_usage(conn: &Connection, kind: &str, model: Option<&str>, usage: &openrouter::Usage) {
+    let _ = conn.execute(
+        "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens) VALUES (?1, ?2, ?3, ?4)",
+        params![model, kind, usage.prompt_tokens, usage.completion_tokens],
+    );
+}
+
+/// Write collected background usage rows under one short lock (best-effort), each
+/// attributed to its served model, or the requested primary when none was reported.
+fn log_background_usage(app: &AppHandle, models: &[String], rows: &[(Option<String>, openrouter::Usage)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let state = app.state::<AppState>();
+    let Ok(conn) = state.db.lock() else { return };
+    for (served, usage) in rows {
+        let model = served.as_deref().or_else(|| models.first().map(String::as_str));
+        log_usage(&conn, "background", model, usage);
+    }
+}
+
+/// Refresh the cached pricing when it's stale (check-on-read). Resolves staleness
+/// under a short lock, then does the network fetch + upsert without holding it (rule #4).
+async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
+    let stale = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        let hours: Option<f64> = conn
+            .query_row(
+                "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        cost::pricing_is_stale(hours)
+    };
+    if stale {
+        refresh_pricing_now(app).await?;
+    }
+    Ok(())
+}
+
+/// Pull the public OpenRouter catalogue (no key) and upsert every model's prices into
+/// the cache. Never holds the DB lock across the network call (rule #4).
+async fn refresh_pricing_now(app: &AppHandle) -> Result<()> {
+    let models = openrouter::list_models().await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    let tx = conn.unchecked_transaction()?;
+    for m in &models {
+        tx.execute(
+            "INSERT INTO model_pricing(model, prompt_price, completion_price, fetched_at) \
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+             ON CONFLICT(model) DO UPDATE SET \
+                prompt_price = ?2, completion_price = ?3, fetched_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            params![m.id, m.prompt_price, m.completion_price],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Assemble the cost summary from `usage_log` × the cached `model_pricing`.
+fn build_cost_summary(conn: &Connection) -> Result<CostSummary> {
+    let last_30d = spend_rows(conn, true)?;
+    let all_time = spend_rows(conn, false)?;
+    let total_30d_usd = total_cost(&last_30d);
+    let total_all_time_usd = total_cost(&all_time);
+    let pricing_updated_at: Option<String> = conn
+        .query_row("SELECT MAX(fetched_at) FROM model_pricing", [], |r| r.get(0))
+        .ok()
+        .flatten();
+    Ok(CostSummary {
+        last_30d,
+        all_time,
+        total_30d_usd,
+        total_all_time_usd,
+        pricing_updated_at,
+    })
+}
+
+/// Per-model token sums + request counts (optionally only the last 30 days), priced
+/// from the cache; ordered by request count desc. Rows with a NULL model are excluded.
+fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
+    let window = if last_30d {
+        "AND u.created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days')"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT u.model, \
+                COALESCE(SUM(u.prompt_tokens), 0), \
+                COALESCE(SUM(u.completion_tokens), 0), \
+                COUNT(*), \
+                p.prompt_price, p.completion_price \
+         FROM usage_log u LEFT JOIN model_pricing p ON p.model = u.model \
+         WHERE u.model IS NOT NULL {window} \
+         GROUP BY u.model \
+         ORDER BY COUNT(*) DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |r| {
+            let prompt_tokens: i64 = r.get(1)?;
+            let completion_tokens: i64 = r.get(2)?;
+            let prompt_price: Option<f64> = r.get(4)?;
+            let completion_price: Option<f64> = r.get(5)?;
+            Ok(ModelSpend {
+                model: r.get(0)?,
+                prompt_tokens,
+                completion_tokens,
+                request_count: r.get(3)?,
+                cost_usd: cost::call_cost(
+                    Some(prompt_tokens),
+                    Some(completion_tokens),
+                    prompt_price,
+                    completion_price,
+                ),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Total spend across rows: `Some(0)` with no usage, `None` when there's usage but no
+/// model is priced yet, else the sum of the priced rows (unpriced models shown "—").
+fn total_cost(rows: &[ModelSpend]) -> Option<f64> {
+    if rows.is_empty() {
+        return Some(0.0);
+    }
+    let known: Vec<f64> = rows.iter().filter_map(|r| r.cost_usd).collect();
+    if known.is_empty() {
+        return None;
+    }
+    Some(known.iter().sum())
 }
 
 // --- helpers ---
