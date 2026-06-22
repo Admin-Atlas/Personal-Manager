@@ -14,6 +14,33 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
 
   const installing = update.status === "installing";
 
+  // The in-place update couldn't apply (most likely on an unsigned macOS build, where
+  // Gatekeeper can refuse the swapped bundle) — point the user at a manual download from
+  // the releases page instead of silently looping a failing restart.
+  if (!installing && update.installFailed) {
+    return (
+      <div className="flex items-center justify-between gap-3 border-b border-border bg-accent-soft px-4 py-2 text-sm text-ink2">
+        <span>
+          Couldn&apos;t install the update automatically
+          {update.version ? ` (version ${update.version})` : ""}.
+        </span>
+        <span className="flex shrink-0 items-center gap-2">
+          <a
+            href={update.releasesUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-ink underline underline-offset-2 hover:text-ink2"
+          >
+            Download it manually
+          </a>
+          <Button variant="tertiary" onClick={update.restart} className="px-2 py-1 text-xs">
+            Try again
+          </Button>
+        </span>
+      </div>
+    );
+  }
+
   // After "Later", collapse to a slim, always-reachable chip so the staged update
   // isn't lost for the session — the user can still restart whenever they like.
   if (!installing && update.dismissed) {
