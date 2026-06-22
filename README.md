@@ -108,10 +108,19 @@ npm run tauri build
 ```
 
 Shipping a real auto-updatable release is tag-driven and handled by CI — bump the
-version, push a `vX.Y.Z` tag, and the installers + update feed publish to this
-repo's releases. Full steps and one-time setup are in the release guide in the
-`docs/` folder. Remember to add a changelog entry in `src/lib/changelog.ts` for
-each release.
+version, push a `vX.Y.Z` tag (a `-alpha`/`-beta` suffix is allowed), and the
+installers + update feed publish to this repo's releases. Full steps and one-time
+setup are in the release guide in the `docs/` folder. Remember to add a changelog
+entry in `src/lib/changelog.ts` for each release.
+
+**Code signing.** The auto-update feed is minisign-signed (so updates are verified),
+but the **installers themselves are not yet OS code-signed** on either platform — so
+each warns once on first launch: Windows SmartScreen (**More info → Run anyway**) and
+macOS Gatekeeper (**System Settings → Privacy & Security → Open Anyway**). The release
+notes spell this out for downloaders. The macOS Apple-signing pipeline is already wired
+and **dormant**: add the `APPLE_*` GitHub Actions secrets (a Developer ID certificate +
+an App Store Connect API key) and the macOS build signs + notarizes automatically — no
+code change.
 
 ## Useful commands
 

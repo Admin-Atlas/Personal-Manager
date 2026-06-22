@@ -39,6 +39,11 @@ jobs:
           - os: macos-latest
             args: "--target universal-apple-darwin"
     runs-on: ${{ matrix.os }}
+    env:
+      # Empty until the secret is set. Its presence is what flips the notarization-key
+      # step (and therefore macOS Developer-ID signing) on — until then the macOS build
+      # stays UNSIGNED and succeeds exactly as it does today.
+      APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
     steps:
       # Actions are SHA-pinned; the trailing "# vX.Y.Z" is the human-readable
       # version (and what Dependabot reads). Keep it.
@@ -63,11 +68,34 @@ jobs:
 
       - run: npm ci
 
+      # macOS Developer-ID signing + notarization is DORMANT: Tauri only signs when a real
+      # APPLE_SIGNING_IDENTITY is present, so with these secrets unset the macOS build stays
+      # unsigned (and still succeeds). To switch it on later, add the Apple secrets — no code
+      # change needed. notarytool needs the App Store Connect key as a FILE, so when the
+      # base64 secret exists this step materialises it and exports APPLE_API_KEY_PATH.
+      - name: Prepare Apple notarization key
+        if: matrix.os == 'macos-latest' && env.APPLE_API_KEY_BASE64 != ''
+        shell: bash
+        run: |
+          key_dir="$RUNNER_TEMP/appstore"
+          mkdir -p "$key_dir"
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key_dir/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$key_dir/AuthKey.p8" >> "$GITHUB_ENV"
+
       - name: Build + sign
         run: npm run tauri build -- ${{ matrix.args }}
         env:
+          # Updater (minisign) signing — already active on every build.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Apple Developer-ID signing + notarization — inert until the secrets exist
+          # (Tauri skips signing when APPLE_SIGNING_IDENTITY is empty). APPLE_API_KEY_PATH
+          # is exported by the step above when configured.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
 
       - name: Stage Windows artifacts
         if: matrix.os == 'windows-latest'
@@ -113,13 +141,14 @@ jobs:
         shell: bash
         # Bind the (attacker-influenceable) dispatch input through env — never
         # inline ${{ }} expansion into the script body — and reject anything that
-        # isn't a plain vX.Y.Z tag, so it can't be used for shell injection on the
-        # runner that holds the signing key.
+        # isn't a vX.Y.Z tag with an optional pre-release suffix (e.g. v2.0.0-alpha),
+        # so it can't be used for shell injection on the runner that holds the signing
+        # key. The suffix charset stays shell-safe: digits, letters, dot and dash only.
         env:
           RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           TAG="$RAW_TAG"
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "::error::Refusing to build from an unexpected tag: $TAG"
             exit 1
           fi
@@ -148,6 +177,6 @@ jobs:
           gh release create "$TAG" \
             --repo "$RELEASES_REPO" \
             --title "PM $TAG" \
-            --notes "Automated release for $TAG." \
+            --notes-file .github/RELEASE_NOTES.md \
             "${ASSETS[@]}" \
             artifacts/latest.json
