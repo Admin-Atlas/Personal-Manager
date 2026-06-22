@@ -52,6 +52,10 @@ static REGISTER_VEC: Once = Once::new();
 /// Register the sqlite-vec extension as an auto-extension so every connection
 /// opened afterwards in this process gets the `vec0` virtual table. This is
 /// static linkage — no dynamic `.dll`/`.so` loading.
+// A single, audited FFI cast (sqlite-vec's init fn → the auto-extension fn pointer).
+// Spelling out the transmute's types would couple this to rusqlite's internal
+// libsqlite3-sys type paths, which is more fragile than the cast itself.
+#[allow(clippy::missing_transmute_annotations)]
 fn register_sqlite_vec() {
     REGISTER_VEC.call_once(|| unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
@@ -232,7 +236,10 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .unwrap();
-            assert_eq!((project.as_str(), tags.as_str(), importance, reviewed), ("Unsorted", "[]", None, 0));
+            assert_eq!(
+                (project.as_str(), tags.as_str(), importance, reviewed),
+                ("Unsorted", "[]", None, 0)
+            );
 
             conn.execute(
                 "UPDATE documents SET project = 'Finances', importance = 'high', reviewed = 1 WHERE id = ?1",
@@ -246,7 +253,11 @@ mod tests {
             )
             .unwrap();
             let corr: i64 = conn
-                .query_row("SELECT count(*) FROM corrections WHERE document_id = ?1", params![doc_id], |row| row.get(0))
+                .query_row(
+                    "SELECT count(*) FROM corrections WHERE document_id = ?1",
+                    params![doc_id],
+                    |row| row.get(0),
+                )
                 .unwrap();
             assert_eq!(corr, 1);
         }

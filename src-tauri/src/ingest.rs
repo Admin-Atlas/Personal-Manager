@@ -62,14 +62,34 @@ pub struct Document {
 /// chat `ChatEvent` pattern).
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// These stream as occasional UI progress events; the `Done` variant's `Document`
+// makes it larger, but boxing it (serde-transparent) isn't worth the churn here.
+#[allow(clippy::large_enum_variant)]
 pub enum IngestEvent {
     /// Long first-run setup (installing the engine / downloading the model).
-    Preparing { message: String },
-    Started { path: String, name: String },
-    Skipped { path: String, reason: String },
-    Done { document: Document },
-    Failed { path: String, error: String },
-    Finished { ingested: usize, skipped: usize, failed: usize },
+    Preparing {
+        message: String,
+    },
+    Started {
+        path: String,
+        name: String,
+    },
+    Skipped {
+        path: String,
+        reason: String,
+    },
+    Done {
+        document: Document,
+    },
+    Failed {
+        path: String,
+        error: String,
+    },
+    Finished {
+        ingested: usize,
+        skipped: usize,
+        failed: usize,
+    },
 }
 
 /// Convert + index every file under `inputs` (folders are walked). Blocking.
@@ -114,10 +134,17 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
         }
     }
 
-    let _ = on_event.send(IngestEvent::Finished { ingested, skipped, failed });
+    let _ = on_event.send(IngestEvent::Finished {
+        ingested,
+        skipped,
+        failed,
+    });
     Ok(())
 }
 
+// A short-lived per-document result; not copied in bulk, so the size gap between
+// `Indexed(Document)` and `Skipped(String)` is not worth boxing.
+#[allow(clippy::large_enum_variant)]
 enum Outcome {
     Indexed(Document),
     Skipped(String),
@@ -147,12 +174,13 @@ fn ingest_one(state: &AppState, vault: &Path, path: &Path) -> Result<Outcome> {
     // Dedupe + format timestamps in one short lock; release before embedding.
     let (created_at, ingested_at) = {
         let conn = state.db.lock().unwrap();
-        let exists: bool = conn.query_row(
-            "SELECT 1 FROM documents WHERE content_hash = ?1",
-            params![content_hash],
-            |_| Ok(()),
-        )
-        .optional_exists()?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM documents WHERE content_hash = ?1",
+                params![content_hash],
+                |_| Ok(()),
+            )
+            .optional_exists()?;
         if exists {
             return Ok(Outcome::Skipped("already ingested".into()));
         }
@@ -250,7 +278,11 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
         }
     }
 
-    let _ = on_event.send(IngestEvent::Finished { ingested, skipped: 0, failed });
+    let _ = on_event.send(IngestEvent::Finished {
+        ingested,
+        skipped: 0,
+        failed,
+    });
     Ok(())
 }
 
@@ -263,7 +295,10 @@ fn rebuild_one(state: &AppState, vault_file: &Path) -> Result<Document> {
         .get("content_hash")
         .cloned()
         .unwrap_or_else(|| hex_digest(body.as_bytes()));
-    let title = fields.get("title").cloned().unwrap_or_else(|| "Untitled".into());
+    let title = fields
+        .get("title")
+        .cloned()
+        .unwrap_or_else(|| "Untitled".into());
 
     let chunks = chunk_markdown(body);
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
@@ -285,11 +320,23 @@ fn rebuild_one(state: &AppState, vault_file: &Path) -> Result<Document> {
         ext: fields.get("ext").cloned(),
         byte_size: None,
         created_at: fields.get("created_at").cloned(),
-        project: fields.get("project").cloned().unwrap_or_else(|| "Unsorted".into()),
-        tags: fields.get("tags").map(|s| parse_yaml_list(s)).unwrap_or_default(),
+        project: fields
+            .get("project")
+            .cloned()
+            .unwrap_or_else(|| "Unsorted".into()),
+        tags: fields
+            .get("tags")
+            .map(|s| parse_yaml_list(s))
+            .unwrap_or_default(),
         importance: nullable(fields.get("importance")),
-        reviewed: fields.get("reviewed").map(|v| v.trim() == "true").unwrap_or(false),
-        last_activity: fields.get("last_activity").cloned().or_else(|| Some(ingested_at.clone())),
+        reviewed: fields
+            .get("reviewed")
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false),
+        last_activity: fields
+            .get("last_activity")
+            .cloned()
+            .or_else(|| Some(ingested_at.clone())),
         ingested_at,
     };
     index_document(state, &meta, &chunks, &embeddings)
@@ -305,8 +352,8 @@ fn index_document(
     let mut conn = state.db.lock().unwrap();
     let tx = conn.transaction()?;
 
-    let tags_json = serde_json::to_string(&meta.tags)
-        .map_err(|e| Error::Other(format!("encode tags: {e}")))?;
+    let tags_json =
+        serde_json::to_string(&meta.tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
     tx.execute(
         "INSERT INTO documents \
          (source_path, vault_path, title, content_hash, ext, byte_size, created_at, ingested_at, \
@@ -334,7 +381,13 @@ fn index_document(
         tx.execute(
             "INSERT INTO chunks (document_id, ordinal, heading, content, char_count) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![doc_id, i as i64, chunk.heading, chunk.content, chunk.content.chars().count() as i64],
+            params![
+                doc_id,
+                i as i64,
+                chunk.heading,
+                chunk.content,
+                chunk.content.chars().count() as i64
+            ],
         )?;
         let chunk_id = tx.last_insert_rowid();
 
@@ -351,7 +404,7 @@ fn index_document(
     }
 
     tx.commit()?;
-    Ok(load_document(&conn, doc_id)?)
+    load_document(&conn, doc_id)
 }
 
 /// The SELECT column list backing `row_to_document` — shared by the list and
@@ -421,6 +474,9 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
 /// rolls back with `tx`. This is the building block for an all-or-nothing review
 /// commit — pass a `rusqlite::Transaction` (it derefs to `&Connection`) and only
 /// commit it once every document in the batch has been rewritten.
+// The arguments are the metadata columns being rewritten, not a sign this should
+// be split into smaller functions.
+#[allow(clippy::too_many_arguments)]
 pub fn rewrite_vault_metadata(
     tx: &Connection,
     vault: &Path,
@@ -431,18 +487,27 @@ pub fn rewrite_vault_metadata(
     reviewed: bool,
     last_activity: &str,
 ) -> Result<(std::path::PathBuf, String)> {
-    let vault_path: String =
-        tx.query_row("SELECT vault_path FROM documents WHERE id = ?1", params![doc_id], |r| r.get(0))?;
+    let vault_path: String = tx.query_row(
+        "SELECT vault_path FROM documents WHERE id = ?1",
+        params![doc_id],
+        |r| r.get(0),
+    )?;
 
     let file = vault.join(&vault_path);
     let original = std::fs::read_to_string(&file)?;
-    let (fields, body) =
-        parse_frontmatter(&original).ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
+    let (fields, body) = parse_frontmatter(&original)
+        .ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
 
     let front = Frontmatter {
-        title: fields.get("title").map(String::as_str).unwrap_or("Untitled"),
+        title: fields
+            .get("title")
+            .map(String::as_str)
+            .unwrap_or("Untitled"),
         source_path: fields.get("source_path").map(String::as_str).unwrap_or(""),
-        ext: fields.get("ext").map(String::as_str).filter(|s| !s.is_empty()),
+        ext: fields
+            .get("ext")
+            .map(String::as_str)
+            .filter(|s| !s.is_empty()),
         content_hash: fields.get("content_hash").map(String::as_str).unwrap_or(""),
         created_at: fields.get("created_at").map(String::as_str).unwrap_or(""),
         ingested_at: fields.get("ingested_at").map(String::as_str).unwrap_or(""),
@@ -459,7 +524,14 @@ pub fn rewrite_vault_metadata(
     tx.execute(
         "UPDATE documents SET project = ?1, tags = ?2, importance = ?3, reviewed = ?4, \
          last_activity = ?5 WHERE id = ?6",
-        params![project, tags_json, importance, reviewed as i64, last_activity, doc_id],
+        params![
+            project,
+            tags_json,
+            importance,
+            reviewed as i64,
+            last_activity,
+            doc_id
+        ],
     )?;
     Ok((file, original))
 }
@@ -525,7 +597,11 @@ fn char_count(s: &str) -> usize {
 
 /// Remove and return the first `n` chars of `buf` (char-safe); the rest stays.
 fn take_chars(buf: &mut String, n: usize) -> String {
-    let end = buf.char_indices().nth(n).map(|(i, _)| i).unwrap_or(buf.len());
+    let end = buf
+        .char_indices()
+        .nth(n)
+        .map(|(i, _)| i)
+        .unwrap_or(buf.len());
     let head = buf[..end].to_string();
     buf.replace_range(..end, "");
     head
@@ -534,7 +610,10 @@ fn take_chars(buf: &mut String, n: usize) -> String {
 fn push_chunk(chunks: &mut Vec<Chunk>, heading: Option<String>, buf: &str) {
     let content = buf.trim();
     if !content.is_empty() {
-        chunks.push(Chunk { heading, content: content.to_string() });
+        chunks.push(Chunk {
+            heading,
+            content: content.to_string(),
+        });
     }
 }
 
@@ -562,7 +641,9 @@ fn heading_text(block: &str) -> Option<String> {
 /// The last `CHUNK_OVERLAP` chars of `buf` (char-counted, to match CHUNK_TARGET).
 fn overlap_tail(buf: &str) -> String {
     let total = char_count(buf);
-    buf.chars().skip(total.saturating_sub(CHUNK_OVERLAP)).collect()
+    buf.chars()
+        .skip(total.saturating_sub(CHUNK_OVERLAP))
+        .collect()
 }
 
 // --- front-matter ---
@@ -676,13 +757,18 @@ fn yaml_quote(value: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    format!("\"{}\"", single_line.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "\"{}\"",
+        single_line.replace('\\', "\\\\").replace('"', "\\\"")
+    )
 }
 
 fn yaml_unquote(value: &str) -> String {
     let v = value.trim();
     if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
-        v[1..v.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
+        v[1..v.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
     } else {
         v.to_string()
     }
@@ -757,7 +843,9 @@ fn extension(path: &Path) -> Option<String> {
 }
 
 fn file_name(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().into()).unwrap_or_default()
+    path.file_name()
+        .map(|n| n.to_string_lossy().into())
+        .unwrap_or_default()
 }
 
 /// Prefer the converter's title; fall back to the file's stem.
@@ -805,7 +893,9 @@ fn hex_digest(bytes: &[u8]) -> String {
 /// pinned dimension.
 fn check_embeddings(embeddings: &[Vec<f32>], chunks: usize) -> Result<()> {
     if embeddings.len() != chunks {
-        return Err(Error::Other("embedding count did not match chunk count".into()));
+        return Err(Error::Other(
+            "embedding count did not match chunk count".into(),
+        ));
     }
     if embeddings.iter().any(|v| v.len() != EMBED_DIM) {
         return Err(Error::Other(format!(
@@ -816,7 +906,11 @@ fn check_embeddings(embeddings: &[Vec<f32>], chunks: usize) -> Result<()> {
 }
 
 fn iso_now(conn: &Connection) -> Result<String> {
-    Ok(conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0))?)
+    Ok(
+        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 fn iso_from_mtime(conn: &Connection, path: &Path) -> Result<String> {
@@ -914,9 +1008,17 @@ mod tests {
         let vault = dir.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
         let front = Frontmatter {
-            title: "T", source_path: "", ext: None, content_hash: "h",
-            created_at: "", ingested_at: "", project: "Unsorted", tags: &[],
-            importance: None, last_activity: "", reviewed: false,
+            title: "T",
+            source_path: "",
+            ext: None,
+            content_hash: "h",
+            created_at: "",
+            ingested_at: "",
+            project: "Unsorted",
+            tags: &[],
+            importance: None,
+            last_activity: "",
+            reviewed: false,
         };
         let original = render_markdown(&front, "body");
         std::fs::write(vault.join("doc.md"), &original).unwrap();
@@ -932,8 +1034,17 @@ mod tests {
         {
             let tx = conn.transaction().unwrap();
             written.push(
-                rewrite_vault_metadata(&tx, &vault, 1, "Finances", &["tax".into()], Some("high"), true, "2026-06-20")
-                    .unwrap(),
+                rewrite_vault_metadata(
+                    &tx,
+                    &vault,
+                    1,
+                    "Finances",
+                    &["tax".into()],
+                    Some("high"),
+                    true,
+                    "2026-06-20",
+                )
+                .unwrap(),
             );
             assert!(
                 rewrite_vault_metadata(&tx, &vault, 2, "X", &[], None, true, "2026-06-20").is_err(),
@@ -943,8 +1054,11 @@ mod tests {
         }
         restore_vault_files(written);
 
-        let project: String =
-            conn.query_row("SELECT project FROM documents WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let project: String = conn
+            .query_row("SELECT project FROM documents WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(project, "Unsorted", "DB row should be rolled back");
         assert_eq!(
             std::fs::read_to_string(vault.join("doc.md")).unwrap(),
@@ -976,7 +1090,10 @@ mod tests {
         let text = "あ".repeat(CHUNK_TARGET + 200);
         let chunks = chunk_markdown(&text);
         let first = chunks[0].content.chars().count();
-        assert!(first > CHUNK_TARGET / 2, "first chunk too small: {first} chars");
+        assert!(
+            first > CHUNK_TARGET / 2,
+            "first chunk too small: {first} chars"
+        );
         for c in &chunks {
             assert!(c.content.chars().count() <= CHUNK_TARGET);
         }

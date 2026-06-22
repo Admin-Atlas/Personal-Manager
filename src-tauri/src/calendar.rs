@@ -92,7 +92,11 @@ pub async fn fetch_calendar_list() -> Result<Vec<RawCalendar>> {
 
 /// Fetch events from one calendar within `[time_min, time_max]` (RFC3339), with
 /// recurring events expanded to single instances and ordered by start.
-pub async fn fetch_events(calendar_id: &str, time_min: &str, time_max: &str) -> Result<Vec<CalendarEvent>> {
+pub async fn fetch_events(
+    calendar_id: &str,
+    time_min: &str,
+    time_max: &str,
+) -> Result<Vec<CalendarEvent>> {
     let mut url = reqwest::Url::parse(CALENDAR_API).map_err(|e| Error::Other(e.to_string()))?;
     url.path_segments_mut()
         .map_err(|_| Error::Other("invalid calendar API base".into()))?
@@ -144,7 +148,10 @@ fn save_feeds(feeds: &[IcsFeed]) -> Result<()> {
 pub fn feed_infos() -> Result<Vec<IcsFeedInfo>> {
     Ok(load_feeds()?
         .into_iter()
-        .map(|f| IcsFeedInfo { id: f.id, label: f.label })
+        .map(|f| IcsFeedInfo {
+            id: f.id,
+            label: f.label,
+        })
         .collect())
 }
 
@@ -166,7 +173,11 @@ pub fn add_feed(label: &str, url: &str) -> Result<IcsFeed> {
     };
 
     let mut feeds = load_feeds()?;
-    let feed = IcsFeed { id: new_feed_id()?, label, url };
+    let feed = IcsFeed {
+        id: new_feed_id()?,
+        label,
+        url,
+    };
     feeds.push(feed.clone());
     save_feeds(&feeds)?;
     Ok(feed)
@@ -176,7 +187,10 @@ pub fn add_feed(label: &str, url: &str) -> Result<IcsFeed> {
 pub fn remove_feed(conn: &Connection, id: &str) -> Result<()> {
     let feeds: Vec<IcsFeed> = load_feeds()?.into_iter().filter(|f| f.id != id).collect();
     save_feeds(&feeds)?;
-    conn.execute("DELETE FROM calendar_events WHERE calendar_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM calendar_events WHERE calendar_id = ?1",
+        params![id],
+    )?;
     Ok(())
 }
 
@@ -334,7 +348,11 @@ fn parse_calendars(value: &serde_json::Value) -> Vec<RawCalendar> {
                     let id = it.get("id").and_then(|v| v.as_str())?;
                     let summary = it.get("summary").and_then(|v| v.as_str()).unwrap_or(id);
                     let primary = it.get("primary").and_then(|v| v.as_bool()).unwrap_or(false);
-                    Some(RawCalendar { id: id.to_string(), summary: summary.to_string(), primary })
+                    Some(RawCalendar {
+                        id: id.to_string(),
+                        summary: summary.to_string(),
+                        primary,
+                    })
                 })
                 .collect()
         })
@@ -350,7 +368,11 @@ fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEve
         if it.get("status").and_then(|s| s.as_str()) == Some("cancelled") {
             continue;
         }
-        let Some(event_id) = it.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+        let Some(event_id) = it
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
         let Some((start, all_day)) = parse_when(it.get("start")) else {
@@ -366,12 +388,21 @@ fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEve
                 .filter(|s| !s.is_empty())
                 .unwrap_or("(no title)")
                 .to_string(),
-            description: it.get("description").and_then(|v| v.as_str()).map(str::to_string),
-            location: it.get("location").and_then(|v| v.as_str()).map(str::to_string),
+            description: it
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            location: it
+                .get("location")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             start,
             end,
             all_day,
-            html_link: it.get("htmlLink").and_then(|v| v.as_str()).map(str::to_string),
+            html_link: it
+                .get("htmlLink")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         });
     }
     out
@@ -383,7 +414,9 @@ fn parse_when(node: Option<&serde_json::Value>) -> Option<(String, bool)> {
     if let Some(dt) = node.get("dateTime").and_then(|v| v.as_str()) {
         Some((dt.to_string(), false))
     } else {
-        node.get("date").and_then(|v| v.as_str()).map(|d| (d.to_string(), true))
+        node.get("date")
+            .and_then(|v| v.as_str())
+            .map(|d| (d.to_string(), true))
     }
 }
 
@@ -409,7 +442,11 @@ pub fn selected_calendar_ids(conn: &Connection) -> Result<Vec<String>> {
 }
 
 pub fn set_selected_calendar_ids(conn: &Connection, ids: &[String]) -> Result<()> {
-    let cleaned: Vec<&str> = ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let cleaned: Vec<&str> = ids
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     let json = serde_json::to_string(&cleaned).map_err(|e| Error::Other(e.to_string()))?;
     db::set_setting(conn, SELECTED_KEY, &json)
 }
@@ -419,7 +456,9 @@ pub fn last_sync(conn: &Connection) -> Result<Option<String>> {
 }
 
 pub fn set_last_sync(conn: &Connection) -> Result<()> {
-    let now: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0))?;
+    let now: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+        r.get(0)
+    })?;
     db::set_setting(conn, LAST_SYNC_KEY, &now)
 }
 
@@ -453,20 +492,37 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// Replace one calendar's mirrored events with a freshly fetched set.
-pub fn replace_events(conn: &Connection, calendar_id: &str, events: &[CalendarEvent]) -> Result<()> {
+pub fn replace_events(
+    conn: &Connection,
+    calendar_id: &str,
+    events: &[CalendarEvent],
+) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM calendar_events WHERE calendar_id = ?1", params![calendar_id])?;
+    tx.execute(
+        "DELETE FROM calendar_events WHERE calendar_id = ?1",
+        params![calendar_id],
+    )?;
     for e in events {
         let summary = clip(&e.summary, MAX_SUMMARY_CHARS);
         let location = e.location.as_deref().map(|l| clip(l, MAX_LOCATION_CHARS));
-        let description = e.description.as_deref().map(|d| clip(d, MAX_DESCRIPTION_CHARS));
+        let description = e
+            .description
+            .as_deref()
+            .map(|d| clip(d, MAX_DESCRIPTION_CHARS));
         tx.execute(
             "INSERT OR REPLACE INTO calendar_events \
              (id, calendar_id, summary, description, location, start, end, all_day, html_link) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                e.id, e.calendar_id, summary, description, location, e.start, e.end,
-                e.all_day as i64, e.html_link
+                e.id,
+                e.calendar_id,
+                summary,
+                description,
+                location,
+                e.start,
+                e.end,
+                e.all_day as i64,
+                e.html_link
             ],
         )?;
     }
@@ -480,7 +536,9 @@ pub fn prune_unselected(conn: &Connection, keep: &[String]) -> Result<()> {
         conn.execute("DELETE FROM calendar_events", [])?;
         return Ok(());
     }
-    let placeholders = std::iter::repeat("?").take(keep.len()).collect::<Vec<_>>().join(",");
+    let placeholders = std::iter::repeat_n("?", keep.len())
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!("DELETE FROM calendar_events WHERE calendar_id NOT IN ({placeholders})");
     conn.execute(&sql, rusqlite::params_from_iter(keep))?;
     Ok(())
@@ -521,12 +579,16 @@ pub fn upcoming_events(conn: &Connection, days: i64, limit: usize) -> Result<Vec
             days_until: r.get(9)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Error::from)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
 }
 
 /// The agenda for the focus view (plain event list, capped for display).
 pub fn list_upcoming(conn: &Connection, days: i64) -> Result<Vec<CalendarEvent>> {
-    Ok(upcoming_events(conn, days, 250)?.into_iter().map(|u| u.event).collect())
+    Ok(upcoming_events(conn, days, 250)?
+        .into_iter()
+        .map(|u| u.event)
+        .collect())
 }
 
 /// A compact agenda preamble for chat, or `None` when there's nothing upcoming.
@@ -616,7 +678,10 @@ mod tests {
     fn clip_truncates_only_when_over_the_cap() {
         assert_eq!(clip("short", 300), "short");
         let long = "z".repeat(500);
-        assert_eq!(clip(&long, MAX_SUMMARY_CHARS).chars().count(), MAX_SUMMARY_CHARS);
+        assert_eq!(
+            clip(&long, MAX_SUMMARY_CHARS).chars().count(),
+            MAX_SUMMARY_CHARS
+        );
     }
 
     #[test]

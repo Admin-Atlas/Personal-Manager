@@ -22,7 +22,13 @@ use crate::calendar::CalendarEvent;
 /// viewer zone). The window itself stays an absolute UTC instant range.
 pub fn parse_feed(text: &str, feed_id: &str, window_days: i64, tz: ChronoTz) -> Vec<CalendarEvent> {
     let now = Utc::now();
-    parse_feed_within(text, feed_id, now - Duration::days(1), now + Duration::days(window_days), tz)
+    parse_feed_within(
+        text,
+        feed_id,
+        now - Duration::days(1),
+        now + Duration::days(window_days),
+        tz,
+    )
 }
 
 /// Defensive caps for a hostile or oversized feed: bound how many VEVENT blocks we
@@ -111,15 +117,19 @@ fn expand_vevent(
         .map(unescape)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(no title)".to_string());
-    let location = find(block, "LOCATION").map(unescape).filter(|s| !s.is_empty());
-    let description = find(block, "DESCRIPTION").map(unescape).filter(|s| !s.is_empty());
+    let location = find(block, "LOCATION")
+        .map(unescape)
+        .filter(|s| !s.is_empty());
+    let description = find(block, "DESCRIPTION")
+        .map(unescape)
+        .filter(|s| !s.is_empty());
     let uid = find(block, "UID").unwrap_or("").to_string();
 
     let Some(start_anchor) = parse_any(start_val, param(start_params, "TZID"), all_day, tz) else {
         return Vec::new();
     };
-    let end_anchor = find_prop(block, "DTEND")
-        .and_then(|(p, v)| parse_any(v, param(p, "TZID"), all_day, tz));
+    let end_anchor =
+        find_prop(block, "DTEND").and_then(|(p, v)| parse_any(v, param(p, "TZID"), all_day, tz));
     let dur = end_anchor.map(|e| e - start_anchor);
 
     let starts: Vec<DateTime<Utc>> = if block.iter().any(|l| l.starts_with("RRULE")) {
@@ -132,14 +142,30 @@ fn expand_vevent(
 
     starts
         .into_iter()
-        .map(|s| make_event(feed_id, &uid, &summary, &location, &description, s, dur, all_day, tz))
+        .map(|s| {
+            make_event(
+                feed_id,
+                &uid,
+                &summary,
+                &location,
+                &description,
+                s,
+                dur,
+                all_day,
+                tz,
+            )
+        })
         .collect()
 }
 
 /// Expand an `RRULE` to its UTC occurrence-starts within the window. Feeds the
 /// original DTSTART/RRULE/EXDATE/RDATE lines straight to `rrule` so it resolves the
 /// timezone itself; a parse failure degrades to "no occurrences" rather than erroring.
-fn expand_rrule(block: &[String], win_start: DateTime<Utc>, win_end: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+fn expand_rrule(
+    block: &[String],
+    win_start: DateTime<Utc>,
+    win_end: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
     // Guard against a pathological recurrence: a sub-daily FREQ (SECONDLY/MINUTELY/
     // HOURLY) with a far-past DTSTART and no COUNT/UNTIL forces the iterator to walk
     // millions of pre-window occurrences before reaching the agenda window — a CPU
@@ -180,10 +206,15 @@ fn has_sub_daily_freq(block: &[String]) -> bool {
     block.iter().any(|l| {
         let u = l.to_ascii_uppercase();
         u.starts_with("RRULE")
-            && ["FREQ=SECONDLY", "FREQ=MINUTELY", "FREQ=HOURLY"].iter().any(|f| u.contains(f))
+            && ["FREQ=SECONDLY", "FREQ=MINUTELY", "FREQ=HOURLY"]
+                .iter()
+                .any(|f| u.contains(f))
     })
 }
 
+// Builds a CalendarEvent from its already-parsed parts; the many fields are the
+// event's columns, not a sign the function should be split.
+#[allow(clippy::too_many_arguments)]
 fn make_event(
     feed_id: &str,
     uid: &str,
@@ -200,7 +231,12 @@ fn make_event(
         // that zone before formatting the date, so an all-day event reads as the same
         // calendar day in every zone (UTC formatting would drift it east of UTC).
         let s = start_utc.with_timezone(&tz).format("%Y-%m-%d").to_string();
-        let e = dur.map(|d| (start_utc + d).with_timezone(&tz).format("%Y-%m-%d").to_string());
+        let e = dur.map(|d| {
+            (start_utc + d)
+                .with_timezone(&tz)
+                .format("%Y-%m-%d")
+                .to_string()
+        });
         (s, e)
     } else {
         let s = start_utc.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -224,7 +260,12 @@ fn make_event(
 /// user's zone midnight; floating times (no TZID, no `Z`) resolve in the user's zone
 /// too (an explicit `TZID`, or a trailing `Z`, always wins and keeps its exact
 /// instant). See `make_event` for how all-day dates are formatted back from `tz`.
-fn parse_any(value: &str, tzid: Option<&str>, all_day: bool, tz: ChronoTz) -> Option<DateTime<Utc>> {
+fn parse_any(
+    value: &str,
+    tzid: Option<&str>,
+    all_day: bool,
+    tz: ChronoTz,
+) -> Option<DateTime<Utc>> {
     let v = value.trim();
     if all_day {
         let date = NaiveDate::parse_from_str(v, "%Y%m%d").ok()?;
@@ -244,11 +285,17 @@ fn parse_any(value: &str, tzid: Option<&str>, all_day: bool, tz: ChronoTz) -> Op
     }
     let naive = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?;
     match tzid.and_then(|t| t.parse::<ChronoTz>().ok()) {
-        Some(explicit) => explicit.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&Utc)),
+        Some(explicit) => explicit
+            .from_local_datetime(&naive)
+            .earliest()
+            .map(|d| d.with_timezone(&Utc)),
         // Floating time (no TZID, no Z): RFC 5545 says interpret it in the viewer's
         // zone — use the user's chosen IANA zone (not the machine's), so the event
         // lands on the same instant no matter which machine syncs the feed.
-        None => tz.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&Utc)),
+        None => tz
+            .from_local_datetime(&naive)
+            .earliest()
+            .map(|d| d.with_timezone(&Utc)),
     }
 }
 

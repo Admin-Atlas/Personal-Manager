@@ -1,0 +1,18 @@
+PM — third-party licence notices
+================================
+
+PM bundles the Rust dependencies listed below. Each is reproduced under its own
+licence; PM itself is licensed under AGPL-3.0-or-later (see LICENCE.txt).
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{name}}{{#if id}} ({{id}}){{/if}}
+
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{license_text}}
+
+{{/each}}

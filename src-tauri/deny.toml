@@ -1,0 +1,62 @@
+# cargo-deny — the Rust supply-chain gate (advisories + licences + bans + sources
+# in one). Run from src-tauri/: `cargo deny check`.
+#
+# The allow-list below is derived from the ACTUAL dependency tree (`cargo deny
+# list`), not a guess — so a new dependency that introduces an unlisted licence
+# fails the PR deliberately, surfacing the decision rather than absorbing it
+# silently. This is also the single source for the release NOTICE generation.
+
+[advisories]
+# Mirror src-tauri/.cargo/audit.toml: every id is a transitive, non-exploitable
+# advisory in Tauri's gtk-rs (Linux-WebKit) stack or a build-time/unicode tree —
+# PM ships Windows/macOS and never calls the affected APIs. See the 2026-06-17
+# DECISIONS glib entry; re-evaluate when Tauri adopts gtk-rs 0.20.
+ignore = [
+  "RUSTSEC-2025-0098", # glib VariantStrIter unsound (gtk-rs stack; API never called)
+  "RUSTSEC-2024-0429", # gtk-rs bindings unsound (Linux WebKit backend only)
+  "RUSTSEC-2024-0419", # proc-macro-error unmaintained (build-time macro only)
+  "RUSTSEC-2024-0370", # unic-char-property unmaintained (transitive unicode tree)
+  "RUSTSEC-2025-0081", # unic-* unmaintained
+  "RUSTSEC-2025-0075", # unic-* unmaintained
+  "RUSTSEC-2025-0080", # unic-* unmaintained
+  "RUSTSEC-2025-0100", # unic-* unmaintained
+]
+# Only treat unmaintained crates that are OUR direct dependencies as failures;
+# transitive-unmaintained noise (gtk-rs, etc.) is already covered above.
+unmaintained = "workspace"
+
+[licenses]
+# Permissive licences present in the tree (from `cargo deny list`). AGPL-3.0 is
+# our own crate's licence and is compatible with all of these.
+allow = [
+  "AGPL-3.0-or-later",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "0BSD",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+# r-efi is LGPL-2.1-or-later but only builds for `*-unknown-uefi` targets, so it is
+# never linked into PM's Windows/macOS binaries; AGPL-3.0 also absorbs LGPL fine.
+# Scope the allowance to that one crate so a NEW LGPL dependency still trips here.
+[[licenses.exceptions]]
+name = "r-efi"
+allow = ["LGPL-2.1-or-later"]
+
+[bans]
+# A Tauri tree legitimately carries many duplicate versions; warn (don't fail).
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

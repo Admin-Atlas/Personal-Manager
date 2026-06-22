@@ -2,12 +2,17 @@ name: Release
 
 # Cut a release by pushing a version tag:
 #   npm version <patch|minor|major> --no-git-tag-version   # bumps package.json
-#   # bump src-tauri/tauri.conf.json + Cargo.toml to match, commit, then:
+#   # bump src-tauri/tauri.conf.json + Cargo.toml to match, regenerate lockfiles,
+#   # add the changelog entry, commit, then:
 #   git tag v0.2.0 && git push origin v0.2.0
 #
 # This builds + signs the desktop apps here, then attaches the installers and the
 # updater manifest (latest.json) to this repo's own Releases (via GITHUB_TOKEN) so
 # every desktop can fetch updates.
+#
+# Gating: the `guards` job is a HARD pre-flight (version == tag across the lockstep
+# set, changelog entry present, AGPL licence + source headers unmodified). It runs
+# before anything that touches the signing key, so a bad tag never reaches it.
 
 on:
   push:
@@ -23,13 +28,56 @@ env:
   # Releases attach to this repo; github.repository resolves to <owner>/<name>.
   RELEASES_REPO: ${{ github.repository }}
 
-# The publish job creates a Release on this repo, so GITHUB_TOKEN needs write
-# access here. Both jobs inherit this; there is no job-level override.
+# Least privilege by default; only the publish job is elevated to write (below).
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # --- pre-flight gate (no secrets, runs first) ---------------------------
+  guards:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve + validate version
+        id: ver
+        shell: bash
+        # Bind the (attacker-influenceable) dispatch input through env — never
+        # inline ${{ }} expansion into the script body — and reject anything that
+        # isn't a vX.Y.Z tag with an optional pre-release suffix (e.g. v2.0.0-alpha),
+        # so it can't be used for shell injection on the runner that holds the signing
+        # key. The suffix charset stays shell-safe: digits, letters, dot and dash only.
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          TAG="$RAW_TAG"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Refusing to build from an unexpected tag: $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Version lockstep == tag (+ all files agree, + changelog entry)
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: just version --tag "$TAG"
+
+      - name: AGPL licence + source headers unmodified
+        run: just headers
+
   build:
+    needs: guards
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +96,8 @@ jobs:
       # Actions are SHA-pinned; the trailing "# vX.Y.Z" is the human-readable
       # version (and what Dependabot reads). Keep it.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -121,11 +171,47 @@ jobs:
           path: staged/*
           if-no-files-found: error
 
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
+  # --- standalone-Python smoke: the pinned sidecar deps resolve + import --
+  # There is no bundled interpreter yet; the sidecar runs in a venv provisioned at
+  # runtime, so this proves requirements.txt installs and imports on each SHIPPED OS
+  # (Windows + macOS). Python 3.12 is used for broad wheel availability.
+  python-smoke:
+    needs: guards
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Clean venv → install → import sidecar deps
+        shell: bash
+        run: |
+          python -m venv .smoke-venv
+          if [ -f .smoke-venv/Scripts/activate ]; then
+            source .smoke-venv/Scripts/activate
+          else
+            source .smoke-venv/bin/activate
+          fi
+          python -m pip install --upgrade pip
+          pip install -r sidecar/requirements.txt
+          python -c "import markitdown, fastembed, faster_whisper; print('sidecar deps import OK')"
+
+  publish:
+    needs: [guards, build, python-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      # The publish job creates a Release on this repo, so its token needs write.
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -136,43 +222,48 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Resolve version
-        id: ver
-        shell: bash
-        # Bind the (attacker-influenceable) dispatch input through env — never
-        # inline ${{ }} expansion into the script body — and reject anything that
-        # isn't a vX.Y.Z tag with an optional pre-release suffix (e.g. v2.0.0-alpha),
-        # so it can't be used for shell injection on the runner that holds the signing
-        # key. The suffix charset stays shell-safe: digits, letters, dot and dash only.
-        env:
-          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      # AGPL hygiene: regenerate the third-party licence NOTICE for the bundled Rust
+      # deps and attach it to the release. The accepted-licence set in about.toml is
+      # the same one the PR gate (cargo-deny) enforces, so this can't hit a surprise.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust)
+        with:
+          toolchain: stable
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Install cargo-about
         run: |
-          TAG="$RAW_TAG"
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "::error::Refusing to build from an unexpected tag: $TAG"
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          curl -sSL https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C /usr/local/bin --strip-components=1 cargo-about-0.9.0-x86_64-unknown-linux-musl/cargo-about
+      - name: Generate third-party NOTICE
+        run: just notice artifacts/THIRD-PARTY-NOTICES.txt
 
       - name: Build updater manifest
         env:
           ARTIFACTS_DIR: artifacts
           RELEASES_REPO: ${{ env.RELEASES_REPO }}
-          TAG: ${{ steps.ver.outputs.tag }}
-          VERSION: ${{ steps.ver.outputs.version }}
-          NOTES: "PM ${{ steps.ver.outputs.tag }}"
+          TAG: ${{ needs.guards.outputs.tag }}
+          VERSION: ${{ needs.guards.outputs.version }}
+          NOTES: "PM ${{ needs.guards.outputs.tag }}"
           OUT: artifacts/latest.json
         run: node scripts/build-updater-manifest.mjs
+
+      - name: Verify updater manifest is internally consistent
+        env:
+          OUT: artifacts/latest.json
+          VERSION: ${{ needs.guards.outputs.version }}
+          TAG: ${{ needs.guards.outputs.tag }}
+          RELEASES_REPO: ${{ env.RELEASES_REPO }}
+        run: node scripts/verify-updater-manifest.mjs
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.ver.outputs.tag }}
+          TAG: ${{ needs.guards.outputs.tag }}
         shell: bash
         run: |
           # Upload the installers (.exe/.dmg), the updater bundle (.app.tar.gz),
-          # and latest.json — but not the raw .sig files (folded into latest.json).
+          # the NOTICE, and latest.json — but not the raw .sig files (folded into
+          # latest.json).
           mapfile -t ASSETS < <(find artifacts -type f ! -name '*.sig' ! -name 'latest.json')
           gh release create "$TAG" \
             --repo "$RELEASES_REPO" \

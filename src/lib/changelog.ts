@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.2.0-alpha",
+    date: "2026-06-22",
+    highlights: [
+      "Behind-the-scenes groundwork: PM now runs an automated quality and safety net on every change — formatting, type, security, dependency, and version checks — so updates stay consistent and dependable. No change to your data or how you use PM.",
+    ],
+  },
+  {
     version: "1.1.2-alpha",
     date: "2026-06-22",
     highlights: [
