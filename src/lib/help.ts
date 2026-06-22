@@ -126,6 +126,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Appearance",
     body: "Switch the visual System (Editorial / Slate / Terminal), Light or Dark mode, the accent colour, and Depth (how much detail is shown). Changes apply instantly and are remembered on this device.",
   },
+  "settings-timezone": {
+    title: "Time zone",
+    body: "The zone PM reasons about dates in — which day is 'today', when something is 'due soon', and the times in your calendar agenda and briefing. Auto follows this device; switch to Manual to pin a specific zone (useful when you travel and don't want the boundaries to shift).",
+  },
   "settings-help-mode": {
     title: "Help mode",
     body: "The switch you're using right now. While it's on, hovering any highlighted section shows an explanation like this one.",

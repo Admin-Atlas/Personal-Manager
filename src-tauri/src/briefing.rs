@@ -16,10 +16,12 @@
 //! (rule #6), and the user's learned profile is folded in so the briefing reads like
 //! them.
 
+use chrono_tz::Tz;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use crate::calendar::CalendarEvent;
+use crate::clock;
 use crate::db;
 use crate::error::Result;
 use crate::openrouter::{self, ChatMessage};
@@ -91,6 +93,7 @@ pub fn build_snapshot(
     projects: &[ProjectOverview],
     events: &[CalendarEvent],
     now: &str,
+    zone: Tz,
 ) -> Option<String> {
     if projects.is_empty() && events.is_empty() {
         return None;
@@ -105,7 +108,7 @@ pub fn build_snapshot(
 
     for p in projects {
         match p.status {
-            ProjectStatus::DueSoon => due_soon.push(due_soon_line(p)),
+            ProjectStatus::DueSoon => due_soon.push(due_soon_line(p, zone)),
             ProjectStatus::Blocked => blocked.push(match &p.blocked_by {
                 Some(b) if !b.trim().is_empty() => format!("{} (blocked by {b})", p.name),
                 _ => p.name.clone(),
@@ -125,7 +128,7 @@ pub fn build_snapshot(
     }
 
     let mut out = String::new();
-    out.push_str(&format!("Today is {now} (UTC).\n"));
+    out.push_str(&format!("Today is {now} ({zone}).\n"));
     push_group(&mut out, "Due soon (attend to these)", &due_soon);
     push_group(&mut out, "Blocked", &blocked);
     push_group(&mut out, "Quick wins (≈ an hour each)", &quick);
@@ -141,7 +144,7 @@ pub fn build_snapshot(
     } else {
         out.push_str("Upcoming calendar:\n");
         for e in events.iter().take(MAX_AGENDA_EVENTS) {
-            let when: String = e.start.chars().take(16).collect();
+            let when = clock::to_zone_display(&e.start, zone);
             let loc = e
                 .location
                 .as_deref()
@@ -156,9 +159,9 @@ pub fn build_snapshot(
 }
 
 /// A Due-soon project line, naming the deadline or the calendar event that drives it.
-fn due_soon_line(p: &ProjectOverview) -> String {
+fn due_soon_line(p: &ProjectOverview, zone: Tz) -> String {
     if let Some(ev) = &p.calendar_event {
-        let when: String = ev.start.chars().take(16).collect();
+        let when = clock::to_zone_display(&ev.start, zone);
         format!("{} (event: {} on {when})", p.name, ev.summary)
     } else if let Some(d) = &p.deadline {
         format!("{} (due {})", p.name, d.chars().take(10).collect::<String>())
@@ -289,8 +292,9 @@ mod tests {
         ];
         let events = vec![event("Standup")];
 
-        let snap = build_snapshot(&projects, &events, "2026-06-19T08:00").unwrap();
+        let snap = build_snapshot(&projects, &events, "2026-06-19T08:00", Tz::UTC).unwrap();
         assert!(snap.contains("Due soon"));
+        assert!(snap.contains("Today is 2026-06-19T08:00 (UTC)."));
         assert!(snap.contains("PM v1"));
         assert!(snap.contains("PM launch")); // the calendar event that drives Due soon
         assert!(snap.contains("Blocked: Backend"));
@@ -303,7 +307,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_none_when_nothing_to_brief() {
-        assert!(build_snapshot(&[], &[], "2026-06-19T08:00").is_none());
+        assert!(build_snapshot(&[], &[], "2026-06-19T08:00", Tz::UTC).is_none());
     }
 
     #[test]

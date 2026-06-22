@@ -12,7 +12,7 @@
 //! `propose` runs on the background API key and the document text it sees is
 //! untrusted DATA, never instructions (rule #6).
 
-use rusqlite::{params, Connection};
+use rusqlite::{named_params, params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::calendar::{self, CalendarMatch};
@@ -99,8 +99,11 @@ pub struct ProjectOverview {
 
 /// Every active project (distinct `documents.project`) with its triage metadata
 /// (LEFT JOINed from `projects`) and derived status. Day deltas for the deadline
-/// and last activity are computed in SQL so `derive_status` stays pure.
-pub fn list_overviews(conn: &Connection) -> Result<Vec<ProjectOverview>> {
+/// and last activity are computed in SQL so `derive_status` stays pure. `today` is
+/// the user's zone-local civil date (`YYYY-MM-DD`, from `clock::today_sql_in`): both
+/// deltas reason against this one `:today` midnight, so the deadline and activity
+/// boundaries can't disagree (the V1 bug mixed OS-localtime and UTC nows).
+pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverview>> {
     let mut stmt = conn.prepare(
         "SELECT d.project, \
                 COUNT(*) AS doc_count, \
@@ -108,15 +111,15 @@ pub fn list_overviews(conn: &Connection) -> Result<Vec<ProjectOverview>> {
                 MIN(CASE d.importance WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END) AS imp, \
                 p.deadline, p.size, p.blocked_by, p.parent, \
                 CASE WHEN p.deadline IS NOT NULL \
-                     THEN julianday(date(replace(p.deadline,'Z',''))) - julianday(date('now','localtime')) END AS days_to_deadline, \
-                julianday('now') - julianday(replace(MAX(COALESCE(d.last_activity, d.ingested_at)),'Z','')) AS days_since \
+                     THEN julianday(date(replace(p.deadline,'Z',''))) - julianday(:today) END AS days_to_deadline, \
+                julianday(:today) - julianday(date(replace(MAX(COALESCE(d.last_activity, d.ingested_at)),'Z',''))) AS days_since \
          FROM documents d \
          LEFT JOIN projects p ON p.name = d.project \
          GROUP BY d.project \
          ORDER BY d.project",
     )?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(named_params![":today": today], |row| {
         let name: String = row.get(0)?;
         let doc_count: i64 = row.get(1)?;
         let last_activity: Option<String> = row.get(2)?;

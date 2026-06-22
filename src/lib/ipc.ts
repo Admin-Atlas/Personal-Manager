@@ -39,6 +39,11 @@ export const setOpenRouterBackgroundKey = (key: string) =>
 
 export const getSettings = () => invoke<Settings>("get_settings");
 
+/** Persist the user's IANA time zone (e.g. "Europe/London"). An empty string clears
+ *  it (the backend then reasons in UTC). Validated against the tz database in Rust. */
+export const setTimeZone = (zone: string) =>
+  invoke<void>("set_time_zone", { zone });
+
 /** Ordered preferred chat models (first = primary). */
 export const setChatModels = (models: string[]) =>
   invoke<void>("set_chat_models", { models });

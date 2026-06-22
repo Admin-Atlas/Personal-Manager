@@ -12,15 +12,17 @@
 //! UTC with `chrono`/`chrono-tz`, and expand recurrences with the `rrule` crate,
 //! bounded to the agenda window so a years-old weekly meeting doesn't blow up.
 
-use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz as ChronoTz;
 
 use crate::calendar::CalendarEvent;
 
-/// Parse an ICS feed into events from yesterday through `window_days` ahead.
-pub fn parse_feed(text: &str, feed_id: &str, window_days: i64) -> Vec<CalendarEvent> {
+/// Parse an ICS feed into events from yesterday through `window_days` ahead. `tz` is
+/// the user's zone, used to anchor floating/all-day values (an ICS feed carries no
+/// viewer zone). The window itself stays an absolute UTC instant range.
+pub fn parse_feed(text: &str, feed_id: &str, window_days: i64, tz: ChronoTz) -> Vec<CalendarEvent> {
     let now = Utc::now();
-    parse_feed_within(text, feed_id, now - Duration::days(1), now + Duration::days(window_days))
+    parse_feed_within(text, feed_id, now - Duration::days(1), now + Duration::days(window_days), tz)
 }
 
 /// Defensive caps for a hostile or oversized feed: bound how many VEVENT blocks we
@@ -36,6 +38,7 @@ pub fn parse_feed_within(
     feed_id: &str,
     win_start: DateTime<Utc>,
     win_end: DateTime<Utc>,
+    tz: ChronoTz,
 ) -> Vec<CalendarEvent> {
     let lines = unfold(text);
     let mut out = Vec::new();
@@ -43,7 +46,7 @@ pub fn parse_feed_within(
         if out.len() >= MAX_EVENTS {
             break;
         }
-        out.extend(expand_vevent(&block, feed_id, win_start, win_end));
+        out.extend(expand_vevent(&block, feed_id, win_start, win_end, tz));
     }
     out.truncate(MAX_EVENTS);
     out
@@ -93,6 +96,7 @@ fn expand_vevent(
     feed_id: &str,
     win_start: DateTime<Utc>,
     win_end: DateTime<Utc>,
+    tz: ChronoTz,
 ) -> Vec<CalendarEvent> {
     if find(block, "STATUS") == Some("CANCELLED") {
         return Vec::new();
@@ -111,11 +115,11 @@ fn expand_vevent(
     let description = find(block, "DESCRIPTION").map(unescape).filter(|s| !s.is_empty());
     let uid = find(block, "UID").unwrap_or("").to_string();
 
-    let Some(start_anchor) = parse_any(start_val, param(start_params, "TZID"), all_day) else {
+    let Some(start_anchor) = parse_any(start_val, param(start_params, "TZID"), all_day, tz) else {
         return Vec::new();
     };
     let end_anchor = find_prop(block, "DTEND")
-        .and_then(|(p, v)| parse_any(v, param(p, "TZID"), all_day));
+        .and_then(|(p, v)| parse_any(v, param(p, "TZID"), all_day, tz));
     let dur = end_anchor.map(|e| e - start_anchor);
 
     let starts: Vec<DateTime<Utc>> = if block.iter().any(|l| l.starts_with("RRULE")) {
@@ -128,7 +132,7 @@ fn expand_vevent(
 
     starts
         .into_iter()
-        .map(|s| make_event(feed_id, &uid, &summary, &location, &description, s, dur, all_day))
+        .map(|s| make_event(feed_id, &uid, &summary, &location, &description, s, dur, all_day, tz))
         .collect()
 }
 
@@ -189,10 +193,14 @@ fn make_event(
     start_utc: DateTime<Utc>,
     dur: Option<Duration>,
     all_day: bool,
+    tz: ChronoTz,
 ) -> CalendarEvent {
     let (start, end) = if all_day {
-        let s = start_utc.format("%Y-%m-%d").to_string();
-        let e = dur.map(|d| (start_utc + d).format("%Y-%m-%d").to_string());
+        // The anchor is the user-zone midnight as a UTC instant; convert it *back* to
+        // that zone before formatting the date, so an all-day event reads as the same
+        // calendar day in every zone (UTC formatting would drift it east of UTC).
+        let s = start_utc.with_timezone(&tz).format("%Y-%m-%d").to_string();
+        let e = dur.map(|d| (start_utc + d).with_timezone(&tz).format("%Y-%m-%d").to_string());
         (s, e)
     } else {
         let s = start_utc.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -212,13 +220,23 @@ fn make_event(
     }
 }
 
-/// Resolve an ICS date/datetime value to a UTC instant. All-day values are anchored
-/// to UTC midnight (formatted back to a date later).
-fn parse_any(value: &str, tzid: Option<&str>, all_day: bool) -> Option<DateTime<Utc>> {
+/// Resolve an ICS date/datetime value to a UTC instant. All-day values anchor to the
+/// user's zone midnight; floating times (no TZID, no `Z`) resolve in the user's zone
+/// too (an explicit `TZID`, or a trailing `Z`, always wins and keeps its exact
+/// instant). See `make_event` for how all-day dates are formatted back from `tz`.
+fn parse_any(value: &str, tzid: Option<&str>, all_day: bool, tz: ChronoTz) -> Option<DateTime<Utc>> {
     let v = value.trim();
     if all_day {
         let date = NaiveDate::parse_from_str(v, "%Y%m%d").ok()?;
-        return Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?));
+        // Anchor at NOON, not midnight: a zone whose DST spring-forward lands exactly
+        // at 00:00 (e.g. America/Havana, Africa/Cairo) has no local midnight that day,
+        // so a midnight anchor is a `None` gap and the event silently vanishes. Noon is
+        // never inside a 1-hour gap; `make_event` formats date-only, so the offset is
+        // truncated and the stored civil date is unchanged in every zone.
+        return tz
+            .from_local_datetime(&date.and_hms_opt(12, 0, 0)?)
+            .earliest()
+            .map(|d| d.with_timezone(&Utc));
     }
     if let Some(stripped) = v.strip_suffix('Z') {
         let naive = NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S").ok()?;
@@ -226,11 +244,11 @@ fn parse_any(value: &str, tzid: Option<&str>, all_day: bool) -> Option<DateTime<
     }
     let naive = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?;
     match tzid.and_then(|t| t.parse::<ChronoTz>().ok()) {
-        Some(tz) => tz.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&Utc)),
+        Some(explicit) => explicit.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&Utc)),
         // Floating time (no TZID, no Z): RFC 5545 says interpret it in the viewer's
-        // local zone, so resolve against the system timezone — assuming UTC would
-        // shift the event by the user's offset (Outlook and exported feeds emit these).
-        None => Local.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&Utc)),
+        // zone — use the user's chosen IANA zone (not the machine's), so the event
+        // lands on the same instant no matter which machine syncs the feed.
+        None => tz.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&Utc)),
     }
 }
 
@@ -296,7 +314,7 @@ mod tests {
                     BEGIN:VEVENT\r\nUID:b\r\nSTATUS:CANCELLED\r\nSUMMARY:Off\r\n\
                     DTSTART:20260616T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR";
         let (s, e) = window();
-        let events = parse_feed_within(feed, "feed1", s, e);
+        let events = parse_feed_within(feed, "feed1", s, e, ChronoTz::UTC);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].summary, "Standup");
         assert_eq!(events[0].start, "2026-06-15T09:00:00Z");
@@ -310,7 +328,7 @@ mod tests {
         let feed = "BEGIN:VEVENT\nUID:c\nSUMMARY:Quarterly planning\n offsite day\n\
                     DTSTART;VALUE=DATE:20260620\nDTEND;VALUE=DATE:20260621\nEND:VEVENT";
         let (s, e) = window();
-        let events = parse_feed_within(feed, "f", s, e);
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
         assert_eq!(events.len(), 1);
         assert!(events[0].all_day);
         assert_eq!(events[0].start, "2026-06-20");
@@ -324,7 +342,7 @@ mod tests {
         let feed = "BEGIN:VEVENT\nUID:d\nSUMMARY:Call\n\
                     DTSTART;TZID=Europe/London:20260615T090000\nEND:VEVENT";
         let (s, e) = window();
-        let events = parse_feed_within(feed, "f", s, e);
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
         assert_eq!(events[0].start, "2026-06-15T08:00:00Z");
     }
 
@@ -336,7 +354,7 @@ mod tests {
                     RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT";
         let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
-        let events = parse_feed_within(feed, "f", s, e);
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
         // Mondays in [Jun 1, Jun 30): 1, 8, 15, 22, 29.
         assert_eq!(events.len(), 5);
         assert!(events.iter().all(|ev| ev.summary == "Weekly sync"));
@@ -351,17 +369,46 @@ mod tests {
         let feed = "BEGIN:VEVENT\nUID:bomb\nSUMMARY:tick\n\
                     DTSTART:20000101T000000Z\nRRULE:FREQ=SECONDLY\nEND:VEVENT";
         let (s, e) = window();
-        let events = parse_feed_within(feed, "f", s, e);
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
         assert!(events.is_empty(), "sub-daily recurrence should be skipped");
     }
 
     #[test]
-    fn floating_time_resolves_to_local_not_utc() {
-        // A floating DTSTART (no Z, no TZID) is the viewer's local time, not UTC
-        // (F5). Guard against regressing to a hard-coded UTC interpretation.
-        let naive = NaiveDateTime::parse_from_str("20260615T090000", "%Y%m%dT%H%M%S").unwrap();
-        let got = parse_any("20260615T090000", None, false).unwrap();
-        let expected = Local.from_local_datetime(&naive).earliest().unwrap().with_timezone(&Utc);
-        assert_eq!(got, expected);
+    fn floating_time_resolves_to_user_zone_not_machine() {
+        // A floating DTSTART (no Z, no TZID) is the viewer's zone — the user's chosen
+        // IANA zone, NOT the machine's. 09:00 floating in Asia/Tokyo (+09) = 00:00 UTC.
+        // Guard against regressing to UTC or the machine's local zone.
+        use chrono_tz::Asia::Tokyo;
+        let got = parse_any("20260615T090000", None, false, Tokyo).unwrap();
+        assert_eq!(got, Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn all_day_keeps_its_calendar_date_across_zones() {
+        // An all-day VALUE=DATE event is a civil date with no instant; it must read as
+        // the same calendar day in every zone. `make_event` formats the user-zone
+        // midnight anchor back in that zone, so an east-of-UTC zone doesn't drift it a
+        // day (without that fix, Tokyo would render 2026-06-19).
+        let feed = "BEGIN:VEVENT\nUID:c\nSUMMARY:Offsite\n\
+                    DTSTART;VALUE=DATE:20260620\nDTEND;VALUE=DATE:20260621\nEND:VEVENT";
+        let (s, e) = window();
+        let east = parse_feed_within(feed, "f", s, e, chrono_tz::Asia::Tokyo);
+        let west = parse_feed_within(feed, "f", s, e, chrono_tz::America::Los_Angeles);
+        assert_eq!(east[0].start, "2026-06-20");
+        assert_eq!(west[0].start, "2026-06-20");
+        assert_eq!(east[0].end.as_deref(), Some("2026-06-21"));
+    }
+
+    #[test]
+    fn all_day_survives_a_midnight_dst_gap() {
+        // America/Havana springs forward at 00:00 on 2026-03-08, so local midnight
+        // that day does not exist. An all-day event must still parse (anchored at
+        // noon, never inside the gap) instead of silently vanishing.
+        let feed = "BEGIN:VEVENT\nUID:h\nSUMMARY:Holiday\nDTSTART;VALUE=DATE:20260308\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 3, 31, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, chrono_tz::America::Havana);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].start, "2026-03-08");
     }
 }
