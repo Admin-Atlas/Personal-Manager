@@ -10,6 +10,7 @@ import { DocumentsView } from "./components/DocumentsView";
 import { FocusView } from "./components/FocusView";
 import { GraphView } from "./components/GraphView";
 import { HelpOverlay } from "./components/HelpOverlay";
+import { LockScreen } from "./components/LockScreen";
 import { PinboardView } from "./components/PinboardView";
 import { ProjectView } from "./components/ProjectView";
 import { ReviewView } from "./components/ReviewView";
@@ -24,6 +25,7 @@ import { useUpdater } from "./lib/useUpdater";
 
 const LAST_SEEN_VERSION_KEY = "pm:lastSeenVersion";
 import {
+  appLockStatus,
   createConversation,
   getMessages,
   getSettings,
@@ -37,6 +39,10 @@ import type { Conversation, Settings } from "./lib/types";
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [keySet, setKeySet] = useState(false);
+  // The optional biometric app-lock (soft UI gate). Locked at launch when the user has
+  // turned it on; lifted once the OS verifies them (see LockScreen). The store is already
+  // decrypted regardless — this only withholds the window.
+  const [locked, setLocked] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [view, setView] = useState<View>("focus");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
@@ -126,6 +132,9 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
+        // Resolve the launch lock before the first paint so locked content never flashes.
+        const lock = await appLockStatus().catch(() => null);
+        if (lock?.locked) setLocked(true);
         const has = await hasOpenRouterKey();
         setKeySet(has);
         if (has) await refreshConversations(true);
@@ -223,6 +232,12 @@ export default function App() {
         </div>
       </div>
     );
+  }
+
+  // The launch lock sits in front of everything (but below the title bar, which lives in
+  // main.tsx) so the window stays draggable/closable while locked.
+  if (locked) {
+    return <LockScreen onUnlocked={() => setLocked(false)} />;
   }
 
   if (!keySet) {

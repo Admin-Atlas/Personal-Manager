@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+mod applock;
 mod briefing;
 mod calendar;
 mod clock;
@@ -22,6 +23,7 @@ mod secrets;
 mod sidecar;
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
@@ -35,6 +37,11 @@ use sidecar::{SidecarManager, SidecarPaths};
 pub struct AppState {
     pub db: Mutex<Connection>,
     pub sidecar: SidecarManager,
+    /// Whether the optional app-lock has been satisfied this process. Starts false;
+    /// `unlock_app` sets it on a successful OS verification. A soft UI gate only — the
+    /// store is already decrypted (see `applock`). Backend-owned so the launch decision
+    /// can't be flipped from the webview.
+    pub app_unlocked: AtomicBool,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -67,6 +74,7 @@ pub fn run() {
             app.manage(AppState {
                 db: Mutex::new(conn),
                 sidecar,
+                app_unlocked: AtomicBool::new(false),
             });
             Ok(())
         })
@@ -83,6 +91,9 @@ pub fn run() {
             commands::set_help_mode,
             commands::get_time_zone,
             commands::set_time_zone,
+            commands::app_lock_status,
+            commands::set_app_lock,
+            commands::unlock_app,
             commands::list_models,
             commands::get_learning_profile,
             commands::refresh_learning_profile,

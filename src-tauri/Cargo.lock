@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "pm"
-version = "1.0.0-alpha"
+version = "1.1.0-alpha"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2820,6 +2820,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "windows",
+ "windows-future",
  "zeroize",
 ]
 

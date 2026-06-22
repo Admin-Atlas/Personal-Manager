@@ -18,7 +18,9 @@ use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
-use crate::{briefing, clock, cost, db, learning, openrouter, paths, recommend, secrets, AppState};
+use crate::{
+    applock, briefing, clock, cost, db, learning, openrouter, paths, recommend, secrets, AppState,
+};
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
 /// stored as a plain string (spec §6 — never locked into a model).
@@ -35,6 +37,11 @@ const BACKGROUND_AUTO_SWITCH_KEY: &str = "background_auto_switch";
 /// frontend via `Intl.DateTimeFormat().resolvedOptions().timeZone`. Empty/unset →
 /// the backend reasons in UTC (see `resolve_zone`).
 const TIME_ZONE_KEY: &str = "time_zone";
+
+/// Whether the optional biometric app-lock is on ("true"/"false", default off). A soft
+/// UI gate only — it never gates the DB key (see `applock`). Lives in `settings`
+/// (security preference → backend), not localStorage.
+const APP_LOCK_ENABLED_KEY: &str = "app_lock_enabled";
 
 /// Optional, user-editable denylist (provider or model slugs) the recommender excludes
 /// as defense-in-depth — JSON array of strings. The real privacy boundary is the
@@ -201,6 +208,92 @@ pub fn set_time_zone(state: State<'_, AppState>, zone: String) -> Result<()> {
     }
     let conn = state.db.lock().unwrap();
     db::set_setting(&conn, TIME_ZONE_KEY, zone)
+}
+
+/// The optional biometric app-lock's state for Settings + the launch gate. `available`
+/// reflects whether the OS can actually verify (Windows Hello enrolled / Touch ID) — the
+/// toggle is disabled when it's false so the lock can't be switched on where it could
+/// never open. `locked` is the launch gate: enabled and not yet verified this session.
+#[derive(Serialize)]
+pub struct AppLockStatus {
+    pub enabled: bool,
+    pub available: bool,
+    pub locked: bool,
+}
+
+/// Read the app-lock preference, whether the OS can verify, and whether the UI should be
+/// gated right now. The gate is computed backend-side (`applock::should_lock`) from the
+/// stored preference + this process's verified flag so it can't be flipped from the webview.
+#[tauri::command]
+pub fn app_lock_status(state: State<'_, AppState>) -> Result<AppLockStatus> {
+    let enabled = {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| Error::Other("database lock poisoned".into()))?;
+        db::get_setting(&conn, APP_LOCK_ENABLED_KEY)?.as_deref() == Some("true")
+    };
+    let verified = state
+        .app_unlocked
+        .load(std::sync::atomic::Ordering::Relaxed);
+    Ok(AppLockStatus {
+        enabled,
+        available: applock::available(),
+        locked: applock::should_lock(enabled, verified),
+    })
+}
+
+/// Turn the soft app-lock on or off. Enabling is refused when the OS can't verify, so a
+/// user can't strand themselves behind a gate that will never open (e.g. no Hello
+/// enrolled, or macOS where it isn't implemented yet).
+#[tauri::command]
+pub fn set_app_lock(state: State<'_, AppState>, enabled: bool) -> Result<()> {
+    if enabled && !applock::available() {
+        return Err(Error::Other(
+            "this device can't perform a biometric/Windows Hello check, so the app-lock can't be enabled".into(),
+        ));
+    }
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| Error::Other("database lock poisoned".into()))?;
+    db::set_setting(&conn, APP_LOCK_ENABLED_KEY, if enabled { "true" } else { "false" })
+}
+
+/// Run the OS verification (Windows Hello / Touch ID) to lift the launch lock. Returns
+/// `true` on success, `false` when the user cancels/fails. The HWND is read on the UI
+/// thread (it's `!Send`) and the blocking WinRT wait runs on a worker thread so the UI
+/// stays responsive while the system prompt is up.
+#[tauri::command]
+pub async fn unlock_app(
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+) -> Result<bool> {
+    let raw_handle = {
+        #[cfg(target_os = "windows")]
+        {
+            window
+                .hwnd()
+                .map_err(|e| Error::Other(format!("no window handle for verification: {e}")))?
+                .0 as isize
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Unused off Windows (the stubs ignore it), but keep the binding so the
+            // worker closure is identical across platforms.
+            let _ = &window;
+            0isize
+        }
+    };
+    let verified = tauri::async_runtime::spawn_blocking(move || applock::verify(raw_handle, "Unlock PM"))
+        .await
+        .map_err(|e| Error::Other(format!("verification task failed: {e}")))??;
+    if verified {
+        state
+            .app_unlocked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(verified)
 }
 
 /// The OpenRouter model catalogue (public endpoint, no key needed) so the user can

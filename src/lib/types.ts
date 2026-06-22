@@ -36,6 +36,16 @@ export interface Settings {
   time_zone: string;
 }
 
+/** State of the optional biometric app-lock (a soft UI gate; the store is encrypted at
+ *  rest regardless). `available` is whether the OS can verify (Windows Hello enrolled /
+ *  Touch ID) — the Settings toggle is disabled when it's false. */
+export interface AppLockStatus {
+  enabled: boolean;
+  available: boolean;
+  /** The launch gate: enabled and not yet verified this session. Computed backend-side. */
+  locked: boolean;
+}
+
 /** A model from the OpenRouter catalogue, for the Settings model picker.
  *  Prices are USD per token (the picker renders them per-million). */
 export interface ModelInfo {
