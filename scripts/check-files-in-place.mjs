@@ -84,6 +84,7 @@ const ALLOWED_ROOT = new Set([
   "package-lock.json",
   "package.json",
   "ruff.toml",
+  "SECURITY.md",
   "scripts",
   "sidecar",
   "src",
