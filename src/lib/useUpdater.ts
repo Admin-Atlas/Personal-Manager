@@ -29,9 +29,17 @@ export interface AppUpdate {
   progress: number | null;
   /** True once the user clicked "Later" — the banner collapses to a slim chip. */
   dismissed: boolean;
+  /** True after an in-place install failed — the banner offers a manual download instead.
+   *  Most likely on an unsigned macOS build, where Gatekeeper can refuse the swapped app. */
+  installFailed: boolean;
+  /** The releases page for the manual-download fallback. */
+  releasesUrl: string;
   restart: () => void;
   dismiss: () => void;
 }
+
+/** The "latest release" page — the manual-download fallback when an auto-update can't apply. */
+const RELEASES_URL = "https://github.com/Admin-Atlas/Personal-Manager/releases/latest";
 
 export function useUpdater(): AppUpdate {
   const [status, setStatus] = useState<UpdateStatus>("idle");
@@ -39,6 +47,7 @@ export function useUpdater(): AppUpdate {
   const [progress, setProgress] = useState<number | null>(null);
   const [update, setUpdate] = useState<Update | null>(null);
   const [dismissed, setDismissed] = useState(false);
+  const [installFailed, setInstallFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -90,12 +99,16 @@ export function useUpdater(): AppUpdate {
     if (!update) return;
     (async () => {
       setStatus("installing");
+      setInstallFailed(false);
       try {
         await update.install();
         await relaunch();
       } catch {
-        // If install fails, fall back to "ready" so the user can retry.
+        // The in-place update couldn't apply — most likely on an unsigned macOS build,
+        // where Gatekeeper can refuse the swapped bundle. Drop back to "ready" and flag the
+        // failure so the banner can offer a manual download instead of silently looping.
         setStatus("ready");
+        setInstallFailed(true);
       }
     })();
   }, [update]);
@@ -106,5 +119,5 @@ export function useUpdater(): AppUpdate {
     setDismissed(true);
   }, []);
 
-  return { status, version, progress, dismissed, restart, dismiss };
+  return { status, version, progress, dismissed, installFailed, releasesUrl: RELEASES_URL, restart, dismiss };
 }
