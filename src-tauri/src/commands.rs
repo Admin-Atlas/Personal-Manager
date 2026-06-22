@@ -210,6 +210,33 @@ pub fn set_time_zone(state: State<'_, AppState>, zone: String) -> Result<()> {
     db::set_setting(&conn, TIME_ZONE_KEY, zone)
 }
 
+/// Webview-owned UI preferences that may be persisted via `set_pref`. Holding the
+/// list here (rather than letting the webview write any key) keeps presentation
+/// state out of the schema-critical rows: the webview must never be able to
+/// rewrite e.g. `embedding_dim` and silently corrupt the index.
+const WRITABLE_PREFS: &[&str] = &["appearance", "pinboard"];
+
+/// Read a UI preference blob the webview previously stored (theme axes, pinboard
+/// layout). These live in the encrypted `settings` table — not the webview's
+/// `localStorage` — so they travel with the data folder when it's backed up or
+/// moved to another machine. Returns `None` when nothing is stored yet.
+#[tauri::command]
+pub fn get_pref(state: State<'_, AppState>, key: String) -> Result<Option<String>> {
+    let conn = state.db.lock().unwrap();
+    db::get_setting(&conn, &key)
+}
+
+/// Persist a UI preference blob (see [`get_pref`]). Restricted to [`WRITABLE_PREFS`]
+/// so the webview can only touch presentation state, never schema-critical keys.
+#[tauri::command]
+pub fn set_pref(state: State<'_, AppState>, key: String, value: String) -> Result<()> {
+    if !WRITABLE_PREFS.contains(&key.as_str()) {
+        return Err(Error::Other(format!("preference '{key}' is not writable")));
+    }
+    let conn = state.db.lock().unwrap();
+    db::set_setting(&conn, &key, &value)
+}
+
 /// The optional biometric app-lock's state for Settings + the launch gate. `available`
 /// reflects whether the OS can actually verify (Windows Hello enrolled / Touch ID) — the
 /// toggle is disabled when it's false so the lock can't be switched on where it could

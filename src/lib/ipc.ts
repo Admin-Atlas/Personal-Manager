@@ -47,6 +47,16 @@ export const getSettings = () => invoke<Settings>("get_settings");
 export const setTimeZone = (zone: string) =>
   invoke<void>("set_time_zone", { zone });
 
+/** Read a UI preference blob (theme axes, pinboard layout) from the encrypted store
+ *  so it travels with the data folder. `null` when nothing is stored yet. */
+export const getPref = (key: string) =>
+  invoke<string | null>("get_pref", { key });
+
+/** Persist a UI preference blob. The backend only accepts a fixed allowlist of keys
+ *  (`appearance`, `pinboard`), so this can't touch schema-critical settings. */
+export const setPref = (key: string, value: string) =>
+  invoke<void>("set_pref", { key, value });
+
 /** Ordered preferred chat models (first = primary). */
 export const setChatModels = (models: string[]) =>
   invoke<void>("set_chat_models", { models });

@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The only state the design layer owns: { system, mode, accent, depth }. Persisted in
-// localStorage (not the backend Settings struct) — it's non-secret presentation state, reads
-// synchronously so the first paint is already themed, and the read/write seam here can later
-// move to IPC without touching any component.
+// The only state the design layer owns: { system, mode, accent, depth }. Persisted two ways:
+// localStorage stays the fast-path so the very first paint is already themed (a synchronous
+// read, no IPC round-trip → no flash), and it is *also* mirrored into the encrypted settings
+// table via `set_pref` so the theme travels with the data folder when it's backed up or moved
+// to another machine. On a fresh machine (localStorage empty at boot) we hydrate from the
+// stored blob; on the same machine localStorage already holds the values, so nothing flashes
+// and the store is simply refreshed.
 
 import {
   createContext, useContext, useEffect, useState, type ReactNode,
@@ -14,6 +17,10 @@ import {
   ACCENTS, SYSTEMS, MODES, DEPTHS,
   type System, type Mode, type Depth,
 } from "./profiles";
+import { getPref, setPref } from "../lib/ipc";
+
+// The settings-table key under which the full theme blob is mirrored (see below).
+const PREF_KEY = "appearance";
 
 export interface ThemeState {
   system: System;
@@ -86,6 +93,56 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       : defaultAccentFor(initialSystem);
   });
 
+  // Was localStorage empty at boot? If so this is likely a fresh machine (or a
+  // restored data folder), so the stored blob should win on hydration. Computed once,
+  // before the persist effect writes anything back.
+  const [bootEmpty] = useState(() => read(KEY.system) === null);
+  // Gate the store-mirror until the one-shot hydration has run, so the default theme
+  // can't overwrite a stored blob before we've read it (a fresh-machine race).
+  const [hydrated, setHydrated] = useState(false);
+
+  // Apply a blob read back from the store (theme axes + the per-System accent memory).
+  function applyAppearance(blob: unknown): void {
+    if (!blob || typeof blob !== "object") return;
+    const b = blob as Record<string, unknown>;
+    const sys = oneOf(typeof b.system === "string" ? b.system : null, SYSTEMS, DEFAULT_SYSTEM);
+    if (b.accentBySystem && typeof b.accentBySystem === "object") {
+      write(KEY.accentBySystem, JSON.stringify(b.accentBySystem));
+    }
+    setSystemState(sys);
+    setModeState(oneOf(typeof b.mode === "string" ? b.mode : null, MODES, DEFAULT_MODE));
+    setDepthState(oneOf(typeof b.depth === "string" ? b.depth : null, DEPTHS, DEFAULT_DEPTH));
+    setAccentState(
+      typeof b.accent === "string" && ACCENTS[sys].includes(b.accent)
+        ? b.accent
+        : defaultAccentFor(sys),
+    );
+  }
+
+  // One-shot hydration from the store. On a fresh machine (localStorage empty) the
+  // stored blob is applied; either way we then unlock the store-mirror below.
+  useEffect(() => {
+    let cancelled = false;
+    getPref(PREF_KEY)
+      .then((raw) => {
+        if (cancelled || !raw || !bootEmpty) return;
+        try {
+          applyAppearance(JSON.parse(raw));
+        } catch {
+          /* ignore a corrupt blob — keep the localStorage/default theme */
+        }
+      })
+      .catch(() => {
+        /* store not ready / no value — keep localStorage */
+      })
+      .finally(() => {
+        if (!cancelled) setHydrated(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bootEmpty]);
+
   // Switching System recalls the accent last chosen for it, else that System's default (§3).
   function setSystem(next: System): void {
     setSystemState(next);
@@ -102,13 +159,21 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }
 
   // Apply + persist whenever an axis changes (also runs on mount → themed first paint).
+  // localStorage is the fast path; the store is mirrored once hydration has run so the
+  // theme survives a folder backup/transfer.
   useEffect(() => {
     applyTheme(document.documentElement, system, mode, accent, depth);
     write(KEY.system, system);
     write(KEY.mode, mode);
     write(KEY.accent, accent);
     write(KEY.depth, depth);
-  }, [system, mode, accent, depth]);
+    if (hydrated) {
+      const blob = { system, mode, accent, depth, accentBySystem: readAccentBySystem() };
+      setPref(PREF_KEY, JSON.stringify(blob)).catch(() => {
+        /* fire-and-forget — localStorage already holds the value */
+      });
+    }
+  }, [system, mode, accent, depth, hydrated]);
 
   const value: ThemeState = {
     system,

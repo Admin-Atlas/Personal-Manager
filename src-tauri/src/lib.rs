@@ -91,6 +91,8 @@ pub fn run() {
             commands::set_help_mode,
             commands::get_time_zone,
             commands::set_time_zone,
+            commands::get_pref,
+            commands::set_pref,
             commands::app_lock_status,
             commands::set_app_lock,
             commands::unlock_app,
