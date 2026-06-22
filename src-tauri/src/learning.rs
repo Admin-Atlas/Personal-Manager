@@ -112,15 +112,17 @@ fn frame_profile(profile: &str) -> String {
 
 /// Distil corrections into an updated profile via the background model. Returns
 /// the new profile text; the caller decides what to do on error (best-effort).
+/// Returns the cleaned profile text plus the served model + token usage (for the cost
+/// logger); the caller decides what to do on error (best-effort).
 pub async fn distill(
     api_key: &str,
     models: &[String],
     current_profile: &str,
     corrections: &[Correction],
-) -> Result<String> {
+) -> Result<(String, openrouter::Usage, Option<String>)> {
     let messages = build_messages(current_profile, corrections);
-    let reply = openrouter::complete(api_key, models, &messages).await?;
-    Ok(clean(&reply))
+    let c = openrouter::complete(api_key, models, &messages).await?;
+    Ok((clean(&c.text), c.usage, c.model))
 }
 
 /// Build the self-edit prompt: current profile + correction log in, an updated

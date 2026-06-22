@@ -19,6 +19,33 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Token usage OpenRouter reports for one completion. Either field may be absent
+/// (a provider that doesn't report usage, or a degraded/early-terminated response),
+/// so the cost logger stores NULLs and shows the spend as unknown rather than zero.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Usage {
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+}
+
+/// The result of a chat call: the assembled text, the model that actually served it
+/// (may differ from the requested primary when an auto-switch fallback fires), and
+/// token usage when reported. Shared by the streaming and non-streaming paths so the
+/// cost logger can attribute spend to the model that actually ran.
+pub struct Completion {
+    pub text: String,
+    pub model: Option<String>,
+    pub usage: Usage,
+}
+
+/// Extract token usage from a response/chunk's `usage` object (absent fields → None).
+fn parse_usage(value: &serde_json::Value) -> Usage {
+    Usage {
+        prompt_tokens: value["usage"]["prompt_tokens"].as_i64(),
+        completion_tokens: value["usage"]["completion_tokens"].as_i64(),
+    }
+}
+
 /// One model from OpenRouter's public catalogue, trimmed to what the Settings
 /// picker needs: identity, pricing, context window, and input modalities (so the
 /// UI can tag vision-capable models). Prices are USD **per token**; the frontend
@@ -123,6 +150,10 @@ fn chat_body(models: &[String], messages: &[ChatMessage], stream: bool) -> serde
         "messages": messages,
         "stream": stream,
     });
+    if stream {
+        // Ask OpenRouter to emit a final usage chunk so we can log token spend.
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
     if models.len() == 1 {
         body["model"] = serde_json::json!(models[0]);
     } else {
@@ -139,7 +170,7 @@ pub async fn stream_chat<F>(
     models: &[String],
     messages: &[ChatMessage],
     mut on_token: F,
-) -> Result<(String, Option<String>)>
+) -> Result<Completion>
 where
     F: FnMut(&str),
 {
@@ -173,6 +204,7 @@ where
 
     let mut full = String::new();
     let mut served: Option<String> = None;
+    let mut usage = Usage::default();
     // Raw bytes, decoded only one complete line at a time: a multi-byte UTF-8
     // char split across two network chunks must not be lossily decoded in halves.
     let mut buffer: Vec<u8> = Vec::new();
@@ -188,7 +220,7 @@ where
             };
             let data = data.trim();
             if data == "[DONE]" {
-                return Ok((full, served));
+                return Ok(Completion { text: full, model: served, usage });
             }
             if data.is_empty() {
                 continue;
@@ -200,6 +232,12 @@ where
                     if let Some(m) = value["model"].as_str() {
                         served = Some(m.to_string());
                     }
+                }
+                // The final chunk (empty choices) carries token usage — we asked for
+                // it via stream_options; keep it whenever present.
+                let u = parse_usage(&value);
+                if u.prompt_tokens.is_some() || u.completion_tokens.is_some() {
+                    usage = u;
                 }
                 if let Some(token) = value["choices"][0]["delta"]["content"].as_str() {
                     full.push_str(token);
@@ -218,7 +256,7 @@ where
         }
     }
 
-    Ok((full, served))
+    Ok(Completion { text: full, model: served, usage })
 }
 
 /// Drain every complete `\n`-terminated line from a raw SSE byte buffer, decoding
@@ -261,13 +299,29 @@ mod tests {
         // The unterminated "data: c" is held back for the next chunk.
         assert_eq!(buffer, b"data: c");
     }
+
+    #[test]
+    fn parse_usage_reads_tokens_and_defaults_to_none() {
+        // The final streamed usage chunk has empty choices + a usage object.
+        let chunk: serde_json::Value =
+            serde_json::from_str(r#"{"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45}}"#)
+                .unwrap();
+        let u = parse_usage(&chunk);
+        assert_eq!(u.prompt_tokens, Some(123));
+        assert_eq!(u.completion_tokens, Some(45));
+        // A chunk with no usage object → both None (cost shown as unknown, not zero).
+        let plain: serde_json::Value =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).unwrap();
+        let n = parse_usage(&plain);
+        assert!(n.prompt_tokens.is_none() && n.completion_tokens.is_none());
+    }
 }
 
 /// A single non-streaming chat completion — used for background work (sorting
 /// proposals, the Learning-You profile) where we want the whole answer at once,
 /// not a token stream. Takes an ordered model list (one model, or several for
 /// auto-switch fallback). Returns the assistant message content.
-pub async fn complete(api_key: &str, models: &[String], messages: &[ChatMessage]) -> Result<String> {
+pub async fn complete(api_key: &str, models: &[String], messages: &[ChatMessage]) -> Result<Completion> {
     let body = chat_body(models, messages, false);
 
     let response = reqwest::Client::builder()
@@ -288,8 +342,13 @@ pub async fn complete(api_key: &str, models: &[String], messages: &[ChatMessage]
     }
 
     let value: serde_json::Value = response.json().await?;
-    value["choices"][0]["message"]["content"]
+    let text = value["choices"][0]["message"]["content"]
         .as_str()
         .map(str::to_string)
-        .ok_or_else(|| Error::Other("OpenRouter response had no message content".into()))
+        .ok_or_else(|| Error::Other("OpenRouter response had no message content".into()))?;
+    Ok(Completion {
+        text,
+        model: value["model"].as_str().map(str::to_string),
+        usage: parse_usage(&value),
+    })
 }

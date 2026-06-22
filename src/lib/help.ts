@@ -130,6 +130,14 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Time zone",
     body: "The zone PM reasons about dates in — which day is 'today', when something is 'due soon', and the times in your calendar agenda and briefing. Auto follows this device; switch to Manual to pin a specific zone (useful when you travel and don't want the boundaries to shift).",
   },
+  "settings-recommended-models": {
+    title: "Recommended models",
+    body: "PM's sensible defaults — a capable model for chat, and cheaper/faster models for background work (sorting and learning). Click to fill the lists above with the recommendation; nothing changes until you Save, and you can still edit them.",
+  },
+  "settings-usage-cost": {
+    title: "Usage & cost",
+    body: "What you've spent on model calls, priced from OpenRouter's public rates (refreshed about once a day). Shows last-30-days and all-time totals; expand 'How this is calculated' for the method and a per-model spend ranking. 'Refresh prices' re-pulls the latest rates. Costs are computed from token counts at read time, so a price change re-prices your history.",
+  },
   "settings-help-mode": {
     title: "Help mode",
     body: "The switch you're using right now. While it's on, hovering any highlighted section shows an explanation like this one.",

@@ -186,15 +186,17 @@ fn push_group(out: &mut String, label: &str, items: &[String]) {
 
 /// Generate the briefing text via the background model. Returns the cleaned text; the
 /// caller decides what to do on error (best-effort, like `learning::distill`).
+/// Returns the cleaned briefing text plus the served model + token usage (for the
+/// cost logger). The caller decides what to do on error (best-effort, like `learning::distill`).
 pub async fn generate(
     api_key: &str,
     models: &[String],
     snapshot: &str,
     profile: Option<&str>,
-) -> Result<String> {
+) -> Result<(String, openrouter::Usage, Option<String>)> {
     let messages = build_messages(snapshot, profile);
-    let reply = openrouter::complete(api_key, models, &messages).await?;
-    Ok(clean(&reply))
+    let c = openrouter::complete(api_key, models, &messages).await?;
+    Ok((clean(&c.text), c.usage, c.model))
 }
 
 /// Build the briefing prompt: the snapshot in, a short plain-text briefing out. The

@@ -48,6 +48,25 @@ export interface ModelInfo {
   input_modalities: string[];
 }
 
+/** Spend for one model over a window (the cost logger). `cost_usd` is null when the
+ *  model isn't in the price cache yet — shown as "—", not an understated $0. */
+export interface ModelSpend {
+  model: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  request_count: number;
+  cost_usd: number | null;
+}
+
+/** The Settings "Usage & cost" payload (token spend priced from OpenRouter). */
+export interface CostSummary {
+  last_30d: ModelSpend[];
+  all_time: ModelSpend[];
+  total_30d_usd: number | null;
+  total_all_time_usd: number | null;
+  pricing_updated_at: string | null;
+}
+
 /** The distilled Learning-You profile shown in Settings (Step 4b, spec §4.5). */
 export interface LearningProfile {
   profile: string;

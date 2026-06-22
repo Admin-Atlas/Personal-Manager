@@ -3,11 +3,14 @@
 
 import { useEffect, useState } from "react";
 import {
+  costSummary,
   getLearningProfile,
   getSettings,
   hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
+  recommendedModels,
   refreshLearningProfile,
+  refreshPricing,
   setBackgroundAutoSwitch,
   setBackgroundModels,
   setChatAutoSwitch,
@@ -19,9 +22,9 @@ import {
 import { useHelp } from "../lib/help";
 import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
-import type { LearningProfile } from "../lib/types";
-import { useTheme, ACCENTS } from "../theme";
-import { Button, Input, SegmentedControl, Select } from "./ui";
+import type { CostSummary, LearningProfile } from "../lib/types";
+import { useTheme, useDepth, ACCENTS } from "../theme";
+import { Button, Collapsible, Input, SegmentedControl, Select } from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -32,6 +35,7 @@ interface Props {
 export function SettingsView({ onClose, onboarding }: Props) {
   const help = useHelp();
   const { system, setSystem, mode, setMode, depth, setDepth, accent, setAccent } = useTheme();
+  const { showMeta, showPower } = useDepth();
   const [key, setKey] = useState("");
   const [bgKey, setBgKey] = useState("");
   const [chatModels, setChatModelsState] = useState<string[]>([]);
@@ -46,6 +50,8 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [refreshing, setRefreshing] = useState(false);
   const [timeZone, setTimeZoneState] = useState("");
   const [tzAuto, setTzAuto] = useState(true);
+  const [cost, setCost] = useState<CostSummary | null>(null);
+  const [refreshingPrices, setRefreshingPrices] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -81,6 +87,13 @@ export function SettingsView({ onClose, onboarding }: Props) {
     })();
   }, [onboarding]);
 
+  // Cost summary loads on its own (its first read may trigger a daily pricing fetch),
+  // so it never blocks the rest of Settings from showing.
+  useEffect(() => {
+    if (onboarding) return;
+    costSummary().then(setCost).catch(() => {});
+  }, [onboarding]);
+
   async function refreshProfile() {
     setRefreshing(true);
     setError(null);
@@ -90,6 +103,18 @@ export function SettingsView({ onClose, onboarding }: Props) {
       setError(String(e));
     } finally {
       setRefreshing(false);
+    }
+  }
+
+  async function refreshPrices() {
+    setRefreshingPrices(true);
+    setError(null);
+    try {
+      setCost(await refreshPricing());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRefreshingPrices(false);
     }
   }
 
@@ -313,7 +338,106 @@ export function SettingsView({ onClose, onboarding }: Props) {
             autoSwitch={backgroundAuto}
             onAutoSwitchChange={setBackgroundAuto}
           />
+          {!onboarding && (
+            <div className="flex flex-wrap gap-2" data-help="settings-recommended-models">
+              <Button
+                variant="tertiary"
+                className="px-2 py-1 text-xs"
+                onClick={async () => setChatModelsState(await recommendedModels("chat"))}
+              >
+                Use recommended chat models
+              </Button>
+              <Button
+                variant="tertiary"
+                className="px-2 py-1 text-xs"
+                onClick={async () => setBackgroundModelsState(await recommendedModels("background"))}
+              >
+                Use recommended background models
+              </Button>
+            </div>
+          )}
         </div>
+
+        {!onboarding && showMeta && cost && (
+          <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
+            <div className="flex items-center justify-between">
+              <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                Usage &amp; cost
+              </label>
+              <Button
+                variant="tertiary"
+                onClick={refreshPrices}
+                disabled={refreshingPrices}
+                className="px-2 py-0.5 text-xs"
+              >
+                {refreshingPrices ? "Refreshing…" : "Refresh prices"}
+              </Button>
+            </div>
+            <p className="mt-1 text-xs text-ink4">
+              Estimated from the tokens each model call used × OpenRouter&apos;s per-token price
+              {cost.pricing_updated_at ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})` : ""}.
+            </p>
+            <div className="mt-2 flex gap-6 text-sm">
+              <div>
+                <div className="text-xs text-ink4">Last 30 days</div>
+                <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
+              </div>
+              <div>
+                <div className="text-xs text-ink4">All time</div>
+                <div className="font-mono text-ink2">{fmtUsd(cost.total_all_time_usd)}</div>
+              </div>
+            </div>
+            <div className="mt-3">
+              <Collapsible title="How this is calculated" defaultOpen={showPower}>
+                <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
+                  <p>
+                    Each model reply reports the tokens it used (your prompt + its reply). PM logs
+                    those per call. It fetches OpenRouter&apos;s public price list about once a day
+                    and caches it — no extra model call, and your API key is never used for it.
+                  </p>
+                  <p>
+                    Cost per model = prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
+                    reply&nbsp;price, summed over that model&apos;s calls. It&apos;s computed when
+                    you open this page, so a later price change re-prices your history. A model not
+                    yet in the price cache shows <span className="font-mono text-ink4">—</span>,
+                    never an understated&nbsp;$0.
+                  </p>
+                </div>
+                {cost.all_time.length > 0 ? (
+                  <div className="mt-3">
+                    <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
+                      By model · most expensive first (all time)
+                    </p>
+                    <table className="w-full text-left text-xs">
+                      <thead className="font-mono uppercase tracking-wide text-ink4">
+                        <tr className="border-b border-rule">
+                          <th className="py-1 font-medium">Model</th>
+                          <th className="py-1 text-right font-medium">Reqs</th>
+                          <th className="py-1 text-right font-medium">Tokens in/out</th>
+                          <th className="py-1 text-right font-medium">Cost</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {cost.all_time.map((s) => (
+                          <tr key={s.model} className="border-b border-rule">
+                            <td className="py-1 pr-2 text-ink2">{s.model}</td>
+                            <td className="py-1 text-right text-ink3">{s.request_count}</td>
+                            <td className="py-1 text-right font-mono text-ink4">
+                              {s.prompt_tokens.toLocaleString()} / {s.completion_tokens.toLocaleString()}
+                            </td>
+                            <td className="py-1 text-right font-mono text-ink3">{fmtUsd(s.cost_usd)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
+                )}
+              </Collapsible>
+            </div>
+          </div>
+        )}
 
         {!onboarding && (
           <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
@@ -426,6 +550,13 @@ export function SettingsView({ onClose, onboarding }: Props) {
 function formatWhen(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+/** Format a USD cost, or "—" when unknown (the model isn't in the price cache yet). */
+function fmtUsd(v: number | null): string {
+  if (v == null) return "—";
+  if (v === 0) return "$0.00";
+  return v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
 }
 
 /** The device's IANA time zone (e.g. "Europe/London"), via the Intl API. */
