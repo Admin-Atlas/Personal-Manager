@@ -307,3 +307,13 @@ export const getDailyBriefing = () => invoke<DailyBriefing>("get_daily_briefing"
 /** Regenerate the briefing from the current focus-view state; returns the new one. */
 export const refreshDailyBriefing = () =>
   invoke<DailyBriefing>("refresh_daily_briefing");
+
+// --- Data folder: reveal + export ---
+
+/** Reveal the data folder (encrypted store + Markdown vault) in the OS file manager. */
+export const openDataFolder = () => invoke<void>("open_data_folder");
+
+/** Bundle the data folder into a single .zip at `destPath` (store snapshot + vault;
+ *  the regenerable runtime/ is excluded). The store stays encrypted in the archive. */
+export const exportAllData = (destPath: string) =>
+  invoke<void>("export_all_data", { destPath });

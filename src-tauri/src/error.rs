@@ -19,6 +19,9 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("archive error: {0}")]
+    Zip(#[from] zip::result::ZipError),
+
     #[error("{0}")]
     Other(String),
 }

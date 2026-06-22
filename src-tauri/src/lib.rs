@@ -136,6 +136,8 @@ pub fn run() {
             commands::refresh_pricing,
             commands::model_recommendations,
             commands::set_recommend_denylist,
+            commands::open_data_folder,
+            commands::export_all_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
