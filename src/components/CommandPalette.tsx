@@ -52,6 +52,7 @@ const NAV_DESTS: { label: string; view: View }[] = [
   { label: "Documents", view: "documents" },
   { label: "Review", view: "review" },
   { label: "Map", view: "graph" },
+  { label: "Pinboard", view: "pinboard" },
 ];
 
 /**

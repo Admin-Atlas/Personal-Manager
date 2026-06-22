@@ -5,7 +5,7 @@ import type { Conversation } from "../lib/types";
 import { useDepth } from "../theme";
 import { NavItem } from "./ui";
 
-export type View = "focus" | "project" | "chat" | "documents" | "review" | "graph";
+export type View = "focus" | "project" | "chat" | "documents" | "review" | "graph" | "pinboard";
 
 /** The command-palette shortcut hint shown in the sidebar (⌘ on macOS). */
 const SHORTCUT_HINT =
@@ -110,6 +110,13 @@ export function Sidebar({
         </NavItem>
         <NavItem active={view === "graph"} onClick={() => onNavigate("graph")} helpId="nav-graph">
           Map
+        </NavItem>
+        <NavItem
+          active={view === "pinboard"}
+          onClick={() => onNavigate("pinboard")}
+          helpId="nav-pinboard"
+        >
+          Pinboard
         </NavItem>
       </nav>
 
