@@ -132,6 +132,15 @@ fn passes_reliability(m: &ModelDetail) -> bool {
         .any(|s| s == "tools" || s == "response_format" || s == "structured_outputs")
 }
 
+/// True for a free-tier listing (both prompt and completion priced at $0). Mirrors the
+/// frontend's "Free" tag in `ModelPicker`. Free OpenRouter models are heavily rate-limited
+/// and frequently return nothing useful, which makes OpenRouter silently auto-switch to the
+/// user's fallback model — so the Day-to-day pick skips them and recommends the cheapest
+/// *paid* model instead, even though a free model would always "win" on raw cost.
+fn is_free(m: &ModelDetail) -> bool {
+    m.prompt_price == Some(0.0) && m.completion_price == Some(0.0)
+}
+
 /// True when `id` is covered by a denylist entry. A bare provider ("openai") denies the
 /// whole `openai/...` namespace; a slug or slug-prefix ("openai/gpt") matches as a prefix.
 /// Case-insensitive.
@@ -151,18 +160,21 @@ fn is_denylisted(id: &str, denylist: &[String]) -> bool {
 }
 
 /// Day-to-day: cheapest effective cost among reliable, non-denylisted, priced models that
-/// clear the context floor.
+/// clear the context floor. Free ($0) tiers are excluded — they'd always win on raw cost but
+/// are rate-limited enough to be practically unusable (see [`is_free`]).
 fn pick_day_to_day(candidates: &[&ModelDetail], denylist: &[String]) -> Option<Recommendation> {
     let (m, cost) = candidates
         .iter()
         .filter(|m| !is_denylisted(&m.id, denylist))
+        .filter(|m| !is_free(m))
         .filter(|m| m.context_length.unwrap_or(0) >= DAYTODAY_MIN_CONTEXT)
         .filter(|m| passes_reliability(m))
         .filter_map(|m| effective_cost_per_token(m).map(|c| (*m, c)))
         .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
     let why = format!(
-        "Cheapest model that still supports tool-calling and a {}K+ context — ideal for \
-         high-volume sorting and everyday chat.",
+        "The cheapest dependable model with tool-calling and a {}K+ context — free tiers are \
+         skipped because they're rate-limited and unreliable. Great for high-volume sorting \
+         and everyday chat.",
         DAYTODAY_MIN_CONTEXT / 1000
     );
     Some(Recommendation {
@@ -366,6 +378,33 @@ mod tests {
         let cat = vec![cheap_unreliable, cheap_short, budget_ok, pricey];
         let (day, _) = recommend(&cat, &CuratedTiers::default(), &[]);
         assert_eq!(day.unwrap().model, "x/budget-ok");
+    }
+
+    #[test]
+    fn day_to_day_skips_free_models() {
+        // A free ($0) listing that clears every other floor must NOT be picked — free tiers are
+        // rate-limited and trigger OpenRouter's silent auto-switch to the user's fallback. The
+        // cheapest *paid* reliable model wins instead, even though free would "win" on raw cost.
+        let make_free = |id: &str| {
+            let mut m = model(id);
+            m.prompt_price = Some(0.0);
+            m.completion_price = Some(0.0);
+            m
+        };
+
+        let mut paid = model("x/paid");
+        paid.prompt_price = Some(2e-7);
+        paid.completion_price = Some(2e-7);
+        let pricey = model("x/pricey"); // 3e-6 / 15e-6 — paid but dearer
+
+        let cat = vec![make_free("x/free"), paid, pricey];
+        let (day, _) = recommend(&cat, &CuratedTiers::default(), &[]);
+        assert_eq!(day.unwrap().model, "x/paid");
+
+        // With nothing but free models, Day-to-day yields no pick — the card shows
+        // "unavailable" rather than recommending a known-flaky free tier.
+        let (only_free, _) = recommend(&[make_free("x/free")], &CuratedTiers::default(), &[]);
+        assert!(only_free.is_none());
     }
 
     #[test]
