@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Bobby Yu -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!--
+  macOS hardened-runtime entitlements. These apply ONLY when the bundle is code-signed with
+  a Developer ID (i.e. when APPLE_SIGNING_IDENTITY is set in CI). Unsigned builds skip
+  code-signing entirely, so this file has no effect on them — it sits dormant until Apple
+  signing is switched on.
+
+  PM is distributed with Developer ID + notarization (NOT the App Store), so it is NOT
+  sandboxed. Only the hardened-runtime opt-outs below are needed; App-Sandbox keys
+  (com.apple.security.network.client / files.* / device.audio-input) are inert when
+  un-sandboxed. Microphone access for voice input is gated by NSMicrophoneUsageDescription
+  in Info.plist + TCC, not by an entitlement here.
+
+  If the Python sidecar later fails to load under the hardened runtime, the next entitlement
+  to try is com.apple.security.cs.allow-dyld-environment-variables (verify on a Mac).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- The WebView's JavaScript engine JITs; the hardened runtime blocks that by default. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <!-- The Python sidecar loads native extension modules (onnxruntime, faster-whisper, PyAV)
+       that pip installs at runtime and are therefore not signed by us; library validation
+       would refuse to load them under the hardened runtime without this. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>
