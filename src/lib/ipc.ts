@@ -31,11 +31,9 @@ import type {
 
 export const hasOpenRouterKey = () => invoke<boolean>("has_openrouter_key");
 
-export const setOpenRouterKey = (key: string) =>
-  invoke<void>("set_openrouter_key", { key });
+export const setOpenRouterKey = (key: string) => invoke<void>("set_openrouter_key", { key });
 
-export const hasOpenRouterBackgroundKey = () =>
-  invoke<boolean>("has_openrouter_background_key");
+export const hasOpenRouterBackgroundKey = () => invoke<boolean>("has_openrouter_background_key");
 
 export const setOpenRouterBackgroundKey = (key: string) =>
   invoke<void>("set_openrouter_background_key", { key });
@@ -44,22 +42,18 @@ export const getSettings = () => invoke<Settings>("get_settings");
 
 /** Persist the user's IANA time zone (e.g. "Europe/London"). An empty string clears
  *  it (the backend then reasons in UTC). Validated against the tz database in Rust. */
-export const setTimeZone = (zone: string) =>
-  invoke<void>("set_time_zone", { zone });
+export const setTimeZone = (zone: string) => invoke<void>("set_time_zone", { zone });
 
 /** Read a UI preference blob (theme axes, pinboard layout) from the encrypted store
  *  so it travels with the data folder. `null` when nothing is stored yet. */
-export const getPref = (key: string) =>
-  invoke<string | null>("get_pref", { key });
+export const getPref = (key: string) => invoke<string | null>("get_pref", { key });
 
 /** Persist a UI preference blob. The backend only accepts a fixed allowlist of keys
  *  (`appearance`, `pinboard`), so this can't touch schema-critical settings. */
-export const setPref = (key: string, value: string) =>
-  invoke<void>("set_pref", { key, value });
+export const setPref = (key: string, value: string) => invoke<void>("set_pref", { key, value });
 
 /** Ordered preferred chat models (first = primary). */
-export const setChatModels = (models: string[]) =>
-  invoke<void>("set_chat_models", { models });
+export const setChatModels = (models: string[]) => invoke<void>("set_chat_models", { models });
 
 /** Ordered preferred background models (sorting proposals + Learning You). */
 export const setBackgroundModels = (models: string[]) =>
@@ -88,16 +82,14 @@ export const refreshPricing = () => invoke<CostSummary>("refresh_pricing");
 
 /** PM's two live model recommendations (Day-to-day / Advanced) for the Settings cards.
  *  Reads the cached catalogue (refreshed on the cost logger's daily cadence). */
-export const modelRecommendations = () =>
-  invoke<ModelRecommendations>("model_recommendations");
+export const modelRecommendations = () => invoke<ModelRecommendations>("model_recommendations");
 
 /** Persist the optional recommender denylist (provider or model slugs). */
 export const setRecommendDenylist = (denylist: string[]) =>
   invoke<void>("set_recommend_denylist", { denylist });
 
 /** Toggle the UI help/explain mode (Step 4b). */
-export const setHelpMode = (enabled: boolean) =>
-  invoke<void>("set_help_mode", { enabled });
+export const setHelpMode = (enabled: boolean) => invoke<void>("set_help_mode", { enabled });
 
 // --- Biometric app-lock (soft UI gate, opt-in — spec §16.2) ---
 
@@ -105,8 +97,7 @@ export const setHelpMode = (enabled: boolean) =>
 export const appLockStatus = () => invoke<AppLockStatus>("app_lock_status");
 
 /** Turn the app-lock on/off. Enabling is rejected by the backend when unavailable. */
-export const setAppLock = (enabled: boolean) =>
-  invoke<void>("set_app_lock", { enabled });
+export const setAppLock = (enabled: boolean) => invoke<void>("set_app_lock", { enabled });
 
 /** Run the OS verification (Windows Hello / Touch ID) to lift the launch lock.
  *  Resolves true on success, false when the user cancels/fails; rejects when the
@@ -116,15 +107,12 @@ export const unlockApp = () => invoke<boolean>("unlock_app");
 // --- Learning You (Step 4b, spec §4.5) ---
 
 /** The distilled profile of how the user organises, for display in Settings. */
-export const getLearningProfile = () =>
-  invoke<LearningProfile>("get_learning_profile");
+export const getLearningProfile = () => invoke<LearningProfile>("get_learning_profile");
 
 /** Re-distil the profile from logged corrections; returns the refreshed profile. */
-export const refreshLearningProfile = () =>
-  invoke<LearningProfile>("refresh_learning_profile");
+export const refreshLearningProfile = () => invoke<LearningProfile>("refresh_learning_profile");
 
-export const listConversations = () =>
-  invoke<Conversation[]>("list_conversations");
+export const listConversations = () => invoke<Conversation[]>("list_conversations");
 
 /** Start a conversation, optionally scoped to a project (Step 5) so its chat
  *  retrieval is confined to that project's documents. */
@@ -167,19 +155,14 @@ export const transcribeAudio = (audioBase64: string) =>
   invoke<string>("transcribe_audio", { audioBase64 });
 
 /** Ingest files/folders, streaming progress for each item. */
-export function ingestPaths(
-  paths: string[],
-  onEvent: (event: IngestEvent) => void,
-): Promise<void> {
+export function ingestPaths(paths: string[], onEvent: (event: IngestEvent) => void): Promise<void> {
   const channel = new Channel<IngestEvent>();
   channel.onmessage = onEvent;
   return invoke<void>("ingest_paths", { paths, onEvent: channel });
 }
 
 /** Drop the index and rebuild it from the Markdown vault. */
-export function rebuildIndex(
-  onEvent: (event: IngestEvent) => void,
-): Promise<void> {
+export function rebuildIndex(onEvent: (event: IngestEvent) => void): Promise<void> {
   const channel = new Channel<IngestEvent>();
   channel.onmessage = onEvent;
   return invoke<void>("rebuild_index", { onEvent: channel });
@@ -214,14 +197,12 @@ export const setDocumentMetadata = (
   project: string,
   tags: string[],
   importance: Importance,
-) =>
-  invoke<Document>("set_document_metadata", { documentId, project, tags, importance });
+) => invoke<Document>("set_document_metadata", { documentId, project, tags, importance });
 
 // --- Personal Assistant: focus view & projects (Step 5, spec §4) ---
 
 /** Every active project with its triage metadata and derived status. */
-export const listProjectOverviews = () =>
-  invoke<ProjectOverview[]>("list_project_overviews");
+export const listProjectOverviews = () => invoke<ProjectOverview[]>("list_project_overviews");
 
 /** Set/clear a project's triage metadata (the confirm half of the AI loop, or a
  *  hand edit). Blank/omitted fields clear that attribute. */
@@ -268,8 +249,7 @@ export const addIcsFeed = (label: string, url: string) =>
   invoke<void>("add_ics_feed", { label, url });
 
 /** Remove a feed and its synced events. */
-export const removeIcsFeed = (id: string) =>
-  invoke<void>("remove_ics_feed", { id });
+export const removeIcsFeed = (id: string) => invoke<void>("remove_ics_feed", { id });
 
 /** Save the user's BYO Google "Desktop app" client credentials (keychain only). */
 export const setGoogleClient = (clientId: string, clientSecret: string) =>
@@ -285,8 +265,7 @@ export const connectGoogle = () => invoke<void>("connect_google");
 export const disconnectGoogle = () => invoke<void>("disconnect_google");
 
 /** The user's calendars, with PM's selection applied (for the picker). */
-export const listGoogleCalendars = () =>
-  invoke<GoogleCalendar[]>("list_google_calendars");
+export const listGoogleCalendars = () => invoke<GoogleCalendar[]>("list_google_calendars");
 
 /** Choose which calendars to sync. */
 export const setGoogleCalendarIds = (ids: string[]) =>
@@ -296,8 +275,7 @@ export const setGoogleCalendarIds = (ids: string[]) =>
 export const syncCalendar = () => invoke<number>("sync_calendar");
 
 /** Upcoming events in the mirror, for the focus-view agenda. */
-export const listCalendarEvents = () =>
-  invoke<CalendarEvent[]>("list_calendar_events");
+export const listCalendarEvents = () => invoke<CalendarEvent[]>("list_calendar_events");
 
 // --- Personal Assistant: Daily briefing (Step 7, spec §4 P1) ---
 
@@ -305,8 +283,7 @@ export const listCalendarEvents = () =>
 export const getDailyBriefing = () => invoke<DailyBriefing>("get_daily_briefing");
 
 /** Regenerate the briefing from the current focus-view state; returns the new one. */
-export const refreshDailyBriefing = () =>
-  invoke<DailyBriefing>("refresh_daily_briefing");
+export const refreshDailyBriefing = () => invoke<DailyBriefing>("refresh_daily_briefing");
 
 // --- Data folder: reveal + export ---
 
@@ -315,5 +292,4 @@ export const openDataFolder = () => invoke<void>("open_data_folder");
 
 /** Bundle the data folder into a single .zip at `destPath` (store snapshot + vault;
  *  the regenerable runtime/ is excluded). The store stays encrypted in the archive. */
-export const exportAllData = (destPath: string) =>
-  invoke<void>("export_all_data", { destPath });
+export const exportAllData = (destPath: string) => invoke<void>("export_all_data", { destPath });

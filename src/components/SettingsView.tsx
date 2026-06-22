@@ -99,13 +99,17 @@ export function SettingsView({ onClose, onboarding }: Props) {
   // so it never blocks the rest of Settings from showing.
   useEffect(() => {
     if (onboarding) return;
-    costSummary().then(setCost).catch(() => {});
+    costSummary()
+      .then(setCost)
+      .catch(() => {});
   }, [onboarding]);
 
   // App-lock status (enabled + whether the OS can verify) loads independently.
   useEffect(() => {
     if (onboarding) return;
-    appLockStatus().then(setAppLockState).catch(() => {});
+    appLockStatus()
+      .then(setAppLockState)
+      .catch(() => {});
   }, [onboarding]);
 
   async function toggleAppLock(next: boolean) {
@@ -283,7 +287,9 @@ export function SettingsView({ onClose, onboarding }: Props) {
                     onClick={() => setAccent(hex)}
                     style={{ background: hex }}
                     className={`h-5 w-5 rounded-full transition ${
-                      accent === hex ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]" : ""
+                      accent === hex
+                        ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
+                        : ""
                     }`}
                   />
                 ))}
@@ -335,9 +341,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
           </div>
         )}
 
-        <label className="mt-5 block text-sm font-medium text-ink2">
-          OpenRouter API key
-        </label>
+        <label className="mt-5 block text-sm font-medium text-ink2">OpenRouter API key</label>
         <Input
           type="password"
           autoComplete="off"
@@ -358,9 +362,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
 
         {!onboarding && (
           <>
-            <label className="mt-4 block text-sm font-medium text-ink2">
-              Background API key
-            </label>
+            <label className="mt-4 block text-sm font-medium text-ink2">Background API key</label>
             <Input
               type="password"
               autoComplete="off"
@@ -371,8 +373,8 @@ export function SettingsView({ onClose, onboarding }: Props) {
               className="mt-1"
             />
             <p className="mt-1 text-xs text-ink4">
-              Used for background work (sorting proposals, learning). Lets you track that
-              spend separately. Falls back to your main key if blank.
+              Used for background work (sorting proposals, learning). Lets you track that spend
+              separately. Falls back to your main key if blank.
             </p>
           </>
         )}
@@ -404,9 +406,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 setChatModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
               }
               onUseForBackground={(m) =>
-                setBackgroundModelsState((prev) =>
-                  [m, ...prev.filter((x) => x !== m)].slice(0, 50),
-                )
+                setBackgroundModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
               }
             />
           )}
@@ -429,7 +429,10 @@ export function SettingsView({ onClose, onboarding }: Props) {
             </div>
             <p className="mt-1 text-xs text-ink4">
               Estimated from the tokens each model call used × OpenRouter&apos;s per-token price
-              {cost.pricing_updated_at ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})` : ""}.
+              {cost.pricing_updated_at
+                ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
+                : ""}
+              .
             </p>
             <div className="mt-2 flex gap-6 text-sm">
               <div>
@@ -477,9 +480,12 @@ export function SettingsView({ onClose, onboarding }: Props) {
                             <td className="py-1 pr-2 text-ink2">{s.model}</td>
                             <td className="py-1 text-right text-ink3">{s.request_count}</td>
                             <td className="py-1 text-right font-mono text-ink4">
-                              {s.prompt_tokens.toLocaleString()} / {s.completion_tokens.toLocaleString()}
+                              {s.prompt_tokens.toLocaleString()} /{" "}
+                              {s.completion_tokens.toLocaleString()}
                             </td>
-                            <td className="py-1 text-right font-mono text-ink3">{fmtUsd(s.cost_usd)}</td>
+                            <td className="py-1 text-right font-mono text-ink3">
+                              {fmtUsd(s.cost_usd)}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -497,11 +503,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
           <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
             <div className="flex items-center justify-between">
               <label className="block text-sm font-medium text-ink2">Learning You</label>
-              <Button
-                variant="tertiary"
-                onClick={refreshProfile}
-                disabled={refreshing}
-              >
+              <Button variant="tertiary" onClick={refreshProfile} disabled={refreshing}>
                 {refreshing ? "Refreshing…" : "Refresh now"}
               </Button>
             </div>
@@ -515,7 +517,9 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 : "Nothing learned yet — it builds up as you correct the AI's proposals in Review."}
             </div>
             <p className="mt-1 text-xs text-faint">
-              {profile ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"} logged` : ""}
+              {profile
+                ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"} logged`
+                : ""}
               {profile?.updated_at ? ` · updated ${formatWhen(profile.updated_at)}` : ""}
             </p>
           </div>
@@ -524,7 +528,10 @@ export function SettingsView({ onClose, onboarding }: Props) {
         {!onboarding && <CalendarSettings />}
 
         {!onboarding && (
-          <div className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4" data-help="settings-app-lock">
+          <div
+            className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4"
+            data-help="settings-app-lock"
+          >
             <div>
               <label className="block text-sm font-medium text-ink2">App lock</label>
               <p className="mt-1 text-xs text-ink4">
@@ -554,7 +561,10 @@ export function SettingsView({ onClose, onboarding }: Props) {
         )}
 
         {!onboarding && (
-          <div className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4" data-help="settings-help-mode">
+          <div
+            className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4"
+            data-help="settings-help-mode"
+          >
             <div>
               <label className="block text-sm font-medium text-ink2">Help mode</label>
               <p className="mt-1 text-xs text-ink4">
@@ -582,11 +592,11 @@ export function SettingsView({ onClose, onboarding }: Props) {
           <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
             <label className="block text-sm font-medium text-ink2">Data</label>
             <p className="mt-1 text-xs text-ink4">
-              Your documents and the encrypted store live in one folder
-              (<span className="font-medium">Personal Manager</span>). Open it to back it up by
-              hand, or export everything to a single <span className="font-medium">.zip</span> —
-              the Markdown vault plus the encrypted store (the regenerable runtime is left out).
-              The store stays encrypted in the archive.
+              Your documents and the encrypted store live in one folder (
+              <span className="font-medium">Personal Manager</span>). Open it to back it up by hand,
+              or export everything to a single <span className="font-medium">.zip</span> — the
+              Markdown vault plus the encrypted store (the regenerable runtime is left out). The
+              store stays encrypted in the archive.
             </p>
             <div className="mt-2 flex flex-wrap gap-2">
               <Button variant="tertiary" onClick={revealDataFolder}>
@@ -596,14 +606,15 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 {exporting ? "Exporting…" : "Export all data…"}
               </Button>
             </div>
-            {exportMsg && (
-              <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>
-            )}
+            {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
           </div>
         )}
 
         {!onboarding && (
-          <div className="mt-5 border-t border-border pt-4 text-xs leading-relaxed text-ink4" data-help="settings-license">
+          <div
+            className="mt-5 border-t border-border pt-4 text-xs leading-relaxed text-ink4"
+            data-help="settings-license"
+          >
             <p>
               PM is free software, licensed under the{" "}
               <a

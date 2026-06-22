@@ -11,7 +11,11 @@
 //! (withhold the DB key until verification succeeds) is documented as deferred to v4
 //! in `docs/DECISIONS.md`.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
+// `Error` is only constructed in the Windows and macOS platform modules below; on
+// other targets (e.g. Linux CI) it would be an unused import.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use crate::error::Error;
 
 /// Pure policy: should the UI be locked right now? Locked iff the feature is enabled
 /// *and* the user hasn't verified yet this session. Kept separate from the OS call so
@@ -112,8 +116,8 @@ mod platform {
 
             // Desktop (Win32) apps must use the interop variant that takes an HWND;
             // the windowless `RequestVerificationAsync` only works for UWP.
-            let interop = factory::<UserConsentVerifier, IUserConsentVerifierInterop>()
-                .map_err(win_err)?;
+            let interop =
+                factory::<UserConsentVerifier, IUserConsentVerifierInterop>().map_err(win_err)?;
             // SAFETY: `window_handle` is the live main-window HWND captured on the UI
             // thread; the interop call only reads it to parent the system dialog.
             let operation: IAsyncOperation<UserConsentVerificationResult> = unsafe {

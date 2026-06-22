@@ -1,0 +1,65 @@
+# pre-commit — runs the fast check subset on commit. Each hook calls the matching
+# `just` recipe, so it runs the EXACT same command as CI and local `just` (one
+# source of truth, no drift). The compile/test/supply-chain/security checks
+# (clippy, cargo test, cargo-deny, gitleaks, zizmor) are left to CI and
+# `just check` — too slow for every commit.
+#
+# Setup:  pipx install pre-commit && pre-commit install
+# Needs:  just, node + npm install (prettier/eslint/tsc), ruff on PATH.
+repos:
+  - repo: local
+    hooks:
+      - id: prettier
+        name: prettier --check
+        entry: just prettier
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: eslint
+        name: eslint
+        entry: just eslint
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: tsc
+        name: tsc --noEmit
+        entry: just tsc
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: just cargo-fmt
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ruff
+        name: ruff check
+        entry: just ruff
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ruff-fmt
+        name: ruff format --check
+        entry: just ruff-fmt
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: version-lockstep
+        name: version lockstep + changelog
+        entry: just version
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: files-in-place
+        name: files-in-place
+        entry: just files
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: spdx-headers
+        name: spdx headers + licence
+        entry: just headers
+        language: system
+        pass_filenames: false
+        always_run: true

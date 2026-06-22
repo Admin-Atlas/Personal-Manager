@@ -1,0 +1,13 @@
+# Ruff config for the Python document sidecar (the only Python in PM).
+#
+# A conservative baseline floor: Pyflakes (F) + pycodestyle errors (E) + import
+# sorting (I). mypy is intentionally deferred until the sidecar is type-annotated
+# (adding it now would only fail noisily). Format matches Ruff's defaults.
+
+# The sidecar runs on the user's interpreter (verified on 3.14); 3.9 is the floor
+# we still want to lint cleanly against.
+target-version = "py39"
+line-length = 100
+
+[lint]
+select = ["E", "F", "I"]

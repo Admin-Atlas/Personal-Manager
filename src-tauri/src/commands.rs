@@ -99,13 +99,17 @@ pub struct Settings {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEvent {
-    Token { text: String },
+    Token {
+        text: String,
+    },
     Done {
         message_id: i64,
         content: String,
         citations: Vec<Citation>,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 // --- secrets ---
@@ -172,13 +176,21 @@ pub fn set_background_models(state: State<'_, AppState>, models: Vec<String>) ->
 #[tauri::command]
 pub fn set_chat_auto_switch(state: State<'_, AppState>, enabled: bool) -> Result<()> {
     let conn = state.db.lock().unwrap();
-    db::set_setting(&conn, CHAT_AUTO_SWITCH_KEY, if enabled { "true" } else { "false" })
+    db::set_setting(
+        &conn,
+        CHAT_AUTO_SWITCH_KEY,
+        if enabled { "true" } else { "false" },
+    )
 }
 
 #[tauri::command]
 pub fn set_background_auto_switch(state: State<'_, AppState>, enabled: bool) -> Result<()> {
     let conn = state.db.lock().unwrap();
-    db::set_setting(&conn, BACKGROUND_AUTO_SWITCH_KEY, if enabled { "true" } else { "false" })
+    db::set_setting(
+        &conn,
+        BACKGROUND_AUTO_SWITCH_KEY,
+        if enabled { "true" } else { "false" },
+    )
 }
 
 /// Toggle the UI help/explain mode (Step 4b). Stored in `settings` so it persists.
@@ -284,7 +296,11 @@ pub fn set_app_lock(state: State<'_, AppState>, enabled: bool) -> Result<()> {
         .db
         .lock()
         .map_err(|_| Error::Other("database lock poisoned".into()))?;
-    db::set_setting(&conn, APP_LOCK_ENABLED_KEY, if enabled { "true" } else { "false" })
+    db::set_setting(
+        &conn,
+        APP_LOCK_ENABLED_KEY,
+        if enabled { "true" } else { "false" },
+    )
 }
 
 /// Run the OS verification (Windows Hello / Touch ID) to lift the launch lock. Returns
@@ -292,10 +308,7 @@ pub fn set_app_lock(state: State<'_, AppState>, enabled: bool) -> Result<()> {
 /// thread (it's `!Send`) and the blocking WinRT wait runs on a worker thread so the UI
 /// stays responsive while the system prompt is up.
 #[tauri::command]
-pub async fn unlock_app(
-    state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
-) -> Result<bool> {
+pub async fn unlock_app(state: State<'_, AppState>, window: tauri::WebviewWindow) -> Result<bool> {
     let raw_handle = {
         #[cfg(target_os = "windows")]
         {
@@ -312,9 +325,10 @@ pub async fn unlock_app(
             0isize
         }
     };
-    let verified = tauri::async_runtime::spawn_blocking(move || applock::verify(raw_handle, "Unlock PM"))
-        .await
-        .map_err(|e| Error::Other(format!("verification task failed: {e}")))??;
+    let verified =
+        tauri::async_runtime::spawn_blocking(move || applock::verify(raw_handle, "Unlock PM"))
+            .await
+            .map_err(|e| Error::Other(format!("verification task failed: {e}")))??;
     if verified {
         state
             .app_unlocked
@@ -354,7 +368,9 @@ pub fn create_conversation(
     state: State<'_, AppState>,
     project: Option<String>,
 ) -> Result<Conversation> {
-    let project = project.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    let project = project
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
     let conn = state.db.lock().unwrap();
     conn.execute(
         "INSERT INTO conversations(project) VALUES (?1)",
@@ -445,12 +461,15 @@ pub async fn send_message(
              ORDER BY id",
         )?;
         let history = stmt
-            .query_map(params![conversation_id, MAX_HISTORY_MESSAGES as i64], |row| {
-                Ok(openrouter::ChatMessage {
-                    role: row.get(0)?,
-                    content: row.get(1)?,
-                })
-            })?
+            .query_map(
+                params![conversation_id, MAX_HISTORY_MESSAGES as i64],
+                |row| {
+                    Ok(openrouter::ChatMessage {
+                        role: row.get(0)?,
+                        content: row.get(1)?,
+                    })
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let profile = learning::profile_preamble(&conn)?;
@@ -576,13 +595,19 @@ async fn retrieve_grounding(
             return Ok(Vec::new());
         }
 
-        let embeddings = state.sidecar.embed(&[query.clone()])?;
+        let embeddings = state.sidecar.embed(std::slice::from_ref(&query))?;
         let Some(query_vec) = embeddings.into_iter().next() else {
             return Ok(Vec::new());
         };
 
         let conn = state.db.lock().unwrap();
-        retrieval::hybrid_search(&conn, &query, &query_vec, retrieval::DEFAULT_TOP_K, project.as_deref())
+        retrieval::hybrid_search(
+            &conn,
+            &query,
+            &query_vec,
+            retrieval::DEFAULT_TOP_K,
+            project.as_deref(),
+        )
     })
     .await;
 
@@ -661,7 +686,7 @@ pub async fn search_documents(
         let state = app.state::<AppState>();
         state.sidecar.ensure_installed()?;
 
-        let embeddings = state.sidecar.embed(&[query.clone()])?;
+        let embeddings = state.sidecar.embed(std::slice::from_ref(&query))?;
         let query_vec = embeddings.into_iter().next().unwrap_or_default();
 
         let conn = state.db.lock().unwrap();
@@ -689,7 +714,9 @@ pub async fn transcribe_audio(app: AppHandle, audio_base64: String) -> Result<St
         const MAX_AUDIO_B64_CHARS: usize = 32 * 1024 * 1024;
         let b64 = audio_base64.trim();
         if b64.len() > MAX_AUDIO_B64_CHARS {
-            return Err(Error::Other("the recording is too large to transcribe".into()));
+            return Err(Error::Other(
+                "the recording is too large to transcribe".into(),
+            ));
         }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -757,7 +784,10 @@ pub async fn propose_metadata(
     // each, so an unbounded list would blow SQLITE_MAX_VARIABLE_NUMBER. Far above
     // any real review selection.
     const MAX_PROPOSE_IDS: usize = 10_000;
-    if document_ids.as_ref().is_some_and(|ids| ids.len() > MAX_PROPOSE_IDS) {
+    if document_ids
+        .as_ref()
+        .is_some_and(|ids| ids.len() > MAX_PROPOSE_IDS)
+    {
         return Err(Error::Other("too many documents selected at once".into()));
     }
 
@@ -784,7 +814,9 @@ pub async fn propose_metadata(
                 if ids.is_empty() {
                     format!("{base_sql} AND 1=0 ORDER BY d.ingested_at DESC, d.id DESC")
                 } else {
-                    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(", ");
+                    let placeholders = std::iter::repeat_n("?", ids.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!("{base_sql} AND d.id IN ({placeholders}) ORDER BY d.ingested_at DESC, d.id DESC")
                 }
             } else {
@@ -793,14 +825,23 @@ pub async fn propose_metadata(
 
             let mut stmt = conn.prepare(&pending_sql)?;
             if let Some(ids) = document_ids.as_ref().filter(|ids| !ids.is_empty()) {
-                stmt.query_map(
-                    rusqlite::params_from_iter(ids),
-                    |r| Ok(Pending { id: r.get(0)?, title: r.get(1)?, body: r.get(2)? }),
-                )?
+                stmt.query_map(rusqlite::params_from_iter(ids), |r| {
+                    Ok(Pending {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        body: r.get(2)?,
+                    })
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
             } else {
-                stmt.query_map([], |r| Ok(Pending { id: r.get(0)?, title: r.get(1)?, body: r.get(2)? }))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?
+                stmt.query_map([], |r| {
+                    Ok(Pending {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        body: r.get(2)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
             }
         };
         (pending, projects, models, profile)
@@ -809,12 +850,22 @@ pub async fn propose_metadata(
     let mut proposed = 0;
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
     for p in pending {
-        let (proposal, usage_info) =
-            review::propose(&api_key, &models, &p.title, &p.body, &projects, profile.as_deref()).await;
+        let (proposal, usage_info) = review::propose(
+            &api_key,
+            &models,
+            &p.title,
+            &p.body,
+            &projects,
+            profile.as_deref(),
+        )
+        .await;
         if let Some((usage, served)) = usage_info {
             usage_rows.push((served, usage));
         }
-        let _ = on_event.send(ReviewEvent::Proposed { document_id: p.id, proposal });
+        let _ = on_event.send(ReviewEvent::Proposed {
+            document_id: p.id,
+            proposal,
+        });
         proposed += 1;
     }
     log_background_usage(&app, &models, &usage_rows);
@@ -846,12 +897,23 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
             let mut logged = 0usize;
             for d in &decisions {
                 let title: String = tx
-                    .query_row("SELECT title FROM documents WHERE id = ?1", params![d.document_id], |r| r.get(0))
+                    .query_row(
+                        "SELECT title FROM documents WHERE id = ?1",
+                        params![d.document_id],
+                        |r| r.get(0),
+                    )
                     .unwrap_or_default();
                 logged += review::log_corrections(&tx, d, &title)?;
                 let importance = review::normalize_importance(d.importance.clone());
                 let w = ingest::rewrite_vault_metadata(
-                    &tx, &vault, d.document_id, &d.project, &d.tags, importance.as_deref(), true, &now,
+                    &tx,
+                    &vault,
+                    d.document_id,
+                    &d.project,
+                    &d.tags,
+                    importance.as_deref(),
+                    true,
+                    &now,
                 )?;
                 written.push(w);
             }
@@ -910,12 +972,16 @@ pub async fn set_document_metadata(
         let mut written: Vec<(std::path::PathBuf, String)> = Vec::new();
 
         let work = (|| -> Result<()> {
-            let (cur_project, cur_tags_json, cur_importance, title): (String, String, Option<String>, String) = tx
-                .query_row(
-                    "SELECT project, tags, importance, title FROM documents WHERE id = ?1",
-                    params![document_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )?;
+            let (cur_project, cur_tags_json, cur_importance, title): (
+                String,
+                String,
+                Option<String>,
+                String,
+            ) = tx.query_row(
+                "SELECT project, tags, importance, title FROM documents WHERE id = ?1",
+                params![document_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
             let decision = ReviewDecision {
                 document_id,
                 project: project.clone(),
@@ -927,7 +993,14 @@ pub async fn set_document_metadata(
             };
             review::log_corrections(&tx, &decision, &title)?;
             written.push(ingest::rewrite_vault_metadata(
-                &tx, &vault, document_id, &project, &tags, importance.as_deref(), true, &now,
+                &tx,
+                &vault,
+                document_id,
+                &project,
+                &tags,
+                importance.as_deref(),
+                true,
+                &now,
             )?);
             Ok(())
         })();
@@ -1026,7 +1099,11 @@ pub async fn propose_project_metadata(
     let mut proposed = 0;
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
     for t in targets {
-        let others: Vec<String> = all_projects.iter().filter(|p| **p != t.name).cloned().collect();
+        let others: Vec<String> = all_projects
+            .iter()
+            .filter(|p| **p != t.name)
+            .cloned()
+            .collect();
         let (proposal, usage_info) =
             projects::propose(&api_key, &models, &t.name, &t.samples, &others).await;
         if let Some((usage, served)) = usage_info {
@@ -1126,7 +1203,9 @@ pub fn set_google_client(client_id: String, client_secret: String) -> Result<()>
     let id = client_id.trim();
     let secret = client_secret.trim();
     if id.is_empty() || secret.is_empty() {
-        return Err(Error::Other("Both the Client ID and Client secret are required.".into()));
+        return Err(Error::Other(
+            "Both the Client ID and Client secret are required.".into(),
+        ));
     }
     secrets::set_google_client(id, secret)
 }
@@ -1300,12 +1379,20 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
         return Ok(());
     }
 
-    let (updated, usage, served) = learning::distill(&api_key, &models, &current, &corrections).await?;
+    let (updated, usage, served) =
+        learning::distill(&api_key, &models, &current, &corrections).await?;
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
     let conn = state.db.lock().unwrap();
-    log_usage(&conn, "background", served.as_deref().or_else(|| models.first().map(String::as_str)), &usage);
+    log_usage(
+        &conn,
+        "background",
+        served
+            .as_deref()
+            .or_else(|| models.first().map(String::as_str)),
+        &usage,
+    );
     learning::save_profile(&conn, &updated, &now)
 }
 
@@ -1356,7 +1443,14 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
     let conn = state.db.lock().unwrap();
-    log_usage(&conn, "background", served.as_deref().or_else(|| models.first().map(String::as_str)), &usage);
+    log_usage(
+        &conn,
+        "background",
+        served
+            .as_deref()
+            .or_else(|| models.first().map(String::as_str)),
+        &usage,
+    );
     briefing::save_briefing(&conn, &text, &now)?;
     briefing::get_briefing(&conn)
 }
@@ -1453,7 +1547,13 @@ pub async fn model_recommendations(app: AppHandle) -> Result<ModelRecommendation
     let stale = cost::pricing_is_stale(hours);
     let curated = curated_tiers();
     let (day_to_day, advanced) = recommend::recommend(&catalogue, &curated, &denylist);
-    Ok(ModelRecommendations { day_to_day, advanced, denylist, zdr_enforced: true, stale })
+    Ok(ModelRecommendations {
+        day_to_day,
+        advanced,
+        denylist,
+        zdr_enforced: true,
+        stale,
+    })
 }
 
 /// Persist the recommender denylist (provider/model slugs). Cleaned like model lists:
@@ -1537,14 +1637,20 @@ fn log_usage(conn: &Connection, kind: &str, model: Option<&str>, usage: &openrou
 
 /// Write collected background usage rows under one short lock (best-effort), each
 /// attributed to its served model, or the requested primary when none was reported.
-fn log_background_usage(app: &AppHandle, models: &[String], rows: &[(Option<String>, openrouter::Usage)]) {
+fn log_background_usage(
+    app: &AppHandle,
+    models: &[String],
+    rows: &[(Option<String>, openrouter::Usage)],
+) {
     if rows.is_empty() {
         return;
     }
     let state = app.state::<AppState>();
     let Ok(conn) = state.db.lock() else { return };
     for (served, usage) in rows {
-        let model = served.as_deref().or_else(|| models.first().map(String::as_str));
+        let model = served
+            .as_deref()
+            .or_else(|| models.first().map(String::as_str));
         log_usage(&conn, "background", model, usage);
     }
 }
@@ -1622,9 +1728,12 @@ async fn refresh_pricing_now(app: &AppHandle) -> Result<()> {
     // OpenRouter keeps an older timestamp and drops out of candidacy — see `cached_catalogue`),
     // and keeps the staleness check exact.
     let fetched_at: String =
-        tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0))?;
+        tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+            r.get(0)
+        })?;
     for m in &models {
-        let supported = serde_json::to_string(&m.supported_parameters).unwrap_or_else(|_| "[]".into());
+        let supported =
+            serde_json::to_string(&m.supported_parameters).unwrap_or_else(|_| "[]".into());
         let modalities = serde_json::to_string(&m.input_modalities).unwrap_or_else(|_| "[]".into());
         tx.execute(
             "INSERT INTO model_pricing(model, prompt_price, completion_price, name, context_length, \
@@ -1659,7 +1768,9 @@ fn build_cost_summary(conn: &Connection) -> Result<CostSummary> {
     let total_30d_usd = total_cost(&last_30d);
     let total_all_time_usd = total_cost(&all_time);
     let pricing_updated_at: Option<String> = conn
-        .query_row("SELECT MAX(fetched_at) FROM model_pricing", [], |r| r.get(0))
+        .query_row("SELECT MAX(fetched_at) FROM model_pricing", [], |r| {
+            r.get(0)
+        })
         .ok()
         .flatten();
     Ok(CostSummary {
@@ -1741,7 +1852,11 @@ fn total_cost(rows: &[ModelSpend]) -> Option<f64> {
 /// Current UTC time in the store's ISO8601 format (matches ingest timestamps).
 fn iso_now(state: &AppState) -> Result<String> {
     let conn = state.db.lock().unwrap();
-    Ok(conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0))?)
+    Ok(
+        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// Resolve the user's stored IANA zone to a `chrono_tz::Tz`. Falls back to UTC when
@@ -1884,9 +1999,11 @@ pub async fn export_all_data(
     }
     let data_dir = paths::data_dir(&app)?;
     let dest = dest_path;
-    tokio::task::spawn_blocking(move || write_export_zip(&data_dir, &snapshot, std::path::Path::new(&dest)))
-        .await
-        .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        write_export_zip(&data_dir, &snapshot, std::path::Path::new(&dest))
+    })
+    .await
+    .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
 }
 
 /// Write the export archive: the DB snapshot as `pm.sqlite`, then the vault tree.
@@ -1959,7 +2076,14 @@ mod tests {
 
         let stored = models_for(&conn, CHAT_MODELS_KEY).unwrap();
         assert!(stored.len() <= 50, "model count is capped");
-        assert!(stored.iter().all(|m| m.chars().count() <= 200), "over-long id dropped");
-        assert_eq!(stored.iter().filter(|m| *m == "vendor/model-0").count(), 1, "de-duped");
+        assert!(
+            stored.iter().all(|m| m.chars().count() <= 200),
+            "over-long id dropped"
+        );
+        assert_eq!(
+            stored.iter().filter(|m| *m == "vendor/model-0").count(),
+            1,
+            "de-duped"
+        );
     }
 }

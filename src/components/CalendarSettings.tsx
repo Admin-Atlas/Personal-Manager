@@ -18,9 +18,7 @@ import {
 import type { CalendarStatus, GoogleCalendar, IcsFeedInfo } from "../lib/types";
 import { Button, ConfirmDialog, Input, Skeleton } from "./ui";
 
-type Confirm =
-  | { kind: "disconnect" }
-  | { kind: "remove-feed"; id: string; label: string };
+type Confirm = { kind: "disconnect" } | { kind: "remove-feed"; id: string; label: string };
 
 /**
  * The read-only calendar connector (Step 6). Two paths:
@@ -167,8 +165,8 @@ export function CalendarSettings() {
     <div className="mt-5 border-t border-border pt-4" data-help="settings-calendar">
       <label className="block text-sm font-medium text-ink2">Calendar</label>
       <p className="mt-1 text-xs text-ink4">
-        Read-only. Powers your agenda, schedule questions in chat, and the “Due soon” status when
-        an event names a project. Everything stays in your keychain / local store.
+        Read-only. Powers your agenda, schedule questions in chat, and the “Due soon” status when an
+        event names a project. Everything stays in your keychain / local store.
       </p>
 
       {/* iCal feeds — the simple default path. */}
@@ -197,7 +195,10 @@ export function CalendarSettings() {
         {feeds.length > 0 && (
           <ul className="mt-2 divide-y divide-rule rounded-[var(--radius)] border border-border">
             {feeds.map((f) => (
-              <li key={f.id} className="flex items-center justify-between px-3 py-1.5 text-sm text-ink">
+              <li
+                key={f.id}
+                className="flex items-center justify-between px-3 py-1.5 text-sm text-ink"
+              >
                 <span className="truncate">{f.label}</span>
                 <Button
                   variant="tertiary"
@@ -336,7 +337,10 @@ export function CalendarSettings() {
                 ) : (
                   <ul className="max-h-40 overflow-y-auto rounded-[var(--radius)] border border-border">
                     {calendars.map((c) => (
-                      <li key={c.id} className="flex items-center gap-2 px-3 py-1.5 text-sm text-ink">
+                      <li
+                        key={c.id}
+                        className="flex items-center gap-2 px-3 py-1.5 text-sm text-ink"
+                      >
                         <input
                           type="checkbox"
                           checked={c.selected}
@@ -345,7 +349,9 @@ export function CalendarSettings() {
                           className="accent-[var(--accent)]"
                         />
                         <span className="truncate">{c.summary}</span>
-                        {c.primary && <span className="font-mono text-[10px] text-ink4">primary</span>}
+                        {c.primary && (
+                          <span className="font-mono text-[10px] text-ink4">primary</span>
+                        )}
                       </li>
                     ))}
                   </ul>
@@ -368,7 +374,11 @@ export function CalendarSettings() {
 
       <ConfirmDialog
         open={confirm != null}
-        title={confirm?.kind === "disconnect" ? "Disconnect Google Calendar?" : "Remove this calendar feed?"}
+        title={
+          confirm?.kind === "disconnect"
+            ? "Disconnect Google Calendar?"
+            : "Remove this calendar feed?"
+        }
         danger
         confirmLabel={confirm?.kind === "disconnect" ? "Disconnect" : "Remove"}
         onConfirm={() => {
@@ -408,7 +418,10 @@ function FeedGuide() {
         </a>{" "}
         on the web.
       </li>
-      <li>2. Hover the calendar in the left list → ⋮ → <span className="text-ink2">Settings and sharing</span>.</li>
+      <li>
+        2. Hover the calendar in the left list → ⋮ →{" "}
+        <span className="text-ink2">Settings and sharing</span>.
+      </li>
       <li>
         3. Scroll to <span className="text-ink2">Integrate calendar</span> → copy the{" "}
         <span className="text-ink2">Secret address in iCal format</span>.

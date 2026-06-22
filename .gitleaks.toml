@@ -1,0 +1,60 @@
+# gitleaks config for PM. Extends the upstream default ruleset with detectors for
+# the secret *shapes* this project actually handles, so a leak of one of ours is
+# caught even if it doesn't match a generic pattern.
+#
+# Secrets live only in the OS keychain (runtime) or GitHub Actions secrets (CI) —
+# never in the tree (tracked or ignored). See AGENTS.md "Security model".
+
+title = "PM gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "pm-openrouter-api-key"
+description = "OpenRouter API key"
+# OpenRouter keys are `sk-or-v1-` + a long token.
+regex = '''(?i)\bsk-or-v1-[a-z0-9_-]{20,}\b'''
+keywords = ["sk-or-v1-"]
+
+[[rules]]
+id = "pm-minisign-secret-key"
+description = "minisign secret key (the updater signing key) — plaintext key file"
+# The secret key file's comment line; the PUBLIC key says "public key", so this
+# never matches the pubkey committed in tauri.conf.json.
+regex = '''untrusted comment: minisign (encrypted )?secret key'''
+keywords = ["minisign"]
+
+[[rules]]
+id = "pm-minisign-secret-key-base64"
+description = "minisign secret key (the updater signing key) — base64-encoded key file"
+# base64 of "untrusted comment: minisign encrypted secret key". Diverges from the
+# public key's base64 (…IHB1…) at the final group, so the pubkey is not matched.
+regex = '''dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIGVu[A-Za-z0-9+/=\s]{16,}'''
+keywords = ["dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWdu"]
+
+[[rules]]
+id = "pm-google-private-ical-url"
+description = "Google private iCal feed URL (a secret calendar address)"
+regex = '''https://calendar\.google\.com/calendar/ical/[^/\s"'<>]+/private-[A-Za-z0-9]+/basic\.ics'''
+keywords = ["calendar.google.com/calendar/ical"]
+
+[allowlist]
+description = "Known-safe values + non-source paths"
+# Build output / dependencies / runtime dirs are never our source. CI scans a
+# clean checkout (these aren't present), but excluding them keeps local
+# `just gitleaks` fast and free of third-party false positives.
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+  '''(^|/)dist(-ssr)?/''',
+  '''(^|/)\.venv/''',
+  '''(^|/)\.git/''',
+]
+regexes = [
+  # The updater's minisign PUBLIC key (safe to ship — it only verifies updates).
+  '''dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6''',
+  # An obvious dummy SQLCipher key used only in unit tests (a sequential 00 11 22…
+  # byte pattern), not a real secret — trips the default high-entropy rule.
+  '''00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff''',
+]

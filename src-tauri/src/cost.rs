@@ -52,7 +52,10 @@ mod tests {
         // A missing price → unknown (None), never silently zero.
         assert!(call_cost(Some(1000), Some(500), None, Some(15e-6)).is_none());
         // A genuinely free model ($0 prices) is a real 0.0, distinct from unknown.
-        assert_eq!(call_cost(Some(1000), Some(500), Some(0.0), Some(0.0)), Some(0.0));
+        assert_eq!(
+            call_cost(Some(1000), Some(500), Some(0.0), Some(0.0)),
+            Some(0.0)
+        );
         // Missing token counts count as 0.
         assert_eq!(call_cost(None, None, Some(3e-6), Some(15e-6)), Some(0.0));
     }

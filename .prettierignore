@@ -1,0 +1,29 @@
+# Build output & dependencies
+node_modules
+dist
+dist-ssr
+.dist
+src-tauri/target
+src-tauri/gen
+
+# Generated / vendored — not ours to reformat
+package-lock.json
+src-tauri/Cargo.lock
+design-system-docs
+THIRD-PARTY-NOTICES.txt
+
+# Handlebars template for cargo-about (whitespace is significant; Prettier mangles it)
+*.hbs
+
+# Local-only working tree (git-ignored)
+docs
+
+# Tool-managed configs — left as their tools write them, not reflowed by Prettier
+.claude
+.vscode
+
+# Prose/data left as authored
+*.md
+
+# Workflows are checked by zizmor/actionlint, not reflowed by Prettier
+.github

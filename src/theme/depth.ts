@@ -13,8 +13,8 @@ const RANK: Record<Depth, number> = { min: 0, standard: 1, power: 2 };
 export interface DepthState {
   depth: Depth;
   atLeast: (d: Depth) => boolean;
-  minimal: boolean;   // depth === "min": hide meta, larger type, more air
-  showMeta: boolean;  // depth >= standard: meta lines, model footers, secondary columns
+  minimal: boolean; // depth === "min": hide meta, larger type, more air
+  showMeta: boolean; // depth >= standard: meta lines, model footers, secondary columns
   showPower: boolean; // depth === "power": cost, token counts, timestamps, keybind hints
 }
 

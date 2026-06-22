@@ -53,7 +53,11 @@ pub fn get_profile(conn: &Connection) -> Result<LearningProfile> {
     let updated_at = db::get_setting(conn, PROFILE_UPDATED_KEY)?;
     let correction_count: i64 =
         conn.query_row("SELECT count(*) FROM corrections", [], |r| r.get(0))?;
-    Ok(LearningProfile { profile, updated_at, correction_count })
+    Ok(LearningProfile {
+        profile,
+        updated_at,
+        correction_count,
+    })
 }
 
 /// Persist a freshly distilled profile + the time it was distilled.
@@ -139,7 +143,10 @@ fn build_messages(current_profile: &str, corrections: &[Correction]) -> Vec<Chat
         let before = c.before.as_deref().unwrap_or("null");
         let after = c.after.as_deref().unwrap_or("null");
         let title = c.title.as_deref().unwrap_or("");
-        log.push_str(&format!("- {}: {before} → {after}  (document: {title})\n", c.field));
+        log.push_str(&format!(
+            "- {}: {before} → {after}  (document: {title})\n",
+            c.field
+        ));
     }
     if log.is_empty() {
         log.push_str("(no corrections logged)\n");
@@ -168,8 +175,14 @@ fn build_messages(current_profile: &str, corrections: &[Correction]) -> Vec<Chat
     );
 
     vec![
-        ChatMessage { role: "system".into(), content: system },
-        ChatMessage { role: "user".into(), content: user },
+        ChatMessage {
+            role: "system".into(),
+            content: system,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: user,
+        },
     ]
 }
 
@@ -227,7 +240,10 @@ mod tests {
 
     #[test]
     fn clean_strips_code_fences_and_language_tag() {
-        assert_eq!(clean("```markdown\n- likes X\n- files Y\n```"), "- likes X\n- files Y");
+        assert_eq!(
+            clean("```markdown\n- likes X\n- files Y\n```"),
+            "- likes X\n- files Y"
+        );
         assert_eq!(clean("```\nplain\n```"), "plain");
         assert_eq!(clean("  no fences  "), "no fences");
     }

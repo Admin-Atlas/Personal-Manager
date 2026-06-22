@@ -60,10 +60,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
     };
   }, [open]);
 
-  const selected = useMemo(
-    () => models?.find((m) => m.id === value) ?? null,
-    [models, value],
-  );
+  const selected = useMemo(() => models?.find((m) => m.id === value) ?? null, [models, value]);
 
   const filtered = useMemo(() => {
     if (!models) return [];
@@ -89,8 +86,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
 
   // Let the user pick a model id that isn't in the catalogue (or hasn't loaded).
   const trimmed = query.trim();
-  const customAvailable =
-    trimmed.length > 0 && !filtered.some((m) => m.id === trimmed);
+  const customAvailable = trimmed.length > 0 && !filtered.some((m) => m.id === trimmed);
 
   function pick(modelId: string) {
     onChange(modelId);
@@ -107,9 +103,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
       >
         <span className="min-w-0 flex-1 truncate">
           {selected ? selected.name : value || triggerLabel}
-          {selected && (
-            <span className="ml-2 font-mono text-xs text-ink4">{selected.id}</span>
-          )}
+          {selected && <span className="ml-2 font-mono text-xs text-ink4">{selected.id}</span>}
         </span>
         <span className="shrink-0 text-ink4">{open ? "▴" : "▾"}</span>
       </button>
@@ -129,7 +123,9 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
           {/* Count, a price-sort toggle, and the column hint for the prices. */}
           {models && !error && (
             <div className="flex items-center gap-2 px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-faint">
-              <span>{filtered.length} model{filtered.length === 1 ? "" : "s"}</span>
+              <span>
+                {filtered.length} model{filtered.length === 1 ? "" : "s"}
+              </span>
               <Button
                 variant="tertiary"
                 onClick={() =>
@@ -173,9 +169,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <span className="truncate text-sm text-ink">{m.name}</span>
-                      {m.id === value && (
-                        <span className="shrink-0 text-xs text-st-quick">✓</span>
-                      )}
+                      {m.id === value && <span className="shrink-0 text-xs text-st-quick">✓</span>}
                     </div>
                     <div className="truncate font-mono text-xs text-ink4">{m.id}</div>
                     <div className="mt-1 flex flex-wrap gap-1">
@@ -245,7 +239,7 @@ function modelTags(m: ModelInfo): Tag[] {
       label: "Free",
       cls: "bg-[color-mix(in_oklab,var(--st-quick)_15%,transparent)] text-[var(--st-quick)]",
     });
-  if (/(?:^|[/\-])(?:o[134]|r1|qwq)|reason|think/.test(hay))
+  if (/(?:^|[/-])(?:o[134]|r1|qwq)|reason|think/.test(hay))
     tags.push({
       label: "Reasoning",
       cls: "bg-[color-mix(in_oklab,var(--st-blocked)_15%,transparent)] text-[var(--st-blocked)]",

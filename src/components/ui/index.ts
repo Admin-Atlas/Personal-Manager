@@ -9,11 +9,7 @@ export { Button, type ButtonProps, type ButtonVariant } from "./Button";
 export { Input } from "./Input";
 export { Textarea } from "./Textarea";
 export { Select } from "./Select";
-export {
-  SegmentedControl,
-  type SegOption,
-  type SegmentedControlProps,
-} from "./SegmentedControl";
+export { SegmentedControl, type SegOption, type SegmentedControlProps } from "./SegmentedControl";
 export { Card, type CardProps } from "./Card";
 export { Collapsible, type CollapsibleProps } from "./Collapsible";
 export { ListRow, type ListRowProps } from "./ListRow";

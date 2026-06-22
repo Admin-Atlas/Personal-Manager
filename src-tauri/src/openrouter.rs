@@ -130,7 +130,10 @@ pub async fn fetch_catalogue() -> Result<Vec<ModelDetail>> {
         .timeout(std::time::Duration::from_secs(30))
         .build()?
         .get(MODELS_ENDPOINT)
-        .header("HTTP-Referer", "https://github.com/Admin-Atlas/Personal-Manager")
+        .header(
+            "HTTP-Referer",
+            "https://github.com/Admin-Atlas/Personal-Manager",
+        )
         .header("X-Title", "PM")
         .send()
         .await?;
@@ -165,7 +168,10 @@ pub async fn fetch_catalogue() -> Result<Vec<ModelDetail>> {
                 prompt_price,
                 completion_price,
                 cache_read_price,
-                input_modalities: m.architecture.map(|a| a.input_modalities).unwrap_or_default(),
+                input_modalities: m
+                    .architecture
+                    .map(|a| a.input_modalities)
+                    .unwrap_or_default(),
                 supported_parameters: m.supported_parameters,
                 intelligence_index,
             }
@@ -283,7 +289,10 @@ where
         .post(ENDPOINT)
         .bearer_auth(api_key)
         // Optional attribution headers OpenRouter recognises.
-        .header("HTTP-Referer", "https://github.com/Admin-Atlas/Personal-Manager")
+        .header(
+            "HTTP-Referer",
+            "https://github.com/Admin-Atlas/Personal-Manager",
+        )
         .header("X-Title", "PM")
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .json(&body)
@@ -321,7 +330,11 @@ where
             };
             let data = data.trim();
             if data == "[DONE]" {
-                return Ok(Completion { text: full, model: served, usage });
+                return Ok(Completion {
+                    text: full,
+                    model: served,
+                    usage,
+                });
             }
             if data.is_empty() {
                 continue;
@@ -343,7 +356,9 @@ where
                 if let Some(token) = value["choices"][0]["delta"]["content"].as_str() {
                     full.push_str(token);
                     if full.len() > MAX_REPLY_BYTES {
-                        return Err(Error::Other("the model reply exceeded the size limit".into()));
+                        return Err(Error::Other(
+                            "the model reply exceeded the size limit".into(),
+                        ));
                     }
                     on_token(token);
                 }
@@ -353,11 +368,17 @@ where
         // After draining complete lines, only an unfinished line remains; if it has
         // grown past the cap there's no newline coming — bail rather than buffer on.
         if buffer.len() > MAX_SSE_LINE_BYTES {
-            return Err(Error::Other("the model stream sent an oversized line".into()));
+            return Err(Error::Other(
+                "the model stream sent an oversized line".into(),
+            ));
         }
     }
 
-    Ok(Completion { text: full, model: served, usage })
+    Ok(Completion {
+        text: full,
+        model: served,
+        usage,
+    })
 }
 
 /// Drain every complete `\n`-terminated line from a raw SSE byte buffer, decoding
@@ -371,6 +392,49 @@ fn drain_lines(buffer: &mut Vec<u8>) -> Vec<String> {
         lines.push(String::from_utf8_lossy(&line_bytes).trim().to_string());
     }
     lines
+}
+
+/// A single non-streaming chat completion — used for background work (sorting
+/// proposals, the Learning-You profile) where we want the whole answer at once,
+/// not a token stream. Takes an ordered model list (one model, or several for
+/// auto-switch fallback). Returns the assistant message content.
+pub async fn complete(
+    api_key: &str,
+    models: &[String],
+    messages: &[ChatMessage],
+) -> Result<Completion> {
+    let body = chat_body(models, messages, false);
+
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?
+        .post(ENDPOINT)
+        .bearer_auth(api_key)
+        .header(
+            "HTTP-Referer",
+            "https://github.com/Admin-Atlas/Personal-Manager",
+        )
+        .header("X-Title", "PM")
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = crate::error::truncate_detail(&response.text().await.unwrap_or_default());
+        return Err(request_error(status, &detail));
+    }
+
+    let value: serde_json::Value = response.json().await?;
+    let text = value["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| Error::Other("OpenRouter response had no message content".into()))?;
+    Ok(Completion {
+        text,
+        model: value["model"].as_str().map(str::to_string),
+        usage: parse_usage(&value),
+    })
 }
 
 #[cfg(test)]
@@ -404,9 +468,10 @@ mod tests {
     #[test]
     fn parse_usage_reads_tokens_and_defaults_to_none() {
         // The final streamed usage chunk has empty choices + a usage object.
-        let chunk: serde_json::Value =
-            serde_json::from_str(r#"{"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45}}"#)
-                .unwrap();
+        let chunk: serde_json::Value = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45}}"#,
+        )
+        .unwrap();
         let u = parse_usage(&chunk);
         assert_eq!(u.prompt_tokens, Some(123));
         assert_eq!(u.completion_tokens, Some(45));
@@ -423,10 +488,16 @@ mod tests {
         // usage opt-in. chat_body is PM's only ZDR enforcement point, so this guards it.
         let one = chat_body(&["a/b".to_string()], &[], true);
         assert_eq!(one["provider"]["zdr"], serde_json::json!(true));
-        assert_eq!(one["provider"]["data_collection"], serde_json::json!("deny"));
+        assert_eq!(
+            one["provider"]["data_collection"],
+            serde_json::json!("deny")
+        );
         assert_eq!(one["model"], serde_json::json!("a/b"));
         assert!(one.get("models").is_none());
-        assert_eq!(one["stream_options"]["include_usage"], serde_json::json!(true));
+        assert_eq!(
+            one["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
         // Several models: the ordered "models" fallback list, still ZDR-enforced, no "model"
         // and (non-streaming) no usage opt-in.
         let many = chat_body(&["a/b".to_string(), "c/d".to_string()], &[], false);
@@ -435,40 +506,4 @@ mod tests {
         assert_eq!(many["provider"]["zdr"], serde_json::json!(true));
         assert!(many.get("stream_options").is_none());
     }
-}
-
-/// A single non-streaming chat completion — used for background work (sorting
-/// proposals, the Learning-You profile) where we want the whole answer at once,
-/// not a token stream. Takes an ordered model list (one model, or several for
-/// auto-switch fallback). Returns the assistant message content.
-pub async fn complete(api_key: &str, models: &[String], messages: &[ChatMessage]) -> Result<Completion> {
-    let body = chat_body(models, messages, false);
-
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?
-        .post(ENDPOINT)
-        .bearer_auth(api_key)
-        .header("HTTP-Referer", "https://github.com/Admin-Atlas/Personal-Manager")
-        .header("X-Title", "PM")
-        .json(&body)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let detail = crate::error::truncate_detail(&response.text().await.unwrap_or_default());
-        return Err(request_error(status, &detail));
-    }
-
-    let value: serde_json::Value = response.json().await?;
-    let text = value["choices"][0]["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| Error::Other("OpenRouter response had no message content".into()))?;
-    Ok(Completion {
-        text,
-        model: value["model"].as_str().map(str::to_string),
-        usage: parse_usage(&value),
-    })
 }

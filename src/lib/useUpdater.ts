@@ -53,7 +53,7 @@ export function useUpdater(): AppUpdate {
     let cancelled = false;
 
     (async () => {
-      let found: Update | null = null;
+      let found: Update | null;
       try {
         found = await check();
       } catch {
@@ -119,5 +119,14 @@ export function useUpdater(): AppUpdate {
     setDismissed(true);
   }, []);
 
-  return { status, version, progress, dismissed, installFailed, releasesUrl: RELEASES_URL, restart, dismiss };
+  return {
+    status,
+    version,
+    progress,
+    dismissed,
+    installFailed,
+    releasesUrl: RELEASES_URL,
+    restart,
+    dismiss,
+  };
 }

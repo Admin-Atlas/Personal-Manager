@@ -58,7 +58,11 @@ pub fn get_briefing(conn: &Connection) -> Result<DailyBriefing> {
     let briefing = db::get_setting(conn, BRIEFING_KEY)?.unwrap_or_default();
     let updated_at = db::get_setting(conn, BRIEFING_UPDATED_KEY)?;
     let stale = is_stale(conn, updated_at.as_deref())?;
-    Ok(DailyBriefing { briefing, updated_at, stale })
+    Ok(DailyBriefing {
+        briefing,
+        updated_at,
+        stale,
+    })
 }
 
 /// Persist a freshly generated briefing + the time it was generated.
@@ -71,7 +75,9 @@ pub fn save_briefing(conn: &Connection, briefing: &str, now: &str) -> Result<()>
 /// True when there's no briefing yet or the stored one is older than [`STALE_HOURS`].
 /// The hour delta is computed in SQL (the `Z` is stripped, mirroring `projects.rs`).
 fn is_stale(conn: &Connection, updated_at: Option<&str>) -> Result<bool> {
-    let Some(ts) = updated_at else { return Ok(true) };
+    let Some(ts) = updated_at else {
+        return Ok(true);
+    };
     let hours: Option<f64> = conn
         .query_row(
             "SELECT (julianday('now') - julianday(replace(?1,'Z',''))) * 24.0",
@@ -164,7 +170,11 @@ fn due_soon_line(p: &ProjectOverview, zone: Tz) -> String {
         let when = clock::to_zone_display(&ev.start, zone);
         format!("{} (event: {} on {when})", p.name, ev.summary)
     } else if let Some(d) = &p.deadline {
-        format!("{} (due {})", p.name, d.chars().take(10).collect::<String>())
+        format!(
+            "{} (due {})",
+            p.name,
+            d.chars().take(10).collect::<String>()
+        )
     } else {
         p.name.clone()
     }
@@ -225,8 +235,14 @@ fn build_messages(snapshot: &str, profile: Option<&str>) -> Vec<ChatMessage> {
     let user = format!("Snapshot:\n{snapshot}\n\nWrite the briefing.");
 
     vec![
-        ChatMessage { role: "system".into(), content: system },
-        ChatMessage { role: "user".into(), content: user },
+        ChatMessage {
+            role: "system".into(),
+            content: system,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: user,
+        },
     ]
 }
 
@@ -323,7 +339,10 @@ mod tests {
 
     #[test]
     fn clean_strips_fences() {
-        assert_eq!(clean("```\nFocus on PM v1 today.\n```"), "Focus on PM v1 today.");
+        assert_eq!(
+            clean("```\nFocus on PM v1 today.\n```"),
+            "Focus on PM v1 today."
+        );
         assert_eq!(clean("  plain briefing  "), "plain briefing");
     }
 }

@@ -50,8 +50,21 @@ export function LockScreen({ onUnlocked }: { onUnlocked: () => void }) {
       <div className="flex h-12 w-12 items-center justify-center rounded-full border border-border text-ink2">
         {/* A simple padlock glyph — no icon dep. */}
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <rect x="4" y="10" width="16" height="10" rx="2" stroke="currentColor" strokeWidth="1.6" />
-          <path d="M8 10V7a4 4 0 1 1 8 0v3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+          <rect
+            x="4"
+            y="10"
+            width="16"
+            height="10"
+            rx="2"
+            stroke="currentColor"
+            strokeWidth="1.6"
+          />
+          <path
+            d="M8 10V7a4 4 0 1 1 8 0v3"
+            stroke="currentColor"
+            strokeWidth="1.6"
+            strokeLinecap="round"
+          />
         </svg>
       </div>
 

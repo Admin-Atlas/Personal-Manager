@@ -37,7 +37,10 @@ pub struct Token {
 
 /// True once the user has pasted a client id + secret.
 pub fn has_client() -> Result<bool> {
-    Ok(secrets::get_google_client_id()?.is_some() && secrets::get_google_client_secret()?.is_some())
+    Ok(
+        secrets::get_google_client_id()?.is_some()
+            && secrets::get_google_client_secret()?.is_some(),
+    )
 }
 
 /// True once an OAuth token is stored (the user has completed sign-in).
@@ -46,10 +49,12 @@ pub fn is_connected() -> Result<bool> {
 }
 
 fn client_creds() -> Result<(String, String)> {
-    let id = secrets::get_google_client_id()?
-        .ok_or_else(|| Error::Other("Add your Google client ID and secret in Settings first.".into()))?;
-    let secret = secrets::get_google_client_secret()?
-        .ok_or_else(|| Error::Other("Add your Google client ID and secret in Settings first.".into()))?;
+    let id = secrets::get_google_client_id()?.ok_or_else(|| {
+        Error::Other("Add your Google client ID and secret in Settings first.".into())
+    })?;
+    let secret = secrets::get_google_client_secret()?.ok_or_else(|| {
+        Error::Other("Add your Google client ID and secret in Settings first.".into())
+    })?;
     Ok((id, secret))
 }
 
@@ -74,7 +79,13 @@ pub async fn connect() -> Result<()> {
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
-    let auth_url = build_auth_url(&client_id, &redirect_uri, &challenge, &state, CALENDAR_SCOPE)?;
+    let auth_url = build_auth_url(
+        &client_id,
+        &redirect_uri,
+        &challenge,
+        &state,
+        CALENDAR_SCOPE,
+    )?;
     open::that(&auth_url)
         .map_err(|e| Error::Other(format!("Couldn't open your browser to sign in: {e}")))?;
 
@@ -109,10 +120,18 @@ pub async fn authorized_get(url: &str) -> Result<serde_json::Value> {
         token = do_refresh(&client_id, &client_secret, &token).await?;
     }
 
-    let resp = http()?.get(url).bearer_auth(&token.access_token).send().await?;
+    let resp = http()?
+        .get(url)
+        .bearer_auth(&token.access_token)
+        .send()
+        .await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         let token = do_refresh(&client_id, &client_secret, &token).await?;
-        let resp = http()?.get(url).bearer_auth(&token.access_token).send().await?;
+        let resp = http()?
+            .get(url)
+            .bearer_auth(&token.access_token)
+            .send()
+            .await?;
         return json_or_err(resp).await;
     }
     json_or_err(resp).await
@@ -122,7 +141,9 @@ async fn json_or_err(resp: reqwest::Response) -> Result<serde_json::Value> {
     if !resp.status().is_success() {
         let status = resp.status();
         let detail = crate::error::truncate_detail(&resp.text().await.unwrap_or_default());
-        return Err(Error::Other(format!("Google API request failed ({status}): {detail}")));
+        return Err(Error::Other(format!(
+            "Google API request failed ({status}): {detail}"
+        )));
     }
     resp.json().await.map_err(Error::from)
 }
@@ -185,7 +206,9 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
     if !resp.status().is_success() {
         let status = resp.status();
         let detail = crate::error::truncate_detail(&resp.text().await.unwrap_or_default());
-        return Err(Error::Other(format!("Google sign-in failed ({status}): {detail}")));
+        return Err(Error::Other(format!(
+            "Google sign-in failed ({status}): {detail}"
+        )));
     }
     let t: TokenResponse = resp.json().await?;
     Ok(Token {
@@ -199,7 +222,8 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
 fn load_token() -> Result<Token> {
     let raw = secrets::get_google_token()?
         .ok_or_else(|| Error::Other("Not connected to Google. Connect in Settings.".into()))?;
-    serde_json::from_str(&raw).map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))
+    serde_json::from_str(&raw)
+        .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))
 }
 
 fn save_token(token: &Token) -> Result<()> {
@@ -262,11 +286,14 @@ fn wait_for_redirect(listener: std::net::TcpListener, expected_state: &str) -> R
     use std::io::Read;
 
     listener.set_nonblocking(true)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(REDIRECT_TIMEOUT_SECS);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(REDIRECT_TIMEOUT_SECS);
 
     loop {
         if std::time::Instant::now() >= deadline {
-            return Err(Error::Other("Timed out waiting for Google sign-in. Please try again.".into()));
+            return Err(Error::Other(
+                "Timed out waiting for Google sign-in. Please try again.".into(),
+            ));
         }
         let (mut stream, _) = match listener.accept() {
             Ok(pair) => pair,
@@ -278,7 +305,9 @@ fn wait_for_redirect(listener: std::net::TcpListener, expected_state: &str) -> R
         };
 
         stream.set_nonblocking(false).ok();
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .ok();
         let mut buf = [0u8; 4096];
         let n = match stream.read(&mut buf) {
             Ok(n) => n,
@@ -292,11 +321,18 @@ fn wait_for_redirect(listener: std::net::TcpListener, expected_state: &str) -> R
         let params = parse_query(&target);
 
         if let Some(err) = params.get("error") {
-            let _ = write_page(&mut stream, "Sign-in was cancelled. You can close this tab.");
+            let _ = write_page(
+                &mut stream,
+                "Sign-in was cancelled. You can close this tab.",
+            );
             return Err(Error::Other(format!("Google sign-in was declined: {err}")));
         }
         match params.get("code") {
-            Some(code) if params.get("state").is_some_and(|s| ct_eq(s, expected_state)) => {
+            Some(code)
+                if params
+                    .get("state")
+                    .is_some_and(|s| ct_eq(s, expected_state)) =>
+            {
                 let _ = write_page(
                     &mut stream,
                     "PM is connected to Google Calendar. You can close this tab and return to PM.",
@@ -304,8 +340,13 @@ fn wait_for_redirect(listener: std::net::TcpListener, expected_state: &str) -> R
                 return Ok(code.clone());
             }
             Some(_) => {
-                let _ = write_page(&mut stream, "Sign-in could not be verified. Please try again.");
-                return Err(Error::Other("OAuth state mismatch — sign-in aborted for safety.".into()));
+                let _ = write_page(
+                    &mut stream,
+                    "Sign-in could not be verified. Please try again.",
+                );
+                return Err(Error::Other(
+                    "OAuth state mismatch — sign-in aborted for safety.".into(),
+                ));
             }
             None => {
                 // Not the redirect (e.g. a favicon probe) — keep waiting.

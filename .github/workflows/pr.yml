@@ -1,0 +1,194 @@
+name: PR
+
+# The fast, enforced baseline that runs on every pull request. Each ecosystem is
+# its own job so a failure is legible at a glance, and every job invokes the same
+# `just` recipes the maintainer runs locally and pre-commit runs on commit — one
+# source of truth (the justfile), so local and CI cannot drift.
+#
+# SECURITY: this is `pull_request`, never `pull_request_target`. The latter runs
+# with this repo's secrets in the context of the (untrusted) fork head — which
+# would put the updater signing key within reach of fork code. Do not change it.
+# The token is read-only and no job references a secret, so this is safe on forks.
+#
+# Actions are SHA-pinned (the repo enforces it); the trailing "# vX.Y.Z" is the
+# human-readable version Dependabot reads. Pins mirror release.yml.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to a PR cancels the previous, still-running checks for it.
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- frontend: format, lint, type-check (TS / React) --------------------
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Prettier (--check)
+        run: just prettier
+      - name: ESLint
+        run: just eslint
+      - name: Type-check (tsc --noEmit)
+        run: just tsc
+
+  # --- backend: format, clippy, check, tests (Rust) -----------------------
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        # @stable is a moving branch ref, not a version tag; pinned to its tip with
+        # an explicit toolchain so the SHA pin still selects stable.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust)
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+      - name: Install Linux Tauri build dependencies
+        # tauri/wry resolve the GTK/WebKit stack through pkg-config, so even
+        # `cargo check`/clippy need these dev packages on the runner.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: rustfmt (--check)
+        run: just cargo-fmt
+      - name: Clippy (-D warnings)
+        run: just clippy
+      - name: cargo check (--tests)
+        run: just cargo-check
+      - name: cargo test
+        run: just rust-test
+
+  # --- sidecar: lint + format (Python) ------------------------------------
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install Ruff
+        run: pip install ruff==0.15.18
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Ruff (check)
+        run: just ruff
+      - name: Ruff (format --check)
+        run: just ruff-fmt
+
+  # --- secrets: gitleaks over the working tree ----------------------------
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install gitleaks
+        # The CLI binary (not the Action) — keeps the check identical to local
+        # `just gitleaks` and avoids the Action's comment/permission surface.
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Scan for secrets
+        run: just gitleaks
+
+  # --- dependencies: CVEs + licences across all three ecosystems ----------
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Rust — cargo-deny (advisories + licences + bans + sources)
+        # Runs `cargo deny check` against src-tauri/ (finds src-tauri/deny.toml next
+        # to the manifest) — identical to local `just deny`.
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          manifest-path: ./src-tauri/Cargo.toml
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install pip-audit
+        run: pip install pip-audit==2.10.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Python — pip-audit (sidecar deps)
+        run: just pip-audit
+      - name: JS — npm audit
+        run: just npm-audit
+
+  # --- workflow security: zizmor over .github/workflows -------------------
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install zizmor
+        run: pip install zizmor==1.26.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Audit workflows
+        # GH_TOKEN lets zizmor's online audits run without hitting rate limits;
+        # the token is read-only (contents: read).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just zizmor
+
+  # --- version: lockstep + bumped-vs-base + changelog (the highest-value gate)
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Full history so the base commit is present for the bumped-vs-base check.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Version lockstep + bump + changelog
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: just version --base "$BASE_SHA"
+
+  # --- hygiene: files-in-place + SPDX headers + licence integrity ---------
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Files-in-place
+        run: just files
+      - name: SPDX headers + licence integrity
+        run: just headers

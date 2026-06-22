@@ -9,14 +9,9 @@
 // stored blob; on the same machine localStorage already holds the values, so nothing flashes
 // and the store is simply refreshed.
 
-import {
-  createContext, useContext, useEffect, useState, type ReactNode,
-} from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { applyTheme } from "./tokens";
-import {
-  ACCENTS, SYSTEMS, MODES, DEPTHS,
-  type System, type Mode, type Depth,
-} from "./profiles";
+import { ACCENTS, SYSTEMS, MODES, DEPTHS, type System, type Mode, type Depth } from "./profiles";
 import { getPref, setPref } from "../lib/ipc";
 
 // The settings-table key under which the full theme blob is mirrored (see below).
@@ -85,7 +80,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const [system, setSystemState] = useState<System>(initialSystem);
   const [mode, setModeState] = useState<Mode>(() => oneOf(read(KEY.mode), MODES, DEFAULT_MODE));
-  const [depth, setDepthState] = useState<Depth>(() => oneOf(read(KEY.depth), DEPTHS, DEFAULT_DEPTH));
+  const [depth, setDepthState] = useState<Depth>(() =>
+    oneOf(read(KEY.depth), DEPTHS, DEFAULT_DEPTH),
+  );
   const [accent, setAccentState] = useState<string>(() => {
     const stored = read(KEY.accent);
     return stored && ACCENTS[initialSystem].includes(stored)

@@ -131,8 +131,16 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
         let days_to_deadline: Option<f64> = row.get(8)?;
         let days_since: Option<f64> = row.get(9)?;
         Ok((
-            name, doc_count, last_activity, imp, deadline, size, blocked_by, parent,
-            days_to_deadline, days_since,
+            name,
+            doc_count,
+            last_activity,
+            imp,
+            deadline,
+            size,
+            blocked_by,
+            parent,
+            days_to_deadline,
+            days_since,
         ))
     })?;
 
@@ -145,7 +153,9 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     let events = calendar::upcoming_events(conn, calendar::AGENDA_DAYS, 250).unwrap_or_default();
 
     let mut out = Vec::new();
-    for (name, doc_count, last_activity, imp, deadline, size, blocked_by, parent, dtd, dsince) in raw {
+    for (name, doc_count, last_activity, imp, deadline, size, blocked_by, parent, dtd, dsince) in
+        raw
+    {
         // The effective deadline signal is the soonest of the manual deadline and a
         // name-matched calendar event; a deadline (either source) is the loudest signal.
         let manual_days = deadline.as_ref().and(dtd);
@@ -268,8 +278,13 @@ impl ProjectProposal {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProjectProposalEvent {
-    Proposed { project: String, proposal: ProjectProposal },
-    Finished { proposed: usize },
+    Proposed {
+        project: String,
+        proposal: ProjectProposal,
+    },
+    Finished {
+        proposed: usize,
+    },
 }
 
 /// Propose triage metadata for one project via the background model. Best-effort:
@@ -289,11 +304,18 @@ pub async fn propose(
     let messages = build_messages(project, samples, other_projects);
     match openrouter::complete(api_key, models, &messages).await {
         Ok(c) => (parse_proposal(&c.text, project), Some((c.usage, c.model))),
-        Err(e) => (ProjectProposal::fallback(format!("Proposal request failed: {e}")), None),
+        Err(e) => (
+            ProjectProposal::fallback(format!("Proposal request failed: {e}")),
+            None,
+        ),
     }
 }
 
-fn build_messages(project: &str, samples: &[String], other_projects: &[String]) -> Vec<ChatMessage> {
+fn build_messages(
+    project: &str,
+    samples: &[String],
+    other_projects: &[String],
+) -> Vec<ChatMessage> {
     let others = if other_projects.is_empty() {
         "(none yet)".to_string()
     } else {
@@ -305,7 +327,13 @@ fn build_messages(project: &str, samples: &[String], other_projects: &[String]) 
         samples
             .iter()
             .enumerate()
-            .map(|(i, s)| format!("- [{}] {}", i + 1, s.chars().take(SAMPLE_CHARS).collect::<String>()))
+            .map(|(i, s)| {
+                format!(
+                    "- [{}] {}",
+                    i + 1,
+                    s.chars().take(SAMPLE_CHARS).collect::<String>()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -326,8 +354,14 @@ fn build_messages(project: &str, samples: &[String], other_projects: &[String]) 
     let user = format!("Project: {project}\n\nDocument samples:\n{sample_block}");
 
     vec![
-        ChatMessage { role: "system".into(), content: system },
-        ChatMessage { role: "user".into(), content: user },
+        ChatMessage {
+            role: "system".into(),
+            content: system,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: user,
+        },
     ]
 }
 

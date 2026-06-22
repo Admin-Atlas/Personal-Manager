@@ -127,9 +127,9 @@ fn per_mtok(per_token: f64) -> f64 {
 /// True when the model can be relied on for PM's structured / tool-using calls: it must
 /// advertise tool-calling or structured-output support in `supported_parameters`.
 fn passes_reliability(m: &ModelDetail) -> bool {
-    m.supported_parameters.iter().any(|s| {
-        s == "tools" || s == "response_format" || s == "structured_outputs"
-    })
+    m.supported_parameters
+        .iter()
+        .any(|s| s == "tools" || s == "response_format" || s == "structured_outputs")
 }
 
 /// True when `id` is covered by a denylist entry. A bare provider ("openai") denies the
@@ -211,8 +211,12 @@ fn pick_advanced(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 // tie-break: the cheaper effective cost wins (unpriced sorts last).
                 .then_with(|| {
-                    let ca = effective_cost_per_token(a).map(per_mtok).unwrap_or(f64::INFINITY);
-                    let cb = effective_cost_per_token(b).map(per_mtok).unwrap_or(f64::INFINITY);
+                    let ca = effective_cost_per_token(a)
+                        .map(per_mtok)
+                        .unwrap_or(f64::INFINITY);
+                    let cb = effective_cost_per_token(b)
+                        .map(per_mtok)
+                        .unwrap_or(f64::INFINITY);
                     cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
                 })
         })?;
@@ -258,7 +262,11 @@ fn capability_score(m: &ModelDetail, curated_rank: Option<usize>) -> f64 {
             None => 0.0,
         },
     };
-    base + if curated_rank.is_some() { CURATED_BONUS } else { 0.0 }
+    base + if curated_rank.is_some() {
+        CURATED_BONUS
+    } else {
+        0.0
+    }
 }
 
 fn display_name(m: &ModelDetail) -> String {
@@ -317,7 +325,10 @@ mod tests {
         let with_cache = effective_cost_per_token(&m).unwrap();
         m.cache_read_price = None; // falls back to the full prompt rate
         let without_cache = effective_cost_per_token(&m).unwrap();
-        assert!(with_cache < without_cache, "cache read rate must lower effective cost");
+        assert!(
+            with_cache < without_cache,
+            "cache read rate must lower effective cost"
+        );
         m.prompt_price = None;
         assert!(effective_cost_per_token(&m).is_none());
     }
@@ -328,7 +339,10 @@ mod tests {
         assert!(is_denylisted("openai/gpt-5.5", &["openai/gpt".into()]));
         assert!(!is_denylisted("openai-mirror/x", &["openai".into()])); // boundary respected
         assert!(!is_denylisted("anthropic/claude", &["openai".into()]));
-        assert!(!is_denylisted("anthropic/claude", &[" ".into(), String::new()]));
+        assert!(!is_denylisted(
+            "anthropic/claude",
+            &[" ".into(), String::new()]
+        ));
     }
 
     #[test]

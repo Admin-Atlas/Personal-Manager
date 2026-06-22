@@ -198,10 +198,7 @@ export default function App() {
     // Reload persisted state. The conversation list (titles/order) always
     // refreshes; the messages are adopted only if the user is still here.
     try {
-      const [msgs, convs] = await Promise.all([
-        getMessages(convId),
-        listConversations(),
-      ]);
+      const [msgs, convs] = await Promise.all([getMessages(convId), listConversations()]);
       setConversations(convs);
       if (activeIdRef.current === convId) {
         chat.setMessages(msgs);

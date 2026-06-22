@@ -96,7 +96,10 @@ export function GraphView() {
           <div className="flex max-w-[60%] flex-wrap justify-end gap-x-3 gap-y-1">
             {layout.projects.map((p) => (
               <span key={p.name} className="inline-flex items-center gap-1.5 text-xs text-ink2">
-                <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: p.color }} />
+                <span
+                  className="inline-block h-2.5 w-2.5 rounded-full"
+                  style={{ background: p.color }}
+                />
                 {p.name}
               </span>
             ))}
@@ -140,7 +143,11 @@ export function GraphView() {
             No documents yet. Ingest some in the Documents view and they'll appear here.
           </div>
         ) : (
-          <svg viewBox={layout.viewBox} className="h-full w-full" preserveAspectRatio="xMidYMid meet">
+          <svg
+            viewBox={layout.viewBox}
+            className="h-full w-full"
+            preserveAspectRatio="xMidYMid meet"
+          >
             {layout.edges.map((e, i) => (
               <line
                 key={i}
@@ -155,7 +162,15 @@ export function GraphView() {
             {layout.nodes.map((n) =>
               n.kind === "project" ? (
                 <g key={n.id} className="pointer-events-none">
-                  <circle cx={n.x} cy={n.y} r={n.radius} fill={n.color} fillOpacity={0.25} stroke={n.color} strokeWidth={1.5} />
+                  <circle
+                    cx={n.x}
+                    cy={n.y}
+                    r={n.radius}
+                    fill={n.color}
+                    fillOpacity={0.25}
+                    stroke={n.color}
+                    strokeWidth={1.5}
+                  />
                   <text
                     x={n.x}
                     y={(n.y ?? 0) - n.radius - 4}
@@ -208,7 +223,10 @@ function DetailCard({ doc }: { doc: Document }) {
       {doc.tags.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1">
           {doc.tags.map((t) => (
-            <span key={t} className="rounded-[var(--radius-sm)] bg-bg px-2 py-0.5 text-xs text-ink2">
+            <span
+              key={t}
+              className="rounded-[var(--radius-sm)] bg-bg px-2 py-0.5 text-xs text-ink2"
+            >
               {t}
             </span>
           ))}
@@ -261,10 +279,19 @@ function buildLayout(documents: Document[], mode: Mode): Layout | null {
   const links: GLink[] = docNodes.map((n) => ({ source: n.id, target: `project:${n.project}` }));
 
   const sim = forceSimulation(nodes)
-    .force("link", forceLink<GNode, GLink>(links).id((n) => n.id).distance(55).strength(0.7))
+    .force(
+      "link",
+      forceLink<GNode, GLink>(links)
+        .id((n) => n.id)
+        .distance(55)
+        .strength(0.7),
+    )
     .force("charge", forceManyBody().strength(-170))
     .force("center", forceCenter(WIDTH / 2, HEIGHT / 2))
-    .force("collide", forceCollide<GNode>().radius((n) => n.radius + 5))
+    .force(
+      "collide",
+      forceCollide<GNode>().radius((n) => n.radius + 5),
+    )
     .force("x", forceX(WIDTH / 2).strength(0.05))
     .force("y", forceY(HEIGHT / 2).strength(0.05))
     .stop();

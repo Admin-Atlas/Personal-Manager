@@ -256,7 +256,9 @@ impl SidecarManager {
             .iter()
             .map(|row| {
                 row.as_array()
-                    .ok_or_else(|| Error::Other("sidecar embed returned a malformed vector".into()))?
+                    .ok_or_else(|| {
+                        Error::Other("sidecar embed returned a malformed vector".into())
+                    })?
                     .iter()
                     .map(|n| {
                         // Reject a non-numeric / NaN / infinite component rather than
@@ -265,7 +267,9 @@ impl SidecarManager {
                             .filter(|f| f.is_finite())
                             .map(|f| f as f32)
                             .ok_or_else(|| {
-                                Error::Other("sidecar embed returned a non-numeric component".into())
+                                Error::Other(
+                                    "sidecar embed returned a non-numeric component".into(),
+                                )
                             })
                     })
                     .collect::<Result<Vec<f32>>>()
@@ -459,6 +463,33 @@ fn probe_python(candidate: &Path) -> bool {
     matches!(command.output(), Ok(out) if out.status.success())
 }
 
+fn run_command(command: &mut Command, what: &str) -> Result<()> {
+    let output = command
+        .output()
+        .map_err(|e| Error::Other(format!("could not run {what}: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Other(format!(
+            "{what} failed: {}",
+            stderr.trim().lines().last().unwrap_or("(no output)")
+        )));
+    }
+    Ok(())
+}
+
+/// Suppress the console window that would otherwise flash when spawning a
+/// child process from a GUI app on Windows. No-op elsewhere.
+#[cfg(windows)]
+fn no_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+fn no_window(_command: &mut Command) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,29 +518,3 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
-
-fn run_command(command: &mut Command, what: &str) -> Result<()> {
-    let output = command
-        .output()
-        .map_err(|e| Error::Other(format!("could not run {what}: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::Other(format!(
-            "{what} failed: {}",
-            stderr.trim().lines().last().unwrap_or("(no output)")
-        )));
-    }
-    Ok(())
-}
-
-/// Suppress the console window that would otherwise flash when spawning a
-/// child process from a GUI app on Windows. No-op elsewhere.
-#[cfg(windows)]
-fn no_window(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn no_window(_command: &mut Command) {}

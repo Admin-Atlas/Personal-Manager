@@ -16,9 +16,7 @@ export function formatDate(iso: string): string {
   const day = pad2(d.getDate());
   const month = pad2(d.getMonth() + 1);
   const year = d.getFullYear();
-  return year === new Date().getFullYear()
-    ? `${day}-${month}`
-    : `${day}-${month}-${year}`;
+  return year === new Date().getFullYear() ? `${day}-${month}` : `${day}-${month}-${year}`;
 }
 
 /**
