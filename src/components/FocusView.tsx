@@ -39,18 +39,27 @@ const STATUS_ORDER: ProjectStatus[] = [
   "on_track",
 ];
 
+// Switching tabs unmounts this view, so without a cache every return refetches and
+// flashes the skeleton. Remember the last good load at module scope and seed state
+// from it: revisits render instantly, then the mount effect revalidates in the
+// background. Memory-only (cleared on app reload), so the first open still loads.
+let cachedProjects: ProjectOverview[] | null = null;
+let cachedEvents: CalendarEvent[] = [];
+let cachedBriefing: DailyBriefing | null = null;
+
 export function FocusView({ onOpenProject }: Props) {
-  const [projects, setProjects] = useState<ProjectOverview[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [projects, setProjects] = useState<ProjectOverview[]>(() => cachedProjects ?? []);
+  // Skeleton only on the genuine first load of the session; revisits seed from cache.
+  const [loading, setLoading] = useState(cachedProjects === null);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   /** AI proposals keyed by project name, populated by "Suggest attributes". */
   const [proposals, setProposals] = useState<Record<string, ProjectProposal>>({});
   const [proposing, setProposing] = useState(false);
   /** Upcoming calendar events for the agenda (empty when not connected). */
-  const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [events, setEvents] = useState<CalendarEvent[]>(() => cachedEvents);
   /** The daily briefing (Step 7); null until loaded, then refreshed when stale. */
-  const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
+  const [briefing, setBriefing] = useState<DailyBriefing | null>(() => cachedBriefing);
   const [briefingBusy, setBriefingBusy] = useState(false);
   // Sequence guard so a stale in-flight refresh can't overwrite a newer one — the
   // initial pre-sync load and the post-sync reload can resolve out of order.
@@ -58,13 +67,22 @@ export function FocusView({ onOpenProject }: Props) {
   // These views fire background model calls (suggest/briefing) that can resolve
   // after the user has left; don't write state once unmounted.
   const aliveRef = useRef(true);
-  useEffect(() => () => void (aliveRef.current = false), []);
+  // StrictMode (dev) double-invokes effects mount → unmount → mount; without
+  // re-arming on remount the flag stays false and every guarded write — including
+  // refresh()'s setLoading(false) — is silently dropped, stranding the skeleton.
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => void (aliveRef.current = false);
+  }, []);
 
   async function refresh() {
     const seq = ++refreshSeqRef.current;
     try {
       const overviews = await listProjectOverviews();
-      if (aliveRef.current && seq === refreshSeqRef.current) setProjects(overviews);
+      if (aliveRef.current && seq === refreshSeqRef.current) {
+        setProjects(overviews);
+        cachedProjects = overviews;
+      }
     } catch (e) {
       if (aliveRef.current && seq === refreshSeqRef.current) setError(String(e));
     } finally {
@@ -78,7 +96,10 @@ export function FocusView({ onOpenProject }: Props) {
     setBriefingBusy(true);
     try {
       const b = await refreshDailyBriefing();
-      if (aliveRef.current) setBriefing(b);
+      if (aliveRef.current) {
+        setBriefing(b);
+        cachedBriefing = b;
+      }
     } catch {
       /* keep whatever we have */
     } finally {
@@ -93,6 +114,7 @@ export function FocusView({ onOpenProject }: Props) {
       const b = await getDailyBriefing();
       if (!aliveRef.current) return;
       setBriefing(b);
+      cachedBriefing = b;
       if (b.stale) void regenerateBriefing();
     } catch {
       /* briefing is optional — focus view works without it */
@@ -109,7 +131,10 @@ export function FocusView({ onOpenProject }: Props) {
         if (status.ics_feeds > 0 || status.oauth_connected) {
           await syncCalendar().catch(() => {});
           const evts = await listCalendarEvents();
-          if (aliveRef.current) setEvents(evts);
+          if (aliveRef.current) {
+            setEvents(evts);
+            cachedEvents = evts;
+          }
         }
       } catch {
         /* connector optional — focus view works without it */
