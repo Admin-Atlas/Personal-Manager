@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.3.1-alpha",
+    date: "2026-06-23",
+    highlights: [
+      "Fixed the Focus tab getting stuck on its loading placeholder instead of showing your projects.",
+      "Focus now opens instantly when you switch back to it from another tab, instead of reloading each time.",
+    ],
+  },
+  {
     version: "1.3.0-alpha",
     date: "2026-06-22",
     highlights: [
