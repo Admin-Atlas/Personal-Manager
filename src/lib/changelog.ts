@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.3.0-alpha",
+    date: "2026-06-22",
+    highlights: [
+      "On Windows, PM is now fully self-contained — you no longer need to install Python yourself before using the document features. Everything PM needs to run ships inside the app.",
+      "The document engine still does its one-time setup the first time you add a document (it downloads the tools and models it needs); after that it's ready and offline-capable.",
+    ],
+  },
+  {
     version: "1.2.1-alpha",
     date: "2026-06-22",
     highlights: [

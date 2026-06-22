@@ -46,16 +46,24 @@ tsc:
 
 # --- backend (Rust) -------------------------------------------------------
 
+# Fetch the bundled standalone interpreter before anything that compiles the
+# crate. On Windows the merged tauri.windows.conf.json bundles `src-tauri/python/`
+# as a resource, so the Tauri build script needs it present; this fetches it
+# (idempotent — skips if current). A NO-OP on Linux/macOS, where the Windows
+# config isn't merged, so the Linux CI rust job stays network-free.
+fetch-python:
+    node scripts/fetch-python.mjs
+
 cargo-fmt:
     cargo fmt --check --manifest-path {{manifest}}
 
-clippy:
+clippy: fetch-python
     cargo clippy --all-targets --all-features --manifest-path {{manifest}} -- -D warnings
 
-cargo-check:
+cargo-check: fetch-python
     cargo check --all-targets --tests --manifest-path {{manifest}}
 
-rust-test:
+rust-test: fetch-python
     cargo test --manifest-path {{manifest}}
 
 # --- sidecar (Python) -----------------------------------------------------

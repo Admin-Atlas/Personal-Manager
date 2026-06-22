@@ -79,9 +79,13 @@ release. What works today:
 ## Prerequisites
 
 - **Node.js** 20+ and **Rust** (stable)
-- **Python** 3.10+ on your PATH — the document sidecar (MarkItDown + local
-  embeddings) installs into a managed venv on first ingest. Point `PM_PYTHON` at
-  a specific interpreter if it isn't named `python`/`python3`.
+- **Python** 3.10+ on your PATH — needed for development (`tauri dev`) and as the
+  base for the document sidecar's managed venv (MarkItDown + local embeddings),
+  built on first ingest. Point `PM_PYTHON` at a specific interpreter if it isn't
+  named `python`/`python3`. (Packaged **Windows** release builds **bundle** a
+  standalone interpreter — `npm run tauri build` fetches it via
+  [`scripts/fetch-python.mjs`](scripts/fetch-python.mjs) — so end users need no
+  Python install. macOS bundling is deferred behind signing.)
 - **Tauri OS prerequisites:** see <https://tauri.app/start/prerequisites/>
   - Windows: Microsoft C++ Build Tools + WebView2 (preinstalled on Win 11)
   - macOS: Xcode Command Line Tools
