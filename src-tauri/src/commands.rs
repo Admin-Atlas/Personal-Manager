@@ -1315,7 +1315,7 @@ pub struct ModelRecommendations {
 /// empty/stale cache yields `null` picks with `stale = true` rather than an invented one.
 #[tauri::command]
 pub async fn model_recommendations(app: AppHandle) -> Result<ModelRecommendations> {
-    let _ = ensure_pricing_fresh(&app).await; // best-effort; offline keeps the last-good list
+    let _ = ensure_catalogue_fresh(&app).await; // best-effort; offline keeps the last-good list
     let state = app.state::<AppState>();
     let conn = state.db.lock().unwrap();
     let catalogue = cached_catalogue(&conn)?;
@@ -1446,6 +1446,43 @@ async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
         cost::pricing_is_stale(hours)
     };
     if stale {
+        refresh_pricing_now(app).await?;
+    }
+    Ok(())
+}
+
+/// Like [`ensure_pricing_fresh`], but for the recommender: also force a refresh when the
+/// cached catalogue is missing the v8 signal columns. An install that ran the cost logger
+/// before this feature has a price-only cache with a recent `fetched_at` (so the age check
+/// alone would skip the refresh) but NULL recommender signals — without this the cards would
+/// show "no recommendations yet" until the next daily refresh. Resolves the decision under a
+/// short lock, then fetches without holding it (rule #4).
+async fn ensure_catalogue_fresh(app: &AppHandle) -> Result<()> {
+    let needs_refresh = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        let hours: Option<f64> = conn
+            .query_row(
+                "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        // Does the newest batch actually carry the recommender signals? A price-only cache
+        // written before this feature won't, so treat that as needing a refresh even if fresh.
+        let has_signals: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM model_pricing \
+                 WHERE fetched_at = (SELECT MAX(fetched_at) FROM model_pricing) \
+                   AND context_length IS NOT NULL AND supported_parameters IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        cost::pricing_is_stale(hours) || !has_signals
+    };
+    if needs_refresh {
         refresh_pricing_now(app).await?;
     }
     Ok(())
