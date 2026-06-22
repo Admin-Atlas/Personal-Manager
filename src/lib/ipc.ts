@@ -3,6 +3,7 @@
 
 import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
+  AppLockStatus,
   CalendarEvent,
   CalendarStatus,
   ChatEvent,
@@ -87,6 +88,20 @@ export const setRecommendDenylist = (denylist: string[]) =>
 /** Toggle the UI help/explain mode (Step 4b). */
 export const setHelpMode = (enabled: boolean) =>
   invoke<void>("set_help_mode", { enabled });
+
+// --- Biometric app-lock (soft UI gate, opt-in — spec §16.2) ---
+
+/** Whether the app-lock is on, and whether this device can perform an OS verification. */
+export const appLockStatus = () => invoke<AppLockStatus>("app_lock_status");
+
+/** Turn the app-lock on/off. Enabling is rejected by the backend when unavailable. */
+export const setAppLock = (enabled: boolean) =>
+  invoke<void>("set_app_lock", { enabled });
+
+/** Run the OS verification (Windows Hello / Touch ID) to lift the launch lock.
+ *  Resolves true on success, false when the user cancels/fails; rejects when the
+ *  verifier can't run at all. */
+export const unlockApp = () => invoke<boolean>("unlock_app");
 
 // --- Learning You (Step 4b, spec §4.5) ---
 

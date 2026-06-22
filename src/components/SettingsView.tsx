@@ -3,6 +3,7 @@
 
 import { useEffect, useState } from "react";
 import {
+  appLockStatus,
   costSummary,
   getLearningProfile,
   getSettings,
@@ -10,6 +11,7 @@ import {
   hasOpenRouterKey,
   refreshLearningProfile,
   refreshPricing,
+  setAppLock,
   setBackgroundAutoSwitch,
   setBackgroundModels,
   setChatAutoSwitch,
@@ -22,7 +24,7 @@ import { useHelp } from "../lib/help";
 import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
-import type { CostSummary, LearningProfile } from "../lib/types";
+import type { AppLockStatus, CostSummary, LearningProfile } from "../lib/types";
 import { useTheme, useDepth, ACCENTS } from "../theme";
 import { Button, Collapsible, Input, SegmentedControl, Select } from "./ui";
 
@@ -52,6 +54,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [tzAuto, setTzAuto] = useState(true);
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [refreshingPrices, setRefreshingPrices] = useState(false);
+  const [appLock, setAppLockState] = useState<AppLockStatus | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -93,6 +96,22 @@ export function SettingsView({ onClose, onboarding }: Props) {
     if (onboarding) return;
     costSummary().then(setCost).catch(() => {});
   }, [onboarding]);
+
+  // App-lock status (enabled + whether the OS can verify) loads independently.
+  useEffect(() => {
+    if (onboarding) return;
+    appLockStatus().then(setAppLockState).catch(() => {});
+  }, [onboarding]);
+
+  async function toggleAppLock(next: boolean) {
+    setError(null);
+    try {
+      await setAppLock(next);
+      setAppLockState((s) => (s ? { ...s, enabled: next } : s));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
 
   async function refreshProfile() {
     setRefreshing(true);
@@ -464,6 +483,36 @@ export function SettingsView({ onClose, onboarding }: Props) {
         )}
 
         {!onboarding && <CalendarSettings />}
+
+        {!onboarding && (
+          <div className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4" data-help="settings-app-lock">
+            <div>
+              <label className="block text-sm font-medium text-ink2">App lock</label>
+              <p className="mt-1 text-xs text-ink4">
+                {appLock?.available
+                  ? "Require Windows Hello (face, fingerprint, or PIN) to open PM. A convenience lock for the window — your store is always encrypted at rest. Takes effect next time you open PM."
+                  : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={appLock?.enabled ?? false}
+              aria-label="App lock"
+              disabled={!appLock?.available}
+              onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
+              className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                appLock?.enabled ? "bg-accent" : "bg-surface"
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                  appLock?.enabled ? "translate-x-4" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
+        )}
 
         {!onboarding && (
           <div className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4" data-help="settings-help-mode">

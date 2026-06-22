@@ -146,6 +146,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Help mode",
     body: "The switch you're using right now. While it's on, hovering any highlighted section shows an explanation like this one.",
   },
+  "settings-app-lock": {
+    title: "App lock",
+    body: "Optionally require an OS check — Windows Hello (face, fingerprint, or PIN) — before PM opens. It's a convenience lock for the window only: your store is always encrypted at rest, so this isn't a second password on your data. It's off until you turn it on, only available where your device can actually verify, and takes effect the next time you open PM. If your device can't verify, you can still get in — you're never locked out of your own app.",
+  },
   "settings-calendar": {
     title: "Calendar",
     body: "Connect a calendar (read-only) so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. Two ways: paste a calendar's private iCal feed URL (simplest — no sign-in, works with Advanced Protection), or use Google sign-in with your own OAuth credentials (advanced). Feed URLs and tokens live only in your keychain.",
