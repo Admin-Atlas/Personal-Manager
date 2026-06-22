@@ -15,6 +15,7 @@ mod learning;
 mod openrouter;
 mod paths;
 mod projects;
+mod recommend;
 mod retrieval;
 mod review;
 mod secrets;
@@ -120,7 +121,8 @@ pub fn run() {
             commands::refresh_daily_briefing,
             commands::cost_summary,
             commands::refresh_pricing,
-            commands::recommended_models,
+            commands::model_recommendations,
+            commands::set_recommend_denylist,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -8,7 +8,6 @@ import {
   getSettings,
   hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
-  recommendedModels,
   refreshLearningProfile,
   refreshPricing,
   setBackgroundAutoSwitch,
@@ -22,6 +21,7 @@ import {
 import { useHelp } from "../lib/help";
 import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
+import { ModelRecommendationCards } from "./ModelRecommendationCards";
 import type { CostSummary, LearningProfile } from "../lib/types";
 import { useTheme, useDepth, ACCENTS } from "../theme";
 import { Button, Collapsible, Input, SegmentedControl, Select } from "./ui";
@@ -339,22 +339,18 @@ export function SettingsView({ onClose, onboarding }: Props) {
             onAutoSwitchChange={setBackgroundAuto}
           />
           {!onboarding && (
-            <div className="flex flex-wrap gap-2" data-help="settings-recommended-models">
-              <Button
-                variant="tertiary"
-                className="px-2 py-1 text-xs"
-                onClick={async () => setChatModelsState(await recommendedModels("chat"))}
-              >
-                Use recommended chat models
-              </Button>
-              <Button
-                variant="tertiary"
-                className="px-2 py-1 text-xs"
-                onClick={async () => setBackgroundModelsState(await recommendedModels("background"))}
-              >
-                Use recommended background models
-              </Button>
-            </div>
+            <ModelRecommendationCards
+              showMeta={showMeta}
+              showPower={showPower}
+              onUseForChat={(m) =>
+                setChatModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
+              }
+              onUseForBackground={(m) =>
+                setBackgroundModelsState((prev) =>
+                  [m, ...prev.filter((x) => x !== m)].slice(0, 50),
+                )
+              }
+            />
           )}
         </div>
 

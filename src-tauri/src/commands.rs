@@ -18,20 +18,11 @@ use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
-use crate::{briefing, clock, cost, db, learning, openrouter, paths, secrets, AppState};
+use crate::{briefing, clock, cost, db, learning, openrouter, paths, recommend, secrets, AppState};
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
 /// stored as a plain string (spec §6 — never locked into a model).
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.6";
-
-/// Recommended model presets offered in Settings — the "sensible defaults" half of
-/// the Cost Logger (spec §17.1): cheap/fast for high-volume background work, stronger
-/// for chat. Consumed ONLY as the "use recommended" suggestion (and applied by the
-/// user, who then Saves) — never by `effective_models`, which always reads the user's
-/// stored list (spec §6: nothing hardcoded into the engine). `DEFAULT_CHAT_MODELS[0]`
-/// stays == `DEFAULT_MODEL`. These are swappable strings, not pinned ids.
-const DEFAULT_CHAT_MODELS: &[&str] = &["anthropic/claude-sonnet-4.6", "anthropic/claude-haiku-4.5"];
-const DEFAULT_BACKGROUND_MODELS: &[&str] = &["anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4.6"];
 
 /// Settings keys for the two model roles. Each holds a JSON array of model ids
 /// (ordered, first = primary); the `*_AUTO_SWITCH` keys hold "true"/"false".
@@ -44,6 +35,11 @@ const BACKGROUND_AUTO_SWITCH_KEY: &str = "background_auto_switch";
 /// frontend via `Intl.DateTimeFormat().resolvedOptions().timeZone`. Empty/unset →
 /// the backend reasons in UTC (see `resolve_zone`).
 const TIME_ZONE_KEY: &str = "time_zone";
+
+/// Optional, user-editable denylist (provider or model slugs) the recommender excludes
+/// as defense-in-depth — JSON array of strings. The real privacy boundary is the
+/// request-level ZDR enforcement in `openrouter::chat_body`; this is secondary (spec §6).
+const RECOMMEND_DENYLIST_KEY: &str = "recommend_denylist";
 
 /// Caps for chat: the most we'll store for a single message, and how many prior
 /// turns we replay into a request. A long conversation or one giant pasted message
@@ -1295,17 +1291,119 @@ pub async fn refresh_pricing(app: AppHandle) -> Result<CostSummary> {
     build_cost_summary(&conn)
 }
 
-/// The recommended model preset for a role ("chat" | "background") — the cost
-/// logger's "sensible defaults". The UI pre-fills the model editor with these and the
-/// user Saves, so nothing is applied without confirmation (spec §6: swappable).
+// --- model recommender (spec §6) ---
+
+/// PM's two live model recommendations for the Settings cards. `day_to_day` /`advanced`
+/// are `null` when the cache can't yet produce a pick (e.g. offline before any fetch) —
+/// the UI shows "unavailable", never a silent non-compliant fallback. `zdr_enforced` is
+/// always true (PM sends Zero-Data-Retention on every request — see `openrouter::chat_body`);
+/// the UI shows it on each card so the user sees why a model is safe. `stale` flags a cache
+/// older than the daily refresh window (a failed/offline refresh), so the UI can mark the
+/// picks possibly out of date.
+#[derive(Serialize)]
+pub struct ModelRecommendations {
+    pub day_to_day: Option<recommend::Recommendation>,
+    pub advanced: Option<recommend::Recommendation>,
+    pub denylist: Vec<String>,
+    pub zdr_enforced: bool,
+    pub stale: bool,
+}
+
+/// Compute the two recommendations from the cached catalogue + curated tier list + the
+/// user denylist. Reuses the cost logger's daily price refresh (no second fetch) and is
+/// fail-safe: a best-effort refresh keeps the last-good list when offline, and an
+/// empty/stale cache yields `null` picks with `stale = true` rather than an invented one.
 #[tauri::command]
-pub fn recommended_models(role: String) -> Result<Vec<String>> {
-    let list = match role.as_str() {
-        "chat" => DEFAULT_CHAT_MODELS,
-        "background" => DEFAULT_BACKGROUND_MODELS,
-        _ => return Err(Error::Other(format!("unknown model role: {role}"))),
-    };
-    Ok(list.iter().map(|s| s.to_string()).collect())
+pub async fn model_recommendations(app: AppHandle) -> Result<ModelRecommendations> {
+    let _ = ensure_pricing_fresh(&app).await; // best-effort; offline keeps the last-good list
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    let catalogue = cached_catalogue(&conn)?;
+    let denylist = recommend_denylist(&conn)?;
+    // Reuse the cost logger's staleness rule: if the best-effort refresh above couldn't
+    // freshen the cache (offline), the newest fetch is old → flag the picks as stale.
+    let hours: Option<f64> = conn
+        .query_row(
+            "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let stale = cost::pricing_is_stale(hours);
+    let curated = curated_tiers();
+    let (day_to_day, advanced) = recommend::recommend(&catalogue, &curated, &denylist);
+    Ok(ModelRecommendations { day_to_day, advanced, denylist, zdr_enforced: true, stale })
+}
+
+/// Persist the recommender denylist (provider/model slugs). Cleaned like model lists:
+/// trimmed, empties dropped, capped.
+#[tauri::command]
+pub fn set_recommend_denylist(state: State<'_, AppState>, denylist: Vec<String>) -> Result<()> {
+    let cleaned: Vec<String> = denylist
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(100)
+        .collect();
+    let json = serde_json::to_string(&cleaned).map_err(|e| Error::Other(e.to_string()))?;
+    let conn = state.db.lock().unwrap();
+    db::set_setting(&conn, RECOMMEND_DENYLIST_KEY, &json)
+}
+
+/// The curated faithfulness list, embedded at compile time so it ships in the binary (a
+/// relocatable app has no fixed runtime path). A parse failure degrades to an empty list —
+/// the live intelligence index still drives the Advanced pick — never a crash.
+fn curated_tiers() -> recommend::CuratedTiers {
+    const RAW: &str = include_str!("../recommend_tiers.json");
+    serde_json::from_str(RAW).unwrap_or_default()
+}
+
+/// Read the stored recommender denylist (empty when unset/unparseable).
+fn recommend_denylist(conn: &Connection) -> Result<Vec<String>> {
+    Ok(db::get_setting(conn, RECOMMEND_DENYLIST_KEY)?
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default())
+}
+
+/// Reconstruct the recommender's view of the catalogue from the daily price/signal cache
+/// (`model_pricing`, extended in migration v8). Reading from the cache — not a live fetch —
+/// is what lets recommendations survive offline. Only the **latest refresh batch** is in
+/// scope (`fetched_at = MAX(fetched_at)`): a model that has left OpenRouter keeps an older
+/// timestamp and is excluded, so the recommender never surfaces a model that can no longer
+/// be served under PM's ZDR enforcement. (The cost-summary join reads `model_pricing`
+/// unfiltered, so historical spend on a now-removed model is still priced.)
+fn cached_catalogue(conn: &Connection) -> Result<Vec<openrouter::ModelDetail>> {
+    let mut stmt = conn.prepare(
+        "SELECT model, COALESCE(name, ''), context_length, prompt_price, completion_price, \
+                cache_read_price, supported_parameters, input_modalities, intelligence_index \
+         FROM model_pricing \
+         WHERE fetched_at = (SELECT MAX(fetched_at) FROM model_pricing)",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let context_length: Option<i64> = r.get(2)?;
+            let supported: Option<String> = r.get(6)?;
+            let modalities: Option<String> = r.get(7)?;
+            Ok(openrouter::ModelDetail {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                description: String::new(),
+                context_length: context_length.map(|v| v as u64),
+                prompt_price: r.get(3)?,
+                completion_price: r.get(4)?,
+                cache_read_price: r.get(5)?,
+                input_modalities: modalities
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                supported_parameters: supported
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                intelligence_index: r.get(8)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Append a `usage_log` row — best-effort: cost logging must never fail a model call,
@@ -1353,20 +1451,44 @@ async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Pull the public OpenRouter catalogue (no key) and upsert every model's prices into
-/// the cache. Never holds the DB lock across the network call (rule #4).
+/// Pull the public OpenRouter catalogue (no key) and upsert every model's prices — and
+/// the recommender's signals (cache rate, context, supported params, capability indices) —
+/// into the cache. One fetch serves both the cost logger and the recommender (no second
+/// fetch/scheduler). Never holds the DB lock across the network call (rule #4).
 async fn refresh_pricing_now(app: &AppHandle) -> Result<()> {
-    let models = openrouter::list_models().await?;
+    let models = openrouter::fetch_catalogue().await?;
     let state = app.state::<AppState>();
     let conn = state.db.lock().unwrap();
     let tx = conn.unchecked_transaction()?;
+    // One timestamp for the whole batch, so every model in this pull shares an identical
+    // `fetched_at`. That lets the recommender read only the latest batch (a model that left
+    // OpenRouter keeps an older timestamp and drops out of candidacy — see `cached_catalogue`),
+    // and keeps the staleness check exact.
+    let fetched_at: String =
+        tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0))?;
     for m in &models {
+        let supported = serde_json::to_string(&m.supported_parameters).unwrap_or_else(|_| "[]".into());
+        let modalities = serde_json::to_string(&m.input_modalities).unwrap_or_else(|_| "[]".into());
         tx.execute(
-            "INSERT INTO model_pricing(model, prompt_price, completion_price, fetched_at) \
-             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+            "INSERT INTO model_pricing(model, prompt_price, completion_price, name, context_length, \
+                cache_read_price, supported_parameters, input_modalities, intelligence_index, fetched_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
              ON CONFLICT(model) DO UPDATE SET \
-                prompt_price = ?2, completion_price = ?3, fetched_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-            params![m.id, m.prompt_price, m.completion_price],
+                prompt_price = ?2, completion_price = ?3, name = ?4, context_length = ?5, \
+                cache_read_price = ?6, supported_parameters = ?7, input_modalities = ?8, \
+                intelligence_index = ?9, fetched_at = ?10",
+            params![
+                m.id,
+                m.prompt_price,
+                m.completion_price,
+                m.name,
+                m.context_length.map(|v| v as i64),
+                m.cache_read_price,
+                supported,
+                modalities,
+                m.intelligence_index,
+                fetched_at,
+            ],
         )?;
     }
     tx.commit()?;

@@ -132,7 +132,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-recommended-models": {
     title: "Recommended models",
-    body: "PM's sensible defaults — a capable model for chat, and cheaper/faster models for background work (sorting and learning). Click to fill the lists above with the recommendation; nothing changes until you Save, and you can still edit them.",
+    body: "Two live suggestions from OpenRouter's catalogue. Day-to-day is the cheapest model that still handles tool-calling and a decent context — ideal for high-volume sorting and everyday chat. Advanced is the highest-capability, most faithful model for high-stakes, citation-critical chat. Each shows why it was picked and its effective (cache-weighted) price. PM enforces zero-data-retention on every request, so providers can't store or train on your prompts — that's the 'ZDR' marker. Apply either to your chat or background slot; nothing changes until you Save.",
   },
   "settings-usage-cost": {
     title: "Usage & cost",
