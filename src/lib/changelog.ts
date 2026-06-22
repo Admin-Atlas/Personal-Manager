@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.2.1-alpha",
+    date: "2026-06-22",
+    highlights: [
+      "Added a security policy (SECURITY.md): how to privately report a security issue, which versions get fixes, and what's in and out of scope. No change to your data or how you use PM.",
+    ],
+  },
+  {
     version: "1.2.0-alpha",
     date: "2026-06-22",
     highlights: [
