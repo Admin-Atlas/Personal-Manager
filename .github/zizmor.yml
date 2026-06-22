@@ -1,0 +1,13 @@
+# zizmor configuration.
+#
+# release.yml builds AND SIGNS the desktop apps, so zizmor's cache-poisoning audit
+# flags every cache-capable action there (setup-node, Swatinem/rust-cache). We
+# accept that flag for this workflow specifically: GitHub Actions caches are
+# ref-scoped — a fork PR cannot write the cache scope the release (a maintainer-
+# pushed `v*` tag) reads — and all dependencies are integrity-pinned by the
+# committed lockfiles. The fast PR workflow keeps its caches; only the release
+# path is exempted here. Revisit if releases ever run from a less-trusted trigger.
+rules:
+  cache-poisoning:
+    ignore:
+      - release.yml

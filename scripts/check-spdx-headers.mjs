@@ -27,9 +27,10 @@ const read = (rel) => readFileSync(join(repoRoot, rel), "utf8");
 
 // The verbatim AGPL-3.0 text (LICENCE.txt). Editing the licence — even a stray
 // character — changes this; replacing it for a new FSF revision means updating
-// this constant in the same, reviewed commit.
+// this constant in the same, reviewed commit. The hash is over LF-normalised
+// content so it is identical on Windows (CRLF working tree) and Linux CI.
 const LICENCE_FILE = "LICENCE.txt";
-const LICENCE_SHA256 = "e0eedba615d5cd1b986afb6c5b3a4b1ae33713e7e9dc74d19daec5e3221f9d2e";
+const LICENCE_SHA256 = "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0";
 
 const HEADER_EXTENSIONS = ["rs", "ts", "tsx", "js", "mjs", "py", "css"];
 // Generated bundles / third-party design reference — not first-party source.
@@ -64,10 +65,9 @@ for (const f of tracked) {
   checked++;
 }
 
-// 2. Licence integrity.
-const sha = createHash("sha256")
-  .update(readFileSync(join(repoRoot, LICENCE_FILE)))
-  .digest("hex");
+// 2. Licence integrity (LF-normalised, so line-ending differences don't matter).
+const licenceText = readFileSync(join(repoRoot, LICENCE_FILE), "utf8").replace(/\r\n/g, "\n");
+const sha = createHash("sha256").update(licenceText).digest("hex");
 if (sha !== LICENCE_SHA256) {
   problems.push(
     `${LICENCE_FILE} has changed — sha256 ${sha} ≠ expected ${LICENCE_SHA256}. ` +

@@ -4,6 +4,7 @@ dist
 dist-ssr
 .dist
 src-tauri/target
+src-tauri/gen
 
 # Generated / vendored — not ours to reformat
 package-lock.json
@@ -16,6 +17,10 @@ THIRD-PARTY-NOTICES.txt
 
 # Local-only working tree (git-ignored)
 docs
+
+# Tool-managed configs — left as their tools write them, not reflowed by Prettier
+.claude
+.vscode
 
 # Prose/data left as authored
 *.md

@@ -11,7 +11,11 @@
 //! (withhold the DB key until verification succeeds) is documented as deferred to v4
 //! in `docs/DECISIONS.md`.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
+// `Error` is only constructed in the Windows and macOS platform modules below; on
+// other targets (e.g. Linux CI) it would be an unused import.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use crate::error::Error;
 
 /// Pure policy: should the UI be locked right now? Locked iff the feature is enabled
 /// *and* the user hasn't verified yet this session. Kept separate from the OS call so

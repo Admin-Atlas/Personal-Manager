@@ -486,6 +486,10 @@ fn no_window(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+fn no_window(_command: &mut Command) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +518,3 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
-
-#[cfg(not(windows))]
-fn no_window(_command: &mut Command) {}
