@@ -7,8 +7,15 @@
 
 import { oklabLCH, hexA } from "./oklab";
 import {
-  FONTS, RADII, PROFILES, STATUS, ROLES, STATUS_KEYS,
-  type System, type Mode, type Depth,
+  FONTS,
+  RADII,
+  PROFILES,
+  STATUS,
+  ROLES,
+  STATUS_KEYS,
+  type System,
+  type Mode,
+  type Depth,
 } from "./profiles";
 
 export type ThemeVars = Record<`--${string}`, string>;
@@ -20,8 +27,12 @@ export function themeVars(system: System, mode: Mode, accent: string): ThemeVars
   const ok = ([L, c]: readonly [number, number]): string => `oklch(${L} ${c} ${H})`;
   const v: ThemeVars = {};
 
-  ROLES.forEach((r) => { v[`--${r}`] = ok(ramp[r]); });
-  STATUS_KEYS.forEach((k, i) => { v[`--st-${k}`] = stat[i]; });
+  ROLES.forEach((r) => {
+    v[`--${r}`] = ok(ramp[r]);
+  });
+  STATUS_KEYS.forEach((k, i) => {
+    v[`--st-${k}`] = stat[i];
+  });
 
   v["--head"] = FONTS[system].head;
   v["--ui"] = FONTS[system].ui;

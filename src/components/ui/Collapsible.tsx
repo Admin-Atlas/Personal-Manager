@@ -25,7 +25,13 @@ export interface CollapsibleProps {
   className?: string;
 }
 
-export function Collapsible({ title, defaultOpen = true, meta, children, className }: CollapsibleProps) {
+export function Collapsible({
+  title,
+  defaultOpen = true,
+  meta,
+  children,
+  className,
+}: CollapsibleProps) {
   const [open, setOpen] = useState(defaultOpen);
   const { system } = useTheme();
   return (

@@ -103,8 +103,8 @@ export function ModelRecommendationCards({
         <>
           {!recs.day_to_day && !recs.advanced ? (
             <p className="mt-3 text-xs text-ink4">
-              No recommendations yet — open this page while online once so PM can fetch the
-              model list.
+              No recommendations yet — open this page while online once so PM can fetch the model
+              list.
             </p>
           ) : (
             <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -135,17 +135,16 @@ export function ModelRecommendationCards({
                 <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
                   <p>
                     Every PM request is sent with{" "}
-                    <span className="font-mono text-ink4">zero-data-retention</span> enforced,
-                    so a provider can&apos;t store or train on your prompts — this is the real
-                    boundary, applied to whichever model you pick. (OpenRouter exposes no
-                    per-model data-retention flag, so PM enforces it per request rather than
-                    guessing from a list.)
+                    <span className="font-mono text-ink4">zero-data-retention</span> enforced, so a
+                    provider can&apos;t store or train on your prompts — this is the real boundary,
+                    applied to whichever model you pick. (OpenRouter exposes no per-model
+                    data-retention flag, so PM enforces it per request rather than guessing from a
+                    list.)
                   </p>
                   <p>
-                    The list below only removes models from the two suggestions above — it does
-                    not block a model you pick yourself (ZDR already protects every request). One
-                    slug per line, e.g.{" "}
-                    <span className="font-mono text-ink4">openai</span> or{" "}
+                    The list below only removes models from the two suggestions above — it does not
+                    block a model you pick yourself (ZDR already protects every request). One slug
+                    per line, e.g. <span className="font-mono text-ink4">openai</span> or{" "}
                     <span className="font-mono text-ink4">openai/gpt-5.5</span>.
                   </p>
                 </div>
@@ -186,7 +185,15 @@ interface CardProps {
   onUseForBackground: (model: string) => void;
 }
 
-function RecCard({ slot, tagline, rec, zdr, showMeta, onUseForChat, onUseForBackground }: CardProps) {
+function RecCard({
+  slot,
+  tagline,
+  rec,
+  zdr,
+  showMeta,
+  onUseForChat,
+  onUseForBackground,
+}: CardProps) {
   return (
     <div className="flex flex-col rounded-[var(--radius)] border border-border2 bg-surface p-3">
       <div className="flex items-center justify-between gap-2">

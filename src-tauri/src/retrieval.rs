@@ -84,7 +84,11 @@ pub fn hybrid_search(
     };
     // Over-fetch when scoping so the project's chunks survive the filter even if
     // they aren't in the global top-N; otherwise fetch exactly the branch limit.
-    let fetch = if allowed.is_some() { SCOPED_POOL.max(branch_limit) } else { branch_limit };
+    let fetch = if allowed.is_some() {
+        SCOPED_POOL.max(branch_limit)
+    } else {
+        branch_limit
+    };
     let mut vec_hits = vector_search(conn, query_embedding, fetch)?;
     let mut fts_hits = keyword_search(conn, query_text, fetch)?;
     if let Some(allowed) = &allowed {
@@ -119,8 +123,9 @@ fn vector_search(conn: &Connection, embedding: &[f32], limit: usize) -> Result<V
     // Serialized exactly as ingestion stores it (see ingest::index_document).
     let json = serde_json::to_string(embedding)
         .map_err(|e| Error::Other(format!("encode query embedding: {e}")))?;
-    let mut stmt = conn
-        .prepare("SELECT rowid FROM chunk_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2")?;
+    let mut stmt = conn.prepare(
+        "SELECT rowid FROM chunk_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+    )?;
     let rows = stmt
         .query_map(params![json, limit as i64], |row| row.get::<_, i64>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -135,7 +140,9 @@ fn keyword_search(conn: &Connection, query_text: &str, limit: usize) -> Result<V
     let mut stmt = conn
         .prepare("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY rank LIMIT ?2")?;
     let rows = stmt
-        .query_map(params![match_query, limit as i64], |row| row.get::<_, i64>(0))?
+        .query_map(params![match_query, limit as i64], |row| {
+            row.get::<_, i64>(0)
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -299,7 +306,13 @@ pub fn grounding_prompt(chunks: &[RetrievedChunk]) -> String {
     );
     for (i, c) in chunks.iter().enumerate() {
         let loc = c.source_path.as_deref().unwrap_or(&c.vault_path);
-        s.push_str(&format!("[{}] {} ({})\n{}\n\n", i + 1, c.title, loc, c.content));
+        s.push_str(&format!(
+            "[{}] {} ({})\n{}\n\n",
+            i + 1,
+            c.title,
+            loc,
+            c.content
+        ));
     }
     s
 }
@@ -373,7 +386,13 @@ mod tests {
         .unwrap();
     }
 
-    fn insert_dated_doc(conn: &Connection, title: &str, content: &str, emb: &[f32], modifier: &str) {
+    fn insert_dated_doc(
+        conn: &Connection,
+        title: &str,
+        content: &str,
+        emb: &[f32],
+        modifier: &str,
+    ) {
         conn.execute(
             "INSERT INTO documents(vault_path, title, content_hash, last_activity) \
              VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now',?4))",
@@ -388,10 +407,16 @@ mod tests {
         .unwrap();
         let chunk_id = conn.last_insert_rowid();
         let json = serde_json::to_string(emb).unwrap();
-        conn.execute("INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)", params![chunk_id, json])
-            .unwrap();
-        conn.execute("INSERT INTO chunks_fts(rowid, content) VALUES (?1, ?2)", params![chunk_id, content])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+            params![chunk_id, json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?1, ?2)",
+            params![chunk_id, content],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -407,12 +432,27 @@ mod tests {
         let query = unit_vec(0);
         let mut fresher = unit_vec(0);
         fresher[1] = 0.2; // nudged off the query so it ranks just behind the stale doc
-        insert_dated_doc(&conn, "Stale note", "the meeting agenda", &query, "-1095 days");
-        insert_dated_doc(&conn, "Fresh note", "the meeting agenda", &fresher, "-1 days");
+        insert_dated_doc(
+            &conn,
+            "Stale note",
+            "the meeting agenda",
+            &query,
+            "-1095 days",
+        );
+        insert_dated_doc(
+            &conn,
+            "Fresh note",
+            "the meeting agenda",
+            &fresher,
+            "-1 days",
+        );
 
         let hits = hybrid_search(&conn, "agenda", &query, 2, None).unwrap();
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].title, "Fresh note", "recency decay should lift the fresher document");
+        assert_eq!(
+            hits[0].title, "Fresh note",
+            "recency decay should lift the fresher document"
+        );
     }
 
     #[test]
@@ -423,8 +463,18 @@ mod tests {
         let conn = crate::db::open(&path, key).unwrap();
 
         // Two unrelated documents whose embeddings point in different directions.
-        insert_doc_chunk(&conn, "Cat facts", "Cats purr when they are content.", &unit_vec(0));
-        insert_doc_chunk(&conn, "Tax guide", "File your taxes before April 15th.", &unit_vec(1));
+        insert_doc_chunk(
+            &conn,
+            "Cat facts",
+            "Cats purr when they are content.",
+            &unit_vec(0),
+        );
+        insert_doc_chunk(
+            &conn,
+            "Tax guide",
+            "File your taxes before April 15th.",
+            &unit_vec(1),
+        );
 
         // A query near the first chunk semantically and matching its keyword.
         let hits = hybrid_search(&conn, "purr", &unit_vec(0), 2, None).unwrap();
@@ -437,7 +487,13 @@ mod tests {
     }
 
     /// Insert a document (with a project label) + one chunk, indexed in both branches.
-    fn insert_doc_in_project(conn: &Connection, title: &str, content: &str, emb: &[f32], project: &str) {
+    fn insert_doc_in_project(
+        conn: &Connection,
+        title: &str,
+        content: &str,
+        emb: &[f32],
+        project: &str,
+    ) {
         conn.execute(
             "INSERT INTO documents(vault_path, title, content_hash, project) VALUES (?1, ?2, ?3, ?4)",
             params![format!("{title}.md"), title, title, project],
@@ -451,10 +507,16 @@ mod tests {
         .unwrap();
         let chunk_id = conn.last_insert_rowid();
         let json = serde_json::to_string(emb).unwrap();
-        conn.execute("INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)", params![chunk_id, json])
-            .unwrap();
-        conn.execute("INSERT INTO chunks_fts(rowid, content) VALUES (?1, ?2)", params![chunk_id, content])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+            params![chunk_id, json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?1, ?2)",
+            params![chunk_id, content],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -465,8 +527,20 @@ mod tests {
         let conn = crate::db::open(&path, key).unwrap();
 
         // Two documents that both match the query, in different projects.
-        insert_doc_in_project(&conn, "Alpha note", "the meeting agenda", &unit_vec(0), "Alpha");
-        insert_doc_in_project(&conn, "Beta note", "the meeting agenda", &unit_vec(0), "Beta");
+        insert_doc_in_project(
+            &conn,
+            "Alpha note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Alpha",
+        );
+        insert_doc_in_project(
+            &conn,
+            "Beta note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Beta",
+        );
 
         // Unscoped: both are reachable.
         let all = hybrid_search(&conn, "agenda", &unit_vec(0), 6, None).unwrap();

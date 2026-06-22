@@ -107,7 +107,11 @@ export function ReviewView({ onChanged }: Props) {
   }
 
   function decisionFor(doc: Document): ReviewDecision {
-    const edit = edits[doc.id] ?? { project: doc.project, tags: doc.tags, importance: doc.importance };
+    const edit = edits[doc.id] ?? {
+      project: doc.project,
+      tags: doc.tags,
+      importance: doc.importance,
+    };
     const proposal = proposals[doc.id];
     return {
       document_id: doc.id,
@@ -292,7 +296,10 @@ function ReviewRow({
 
           <div className="flex items-center gap-2 text-xs text-ink3">
             Importance
-            <ImportancePicker value={value.importance} onChange={(importance) => onChange({ importance })} />
+            <ImportancePicker
+              value={value.importance}
+              onChange={(importance) => onChange({ importance })}
+            />
           </div>
         </div>
 

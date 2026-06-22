@@ -160,7 +160,10 @@ export function usePinboard() {
         ...b,
         widgets: b.widgets.map((w) =>
           w.id === id
-            ? { ...w, items: (w.items ?? []).map((it) => (it.id === itemId ? { ...it, ...patch } : it)) }
+            ? {
+                ...w,
+                items: (w.items ?? []).map((it) => (it.id === itemId ? { ...it, ...patch } : it)),
+              }
             : w,
         ),
       }));

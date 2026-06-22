@@ -4,7 +4,16 @@
 // Public surface of the theme layer. Components import from "../theme" (or "../../theme").
 
 export {
-  SYSTEMS, MODES, DEPTHS, ROLES, STATUS_KEYS, FONTS, RADII, PROFILES, ACCENTS, STATUS,
+  SYSTEMS,
+  MODES,
+  DEPTHS,
+  ROLES,
+  STATUS_KEYS,
+  FONTS,
+  RADII,
+  PROFILES,
+  ACCENTS,
+  STATUS,
 } from "./profiles";
 export type { System, Mode, Depth, Role, StatusKey, Fonts } from "./profiles";
 

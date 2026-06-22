@@ -48,8 +48,13 @@ impl Proposal {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReviewEvent {
-    Proposed { document_id: i64, proposal: Proposal },
-    Finished { proposed: usize },
+    Proposed {
+        document_id: i64,
+        proposal: Proposal,
+    },
+    Finished {
+        proposed: usize,
+    },
 }
 
 /// One row of the user's review submission: the values they confirmed for a
@@ -84,7 +89,10 @@ pub async fn propose(
     let messages = build_messages(title, body, existing_projects, profile);
     match openrouter::complete(api_key, models, &messages).await {
         Ok(c) => (parse_proposal(&c.text), Some((c.usage, c.model))),
-        Err(e) => (Proposal::fallback(format!("Proposal request failed: {e}")), None),
+        Err(e) => (
+            Proposal::fallback(format!("Proposal request failed: {e}")),
+            None,
+        ),
     }
 }
 
@@ -123,8 +131,14 @@ fn build_messages(
     let user = format!("Title: {title}\n\nDocument:\n{excerpt}");
 
     vec![
-        ChatMessage { role: "system".into(), content: system },
-        ChatMessage { role: "user".into(), content: user },
+        ChatMessage {
+            role: "system".into(),
+            content: system,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: user,
+        },
     ]
 }
 
@@ -153,7 +167,10 @@ fn parse_proposal(raw: &str) -> Proposal {
                 .take(5)
                 .collect();
             Proposal {
-                project: r.project.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "Unsorted".into()),
+                project: r
+                    .project
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "Unsorted".into()),
                 tags,
                 importance: normalize_importance(r.importance),
                 reasoning: r.reasoning.unwrap_or_default(),
@@ -182,15 +199,36 @@ fn extract_json_object(raw: &str) -> Option<&str> {
 pub fn log_corrections(conn: &Connection, d: &ReviewDecision, title: &str) -> Result<usize> {
     let mut n = 0;
     if d.project != d.proposed_project {
-        insert_correction(conn, d.document_id, "project", &json(&d.proposed_project)?, &json(&d.project)?, title)?;
+        insert_correction(
+            conn,
+            d.document_id,
+            "project",
+            &json(&d.proposed_project)?,
+            &json(&d.project)?,
+            title,
+        )?;
         n += 1;
     }
     if !same_tags(&d.tags, &d.proposed_tags) {
-        insert_correction(conn, d.document_id, "tags", &json(&d.proposed_tags)?, &json(&d.tags)?, title)?;
+        insert_correction(
+            conn,
+            d.document_id,
+            "tags",
+            &json(&d.proposed_tags)?,
+            &json(&d.tags)?,
+            title,
+        )?;
         n += 1;
     }
     if d.importance != d.proposed_importance {
-        insert_correction(conn, d.document_id, "importance", &json(&d.proposed_importance)?, &json(&d.importance)?, title)?;
+        insert_correction(
+            conn,
+            d.document_id,
+            "importance",
+            &json(&d.proposed_importance)?,
+            &json(&d.importance)?,
+            title,
+        )?;
         n += 1;
     }
     Ok(n)
@@ -213,7 +251,8 @@ fn insert_correction(
 }
 
 fn json<T: Serialize>(value: &T) -> Result<String> {
-    serde_json::to_string(value).map_err(|e| crate::error::Error::Other(format!("encode correction: {e}")))
+    serde_json::to_string(value)
+        .map_err(|e| crate::error::Error::Other(format!("encode correction: {e}")))
 }
 
 /// Tags compared as sets — reordering isn't a correction.
@@ -250,12 +289,18 @@ mod tests {
     fn null_or_bogus_importance_becomes_none() {
         assert_eq!(normalize_importance(Some("null".into())), None);
         assert_eq!(normalize_importance(Some("urgent".into())), None);
-        assert_eq!(normalize_importance(Some("Low".into())).as_deref(), Some("low"));
+        assert_eq!(
+            normalize_importance(Some("Low".into())).as_deref(),
+            Some("low")
+        );
     }
 
     #[test]
     fn tag_reordering_is_not_a_correction() {
-        assert!(same_tags(&["a".into(), "b".into()], &["b".into(), "a".into()]));
+        assert!(same_tags(
+            &["a".into(), "b".into()],
+            &["b".into(), "a".into()]
+        ));
         assert!(!same_tags(&["a".into()], &["a".into(), "b".into()]));
     }
 }

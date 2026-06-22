@@ -18,15 +18,15 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTheme } from "../../theme";
 import { cn } from "./cn";
 
-const IS_MAC =
-  typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
+const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
 function SystemLabel() {
   const { system } = useTheme();
   if (system === "terminal") {
     return (
       <span className="pointer-events-none font-mono text-xs text-ink3">
-        <span style={{ color: "var(--accent)" }}>●</span> pm <span className="text-ink4">[alpha]</span>
+        <span style={{ color: "var(--accent)" }}>●</span> pm{" "}
+        <span className="text-ink4">[alpha]</span>
       </span>
     );
   }
@@ -82,7 +82,15 @@ function CaptionButton({
 /** Corner brackets: pointing outward = enter fullscreen; inward = exit. */
 function FullscreenIcon({ active }: { active: boolean }) {
   return (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2" aria-hidden>
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      aria-hidden
+    >
       {active ? (
         <path d="M4 1v3H1 M8 1v3h3 M4 11V8H1 M8 11V8h3" />
       ) : (
@@ -103,11 +111,22 @@ export function TitleBar() {
     // There is no fullscreen-changed event, and toggling fullscreen also fires a
     // resize, so re-read both window states from the one onResized handler.
     const sync = () => {
-      win.isMaximized().then(setMaximized).catch(() => {});
-      win.isFullscreen().then(setFullscreen).catch(() => {});
+      win
+        .isMaximized()
+        .then(setMaximized)
+        .catch(() => {});
+      win
+        .isFullscreen()
+        .then(setFullscreen)
+        .catch(() => {});
     };
     sync();
-    win.onResized(sync).then((fn) => { unlisten = fn; }).catch(() => {});
+    win
+      .onResized(sync)
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
 
     // F11 toggles fullscreen; Esc leaves it — a frameless fullscreen must never trap
     // the user. Read the live state (not the closed-over value) before toggling.
@@ -119,9 +138,17 @@ export function TitleBar() {
       if (e.key === "Escape" && document.querySelector('[role="dialog"]')) return;
       if (e.key === "F11") {
         e.preventDefault();
-        getCurrentWindow().isFullscreen().then((fs) => getCurrentWindow().setFullscreen(!fs)).catch(() => {});
+        getCurrentWindow()
+          .isFullscreen()
+          .then((fs) => getCurrentWindow().setFullscreen(!fs))
+          .catch(() => {});
       } else if (e.key === "Escape") {
-        getCurrentWindow().isFullscreen().then((fs) => { if (fs) void getCurrentWindow().setFullscreen(false); }).catch(() => {});
+        getCurrentWindow()
+          .isFullscreen()
+          .then((fs) => {
+            if (fs) void getCurrentWindow().setFullscreen(false);
+          })
+          .catch(() => {});
       }
     };
     window.addEventListener("keydown", onKey);
@@ -131,11 +158,23 @@ export function TitleBar() {
     };
   }, []);
 
-  const minimize = () => void getCurrentWindow().minimize().catch(() => {});
-  const toggleMaximize = () => void getCurrentWindow().toggleMaximize().catch(() => {});
+  const minimize = () =>
+    void getCurrentWindow()
+      .minimize()
+      .catch(() => {});
+  const toggleMaximize = () =>
+    void getCurrentWindow()
+      .toggleMaximize()
+      .catch(() => {});
   const toggleFullscreen = () =>
-    void getCurrentWindow().isFullscreen().then((fs) => getCurrentWindow().setFullscreen(!fs)).catch(() => {});
-  const close = () => void getCurrentWindow().close().catch(() => {});
+    void getCurrentWindow()
+      .isFullscreen()
+      .then((fs) => getCurrentWindow().setFullscreen(!fs))
+      .catch(() => {});
+  const close = () =>
+    void getCurrentWindow()
+      .close()
+      .catch(() => {});
 
   return (
     <div

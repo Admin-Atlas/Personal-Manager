@@ -19,7 +19,14 @@ export interface ModalProps {
   labelledBy?: string;
 }
 
-export function Modal({ open, onClose, children, widthClassName, className, labelledBy }: ModalProps) {
+export function Modal({
+  open,
+  onClose,
+  children,
+  widthClassName,
+  className,
+  labelledBy,
+}: ModalProps) {
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {

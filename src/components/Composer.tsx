@@ -53,9 +53,7 @@ export function Composer({ disabled, onSend }: Props) {
             aria-label={micTitle}
             data-help="composer-mic"
             className={`flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-[var(--radius-sm)] border text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-              recording
-                ? "animate-pulse"
-                : "border-border2 text-ink3 hover:text-ink2"
+              recording ? "animate-pulse" : "border-border2 text-ink3 hover:text-ink2"
             }`}
             style={
               recording
@@ -133,7 +131,13 @@ function StopIcon() {
 
 function SpinnerIcon() {
   return (
-    <svg viewBox="0 0 24 24" className="h-5 w-5 animate-spin" fill="none" stroke="currentColor" strokeWidth={2}>
+    <svg
+      viewBox="0 0 24 24"
+      className="h-5 w-5 animate-spin"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+    >
       <path d="M12 3a9 9 0 1 0 9 9" strokeLinecap="round" />
     </svg>
   );

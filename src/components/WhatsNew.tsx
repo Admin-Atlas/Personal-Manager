@@ -17,7 +17,12 @@ export function WhatsNew({
   currentVersion: string | null;
 }) {
   return (
-    <Modal open onClose={onClose} labelledBy="whats-new-title" className="flex max-h-[80vh] flex-col">
+    <Modal
+      open
+      onClose={onClose}
+      labelledBy="whats-new-title"
+      className="flex max-h-[80vh] flex-col"
+    >
       <div className="flex items-center justify-between border-b border-border px-6 py-4">
         <h1 id="whats-new-title" className="font-head text-lg font-semibold text-ink">
           What's New
@@ -31,9 +36,7 @@ export function WhatsNew({
         {CHANGELOG.map((entry) => (
           <section key={entry.version} className="mb-6 last:mb-0">
             <div className="flex items-baseline gap-2">
-              <h2 className="font-head text-sm font-semibold text-ink">
-                Version {entry.version}
-              </h2>
+              <h2 className="font-head text-sm font-semibold text-ink">Version {entry.version}</h2>
               {entry.version === currentVersion && (
                 <span className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wide text-accent-text">
                   Current

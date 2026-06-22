@@ -4,13 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import {
-  ensureSidecar,
-  ingestPaths,
-  listDocuments,
-  rebuildIndex,
-  sidecarStatus,
-} from "../lib/ipc";
+import { ensureSidecar, ingestPaths, listDocuments, rebuildIndex, sidecarStatus } from "../lib/ipc";
 import type { Document, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
@@ -52,7 +46,9 @@ export function DocumentsView({ onReviewClick }: Props) {
 
   useEffect(() => {
     refresh();
-    sidecarStatus().then(setStatus).catch(() => {});
+    sidecarStatus()
+      .then(setStatus)
+      .catch(() => {});
   }, []);
 
   // Window-level file drag-and-drop (Tauri gives us absolute paths).
@@ -252,8 +248,7 @@ export function DocumentsView({ onReviewClick }: Props) {
           )}
           {status?.state === "not_installed" && (
             <Banner tone="info">
-              The document engine isn't installed yet. It's a one-time setup
-              (needs Python).{" "}
+              The document engine isn't installed yet. It's a one-time setup (needs Python).{" "}
               <button onClick={doSetup} className="underline" disabled={busy}>
                 Set it up now
               </button>
@@ -265,17 +260,13 @@ export function DocumentsView({ onReviewClick }: Props) {
             onClick={pickFiles}
             data-help="documents-dropzone"
             className={`cursor-pointer rounded-[var(--radius)] border-2 border-dashed p-10 text-center transition-colors ${
-              dragging
-                ? "border-accent bg-surface"
-                : "border-border2 hover:border-border"
+              dragging ? "border-accent bg-surface" : "border-border2 hover:border-border"
             }`}
           >
-            <p className="text-sm text-ink2">
-              {busy ? "Working…" : "Drop files or a folder here"}
-            </p>
+            <p className="text-sm text-ink2">{busy ? "Working…" : "Drop files or a folder here"}</p>
             <p className="mt-1 text-xs text-ink3">
-              PDFs, Office docs, images, HTML, CSV/JSON, text — converted, chunked,
-              embedded, and indexed locally.
+              PDFs, Office docs, images, HTML, CSV/JSON, text — converted, chunked, embedded, and
+              indexed locally.
             </p>
           </div>
 
@@ -302,8 +293,8 @@ export function DocumentsView({ onReviewClick }: Props) {
               )}
               {summary && (
                 <p className="mt-2 border-t border-rule px-1 pt-2 text-xs text-ink3">
-                  Done — {summary.ingested} ingested, {summary.skipped} skipped,{" "}
-                  {summary.failed} failed.
+                  Done — {summary.ingested} ingested, {summary.skipped} skipped, {summary.failed}{" "}
+                  failed.
                 </p>
               )}
             </Card>
@@ -331,10 +322,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                           {doc.title}
                         </div>
                         {doc.source_path && (
-                          <div
-                            className="truncate text-xs text-ink4"
-                            title={doc.source_path}
-                          >
+                          <div className="truncate text-xs text-ink4" title={doc.source_path}>
                             {doc.source_path}
                           </div>
                         )}
@@ -351,16 +339,10 @@ export function DocumentsView({ onReviewClick }: Props) {
                           {doc.project}
                         </span>
                       </td>
-                      <td className="py-2 pr-3 capitalize text-ink3">
-                        {doc.importance ?? "—"}
-                      </td>
-                      <td className="py-2 pr-3 text-right text-ink3">
-                        {doc.chunk_count}
-                      </td>
+                      <td className="py-2 pr-3 capitalize text-ink3">{doc.importance ?? "—"}</td>
+                      <td className="py-2 pr-3 text-right text-ink3">{doc.chunk_count}</td>
                       {showPower && (
-                        <td className="py-2 text-right text-ink4">
-                          {formatDate(doc.ingested_at)}
-                        </td>
+                        <td className="py-2 text-right text-ink4">{formatDate(doc.ingested_at)}</td>
                       )}
                     </tr>
                   ))}

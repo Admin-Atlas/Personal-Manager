@@ -49,7 +49,9 @@ export function ConfirmDialog({
         <h2 id={titleId} className="font-head text-base font-semibold text-ink">
           {title}
         </h2>
-        {children != null && <div className="mt-2 text-sm leading-relaxed text-ink3">{children}</div>}
+        {children != null && (
+          <div className="mt-2 text-sm leading-relaxed text-ink3">{children}</div>
+        )}
         <div className="mt-5 flex justify-end gap-2">
           <Button variant="tertiary" onClick={onClose} disabled={busy}>
             {cancelLabel}

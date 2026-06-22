@@ -89,7 +89,8 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
         <div className="min-w-0">
           <h1 className="truncate font-head text-sm font-semibold text-ink">{project}</h1>
           <p className="font-mono text-xs text-ink4">
-            {documents.length} document{documents.length === 1 ? "" : "s"} · chat scoped to this project
+            {documents.length} document{documents.length === 1 ? "" : "s"} · chat scoped to this
+            project
           </p>
         </div>
       </header>
@@ -116,7 +117,9 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
           className="w-80 shrink-0 overflow-y-auto border-l border-border bg-panel"
           data-help="project-files"
         >
-          <p className="px-4 pb-1 pt-3 font-mono text-xs uppercase tracking-wide text-ink4">Files</p>
+          <p className="px-4 pb-1 pt-3 font-mono text-xs uppercase tracking-wide text-ink4">
+            Files
+          </p>
           {documents.length === 0 ? (
             <p className="px-4 py-2 text-xs text-ink4">No documents in this project.</p>
           ) : (

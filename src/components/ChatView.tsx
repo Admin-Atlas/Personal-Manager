@@ -14,7 +14,11 @@ interface Props {
 /** Render assistant text with inline `[n]` citation markers turned into buttons that
  *  jump to the matching source (the grounding prompt asks the model to cite as
  *  [1], [2], …). A marker outside the citation range stays plain text. */
-function renderWithCitations(content: string, count: number, onCite: (n: number) => void): ReactNode {
+function renderWithCitations(
+  content: string,
+  count: number,
+  onCite: (n: number) => void,
+): ReactNode {
   return content.split(/(\[\d+\])/g).map((part, i) => {
     const m = /^\[(\d+)\]$/.exec(part);
     const n = m ? Number(m[1]) : 0;
@@ -106,7 +110,7 @@ function MessageBlock({ message }: { message: Message }) {
   const itemRefs = useRef<(HTMLLIElement | null)[]>([]);
   const [flash, setFlash] = useState<number | null>(null);
 
-  const citations = message.role === "assistant" ? message.citations ?? [] : [];
+  const citations = message.role === "assistant" ? (message.citations ?? []) : [];
   const showSources = atLeast("standard") && citations.length > 0;
 
   const jumpToSource = (n: number) => {

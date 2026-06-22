@@ -306,9 +306,7 @@ function TimelineBody({
         className="mb-1 border-0 bg-transparent px-0 text-sm font-medium focus:ring-0"
       />
       <div className="min-h-0 flex-1 space-y-1 overflow-auto">
-        {items.length === 0 && (
-          <p className="text-[11px] text-ink4">No milestones yet.</p>
-        )}
+        {items.length === 0 && <p className="text-[11px] text-ink4">No milestones yet.</p>}
         {items.map((it) => (
           <div key={it.id} className="flex items-center gap-1">
             <input
@@ -325,7 +323,9 @@ function TimelineBody({
               className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-transparent bg-transparent px-1 py-0.5 text-xs text-ink2 focus:border-accent focus:outline-none"
             />
             {showPower && it.date && (
-              <span className="shrink-0 font-mono text-[9px] text-faint">{formatDate(it.date)}</span>
+              <span className="shrink-0 font-mono text-[9px] text-faint">
+                {formatDate(it.date)}
+              </span>
             )}
             <button
               onClick={() => onRemoveItem(widget.id, it.id)}

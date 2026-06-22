@@ -43,7 +43,9 @@ pub fn now_local_iso(zone: Tz) -> String {
 
 /// [`now_local_iso`] with an injected instant (test seam).
 pub fn now_local_iso_at(zone: Tz, now: DateTime<Utc>) -> String {
-    now.with_timezone(&zone).format("%Y-%m-%dT%H:%M").to_string()
+    now.with_timezone(&zone)
+        .format("%Y-%m-%dT%H:%M")
+        .to_string()
 }
 
 /// Render a stored event start for display in `zone`. A timed instant (RFC3339 —
@@ -69,7 +71,10 @@ mod tests {
         // 2026-06-22 03:00 UTC is still 2026-06-21 23:00 in New York (EDT, -04).
         use chrono_tz::America::New_York;
         let now = Utc.with_ymd_and_hms(2026, 6, 22, 3, 0, 0).unwrap();
-        assert_eq!(today_in_at(New_York, now), NaiveDate::from_ymd_opt(2026, 6, 21).unwrap());
+        assert_eq!(
+            today_in_at(New_York, now),
+            NaiveDate::from_ymd_opt(2026, 6, 21).unwrap()
+        );
         assert_eq!(today_sql_in_at(New_York, now), "2026-06-21");
         // The very same instant is already the 22nd in UTC — proving the split.
         assert_eq!(today_sql_in_at(Tz::UTC, now), "2026-06-22");
@@ -81,7 +86,10 @@ mod tests {
         // (pre-jump, -05) → the civil date is still Mar 8; the math must not panic.
         use chrono_tz::America::New_York;
         let now = Utc.with_ymd_and_hms(2026, 3, 8, 7, 30, 0).unwrap();
-        assert_eq!(today_in_at(New_York, now), NaiveDate::from_ymd_opt(2026, 3, 8).unwrap());
+        assert_eq!(
+            today_in_at(New_York, now),
+            NaiveDate::from_ymd_opt(2026, 3, 8).unwrap()
+        );
     }
 
     #[test]
@@ -95,9 +103,15 @@ mod tests {
     fn to_zone_display_converts_timed_and_passes_through_all_day() {
         use chrono_tz::America::New_York;
         // 15:00Z → 11:00 in New York (EDT, -04).
-        assert_eq!(to_zone_display("2026-06-20T15:00:00Z", New_York), "2026-06-20T11:00");
+        assert_eq!(
+            to_zone_display("2026-06-20T15:00:00Z", New_York),
+            "2026-06-20T11:00"
+        );
         // An offset instant is honoured too: 15:00+01:00 = 14:00Z = 10:00 EDT.
-        assert_eq!(to_zone_display("2026-06-20T15:00:00+01:00", New_York), "2026-06-20T10:00");
+        assert_eq!(
+            to_zone_display("2026-06-20T15:00:00+01:00", New_York),
+            "2026-06-20T10:00"
+        );
         // An all-day date has no instant — returned unchanged in any zone.
         assert_eq!(to_zone_display("2026-06-20", New_York), "2026-06-20");
         assert_eq!(to_zone_display("2026-06-20", Tz::UTC), "2026-06-20");

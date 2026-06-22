@@ -241,7 +241,9 @@ function ProjectCard({
   const badge = (
     <StatusBadge
       status={project.status}
-      label={project.status === "part_of" && project.parent ? `Part of ${project.parent}` : undefined}
+      label={
+        project.status === "part_of" && project.parent ? `Part of ${project.parent}` : undefined
+      }
     />
   );
 
@@ -254,7 +256,9 @@ function ProjectCard({
               <span className="shrink-0" data-help="focus-status-badge">
                 {badge}
               </span>
-              <span className={`truncate font-medium text-ink ${minimal ? "text-base" : "text-sm"}`}>
+              <span
+                className={`truncate font-medium text-ink ${minimal ? "text-base" : "text-sm"}`}
+              >
                 {project.name}
               </span>
             </div>
@@ -263,7 +267,9 @@ function ProjectCard({
                 <span>
                   {project.doc_count} doc{project.doc_count === 1 ? "" : "s"}
                 </span>
-                {project.importance && <span className="capitalize">{project.importance} importance</span>}
+                {project.importance && (
+                  <span className="capitalize">{project.importance} importance</span>
+                )}
                 {project.size && <span>{project.size}</span>}
                 {project.deadline && <span>due {formatDate(project.deadline.slice(0, 10))}</span>}
                 {project.blocked_by && <span>blocked by {project.blocked_by}</span>}
@@ -272,7 +278,8 @@ function ProjectCard({
             )}
             {showMeta && project.calendar_event && (
               <div className="mt-1 truncate text-xs text-accent-text">
-                📅 {project.calendar_event.summary} · {formatEventWhen(project.calendar_event.start)}
+                📅 {project.calendar_event.summary} ·{" "}
+                {formatEventWhen(project.calendar_event.start)}
               </div>
             )}
           </button>
@@ -382,11 +389,7 @@ function MetaEditor({
           </Select>
         </Field>
         <Field label="Deadline (Due soon)">
-          <Input
-            type="date"
-            value={deadline}
-            onChange={(e) => setDeadline(e.target.value)}
-          />
+          <Input type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)} />
         </Field>
         <Field label="Blocked by">
           <ProjectSelect value={blockedBy} options={otherProjects} onChange={setBlockedBy} />
@@ -481,11 +484,15 @@ function Agenda({ events }: { events: CalendarEvent[] }) {
   const shown = events.slice(0, 8);
   return (
     <Card className="mb-5 px-4 py-3" data-help="focus-agenda">
-      <h2 className="mb-2 font-mono text-xs font-semibold uppercase tracking-wide text-ink3">Upcoming</h2>
+      <h2 className="mb-2 font-mono text-xs font-semibold uppercase tracking-wide text-ink3">
+        Upcoming
+      </h2>
       <ul className="flex flex-col gap-1.5">
         {shown.map((e) => (
           <li key={e.id} className="flex items-baseline gap-3 text-sm">
-            <span className="w-32 shrink-0 font-mono text-xs text-ink3">{formatEventWhen(e.start, e.all_day)}</span>
+            <span className="w-32 shrink-0 font-mono text-xs text-ink3">
+              {formatEventWhen(e.start, e.all_day)}
+            </span>
             <span className="truncate text-ink2">{e.summary}</span>
             {e.location && <span className="truncate text-xs text-ink4">{e.location}</span>}
           </li>

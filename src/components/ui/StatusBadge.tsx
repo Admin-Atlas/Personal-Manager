@@ -61,7 +61,10 @@ export function StatusBadge({ status, label, className }: StatusBadgeProps) {
 
   if (system === "terminal") {
     return (
-      <span className={cn("inline-flex items-center gap-1 font-mono text-xs", className)} style={{ color }}>
+      <span
+        className={cn("inline-flex items-center gap-1 font-mono text-xs", className)}
+        style={{ color }}
+      >
         <span aria-hidden>●</span>
         {text}
       </span>
@@ -71,7 +74,11 @@ export function StatusBadge({ status, label, className }: StatusBadgeProps) {
   // editorial: coloured dot + italic label
   return (
     <span className={cn("inline-flex items-center gap-1.5 text-sm", className)} style={{ color }}>
-      <span aria-hidden className="inline-block h-1.5 w-1.5 rounded-full" style={{ background: color }} />
+      <span
+        aria-hidden
+        className="inline-block h-1.5 w-1.5 rounded-full"
+        style={{ background: color }}
+      />
       <span className="font-head italic">{text}</span>
     </span>
   );

@@ -112,8 +112,8 @@ mod platform {
 
             // Desktop (Win32) apps must use the interop variant that takes an HWND;
             // the windowless `RequestVerificationAsync` only works for UWP.
-            let interop = factory::<UserConsentVerifier, IUserConsentVerifierInterop>()
-                .map_err(win_err)?;
+            let interop =
+                factory::<UserConsentVerifier, IUserConsentVerifierInterop>().map_err(win_err)?;
             // SAFETY: `window_handle` is the live main-window HWND captured on the UI
             // thread; the interop call only reads it to parent the system dialog.
             let operation: IAsyncOperation<UserConsentVerificationResult> = unsafe {

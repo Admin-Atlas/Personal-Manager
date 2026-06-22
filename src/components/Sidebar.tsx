@@ -151,7 +151,9 @@ export function Sidebar({
           className="mb-1 w-full rounded-[var(--radius-sm)] px-3 py-1.5 text-left hover:bg-surface"
         >
           {showMeta && <ModelRow role="Chat" id={chatModel} fallbacks={chatFallbacks} />}
-          {showMeta && <ModelRow role="Tasks" id={backgroundModel} fallbacks={backgroundFallbacks} />}
+          {showMeta && (
+            <ModelRow role="Tasks" id={backgroundModel} fallbacks={backgroundFallbacks} />
+          )}
         </button>
         <button
           onClick={onOpenWhatsNew}

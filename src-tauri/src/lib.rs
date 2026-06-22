@@ -67,9 +67,13 @@ pub fn run() {
 
             // The sidecar source folder is optional at boot — chat works without
             // it; ingestion surfaces a clear error if it (or Python) is missing.
-            let source_dir = paths::sidecar_source_dir(handle).unwrap_or_else(|_| PathBuf::from("sidecar"));
+            let source_dir =
+                paths::sidecar_source_dir(handle).unwrap_or_else(|_| PathBuf::from("sidecar"));
             let venv_dir = paths::venv_dir(handle)?;
-            let sidecar = SidecarManager::new(SidecarPaths { source_dir, venv_dir });
+            let sidecar = SidecarManager::new(SidecarPaths {
+                source_dir,
+                venv_dir,
+            });
 
             app.manage(AppState {
                 db: Mutex::new(conn),

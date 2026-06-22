@@ -13,8 +13,7 @@ export type ButtonVariant = "primary" | "secondary" | "tertiary";
 const VARIANT: Record<ButtonVariant, string> = {
   primary:
     "bg-accent text-accent-ink font-semibold hover:brightness-105 active:brightness-95 disabled:bg-surface disabled:text-faint",
-  secondary:
-    "bg-transparent text-ink2 border border-border2 hover:bg-surface disabled:text-faint",
+  secondary: "bg-transparent text-ink2 border border-border2 hover:bg-surface disabled:text-faint",
   tertiary: "bg-transparent text-ink4 hover:text-ink2 disabled:text-faint",
 };
 
