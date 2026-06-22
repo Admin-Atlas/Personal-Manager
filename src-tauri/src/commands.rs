@@ -1412,7 +1412,7 @@ fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
          ORDER BY COUNT(*) DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map([], |r| {
             let prompt_tokens: i64 = r.get(1)?;
             let completion_tokens: i64 = r.get(2)?;
@@ -1432,6 +1432,15 @@ fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Rank by cost (most expensive first); unpriced models (unknown cost) sort last,
+    // then by request count — so the breakdown reads as a spend ranking.
+    rows.sort_by(|a, b| {
+        let ak = a.cost_usd.unwrap_or(f64::NEG_INFINITY);
+        let bk = b.cost_usd.unwrap_or(f64::NEG_INFINITY);
+        bk.partial_cmp(&ak)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.request_count.cmp(&a.request_count))
+    });
     Ok(rows)
 }
 

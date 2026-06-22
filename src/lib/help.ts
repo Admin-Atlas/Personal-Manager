@@ -136,7 +136,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-usage-cost": {
     title: "Usage & cost",
-    body: "What you've spent on model calls, priced from OpenRouter's public rates (refreshed about once a day). Shows last-30-days and all-time totals; at Power depth it breaks spend down per model. 'Refresh prices' re-pulls the latest rates. Costs are computed from token counts at read time, so a price change re-prices your history.",
+    body: "What you've spent on model calls, priced from OpenRouter's public rates (refreshed about once a day). Shows last-30-days and all-time totals; expand 'How this is calculated' for the method and a per-model spend ranking. 'Refresh prices' re-pulls the latest rates. Costs are computed from token counts at read time, so a price change re-prices your history.",
   },
   "settings-help-mode": {
     title: "Help mode",

@@ -24,7 +24,7 @@ import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import type { CostSummary, LearningProfile } from "../lib/types";
 import { useTheme, useDepth, ACCENTS } from "../theme";
-import { Button, Input, SegmentedControl, Select } from "./ui";
+import { Button, Collapsible, Input, SegmentedControl, Select } from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -374,8 +374,8 @@ export function SettingsView({ onClose, onboarding }: Props) {
               </Button>
             </div>
             <p className="mt-1 text-xs text-ink4">
-              Token spend, priced from OpenRouter
-              {cost.pricing_updated_at ? ` · prices updated ${formatWhen(cost.pricing_updated_at)}` : ""}.
+              Estimated from the tokens each model call used × OpenRouter&apos;s per-token price
+              {cost.pricing_updated_at ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})` : ""}.
             </p>
             <div className="mt-2 flex gap-6 text-sm">
               <div>
@@ -387,30 +387,55 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 <div className="font-mono text-ink2">{fmtUsd(cost.total_all_time_usd)}</div>
               </div>
             </div>
-            {showPower && cost.all_time.length > 0 && (
-              <table className="mt-3 w-full text-left text-xs">
-                <thead className="font-mono uppercase tracking-wide text-ink4">
-                  <tr className="border-b border-rule">
-                    <th className="py-1 font-medium">Model</th>
-                    <th className="py-1 text-right font-medium">Reqs</th>
-                    <th className="py-1 text-right font-medium">Tokens in/out</th>
-                    <th className="py-1 text-right font-medium">Cost</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {cost.all_time.map((s) => (
-                    <tr key={s.model} className="border-b border-rule">
-                      <td className="py-1 pr-2 text-ink2">{s.model}</td>
-                      <td className="py-1 text-right text-ink3">{s.request_count}</td>
-                      <td className="py-1 text-right font-mono text-ink4">
-                        {s.prompt_tokens.toLocaleString()} / {s.completion_tokens.toLocaleString()}
-                      </td>
-                      <td className="py-1 text-right font-mono text-ink3">{fmtUsd(s.cost_usd)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
+            <div className="mt-3">
+              <Collapsible title="How this is calculated" defaultOpen={showPower}>
+                <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
+                  <p>
+                    Each model reply reports the tokens it used (your prompt + its reply). PM logs
+                    those per call. It fetches OpenRouter&apos;s public price list about once a day
+                    and caches it — no extra model call, and your API key is never used for it.
+                  </p>
+                  <p>
+                    Cost per model = prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
+                    reply&nbsp;price, summed over that model&apos;s calls. It&apos;s computed when
+                    you open this page, so a later price change re-prices your history. A model not
+                    yet in the price cache shows <span className="font-mono text-ink4">—</span>,
+                    never an understated&nbsp;$0.
+                  </p>
+                </div>
+                {cost.all_time.length > 0 ? (
+                  <div className="mt-3">
+                    <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
+                      By model · most expensive first (all time)
+                    </p>
+                    <table className="w-full text-left text-xs">
+                      <thead className="font-mono uppercase tracking-wide text-ink4">
+                        <tr className="border-b border-rule">
+                          <th className="py-1 font-medium">Model</th>
+                          <th className="py-1 text-right font-medium">Reqs</th>
+                          <th className="py-1 text-right font-medium">Tokens in/out</th>
+                          <th className="py-1 text-right font-medium">Cost</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {cost.all_time.map((s) => (
+                          <tr key={s.model} className="border-b border-rule">
+                            <td className="py-1 pr-2 text-ink2">{s.model}</td>
+                            <td className="py-1 text-right text-ink3">{s.request_count}</td>
+                            <td className="py-1 text-right font-mono text-ink4">
+                              {s.prompt_tokens.toLocaleString()} / {s.completion_tokens.toLocaleString()}
+                            </td>
+                            <td className="py-1 text-right font-mono text-ink3">{fmtUsd(s.cost_usd)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
+                )}
+              </Collapsible>
+            </div>
           </div>
         )}
 
