@@ -25,13 +25,24 @@ fn dev_override(var: &str) -> Option<std::ffi::OsString> {
 /// The stable directory that holds all of the user's data: the encrypted SQLite
 /// store and the Markdown vault. It lives *outside* the app bundle and the repo
 /// (spec §7) so updates never wipe it. `PM_DATA_DIR` overrides it in dev builds.
+///
+/// We resolve the *machine-local* base (`%LOCALAPPDATA%` on Windows,
+/// `~/Library/Application Support` on macOS) and join a human-readable
+/// `"Personal Manager"` ourselves, rather than using `app_data_dir()`. Two reasons:
+/// the data is large and machine-specific (the store + Python venv) and its
+/// decryption key lives in the non-roaming OS keychain, so the local base is the
+/// correct home; and the friendly name is far easier for the user to find and back
+/// up. The folder name is deliberately decoupled from the bundle identifier
+/// (`org.itsatlas.pm`) — the identifier stays fixed because the keychain service is
+/// keyed to it (`secrets.rs`), so it must never be renamed.
 pub fn data_dir(app: &AppHandle) -> Result<PathBuf> {
     let dir = match dev_override("PM_DATA_DIR") {
         Some(value) => PathBuf::from(value),
         None => app
             .path()
-            .app_data_dir()
-            .map_err(|e| Error::Other(format!("could not resolve app data dir: {e}")))?,
+            .local_data_dir()
+            .map_err(|e| Error::Other(format!("could not resolve local data dir: {e}")))?
+            .join("Personal Manager"),
     };
     std::fs::create_dir_all(&dir)?;
     // The Markdown vault (source of truth) lives alongside the index; empty in v1.

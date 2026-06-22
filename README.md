@@ -138,10 +138,13 @@ touch it:
 - the encrypted `pm.sqlite` store
 - a `vault/` of Markdown (the source of truth; populated from Step 2 on)
 
-Default location is the OS app-data dir (e.g. `%APPDATA%/org.itsatlas.pm` on
-Windows, `~/Library/Application Support/org.itsatlas.pm` on macOS). Override it
-for development with the `PM_DATA_DIR` environment variable. Encryption keys and API
-keys live in the OS keychain, never the data directory.
+It lives in a friendly, machine-local folder named **`Personal Manager`**:
+`%LOCALAPPDATA%\Personal Manager` on Windows, `~/Library/Application Support/Personal Manager`
+on macOS. The folder name is deliberately decoupled from the app's bundle identifier
+(`org.itsatlas.pm`, which stays fixed because the OS keychain is keyed to it) — so it's
+easy to find and back up. Override the location for development with the `PM_DATA_DIR`
+environment variable. Encryption keys and API keys live in the OS keychain, never the data
+directory.
 
 ## Privacy
 
