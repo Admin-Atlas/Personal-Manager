@@ -171,10 +171,13 @@ jobs:
           path: staged/*
           if-no-files-found: error
 
-  # --- standalone-Python smoke: the pinned sidecar deps resolve + import --
-  # There is no bundled interpreter yet; the sidecar runs in a venv provisioned at
-  # runtime, so this proves requirements.txt installs and imports on each SHIPPED OS
-  # (Windows + macOS). Python 3.12 is used for broad wheel availability.
+  # --- sidecar-deps smoke: the pinned requirements resolve + import -------
+  # Proves requirements.txt installs and imports on each SHIPPED OS (Windows +
+  # macOS) against Python 3.12 — the version Windows now BUNDLES (python-build-
+  # standalone, fetched into the bundle by scripts/fetch-python.mjs) and the floor
+  # macOS still provisions its runtime venv against. Catches a dep that can't
+  # resolve before a release does. (The bundled interpreter is a prebuilt binary,
+  # so the build runners still need no Python toolchain to compile.)
   python-smoke:
     needs: guards
     strategy:

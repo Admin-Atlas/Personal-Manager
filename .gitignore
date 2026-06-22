@@ -40,6 +40,10 @@ __pycache__/
 *.pyc
 sidecar/.venv/
 
+# Bundled standalone interpreter (python-build-standalone) — fetched at build time
+# by scripts/fetch-python.mjs and shipped as a Windows resource, never committed.
+/src-tauri/python/
+
 # Claude Code: the shared project settings.json is committed; the per-developer
 # settings.local.json (personal permission overrides) stays local.
 .claude/settings.local.json

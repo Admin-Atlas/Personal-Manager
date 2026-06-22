@@ -40,6 +40,10 @@ const FORBIDDEN = [
     re: /(^|\/)\.venv\//,
     why: "Python virtualenv (a runtime artifact, provisioned on the user's machine)",
   },
+  {
+    re: /^src-tauri\/python\//,
+    why: "bundled standalone interpreter (fetched at build time by fetch-python.mjs, never committed)",
+  },
   { re: /(^|\/)__pycache__\//, why: "Python bytecode cache" },
   { re: /\.pyc$/, why: "compiled Python" },
   { re: /(^|\/)node_modules\//, why: "installed npm packages" },

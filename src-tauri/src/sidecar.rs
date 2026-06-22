@@ -6,9 +6,11 @@
 //! (fastembed). It is the only Python in PM; everything else is Rust.
 //!
 //! Python is provided by a *managed venv* created on first run (spec decision):
-//! the app locates a base interpreter, builds an isolated venv under the data
-//! directory, and pip-installs the pinned `requirements.txt`. A `.ready` marker
-//! keyed by a hash of that file lets later runs skip the slow setup.
+//! the app locates a base interpreter — the standalone one bundled with the app
+//! on Windows release builds, else a system Python — builds an isolated venv
+//! under the data directory, and pip-installs the pinned `requirements.txt`. A
+//! `.ready` marker keyed by a hash of that file lets later runs skip the slow
+//! setup.
 //!
 //! Talking to the child is newline-delimited JSON over stdio. Requests are
 //! serialized by the `Mutex<Option<Process>>`, so each reply is the next line on
@@ -65,6 +67,22 @@ impl SidecarPaths {
         } else {
             self.venv_dir.join("bin").join("python")
         }
+    }
+
+    /// The bundled standalone interpreter shipped beside the sidecar resources
+    /// (`<resource_dir>/python/`), if present. Release Windows builds ship it
+    /// (scripts/fetch-python.mjs + tauri.windows.conf.json) so the venv is built
+    /// without a system Python. In dev `source_dir` is the repo's `sidecar/`,
+    /// which has no `python/` sibling, so this is `None` and we fall back to a
+    /// base interpreter on PATH.
+    fn bundled_python(&self) -> Option<PathBuf> {
+        let dir = self.source_dir.parent()?.join("python");
+        let exe = if cfg!(windows) {
+            dir.join("python.exe")
+        } else {
+            dir.join("bin").join("python3")
+        };
+        exe.exists().then_some(exe)
     }
 
     fn ready_marker(&self) -> PathBuf {
@@ -184,13 +202,20 @@ impl SidecarManager {
             )));
         }
 
-        let base = find_base_python().ok_or_else(|| {
-            Error::Other(
-                "No Python interpreter found. Install Python 3.10+ and ensure it is on PATH, \
-                 or set PM_PYTHON to its full path."
-                    .into(),
-            )
-        })?;
+        // Prefer the interpreter bundled with the app (Windows release builds);
+        // fall back to a system Python (dev, or a build with no bundled one).
+        let base = self
+            .paths
+            .bundled_python()
+            .or_else(find_base_python)
+            .ok_or_else(|| {
+                Error::Other(
+                    "No Python interpreter found: the bundled interpreter is missing and no \
+                     system Python is on PATH. Install Python 3.10+ and ensure it is on PATH, \
+                     or set PM_PYTHON to its full path."
+                        .into(),
+                )
+            })?;
 
         if let Some(parent) = self.paths.venv_dir.parent() {
             std::fs::create_dir_all(parent)?;
@@ -516,5 +541,42 @@ mod tests {
         let mut r = Cursor::new(vec![b'x'; 5000]);
         let err = read_line_capped(&mut r, 1024).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    fn paths_with_source(source_dir: PathBuf) -> SidecarPaths {
+        let venv_dir = source_dir.join("runtime").join("venv");
+        SidecarPaths {
+            source_dir,
+            venv_dir,
+        }
+    }
+
+    #[test]
+    fn bundled_python_found_beside_sidecar_resources() {
+        // The bundle ships the interpreter as a `python/` sibling of the
+        // `sidecar/` resource dir; bundled_python() resolves it.
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("sidecar");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let exe = if cfg!(windows) {
+            root.path().join("python").join("python.exe")
+        } else {
+            root.path().join("python").join("bin").join("python3")
+        };
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+
+        assert_eq!(paths_with_source(source_dir).bundled_python(), Some(exe));
+    }
+
+    #[test]
+    fn bundled_python_absent_in_dev_layout() {
+        // No `python/` sibling (the dev repo layout) → None, so provisioning
+        // falls back to a system interpreter on PATH.
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("sidecar");
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        assert_eq!(paths_with_source(source_dir).bundled_python(), None);
     }
 }
