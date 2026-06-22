@@ -14,13 +14,14 @@ import {
   setChatModels,
   setOpenRouterBackgroundKey,
   setOpenRouterKey,
+  setTimeZone,
 } from "../lib/ipc";
 import { useHelp } from "../lib/help";
 import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import type { LearningProfile } from "../lib/types";
 import { useTheme, ACCENTS } from "../theme";
-import { Button, Input, SegmentedControl } from "./ui";
+import { Button, Input, SegmentedControl, Select } from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -43,6 +44,8 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [profile, setProfile] = useState<LearningProfile | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [timeZone, setTimeZoneState] = useState("");
+  const [tzAuto, setTzAuto] = useState(true);
 
   useEffect(() => {
     (async () => {
@@ -54,6 +57,23 @@ export function SettingsView({ onClose, onboarding }: Props) {
         setBackgroundModelsState(settings.background_models);
         setChatAuto(settings.chat_auto_switch);
         setBackgroundAuto(settings.background_auto_switch);
+        if (settings.time_zone) {
+          setTimeZoneState(settings.time_zone);
+          setTzAuto(settings.time_zone === detectTimeZone());
+        } else {
+          // First launch: detect the device zone and persist it so the backend's
+          // "today"/agenda reasoning has a zone from the start.
+          const detected = detectTimeZone();
+          setTimeZoneState(detected);
+          setTzAuto(true);
+          // Best-effort: an exotic zone chrono-tz doesn't recognise stays unsaved and
+          // the backend reasons in UTC — don't let it block the rest of the load.
+          try {
+            await setTimeZone(detected);
+          } catch {
+            /* ignore — UTC fallback in the backend */
+          }
+        }
         if (!onboarding) setProfile(await getLearningProfile());
       } catch (e) {
         setError(String(e));
@@ -95,6 +115,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
       if (backgroundModels.length > 0) await setBackgroundModels(backgroundModels);
       await setChatAutoSwitch(chatAuto);
       await setBackgroundAutoSwitch(backgroundAuto);
+      await setTimeZone(tzAuto ? detectTimeZone() : timeZone);
       onClose();
     } catch (e) {
       setError(String(e));
@@ -185,6 +206,49 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 ))}
               </div>
             </div>
+          </div>
+        )}
+
+        {!onboarding && (
+          <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">
+            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+              Time zone
+            </label>
+            <p className="mt-1 text-xs text-ink4">
+              Sets “today”, “due soon”, and your calendar agenda. Auto follows this device.
+            </p>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-sm text-ink2">Detection</span>
+              <SegmentedControl
+                value={tzAuto ? "auto" : "manual"}
+                onChange={(v) => setTzAuto(v === "auto")}
+                options={[
+                  { value: "auto", label: "Auto" },
+                  { value: "manual", label: "Manual" },
+                ]}
+              />
+            </div>
+            {!tzAuto && (
+              <div className="mt-3 flex items-center justify-between gap-3">
+                <span className="text-sm text-ink2">Zone</span>
+                <Select
+                  value={timeZone}
+                  onChange={(e) => setTimeZoneState(e.target.value)}
+                  className="max-w-[14rem]"
+                >
+                  {allTimeZones().map((z) => (
+                    <option key={z} value={z}>
+                      {z}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            )}
+            <p className="mt-2 text-xs text-faint">
+              {tzAuto
+                ? `Following this device: ${detectTimeZone()}`
+                : `Selected: ${timeZone || "—"}`}
+            </p>
           </div>
         )}
 
@@ -362,4 +426,18 @@ export function SettingsView({ onClose, onboarding }: Props) {
 function formatWhen(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+/** The device's IANA time zone (e.g. "Europe/London"), via the Intl API. */
+function detectTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+/** Every IANA zone the runtime knows, for the manual picker. Falls back to just the
+ *  detected zone on a runtime without `Intl.supportedValuesOf`. */
+function allTimeZones(): string[] {
+  const intl = Intl as typeof Intl & { supportedValuesOf?: (key: string) => string[] };
+  return typeof intl.supportedValuesOf === "function"
+    ? intl.supportedValuesOf("timeZone")
+    : [detectTimeZone()];
 }

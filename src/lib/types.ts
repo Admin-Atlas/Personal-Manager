@@ -30,6 +30,10 @@ export interface Settings {
   background_auto_switch: boolean;
   /** When on, hovering a section shows an explanation panel (Step 4b help mode). */
   help_mode: boolean;
+  /** The user's IANA time zone (e.g. "Europe/London"), or "" if not yet set — the UI
+   *  auto-detects + persists one on first load. Drives the focus-view day boundaries
+   *  and the briefing/agenda "now". */
+  time_zone: string;
 }
 
 /** A model from the OpenRouter catalogue, for the Settings model picker.

@@ -18,7 +18,7 @@ use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
-use crate::{briefing, db, learning, openrouter, paths, secrets, AppState};
+use crate::{briefing, clock, db, learning, openrouter, paths, secrets, AppState};
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
 /// stored as a plain string (spec §6 — never locked into a model).
@@ -30,6 +30,11 @@ const CHAT_MODELS_KEY: &str = "chat_models";
 const BACKGROUND_MODELS_KEY: &str = "background_models";
 const CHAT_AUTO_SWITCH_KEY: &str = "chat_auto_switch";
 const BACKGROUND_AUTO_SWITCH_KEY: &str = "background_auto_switch";
+
+/// The user's IANA time-zone name (e.g. "America/New_York"), supplied by the
+/// frontend via `Intl.DateTimeFormat().resolvedOptions().timeZone`. Empty/unset →
+/// the backend reasons in UTC (see `resolve_zone`).
+const TIME_ZONE_KEY: &str = "time_zone";
 
 /// Caps for chat: the most we'll store for a single message, and how many prior
 /// turns we replay into a request. A long conversation or one giant pasted message
@@ -73,6 +78,9 @@ pub struct Settings {
     /// When on, the UI shows an explanation panel for whatever section the user
     /// hovers — a learn-the-app affordance (Step 4b). Defaults off.
     pub help_mode: bool,
+    /// The user's IANA time zone (e.g. "Europe/London"), or "" when not yet set —
+    /// the focus-view day boundaries and the briefing/agenda "now" reason in it.
+    pub time_zone: String,
 }
 
 /// Streamed back to the UI over a Tauri channel as the assistant replies.
@@ -133,6 +141,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
         background_auto_switch: db::get_setting(&conn, BACKGROUND_AUTO_SWITCH_KEY)?.as_deref()
             == Some("true"),
         help_mode: db::get_setting(&conn, "help_mode")?.as_deref() == Some("true"),
+        time_zone: db::get_setting(&conn, TIME_ZONE_KEY)?.unwrap_or_default(),
     })
 }
 
@@ -165,6 +174,28 @@ pub fn set_background_auto_switch(state: State<'_, AppState>, enabled: bool) -> 
 pub fn set_help_mode(state: State<'_, AppState>, enabled: bool) -> Result<()> {
     let conn = state.db.lock().unwrap();
     db::set_setting(&conn, "help_mode", if enabled { "true" } else { "false" })
+}
+
+/// The stored IANA time zone (empty string = none set; the backend then uses UTC).
+#[tauri::command]
+pub fn get_time_zone(state: State<'_, AppState>) -> Result<String> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_setting(&conn, TIME_ZONE_KEY)?.unwrap_or_default())
+}
+
+/// Persist the IANA zone the frontend resolved via `Intl`. Validated against the
+/// chrono-tz database so a garbage string can't be stored; an empty value clears it
+/// (the backend falls back to UTC). This is correctness state, not appearance, so it
+/// lives in the backend `settings` table where the SQL/date logic reads it.
+#[tauri::command]
+pub fn set_time_zone(state: State<'_, AppState>, zone: String) -> Result<()> {
+    use std::str::FromStr;
+    let zone = zone.trim();
+    if !zone.is_empty() && chrono_tz::Tz::from_str(zone).is_err() {
+        return Err(Error::Other(format!("unrecognised time zone: {zone}")));
+    }
+    let conn = state.db.lock().unwrap();
+    db::set_setting(&conn, TIME_ZONE_KEY, zone)
 }
 
 /// The OpenRouter model catalogue (public endpoint, no key needed) so the user can
@@ -301,7 +332,7 @@ pub async fn send_message(
         // Give a global (unscoped) chat the user's upcoming agenda so it can answer
         // "what's on at 3pm?" (Step 6). A project-scoped chat stays on its documents.
         let agenda = if scope.is_none() {
-            calendar::agenda_preamble(&conn, 7)?
+            calendar::agenda_preamble(&conn, 7, resolve_zone(&conn))?
         } else {
             None
         };
@@ -788,7 +819,8 @@ pub async fn set_document_metadata(
 #[tauri::command]
 pub fn list_project_overviews(state: State<'_, AppState>) -> Result<Vec<ProjectOverview>> {
     let conn = state.db.lock().unwrap();
-    projects::list_overviews(&conn)
+    let today = clock::today_sql_in(resolve_zone(&conn));
+    projects::list_overviews(&conn, &today)
 }
 
 /// Set (or update) a project's triage metadata — the user confirming/correcting an
@@ -916,7 +948,14 @@ pub fn list_ics_feeds() -> Result<Vec<IcsFeedInfo>> {
 #[tauri::command]
 pub async fn add_ics_feed(app: AppHandle, label: String, url: String) -> Result<()> {
     let feed = calendar::add_feed(&label, &url)?;
-    match calendar::sync_feed(&feed).await {
+    // Resolve the user's zone (for floating/all-day ICS times) under a short lock,
+    // then drop it before the network sync (rule #4).
+    let tz = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        resolve_zone(&conn)
+    };
+    match calendar::sync_feed(&feed, tz).await {
         Ok(events) => {
             let state = app.state::<AppState>();
             let conn = state.db.lock().unwrap();
@@ -1000,7 +1039,7 @@ pub fn set_google_calendar_ids(state: State<'_, AppState>, ids: Vec<String>) -> 
 /// every source failed (so a transient miss keeps the last-good events).
 #[tauri::command]
 pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
-    let (oauth_ids, feeds, time_min, time_max) = {
+    let (oauth_ids, feeds, time_min, time_max, tz) = {
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
         let oauth_ids = if google::is_connected()? {
@@ -1010,7 +1049,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         };
         let feeds = calendar::load_feeds()?;
         let (min, max) = calendar::time_window(&conn)?;
-        (oauth_ids, feeds, min, max)
+        (oauth_ids, feeds, min, max, resolve_zone(&conn))
     };
 
     // Every calendar/feed we intend to keep events for — anything else is pruned.
@@ -1040,7 +1079,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         }
     }
     for feed in &feeds {
-        match calendar::sync_feed(feed).await {
+        match calendar::sync_feed(feed, tz).await {
             Ok(events) => {
                 let state = app.state::<AppState>();
                 let conn = state.db.lock().unwrap();
@@ -1152,10 +1191,12 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
-        let now: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M','now')", [], |r| r.get(0))?;
-        let projects = projects::list_overviews(&conn)?;
+        let zone = resolve_zone(&conn);
+        let now = clock::now_local_iso(zone);
+        let today = clock::today_sql_in(zone);
+        let projects = projects::list_overviews(&conn, &today)?;
         let events = calendar::list_upcoming(&conn, briefing::BRIEFING_AGENDA_DAYS)?;
-        let snapshot = briefing::build_snapshot(&projects, &events, &now);
+        let snapshot = briefing::build_snapshot(&projects, &events, &now, zone);
         let profile = learning::profile_preamble(&conn)?;
         (snapshot, profile, models)
     };
@@ -1182,6 +1223,20 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
 fn iso_now(state: &AppState) -> Result<String> {
     let conn = state.db.lock().unwrap();
     Ok(conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0))?)
+}
+
+/// Resolve the user's stored IANA zone to a `chrono_tz::Tz`. Falls back to UTC when
+/// the key is unset, empty, or unparseable — chrono `Local` only yields an offset
+/// (no IANA name, DST-unstable), so the canonical zone is supplied by the frontend
+/// (`Intl`) and stored; UTC is the stable default matching every `strftime('now')`.
+/// Infallible by design (worst case UTC) so call sites stay one-liners.
+fn resolve_zone(conn: &Connection) -> chrono_tz::Tz {
+    use std::str::FromStr;
+    db::get_setting(conn, TIME_ZONE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| chrono_tz::Tz::from_str(s.trim()).ok())
+        .unwrap_or(chrono_tz::Tz::UTC)
 }
 
 fn current_model(conn: &Connection) -> Result<String> {

@@ -3,6 +3,7 @@
 
 mod briefing;
 mod calendar;
+mod clock;
 mod commands;
 mod db;
 mod error;
@@ -78,6 +79,8 @@ pub fn run() {
             commands::set_chat_auto_switch,
             commands::set_background_auto_switch,
             commands::set_help_mode,
+            commands::get_time_zone,
+            commands::set_time_zone,
             commands::list_models,
             commands::get_learning_profile,
             commands::refresh_learning_profile,

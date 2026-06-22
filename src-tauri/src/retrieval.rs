@@ -194,6 +194,9 @@ fn apply_recency(conn: &Connection, fused: Vec<(i64, f64)>, k: usize) -> Result<
     // Age (in days) for every candidate in a single query rather than one round-trip
     // per candidate. Strip the trailing `Z` our timestamps carry — older SQLite
     // builds don't parse the zone suffix in julianday, and our times are already UTC.
+    // Deliberately UTC, not the user's zone: recency is a continuous half-life over an
+    // *instant* age (UTC-now minus a UTC-stored timestamp), not a civil-day "today"
+    // boundary like the focus-view deltas — so don't thread the user's zone here.
     let placeholders = vec!["?"; fused.len()].join(",");
     let mut stmt = conn.prepare(&format!(
         "SELECT c.id, julianday('now') \
