@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.3.2-alpha",
+    date: "2026-06-23",
+    highlights: [
+      "The “Day-to-day” model suggestion now skips free models — they’re often rate-limited and unreliable, which caused chat to silently fall back to your second-choice model. It now recommends the cheapest dependable model instead.",
+    ],
+  },
+  {
     version: "1.3.1-alpha",
     date: "2026-06-23",
     highlights: [
