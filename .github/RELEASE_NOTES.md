@@ -1,5 +1,22 @@
 PM desktop release.
 
+## What's new in 2.0.0-alpha
+
+The **first public release** of PM — a private, local-first personal manager for
+your documents, your focus, and the moving parts of your day, in one calm place.
+
+- **Yours, on your machine.** Everything stays local; your encrypted store stays
+  encrypted, and PM never sends your data anywhere on its own.
+- **A workspace that fits you.** A polished, fully themeable interface — light and
+  dark, accent colours, and depth — with documents, a Focus briefing, usage
+  tracking, model suggestions, and a Pinboard.
+- **Optional app lock.** Keep a quick glance from opening your things (Windows
+  Hello).
+- **Self-contained on Windows.** Nothing extra to install, and from here on PM
+  quietly keeps itself up to date.
+
+> This is an **alpha**: expect rough edges, and please report anything that bites.
+
 ## Install
 
 **Windows** — download and run the `*-setup.exe` installer. PM is **self-contained**:
