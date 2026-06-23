@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.3.5-alpha",
+    date: "2026-06-23",
+    highlights: [
+      "Security hardening (nothing changes in how you use PM): your sensitive values — the database key, your OpenRouter keys, and your Google Calendar tokens — are now held in a wrapper that can never be accidentally written to a log or error message, so they stay protected even as the app keeps growing.",
+    ],
+  },
+  {
     version: "1.3.4-alpha",
     date: "2026-06-23",
     highlights: [

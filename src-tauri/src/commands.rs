@@ -514,7 +514,7 @@ pub async fn send_message(
     messages.extend(history);
 
     // Stream the reply, forwarding each token to the UI.
-    let result = openrouter::stream_chat(&api_key, &models, &messages, |token| {
+    let result = openrouter::stream_chat(api_key.expose(), &models, &messages, |token| {
         let _ = on_event.send(ChatEvent::Token {
             text: token.to_string(),
         });
@@ -851,7 +851,7 @@ pub async fn propose_metadata(
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
     for p in pending {
         let (proposal, usage_info) = review::propose(
-            &api_key,
+            api_key.expose(),
             &models,
             &p.title,
             &p.body,
@@ -1105,7 +1105,7 @@ pub async fn propose_project_metadata(
             .cloned()
             .collect();
         let (proposal, usage_info) =
-            projects::propose(&api_key, &models, &t.name, &t.samples, &others).await;
+            projects::propose(api_key.expose(), &models, &t.name, &t.samples, &others).await;
         if let Some((usage, served)) = usage_info {
             usage_rows.push((served, usage));
         }
@@ -1380,7 +1380,7 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
     }
 
     let (updated, usage, served) =
-        learning::distill(&api_key, &models, &current, &corrections).await?;
+        learning::distill(api_key.expose(), &models, &current, &corrections).await?;
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
@@ -1438,7 +1438,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
     };
 
     let (text, usage, served) =
-        briefing::generate(&api_key, &models, &snapshot, profile.as_deref()).await?;
+        briefing::generate(api_key.expose(), &models, &snapshot, profile.as_deref()).await?;
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
