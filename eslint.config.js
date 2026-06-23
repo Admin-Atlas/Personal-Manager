@@ -19,7 +19,18 @@ import reactRefresh from "eslint-plugin-react-refresh";
 import prettier from "eslint-config-prettier";
 
 export default tseslint.config(
-  { ignores: ["dist", "dist-ssr", "src-tauri/target", "design-system-docs", "node_modules"] },
+  // src-tauri/python is the fetched standalone interpreter (a build artifact, like
+  // src-tauri/target) — present only on Windows checkouts and full of vendored JS.
+  {
+    ignores: [
+      "dist",
+      "dist-ssr",
+      "src-tauri/target",
+      "src-tauri/python",
+      "design-system-docs",
+      "node_modules",
+    ],
+  },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   // Frontend (browser).

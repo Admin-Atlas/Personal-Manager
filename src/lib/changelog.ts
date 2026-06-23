@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.3.3-alpha",
+    date: "2026-06-23",
+    highlights: [
+      "Developer tooling only (no change to the app or your data): PM’s code-quality checks now skip the bundled Python runtime on Windows, so local builds stay clean.",
+    ],
+  },
+  {
     version: "1.3.2-alpha",
     date: "2026-06-23",
     highlights: [
