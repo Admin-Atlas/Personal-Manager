@@ -10,8 +10,11 @@
 
 A local-first desktop app that **archives your knowledge so you can find and use
 it** and **gives you one clean view of everything you have going on**. Your data
-stays on your device, encrypted; the only traffic that leaves is the model API
-call (and, if you connect one, a read-only calendar fetch).
+stays on your device — the database (settings, search index) is encrypted with
+SQLCipher, while your documents live in a plaintext Markdown vault whose at-rest
+protection relies on your OS full-disk encryption (BitLocker / FileVault). The only
+traffic that leaves is the model API call (and, if you connect one, a read-only
+calendar fetch).
 
 This repo is the **application code**. Your personal data is never committed — it
 lives in a git-ignored local data directory (see below). The full product spec and
@@ -152,9 +155,11 @@ directory.
 
 ## Privacy
 
-Local-first by design: data is encrypted at rest, secrets are in the keychain,
-and the only outbound traffic is the OpenRouter model call. The repo holds code
-only — `.gitignore` keeps data and secrets out.
+Local-first by design: the store is encrypted at rest (SQLCipher) and secrets are
+in the keychain. The Markdown vault is plaintext on disk — its at-rest protection
+relies on your OS full-disk encryption (BitLocker / FileVault), so enable that. The
+only outbound traffic is the OpenRouter model call. The repo holds code only —
+`.gitignore` keeps data and secrets out.
 
 ## License
 

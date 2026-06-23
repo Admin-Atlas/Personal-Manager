@@ -598,6 +598,11 @@ export function SettingsView({ onClose, onboarding }: Props) {
               Markdown vault plus the encrypted store (the regenerable runtime is left out). The
               store stays encrypted in the archive.
             </p>
+            <p className="mt-1 text-xs text-ink4">
+              Your documents in the Markdown vault are stored unencrypted so any tool can read them.
+              To protect them when your machine is off or logged out, turn on full-disk encryption
+              (BitLocker on Windows, FileVault on macOS).
+            </p>
             <div className="mt-2 flex flex-wrap gap-2">
               <Button variant="tertiary" onClick={revealDataFolder}>
                 Open data folder
