@@ -118,11 +118,10 @@ jobs:
 
       - run: npm ci
 
-      # macOS Developer-ID signing + notarization is DORMANT: Tauri only signs when a real
-      # APPLE_SIGNING_IDENTITY is present, so with these secrets unset the macOS build stays
-      # unsigned (and still succeeds). To switch it on later, add the Apple secrets — no code
-      # change needed. notarytool needs the App Store Connect key as a FILE, so when the
-      # base64 secret exists this step materialises it and exports APPLE_API_KEY_PATH.
+      # macOS Developer-ID signing + notarization is DORMANT until the Apple secrets exist
+      # (see the cert-detection + signed/unsigned build split below — that's what keeps the
+      # unsigned build green). notarytool needs the App Store Connect key as a FILE, so when
+      # the base64 secret exists this step materialises it and exports APPLE_API_KEY_PATH.
       - name: Prepare Apple notarization key
         if: matrix.os == 'macos-latest' && env.APPLE_API_KEY_BASE64 != ''
         shell: bash
@@ -132,15 +131,43 @@ jobs:
           printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key_dir/AuthKey.p8"
           echo "APPLE_API_KEY_PATH=$key_dir/AuthKey.p8" >> "$GITHUB_ENV"
 
-      - name: Build + sign
+      # Is macOS Developer-ID signing configured? The cert/identity env vars must be
+      # ABSENT from the build when unset — an empty-but-defined APPLE_CERTIFICATE makes
+      # Tauri attempt `security import` on empty data and fail the bundle (the maiden
+      # v2.0.0-alpha release hit exactly this). We detect the secret in an isolated step
+      # (its env stays local to the step, never leaking an empty value to the build) and
+      # branch the build on the result. `steps.apple.outputs.enabled` is "" on Windows
+      # (step skipped), so Windows always takes the unsigned path below.
+      - name: Detect Apple signing
+        id: apple
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Default path: minisign updater signing only (always active). No Apple env is
+      # defined here, so macOS bundles unsigned and succeeds. Windows also runs here.
+      - name: Build (updater-signed)
+        if: steps.apple.outputs.enabled != 'true'
         run: npm run tauri build -- ${{ matrix.args }}
         env:
-          # Updater (minisign) signing — already active on every build.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Apple Developer-ID signing + notarization — inert until the secrets exist
-          # (Tauri skips signing when APPLE_SIGNING_IDENTITY is empty). APPLE_API_KEY_PATH
-          # is exported by the step above when configured.
+
+      # Switched on automatically once the Apple secrets exist — no code change needed.
+      # APPLE_API_KEY_PATH is exported by the notarization-key step above when configured.
+      - name: Build (updater + Apple-signed)
+        if: steps.apple.outputs.enabled == 'true'
+        run: npm run tauri build -- ${{ matrix.args }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
