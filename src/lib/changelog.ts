@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.0.1-alpha",
+    date: "2026-06-23",
+    highlights: [
+      "Behind-the-scenes fixes to how PM is packaged and shipped, so the Windows installer builds correctly and the macOS app bundles cleanly — no change to how you use PM. (This is the build that delivers the first public release.)",
+    ],
+  },
+  {
     version: "2.0.0-alpha",
     date: "2026-06-23",
     highlights: [

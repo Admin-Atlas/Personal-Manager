@@ -1,6 +1,6 @@
 PM desktop release.
 
-## What's new in 2.0.0-alpha
+## What's new in 2.0.1-alpha
 
 The **first public release** of PM — a private, local-first personal manager for
 your documents, your focus, and the moving parts of your day, in one calm place.
