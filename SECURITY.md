@@ -7,9 +7,13 @@ no bug bounty.
 
 ## Threat model (the short version)
 
-PM is **local-first**: your data lives encrypted on your own machine, and the
-only traffic that leaves is the model API call (and, if you connect one, a
-read-only calendar fetch). PM treats **all ingested content as untrusted data,
+PM is **local-first**: your data lives on your own machine, and the only traffic
+that leaves is the model API call (and, if you connect one, a read-only calendar
+fetch). At rest, the **SQLCipher store** (settings, search index) is encrypted with
+a key held in the OS keychain; your **documents live in a plaintext Markdown vault**,
+so their at-rest protection relies on your own OS full-disk encryption (BitLocker /
+FileVault) — a deliberate choice to keep your notes openable by any tool, not a gap
+to report. PM treats **all ingested content as untrusted data,
 never as instructions** — documents, calendar feeds, and model output can't make
 PM act on your behalf. The areas where a bug would matter most are: the
 **encrypted local store** (SQLCipher), **secret handling** (the OS keychain

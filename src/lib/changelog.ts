@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.3.4-alpha",
+    date: "2026-06-23",
+    highlights: [
+      "Clearer wording about what’s protected at rest: your encrypted store stays encrypted, but the documents in your Markdown vault are stored in the open — so Settings → Data now reminds you to turn on full-disk encryption (BitLocker / FileVault) to protect them.",
+    ],
+  },
+  {
     version: "1.3.3-alpha",
     date: "2026-06-23",
     highlights: [
