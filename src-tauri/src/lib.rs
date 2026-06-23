@@ -19,6 +19,7 @@ mod projects;
 mod recommend;
 mod retrieval;
 mod review;
+mod secret;
 mod secrets;
 mod sidecar;
 
@@ -63,7 +64,7 @@ pub fn run() {
             let handle = app.handle();
             let db_path = paths::db_path(handle)?;
             let key = secrets::get_or_create_db_key()?;
-            let conn = db::open(&db_path, &key)?;
+            let conn = db::open(&db_path, key.expose())?;
 
             // The sidecar source folder is optional at boot — chat works without
             // it; ingestion surfaces a clear error if it (or Python) is missing.

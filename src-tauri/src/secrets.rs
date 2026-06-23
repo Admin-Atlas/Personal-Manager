@@ -10,6 +10,7 @@ use keyring::Entry;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+use crate::secret::Secret;
 
 // Reverse-DNS to match the Tauri bundle identifier (`tauri.conf.json`). Keep the
 // two in step: renaming this orphans every existing keychain entry (including the
@@ -55,16 +56,16 @@ fn delete(name: &str) -> Result<()> {
     }
 }
 
-pub fn get_openrouter_key() -> Result<Option<String>> {
-    get(OPENROUTER_KEY)
+pub fn get_openrouter_key() -> Result<Option<Secret>> {
+    Ok(get(OPENROUTER_KEY)?.map(Secret::from))
 }
 
 pub fn set_openrouter_key(value: &str) -> Result<()> {
     set(OPENROUTER_KEY, value)
 }
 
-pub fn get_openrouter_background_key() -> Result<Option<String>> {
-    get(OPENROUTER_BACKGROUND_KEY)
+pub fn get_openrouter_background_key() -> Result<Option<Secret>> {
+    Ok(get(OPENROUTER_BACKGROUND_KEY)?.map(Secret::from))
 }
 
 pub fn set_openrouter_background_key(value: &str) -> Result<()> {
@@ -74,7 +75,7 @@ pub fn set_openrouter_background_key(value: &str) -> Result<()> {
 /// The key for background work: the dedicated background key if the user set one,
 /// otherwise the primary key as a fallback (so proposals/learning work before a
 /// second key is configured). Errors only if neither is set.
-pub fn get_background_or_primary_key() -> Result<Option<String>> {
+pub fn get_background_or_primary_key() -> Result<Option<Secret>> {
     match get_openrouter_background_key()? {
         Some(key) => Ok(Some(key)),
         None => get_openrouter_key(),
@@ -87,8 +88,8 @@ pub fn get_google_client_id() -> Result<Option<String>> {
     get(GOOGLE_CLIENT_ID)
 }
 
-pub fn get_google_client_secret() -> Result<Option<String>> {
-    get(GOOGLE_CLIENT_SECRET)
+pub fn get_google_client_secret() -> Result<Option<Secret>> {
+    Ok(get(GOOGLE_CLIENT_SECRET)?.map(Secret::from))
 }
 
 /// Store the user's BYO Google client credentials together.
@@ -103,8 +104,8 @@ pub fn clear_google_client() -> Result<()> {
     delete(GOOGLE_CLIENT_SECRET)
 }
 
-pub fn get_google_token() -> Result<Option<String>> {
-    get(GOOGLE_TOKEN)
+pub fn get_google_token() -> Result<Option<Secret>> {
+    Ok(get(GOOGLE_TOKEN)?.map(Secret::from))
 }
 
 pub fn set_google_token(value: &str) -> Result<()> {
@@ -117,8 +118,8 @@ pub fn clear_google_token() -> Result<()> {
     delete(GOOGLE_TOKEN)
 }
 
-pub fn get_ics_feeds() -> Result<Option<String>> {
-    get(CALENDAR_ICS_FEEDS)
+pub fn get_ics_feeds() -> Result<Option<Secret>> {
+    Ok(get(CALENDAR_ICS_FEEDS)?.map(Secret::from))
 }
 
 pub fn set_ics_feeds(value: &str) -> Result<()> {
@@ -127,10 +128,11 @@ pub fn set_ics_feeds(value: &str) -> Result<()> {
 
 /// Returns the database encryption key, generating and persisting a fresh
 /// 256-bit random key on first run. The key never touches disk in plaintext.
-/// Wrapped in `Zeroizing` so the in-memory copy is wiped once the caller drops it.
-pub fn get_or_create_db_key() -> Result<Zeroizing<String>> {
+/// Returned as a [`Secret`] so the in-memory copy is zeroized once the caller drops
+/// it (as before) and can never be printed to a log or error.
+pub fn get_or_create_db_key() -> Result<Secret> {
     if let Some(key) = get(DB_KEY)? {
-        return Ok(Zeroizing::new(key));
+        return Ok(Secret::from(key));
     }
     let mut bytes = Zeroizing::new([0u8; 32]);
     getrandom::fill(bytes.as_mut_slice()).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
@@ -141,7 +143,7 @@ pub fn get_or_create_db_key() -> Result<Zeroizing<String>> {
     // `set`, return whatever the keychain now holds so we open the store with the
     // persisted key — never a local one that an overwrite could have orphaned.
     match get(DB_KEY)? {
-        Some(stored) => Ok(Zeroizing::new(stored)),
-        None => Ok(key),
+        Some(stored) => Ok(Secret::from(stored)),
+        None => Ok(Secret::from(key)),
     }
 }

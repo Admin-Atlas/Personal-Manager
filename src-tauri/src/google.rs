@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::secret::Secret;
 use crate::secrets;
 
 const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -25,11 +26,13 @@ pub const CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar.reado
 const REDIRECT_TIMEOUT_SECS: u64 = 180;
 
 /// The stored OAuth token blob (one keychain entry, JSON). `expiry` is Unix seconds.
+/// The bearer/refresh values are [`Secret`], so the derived `Debug` here can never
+/// print them — and serde stays transparent, so the JSON blob round-trips unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Token {
-    pub access_token: String,
+    pub access_token: Secret,
     #[serde(default)]
-    pub refresh_token: Option<String>,
+    pub refresh_token: Option<Secret>,
     pub expiry: i64,
     #[serde(default)]
     pub scope: Option<String>,
@@ -48,7 +51,7 @@ pub fn is_connected() -> Result<bool> {
     Ok(secrets::get_google_token()?.is_some())
 }
 
-fn client_creds() -> Result<(String, String)> {
+fn client_creds() -> Result<(String, Secret)> {
     let id = secrets::get_google_client_id()?.ok_or_else(|| {
         Error::Other("Add your Google client ID and secret in Settings first.".into())
     })?;
@@ -95,7 +98,14 @@ pub async fn connect() -> Result<()> {
         .await
         .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
 
-    let token = exchange_code(&client_id, &client_secret, &code, &redirect_uri, &verifier).await?;
+    let token = exchange_code(
+        &client_id,
+        client_secret.expose(),
+        &code,
+        &redirect_uri,
+        &verifier,
+    )
+    .await?;
     if token.refresh_token.is_none() {
         // Without offline access we can't refresh; tell the user how to fix it.
         return Err(Error::Other(
@@ -117,19 +127,19 @@ pub async fn authorized_get(url: &str) -> Result<serde_json::Value> {
     // Refresh proactively a minute before expiry so a request doesn't fail mid-flight;
     // the 401 retry below is the backstop for a token that's revoked or expires early.
     if token.expiry <= now_unix() + 60 {
-        token = do_refresh(&client_id, &client_secret, &token).await?;
+        token = do_refresh(&client_id, client_secret.expose(), &token).await?;
     }
 
     let resp = http()?
         .get(url)
-        .bearer_auth(&token.access_token)
+        .bearer_auth(token.access_token.expose())
         .send()
         .await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let token = do_refresh(&client_id, &client_secret, &token).await?;
+        let token = do_refresh(&client_id, client_secret.expose(), &token).await?;
         let resp = http()?
             .get(url)
-            .bearer_auth(&token.access_token)
+            .bearer_auth(token.access_token.expose())
             .send()
             .await?;
         return json_or_err(resp).await;
@@ -189,7 +199,7 @@ async fn do_refresh(client_id: &str, client_secret: &str, current: &Token) -> Re
         .ok_or_else(|| Error::Other("Google session expired — reconnect in Settings.".into()))?;
     let params = [
         ("grant_type", "refresh_token"),
-        ("refresh_token", refresh.as_str()),
+        ("refresh_token", refresh.expose()),
         ("client_id", client_id),
         ("client_secret", client_secret),
     ];
@@ -212,8 +222,8 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
     }
     let t: TokenResponse = resp.json().await?;
     Ok(Token {
-        access_token: t.access_token,
-        refresh_token: t.refresh_token,
+        access_token: Secret::from(t.access_token),
+        refresh_token: t.refresh_token.map(Secret::from),
         expiry: now_unix() + t.expires_in.unwrap_or(3600),
         scope: t.scope,
     })
@@ -222,7 +232,7 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
 fn load_token() -> Result<Token> {
     let raw = secrets::get_google_token()?
         .ok_or_else(|| Error::Other("Not connected to Google. Connect in Settings.".into()))?;
-    serde_json::from_str(&raw)
+    serde_json::from_str(raw.expose())
         .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))
 }
 

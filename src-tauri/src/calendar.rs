@@ -134,7 +134,7 @@ pub fn load_feeds() -> Result<Vec<IcsFeed>> {
         // Surface a corrupt blob rather than silently returning an empty list — a
         // later save_feeds would otherwise persist the emptied list and lose every
         // subscribed feed for good.
-        Some(json) => serde_json::from_str(&json)
+        Some(json) => serde_json::from_str(json.expose())
             .map_err(|e| Error::Other(format!("stored calendar feeds are unreadable: {e}"))),
         None => Ok(Vec::new()),
     }
