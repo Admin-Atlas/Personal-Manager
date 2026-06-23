@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.0.0-alpha",
+    date: "2026-06-23",
+    highlights: [
+      "Welcome to the first public release of PM — your private, local-first personal manager that keeps your documents, your focus, and the moving parts of your day in one calm place.",
+      "Everything stays on your machine. Your encrypted store stays encrypted, and PM never sends your data anywhere on its own.",
+      "A polished, fully themeable interface — light and dark, accent colours, and depth — plus an optional app lock so a quick glance can't open your things (Windows Hello).",
+      "On Windows, PM is completely self-contained: there's nothing extra to install, and from here on it quietly keeps itself up to date.",
+    ],
+  },
+  {
     version: "1.3.5-alpha",
     date: "2026-06-23",
     highlights: [
