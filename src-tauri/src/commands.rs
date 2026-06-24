@@ -19,8 +19,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, learning, openrouter, paths, recommend, secrets, vault,
-    AppState, VaultRuntime,
+    applock, briefing, clock, cost, db, learning, lock_session, openrouter, paths, recommend,
+    secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -403,9 +403,14 @@ pub async fn create_shareable_vault(app: AppHandle, passphrase: String) -> Resul
         target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
         target_location: None,
     };
-    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app, plan))
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
         .await
-        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))?
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
+    // release if it went device-only, or re-acquire at the new location after a move.
+    lock_session::engage(&app)?;
+    Ok(())
 }
 
 /// Change a shareable vault's passphrase: re-derive the key (new salt + verifier),
@@ -431,9 +436,14 @@ pub async fn change_vault_passphrase(app: AppHandle, new_passphrase: String) -> 
         target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
         target_location: None,
     };
-    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app, plan))
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
         .await
-        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))?
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
+    // release if it went device-only, or re-acquire at the new location after a move.
+    lock_session::engage(&app)?;
+    Ok(())
 }
 
 /// Make a shareable vault private again: re-key it to a random device key (held only in
@@ -456,9 +466,14 @@ pub async fn make_vault_private(app: AppHandle) -> Result<()> {
         target_markdown: vault::MarkdownEncryption::None,
         target_location: None,
     };
-    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app, plan))
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
         .await
-        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))?
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
+    // release if it went device-only, or re-acquire at the new location after a move.
+    lock_session::engage(&app)?;
+    Ok(())
 }
 
 /// Move the vault to a new folder (e.g. a shared location), keeping its key and Markdown
@@ -477,9 +492,14 @@ pub async fn move_vault(app: AppHandle, folder: String) -> Result<()> {
             target_location: Some(target),
         }
     };
-    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app, plan))
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
         .await
-        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))?
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
+    // release if it went device-only, or re-acquire at the new location after a move.
+    lock_session::engage(&app)?;
+    Ok(())
 }
 
 /// Unlock the current (passphrase) vault: derive + verify, open the store, and cache
@@ -493,6 +513,8 @@ pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: Stri
     secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
     let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
     state.open_session(conn, runtime)?;
+    // Now that the store is open, engage the cooperative writer lock for this vault.
+    lock_session::engage(&app)?;
     Ok(())
 }
 
@@ -536,6 +558,7 @@ pub fn open_existing_vault(
     let data_dir = paths::data_dir(&app)?;
     vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
     state.open_session(conn, runtime)?;
+    lock_session::engage(&app)?;
     Ok(())
 }
 
@@ -567,6 +590,28 @@ pub fn link_vault_account(app: AppHandle, account: String) -> Result<()> {
         ));
     }
     vault::acl::grant_access(&resolved.vault_root, &account)
+}
+
+/// The cooperative writer-lock status for a shared vault: whether this instance is the
+/// active writer, whether another live profile holds it, and whether that holder looks
+/// crashed (so the UI can offer a warned force-take). A device vault always reports active.
+#[tauri::command]
+pub fn vault_lock_status(app: AppHandle) -> Result<lock_session::VaultLockStatus> {
+    Ok(lock_session::status(&app))
+}
+
+/// "Continue here" on the curtain: ask the other live profile to hand the vault over (the
+/// watcher takes it once they release), or take it immediately if they've already gone.
+#[tauri::command]
+pub fn continue_here(app: AppHandle) -> Result<()> {
+    lock_session::continue_here(&app)
+}
+
+/// Force-take a vault whose holder looks crashed (a stale heartbeat). The UI shows the
+/// "the other instance may not have saved its last change" warning before calling this.
+#[tauri::command]
+pub fn force_take_vault(app: AppHandle) -> Result<()> {
+    lock_session::force_take(&app)
 }
 
 /// The OpenRouter model catalogue (public endpoint, no key needed) so the user can

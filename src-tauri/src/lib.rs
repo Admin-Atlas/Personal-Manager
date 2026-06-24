@@ -13,6 +13,7 @@ mod google;
 mod ics;
 mod ingest;
 mod learning;
+mod lock_session;
 mod openrouter;
 mod paths;
 mod projects;
@@ -63,6 +64,11 @@ pub struct AppState {
     /// store is already decrypted (see `applock`). Backend-owned so the launch decision
     /// can't be flipped from the webview.
     pub app_unlocked: AtomicBool,
+    /// This process's random id, written into the vault lockfile so a shared vault's
+    /// other instance can tell our heartbeat from its own (see `lock_session`).
+    pub instance_id: String,
+    /// Cooperative single-writer lock state for the engaged shared vault, if any.
+    pub lock_session: Mutex<lock_session::LockSession>,
 }
 
 /// A borrow of the open connection. Derefs to [`Connection`], so call sites read just
@@ -138,6 +144,17 @@ impl AppState {
             .lock()
             .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
         *guard = Some(runtime);
+        Ok(())
+    }
+
+    /// Clear the active vault's Markdown runtime (used alongside `take_conn` when the lock
+    /// session closes the store because another profile became the active writer).
+    pub fn clear_vault_runtime(&self) -> error::Result<()> {
+        let mut guard = self
+            .vault
+            .lock()
+            .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
+        *guard = None;
         Ok(())
     }
 
@@ -220,7 +237,15 @@ pub fn run() {
                 vault: Mutex::new(vault_runtime),
                 sidecar,
                 app_unlocked: AtomicBool::new(false),
+                instance_id: vault::lock::new_instance_id(),
+                lock_session: Mutex::new(lock_session::LockSession::default()),
             });
+
+            // Engage the cooperative writer lock for a shared vault (acquire it, or step
+            // back behind another live profile), then run the heartbeat + hand-off watcher
+            // for the life of the app. A no-op for a device-only vault.
+            lock_session::engage(handle)?;
+            lock_session::spawn_watcher(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -250,6 +275,9 @@ pub fn run() {
             commands::open_existing_vault,
             commands::forget_vault_passphrase,
             commands::link_vault_account,
+            commands::vault_lock_status,
+            commands::continue_here,
+            commands::force_take_vault,
             commands::list_models,
             commands::get_learning_profile,
             commands::refresh_learning_profile,
