@@ -233,9 +233,29 @@ export function VaultCard() {
           {pending === "link" && (
             <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
               <p className="text-xs text-ink4">
-                Grant another Windows account access to the shared vault folder. Enter its account
-                name (e.g. <span className="font-mono">PC\alice</span>) or SID.
+                Grant another Windows account access to the shared vault folder. Enter the account's{" "}
+                <strong>name</strong> or <strong>SID</strong> — <em>not</em> a profile path like{" "}
+                <span className="rounded-[var(--radius-sm)] bg-bg px-1 py-0.5 font-mono text-[0.85em] text-ink">
+                  C:\Users\name
+                </span>
+                .
               </p>
+              <p className="text-xs text-ink4">
+                To find either, open <strong>PowerShell</strong> (Win+X → Terminal) and run:
+              </p>
+              <pre className="overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
+                Get-LocalUser | Select Name, SID
+              </pre>
+              <ul className="ml-4 list-disc space-y-1 text-xs text-ink4">
+                <li>
+                  <strong>Account name</strong> — <span className="font-mono">PC\alice</span>. Easy
+                  to read, but breaks if the account is ever renamed.
+                </li>
+                <li>
+                  <strong>SID</strong> — <span className="font-mono">S-1-5-21-…</span>. A stable ID
+                  that survives renames. Recommended — paste the whole string.
+                </li>
+              </ul>
               <Input
                 placeholder="Account name or SID"
                 value={account}

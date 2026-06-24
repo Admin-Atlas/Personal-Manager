@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.1.5-alpha",
+    date: "2026-06-24",
+    highlights: [
+      "Linking a second Windows account to a shared vault is clearer: Settings → Vault now shows you exactly what to enter (an account name or SID, not a folder path), the PowerShell command to look it up, and the difference between the two — with the stable SID recommended.",
+    ],
+  },
+  {
     version: "2.1.4-alpha",
     date: "2026-06-24",
     highlights: [
