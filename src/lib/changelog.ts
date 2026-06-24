@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.1.4-alpha",
+    date: "2026-06-24",
+    highlights: [
+      "Document engine setup is more reliable on macOS: PM now finds a modern Python automatically (including Homebrew and python.org installs) and rebuilds its engine after a Python upgrade — so setup just works, with no Terminal steps. If it still can't finish, a new troubleshooting popup explains exactly what to do.",
+    ],
+  },
+  {
     version: "2.1.3-alpha",
     date: "2026-06-24",
     highlights: [

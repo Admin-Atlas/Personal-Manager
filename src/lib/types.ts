@@ -314,12 +314,21 @@ export interface DailyBriefing {
   stale: boolean;
 }
 
+/** Machine-readable cause of a setup failure, so the UI can show a tailored
+ *  troubleshooting guide. Mirrors `SidecarErrorKind` in src-tauri/src/sidecar.rs. */
+export type SidecarErrorKind =
+  | "python_too_old"
+  | "python_missing"
+  | "pip_failed"
+  | "requirements_missing"
+  | "unknown";
+
 /** Lifecycle of the Python document engine (sidecar). */
 export type SidecarStatus =
   | { state: "not_installed" }
   | { state: "installing" }
   | { state: "ready" }
-  | { state: "error"; message: string };
+  | { state: "error"; message: string; kind: SidecarErrorKind };
 
 export type IngestEvent =
   | { type: "preparing"; message: string }

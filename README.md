@@ -96,12 +96,16 @@ For a full tour of the architecture and the rules for working in this repo, see
 ## Prerequisites
 
 - **Node.js** 20+ and **Rust** (stable)
-- **Python** 3.10+ on your PATH — needed for development (`tauri dev`) and as the base
-  for the document sidecar's managed virtual environment, built on first use. Point
-  `PM_PYTHON` at a specific interpreter if it isn't named `python`/`python3`. (Packaged
+- **Python** 3.10+ — needed for development (`tauri dev`) and as the base for the
+  document sidecar's managed virtual environment, built on first use. PM finds a suitable
+  interpreter automatically: `PM_PYTHON`, then versioned names (`python3.12` … `python3.10`),
+  `python3`/`python`, and common macOS locations (Homebrew, python.org) — so even a
+  Finder-launched app finds one off its stripped PATH. It also rebuilds the venv if that
+  interpreter is older than 3.10. Set `PM_PYTHON` only for an unusual setup. (Packaged
   **Windows** release builds **bundle** a standalone interpreter — `npm run tauri build`
   fetches it via [`scripts/fetch-python.mjs`](scripts/fetch-python.mjs) — so end users
-  need no Python install. macOS bundling is deferred behind signing.)
+  need no Python install. macOS bundling is deferred behind signing, so macOS users install
+  Python 3.10+ themselves; PM then finds it.)
 - **Tauri OS prerequisites:** see <https://tauri.app/start/prerequisites/>
   - Windows: Microsoft C++ Build Tools + WebView2 (preinstalled on Win 11)
   - macOS: Xcode Command Line Tools
