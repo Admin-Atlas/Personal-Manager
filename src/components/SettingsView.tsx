@@ -27,6 +27,7 @@ import { useHelp } from "../lib/help";
 import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
+import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LearningProfile } from "../lib/types";
 import { useTheme, useDepth, ACCENTS } from "../theme";
 import { Button, Collapsible, Input, SegmentedControl, Select } from "./ui";
@@ -614,6 +615,8 @@ export function SettingsView({ onClose, onboarding }: Props) {
             {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
           </div>
         )}
+
+        {!onboarding && <VaultCard />}
 
         {!onboarding && (
           <div
