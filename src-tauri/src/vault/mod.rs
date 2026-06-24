@@ -16,6 +16,7 @@
 #![allow(dead_code)]
 
 pub mod kdf;
+pub mod lock;
 pub mod pointer;
 pub mod verifier;
 
