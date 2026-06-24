@@ -17,6 +17,7 @@ import { ReviewView } from "./components/ReviewView";
 import { Sidebar, type View } from "./components/Sidebar";
 import { SettingsView } from "./components/SettingsView";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { VaultUnlock } from "./components/VaultUnlock";
 import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
@@ -33,8 +34,9 @@ import {
   listConversations,
   reviewQueue,
   setHelpMode,
+  vaultStatus,
 } from "./lib/ipc";
-import type { Conversation, Settings } from "./lib/types";
+import type { Conversation, Settings, VaultStatus } from "./lib/types";
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -43,6 +45,11 @@ export default function App() {
   // turned it on; lifted once the OS verifies them (see LockScreen). The store is already
   // decrypted regardless — this only withholds the window.
   const [locked, setLocked] = useState(false);
+  // The vault unlock gate: a passphrase vault that booted without a cached key on this
+  // profile. This gates *real* decryption (the DB is closed until unlocked), so it sits
+  // ahead of everything that touches the store.
+  const [vault, setVault] = useState<VaultStatus | null>(null);
+  const [vaultNeedsUnlock, setVaultNeedsUnlock] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [view, setView] = useState<View>("focus");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
@@ -135,6 +142,14 @@ export default function App() {
         // Resolve the launch lock before the first paint so locked content never flashes.
         const lock = await appLockStatus().catch(() => null);
         if (lock?.locked) setLocked(true);
+        // A passphrase vault with no cached key on this profile boots locked (the store
+        // can't open until unlocked), so defer the store-backed load until it is.
+        const vs = await vaultStatus().catch(() => null);
+        setVault(vs);
+        if (vs?.needs_unlock) {
+          setVaultNeedsUnlock(true);
+          return;
+        }
         const has = await hasOpenRouterKey();
         setKeySet(has);
         if (has) await refreshConversations(true);
@@ -145,6 +160,22 @@ export default function App() {
       }
     })();
   }, []);
+
+  // Once the vault is unlocked, load what the locked boot deferred.
+  async function completeUnlock() {
+    setVaultNeedsUnlock(false);
+    setLoading(true);
+    try {
+      setVault(await vaultStatus().catch(() => null));
+      const has = await hasOpenRouterKey();
+      setKeySet(has);
+      if (has) await refreshConversations(true);
+    } catch (e) {
+      chat.setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
 
   async function refreshConversations(selectFirst = false) {
     const list = await listConversations();
@@ -229,6 +260,12 @@ export default function App() {
         </div>
       </div>
     );
+  }
+
+  // The vault unlock gate comes first — it gates real decryption (the store is closed),
+  // so it sits ahead of the soft biometric lock and the rest of the app.
+  if (vaultNeedsUnlock) {
+    return <VaultUnlock status={vault} onUnlocked={completeUnlock} />;
   }
 
   // The launch lock sits in front of everything (but below the title bar, which lives in
