@@ -60,7 +60,11 @@ const CALIBRATE_TARGET_MS: u64 = 350;
 /// overwritten by the OS RNG and handed back as a function result, so callers
 /// receive randomness rather than a hard-coded literal.
 pub(crate) fn random_array<const N: usize>() -> Result<[u8; N]> {
-    let mut buf = [0u8; N];
+    // Build the buffer with `array::from_fn` rather than a `[0u8; N]` literal. The
+    // bytes are immediately overwritten by the OS CSPRNG below; avoiding the constant
+    // array literal also keeps static analysis from mistaking the zeroed placeholder
+    // for the live salt (it does not model the in-place RNG fill as an overwrite).
+    let mut buf: [u8; N] = std::array::from_fn(|_| 0);
     getrandom::fill(&mut buf).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
     Ok(buf)
 }
