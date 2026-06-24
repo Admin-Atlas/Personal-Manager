@@ -6,6 +6,7 @@ import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   appLockStatus,
   costSummary,
+  createShareableVault,
   exportAllData,
   getLearningProfile,
   getSettings,
@@ -61,6 +62,12 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [appLock, setAppLockState] = useState<AppLockStatus | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportMsg, setExportMsg] = useState<string | null>(null);
+  // First-run vault choice (onboarding only). Default device-only = today's zero-friction
+  // path; "shareable" derives the key from a passphrase so the vault can be opened from
+  // other profiles. Applied once, after the API key is saved.
+  const [vaultMode, setVaultMode] = useState<"device" | "shareable">("device");
+  const [vaultPass, setVaultPass] = useState("");
+  const [vaultConfirm, setVaultConfirm] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -181,7 +188,12 @@ export function SettingsView({ onClose, onboarding }: Props) {
     }
   }
 
-  const canSave = !saving && (keyAlreadySet || key.trim().length > 0);
+  // A shareable first-run vault needs a passphrase that matches its confirmation.
+  const vaultChoiceValid =
+    !onboarding ||
+    vaultMode === "device" ||
+    (vaultPass.trim().length > 0 && vaultPass === vaultConfirm);
+  const canSave = !saving && (keyAlreadySet || key.trim().length > 0) && vaultChoiceValid;
 
   async function save() {
     setSaving(true);
@@ -204,6 +216,11 @@ export function SettingsView({ onClose, onboarding }: Props) {
       await setChatAutoSwitch(chatAuto);
       await setBackgroundAutoSwitch(backgroundAuto);
       await setTimeZone(tzAuto ? detectTimeZone() : timeZone);
+      // First-run: if the user opted into a shareable vault, convert the fresh (empty)
+      // device vault now that the key is saved. Device-only needs nothing — it's default.
+      if (onboarding && vaultMode === "shareable") {
+        await createShareableVault(vaultPass.trim());
+      }
       onClose();
     } catch (e) {
       setError(String(e));
@@ -230,7 +247,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
         </div>
         <p className="mt-1 text-sm text-ink3">
           {onboarding
-            ? "Add your OpenRouter API key to start chatting. It's stored in your OS keychain, never on disk or in the repo."
+            ? "PM is a private, local-first assistant — your documents, notes, and chats live in an encrypted store on this device. Two quick things to set up below: an AI provider key, and how your vault is protected."
             : "Your API key lives in the OS keychain. The model is swappable anytime."}
         </p>
 
@@ -342,7 +359,29 @@ export function SettingsView({ onClose, onboarding }: Props) {
           </div>
         )}
 
-        <label className="mt-5 block text-sm font-medium text-ink2">OpenRouter API key</label>
+        {onboarding && (
+          <div className="mt-5 border-t border-border pt-4">
+            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+              AI provider
+            </label>
+            <p className="mt-1 text-xs leading-relaxed text-ink4">
+              PM reaches AI models through{" "}
+              <a
+                href="https://openrouter.ai"
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent-text underline hover:brightness-110"
+              >
+                OpenRouter
+              </a>{" "}
+              — one account for OpenAI, Anthropic, Google, and free models. It's free to start, and
+              PM sends Zero-Data-Retention on every request.
+            </p>
+          </div>
+        )}
+        <label className={`block text-sm font-medium text-ink2 ${onboarding ? "mt-3" : "mt-5"}`}>
+          OpenRouter API key
+        </label>
         <Input
           type="password"
           autoComplete="off"
@@ -412,6 +451,54 @@ export function SettingsView({ onClose, onboarding }: Props) {
             />
           )}
         </div>
+
+        {onboarding && (
+          <div className="mt-5 border-t border-border pt-4">
+            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+              Your vault
+            </label>
+            <p className="mt-1 text-xs text-ink4">
+              Your documents and notes live in one encrypted store. Choose how it's protected — you
+              can change this anytime in Settings.
+            </p>
+            <div className="mt-3">
+              <SegmentedControl
+                value={vaultMode}
+                onChange={setVaultMode}
+                options={[
+                  { value: "device", label: "This device only" },
+                  { value: "shareable", label: "Shareable" },
+                ]}
+              />
+            </div>
+            <p className="mt-2 text-xs text-faint">
+              {vaultMode === "device"
+                ? "Recommended. The key stays in this device's keychain — zero friction, nothing to remember."
+                : "Protected by a passphrase you choose, so the same vault can be opened from another Windows account (and your Markdown is encrypted at rest). The passphrase can't be recovered — if you forget it, the vault can't be opened."}
+            </p>
+            {vaultMode === "shareable" && (
+              <div className="mt-3 space-y-2">
+                <Input
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder="Passphrase"
+                  value={vaultPass}
+                  onChange={(e) => setVaultPass(e.target.value)}
+                />
+                <Input
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder="Confirm passphrase"
+                  value={vaultConfirm}
+                  onChange={(e) => setVaultConfirm(e.target.value)}
+                />
+                {vaultPass.length > 0 && vaultPass !== vaultConfirm && (
+                  <p className="text-xs text-st-due">Passphrases don't match.</p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {!onboarding && showMeta && cost && (
           <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
@@ -665,7 +752,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
             </Button>
           )}
           <Button variant="primary" onClick={save} disabled={!canSave}>
-            {saving ? "Saving…" : "Save"}
+            {saving ? "Saving…" : onboarding ? "Get started" : "Save"}
           </Button>
         </div>
       </div>
