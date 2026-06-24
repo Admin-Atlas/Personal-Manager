@@ -22,6 +22,7 @@ mod review;
 mod secret;
 mod secrets;
 mod sidecar;
+mod vault;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -65,6 +66,12 @@ pub fn run() {
             let db_path = paths::db_path(handle)?;
             let key = secrets::get_or_create_db_key()?;
             let conn = db::open(&db_path, key.expose())?;
+
+            // Every vault carries a small, non-secret metadata file from creation
+            // (vault id + cipher profile + Markdown policy; spec §6). On a fresh
+            // install this writes device-mode metadata; the passphrase/shareable
+            // path is layered on top in later build steps.
+            vault::ensure_device_meta(&paths::vault_dir(handle)?)?;
 
             // The sidecar source folder is optional at boot — chat works without
             // it; ingestion surfaces a clear error if it (or Python) is missing.

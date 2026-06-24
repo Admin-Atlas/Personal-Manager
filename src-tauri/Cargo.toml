@@ -45,6 +45,20 @@ getrandom = "0.4"
 hex = "0.4"
 # base64url for the PKCE S256 code challenge (Step 6 Google OAuth).
 base64 = "0.22"
+
+# --- Shared & Portable Vaults (v2.1.0) ---
+# Passphrase-derived key model + at-rest Markdown encryption. argon2id turns a user
+# passphrase into the raw 256-bit SQLCipher key (the calibrated cost is stored in the
+# non-secret vault-meta.json and read back, never hardcoded). blake3 derives a
+# distinct Markdown subkey (derive_key) and the wrong-passphrase verifier
+# (keyed_hash) from that master — self-contained, so no second sha2/digest version is
+# pulled in beside sha2 0.11. XChaCha20-Poly1305 encrypts the Markdown at rest (its
+# 192-bit nonce is safe to pick at random under the many small metadata rewrites).
+# uuid mints the stable per-vault id that keys the per-profile keychain cache.
+argon2 = "0.5"
+blake3 = "1"
+chacha20poly1305 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 # Open the system browser for the OAuth consent screen (handles per-OS URL quirks).
 open = "5"
 
