@@ -434,10 +434,14 @@ fn build_passphrase_meta(
             salt_b64: B64.encode(salt),
         }),
         verifier: Some(verifier),
-        // Markdown-at-rest encryption is layered on in Build 6; until then a freshly
-        // created shareable vault keeps plaintext Markdown (spec build order: creation
-        // precedes the encryption engine). Build 6 turns it on for shared vaults.
-        markdown: MarkdownPolicy::default(),
+        // A shareable vault is, by definition, reachable from other accounts on the
+        // machine, so folder isolation no longer protects the Markdown — encryption at
+        // rest is mandatory (spec §3). Recorded here so every profile that opens the
+        // vault agrees to encrypt/decrypt with the same subkey scheme.
+        markdown: MarkdownPolicy {
+            encryption: MarkdownEncryption::XChaCha20Poly1305,
+            subkey: MARKDOWN_SUBKEY_SCHEME.to_string(),
+        },
     };
     Ok((meta, master))
 }
@@ -581,6 +585,11 @@ mod tests {
         assert!(json.contains("argon2id"));
         assert!(json.contains("blake3-derive-key"));
         assert!(json.contains("\"key_mode\": \"passphrase\""));
+        // A shareable vault must declare Markdown-at-rest encryption (spec §3).
+        assert_eq!(
+            meta.markdown.encryption,
+            MarkdownEncryption::XChaCha20Poly1305
+        );
         // The passphrase itself must never be written to the metadata file.
         assert!(
             !json.contains(pass),
@@ -748,5 +757,48 @@ mod tests {
         );
         assert!(!dest.join("a.md.pmenc").exists(), "no ciphertext suffix");
         assert!(!dest.join("notes.txt").exists(), "non-markdown skipped");
+    }
+
+    #[test]
+    fn convert_markdown_encrypts_in_place_and_updates_vault_path() {
+        // The device → shareable transition's Markdown half: a plaintext file becomes
+        // a renamed ciphertext file and its DB row follows.
+        let dir = tempfile::tempdir().unwrap();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), key).unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('a.md', 'A', 'h')",
+            [],
+        )
+        .unwrap();
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("a.md"), "# A\nplaintext body").unwrap();
+
+        let c = enc_cipher();
+        assert_eq!(
+            crate::ingest::convert_markdown(&conn, &vault, &c, &c).unwrap(),
+            1
+        );
+
+        assert!(!vault.join("a.md").exists(), "old plaintext file removed");
+        let enc = vault.join("a.md.pmenc");
+        assert!(crypto::is_encrypted(&std::fs::read(&enc).unwrap()));
+        let stored: String = conn
+            .query_row(
+                "SELECT vault_path FROM documents WHERE title='A'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "a.md.pmenc", "vault_path follows the rename");
+        assert_eq!(c.read(&enc).unwrap(), "# A\nplaintext body");
+
+        // Idempotent: a second pass over the now-encrypted folder changes nothing.
+        assert_eq!(
+            crate::ingest::convert_markdown(&conn, &vault, &c, &c).unwrap(),
+            0
+        );
     }
 }

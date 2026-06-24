@@ -871,6 +871,51 @@ pub(crate) fn is_vault_markdown(path: &Path) -> bool {
     matches!(extension(path).as_deref(), Some("md") | Some("pmenc"))
 }
 
+/// Bring every Markdown file in `dir` into `write_with`'s policy, in place: decode each
+/// file with `read_with` (read-by-magic, so it handles plaintext or the prior key),
+/// re-encode with `write_with`, rename to the target on-disk name (`.md` <-> `.md.pmenc`),
+/// and update its `documents.vault_path`. Returns how many files changed.
+///
+/// Idempotent — a file already in the target form is skipped — so it is safe to re-run
+/// after an interruption (the mixed plaintext/ciphertext folder reads fine meanwhile).
+/// For a plaintext -> encrypted conversion the two ciphers can be the same (decoding
+/// plaintext needs no key). This is the Markdown half of a sharing/key migration; the
+/// caller owns the DB transaction.
+pub(crate) fn convert_markdown(
+    conn: &Connection,
+    dir: &Path,
+    read_with: &MarkdownCipher,
+    write_with: &MarkdownCipher,
+) -> Result<usize> {
+    let mut changed = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if !path.is_file() || !is_vault_markdown(&path) {
+            continue;
+        }
+        let old_name = file_name(&path);
+        let new_name = write_with.on_disk_name(&MarkdownCipher::logical_name(&old_name));
+        let raw = std::fs::read(&path)?;
+        // Already in the target name AND encryption state? Nothing to do (idempotent).
+        if new_name == old_name
+            && crate::vault::crypto::is_encrypted(&raw) == write_with.encryption_on()
+        {
+            continue;
+        }
+        let content = read_with.decode(&raw, &path)?;
+        write_with.write_to(&dir.join(&new_name), &content)?;
+        if new_name != old_name {
+            std::fs::remove_file(&path)?;
+            conn.execute(
+                "UPDATE documents SET vault_path = ?1 WHERE vault_path = ?2",
+                params![new_name, old_name],
+            )?;
+        }
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 /// Export every Markdown file in `vault` to `dest` as plaintext `.md`, decrypting
 /// encrypted files with `cipher` and dropping the `.pmenc` suffix. Returns the count
 /// written. The core of the "never locked in" escape hatch — kept here (next to the

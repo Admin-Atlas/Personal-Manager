@@ -401,12 +401,25 @@ pub fn create_shareable_vault(
         return Err(Error::Other("this vault is already shareable".into()));
     }
     let (new_meta, new_key) = vault::prepare_shareable(&meta, &passphrase)?;
+    let master = vault::master_from_db_key_hex(new_key.expose())?;
+    let new_cipher = vault::MarkdownCipher::from_meta(&new_meta, &master);
     {
-        let conn = state.conn()?;
+        let mut conn = state.conn()?;
         db::rekey(&conn, new_key.expose())?;
+        // The vault is now passphrase-keyed and encrypted. Record that first (so the
+        // metadata matches the new key for the next boot), then re-encrypt any Markdown
+        // written while it was a plaintext device vault — so "shared ⇒ encrypted at
+        // rest" holds for existing notes, not only new ones.
+        vault::store_meta(&resolved.vault_root, &new_meta)?;
+        let tx = conn.transaction()?;
+        ingest::convert_markdown(&tx, &resolved.markdown_dir, &new_cipher, &new_cipher)?;
+        tx.commit()?;
     }
-    vault::store_meta(&resolved.vault_root, &new_meta)?;
     secrets::set_cached_vault_key(&new_meta.vault_id, new_key.expose())?;
+    state.set_vault_runtime(VaultRuntime {
+        markdown_dir: resolved.markdown_dir.clone(),
+        cipher: new_cipher,
+    })?;
     Ok(())
 }
 
