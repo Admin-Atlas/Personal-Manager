@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppLockStatus,
   CalendarEvent,
@@ -27,6 +28,7 @@ import type {
   RetrievedChunk,
   Settings,
   SidecarStatus,
+  VaultLockStatus,
   VaultStatus,
 } from "./types";
 
@@ -146,6 +148,34 @@ export const linkVaultAccount = (account: string) =>
  *  escape hatch (decrypts with the in-session key). Returns the number of files written. */
 export const exportPlaintextMarkdown = (destDir: string) =>
   invoke<number>("export_plaintext_markdown", { destDir });
+
+// Single-writer lock for a shared vault (spec §5).
+
+/** Whether this instance is the active writer, or another profile holds the vault. */
+export const vaultLockStatus = () => invoke<VaultLockStatus>("vault_lock_status");
+
+/** "Continue here": ask the other live profile to hand the vault over (the backend takes
+ *  it once they release), or take it immediately if they've already gone. */
+export const continueHere = () => invoke<void>("continue_here");
+
+/** Force-take a vault whose holder looks crashed (stale heartbeat). Show the
+ *  "may not have saved its last change" warning before calling. */
+export const forceTakeVault = () => invoke<void>("force_take_vault");
+
+/** The reason this instance was curtained: it found another writer on open
+ *  ("other-active"), or it handed the baton over on request ("handed-off"). */
+export interface VaultCurtainEvent {
+  reason: "other-active" | "handed-off";
+  other_profile: string | null;
+}
+
+/** Subscribe to the curtain event (this instance stepped back from being the writer). */
+export const onVaultCurtain = (handler: (e: VaultCurtainEvent) => void): Promise<UnlistenFn> =>
+  listen<VaultCurtainEvent>("vault://curtain", (e) => handler(e.payload));
+
+/** Subscribe to the acquired event (this instance became the active writer; lift curtain). */
+export const onVaultAcquired = (handler: () => void): Promise<UnlistenFn> =>
+  listen("vault://acquired", () => handler());
 
 // --- Learning You (Step 4b, spec §4.5) ---
 

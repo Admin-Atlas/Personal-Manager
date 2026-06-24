@@ -64,6 +64,17 @@ export interface VaultStatus {
   vault_id: string | null;
 }
 
+/** Cooperative single-writer state for a shared vault. `active` = this instance is the
+ *  writer (always true for a device vault); `contended` = another live profile holds it
+ *  (the curtain shows); `stale` = that holder looks crashed, so a warned force-take is
+ *  offered; `other_profile` names it for the UI. */
+export interface VaultLockStatus {
+  active: boolean;
+  contended: boolean;
+  stale: boolean;
+  other_profile: string | null;
+}
+
 /** A model from the OpenRouter catalogue, for the Settings model picker.
  *  Prices are USD per token (the picker renders them per-million). */
 export interface ModelInfo {

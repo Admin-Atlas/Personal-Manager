@@ -17,6 +17,7 @@ import { ReviewView } from "./components/ReviewView";
 import { Sidebar, type View } from "./components/Sidebar";
 import { SettingsView } from "./components/SettingsView";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { VaultCurtain } from "./components/VaultCurtain";
 import { VaultUnlock } from "./components/VaultUnlock";
 import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
@@ -32,11 +33,14 @@ import {
   getSettings,
   hasOpenRouterKey,
   listConversations,
+  onVaultAcquired,
+  onVaultCurtain,
   reviewQueue,
   setHelpMode,
+  vaultLockStatus,
   vaultStatus,
 } from "./lib/ipc";
-import type { Conversation, Settings, VaultStatus } from "./lib/types";
+import type { Conversation, Settings, VaultLockStatus, VaultStatus } from "./lib/types";
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -50,6 +54,10 @@ export default function App() {
   // ahead of everything that touches the store.
   const [vault, setVault] = useState<VaultStatus | null>(null);
   const [vaultNeedsUnlock, setVaultNeedsUnlock] = useState(false);
+  // Cooperative single-writer state for a shared vault: when another profile is the
+  // active writer, `vaultLock.active` is false and the curtain shows over everything.
+  const [vaultLock, setVaultLock] = useState<VaultLockStatus | null>(null);
+  const [curtainReason, setCurtainReason] = useState<"other-active" | "handed-off">("other-active");
   const [showSettings, setShowSettings] = useState(false);
   const [view, setView] = useState<View>("focus");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
@@ -140,12 +148,18 @@ export default function App() {
     (async () => {
       try {
         // Resolve the launch lock before the first paint so locked content never flashes.
-        const lock = await appLockStatus().catch(() => null);
-        if (lock?.locked) setLocked(true);
+        const appLocked = await appLockStatus().catch(() => null);
+        if (appLocked?.locked) setLocked(true);
         // A passphrase vault with no cached key on this profile boots locked (the store
         // can't open until unlocked), so defer the store-backed load until it is.
         const vs = await vaultStatus().catch(() => null);
         setVault(vs);
+        // Another profile may already be the active writer of a shared vault — then this
+        // instance is curtained (its store closed). That takes priority over the unlock
+        // prompt (the key is cached; the vault just isn't ours to write right now).
+        const writerLock = await vaultLockStatus().catch(() => null);
+        setVaultLock(writerLock);
+        if (writerLock && !writerLock.active) return;
         if (vs?.needs_unlock) {
           setVaultNeedsUnlock(true);
           return;
@@ -176,6 +190,52 @@ export default function App() {
       setLoading(false);
     }
   }
+
+  // Became the active writer (baton acquired): lift the curtain and load the store-backed
+  // state it had withheld (the backend reopened the store on acquisition).
+  async function becomeActiveWriter() {
+    setLoading(true);
+    try {
+      setVaultLock(await vaultLockStatus().catch(() => null));
+      const has = await hasOpenRouterKey();
+      setKeySet(has);
+      if (has) await refreshConversations(true);
+    } catch (e) {
+      chat.setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Writer-lock events: the curtain drops when another profile takes over, and lifts when
+  // this instance (re)acquires the baton.
+  useEffect(() => {
+    let offCurtain: (() => void) | undefined;
+    let offAcquired: (() => void) | undefined;
+    void onVaultCurtain((e) => {
+      setCurtainReason(e.reason);
+      vaultLockStatus()
+        .then(setVaultLock)
+        .catch(() => {});
+    }).then((off) => (offCurtain = off));
+    void onVaultAcquired(() => void becomeActiveWriter()).then((off) => (offAcquired = off));
+    return () => {
+      offCurtain?.();
+      offAcquired?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- subscribe once for the app's life
+  }, []);
+
+  // While curtained, poll the lock so the holder going stale surfaces the force-take option.
+  useEffect(() => {
+    if (vaultLock?.active !== false) return;
+    const id = setInterval(() => {
+      vaultLockStatus()
+        .then(setVaultLock)
+        .catch(() => {});
+    }, 2500);
+    return () => clearInterval(id);
+  }, [vaultLock?.active]);
 
   async function refreshConversations(selectFirst = false) {
     const list = await listConversations();
@@ -262,7 +322,23 @@ export default function App() {
     );
   }
 
-  // The vault unlock gate comes first — it gates real decryption (the store is closed),
+  // The curtain comes first: another profile is the active writer of this shared vault,
+  // so the store is closed here until we take the baton.
+  if (vaultLock && !vaultLock.active) {
+    return (
+      <VaultCurtain
+        status={vaultLock}
+        reason={curtainReason}
+        onChange={() =>
+          vaultLockStatus()
+            .then(setVaultLock)
+            .catch(() => {})
+        }
+      />
+    );
+  }
+
+  // The vault unlock gate comes next — it gates real decryption (the store is closed),
   // so it sits ahead of the soft biometric lock and the rest of the app.
   if (vaultNeedsUnlock) {
     return <VaultUnlock status={vault} onUnlocked={completeUnlock} />;
