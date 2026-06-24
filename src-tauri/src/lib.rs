@@ -24,9 +24,10 @@ mod secrets;
 mod sidecar;
 mod vault;
 
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
 use tauri::Manager;
@@ -37,13 +38,53 @@ use sidecar::{SidecarManager, SidecarPaths};
 /// it only for short synchronous work, never across an `.await`. The sidecar
 /// manages its own interior locking.
 pub struct AppState {
-    pub db: Mutex<Connection>,
+    /// The open store, or `None` when the vault is locked — a passphrase/shareable
+    /// vault on a profile that hasn't unlocked it yet. Reach it via [`AppState::conn`],
+    /// never by locking the mutex directly, so the locked case is handled uniformly.
+    pub db: Mutex<Option<Connection>>,
     pub sidecar: SidecarManager,
     /// Whether the optional app-lock has been satisfied this process. Starts false;
     /// `unlock_app` sets it on a successful OS verification. A soft UI gate only — the
     /// store is already decrypted (see `applock`). Backend-owned so the launch decision
     /// can't be flipped from the webview.
     pub app_unlocked: AtomicBool,
+}
+
+/// A borrow of the open connection. Derefs to [`Connection`], so call sites read just
+/// like the old `state.db.lock().unwrap()` did — only the acquisition line changes to
+/// `state.conn()?`. Holding it keeps the store locked, exactly as before.
+pub struct DbGuard<'a>(MutexGuard<'a, Option<Connection>>);
+
+impl Deref for DbGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.0
+            .as_ref()
+            .expect("DbGuard is only constructed when the connection is present")
+    }
+}
+
+impl DerefMut for DbGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.0
+            .as_mut()
+            .expect("DbGuard is only constructed when the connection is present")
+    }
+}
+
+impl AppState {
+    /// Borrow the open store, or a friendly error if the vault is locked (not unlocked
+    /// this session) or the lock was poisoned. The single way commands reach the DB.
+    pub fn conn(&self) -> error::Result<DbGuard<'_>> {
+        let guard = self
+            .db
+            .lock()
+            .map_err(|_| error::Error::Other("database lock poisoned".into()))?;
+        if guard.is_none() {
+            return Err(error::Error::Other("the vault is locked".into()));
+        }
+        Ok(DbGuard(guard))
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -86,7 +127,7 @@ pub fn run() {
             });
 
             app.manage(AppState {
-                db: Mutex::new(conn),
+                db: Mutex::new(Some(conn)),
                 sidecar,
                 app_unlocked: AtomicBool::new(false),
             });

@@ -146,10 +146,7 @@ pub fn set_openrouter_background_key(key: String) -> Result<()> {
 
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
-    let conn = state
-        .db
-        .lock()
-        .map_err(|_| Error::Other("database lock poisoned".into()))?;
+    let conn = state.conn()?;
     Ok(Settings {
         chat_models: models_for(&conn, CHAT_MODELS_KEY)?,
         background_models: models_for(&conn, BACKGROUND_MODELS_KEY)?,
@@ -163,19 +160,19 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
 
 #[tauri::command]
 pub fn set_chat_models(state: State<'_, AppState>, models: Vec<String>) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     save_models(&conn, CHAT_MODELS_KEY, models)
 }
 
 #[tauri::command]
 pub fn set_background_models(state: State<'_, AppState>, models: Vec<String>) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     save_models(&conn, BACKGROUND_MODELS_KEY, models)
 }
 
 #[tauri::command]
 pub fn set_chat_auto_switch(state: State<'_, AppState>, enabled: bool) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(
         &conn,
         CHAT_AUTO_SWITCH_KEY,
@@ -185,7 +182,7 @@ pub fn set_chat_auto_switch(state: State<'_, AppState>, enabled: bool) -> Result
 
 #[tauri::command]
 pub fn set_background_auto_switch(state: State<'_, AppState>, enabled: bool) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(
         &conn,
         BACKGROUND_AUTO_SWITCH_KEY,
@@ -196,14 +193,14 @@ pub fn set_background_auto_switch(state: State<'_, AppState>, enabled: bool) -> 
 /// Toggle the UI help/explain mode (Step 4b). Stored in `settings` so it persists.
 #[tauri::command]
 pub fn set_help_mode(state: State<'_, AppState>, enabled: bool) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(&conn, "help_mode", if enabled { "true" } else { "false" })
 }
 
 /// The stored IANA time zone (empty string = none set; the backend then uses UTC).
 #[tauri::command]
 pub fn get_time_zone(state: State<'_, AppState>) -> Result<String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     Ok(db::get_setting(&conn, TIME_ZONE_KEY)?.unwrap_or_default())
 }
 
@@ -218,7 +215,7 @@ pub fn set_time_zone(state: State<'_, AppState>, zone: String) -> Result<()> {
     if !zone.is_empty() && chrono_tz::Tz::from_str(zone).is_err() {
         return Err(Error::Other(format!("unrecognised time zone: {zone}")));
     }
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(&conn, TIME_ZONE_KEY, zone)
 }
 
@@ -234,7 +231,7 @@ const WRITABLE_PREFS: &[&str] = &["appearance", "pinboard"];
 /// moved to another machine. Returns `None` when nothing is stored yet.
 #[tauri::command]
 pub fn get_pref(state: State<'_, AppState>, key: String) -> Result<Option<String>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::get_setting(&conn, &key)
 }
 
@@ -245,7 +242,7 @@ pub fn set_pref(state: State<'_, AppState>, key: String, value: String) -> Resul
     if !WRITABLE_PREFS.contains(&key.as_str()) {
         return Err(Error::Other(format!("preference '{key}' is not writable")));
     }
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(&conn, &key, &value)
 }
 
@@ -266,10 +263,7 @@ pub struct AppLockStatus {
 #[tauri::command]
 pub fn app_lock_status(state: State<'_, AppState>) -> Result<AppLockStatus> {
     let enabled = {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| Error::Other("database lock poisoned".into()))?;
+        let conn = state.conn()?;
         db::get_setting(&conn, APP_LOCK_ENABLED_KEY)?.as_deref() == Some("true")
     };
     let verified = state
@@ -292,10 +286,7 @@ pub fn set_app_lock(state: State<'_, AppState>, enabled: bool) -> Result<()> {
             "this device can't perform a biometric/Windows Hello check, so the app-lock can't be enabled".into(),
         ));
     }
-    let conn = state
-        .db
-        .lock()
-        .map_err(|_| Error::Other("database lock poisoned".into()))?;
+    let conn = state.conn()?;
     db::set_setting(
         &conn,
         APP_LOCK_ENABLED_KEY,
@@ -349,7 +340,7 @@ pub async fn list_models() -> Result<Vec<openrouter::ModelInfo>> {
 
 #[tauri::command]
 pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let mut stmt = conn.prepare(
         "SELECT id, title, created_at, updated_at, project FROM conversations \
          ORDER BY updated_at DESC, id DESC",
@@ -371,7 +362,7 @@ pub fn create_conversation(
     let project = project
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     conn.execute(
         "INSERT INTO conversations(project) VALUES (?1)",
         params![project],
@@ -386,7 +377,7 @@ pub fn create_conversation(
 
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, conversation_id: i64) -> Result<Vec<Message>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let mut stmt = conn.prepare(
         "SELECT id, conversation_id, role, content, model, created_at, citations \
          FROM messages WHERE conversation_id = ?1 ORDER BY id",
@@ -422,7 +413,7 @@ pub async fn send_message(
     // conversation's project scope. Scope the lock so the guard is dropped before
     // the network await below.
     let (history, models, profile, scope, agenda) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
 
         let prior: i64 = conn.query_row(
             "SELECT count(*) FROM messages WHERE conversation_id = ?1",
@@ -545,7 +536,7 @@ pub async fn send_message(
         Some(serde_json::to_string(&citations).map_err(|e| Error::Other(e.to_string()))?)
     };
     let message_id = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         conn.execute(
             "INSERT INTO messages(conversation_id, role, content, model, citations) \
              VALUES (?1, 'assistant', ?2, ?3, ?4)",
@@ -584,7 +575,7 @@ async fn retrieve_grounding(
 
         // Nothing to ground on?
         let has_docs: bool = {
-            let conn = state.db.lock().unwrap();
+            let conn = state.conn()?;
             conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?
         };
         if !has_docs {
@@ -600,7 +591,7 @@ async fn retrieve_grounding(
             return Ok(Vec::new());
         };
 
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         retrieval::hybrid_search(
             &conn,
             &query,
@@ -663,7 +654,7 @@ pub async fn rebuild_index(app: AppHandle, on_event: Channel<IngestEvent>) -> Re
 
 #[tauri::command]
 pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<Document>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     ingest::list_documents(&conn)
 }
 
@@ -689,7 +680,7 @@ pub async fn search_documents(
         let embeddings = state.sidecar.embed(std::slice::from_ref(&query))?;
         let query_vec = embeddings.into_iter().next().unwrap_or_default();
 
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         retrieval::hybrid_search(&conn, &query, &query_vec, k, None)
     })
     .await
@@ -756,14 +747,14 @@ pub async fn transcribe_audio(app: AppHandle, audio_base64: String) -> Result<St
 /// and biases the AI proposal toward projects that already exist.
 #[tauri::command]
 pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<String>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::distinct_projects(&conn)
 }
 
 /// Documents still awaiting the sorting review (`reviewed = 0`).
 #[tauri::command]
 pub fn review_queue(state: State<'_, AppState>) -> Result<Vec<Document>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     ingest::review_queue(&conn)
 }
 
@@ -801,7 +792,7 @@ pub async fn propose_metadata(
     // lock, then drop it before any network call (rule #4).
     let (pending, projects, models, profile) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let profile = learning::profile_preamble(&conn)?;
         let projects = db::distinct_projects(&conn)?;
@@ -889,7 +880,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         // every vault file we touched is restored. Otherwise a failure partway
         // through would leave earlier docs marked reviewed (dropped from the queue
         // on retry, their corrections never re-logged) and mid-batch vault/DB drift.
-        let mut conn = state.db.lock().unwrap();
+        let mut conn = state.conn()?;
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, String)> = Vec::new();
 
@@ -967,7 +958,7 @@ pub async fn set_document_metadata(
 
         // Log the correction + rewrite the vault file + update the row atomically,
         // restoring the vault file if the DB side fails (the file write lands first).
-        let mut conn = state.db.lock().unwrap();
+        let mut conn = state.conn()?;
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, String)> = Vec::new();
 
@@ -1026,7 +1017,7 @@ pub async fn set_document_metadata(
 /// focus view's data (spec §4.1).
 #[tauri::command]
 pub fn list_project_overviews(state: State<'_, AppState>) -> Result<Vec<ProjectOverview>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let today = clock::today_sql_in(resolve_zone(&conn));
     projects::list_overviews(&conn, &today)
 }
@@ -1047,7 +1038,7 @@ pub fn set_project_metadata(
     if name.is_empty() {
         return Err(Error::Other("project name is empty".into()));
     }
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     projects::set_metadata(&conn, name, deadline, size, blocked_by, parent)
 }
 
@@ -1081,7 +1072,7 @@ pub async fn propose_project_metadata(
     // a real parent/blocker) + models under a short lock, then drop it (rule #4).
     let (targets, all_projects, models) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let all_projects: Vec<String> = db::distinct_projects(&conn)?;
         let target_names = match names {
@@ -1142,7 +1133,7 @@ pub struct CalendarStatus {
 
 #[tauri::command]
 pub fn calendar_status(state: State<'_, AppState>) -> Result<CalendarStatus> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     Ok(CalendarStatus {
         ics_feeds: calendar::load_feeds()?.len(),
         oauth_client_configured: google::has_client()?,
@@ -1170,20 +1161,20 @@ pub async fn add_ics_feed(app: AppHandle, label: String, url: String) -> Result<
     // then drop it before the network sync (rule #4).
     let tz = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         resolve_zone(&conn)
     };
     match calendar::sync_feed(&feed, tz).await {
         Ok(events) => {
             let state = app.state::<AppState>();
-            let conn = state.db.lock().unwrap();
+            let conn = state.conn()?;
             calendar::replace_events(&conn, &feed.id, &events)?;
             calendar::set_last_sync(&conn)?;
             Ok(())
         }
         Err(e) => {
             let state = app.state::<AppState>();
-            let conn = state.db.lock().unwrap();
+            let conn = state.conn()?;
             let _ = calendar::remove_feed(&conn, &feed.id);
             Err(e)
         }
@@ -1193,7 +1184,7 @@ pub async fn add_ics_feed(app: AppHandle, label: String, url: String) -> Result<
 /// Remove a feed and its mirrored events.
 #[tauri::command]
 pub fn remove_ics_feed(state: State<'_, AppState>, id: String) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::remove_feed(&conn, &id)
 }
 
@@ -1216,7 +1207,7 @@ pub fn set_google_client(client_id: String, client_secret: String) -> Result<()>
 pub fn clear_google_client(state: State<'_, AppState>) -> Result<()> {
     secrets::clear_google_token().ok();
     secrets::clear_google_client()?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::clear_all_events(&conn)
 }
 
@@ -1232,7 +1223,7 @@ pub async fn connect_google() -> Result<()> {
 #[tauri::command]
 pub fn disconnect_google(state: State<'_, AppState>) -> Result<()> {
     secrets::clear_google_token()?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::clear_all_events(&conn)
 }
 
@@ -1241,7 +1232,7 @@ pub fn disconnect_google(state: State<'_, AppState>) -> Result<()> {
 pub async fn list_google_calendars(app: AppHandle) -> Result<Vec<CalendarInfo>> {
     let raw = calendar::fetch_calendar_list().await?;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let selected = calendar::selected_calendar_ids(&conn)?;
     Ok(calendar::to_calendar_infos(raw, &selected))
 }
@@ -1249,7 +1240,7 @@ pub async fn list_google_calendars(app: AppHandle) -> Result<Vec<CalendarInfo>> 
 /// Choose which calendars to sync.
 #[tauri::command]
 pub fn set_google_calendar_ids(state: State<'_, AppState>, ids: Vec<String>) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::set_selected_calendar_ids(&conn, &ids)
 }
 
@@ -1261,7 +1252,7 @@ pub fn set_google_calendar_ids(state: State<'_, AppState>, ids: Vec<String>) -> 
 pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let (oauth_ids, feeds, time_min, time_max, tz) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let oauth_ids = if google::is_connected()? {
             calendar::selected_calendar_ids(&conn)?
         } else {
@@ -1278,7 +1269,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 
     if active.is_empty() {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         calendar::clear_all_events(&conn)?;
         calendar::set_last_sync(&conn)?;
         return Ok(0);
@@ -1291,7 +1282,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         match calendar::fetch_events(id, &time_min, &time_max).await {
             Ok(events) => {
                 let state = app.state::<AppState>();
-                let conn = state.db.lock().unwrap();
+                let conn = state.conn()?;
                 calendar::replace_events(&conn, id, &events)?;
                 total += events.len();
             }
@@ -1302,7 +1293,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         match calendar::sync_feed(feed, tz).await {
             Ok(events) => {
                 let state = app.state::<AppState>();
-                let conn = state.db.lock().unwrap();
+                let conn = state.conn()?;
                 calendar::replace_events(&conn, &feed.id, &events)?;
                 total += events.len();
             }
@@ -1312,7 +1303,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 
     {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         // Reconcile deselected calendars. A source that failed *this* round keeps
         // its last-good events (standard cache behaviour) rather than being blanked.
         calendar::prune_unselected(&conn, &active)?;
@@ -1334,7 +1325,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 /// The upcoming events in the mirror, for the focus-view agenda.
 #[tauri::command]
 pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::list_upcoming(&conn, calendar::AGENDA_DAYS)
 }
 
@@ -1344,7 +1335,7 @@ pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEv
 /// corrections back it, for display in Settings.
 #[tauri::command]
 pub fn get_learning_profile(state: State<'_, AppState>) -> Result<learning::LearningProfile> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     learning::get_profile(&conn)
 }
 
@@ -1354,7 +1345,7 @@ pub fn get_learning_profile(state: State<'_, AppState>) -> Result<learning::Lear
 pub async fn refresh_learning_profile(app: AppHandle) -> Result<learning::LearningProfile> {
     run_profile_refresh(app.clone()).await?;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     learning::get_profile(&conn)
 }
 
@@ -1368,7 +1359,7 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
 
     let (current, corrections, models) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let current = learning::get_profile(&conn)?.profile;
         let corrections = learning::recent_corrections(&conn, learning::MAX_CORRECTIONS)?;
@@ -1384,7 +1375,7 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     log_usage(
         &conn,
         "background",
@@ -1402,7 +1393,7 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
 /// the focus view. Read-only — no model call, so it's cheap on every mount.
 #[tauri::command]
 pub fn get_daily_briefing(state: State<'_, AppState>) -> Result<briefing::DailyBriefing> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     briefing::get_briefing(&conn)
 }
 
@@ -1418,7 +1409,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
 
     let (snapshot, profile, models) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let zone = resolve_zone(&conn);
         let now = clock::now_local_iso(zone);
@@ -1433,7 +1424,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
     // Nothing to brief on yet — leave any prior briefing in place.
     let Some(snapshot) = snapshot else {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         return briefing::get_briefing(&conn);
     };
 
@@ -1442,7 +1433,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     log_usage(
         &conn,
         "background",
@@ -1491,7 +1482,7 @@ pub async fn cost_summary(app: AppHandle) -> Result<CostSummary> {
     // the error instead.
     let _ = ensure_pricing_fresh(&app).await;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     build_cost_summary(&conn)
 }
 
@@ -1501,7 +1492,7 @@ pub async fn cost_summary(app: AppHandle) -> Result<CostSummary> {
 pub async fn refresh_pricing(app: AppHandle) -> Result<CostSummary> {
     refresh_pricing_now(&app).await?;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     build_cost_summary(&conn)
 }
 
@@ -1531,7 +1522,7 @@ pub struct ModelRecommendations {
 pub async fn model_recommendations(app: AppHandle) -> Result<ModelRecommendations> {
     let _ = ensure_catalogue_fresh(&app).await; // best-effort; offline keeps the last-good list
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let catalogue = cached_catalogue(&conn)?;
     let denylist = recommend_denylist(&conn)?;
     // Reuse the cost logger's staleness rule: if the best-effort refresh above couldn't
@@ -1567,7 +1558,7 @@ pub fn set_recommend_denylist(state: State<'_, AppState>, denylist: Vec<String>)
         .take(100)
         .collect();
     let json = serde_json::to_string(&cleaned).map_err(|e| Error::Other(e.to_string()))?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(&conn, RECOMMEND_DENYLIST_KEY, &json)
 }
 
@@ -1646,7 +1637,7 @@ fn log_background_usage(
         return;
     }
     let state = app.state::<AppState>();
-    let Ok(conn) = state.db.lock() else { return };
+    let Ok(conn) = state.conn() else { return };
     for (served, usage) in rows {
         let model = served
             .as_deref()
@@ -1660,7 +1651,7 @@ fn log_background_usage(
 async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
     let stale = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let hours: Option<f64> = conn
             .query_row(
                 "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
@@ -1686,7 +1677,7 @@ async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
 async fn ensure_catalogue_fresh(app: &AppHandle) -> Result<()> {
     let needs_refresh = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let hours: Option<f64> = conn
             .query_row(
                 "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
@@ -1721,7 +1712,7 @@ async fn ensure_catalogue_fresh(app: &AppHandle) -> Result<()> {
 async fn refresh_pricing_now(app: &AppHandle) -> Result<()> {
     let models = openrouter::fetch_catalogue().await?;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let tx = conn.unchecked_transaction()?;
     // One timestamp for the whole batch, so every model in this pull shares an identical
     // `fetched_at`. That lets the recommender read only the latest batch (a model that left
@@ -1851,7 +1842,7 @@ fn total_cost(rows: &[ModelSpend]) -> Option<f64> {
 
 /// Current UTC time in the store's ISO8601 format (matches ingest timestamps).
 fn iso_now(state: &AppState) -> Result<String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     Ok(
         conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
             r.get(0)
@@ -1988,10 +1979,7 @@ pub async fn export_all_data(
     let tmp = tempfile::Builder::new().prefix("pm-export-").tempdir()?;
     let snapshot = tmp.path().join("pm.sqlite");
     {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| Error::Other("database lock poisoned".into()))?;
+        let conn = state.conn()?;
         // VACUUM INTO takes a literal SQL string, not a bound parameter; escape any
         // single quote in the (tool-generated) path so it can't break out.
         let escaped = snapshot.to_string_lossy().replace('\'', "''");

@@ -173,7 +173,7 @@ fn ingest_one(state: &AppState, vault: &Path, path: &Path) -> Result<Outcome> {
 
     // Dedupe + format timestamps in one short lock; release before embedding.
     let (created_at, ingested_at) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let exists: bool = conn
             .query_row(
                 "SELECT 1 FROM documents WHERE content_hash = ?1",
@@ -243,7 +243,7 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     state.sidecar.ensure_installed()?;
 
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         // chunk_vec / chunks_fts cascade from chunks via our own inserts, so
         // clear them explicitly. documents → chunks cascades by FK.
         conn.execute_batch(
@@ -305,10 +305,13 @@ fn rebuild_one(state: &AppState, vault_file: &Path) -> Result<Document> {
     let embeddings = state.sidecar.embed(&texts)?;
     check_embeddings(&embeddings, chunks.len())?;
 
-    let ingested_at = fields
-        .get("ingested_at")
-        .cloned()
-        .unwrap_or_else(|| iso_now(&state.db.lock().unwrap()).unwrap_or_default());
+    let ingested_at = match fields.get("ingested_at").cloned() {
+        Some(value) => value,
+        None => {
+            let conn = state.conn()?;
+            iso_now(&conn).unwrap_or_default()
+        }
+    };
     // Organisation metadata round-trips from the vault so a rebuild reproduces
     // the organised store (spec §3 acceptance). Missing fields fall back to the
     // fresh-ingest defaults, so pre-Step-4 vault files rebuild cleanly.
@@ -349,7 +352,7 @@ fn index_document(
     chunks: &[Chunk],
     embeddings: &[Vec<f32>],
 ) -> Result<Document> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.conn()?;
     let tx = conn.transaction()?;
 
     let tags_json =
