@@ -15,6 +15,7 @@
 // Build 2–6 land and exercise them on a non-test path.
 #![allow(dead_code)]
 
+pub mod crypto;
 pub mod kdf;
 pub mod lock;
 pub mod pointer;
