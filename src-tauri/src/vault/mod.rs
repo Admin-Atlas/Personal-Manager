@@ -19,6 +19,7 @@ pub mod acl;
 pub mod crypto;
 pub mod kdf;
 pub mod lock;
+pub mod migrate;
 pub mod pointer;
 pub mod verifier;
 
