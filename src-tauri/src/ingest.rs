@@ -866,8 +866,34 @@ fn extension(path: &Path) -> Option<String> {
 
 /// Whether a file in the vault folder is a Markdown document to index: a plaintext
 /// `.md` or an encrypted `.md.pmenc`. Anything else (temp files, stray) is skipped.
-fn is_vault_markdown(path: &Path) -> bool {
+/// Shared with the plaintext-export command so both agree on what a vault file is.
+pub(crate) fn is_vault_markdown(path: &Path) -> bool {
     matches!(extension(path).as_deref(), Some("md") | Some("pmenc"))
+}
+
+/// Export every Markdown file in `vault` to `dest` as plaintext `.md`, decrypting
+/// encrypted files with `cipher` and dropping the `.pmenc` suffix. Returns the count
+/// written. The core of the "never locked in" escape hatch — kept here (next to the
+/// rebuild walk it mirrors) so it is unit-testable without a running app.
+pub(crate) fn export_plaintext(
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    dest: &Path,
+) -> Result<usize> {
+    std::fs::create_dir_all(dest)?;
+    let mut written = 0usize;
+    for entry in std::fs::read_dir(vault)? {
+        let path = entry?.path();
+        if !path.is_file() || !is_vault_markdown(&path) {
+            continue;
+        }
+        // Decrypt-if-needed, then write under the logical `.md` name (no `.pmenc`).
+        let content = cipher.read(&path)?;
+        let out_name = MarkdownCipher::logical_name(&file_name(&path));
+        std::fs::write(dest.join(out_name), content)?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 fn file_name(path: &Path) -> String {

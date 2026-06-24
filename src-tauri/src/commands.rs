@@ -2146,6 +2146,25 @@ pub async fn export_all_data(
     .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
 }
 
+/// Export the Markdown vault as plaintext `.md` files to `dest_dir` — the spec's "you
+/// are never locked in" escape hatch (§3). Reads every vault file, decrypting any
+/// encrypted ones with the in-session key, and writes a clean tree with no `.pmenc`
+/// files, so the user can walk away with their notes in the open at any time. The vault
+/// must be unlocked (the Markdown key has to be loaded). Returns the number of files
+/// written. Unlike `export_all_data`, this is a *plaintext* escape hatch, not an
+/// encrypted backup — it deliberately strips the at-rest protection.
+#[tauri::command]
+pub async fn export_plaintext_markdown(
+    state: State<'_, AppState>,
+    dest_dir: String,
+) -> Result<usize> {
+    let (vault, cipher) = state.markdown_io()?;
+    let dest = std::path::PathBuf::from(dest_dir);
+    tokio::task::spawn_blocking(move || ingest::export_plaintext(&vault, &cipher, &dest))
+        .await
+        .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
+}
+
 /// Write the export archive: the DB snapshot as `pm.sqlite`, then the vault tree.
 fn write_export_zip(
     data_dir: &std::path::Path,

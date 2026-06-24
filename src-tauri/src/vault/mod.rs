@@ -719,4 +719,34 @@ mod tests {
         std::fs::write(&path, "still plaintext").unwrap();
         assert_eq!(c.read(&path).unwrap(), "still plaintext");
     }
+
+    #[test]
+    fn export_plaintext_decrypts_the_whole_vault() {
+        // The escape hatch: an encrypted vault exports to a clean plaintext `.md` tree,
+        // proving the user is never locked in.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let c = enc_cipher();
+        c.write_to(&vault.join(c.on_disk_name("a.md")), "# A\nalpha")
+            .unwrap();
+        c.write_to(&vault.join(c.on_disk_name("b.md")), "# B\nbeta")
+            .unwrap();
+        // A stray non-Markdown file is ignored by the export.
+        std::fs::write(vault.join("notes.txt"), "ignore me").unwrap();
+
+        let dest = dir.path().join("export");
+        let n = crate::ingest::export_plaintext(&vault, &c, &dest).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("a.md")).unwrap(),
+            "# A\nalpha"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("b.md")).unwrap(),
+            "# B\nbeta"
+        );
+        assert!(!dest.join("a.md.pmenc").exists(), "no ciphertext suffix");
+        assert!(!dest.join("notes.txt").exists(), "non-markdown skipped");
+    }
 }

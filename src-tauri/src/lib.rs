@@ -272,6 +272,7 @@ pub fn run() {
             commands::set_recommend_denylist,
             commands::open_data_folder,
             commands::export_all_data,
+            commands::export_plaintext_markdown,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
