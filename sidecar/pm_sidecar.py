@@ -45,6 +45,7 @@ WHISPER_MODEL = "base.en"
 
 _markitdown = None
 _embedder = None
+_tokenizer = None
 _whisper = None
 
 
@@ -64,6 +65,41 @@ def get_embedder():
 
         _embedder = TextEmbedding(model_name=EMBED_MODEL)
     return _embedder
+
+
+def get_tokenizer():
+    """The active embedder's tokenizer, for sizing chunks by tokens in Rust.
+
+    fastembed wraps a `tokenizers.Tokenizer`; we reach it defensively across versions
+    (the attribute path is internal), falling back to loading the repo's tokenizer
+    directly, then to `None` so the caller can estimate. Truncation is disabled so an
+    oversized chunk reports its *true* length (the splitter must see it overflow to break
+    it up). Reuses the embedder's already-downloaded weights — no extra download.
+    """
+    global _tokenizer
+    if _tokenizer is not None:
+        return _tokenizer
+    tok = None
+    emb = get_embedder()
+    candidate = getattr(emb, "tokenizer", None) or getattr(
+        getattr(emb, "model", None), "tokenizer", None
+    )
+    if candidate is not None and hasattr(candidate, "encode"):
+        tok = candidate
+    if tok is None:
+        try:
+            from tokenizers import Tokenizer
+
+            tok = Tokenizer.from_pretrained(EMBED_MODEL)
+        except Exception:
+            tok = None
+    if tok is not None:
+        try:
+            tok.no_truncation()
+        except Exception:
+            pass
+    _tokenizer = tok
+    return _tokenizer
 
 
 def get_whisper(model_dir):
@@ -121,6 +157,25 @@ def do_embed(params):
     return {"vectors": vectors, "dim": EMBED_DIM, "model": EMBED_MODEL}
 
 
+def do_count_tokens(params):
+    """Token counts for a batch, using the embedder's own tokenizer.
+
+    The Rust splitter sizes chunks by tokens (never chars) so a chunk never overflows the
+    embedder's input window. Counting with the same tokenizer that embeds keeps the two in
+    lockstep. If no tokenizer can be loaded, fall back to a rough chars/4 estimate so
+    chunking still works rather than failing the document.
+    """
+    texts = [clean_text(t) for t in params.get("texts", [])]
+    tok = get_tokenizer()
+    if tok is not None:
+        try:
+            encodings = tok.encode_batch(texts)
+            return {"counts": [len(e.ids) for e in encodings]}
+        except Exception:
+            pass
+    return {"counts": [max(1, len(t) // 4) for t in texts]}
+
+
 def do_transcribe(params):
     """Transcribe one audio clip to text with the local Whisper model.
 
@@ -141,6 +196,7 @@ HANDLERS = {
     "ping": lambda params: {"ok": True},
     "convert": do_convert,
     "embed": do_embed,
+    "count_tokens": do_count_tokens,
     "transcribe": do_transcribe,
 }
 

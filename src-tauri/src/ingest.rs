@@ -20,17 +20,11 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
 use crate::error::{Error, Result};
+use crate::registry;
+use crate::retrieval_config::RetrievalConfig;
+use crate::splitter::{self, ChunkKind, SplitMeta, Splitter};
 use crate::vault::MarkdownCipher;
 use crate::AppState;
-
-/// Roughly one embedding's worth of text, with a little overlap so meaning that
-/// straddles a boundary is still retrievable.
-const CHUNK_TARGET: usize = 1500;
-const CHUNK_OVERLAP: usize = 150;
-
-/// Dimension of the pinned embedding model (bge-small-en-v1.5). Must match the
-/// `chunk_vec` column and the `embedding_dim` setting.
-const EMBED_DIM: usize = 384;
 
 /// Extensions MarkItDown handles well. Anything else is skipped (still findable
 /// on disk, just not ingested). Lower-case, no dot.
@@ -107,6 +101,16 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
     let (vault, cipher) = state.markdown_io()?;
     let files = collect_files(&inputs);
 
+    // If the vault has no documents yet, everything this run indexes is produced under the
+    // current retrieval config, so we can stamp it at the end and spare the user a rebuild
+    // prompt for an already-correct index. With pre-existing docs the index may be mixed
+    // (e.g. a pre-stamp vault), so we leave the stamp untouched until a full Rebuild.
+    let was_empty = {
+        let conn = state.conn()?;
+        let n: i64 = conn.query_row("SELECT count(*) FROM documents", [], |r| r.get(0))?;
+        n == 0
+    };
+
     let (mut ingested, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for path in files {
         let name = file_name(&path);
@@ -134,6 +138,12 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
                     error: e.to_string(),
                 });
             }
+        }
+    }
+
+    if was_empty {
+        if let Ok(conn) = state.conn() {
+            let _ = crate::db::set_retrieval_stamp(&conn, &RetrievalConfig::current());
         }
     }
 
@@ -197,10 +207,10 @@ fn ingest_one(
         (created_at, ingested_at)
     };
 
-    let chunks = chunk_markdown(&markdown);
-    let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-    let embeddings = state.sidecar.embed(&texts)?;
-    check_embeddings(&embeddings, chunks.len())?;
+    let chunks = split_document(state, &markdown, &title, &content_hash)?;
+    let texts = leaf_embed_texts(&chunks);
+    let embeddings = state.gateway().embed(&texts)?;
+    check_embeddings(&embeddings, texts.len())?;
 
     // Write the vault file (source of truth) before indexing. A freshly ingested
     // document enters the review queue: project Unsorted, no tags/importance,
@@ -292,6 +302,13 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
         }
     }
 
+    // The index now reflects the current retrieval config end-to-end, so stamp the vault —
+    // this clears the one-time "Rebuild recommended" prompt.
+    {
+        let conn = state.conn()?;
+        crate::db::set_retrieval_stamp(&conn, &RetrievalConfig::current())?;
+    }
+
     let _ = on_event.send(IngestEvent::Finished {
         ingested,
         skipped: 0,
@@ -314,10 +331,10 @@ fn rebuild_one(state: &AppState, cipher: &MarkdownCipher, vault_file: &Path) -> 
         .cloned()
         .unwrap_or_else(|| "Untitled".into());
 
-    let chunks = chunk_markdown(body);
-    let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-    let embeddings = state.sidecar.embed(&texts)?;
-    check_embeddings(&embeddings, chunks.len())?;
+    let chunks = split_document(state, body, &title, &content_hash)?;
+    let texts = leaf_embed_texts(&chunks);
+    let embeddings = state.gateway().embed(&texts)?;
+    check_embeddings(&embeddings, texts.len())?;
 
     let ingested_at = match fields.get("ingested_at").cloned() {
         Some(value) => value,
@@ -359,11 +376,14 @@ fn rebuild_one(state: &AppState, cipher: &MarkdownCipher, vault_file: &Path) -> 
     index_document(state, &meta, &chunks, &embeddings)
 }
 
-/// Insert a document and its chunks/vectors/FTS rows in one transaction.
+/// Insert a document and its chunks/vectors/FTS rows in one transaction. `embeddings` are the
+/// leaf embeddings in leaf order (parents are structural-only and carry none); the loop pairs
+/// them with leaves as it walks the chunk list. The splitter emits parents before their
+/// children, so a single ordered pass resolves `parent_uid` → row id from a uid map.
 fn index_document(
     state: &AppState,
     meta: &DocMeta,
-    chunks: &[Chunk],
+    chunks: &[splitter::Chunk],
     embeddings: &[Vec<f32>],
 ) -> Result<Document> {
     let mut conn = state.conn()?;
@@ -394,34 +414,82 @@ fn index_document(
     )?;
     let doc_id = tx.last_insert_rowid();
 
-    for (i, chunk) in chunks.iter().enumerate() {
+    // Map a chunk uid → its inserted row id so a leaf can resolve its parent (which the
+    // splitter always emits first). Only leaves get a vector + FTS row, on the same rowid as
+    // their `chunks.id`, so the rowid-mirrors-chunks.id invariant holds; parents are gaps.
+    let mut uid_to_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    let mut leaf_idx = 0usize;
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+        let parent_id = chunk
+            .parent_uid
+            .as_deref()
+            .and_then(|uid| uid_to_id.get(uid).copied());
         tx.execute(
-            "INSERT INTO chunks (document_id, ordinal, heading, content, char_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO chunks \
+             (document_id, ordinal, heading, content, char_count, uid, parent_id, kind, start_offset, end_offset) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 doc_id,
-                i as i64,
+                ordinal as i64,
                 chunk.heading,
-                chunk.content,
-                chunk.content.chars().count() as i64
+                chunk.display_content,
+                chunk.display_content.chars().count() as i64,
+                chunk.uid,
+                parent_id,
+                chunk.kind.as_str(),
+                chunk.start_offset as i64,
+                chunk.end_offset as i64,
             ],
         )?;
         let chunk_id = tx.last_insert_rowid();
+        uid_to_id.insert(&chunk.uid, chunk_id);
 
-        let vector = serde_json::to_string(&embeddings[i])
-            .map_err(|e| Error::Other(format!("encode embedding: {e}")))?;
-        tx.execute(
-            "INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)",
-            params![chunk_id, vector],
-        )?;
-        tx.execute(
-            "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
-            params![chunk_id, chunk.content],
-        )?;
+        if chunk.kind == ChunkKind::Leaf {
+            let vector = serde_json::to_string(&embeddings[leaf_idx])
+                .map_err(|e| Error::Other(format!("encode embedding: {e}")))?;
+            tx.execute(
+                "INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)",
+                params![chunk_id, vector],
+            )?;
+            // Index the heading-prepended text so keyword search also benefits from the
+            // breadcrumb, while `chunks.content` stays clean for display + citations.
+            tx.execute(
+                "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
+                params![chunk_id, chunk.embed_content],
+            )?;
+            leaf_idx += 1;
+        }
     }
 
     tx.commit()?;
     load_document(&conn, doc_id)
+}
+
+/// Split a document body into chunks with the active splitter, sizing by tokens through the
+/// model gateway (the sidecar's tokenizer). The title + content hash feed the heading
+/// breadcrumb and the stable, rebuild-reproducible chunk uids.
+fn split_document(
+    state: &AppState,
+    body: &str,
+    title: &str,
+    content_hash: &str,
+) -> Result<Vec<splitter::Chunk>> {
+    let splitter = splitter::RecursiveSplitter::default();
+    let meta = SplitMeta {
+        title,
+        content_hash,
+    };
+    splitter.split(body, &meta, &state.gateway())
+}
+
+/// The text to embed + keyword-index for each leaf chunk (heading-prepended). Parents are
+/// structural-only and contribute none, so this lines up 1:1 with the leaf rows.
+fn leaf_embed_texts(chunks: &[splitter::Chunk]) -> Vec<String> {
+    chunks
+        .iter()
+        .filter(|c| c.kind == ChunkKind::Leaf)
+        .map(|c| c.embed_content.clone())
+        .collect()
 }
 
 /// The SELECT column list backing `row_to_document` — shared by the list and
@@ -566,106 +634,6 @@ pub fn restore_vault_files(written: Vec<(std::path::PathBuf, Vec<u8>)>) {
     for (file, original) in written.into_iter().rev() {
         let _ = std::fs::write(&file, original);
     }
-}
-
-// --- chunking ---
-
-pub struct Chunk {
-    pub heading: Option<String>,
-    pub content: String,
-}
-
-/// Split Markdown into overlapping chunks, greedily packing blocks (separated by
-/// blank lines) up to `CHUNK_TARGET` chars and carrying `CHUNK_OVERLAP` chars of
-/// context into the next chunk. Each chunk remembers the heading in force when
-/// it started. Deterministic, so a rebuild reproduces identical chunks.
-pub fn chunk_markdown(markdown: &str) -> Vec<Chunk> {
-    let mut chunks = Vec::new();
-    let mut buf = String::new();
-    let mut buf_heading: Option<String> = None;
-    let mut current_heading: Option<String> = None;
-
-    for block in blocks(markdown) {
-        if let Some(h) = heading_text(&block) {
-            current_heading = Some(h);
-        }
-        if buf.is_empty() {
-            buf_heading = current_heading.clone();
-        } else {
-            buf.push_str("\n\n");
-        }
-        buf.push_str(&block);
-
-        // Flush while the buffer is at/over the target. A loop (not a single
-        // push) so a block larger than the target is split into target-sized
-        // chunks rather than emitted whole — an oversized chunk gets silently
-        // truncated by the embedder, dropping content. Measured in chars, not
-        // bytes, so multi-byte text (e.g. CJK) isn't packed into ~1/3-size chunks.
-        while char_count(&buf) >= CHUNK_TARGET {
-            let head = take_chars(&mut buf, CHUNK_TARGET);
-            push_chunk(&mut chunks, buf_heading.clone(), &head);
-            // Carry an overlap tail of the emitted chunk into the next one.
-            buf = format!("{}{}", overlap_tail(&head), buf);
-            buf_heading = current_heading.clone();
-        }
-    }
-    push_chunk(&mut chunks, buf_heading, &buf);
-    chunks
-}
-
-fn char_count(s: &str) -> usize {
-    s.chars().count()
-}
-
-/// Remove and return the first `n` chars of `buf` (char-safe); the rest stays.
-fn take_chars(buf: &mut String, n: usize) -> String {
-    let end = buf
-        .char_indices()
-        .nth(n)
-        .map(|(i, _)| i)
-        .unwrap_or(buf.len());
-    let head = buf[..end].to_string();
-    buf.replace_range(..end, "");
-    head
-}
-
-fn push_chunk(chunks: &mut Vec<Chunk>, heading: Option<String>, buf: &str) {
-    let content = buf.trim();
-    if !content.is_empty() {
-        chunks.push(Chunk {
-            heading,
-            content: content.to_string(),
-        });
-    }
-}
-
-/// Split into blocks on blank lines, trimming each.
-fn blocks(markdown: &str) -> Vec<String> {
-    markdown
-        .split("\n\n")
-        .map(|b| b.trim())
-        .filter(|b| !b.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-/// If a block is a heading line, return its text without the `#` markers.
-fn heading_text(block: &str) -> Option<String> {
-    let first = block.lines().next()?;
-    let trimmed = first.trim_start();
-    if trimmed.starts_with('#') {
-        Some(trimmed.trim_start_matches('#').trim().to_string())
-    } else {
-        None
-    }
-}
-
-/// The last `CHUNK_OVERLAP` chars of `buf` (char-counted, to match CHUNK_TARGET).
-fn overlap_tail(buf: &str) -> String {
-    let total = char_count(buf);
-    buf.chars()
-        .skip(total.saturating_sub(CHUNK_OVERLAP))
-        .collect()
 }
 
 // --- front-matter ---
@@ -991,17 +959,18 @@ fn hex_digest(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Guard the index against a model mismatch: one vector per chunk, each of the
-/// pinned dimension.
-fn check_embeddings(embeddings: &[Vec<f32>], chunks: usize) -> Result<()> {
-    if embeddings.len() != chunks {
+/// Guard the index against a model mismatch: one vector per leaf chunk, each of the active
+/// embedder's dimension (read from the registry, never a hardcoded 384).
+fn check_embeddings(embeddings: &[Vec<f32>], leaves: usize) -> Result<()> {
+    if embeddings.len() != leaves {
         return Err(Error::Other(
-            "embedding count did not match chunk count".into(),
+            "embedding count did not match leaf-chunk count".into(),
         ));
     }
-    if embeddings.iter().any(|v| v.len() != EMBED_DIM) {
+    let dim = registry::active_embedder().dimension;
+    if embeddings.iter().any(|v| v.len() != dim) {
         return Err(Error::Other(format!(
-            "embedding dimension mismatch (expected {EMBED_DIM}); wrong model?"
+            "embedding dimension mismatch (expected {dim}); wrong model?"
         )));
     }
     Ok(())
@@ -1174,37 +1143,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oversized_block_is_split_to_target() {
-        // A single block with no blank lines must not become one giant chunk the
-        // embedder would truncate — it's split into target-sized pieces.
-        let big = "x".repeat(CHUNK_TARGET * 3 + 50);
-        let chunks = chunk_markdown(&big);
-        assert!(chunks.len() > 1, "expected the giant block to be split");
-        for c in &chunks {
-            assert!(
-                c.content.chars().count() <= CHUNK_TARGET,
-                "chunk exceeds target: {} chars",
-                c.content.chars().count()
-            );
-        }
-    }
-
-    #[test]
-    fn multibyte_chunks_sized_by_chars_not_bytes() {
-        // CJK chars are ~3 bytes each; sizing by bytes would chop chunks to ~1/3
-        // the intended length. Size by chars instead.
-        let text = "あ".repeat(CHUNK_TARGET + 200);
-        let chunks = chunk_markdown(&text);
-        let first = chunks[0].content.chars().count();
-        assert!(
-            first > CHUNK_TARGET / 2,
-            "first chunk too small: {first} chars"
-        );
-        for c in &chunks {
-            assert!(c.content.chars().count() <= CHUNK_TARGET);
-        }
-    }
+    // Chunking behaviour (token-sizing, structure-awareness, parent tiers, determinism) is
+    // now covered by `crate::splitter`'s own unit tests.
 
     #[test]
     fn malicious_title_cannot_inject_frontmatter_fields() {

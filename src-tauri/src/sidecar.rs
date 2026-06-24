@@ -346,8 +346,18 @@ impl SidecarManager {
         Ok((markdown, title))
     }
 
-    /// Embed a batch of strings into 384-d vectors. The first call downloads the
-    /// model (~90 MB) and is slow; subsequent calls are fast and fully local.
+    /// The on-device model-cache dir for the Whisper weights (a sibling of the venv under
+    /// `runtime/models`), created if missing, so they live inside PM's data dir and uninstall
+    /// with it. (The embedder keeps fastembed's default cache in PR 1 — pinning it would force
+    /// existing users to re-download the model; that hygiene is deferred.)
+    fn model_dir_param(&self) -> Option<String> {
+        let dir = self.paths.models_dir()?;
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir.to_string_lossy().into_owned())
+    }
+
+    /// Embed a batch of strings into the active embedder's vectors. The first call
+    /// downloads the model (~90 MB) and is slow; subsequent calls are fast and fully local.
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -381,19 +391,41 @@ impl SidecarManager {
         Ok(vectors)
     }
 
+    /// Count tokens for a batch of strings with the active embedder's tokenizer — the
+    /// splitter sizes chunks by this so a chunk never overflows the model's input window.
+    /// Local, batched (one call per document), and uses the same tokenizer that embeds.
+    pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let result = self.request("count_tokens", json!({ "texts": texts }))?;
+        let counts = result["counts"]
+            .as_array()
+            .ok_or_else(|| Error::Other("sidecar count_tokens returned no counts".into()))?
+            .iter()
+            .map(|n| {
+                n.as_u64().map(|u| u as usize).ok_or_else(|| {
+                    Error::Other("sidecar count_tokens returned a non-integer".into())
+                })
+            })
+            .collect::<Result<Vec<usize>>>()?;
+        if counts.len() != texts.len() {
+            return Err(Error::Other(
+                "sidecar count_tokens returned the wrong number of counts".into(),
+            ));
+        }
+        Ok(counts)
+    }
+
     /// Transcribe an audio clip to text with the local Whisper model. The first
     /// call downloads the model (~145 MB) and is slow; later calls are fast and
     /// fully local. `path` is a temp file the caller writes (and then deletes).
     pub fn transcribe(&self, path: &Path) -> Result<String> {
-        let model_dir = self.paths.models_dir();
-        if let Some(dir) = &model_dir {
-            let _ = std::fs::create_dir_all(dir);
-        }
         let result = self.request(
             "transcribe",
             json!({
                 "path": path.to_string_lossy(),
-                "model_dir": model_dir.as_ref().map(|d| d.to_string_lossy()),
+                "model_dir": self.model_dir_param(),
             }),
         )?;
         Ok(result["text"].as_str().unwrap_or_default().to_string())

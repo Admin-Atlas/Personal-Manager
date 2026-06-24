@@ -65,12 +65,98 @@ pub struct Citation {
 /// only the project's chunks. Generous for a personal store; bounds the work.
 const SCOPED_POOL: usize = 256;
 
-/// Hybrid search: run a vector KNN and an FTS keyword query, fuse the two ranked
-/// lists with Reciprocal Rank Fusion, and return the top-k chunks with document
-/// provenance. The query embedding is supplied by the caller. When `project` is
-/// `Some`, results are confined to that project's documents — the per-project
-/// scoped chat (spec §4: "everything narrows to just it").
-pub fn hybrid_search(
+/// A query-time reranker: re-score the candidate passages for a query, returning one score per
+/// passage (higher = more relevant), or `None` to leave the fused order unchanged. Injected so
+/// the retrieval core stays pure and Python-free in tests. PR 1's only implementation (the
+/// model gateway) is **inert** and returns `None`; PR 2 runs a cross-encoder here behind a
+/// Settings toggle (stateless — no Rebuild).
+pub trait Reranker {
+    fn scores(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>>;
+}
+
+/// Query filters. PR 1 honours `project` (the per-project scoped chat); the rest are reserved
+/// seams for cross-corpus filtering (document type, source, time window) that `retrieve` will
+/// apply as later connectors land. Kept as a struct so adding a filter never changes the
+/// `retrieve` signature. (The reserved fields are write-only until then.)
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct Filters {
+    pub project: Option<String>,
+    pub doc_type: Option<String>,
+    pub source: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+/// The retrieval strategy — the seam for future adaptive routing and agentic retrieval. Exactly
+/// one value today; `retrieve` matches on it so adding a strategy is additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Strategy {
+    #[default]
+    HybridRrf,
+}
+
+/// A retrieval request: the query text + its embedding (supplied by the caller, keeping the
+/// core Python-free), how many results, and the filters/strategy. The stable, typed contract
+/// the chat flow — and later AM agents calling retrieval as a tool — go through.
+pub struct RetrieveQuery<'a> {
+    pub text: &'a str,
+    pub embedding: &'a [f32],
+    pub k: usize,
+    pub filters: Filters,
+    pub strategy: Strategy,
+}
+
+/// Tool-shaped retrieval (spec §21.4): run the requested strategy and return ranked, citable
+/// passages. Decoupled from chat — chat, the Documents search, and (later) agents all call
+/// this one contract. The rerank stage is **inert in PR 1**: with no reranker (or one that
+/// returns `None`) the fused order is unchanged, so existing behaviour is preserved; PR 2
+/// widens the candidate pool and reorders here.
+pub fn retrieve(
+    conn: &Connection,
+    q: &RetrieveQuery,
+    reranker: Option<&dyn Reranker>,
+) -> Result<Vec<RetrievedChunk>> {
+    let chunks = match q.strategy {
+        Strategy::HybridRrf => {
+            hybrid_core(conn, q.text, q.embedding, q.k, q.filters.project.as_deref())?
+        }
+    };
+    match reranker {
+        Some(r) => apply_reranker(r, q.text, chunks),
+        None => Ok(chunks),
+    }
+}
+
+/// Reorder the fused passages by a reranker's scores. A `None` result (PR 1's inert path) or a
+/// malformed score list leaves the order untouched — never mis-orders on bad input.
+fn apply_reranker(
+    reranker: &dyn Reranker,
+    query: &str,
+    chunks: Vec<RetrievedChunk>,
+) -> Result<Vec<RetrievedChunk>> {
+    let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+    let Some(scores) = reranker.scores(query, &texts)? else {
+        return Ok(chunks);
+    };
+    if scores.len() != chunks.len() {
+        return Ok(chunks);
+    }
+    let mut order: Vec<usize> = (0..chunks.len()).collect();
+    order.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    Ok(order.into_iter().map(|i| chunks[i].clone()).collect())
+}
+
+/// The pure-SQL hybrid core: a vector KNN + an FTS keyword query fused with Reciprocal Rank
+/// Fusion, recency-decayed, top-k. The query embedding is supplied by the caller, so this is
+/// unit-testable without Python. Only leaf chunks are ever returned (parents aren't in the
+/// vector/keyword indexes).
+fn hybrid_core(
     conn: &Connection,
     query_text: &str,
     query_embedding: &[f32],
@@ -245,9 +331,12 @@ fn decay_factor(age_days: f64, half_life_days: f64) -> f64 {
 
 /// Load full chunk + document provenance for the fused ids, preserving order.
 fn load_chunks(conn: &Connection, ids: &[i64]) -> Result<Vec<RetrievedChunk>> {
+    // `AND c.kind = 'leaf'` is belt-and-suspenders: parents are never in chunk_vec/chunks_fts,
+    // so a fused id is always a leaf — but the guard means a stray parent id would be skipped
+    // rather than surfaced as a citation.
     let mut stmt = conn.prepare(
         "SELECT c.id, c.document_id, d.title, d.source_path, d.vault_path, c.heading, c.content, c.ordinal \
-         FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = ?1",
+         FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = ?1 AND c.kind = 'leaf'",
     )?;
     let mut out = Vec::with_capacity(ids.len());
     for &id in ids {
@@ -320,6 +409,28 @@ pub fn grounding_prompt(chunks: &[RetrievedChunk]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run an unreranked hybrid search through the typed contract — the concise form the
+    /// pre-foundation tests used (`hybrid_search`), now expressed via `retrieve`.
+    fn search(
+        conn: &Connection,
+        text: &str,
+        embedding: &[f32],
+        k: usize,
+        project: Option<&str>,
+    ) -> Vec<RetrievedChunk> {
+        let q = RetrieveQuery {
+            text,
+            embedding,
+            k,
+            filters: Filters {
+                project: project.map(str::to_string),
+                ..Default::default()
+            },
+            strategy: Strategy::HybridRrf,
+        };
+        retrieve(conn, &q, None).unwrap()
+    }
 
     #[test]
     fn fts_query_sanitizes_punctuation() {
@@ -447,7 +558,7 @@ mod tests {
             "-1 days",
         );
 
-        let hits = hybrid_search(&conn, "agenda", &query, 2, None).unwrap();
+        let hits = search(&conn, "agenda", &query, 2, None);
         assert_eq!(hits.len(), 2);
         assert_eq!(
             hits[0].title, "Fresh note",
@@ -477,7 +588,7 @@ mod tests {
         );
 
         // A query near the first chunk semantically and matching its keyword.
-        let hits = hybrid_search(&conn, "purr", &unit_vec(0), 2, None).unwrap();
+        let hits = search(&conn, "purr", &unit_vec(0), 2, None);
         assert!(!hits.is_empty(), "expected at least one hit");
         assert_eq!(hits[0].title, "Cat facts");
 
@@ -543,11 +654,99 @@ mod tests {
         );
 
         // Unscoped: both are reachable.
-        let all = hybrid_search(&conn, "agenda", &unit_vec(0), 6, None).unwrap();
+        let all = search(&conn, "agenda", &unit_vec(0), 6, None);
         assert_eq!(all.len(), 2);
 
         // Scoped to Beta: only Beta's chunk comes back.
-        let scoped = hybrid_search(&conn, "agenda", &unit_vec(0), 6, Some("Beta")).unwrap();
+        let scoped = search(&conn, "agenda", &unit_vec(0), 6, Some("Beta"));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].title, "Beta note");
+    }
+
+    /// A test reranker that flips the order (scores ascending by position, so the last passage
+    /// wins) — proves `retrieve` actually reorders by a reranker's scores.
+    struct ReverseReranker;
+    impl Reranker for ReverseReranker {
+        fn scores(&self, _query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+            Ok(Some((0..passages.len()).map(|i| i as f32).collect()))
+        }
+    }
+
+    /// A reranker that opts out (the PR-1 inert contract): the fused order must be preserved.
+    struct InertReranker;
+    impl Reranker for InertReranker {
+        fn scores(&self, _query: &str, _passages: &[&str]) -> Result<Option<Vec<f32>>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn retrieve_reorders_with_a_reranker_and_is_inert_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&path, key).unwrap();
+        insert_doc_chunk(&conn, "First", "alpha cats", &unit_vec(0));
+        insert_doc_chunk(&conn, "Second", "beta cats", &unit_vec(1));
+
+        let query = unit_vec(0);
+        let q = RetrieveQuery {
+            text: "cats",
+            embedding: &query,
+            k: 6,
+            filters: Filters::default(),
+            strategy: Strategy::HybridRrf,
+        };
+
+        let base = retrieve(&conn, &q, None).unwrap();
+        assert!(base.len() >= 2, "expected both chunks");
+
+        // A reranker reorders: the reverse reranker puts the fused-last chunk first.
+        let reversed = retrieve(&conn, &q, Some(&ReverseReranker as &dyn Reranker)).unwrap();
+        assert_eq!(
+            reversed.first().unwrap().chunk_id,
+            base.last().unwrap().chunk_id
+        );
+
+        // An inert reranker leaves the fused order untouched (PR-1 behaviour).
+        let inert = retrieve(&conn, &q, Some(&InertReranker as &dyn Reranker)).unwrap();
+        let ids = |v: &[RetrievedChunk]| v.iter().map(|c| c.chunk_id).collect::<Vec<_>>();
+        assert_eq!(ids(&inert), ids(&base));
+    }
+
+    #[test]
+    fn retrieve_honours_the_project_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&path, key).unwrap();
+        insert_doc_in_project(
+            &conn,
+            "Alpha note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Alpha",
+        );
+        insert_doc_in_project(
+            &conn,
+            "Beta note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Beta",
+        );
+
+        let query = unit_vec(0);
+        let q = RetrieveQuery {
+            text: "agenda",
+            embedding: &query,
+            k: 6,
+            filters: Filters {
+                project: Some("Beta".into()),
+                ..Default::default()
+            },
+            strategy: Strategy::HybridRrf,
+        };
+        let scoped = retrieve(&conn, &q, None).unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].title, "Beta note");
     }
