@@ -366,6 +366,35 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
     })
 }
 
+/// Convert this profile's fresh device vault into a shareable, passphrase-protected
+/// one: derive the key from the passphrase, re-key the store in place, and switch the
+/// metadata to passphrase mode. The device-only default is untouched for users who
+/// never opt in.
+#[tauri::command]
+pub fn create_shareable_vault(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    passphrase: String,
+) -> Result<()> {
+    if passphrase.trim().is_empty() {
+        return Err(Error::Other("a passphrase is required".into()));
+    }
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    if meta.key_mode == vault::KeyMode::Passphrase {
+        return Err(Error::Other("this vault is already shareable".into()));
+    }
+    let (new_meta, new_key) = vault::prepare_shareable(&meta, &passphrase)?;
+    {
+        let conn = state.conn()?;
+        db::rekey(&conn, new_key.expose())?;
+    }
+    vault::store_meta(&resolved.vault_root, &new_meta)?;
+    secrets::set_cached_vault_key(&new_meta.vault_id, new_key.expose())?;
+    Ok(())
+}
+
 /// Unlock the current (passphrase) vault: derive + verify, open the store, and cache
 /// the derived key in this profile so the next launch is silent.
 #[tauri::command]

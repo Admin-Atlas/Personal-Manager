@@ -47,6 +47,9 @@ const META_SCHEMA: u32 = 1;
 const MARKDOWN_SUBKEY_CONTEXT: &str = "org.itsatlas.pm markdown-at-rest subkey v1";
 /// Recorded in the meta so every profile agrees on how the Markdown subkey is made.
 const MARKDOWN_SUBKEY_SCHEME: &str = "blake3-derive-key";
+/// Target Argon2id derivation time when creating a shareable vault (~mid of the
+/// 250–500 ms band; spec §2.2). Calibrated once at creation, then stored + reused.
+const CALIBRATE_TARGET_MS: u64 = 350;
 
 /// How a vault's SQLCipher key is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,11 +299,10 @@ fn build_passphrase_meta(
             salt_b64: B64.encode(salt),
         }),
         verifier: Some(verifier),
-        // Shared ⇒ Markdown encryption is mandatory (spec §3).
-        markdown: MarkdownPolicy {
-            encryption: MarkdownEncryption::XChaCha20Poly1305,
-            subkey: MARKDOWN_SUBKEY_SCHEME.to_string(),
-        },
+        // Markdown-at-rest encryption is layered on in Build 6; until then a freshly
+        // created shareable vault keeps plaintext Markdown (spec build order: creation
+        // precedes the encryption engine). Build 6 turns it on for shared vaults.
+        markdown: MarkdownPolicy::default(),
     };
     Ok((meta, master))
 }
@@ -314,6 +316,18 @@ pub fn new_passphrase(
     calibrate_target_ms: u64,
 ) -> Result<(VaultMeta, Zeroizing<[u8; KEY_LEN]>)> {
     build_passphrase_meta(passphrase, kdf::calibrate(calibrate_target_ms))
+}
+
+/// Build the metadata + DB key for converting the current (device) vault into a
+/// shareable, passphrase-derived one. Keeps the existing vault id + creation time —
+/// it's the same vault, re-keyed — so its keychain cache and any future links stay
+/// stable. The caller re-keys the open store with the returned key (PRAGMA rekey) and
+/// writes the metadata.
+pub fn prepare_shareable(old_meta: &VaultMeta, passphrase: &str) -> Result<(VaultMeta, Secret)> {
+    let (mut meta, master) = new_passphrase(passphrase, CALIBRATE_TARGET_MS)?;
+    meta.vault_id = old_meta.vault_id.clone();
+    meta.created_at = old_meta.created_at.clone();
+    Ok((meta, db_key_hex(&master)))
 }
 
 /// Open a passphrase (shareable) vault: derive the master, verify it against the
@@ -425,7 +439,7 @@ mod tests {
         let back: VaultMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(meta, back);
         assert!(json.contains("argon2id"));
-        assert!(json.contains("xchacha20poly1305"));
+        assert!(json.contains("blake3-derive-key"));
         assert!(json.contains("\"key_mode\": \"passphrase\""));
         // The passphrase itself must never be written to the metadata file.
         assert!(

@@ -166,6 +166,7 @@ pub fn run() {
             commands::set_app_lock,
             commands::unlock_app,
             commands::vault_status,
+            commands::create_shareable_vault,
             commands::unlock_vault,
             commands::open_existing_vault,
             commands::forget_vault_passphrase,
