@@ -230,6 +230,7 @@ pub fn run() {
             commands::unlock_vault,
             commands::open_existing_vault,
             commands::forget_vault_passphrase,
+            commands::link_vault_account,
             commands::list_models,
             commands::get_learning_profile,
             commands::refresh_learning_profile,

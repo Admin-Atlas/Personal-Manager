@@ -491,6 +491,25 @@ pub fn forget_vault_passphrase(app: AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// Grant another account on this machine access to the shared vault folder — the
+/// Settings "link a second account" action. Takes an account name (e.g. `PC\alice`) or
+/// a SID. Only a shareable vault can be linked; ACLs are defence in depth (encryption
+/// is the real protection), so on platforms without support this surfaces as a clear
+/// error the UI can show as a warning.
+#[tauri::command]
+pub fn link_vault_account(app: AppHandle, account: String) -> Result<()> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    if meta.key_mode != vault::KeyMode::Passphrase {
+        return Err(Error::Other(
+            "only a shareable vault can be linked to another account; make it shareable first"
+                .into(),
+        ));
+    }
+    vault::acl::grant_access(&resolved.vault_root, &account)
+}
+
 /// The OpenRouter model catalogue (public endpoint, no key needed) so the user can
 /// browse, search, and pick a model with pricing in Settings (spec §6 — any model,
 /// swappable).
