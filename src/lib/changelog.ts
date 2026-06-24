@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.1.3-alpha",
+    date: "2026-06-24",
+    highlights: [
+      "Documentation refresh: the README is now up to date with everything PM does today and written to stay current as features land, and the project ships public Contributing and Releasing guides covering how changes are reviewed, gated, and shipped. No change to the app or your data.",
+    ],
+  },
+  {
     version: "2.1.2-alpha",
     date: "2026-06-24",
     highlights: [
