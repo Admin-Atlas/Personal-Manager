@@ -356,6 +356,11 @@ pub struct VaultStatus {
     pub markdown_encrypted: bool,
     pub location: String,
     pub vault_id: Option<String>,
+    /// Whether the stored index was produced by a different retrieval config than this build
+    /// (a model, chunk-rule, or splitter change) — i.e. a one-time Rebuild is recommended. The
+    /// Documents view surfaces this as a dismissible banner. False when the vault is locked or
+    /// has no documents yet.
+    pub retrieval_rebuild_needed: bool,
 }
 
 /// Report the current vault's mode and whether it needs unlocking (a passphrase vault
@@ -372,12 +377,26 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         ),
         None => (vault::KeyMode::Device, false, None),
     };
+    // A populated vault whose stored index was produced by a different retrieval config than
+    // this build (a model/chunk/splitter change, or a pre-stamp vault) gets a one-time Rebuild
+    // prompt. Only meaningful when the store is open and has documents.
+    let retrieval_rebuild_needed = if state.is_unlocked() {
+        let conn = state.conn()?;
+        let has_docs: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?;
+        has_docs
+            && crate::db::get_retrieval_stamp(&conn)?.as_ref()
+                != Some(&crate::retrieval_config::RetrievalConfig::current())
+    } else {
+        false
+    };
     Ok(VaultStatus {
         mode,
         needs_unlock: !state.is_unlocked(),
         markdown_encrypted,
         location: resolved.vault_root.to_string_lossy().into_owned(),
         vault_id,
+        retrieval_rebuild_needed,
     })
 }
 
@@ -872,19 +891,26 @@ async fn retrieve_grounding(
             return Ok(Vec::new());
         }
 
-        let embeddings = state.sidecar.embed(std::slice::from_ref(&query))?;
+        let embeddings = state.gateway().embed(std::slice::from_ref(&query))?;
         let Some(query_vec) = embeddings.into_iter().next() else {
             return Ok(Vec::new());
         };
 
         let conn = state.conn()?;
-        retrieval::hybrid_search(
-            &conn,
-            &query,
-            &query_vec,
-            retrieval::DEFAULT_TOP_K,
-            project.as_deref(),
-        )
+        let q = retrieval::RetrieveQuery {
+            text: &query,
+            embedding: &query_vec,
+            k: retrieval::DEFAULT_TOP_K,
+            filters: retrieval::Filters {
+                project: project.clone(),
+                ..Default::default()
+            },
+            strategy: retrieval::Strategy::HybridRrf,
+        };
+        // The reranker is inert in PR 1 (returns the fused order); PR 2 runs the cross-encoder
+        // here and must do so off the DB lock.
+        let gateway = state.gateway();
+        retrieval::retrieve(&conn, &q, Some(&gateway as &dyn retrieval::Reranker))
     })
     .await;
 
@@ -963,11 +989,19 @@ pub async fn search_documents(
         let state = app.state::<AppState>();
         state.sidecar.ensure_installed()?;
 
-        let embeddings = state.sidecar.embed(std::slice::from_ref(&query))?;
+        let embeddings = state.gateway().embed(std::slice::from_ref(&query))?;
         let query_vec = embeddings.into_iter().next().unwrap_or_default();
 
         let conn = state.conn()?;
-        retrieval::hybrid_search(&conn, &query, &query_vec, k, None)
+        let q = retrieval::RetrieveQuery {
+            text: &query,
+            embedding: &query_vec,
+            k,
+            filters: retrieval::Filters::default(),
+            strategy: retrieval::Strategy::HybridRrf,
+        };
+        let gateway = state.gateway();
+        retrieval::retrieve(&conn, &q, Some(&gateway as &dyn retrieval::Reranker))
     })
     .await
     .map_err(|e| Error::Other(format!("search task panicked: {e}")))?

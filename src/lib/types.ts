@@ -62,6 +62,10 @@ export interface VaultStatus {
   markdown_encrypted: boolean;
   location: string;
   vault_id: string | null;
+  /** Whether the stored search index was produced by a different retrieval config than this
+   *  build (a model, chunking, or splitter change) — i.e. a one-time Rebuild is recommended.
+   *  The Documents view shows this as a dismissible banner. False when locked or empty. */
+  retrieval_rebuild_needed: boolean;
 }
 
 /** Cooperative single-writer state for a shared vault. `active` = this instance is the

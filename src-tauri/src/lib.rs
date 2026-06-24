@@ -14,15 +14,19 @@ mod ics;
 mod ingest;
 mod learning;
 mod lock_session;
+mod model_gateway;
 mod openrouter;
 mod paths;
 mod projects;
 mod recommend;
+mod registry;
 mod retrieval;
+mod retrieval_config;
 mod review;
 mod secret;
 mod secrets;
 mod sidecar;
+mod splitter;
 mod vault;
 
 use std::ops::{Deref, DerefMut};
@@ -175,6 +179,13 @@ impl AppState {
     /// Whether the store is currently open (the vault is unlocked this session).
     pub fn is_unlocked(&self) -> bool {
         self.db.lock().map(|guard| guard.is_some()).unwrap_or(false)
+    }
+
+    /// The model gateway for this session — the single seam external model-inference calls
+    /// route through (registry-driven embed / count-tokens / rerank). Borrows the sidecar,
+    /// which self-locks, so it's cheap to make per operation.
+    pub fn gateway(&self) -> model_gateway::ModelGateway<'_> {
+        model_gateway::ModelGateway::new(&self.sidecar)
     }
 }
 

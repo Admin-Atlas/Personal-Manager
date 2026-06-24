@@ -36,6 +36,33 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `settings` key holding the retrieval-config stamp (spec §21.4). One JSON row capturing
+/// the index-time config that produced this vault's index.
+const RETRIEVAL_STAMP_KEY: &str = "retrieval_config";
+
+/// The retrieval-config stamp recorded for this vault, if any. `None` for a vault indexed
+/// before stamping existed (pre-PR-1) or one whose stamp can't be parsed — both treated as a
+/// mismatch by the caller, so the user is offered a one-time Rebuild.
+pub fn get_retrieval_stamp(
+    conn: &Connection,
+) -> Result<Option<crate::retrieval_config::RetrievalConfig>> {
+    match get_setting(conn, RETRIEVAL_STAMP_KEY)? {
+        Some(json) => Ok(serde_json::from_str(&json).ok()),
+        None => Ok(None),
+    }
+}
+
+/// Record the retrieval-config stamp for this vault — written after a fresh ingest or a Rebuild,
+/// so the stored index and the stamp always describe the same pipeline.
+pub fn set_retrieval_stamp(
+    conn: &Connection,
+    cfg: &crate::retrieval_config::RetrievalConfig,
+) -> Result<()> {
+    let json = serde_json::to_string(cfg)
+        .map_err(|e| Error::Other(format!("encode retrieval stamp: {e}")))?;
+    set_setting(conn, RETRIEVAL_STAMP_KEY, &json)
+}
+
 /// Distinct project labels across all documents, alphabetical. The one query
 /// behind the review picker, the proposal prompts' "existing projects" list, and
 /// per-project proposals — kept here so those callers can't drift apart.
@@ -316,5 +343,93 @@ mod tests {
             .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn chunk_schema_v9_parents_are_structural_only() {
+        // The retrieval-foundation schema (migration v9): a structural parent spanning two
+        // embedded leaves. The parent lives in `chunks` but is NOT in chunk_vec/chunks_fts, so
+        // the "rowid mirrors chunks.id" invariant holds and a KNN never returns it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v9.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('doc.md','Doc','h9')",
+            [],
+        )
+        .unwrap();
+        let doc = conn.last_insert_rowid();
+
+        // Parent: stored, with a uid + offsets + kind, but never embedded / FTS-indexed.
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count, uid, kind, start_offset, end_offset) \
+             VALUES (?1, 0, 'parent section text', 19, 'uid-parent', 'parent', 0, 40)",
+            params![doc],
+        )
+        .unwrap();
+        let parent_id = conn.last_insert_rowid();
+
+        // Two leaves linked to the parent, each embedded + FTS-indexed on its own rowid.
+        for (ord, uid, text, seed) in [
+            (1i64, "uid-leaf-a", "alpha leaf about cats", "0.10"),
+            (2i64, "uid-leaf-b", "beta leaf about cats", "0.20"),
+        ] {
+            conn.execute(
+                "INSERT INTO chunks(document_id, ordinal, content, char_count, uid, parent_id, kind, start_offset, end_offset) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'leaf', 0, 20)",
+                params![doc, ord, text, text.len() as i64, uid, parent_id],
+            )
+            .unwrap();
+            let leaf_id = conn.last_insert_rowid();
+            let emb = format!("[{}]", vec![seed; 384].join(", "));
+            conn.execute(
+                "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+                params![leaf_id, emb],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, content) VALUES (?1, ?2)",
+                params![leaf_id, text],
+            )
+            .unwrap();
+        }
+
+        // New columns round-trip, and the parent/child linkage resolves.
+        let (kind, uid): (String, String) = conn
+            .query_row(
+                "SELECT kind, uid FROM chunks WHERE id = ?1",
+                params![parent_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), uid.as_str()), ("parent", "uid-parent"));
+        let children: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE parent_id = ?1",
+                params![parent_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(children, 2);
+
+        // The invariant: a KNN over chunk_vec returns only leaves — never the parent (which has
+        // no vector row), so a structural parent being a gap in chunk_vec is safe.
+        let query = format!("[{}]", vec!["0.10"; 384].join(", "));
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid FROM chunk_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT 10",
+            )
+            .unwrap();
+        let hits: Vec<i64> = stmt
+            .query_map(params![query], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(hits.len(), 2, "only the two leaves are in the vector index");
+        assert!(
+            !hits.contains(&parent_id),
+            "KNN must never return a structural parent"
+        );
     }
 }

@@ -198,6 +198,27 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE model_pricing ADD COLUMN input_modalities     TEXT;
     ALTER TABLE model_pricing ADD COLUMN intelligence_index   REAL;
     "#,
+    // v9: the retrieval-foundation chunk schema (spec §21.4, PR 1). The structure-aware
+    // splitter records, per chunk: a STABLE `uid` (deterministic from the document hash +
+    // structural position, so a rebuild reproduces identical ids — the retrofit-painful part
+    // for a future graph / Stage-5 sync), a `parent_id` linking a leaf to the structural
+    // parent that spans its section, source byte offsets (`start_offset`/`end_offset`, for
+    // navigable citations), a `kind` ('leaf' | 'parent'), and a free-form `meta` JSON for
+    // chunk-level facts not on the document. Parent rows are STRUCTURAL-ONLY: they live in
+    // `chunks` but are never inserted into `chunk_vec`/`chunks_fts`, so the "rowid mirrors
+    // chunks.id" invariant holds (KNN/FTS only ever see leaf rowids; parent ids are simply
+    // gaps). All additive/nullable — older rows take the defaults and keep working until the
+    // next Rebuild (prompted by the retrieval-config stamp) repopulates them (rule #3).
+    r#"
+    ALTER TABLE chunks ADD COLUMN uid          TEXT;
+    ALTER TABLE chunks ADD COLUMN parent_id    INTEGER REFERENCES chunks(id) ON DELETE CASCADE;
+    ALTER TABLE chunks ADD COLUMN start_offset INTEGER;
+    ALTER TABLE chunks ADD COLUMN end_offset   INTEGER;
+    ALTER TABLE chunks ADD COLUMN kind         TEXT NOT NULL DEFAULT 'leaf';
+    ALTER TABLE chunks ADD COLUMN meta         TEXT;
+    CREATE INDEX idx_chunks_uid    ON chunks(document_id, uid);
+    CREATE INDEX idx_chunks_parent ON chunks(parent_id);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

@@ -4,7 +4,14 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { ensureSidecar, ingestPaths, listDocuments, rebuildIndex, sidecarStatus } from "../lib/ipc";
+import {
+  ensureSidecar,
+  ingestPaths,
+  listDocuments,
+  rebuildIndex,
+  sidecarStatus,
+  vaultStatus,
+} from "../lib/ipc";
 import type { Document, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
@@ -39,6 +46,7 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmRebuild, setConfirmRebuild] = useState(false);
+  const [rebuildNeeded, setRebuildNeeded] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
   const { showPower } = useDepth();
 
@@ -93,6 +101,10 @@ export function DocumentsView({ onReviewClick }: Props) {
   async function refresh() {
     try {
       setDocuments(await listDocuments());
+      // A retrieval-config change (new chunking/splitter/model) flags a one-time Rebuild;
+      // re-reading here also clears the banner once a rebuild has brought the index in line.
+      const vs = await vaultStatus().catch(() => null);
+      setRebuildNeeded(vs?.retrieval_rebuild_needed ?? false);
     } catch (e) {
       setError(String(e));
     }
@@ -256,6 +268,23 @@ export function DocumentsView({ onReviewClick }: Props) {
               </span>
               <span aria-hidden>→</span>
             </button>
+          )}
+          {rebuildNeeded && !busy && status?.state !== "error" && (
+            <Banner tone="info">
+              <div className="flex items-center justify-between gap-3">
+                <span>
+                  PM's chunking improved in this update. Rebuild the search index once to get the
+                  benefit — your documents aren't changed, they're just re-indexed.
+                </span>
+                <button
+                  onClick={() => setConfirmRebuild(true)}
+                  className="shrink-0 underline"
+                  disabled={busy}
+                >
+                  Rebuild now
+                </button>
+              </div>
+            </Banner>
           )}
           {status?.state === "error" && (
             <Banner tone="warn">
