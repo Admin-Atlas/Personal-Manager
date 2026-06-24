@@ -130,8 +130,9 @@ npm run tauri build
 Shipping a real auto-updatable release is tag-driven and handled by CI: bump the
 version, push a `vX.Y.Z` tag (a pre-release suffix like `-alpha`/`-beta` is allowed),
 and the installers + update feed publish to this repo's releases. Add a matching
-[`src/lib/changelog.ts`](src/lib/changelog.ts) entry for every release. Full steps and
-one-time setup live in the release guide in the `docs/` folder.
+[`src/lib/changelog.ts`](src/lib/changelog.ts) entry for every release. Full steps,
+the lockstep version files, and the one-time setup live in
+[`RELEASING.md`](RELEASING.md).
 
 **Code signing.** The auto-update feed is cryptographically signed, so updates are
 always verified. The **installers themselves are not yet OS code-signed**, so each may
@@ -177,6 +178,13 @@ Either way, you can export everything to plain Markdown whenever you like. The o
 outbound traffic is the model call (and an optional read-only calendar fetch). The repo
 holds code only — see [`SECURITY.md`](SECURITY.md) for the security policy and how to
 report an issue privately.
+
+## Contributing & releasing
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers the change workflow, the one-command check
+gate, and what to verify by hand; [`RELEASING.md`](RELEASING.md) is the release
+runbook; and [`AGENTS.md`](AGENTS.md) is the deep orientation for the codebase and its
+non-negotiable rules.
 
 ## License
 

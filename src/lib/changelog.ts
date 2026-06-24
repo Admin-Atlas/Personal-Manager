@@ -22,7 +22,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     version: "2.1.3-alpha",
     date: "2026-06-24",
     highlights: [
-      "Documentation refresh: the project's README is now up to date with everything PM does today and written to stay current as new features land. No change to the app or your data.",
+      "Documentation refresh: the README is now up to date with everything PM does today and written to stay current as features land, and the project ships public Contributing and Releasing guides covering how changes are reviewed, gated, and shipped. No change to the app or your data.",
     ],
   },
   {
