@@ -50,11 +50,6 @@ pub fn data_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Path to the encrypted SQLite database.
-pub fn db_path(app: &AppHandle) -> Result<PathBuf> {
-    Ok(data_dir(app)?.join("pm.sqlite"))
-}
-
 /// The Markdown vault — the source of truth (spec §3). Every ingested document
 /// is written here and the SQLite index is rebuildable from it.
 pub fn vault_dir(app: &AppHandle) -> Result<PathBuf> {

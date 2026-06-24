@@ -16,17 +16,21 @@
 #![allow(dead_code)]
 
 pub mod kdf;
+pub mod pointer;
 pub mod verifier;
 
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+use crate::paths;
 use crate::secret::Secret;
 use kdf::{KdfParams, KEY_LEN};
+use pointer::VaultPointer;
 use verifier::Verifier;
 
 /// Filename of the per-vault, non-secret metadata, stored inside the vault folder.
@@ -145,14 +149,14 @@ impl VaultMeta {
 }
 
 /// Path to a vault's metadata file inside its folder.
-pub fn meta_path(vault_dir: &Path) -> PathBuf {
-    vault_dir.join(META_FILENAME)
+pub fn meta_path(vault_root: &Path) -> PathBuf {
+    vault_root.join(META_FILENAME)
 }
 
 /// Read `vault-meta.json` if present. `None` means no metadata yet (a brand-new
 /// vault folder); shipping before any user data exists, that's the only no-meta case.
-pub fn load_meta(vault_dir: &Path) -> Result<Option<VaultMeta>> {
-    let path = meta_path(vault_dir);
+pub fn load_meta(vault_root: &Path) -> Result<Option<VaultMeta>> {
+    let path = meta_path(vault_root);
     match std::fs::read(&path) {
         Ok(bytes) => {
             let meta: VaultMeta = serde_json::from_slice(&bytes)
@@ -166,9 +170,9 @@ pub fn load_meta(vault_dir: &Path) -> Result<Option<VaultMeta>> {
 
 /// Write `vault-meta.json` atomically (temp file in the same dir, then rename), so a
 /// crash mid-write can never leave a half-written metadata file.
-pub fn store_meta(vault_dir: &Path, meta: &VaultMeta) -> Result<()> {
-    std::fs::create_dir_all(vault_dir)?;
-    let path = meta_path(vault_dir);
+pub fn store_meta(vault_root: &Path, meta: &VaultMeta) -> Result<()> {
+    std::fs::create_dir_all(vault_root)?;
+    let path = meta_path(vault_root);
     let json = serde_json::to_vec_pretty(meta)
         .map_err(|e| Error::Other(format!("could not encode {META_FILENAME}: {e}")))?;
     let tmp = path.with_extension("json.tmp");
@@ -180,13 +184,52 @@ pub fn store_meta(vault_dir: &Path, meta: &VaultMeta) -> Result<()> {
 /// Ensure a vault folder has metadata, creating device-mode metadata on first run.
 /// Idempotent: returns the existing meta untouched if present. This is what makes
 /// every vault — even the zero-friction default — uniform from creation (spec §6).
-pub fn ensure_device_meta(vault_dir: &Path) -> Result<VaultMeta> {
-    if let Some(meta) = load_meta(vault_dir)? {
+pub fn ensure_device_meta(vault_root: &Path) -> Result<VaultMeta> {
+    if let Some(meta) = load_meta(vault_root)? {
         return Ok(meta);
     }
     let meta = VaultMeta::new_device();
-    store_meta(vault_dir, &meta)?;
+    store_meta(vault_root, &meta)?;
     Ok(meta)
+}
+
+/// The resolved on-disk locations of a vault, after consulting the per-profile
+/// pointer. For the default (no pointer) these are exactly today's paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedVault {
+    /// The portable folder holding pm.sqlite + vault-meta.json + the Markdown.
+    pub vault_root: PathBuf,
+    /// The encrypted SQLite database.
+    pub db_path: PathBuf,
+    /// The Markdown vault (source of truth) — a subfolder of the root.
+    pub markdown_dir: PathBuf,
+}
+
+/// Pure layout rule: where the DB, metadata, and Markdown sit given a profile data
+/// dir and an optional pointer. Side-effect-free so it can be unit-tested.
+pub fn resolve_layout(data_dir: &Path, pointer: Option<&VaultPointer>) -> ResolvedVault {
+    let vault_root = pointer
+        .map(|p| p.vault_root.clone())
+        .unwrap_or_else(|| data_dir.to_path_buf());
+    let db_path = vault_root.join("pm.sqlite");
+    let markdown_dir = vault_root.join("vault");
+    ResolvedVault {
+        vault_root,
+        db_path,
+        markdown_dir,
+    }
+}
+
+/// Resolve (and create) this profile's vault locations: read the pointer, fall back
+/// to the default data dir, and ensure the root + Markdown folders exist. The vault
+/// metadata lives at `vault_root/vault-meta.json` (next to the DB).
+pub fn resolve(app: &AppHandle) -> Result<ResolvedVault> {
+    let data_dir = paths::data_dir(app)?;
+    let pointer = pointer::load(&data_dir)?;
+    let resolved = resolve_layout(&data_dir, pointer.as_ref());
+    std::fs::create_dir_all(&resolved.vault_root)?;
+    std::fs::create_dir_all(&resolved.markdown_dir)?;
+    Ok(resolved)
 }
 
 /// The 64-char lowercase-hex form of a master key, ready for `db::open`'s
@@ -367,5 +410,24 @@ mod tests {
         let salt = [7u8; kdf::SALT_LEN];
         let k = kdf::derive_master("x", &salt, &params).unwrap();
         assert_eq!(k.len(), 32);
+    }
+
+    #[test]
+    fn layout_defaults_to_the_data_dir_when_no_pointer() {
+        let data = std::path::Path::new("/profile/data");
+        let r = resolve_layout(data, None);
+        assert_eq!(r.vault_root, data.to_path_buf());
+        assert_eq!(r.db_path, data.join("pm.sqlite"));
+        assert_eq!(r.markdown_dir, data.join("vault"));
+    }
+
+    #[test]
+    fn layout_follows_the_pointer_when_present() {
+        let shared = std::path::PathBuf::from("/shared/pm-vault");
+        let ptr = pointer::VaultPointer::new(shared.clone());
+        let r = resolve_layout(std::path::Path::new("/profile/data"), Some(&ptr));
+        assert_eq!(r.vault_root, shared);
+        assert_eq!(r.db_path, shared.join("pm.sqlite"));
+        assert_eq!(r.markdown_dir, shared.join("vault"));
     }
 }
