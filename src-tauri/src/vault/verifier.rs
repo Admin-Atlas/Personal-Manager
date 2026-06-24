@@ -36,8 +36,7 @@ fn compute(master: &[u8; 32], salt: &[u8]) -> blake3::Hash {
 
 /// Build a verifier from the master key (at vault creation / passphrase change).
 pub fn build(master: &[u8; 32]) -> Result<Verifier> {
-    let mut salt = [0u8; SALT_LEN];
-    getrandom::fill(&mut salt).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
+    let salt: [u8; SALT_LEN] = super::random_array()?;
     let mac = compute(master, &salt);
     Ok(Verifier {
         alg: "blake3-keyed".to_string(),

@@ -55,6 +55,16 @@ const MARKDOWN_SUBKEY_SCHEME: &str = "blake3-derive-key";
 /// 250–500 ms band; spec §2.2). Calibrated once at creation, then stored + reused.
 const CALIBRATE_TARGET_MS: u64 = 350;
 
+/// A fresh array of CSPRNG bytes (salts, etc.). Centralised so a zeroed
+/// initializer never flows into a KDF/MAC as the live salt: the buffer is
+/// overwritten by the OS RNG and handed back as a function result, so callers
+/// receive randomness rather than a hard-coded literal.
+pub(crate) fn random_array<const N: usize>() -> Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    getrandom::fill(&mut buf).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
+    Ok(buf)
+}
+
 /// How a vault's SQLCipher key is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -435,8 +445,7 @@ fn build_passphrase_meta(
     passphrase: &str,
     params: KdfParams,
 ) -> Result<(VaultMeta, Zeroizing<[u8; KEY_LEN]>)> {
-    let mut salt = [0u8; kdf::SALT_LEN];
-    getrandom::fill(&mut salt).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
+    let salt: [u8; kdf::SALT_LEN] = random_array()?;
     let master = kdf::derive_master(passphrase, &salt, &params)?;
     let verifier = verifier::build(&master)?;
     let meta = VaultMeta {
@@ -629,7 +638,7 @@ mod tests {
         let params = kdf::calibrate(1);
         assert_eq!(params.algorithm, "argon2id");
         assert_eq!(params.key_len, 32);
-        let salt = [7u8; kdf::SALT_LEN];
+        let salt: [u8; kdf::SALT_LEN] = super::random_array().unwrap();
         let k = kdf::derive_master("x", &salt, &params).unwrap();
         assert_eq!(k.len(), 32);
     }

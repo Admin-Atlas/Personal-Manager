@@ -32,7 +32,11 @@ const problems = [];
 // confidentiality or cleanliness — here we prove it actually held.
 const FORBIDDEN = [
   {
+    // The user's Markdown vault / data / runtime dirs must live outside the repo.
+    // `except` spares the Rust source module src-tauri/src/vault/ — that is feature
+    // CODE (the vault key model), not user data.
     re: /(^|\/)(data|runtime|vault)\//,
+    except: /^src-tauri\/src\/vault\//,
     why: "local user-data directory (must live outside the repo)",
   },
   { re: /\.sqlite($|-)/, why: "SQLite store / WAL (the user's encrypted data)" },
@@ -61,8 +65,10 @@ const FORBIDDEN = [
   { re: /(^|\/)settings\.local\.json$/, why: "per-developer Claude settings (stays local)" },
 ];
 for (const f of tracked) {
-  for (const { re, why } of FORBIDDEN) {
-    if (re.test(f)) problems.push(`tracked but must not be: ${f}  — ${why}`);
+  for (const { re, except, why } of FORBIDDEN) {
+    if (re.test(f) && !(except && except.test(f))) {
+      problems.push(`tracked but must not be: ${f}  — ${why}`);
+    }
   }
 }
 

@@ -144,7 +144,13 @@ pub fn calibrate(target_ms: u64) -> KdfParams {
 /// for params we construct) is reported as "very slow" so calibration moves on
 /// rather than panicking.
 fn measure_ms(params: &KdfParams) -> u64 {
-    let salt = [0u8; SALT_LEN];
+    // Salt content is irrelevant to Argon2 timing; draw it from the CSPRNG anyway so
+    // no constant salt ever appears on a derivation path. An RNG failure is reported
+    // as "very slow" so calibration moves on rather than panicking.
+    let salt: [u8; SALT_LEN] = match super::random_array() {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
     let start = Instant::now();
     match derive_master("calibration-probe", &salt, params) {
         Ok(_) => start.elapsed().as_millis() as u64,
