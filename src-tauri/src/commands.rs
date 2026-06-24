@@ -20,7 +20,7 @@ use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
     applock, briefing, clock, cost, db, learning, openrouter, paths, recommend, secrets, vault,
-    AppState,
+    AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -331,6 +331,21 @@ pub async fn unlock_app(state: State<'_, AppState>, window: tauri::WebviewWindow
 
 // --- vault (shareable / portable) ---
 
+/// Build the session's Markdown runtime for a freshly opened vault: the resolved
+/// Markdown dir plus the policy-aware cipher (derived from the master that the DB key
+/// hex carries). Shared by unlock and open-existing so both install an identical runtime.
+fn vault_runtime_for(
+    resolved: &vault::ResolvedVault,
+    meta: &vault::VaultMeta,
+    key_hex: &str,
+) -> Result<VaultRuntime> {
+    let master = vault::master_from_db_key_hex(key_hex)?;
+    Ok(VaultRuntime {
+        markdown_dir: resolved.markdown_dir.clone(),
+        cipher: vault::MarkdownCipher::from_meta(meta, &master),
+    })
+}
+
 /// What the frontend needs to decide whether to show the unlock screen and how to
 /// label the vault. Non-secret: mode, whether the store is currently locked, whether
 /// Markdown is encrypted at rest, the vault location, and the stable vault id.
@@ -404,7 +419,8 @@ pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: Stri
         .ok_or_else(|| Error::Other("this vault has no metadata to unlock".into()))?;
     let (conn, key) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
     secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
-    state.set_conn(conn)?;
+    let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
+    state.open_session(conn, runtime)?;
     Ok(())
 }
 
@@ -426,7 +442,7 @@ pub fn open_existing_vault(
         markdown_dir: root.join("vault"),
         vault_root: root.clone(),
     };
-    let conn = match meta.key_mode {
+    let (conn, runtime) = match meta.key_mode {
         vault::KeyMode::Device => {
             return Err(Error::Other(
                 "that vault is device-only and tied to the profile that created it; \
@@ -440,13 +456,14 @@ pub fn open_existing_vault(
             })?;
             let (conn, key) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
             secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
-            conn
+            let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
+            (conn, runtime)
         }
     };
     // Point this profile here so the next launch opens it directly.
     let data_dir = paths::data_dir(&app)?;
     vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
-    state.set_conn(conn)?;
+    state.open_session(conn, runtime)?;
     Ok(())
 }
 
@@ -1002,10 +1019,10 @@ pub async fn propose_metadata(
 /// the document reviewed. Blocking (file rewrites), so it runs off the runtime.
 #[tauri::command]
 pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Result<()> {
-    let vault = paths::vault_dir(&app)?;
     let blocking_app = app.clone();
     let logged = tokio::task::spawn_blocking(move || -> Result<usize> {
         let state = blocking_app.state::<AppState>();
+        let (vault, cipher) = state.markdown_io()?;
         let now = iso_now(&state)?;
 
         // The whole pass is all-or-nothing: corrections, vault rewrites, and the
@@ -1015,7 +1032,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         // on retry, their corrections never re-logged) and mid-batch vault/DB drift.
         let mut conn = state.conn()?;
         let tx = conn.transaction()?;
-        let mut written: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
         let result: Result<usize> = (|| {
             let mut logged = 0usize;
@@ -1032,6 +1049,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                 let w = ingest::rewrite_vault_metadata(
                     &tx,
                     &vault,
+                    &cipher,
                     d.document_id,
                     &d.project,
                     &d.tags,
@@ -1083,17 +1101,17 @@ pub async fn set_document_metadata(
     tags: Vec<String>,
     importance: Option<String>,
 ) -> Result<Document> {
-    let vault = paths::vault_dir(&app)?;
     let importance = review::normalize_importance(importance);
     tokio::task::spawn_blocking(move || -> Result<Document> {
         let state = app.state::<AppState>();
+        let (vault, cipher) = state.markdown_io()?;
         let now = iso_now(&state)?;
 
         // Log the correction + rewrite the vault file + update the row atomically,
         // restoring the vault file if the DB side fails (the file write lands first).
         let mut conn = state.conn()?;
         let tx = conn.transaction()?;
-        let mut written: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
         let work = (|| -> Result<()> {
             let (cur_project, cur_tags_json, cur_importance, title): (
@@ -1119,6 +1137,7 @@ pub async fn set_document_metadata(
             written.push(ingest::rewrite_vault_metadata(
                 &tx,
                 &vault,
+                &cipher,
                 document_id,
                 &project,
                 &tags,

@@ -50,14 +50,6 @@ pub fn data_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The Markdown vault — the source of truth (spec §3). Every ingested document
-/// is written here and the SQLite index is rebuildable from it.
-pub fn vault_dir(app: &AppHandle) -> Result<PathBuf> {
-    let dir = data_dir(app)?.join("vault");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 /// Where the managed Python venv lives. Regenerable, kept out of the vault so
 /// it never gets confused with user data.
 pub fn venv_dir(app: &AppHandle) -> Result<PathBuf> {

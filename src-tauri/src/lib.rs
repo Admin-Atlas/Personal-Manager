@@ -34,6 +34,17 @@ use tauri::Manager;
 
 use sidecar::{SidecarManager, SidecarPaths};
 
+/// The active vault's runtime context, set whenever the store opens (boot, unlock,
+/// open-existing, make-shareable). Holds where the Markdown lives and the policy-aware
+/// cipher used to read/write it, so ingest never has to re-resolve paths or re-derive
+/// keys. `None` exactly when `db` is `None` (the vault is locked).
+pub struct VaultRuntime {
+    /// The Markdown vault folder (source of truth) for the active vault.
+    pub markdown_dir: PathBuf,
+    /// Policy-aware reader/writer for this vault's Markdown files.
+    pub cipher: vault::MarkdownCipher,
+}
+
 /// Shared app state. The SQLite connection is guarded by a mutex; commands lock
 /// it only for short synchronous work, never across an `.await`. The sidecar
 /// manages its own interior locking.
@@ -42,6 +53,10 @@ pub struct AppState {
     /// vault on a profile that hasn't unlocked it yet. Reach it via [`AppState::conn`],
     /// never by locking the mutex directly, so the locked case is handled uniformly.
     pub db: Mutex<Option<Connection>>,
+    /// The active vault's Markdown dir + cipher, kept in lockstep with `db`: set
+    /// together when the store opens, both `None` while locked. Reach it via
+    /// [`AppState::markdown_io`].
+    pub vault: Mutex<Option<VaultRuntime>>,
     pub sidecar: SidecarManager,
     /// Whether the optional app-lock has been satisfied this process. Starts false;
     /// `unlock_app` sets it on a successful OS verification. A soft UI gate only — the
@@ -86,14 +101,46 @@ impl AppState {
         Ok(DbGuard(guard))
     }
 
-    /// Install the connection after an unlock / open-existing succeeds.
-    pub fn set_conn(&self, conn: Connection) -> error::Result<()> {
-        let mut guard = self
+    /// Open the session after an unlock / open-existing succeeds: install the
+    /// connection and its Markdown runtime together, so `db` and `vault` never drift.
+    pub fn open_session(&self, conn: Connection, runtime: VaultRuntime) -> error::Result<()> {
+        let mut db = self
             .db
             .lock()
             .map_err(|_| error::Error::Other("database lock poisoned".into()))?;
-        *guard = Some(conn);
+        let mut vault = self
+            .vault
+            .lock()
+            .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
+        *db = Some(conn);
+        *vault = Some(runtime);
         Ok(())
+    }
+
+    /// Replace the active vault's Markdown runtime in place (the connection stays open).
+    /// Used when a transition changes the Markdown policy — e.g. making a vault
+    /// shareable flips encryption on without reopening the store.
+    pub fn set_vault_runtime(&self, runtime: VaultRuntime) -> error::Result<()> {
+        let mut guard = self
+            .vault
+            .lock()
+            .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
+        *guard = Some(runtime);
+        Ok(())
+    }
+
+    /// Snapshot the active vault's Markdown dir + cipher, or a friendly error if the
+    /// vault is locked. Cloned so the caller can do file IO without holding the lock —
+    /// the single way ingest reaches the Markdown layer.
+    pub fn markdown_io(&self) -> error::Result<(PathBuf, vault::MarkdownCipher)> {
+        let guard = self
+            .vault
+            .lock()
+            .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
+        match guard.as_ref() {
+            Some(rt) => Ok((rt.markdown_dir.clone(), rt.cipher.clone())),
+            None => Err(error::Error::Other("the vault is locked".into())),
+        }
     }
 
     /// Whether the store is currently open (the vault is unlocked this session).
@@ -128,7 +175,19 @@ pub fn run() {
             // vault opens only if this profile cached its key, otherwise the store stays
             // locked (None) and the UI prompts to unlock before any DB command runs.
             let meta = vault::ensure_device_meta(&resolved.vault_root)?;
-            let conn = vault::open_at_boot(&resolved, &meta)?;
+            // On a successful open we also get the Markdown cipher; pair it with the
+            // resolved Markdown dir as the session's vault runtime. A locked
+            // (passphrase, uncached) vault leaves both `None` until an unlock command.
+            let (conn, vault_runtime) = match vault::open_at_boot(&resolved, &meta)? {
+                Some((conn, cipher)) => (
+                    Some(conn),
+                    Some(VaultRuntime {
+                        markdown_dir: resolved.markdown_dir.clone(),
+                        cipher,
+                    }),
+                ),
+                None => (None, None),
+            };
 
             // The sidecar source folder is optional at boot — chat works without
             // it; ingestion surfaces a clear error if it (or Python) is missing.
@@ -142,6 +201,7 @@ pub fn run() {
 
             app.manage(AppState {
                 db: Mutex::new(conn),
+                vault: Mutex::new(vault_runtime),
                 sidecar,
                 app_unlocked: AtomicBool::new(false),
             });

@@ -279,6 +279,139 @@ pub fn markdown_subkey(master: &[u8; KEY_LEN]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(blake3::derive_key(MARKDOWN_SUBKEY_CONTEXT, master))
 }
 
+/// The at-rest filename suffix for an encrypted Markdown file. Plaintext files keep the
+/// bare `.md`; encrypted ones gain `.pmenc`, so a shared folder visibly shows which
+/// files are ciphertext (and editors won't try to render the binary as Markdown).
+pub const ENCRYPTED_SUFFIX: &str = ".pmenc";
+
+/// Policy-aware Markdown reader/writer for the active vault. Bundles the vault id (the
+/// AAD binding), the at-rest encryption policy, and — when encryption is on — the
+/// Markdown subkey (a BLAKE3 subkey of the master, never the DB key). One is built
+/// whenever the store opens and kept in `AppState`, so every ingest and metadata
+/// rewrite encrypts/decrypts the same way. Cloneable (the key clone is zeroized on
+/// drop) so a command can snapshot it and do file IO without holding a lock.
+#[derive(Clone)]
+pub struct MarkdownCipher {
+    vault_id: String,
+    encryption: MarkdownEncryption,
+    /// Present iff `encryption` is on; absent for plaintext (device) vaults.
+    subkey: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl MarkdownCipher {
+    /// A plaintext cipher (no encryption) — the device-vault default.
+    pub fn plaintext(vault_id: &str) -> Self {
+        Self {
+            vault_id: vault_id.to_string(),
+            encryption: MarkdownEncryption::None,
+            subkey: None,
+        }
+    }
+
+    /// Build the cipher for a vault from its metadata + the resolved master key. The
+    /// Markdown subkey is derived only when the policy calls for encryption, so a
+    /// device vault never holds a Markdown key it won't use.
+    pub fn from_meta(meta: &VaultMeta, master: &[u8; KEY_LEN]) -> Self {
+        let subkey = match meta.markdown.encryption {
+            MarkdownEncryption::None => None,
+            MarkdownEncryption::XChaCha20Poly1305 => Some(markdown_subkey(master)),
+        };
+        Self {
+            vault_id: meta.vault_id.clone(),
+            encryption: meta.markdown.encryption,
+            subkey,
+        }
+    }
+
+    /// Whether this vault encrypts Markdown at rest.
+    pub fn encryption_on(&self) -> bool {
+        self.encryption != MarkdownEncryption::None
+    }
+
+    /// The on-disk filename for a logical `<name>.md`: bare under plaintext,
+    /// `<name>.md.pmenc` under encryption.
+    pub fn on_disk_name(&self, logical_md_name: &str) -> String {
+        if self.encryption_on() {
+            format!("{logical_md_name}{ENCRYPTED_SUFFIX}")
+        } else {
+            logical_md_name.to_string()
+        }
+    }
+
+    /// The logical `<name>.md` for an on-disk filename (drops a trailing `.pmenc`).
+    pub fn logical_name(on_disk_name: &str) -> String {
+        on_disk_name
+            .strip_suffix(ENCRYPTED_SUFFIX)
+            .unwrap_or(on_disk_name)
+            .to_string()
+    }
+
+    /// AAD stem binding a ciphertext to its logical file: the on-disk name without the
+    /// `.pmenc` suffix, so encrypt and decrypt of the same file always agree while a
+    /// file copied to another name or vault fails authentication.
+    fn aad_stem(path: &Path) -> String {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Self::logical_name(&name)
+    }
+
+    /// Decode on-disk bytes to Markdown text, by magic: an encrypted container is
+    /// decrypted (requires the subkey); anything else is treated as plaintext UTF-8.
+    /// This is what tolerates a folder mid-migration (some plaintext, some ciphertext).
+    pub fn decode(&self, bytes: &[u8], path: &Path) -> Result<String> {
+        if crypto::is_encrypted(bytes) {
+            let key = self.subkey.as_ref().ok_or_else(|| {
+                Error::Other("this vault file is encrypted but no Markdown key is loaded".into())
+            })?;
+            let plain = crypto::decrypt(bytes, key, &self.vault_id, &Self::aad_stem(path))?;
+            String::from_utf8(plain)
+                .map_err(|_| Error::Other("decrypted Markdown was not valid UTF-8".into()))
+        } else {
+            String::from_utf8(bytes.to_vec())
+                .map_err(|_| Error::Other("Markdown file was not valid UTF-8".into()))
+        }
+    }
+
+    /// Read + decode a Markdown file from disk (see [`decode`](Self::decode)).
+    pub fn read(&self, path: &Path) -> Result<String> {
+        let bytes = std::fs::read(path)?;
+        self.decode(&bytes, path)
+    }
+
+    /// The raw on-disk bytes, undecoded — used to snapshot a file for rollback so a
+    /// restore writes back exactly what was there (ciphertext stays ciphertext).
+    pub fn read_raw(&self, path: &Path) -> Result<Vec<u8>> {
+        Ok(std::fs::read(path)?)
+    }
+
+    /// Encode Markdown text for writing to `path`, by policy: encrypted into a container
+    /// (AAD-bound to the path's logical name) when encryption is on, else bytes as-is.
+    pub fn encode_for(&self, path: &Path, content: &str) -> Result<Vec<u8>> {
+        if self.encryption_on() {
+            let key = self.subkey.as_ref().ok_or_else(|| {
+                Error::Other("Markdown encryption is on but no key is loaded".into())
+            })?;
+            crypto::encrypt(
+                content.as_bytes(),
+                key,
+                &self.vault_id,
+                &Self::aad_stem(path),
+            )
+        } else {
+            Ok(content.as_bytes().to_vec())
+        }
+    }
+
+    /// Encode + write a Markdown file to `path` per policy.
+    pub fn write_to(&self, path: &Path, content: &str) -> Result<()> {
+        let bytes = self.encode_for(path, content)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
 /// Build the metadata + master for a NEW shareable vault using already-chosen cost
 /// params (the calibration is split out so tests can pass cheap params).
 fn build_passphrase_meta(
@@ -357,18 +490,23 @@ pub fn open_with_passphrase(
 /// Decide how to open a vault at boot from its metadata. Device vaults open with the
 /// keychain key (today's path). Passphrase vaults open only if this profile has the
 /// derived key cached; otherwise return `None` so the store stays locked and the UI
-/// prompts for the passphrase.
-pub fn open_at_boot(resolved: &ResolvedVault, meta: &VaultMeta) -> Result<Option<Connection>> {
-    match meta.key_mode {
-        KeyMode::Device => {
-            let key = secrets::get_or_create_db_key()?;
-            Ok(Some(db::open(&resolved.db_path, key.expose())?))
-        }
+/// prompts for the passphrase. On success also returns the policy-aware Markdown
+/// cipher, so the caller can serve the active session's ingest/rewrite IO.
+pub fn open_at_boot(
+    resolved: &ResolvedVault,
+    meta: &VaultMeta,
+) -> Result<Option<(Connection, MarkdownCipher)>> {
+    let key = match meta.key_mode {
+        KeyMode::Device => secrets::get_or_create_db_key()?,
         KeyMode::Passphrase => match secrets::get_cached_vault_key(&meta.vault_id)? {
-            Some(cached) => Ok(Some(db::open(&resolved.db_path, cached.expose())?)),
-            None => Ok(None),
+            Some(cached) => cached,
+            None => return Ok(None),
         },
-    }
+    };
+    let conn = db::open(&resolved.db_path, key.expose())?;
+    let master = master_from_db_key_hex(key.expose())?;
+    let cipher = MarkdownCipher::from_meta(meta, &master);
+    Ok(Some((conn, cipher)))
 }
 
 #[cfg(test)]
@@ -510,5 +648,75 @@ mod tests {
         drop(conn);
         // The wrong passphrase fails at the verifier, before SQLCipher.
         assert!(open_with_passphrase(&resolved, &meta, "wrong").is_err());
+    }
+
+    /// An encrypted cipher with a fixed subkey (no KDF needed for the file-IO tests).
+    fn enc_cipher() -> MarkdownCipher {
+        MarkdownCipher {
+            vault_id: "vault-1".to_string(),
+            encryption: MarkdownEncryption::XChaCha20Poly1305,
+            subkey: Some(Zeroizing::new([3u8; 32])),
+        }
+    }
+
+    #[test]
+    fn cipher_from_meta_derives_key_only_when_encryption_on() {
+        let (mut meta, master) = build_passphrase_meta("pw", cheap_params()).unwrap();
+        meta.markdown.encryption = MarkdownEncryption::None;
+        let off = MarkdownCipher::from_meta(&meta, &master);
+        assert!(!off.encryption_on() && off.subkey.is_none());
+        meta.markdown.encryption = MarkdownEncryption::XChaCha20Poly1305;
+        let on = MarkdownCipher::from_meta(&meta, &master);
+        assert!(on.encryption_on() && on.subkey.is_some());
+    }
+
+    #[test]
+    fn encrypted_cipher_round_trips_and_writes_ciphertext_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = enc_cipher();
+        assert!(c.encryption_on());
+        assert_eq!(c.on_disk_name("note-abc.md"), "note-abc.md.pmenc");
+
+        let path = dir.path().join(c.on_disk_name("note-abc.md"));
+        c.write_to(&path, "# Secret\nbody text").unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            crypto::is_encrypted(&raw),
+            "on-disk file must be a container"
+        );
+        assert!(
+            !raw.windows(6).any(|w| w == b"Secret"),
+            "plaintext must not be present on disk"
+        );
+        assert_eq!(c.read(&path).unwrap(), "# Secret\nbody text");
+        assert_eq!(
+            MarkdownCipher::logical_name("note-abc.md.pmenc"),
+            "note-abc.md"
+        );
+    }
+
+    #[test]
+    fn plaintext_cipher_writes_and_reads_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = MarkdownCipher::plaintext("vault-1");
+        assert!(!c.encryption_on());
+        assert_eq!(c.on_disk_name("note.md"), "note.md");
+
+        let path = dir.path().join("note.md");
+        c.write_to(&path, "plain body").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "plain body");
+        assert_eq!(c.read(&path).unwrap(), "plain body");
+    }
+
+    #[test]
+    fn encrypted_cipher_still_reads_a_leftover_plaintext_file() {
+        // Mixed folder mid-migration: an encrypted-policy cipher must still read a
+        // plaintext file that hasn't been converted yet (read-by-magic).
+        let dir = tempfile::tempdir().unwrap();
+        let c = enc_cipher();
+        let path = dir.path().join("legacy.md");
+        std::fs::write(&path, "still plaintext").unwrap();
+        assert_eq!(c.read(&path).unwrap(), "still plaintext");
     }
 }
