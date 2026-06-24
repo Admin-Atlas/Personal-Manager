@@ -1,19 +1,21 @@
 PM desktop release.
 
-## What's new in 2.0.1-alpha
+## What's new in 2.1.0-alpha
 
-The **first public release** of PM — a private, local-first personal manager for
-your documents, your focus, and the moving parts of your day, in one calm place.
+**Shared & portable vaults.** PM can now protect your vault with a passphrase you
+choose, instead of tying it to a single Windows account — so the same vault can be
+opened from another profile on the machine.
 
-- **Yours, on your machine.** Everything stays local; your encrypted store stays
-  encrypted, and PM never sends your data anywhere on its own.
-- **A workspace that fits you.** A polished, fully themeable interface — light and
-  dark, accent colours, and depth — with documents, a Focus briefing, usage
-  tracking, model suggestions, and a Pinboard.
-- **Optional app lock.** Keep a quick glance from opening your things (Windows
-  Hello).
-- **Self-contained on Windows.** Nothing extra to install, and from here on PM
-  quietly keeps itself up to date.
+- **Portable, never locked in.** A passphrase vault keeps its Markdown encrypted at
+  rest, and you can export everything to plain Markdown anytime with your passphrase —
+  encryption protects your notes, it doesn't lock you in.
+- **Safe to share.** Only one profile writes at a time: if PM is open elsewhere, you
+  get a calm "Continue here?" hand-off rather than two copies racing over your data.
+- **Manage it in Settings → Vault.** Make a vault shareable or private again, change
+  the passphrase, move it to a shared folder, link another account, or export to
+  plaintext — each runs through one crash-safe migration.
+- **Zero-friction by default.** Don't opt in and nothing changes: your vault stays
+  private to this device, with its key in the OS keychain.
 
 > This is an **alpha**: expect rough edges, and please report anything that bites.
 

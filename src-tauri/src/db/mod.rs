@@ -122,6 +122,20 @@ pub fn open(path: &Path, key: &str) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Re-key the open store in place (SQLCipher `PRAGMA rekey`). The same connection
+/// stays usable with the new key afterward. Used by the vault mode transitions
+/// (device <-> passphrase). Validates the key shape exactly like [`open`].
+pub fn rekey(conn: &Connection, new_key: &str) -> Result<()> {
+    if new_key.len() != 64 || !new_key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Other("invalid database key format".into()));
+    }
+    // Same `x'…'` raw-key form + Zeroizing buffer as `open`, so the heap copy carrying
+    // the new key is wiped right after SQLCipher re-encrypts the database with it.
+    let pragma = zeroize::Zeroizing::new(format!("PRAGMA rekey = \"x'{new_key}'\";"));
+    conn.execute_batch(&pragma)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +290,31 @@ mod tests {
             let wrong = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
             assert!(open(&path, wrong).is_err(), "wrong key must not decrypt");
         }
+    }
+
+    #[test]
+    fn rekey_swaps_the_key_and_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rekey.sqlite");
+        let new_key = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+        {
+            let conn = open(&path, KEY).unwrap();
+            conn.execute("INSERT INTO conversations(title) VALUES ('keep me')", [])
+                .unwrap();
+        }
+        {
+            let conn = open(&path, KEY).unwrap();
+            rekey(&conn, new_key).unwrap();
+        }
+        // The old key no longer opens it; the new key does, with the row intact.
+        assert!(
+            open(&path, KEY).is_err(),
+            "old key must stop working after rekey"
+        );
+        let conn = open(&path, new_key).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

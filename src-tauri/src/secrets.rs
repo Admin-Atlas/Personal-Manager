@@ -147,3 +147,31 @@ pub fn get_or_create_db_key() -> Result<Secret> {
         None => Ok(Secret::from(key)),
     }
 }
+
+// --- Per-profile cache of a shareable vault's derived key (spec §2.2) ---
+//
+// A shareable vault's key is derived from the passphrase, but after the first
+// successful unlock in a profile we cache it in THAT profile's own keychain so the
+// passphrase is needed only the first time (or on a new device, or if the cache is
+// lost). Keyed by the vault's stable id — not its path, which can move — so two
+// profiles pointing at the same shared folder each cache independently, and no profile
+// ever reads another's keychain.
+
+fn vault_key_entry(vault_id: &str) -> String {
+    format!("vault_key::{vault_id}")
+}
+
+/// This profile's cached derived key for a shareable vault, if it has unlocked it before.
+pub fn get_cached_vault_key(vault_id: &str) -> Result<Option<Secret>> {
+    Ok(get(&vault_key_entry(vault_id))?.map(Secret::from))
+}
+
+/// Cache the derived key (64-hex) for a shareable vault in this profile's keychain.
+pub fn set_cached_vault_key(vault_id: &str, key_hex: &str) -> Result<()> {
+    set(&vault_key_entry(vault_id), key_hex)
+}
+
+/// Forget this profile's cached key for a vault ("forget passphrase on this device").
+pub fn clear_cached_vault_key(vault_id: &str) -> Result<()> {
+    delete(&vault_key_entry(vault_id))
+}

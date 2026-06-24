@@ -20,7 +20,8 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
 use crate::error::{Error, Result};
-use crate::{paths, AppState};
+use crate::vault::MarkdownCipher;
+use crate::AppState;
 
 /// Roughly one embedding's worth of text, with a little overlap so meaning that
 /// straddles a boundary is still retrievable.
@@ -101,7 +102,9 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
     });
     state.sidecar.ensure_installed()?;
 
-    let vault = paths::vault_dir(app)?;
+    // The vault's Markdown dir + cipher for this whole run (they don't change mid-run).
+    // Snapshotting up front means we never hold the vault lock across a sidecar call.
+    let (vault, cipher) = state.markdown_io()?;
     let files = collect_files(&inputs);
 
     let (mut ingested, mut skipped, mut failed) = (0usize, 0usize, 0usize);
@@ -112,7 +115,7 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
             name,
         });
 
-        match ingest_one(&state, &vault, &path) {
+        match ingest_one(&state, &vault, &cipher, &path) {
             Ok(Outcome::Indexed(document)) => {
                 ingested += 1;
                 let _ = on_event.send(IngestEvent::Done { document });
@@ -150,7 +153,12 @@ enum Outcome {
     Skipped(String),
 }
 
-fn ingest_one(state: &AppState, vault: &Path, path: &Path) -> Result<Outcome> {
+fn ingest_one(
+    state: &AppState,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    path: &Path,
+) -> Result<Outcome> {
     let ext = extension(path);
     match &ext {
         Some(e) if SUPPORTED.contains(&e.as_str()) => {}
@@ -173,7 +181,7 @@ fn ingest_one(state: &AppState, vault: &Path, path: &Path) -> Result<Outcome> {
 
     // Dedupe + format timestamps in one short lock; release before embedding.
     let (created_at, ingested_at) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let exists: bool = conn
             .query_row(
                 "SELECT 1 FROM documents WHERE content_hash = ?1",
@@ -196,8 +204,9 @@ fn ingest_one(state: &AppState, vault: &Path, path: &Path) -> Result<Outcome> {
 
     // Write the vault file (source of truth) before indexing. A freshly ingested
     // document enters the review queue: project Unsorted, no tags/importance,
-    // `reviewed = false`, and `last_activity` seeded from ingest time.
-    let vault_name = vault_filename(&title, &content_hash);
+    // `reviewed = false`, and `last_activity` seeded from ingest time. The on-disk
+    // name (and whether the bytes are ciphertext) follows the vault's policy.
+    let vault_name = cipher.on_disk_name(&vault_filename(&title, &content_hash));
     let front = Frontmatter {
         title: &title,
         source_path: &path.to_string_lossy(),
@@ -211,7 +220,10 @@ fn ingest_one(state: &AppState, vault: &Path, path: &Path) -> Result<Outcome> {
         last_activity: &ingested_at,
         reviewed: false,
     };
-    std::fs::write(vault.join(&vault_name), render_markdown(&front, &markdown))?;
+    cipher.write_to(
+        &vault.join(&vault_name),
+        &render_markdown(&front, &markdown),
+    )?;
 
     let meta = DocMeta {
         source_path: Some(path.to_string_lossy().into()),
@@ -243,7 +255,7 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     state.sidecar.ensure_installed()?;
 
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         // chunk_vec / chunks_fts cascade from chunks via our own inserts, so
         // clear them explicitly. documents → chunks cascades by FK.
         conn.execute_batch(
@@ -251,11 +263,13 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
         )?;
     }
 
-    let vault = paths::vault_dir(app)?;
+    let (vault, cipher) = state.markdown_io()?;
     let (mut ingested, mut failed) = (0usize, 0usize);
     for entry in std::fs::read_dir(&vault)? {
         let path = entry?.path();
-        if extension(&path).as_deref() != Some("md") {
+        // Accept both plaintext (`.md`) and encrypted (`.md.pmenc`) vault files; the
+        // cipher decides per file how to read them (read-by-magic).
+        if !is_vault_markdown(&path) {
             continue;
         }
         let name = file_name(&path);
@@ -263,7 +277,7 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
             path: path.to_string_lossy().into(),
             name,
         });
-        match rebuild_one(&state, &path) {
+        match rebuild_one(&state, &cipher, &path) {
             Ok(document) => {
                 ingested += 1;
                 let _ = on_event.send(IngestEvent::Done { document });
@@ -286,8 +300,8 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_one(state: &AppState, vault_file: &Path) -> Result<Document> {
-    let raw = std::fs::read_to_string(vault_file)?;
+fn rebuild_one(state: &AppState, cipher: &MarkdownCipher, vault_file: &Path) -> Result<Document> {
+    let raw = cipher.read(vault_file)?;
     let (fields, body) = parse_frontmatter(&raw)
         .ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
 
@@ -305,10 +319,13 @@ fn rebuild_one(state: &AppState, vault_file: &Path) -> Result<Document> {
     let embeddings = state.sidecar.embed(&texts)?;
     check_embeddings(&embeddings, chunks.len())?;
 
-    let ingested_at = fields
-        .get("ingested_at")
-        .cloned()
-        .unwrap_or_else(|| iso_now(&state.db.lock().unwrap()).unwrap_or_default());
+    let ingested_at = match fields.get("ingested_at").cloned() {
+        Some(value) => value,
+        None => {
+            let conn = state.conn()?;
+            iso_now(&conn).unwrap_or_default()
+        }
+    };
     // Organisation metadata round-trips from the vault so a rebuild reproduces
     // the organised store (spec §3 acceptance). Missing fields fall back to the
     // fresh-ingest defaults, so pre-Step-4 vault files rebuild cleanly.
@@ -349,7 +366,7 @@ fn index_document(
     chunks: &[Chunk],
     embeddings: &[Vec<f32>],
 ) -> Result<Document> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.conn()?;
     let tx = conn.transaction()?;
 
     let tags_json =
@@ -469,24 +486,27 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
 /// the `documents` row. No re-chunk / re-embed — the body and `content_hash` are
 /// unchanged, so the existing chunks and vectors stay valid.
 ///
-/// Returns `(vault file, its prior contents)` so the caller can restore the file
-/// (via [`restore_vault_files`]) if a later step in the batch fails; the DB side
-/// rolls back with `tx`. This is the building block for an all-or-nothing review
-/// commit — pass a `rusqlite::Transaction` (it derefs to `&Connection`) and only
-/// commit it once every document in the batch has been rewritten.
+/// Returns `(vault file, its prior raw on-disk bytes)` so the caller can restore the
+/// file (via [`restore_vault_files`]) if a later step in the batch fails; the DB side
+/// rolls back with `tx`. The snapshot is the *raw* bytes, not the decoded text — for an
+/// encrypted vault the file is ciphertext, so restoring decoded text would corrupt it.
+/// This is the building block for an all-or-nothing review commit — pass a
+/// `rusqlite::Transaction` (it derefs to `&Connection`) and only commit it once every
+/// document in the batch has been rewritten.
 // The arguments are the metadata columns being rewritten, not a sign this should
 // be split into smaller functions.
 #[allow(clippy::too_many_arguments)]
 pub fn rewrite_vault_metadata(
     tx: &Connection,
     vault: &Path,
+    cipher: &MarkdownCipher,
     doc_id: i64,
     project: &str,
     tags: &[String],
     importance: Option<&str>,
     reviewed: bool,
     last_activity: &str,
-) -> Result<(std::path::PathBuf, String)> {
+) -> Result<(std::path::PathBuf, Vec<u8>)> {
     let vault_path: String = tx.query_row(
         "SELECT vault_path FROM documents WHERE id = ?1",
         params![doc_id],
@@ -494,8 +514,9 @@ pub fn rewrite_vault_metadata(
     )?;
 
     let file = vault.join(&vault_path);
-    let original = std::fs::read_to_string(&file)?;
-    let (fields, body) = parse_frontmatter(&original)
+    let original = cipher.read_raw(&file)?;
+    let decoded = cipher.decode(&original, &file)?;
+    let (fields, body) = parse_frontmatter(&decoded)
         .ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
 
     let front = Frontmatter {
@@ -517,7 +538,7 @@ pub fn rewrite_vault_metadata(
         last_activity,
         reviewed,
     };
-    std::fs::write(&file, render_markdown(&front, body))?;
+    cipher.write_to(&file, &render_markdown(&front, body))?;
 
     let tags_json =
         serde_json::to_string(tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
@@ -536,11 +557,12 @@ pub fn rewrite_vault_metadata(
     Ok((file, original))
 }
 
-/// Restore vault files overwritten by [`rewrite_vault_metadata`] to their prior
-/// contents — the vault half of rolling back an abandoned metadata batch (the DB
-/// half rolls back by dropping the uncommitted transaction). Best-effort per file
+/// Restore vault files overwritten by [`rewrite_vault_metadata`] to their prior raw
+/// bytes — the vault half of rolling back an abandoned metadata batch (the DB half
+/// rolls back by dropping the uncommitted transaction). Writing back the exact
+/// on-disk bytes keeps an encrypted file's ciphertext intact. Best-effort per file
 /// (a failed restore on one shouldn't stop the rest); applied newest-first.
-pub fn restore_vault_files(written: Vec<(std::path::PathBuf, String)>) {
+pub fn restore_vault_files(written: Vec<(std::path::PathBuf, Vec<u8>)>) {
     for (file, original) in written.into_iter().rev() {
         let _ = std::fs::write(&file, original);
     }
@@ -842,6 +864,86 @@ fn extension(path: &Path) -> Option<String> {
     path.extension().map(|e| e.to_string_lossy().to_lowercase())
 }
 
+/// Whether a file in the vault folder is a Markdown document to index: a plaintext
+/// `.md` or an encrypted `.md.pmenc`. Anything else (temp files, stray) is skipped.
+/// Shared with the plaintext-export command so both agree on what a vault file is.
+pub(crate) fn is_vault_markdown(path: &Path) -> bool {
+    matches!(extension(path).as_deref(), Some("md") | Some("pmenc"))
+}
+
+/// Bring every Markdown file in `dir` into `write_with`'s policy, in place: decode each
+/// file with `read_with` (read-by-magic, so it handles plaintext or the prior key),
+/// re-encode with `write_with`, rename to the target on-disk name (`.md` <-> `.md.pmenc`),
+/// and update its `documents.vault_path`. Returns how many files changed.
+///
+/// Idempotent — a file already in the target form is skipped — so it is safe to re-run
+/// after an interruption (the mixed plaintext/ciphertext folder reads fine meanwhile).
+/// For a plaintext -> encrypted conversion the two ciphers can be the same (decoding
+/// plaintext needs no key). This is the Markdown half of a sharing/key migration; the
+/// caller owns the DB transaction.
+pub(crate) fn convert_markdown(
+    conn: &Connection,
+    dir: &Path,
+    read_with: &MarkdownCipher,
+    write_with: &MarkdownCipher,
+) -> Result<usize> {
+    let mut changed = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if !path.is_file() || !is_vault_markdown(&path) {
+            continue;
+        }
+        let old_name = file_name(&path);
+        let new_name = write_with.on_disk_name(&MarkdownCipher::logical_name(&old_name));
+        let raw = std::fs::read(&path)?;
+        // Already in the exact target form? Nothing to do (idempotent). "Exact" means the
+        // same name, the same encryption state, AND the same key — a passphrase change
+        // keeps the name but moves the subkey, so those files must still be re-encoded.
+        if new_name == old_name
+            && crate::vault::crypto::is_encrypted(&raw) == write_with.encryption_on()
+            && read_with.same_key_as(write_with)
+        {
+            continue;
+        }
+        let content = read_with.decode(&raw, &path)?;
+        write_with.write_to(&dir.join(&new_name), &content)?;
+        if new_name != old_name {
+            std::fs::remove_file(&path)?;
+            conn.execute(
+                "UPDATE documents SET vault_path = ?1 WHERE vault_path = ?2",
+                params![new_name, old_name],
+            )?;
+        }
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Export every Markdown file in `vault` to `dest` as plaintext `.md`, decrypting
+/// encrypted files with `cipher` and dropping the `.pmenc` suffix. Returns the count
+/// written. The core of the "never locked in" escape hatch — kept here (next to the
+/// rebuild walk it mirrors) so it is unit-testable without a running app.
+pub(crate) fn export_plaintext(
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    dest: &Path,
+) -> Result<usize> {
+    std::fs::create_dir_all(dest)?;
+    let mut written = 0usize;
+    for entry in std::fs::read_dir(vault)? {
+        let path = entry?.path();
+        if !path.is_file() || !is_vault_markdown(&path) {
+            continue;
+        }
+        // Decrypt-if-needed, then write under the logical `.md` name (no `.pmenc`).
+        let content = cipher.read(&path)?;
+        let out_name = MarkdownCipher::logical_name(&file_name(&path));
+        std::fs::write(dest.join(out_name), content)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into())
@@ -1029,6 +1131,9 @@ mod tests {
         )
         .unwrap();
 
+        // A plaintext (device) cipher: the rollback path must work the same either way.
+        let cipher = MarkdownCipher::plaintext("test-vault");
+
         // Rewrite doc 1, then fail on a non-existent doc 2 → roll the batch back.
         let mut written = Vec::new();
         {
@@ -1037,6 +1142,7 @@ mod tests {
                 rewrite_vault_metadata(
                     &tx,
                     &vault,
+                    &cipher,
                     1,
                     "Finances",
                     &["tax".into()],
@@ -1047,7 +1153,8 @@ mod tests {
                 .unwrap(),
             );
             assert!(
-                rewrite_vault_metadata(&tx, &vault, 2, "X", &[], None, true, "2026-06-20").is_err(),
+                rewrite_vault_metadata(&tx, &vault, &cipher, 2, "X", &[], None, true, "2026-06-20")
+                    .is_err(),
                 "missing doc should error"
             );
             // Caller abandons the batch: drop the tx (DB rollback) + restore files.

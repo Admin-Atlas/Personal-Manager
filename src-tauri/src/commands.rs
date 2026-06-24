@@ -19,7 +19,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, learning, openrouter, paths, recommend, secrets, AppState,
+    applock, briefing, clock, cost, db, learning, lock_session, openrouter, paths, recommend,
+    secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -146,10 +147,7 @@ pub fn set_openrouter_background_key(key: String) -> Result<()> {
 
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
-    let conn = state
-        .db
-        .lock()
-        .map_err(|_| Error::Other("database lock poisoned".into()))?;
+    let conn = state.conn()?;
     Ok(Settings {
         chat_models: models_for(&conn, CHAT_MODELS_KEY)?,
         background_models: models_for(&conn, BACKGROUND_MODELS_KEY)?,
@@ -163,19 +161,19 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
 
 #[tauri::command]
 pub fn set_chat_models(state: State<'_, AppState>, models: Vec<String>) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     save_models(&conn, CHAT_MODELS_KEY, models)
 }
 
 #[tauri::command]
 pub fn set_background_models(state: State<'_, AppState>, models: Vec<String>) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     save_models(&conn, BACKGROUND_MODELS_KEY, models)
 }
 
 #[tauri::command]
 pub fn set_chat_auto_switch(state: State<'_, AppState>, enabled: bool) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(
         &conn,
         CHAT_AUTO_SWITCH_KEY,
@@ -185,7 +183,7 @@ pub fn set_chat_auto_switch(state: State<'_, AppState>, enabled: bool) -> Result
 
 #[tauri::command]
 pub fn set_background_auto_switch(state: State<'_, AppState>, enabled: bool) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(
         &conn,
         BACKGROUND_AUTO_SWITCH_KEY,
@@ -196,14 +194,14 @@ pub fn set_background_auto_switch(state: State<'_, AppState>, enabled: bool) -> 
 /// Toggle the UI help/explain mode (Step 4b). Stored in `settings` so it persists.
 #[tauri::command]
 pub fn set_help_mode(state: State<'_, AppState>, enabled: bool) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(&conn, "help_mode", if enabled { "true" } else { "false" })
 }
 
 /// The stored IANA time zone (empty string = none set; the backend then uses UTC).
 #[tauri::command]
 pub fn get_time_zone(state: State<'_, AppState>) -> Result<String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     Ok(db::get_setting(&conn, TIME_ZONE_KEY)?.unwrap_or_default())
 }
 
@@ -218,7 +216,7 @@ pub fn set_time_zone(state: State<'_, AppState>, zone: String) -> Result<()> {
     if !zone.is_empty() && chrono_tz::Tz::from_str(zone).is_err() {
         return Err(Error::Other(format!("unrecognised time zone: {zone}")));
     }
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(&conn, TIME_ZONE_KEY, zone)
 }
 
@@ -234,7 +232,7 @@ const WRITABLE_PREFS: &[&str] = &["appearance", "pinboard"];
 /// moved to another machine. Returns `None` when nothing is stored yet.
 #[tauri::command]
 pub fn get_pref(state: State<'_, AppState>, key: String) -> Result<Option<String>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::get_setting(&conn, &key)
 }
 
@@ -245,7 +243,7 @@ pub fn set_pref(state: State<'_, AppState>, key: String, value: String) -> Resul
     if !WRITABLE_PREFS.contains(&key.as_str()) {
         return Err(Error::Other(format!("preference '{key}' is not writable")));
     }
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(&conn, &key, &value)
 }
 
@@ -266,10 +264,7 @@ pub struct AppLockStatus {
 #[tauri::command]
 pub fn app_lock_status(state: State<'_, AppState>) -> Result<AppLockStatus> {
     let enabled = {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| Error::Other("database lock poisoned".into()))?;
+        let conn = state.conn()?;
         db::get_setting(&conn, APP_LOCK_ENABLED_KEY)?.as_deref() == Some("true")
     };
     let verified = state
@@ -292,10 +287,7 @@ pub fn set_app_lock(state: State<'_, AppState>, enabled: bool) -> Result<()> {
             "this device can't perform a biometric/Windows Hello check, so the app-lock can't be enabled".into(),
         ));
     }
-    let conn = state
-        .db
-        .lock()
-        .map_err(|_| Error::Other("database lock poisoned".into()))?;
+    let conn = state.conn()?;
     db::set_setting(
         &conn,
         APP_LOCK_ENABLED_KEY,
@@ -337,6 +329,291 @@ pub async fn unlock_app(state: State<'_, AppState>, window: tauri::WebviewWindow
     Ok(verified)
 }
 
+// --- vault (shareable / portable) ---
+
+/// Build the session's Markdown runtime for a freshly opened vault: the resolved
+/// Markdown dir plus the policy-aware cipher (derived from the master that the DB key
+/// hex carries). Shared by unlock and open-existing so both install an identical runtime.
+fn vault_runtime_for(
+    resolved: &vault::ResolvedVault,
+    meta: &vault::VaultMeta,
+    key_hex: &str,
+) -> Result<VaultRuntime> {
+    let master = vault::master_from_db_key_hex(key_hex)?;
+    Ok(VaultRuntime {
+        markdown_dir: resolved.markdown_dir.clone(),
+        cipher: vault::MarkdownCipher::from_meta(meta, &master),
+    })
+}
+
+/// What the frontend needs to decide whether to show the unlock screen and how to
+/// label the vault. Non-secret: mode, whether the store is currently locked, whether
+/// Markdown is encrypted at rest, the vault location, and the stable vault id.
+#[derive(Serialize)]
+pub struct VaultStatus {
+    pub mode: vault::KeyMode,
+    pub needs_unlock: bool,
+    pub markdown_encrypted: bool,
+    pub location: String,
+    pub vault_id: Option<String>,
+}
+
+/// Report the current vault's mode and whether it needs unlocking (a passphrase vault
+/// whose key isn't cached in this profile yet).
+#[tauri::command]
+pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultStatus> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?;
+    let (mode, markdown_encrypted, vault_id) = match &meta {
+        Some(m) => (
+            m.key_mode,
+            m.markdown.encryption != vault::MarkdownEncryption::None,
+            Some(m.vault_id.clone()),
+        ),
+        None => (vault::KeyMode::Device, false, None),
+    };
+    Ok(VaultStatus {
+        mode,
+        needs_unlock: !state.is_unlocked(),
+        markdown_encrypted,
+        location: resolved.vault_root.to_string_lossy().into_owned(),
+        vault_id,
+    })
+}
+
+/// Convert this profile's device vault into a shareable, passphrase-protected one. Runs
+/// through the one migration routine (derive the key, re-key the store, encrypt the
+/// Markdown), so it is crash-recoverable. The device-only default is untouched for users
+/// who never opt in; changing an existing passphrase is `change_vault_passphrase`.
+#[tauri::command]
+pub async fn create_shareable_vault(app: AppHandle, passphrase: String) -> Result<()> {
+    if passphrase.trim().is_empty() {
+        return Err(Error::Other("a passphrase is required".into()));
+    }
+    {
+        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+        if meta.key_mode == vault::KeyMode::Passphrase {
+            return Err(Error::Other("this vault is already shareable".into()));
+        }
+    }
+    let plan = vault::migrate::MigrationPlan {
+        target_key_mode: vault::KeyMode::Passphrase,
+        new_passphrase: Some(passphrase),
+        target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
+        target_location: None,
+    };
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+        .await
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
+    // release if it went device-only, or re-acquire at the new location after a move.
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// Change a shareable vault's passphrase: re-derive the key (new salt + verifier),
+/// re-key the store, and re-encrypt the Markdown under the new subkey — one atomic,
+/// crash-recoverable migration. Only valid for an already-shareable vault.
+#[tauri::command]
+pub async fn change_vault_passphrase(app: AppHandle, new_passphrase: String) -> Result<()> {
+    if new_passphrase.trim().is_empty() {
+        return Err(Error::Other("a passphrase is required".into()));
+    }
+    {
+        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+        if meta.key_mode != vault::KeyMode::Passphrase {
+            return Err(Error::Other(
+                "this vault has no passphrase; make it shareable first".into(),
+            ));
+        }
+    }
+    let plan = vault::migrate::MigrationPlan {
+        target_key_mode: vault::KeyMode::Passphrase,
+        new_passphrase: Some(new_passphrase),
+        target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
+        target_location: None,
+    };
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+        .await
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
+    // release if it went device-only, or re-acquire at the new location after a move.
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// Make a shareable vault private again: re-key it to a random device key (held only in
+/// this profile's keychain) and decrypt the Markdown back to plaintext. Reverses
+/// `create_shareable_vault`; a no-op-style error if the vault is already device-only.
+#[tauri::command]
+pub async fn make_vault_private(app: AppHandle) -> Result<()> {
+    {
+        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+        if meta.key_mode == vault::KeyMode::Device {
+            return Err(Error::Other(
+                "this vault is already private to this device".into(),
+            ));
+        }
+    }
+    let plan = vault::migrate::MigrationPlan {
+        target_key_mode: vault::KeyMode::Device,
+        new_passphrase: None,
+        target_markdown: vault::MarkdownEncryption::None,
+        target_location: None,
+    };
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+        .await
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
+    // release if it went device-only, or re-acquire at the new location after a move.
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// Move the vault to a new folder (e.g. a shared location), keeping its key and Markdown
+/// policy unchanged. Copy-verify-delete with the pointer flipped last, so an interrupted
+/// move leaves the vault safely at its current location.
+#[tauri::command]
+pub async fn move_vault(app: AppHandle, folder: String) -> Result<()> {
+    let target = std::path::PathBuf::from(folder);
+    let plan = {
+        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+        vault::migrate::MigrationPlan {
+            target_key_mode: meta.key_mode,
+            new_passphrase: None,
+            target_markdown: meta.markdown.encryption,
+            target_location: Some(target),
+        }
+    };
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+        .await
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
+    // release if it went device-only, or re-acquire at the new location after a move.
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// Unlock the current (passphrase) vault: derive + verify, open the store, and cache
+/// the derived key in this profile so the next launch is silent.
+#[tauri::command]
+pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: String) -> Result<()> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata to unlock".into()))?;
+    let (conn, key) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
+    secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
+    let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
+    state.open_session(conn, runtime)?;
+    // Now that the store is open, engage the cooperative writer lock for this vault.
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// Point this profile at an existing vault folder (e.g. a shared one) and open it.
+/// Device-only vaults are bound to their originating profile's keychain, so they can't
+/// be opened here — they must be converted to shareable first.
+#[tauri::command]
+pub fn open_existing_vault(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder: String,
+    passphrase: Option<String>,
+) -> Result<()> {
+    let root = std::path::PathBuf::from(folder);
+    let meta = vault::load_meta(&root)?
+        .ok_or_else(|| Error::Other("no PM vault found in that folder".into()))?;
+    let resolved = vault::ResolvedVault {
+        db_path: root.join("pm.sqlite"),
+        markdown_dir: root.join("vault"),
+        vault_root: root.clone(),
+    };
+    let (conn, runtime) = match meta.key_mode {
+        vault::KeyMode::Device => {
+            return Err(Error::Other(
+                "that vault is device-only and tied to the profile that created it; \
+                 convert it to shareable first"
+                    .into(),
+            ))
+        }
+        vault::KeyMode::Passphrase => {
+            let passphrase = passphrase.ok_or_else(|| {
+                Error::Other("a passphrase is required to open this vault".into())
+            })?;
+            let (conn, key) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
+            secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
+            let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
+            (conn, runtime)
+        }
+    };
+    // Point this profile here so the next launch opens it directly.
+    let data_dir = paths::data_dir(&app)?;
+    vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
+    state.open_session(conn, runtime)?;
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// Forget this profile's cached key for the current vault, so the passphrase is needed
+/// again next launch. Does not lock the current session (the store stays open until exit).
+#[tauri::command]
+pub fn forget_vault_passphrase(app: AppHandle) -> Result<()> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    secrets::clear_cached_vault_key(&meta.vault_id)?;
+    Ok(())
+}
+
+/// Grant another account on this machine access to the shared vault folder — the
+/// Settings "link a second account" action. Takes an account name (e.g. `PC\alice`) or
+/// a SID. Only a shareable vault can be linked; ACLs are defence in depth (encryption
+/// is the real protection), so on platforms without support this surfaces as a clear
+/// error the UI can show as a warning.
+#[tauri::command]
+pub fn link_vault_account(app: AppHandle, account: String) -> Result<()> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    if meta.key_mode != vault::KeyMode::Passphrase {
+        return Err(Error::Other(
+            "only a shareable vault can be linked to another account; make it shareable first"
+                .into(),
+        ));
+    }
+    vault::acl::grant_access(&resolved.vault_root, &account)
+}
+
+/// The cooperative writer-lock status for a shared vault: whether this instance is the
+/// active writer, whether another live profile holds it, and whether that holder looks
+/// crashed (so the UI can offer a warned force-take). A device vault always reports active.
+#[tauri::command]
+pub fn vault_lock_status(app: AppHandle) -> Result<lock_session::VaultLockStatus> {
+    Ok(lock_session::status(&app))
+}
+
+/// "Continue here" on the curtain: ask the other live profile to hand the vault over (the
+/// watcher takes it once they release), or take it immediately if they've already gone.
+#[tauri::command]
+pub fn continue_here(app: AppHandle) -> Result<()> {
+    lock_session::continue_here(&app)
+}
+
+/// Force-take a vault whose holder looks crashed (a stale heartbeat). The UI shows the
+/// "the other instance may not have saved its last change" warning before calling this.
+#[tauri::command]
+pub fn force_take_vault(app: AppHandle) -> Result<()> {
+    lock_session::force_take(&app)
+}
+
 /// The OpenRouter model catalogue (public endpoint, no key needed) so the user can
 /// browse, search, and pick a model with pricing in Settings (spec §6 — any model,
 /// swappable).
@@ -349,7 +626,7 @@ pub async fn list_models() -> Result<Vec<openrouter::ModelInfo>> {
 
 #[tauri::command]
 pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let mut stmt = conn.prepare(
         "SELECT id, title, created_at, updated_at, project FROM conversations \
          ORDER BY updated_at DESC, id DESC",
@@ -371,7 +648,7 @@ pub fn create_conversation(
     let project = project
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     conn.execute(
         "INSERT INTO conversations(project) VALUES (?1)",
         params![project],
@@ -386,7 +663,7 @@ pub fn create_conversation(
 
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, conversation_id: i64) -> Result<Vec<Message>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let mut stmt = conn.prepare(
         "SELECT id, conversation_id, role, content, model, created_at, citations \
          FROM messages WHERE conversation_id = ?1 ORDER BY id",
@@ -422,7 +699,7 @@ pub async fn send_message(
     // conversation's project scope. Scope the lock so the guard is dropped before
     // the network await below.
     let (history, models, profile, scope, agenda) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
 
         let prior: i64 = conn.query_row(
             "SELECT count(*) FROM messages WHERE conversation_id = ?1",
@@ -545,7 +822,7 @@ pub async fn send_message(
         Some(serde_json::to_string(&citations).map_err(|e| Error::Other(e.to_string()))?)
     };
     let message_id = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         conn.execute(
             "INSERT INTO messages(conversation_id, role, content, model, citations) \
              VALUES (?1, 'assistant', ?2, ?3, ?4)",
@@ -584,7 +861,7 @@ async fn retrieve_grounding(
 
         // Nothing to ground on?
         let has_docs: bool = {
-            let conn = state.db.lock().unwrap();
+            let conn = state.conn()?;
             conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?
         };
         if !has_docs {
@@ -600,7 +877,7 @@ async fn retrieve_grounding(
             return Ok(Vec::new());
         };
 
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         retrieval::hybrid_search(
             &conn,
             &query,
@@ -663,7 +940,7 @@ pub async fn rebuild_index(app: AppHandle, on_event: Channel<IngestEvent>) -> Re
 
 #[tauri::command]
 pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<Document>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     ingest::list_documents(&conn)
 }
 
@@ -689,7 +966,7 @@ pub async fn search_documents(
         let embeddings = state.sidecar.embed(std::slice::from_ref(&query))?;
         let query_vec = embeddings.into_iter().next().unwrap_or_default();
 
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         retrieval::hybrid_search(&conn, &query, &query_vec, k, None)
     })
     .await
@@ -756,14 +1033,14 @@ pub async fn transcribe_audio(app: AppHandle, audio_base64: String) -> Result<St
 /// and biases the AI proposal toward projects that already exist.
 #[tauri::command]
 pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<String>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::distinct_projects(&conn)
 }
 
 /// Documents still awaiting the sorting review (`reviewed = 0`).
 #[tauri::command]
 pub fn review_queue(state: State<'_, AppState>) -> Result<Vec<Document>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     ingest::review_queue(&conn)
 }
 
@@ -801,7 +1078,7 @@ pub async fn propose_metadata(
     // lock, then drop it before any network call (rule #4).
     let (pending, projects, models, profile) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let profile = learning::profile_preamble(&conn)?;
         let projects = db::distinct_projects(&conn)?;
@@ -878,10 +1155,10 @@ pub async fn propose_metadata(
 /// the document reviewed. Blocking (file rewrites), so it runs off the runtime.
 #[tauri::command]
 pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Result<()> {
-    let vault = paths::vault_dir(&app)?;
     let blocking_app = app.clone();
     let logged = tokio::task::spawn_blocking(move || -> Result<usize> {
         let state = blocking_app.state::<AppState>();
+        let (vault, cipher) = state.markdown_io()?;
         let now = iso_now(&state)?;
 
         // The whole pass is all-or-nothing: corrections, vault rewrites, and the
@@ -889,9 +1166,9 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         // every vault file we touched is restored. Otherwise a failure partway
         // through would leave earlier docs marked reviewed (dropped from the queue
         // on retry, their corrections never re-logged) and mid-batch vault/DB drift.
-        let mut conn = state.db.lock().unwrap();
+        let mut conn = state.conn()?;
         let tx = conn.transaction()?;
-        let mut written: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
         let result: Result<usize> = (|| {
             let mut logged = 0usize;
@@ -908,6 +1185,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                 let w = ingest::rewrite_vault_metadata(
                     &tx,
                     &vault,
+                    &cipher,
                     d.document_id,
                     &d.project,
                     &d.tags,
@@ -959,17 +1237,17 @@ pub async fn set_document_metadata(
     tags: Vec<String>,
     importance: Option<String>,
 ) -> Result<Document> {
-    let vault = paths::vault_dir(&app)?;
     let importance = review::normalize_importance(importance);
     tokio::task::spawn_blocking(move || -> Result<Document> {
         let state = app.state::<AppState>();
+        let (vault, cipher) = state.markdown_io()?;
         let now = iso_now(&state)?;
 
         // Log the correction + rewrite the vault file + update the row atomically,
         // restoring the vault file if the DB side fails (the file write lands first).
-        let mut conn = state.db.lock().unwrap();
+        let mut conn = state.conn()?;
         let tx = conn.transaction()?;
-        let mut written: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
         let work = (|| -> Result<()> {
             let (cur_project, cur_tags_json, cur_importance, title): (
@@ -995,6 +1273,7 @@ pub async fn set_document_metadata(
             written.push(ingest::rewrite_vault_metadata(
                 &tx,
                 &vault,
+                &cipher,
                 document_id,
                 &project,
                 &tags,
@@ -1026,7 +1305,7 @@ pub async fn set_document_metadata(
 /// focus view's data (spec §4.1).
 #[tauri::command]
 pub fn list_project_overviews(state: State<'_, AppState>) -> Result<Vec<ProjectOverview>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let today = clock::today_sql_in(resolve_zone(&conn));
     projects::list_overviews(&conn, &today)
 }
@@ -1047,7 +1326,7 @@ pub fn set_project_metadata(
     if name.is_empty() {
         return Err(Error::Other("project name is empty".into()));
     }
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     projects::set_metadata(&conn, name, deadline, size, blocked_by, parent)
 }
 
@@ -1081,7 +1360,7 @@ pub async fn propose_project_metadata(
     // a real parent/blocker) + models under a short lock, then drop it (rule #4).
     let (targets, all_projects, models) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let all_projects: Vec<String> = db::distinct_projects(&conn)?;
         let target_names = match names {
@@ -1142,7 +1421,7 @@ pub struct CalendarStatus {
 
 #[tauri::command]
 pub fn calendar_status(state: State<'_, AppState>) -> Result<CalendarStatus> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     Ok(CalendarStatus {
         ics_feeds: calendar::load_feeds()?.len(),
         oauth_client_configured: google::has_client()?,
@@ -1170,20 +1449,20 @@ pub async fn add_ics_feed(app: AppHandle, label: String, url: String) -> Result<
     // then drop it before the network sync (rule #4).
     let tz = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         resolve_zone(&conn)
     };
     match calendar::sync_feed(&feed, tz).await {
         Ok(events) => {
             let state = app.state::<AppState>();
-            let conn = state.db.lock().unwrap();
+            let conn = state.conn()?;
             calendar::replace_events(&conn, &feed.id, &events)?;
             calendar::set_last_sync(&conn)?;
             Ok(())
         }
         Err(e) => {
             let state = app.state::<AppState>();
-            let conn = state.db.lock().unwrap();
+            let conn = state.conn()?;
             let _ = calendar::remove_feed(&conn, &feed.id);
             Err(e)
         }
@@ -1193,7 +1472,7 @@ pub async fn add_ics_feed(app: AppHandle, label: String, url: String) -> Result<
 /// Remove a feed and its mirrored events.
 #[tauri::command]
 pub fn remove_ics_feed(state: State<'_, AppState>, id: String) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::remove_feed(&conn, &id)
 }
 
@@ -1216,7 +1495,7 @@ pub fn set_google_client(client_id: String, client_secret: String) -> Result<()>
 pub fn clear_google_client(state: State<'_, AppState>) -> Result<()> {
     secrets::clear_google_token().ok();
     secrets::clear_google_client()?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::clear_all_events(&conn)
 }
 
@@ -1232,7 +1511,7 @@ pub async fn connect_google() -> Result<()> {
 #[tauri::command]
 pub fn disconnect_google(state: State<'_, AppState>) -> Result<()> {
     secrets::clear_google_token()?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::clear_all_events(&conn)
 }
 
@@ -1241,7 +1520,7 @@ pub fn disconnect_google(state: State<'_, AppState>) -> Result<()> {
 pub async fn list_google_calendars(app: AppHandle) -> Result<Vec<CalendarInfo>> {
     let raw = calendar::fetch_calendar_list().await?;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let selected = calendar::selected_calendar_ids(&conn)?;
     Ok(calendar::to_calendar_infos(raw, &selected))
 }
@@ -1249,7 +1528,7 @@ pub async fn list_google_calendars(app: AppHandle) -> Result<Vec<CalendarInfo>> 
 /// Choose which calendars to sync.
 #[tauri::command]
 pub fn set_google_calendar_ids(state: State<'_, AppState>, ids: Vec<String>) -> Result<()> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::set_selected_calendar_ids(&conn, &ids)
 }
 
@@ -1261,7 +1540,7 @@ pub fn set_google_calendar_ids(state: State<'_, AppState>, ids: Vec<String>) -> 
 pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let (oauth_ids, feeds, time_min, time_max, tz) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let oauth_ids = if google::is_connected()? {
             calendar::selected_calendar_ids(&conn)?
         } else {
@@ -1278,7 +1557,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 
     if active.is_empty() {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         calendar::clear_all_events(&conn)?;
         calendar::set_last_sync(&conn)?;
         return Ok(0);
@@ -1291,7 +1570,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         match calendar::fetch_events(id, &time_min, &time_max).await {
             Ok(events) => {
                 let state = app.state::<AppState>();
-                let conn = state.db.lock().unwrap();
+                let conn = state.conn()?;
                 calendar::replace_events(&conn, id, &events)?;
                 total += events.len();
             }
@@ -1302,7 +1581,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         match calendar::sync_feed(feed, tz).await {
             Ok(events) => {
                 let state = app.state::<AppState>();
-                let conn = state.db.lock().unwrap();
+                let conn = state.conn()?;
                 calendar::replace_events(&conn, &feed.id, &events)?;
                 total += events.len();
             }
@@ -1312,7 +1591,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 
     {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         // Reconcile deselected calendars. A source that failed *this* round keeps
         // its last-good events (standard cache behaviour) rather than being blanked.
         calendar::prune_unselected(&conn, &active)?;
@@ -1334,7 +1613,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 /// The upcoming events in the mirror, for the focus-view agenda.
 #[tauri::command]
 pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     calendar::list_upcoming(&conn, calendar::AGENDA_DAYS)
 }
 
@@ -1344,7 +1623,7 @@ pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEv
 /// corrections back it, for display in Settings.
 #[tauri::command]
 pub fn get_learning_profile(state: State<'_, AppState>) -> Result<learning::LearningProfile> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     learning::get_profile(&conn)
 }
 
@@ -1354,7 +1633,7 @@ pub fn get_learning_profile(state: State<'_, AppState>) -> Result<learning::Lear
 pub async fn refresh_learning_profile(app: AppHandle) -> Result<learning::LearningProfile> {
     run_profile_refresh(app.clone()).await?;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     learning::get_profile(&conn)
 }
 
@@ -1368,7 +1647,7 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
 
     let (current, corrections, models) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let current = learning::get_profile(&conn)?.profile;
         let corrections = learning::recent_corrections(&conn, learning::MAX_CORRECTIONS)?;
@@ -1384,7 +1663,7 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     log_usage(
         &conn,
         "background",
@@ -1402,7 +1681,7 @@ async fn run_profile_refresh(app: AppHandle) -> Result<()> {
 /// the focus view. Read-only — no model call, so it's cheap on every mount.
 #[tauri::command]
 pub fn get_daily_briefing(state: State<'_, AppState>) -> Result<briefing::DailyBriefing> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     briefing::get_briefing(&conn)
 }
 
@@ -1418,7 +1697,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
 
     let (snapshot, profile, models) = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let zone = resolve_zone(&conn);
         let now = clock::now_local_iso(zone);
@@ -1433,7 +1712,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
     // Nothing to brief on yet — leave any prior briefing in place.
     let Some(snapshot) = snapshot else {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         return briefing::get_briefing(&conn);
     };
 
@@ -1442,7 +1721,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     log_usage(
         &conn,
         "background",
@@ -1491,7 +1770,7 @@ pub async fn cost_summary(app: AppHandle) -> Result<CostSummary> {
     // the error instead.
     let _ = ensure_pricing_fresh(&app).await;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     build_cost_summary(&conn)
 }
 
@@ -1501,7 +1780,7 @@ pub async fn cost_summary(app: AppHandle) -> Result<CostSummary> {
 pub async fn refresh_pricing(app: AppHandle) -> Result<CostSummary> {
     refresh_pricing_now(&app).await?;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     build_cost_summary(&conn)
 }
 
@@ -1531,7 +1810,7 @@ pub struct ModelRecommendations {
 pub async fn model_recommendations(app: AppHandle) -> Result<ModelRecommendations> {
     let _ = ensure_catalogue_fresh(&app).await; // best-effort; offline keeps the last-good list
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let catalogue = cached_catalogue(&conn)?;
     let denylist = recommend_denylist(&conn)?;
     // Reuse the cost logger's staleness rule: if the best-effort refresh above couldn't
@@ -1567,7 +1846,7 @@ pub fn set_recommend_denylist(state: State<'_, AppState>, denylist: Vec<String>)
         .take(100)
         .collect();
     let json = serde_json::to_string(&cleaned).map_err(|e| Error::Other(e.to_string()))?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     db::set_setting(&conn, RECOMMEND_DENYLIST_KEY, &json)
 }
 
@@ -1646,7 +1925,7 @@ fn log_background_usage(
         return;
     }
     let state = app.state::<AppState>();
-    let Ok(conn) = state.db.lock() else { return };
+    let Ok(conn) = state.conn() else { return };
     for (served, usage) in rows {
         let model = served
             .as_deref()
@@ -1660,7 +1939,7 @@ fn log_background_usage(
 async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
     let stale = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let hours: Option<f64> = conn
             .query_row(
                 "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
@@ -1686,7 +1965,7 @@ async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
 async fn ensure_catalogue_fresh(app: &AppHandle) -> Result<()> {
     let needs_refresh = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.conn()?;
         let hours: Option<f64> = conn
             .query_row(
                 "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
@@ -1721,7 +2000,7 @@ async fn ensure_catalogue_fresh(app: &AppHandle) -> Result<()> {
 async fn refresh_pricing_now(app: &AppHandle) -> Result<()> {
     let models = openrouter::fetch_catalogue().await?;
     let state = app.state::<AppState>();
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     let tx = conn.unchecked_transaction()?;
     // One timestamp for the whole batch, so every model in this pull shares an identical
     // `fetched_at`. That lets the recommender read only the latest batch (a model that left
@@ -1851,7 +2130,7 @@ fn total_cost(rows: &[ModelSpend]) -> Option<f64> {
 
 /// Current UTC time in the store's ISO8601 format (matches ingest timestamps).
 fn iso_now(state: &AppState) -> Result<String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.conn()?;
     Ok(
         conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
             r.get(0)
@@ -1988,10 +2267,7 @@ pub async fn export_all_data(
     let tmp = tempfile::Builder::new().prefix("pm-export-").tempdir()?;
     let snapshot = tmp.path().join("pm.sqlite");
     {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| Error::Other("database lock poisoned".into()))?;
+        let conn = state.conn()?;
         // VACUUM INTO takes a literal SQL string, not a bound parameter; escape any
         // single quote in the (tool-generated) path so it can't break out.
         let escaped = snapshot.to_string_lossy().replace('\'', "''");
@@ -2004,6 +2280,25 @@ pub async fn export_all_data(
     })
     .await
     .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
+}
+
+/// Export the Markdown vault as plaintext `.md` files to `dest_dir` — the spec's "you
+/// are never locked in" escape hatch (§3). Reads every vault file, decrypting any
+/// encrypted ones with the in-session key, and writes a clean tree with no `.pmenc`
+/// files, so the user can walk away with their notes in the open at any time. The vault
+/// must be unlocked (the Markdown key has to be loaded). Returns the number of files
+/// written. Unlike `export_all_data`, this is a *plaintext* escape hatch, not an
+/// encrypted backup — it deliberately strips the at-rest protection.
+#[tauri::command]
+pub async fn export_plaintext_markdown(
+    state: State<'_, AppState>,
+    dest_dir: String,
+) -> Result<usize> {
+    let (vault, cipher) = state.markdown_io()?;
+    let dest = std::path::PathBuf::from(dest_dir);
+    tokio::task::spawn_blocking(move || ingest::export_plaintext(&vault, &cipher, &dest))
+        .await
+        .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
 }
 
 /// Write the export archive: the DB snapshot as `pm.sqlite`, then the vault tree.

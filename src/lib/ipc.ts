@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppLockStatus,
   CalendarEvent,
@@ -27,6 +28,8 @@ import type {
   RetrievedChunk,
   Settings,
   SidecarStatus,
+  VaultLockStatus,
+  VaultStatus,
 } from "./types";
 
 export const hasOpenRouterKey = () => invoke<boolean>("has_openrouter_key");
@@ -103,6 +106,76 @@ export const setAppLock = (enabled: boolean) => invoke<void>("set_app_lock", { e
  *  Resolves true on success, false when the user cancels/fails; rejects when the
  *  verifier can't run at all. */
 export const unlockApp = () => invoke<boolean>("unlock_app");
+
+// --- Shared & portable vaults (spec §2–6) ---
+
+/** The vault's mode, whether it needs unlocking on this profile, encryption + location. */
+export const vaultStatus = () => invoke<VaultStatus>("vault_status");
+
+/** Convert this device vault into a shareable, passphrase-protected one (re-keys the
+ *  store and encrypts the Markdown via the one migration routine). */
+export const createShareableVault = (passphrase: string) =>
+  invoke<void>("create_shareable_vault", { passphrase });
+
+/** Change a shareable vault's passphrase: re-derive the key and re-encrypt the Markdown. */
+export const changeVaultPassphrase = (newPassphrase: string) =>
+  invoke<void>("change_vault_passphrase", { newPassphrase });
+
+/** Make a shareable vault private again: re-key to a device key and decrypt the Markdown. */
+export const makeVaultPrivate = () => invoke<void>("make_vault_private");
+
+/** Move the vault to another folder (e.g. a shared location), keeping key + policy. */
+export const moveVault = (folder: string) => invoke<void>("move_vault", { folder });
+
+/** Unlock the current passphrase vault for this session and cache the key on this
+ *  profile, so the next launch is silent. */
+export const unlockVault = (passphrase: string) => invoke<void>("unlock_vault", { passphrase });
+
+/** Point this profile at an existing vault folder (a shared one) and open it. */
+export const openExistingVault = (folder: string, passphrase?: string | null) =>
+  invoke<void>("open_existing_vault", { folder, passphrase: passphrase ?? null });
+
+/** Forget this profile's cached passphrase key, so it's asked for again next launch.
+ *  Does not lock the current session. */
+export const forgetVaultPassphrase = () => invoke<void>("forget_vault_passphrase");
+
+/** Grant another account on this machine access to the shared vault folder (a name or
+ *  SID). Only meaningful for a shareable vault; a clear error otherwise. */
+export const linkVaultAccount = (account: string) =>
+  invoke<void>("link_vault_account", { account });
+
+/** Export the Markdown vault as plaintext `.md` into `destDir` — the "never locked in"
+ *  escape hatch (decrypts with the in-session key). Returns the number of files written. */
+export const exportPlaintextMarkdown = (destDir: string) =>
+  invoke<number>("export_plaintext_markdown", { destDir });
+
+// Single-writer lock for a shared vault (spec §5).
+
+/** Whether this instance is the active writer, or another profile holds the vault. */
+export const vaultLockStatus = () => invoke<VaultLockStatus>("vault_lock_status");
+
+/** "Continue here": ask the other live profile to hand the vault over (the backend takes
+ *  it once they release), or take it immediately if they've already gone. */
+export const continueHere = () => invoke<void>("continue_here");
+
+/** Force-take a vault whose holder looks crashed (stale heartbeat). Show the
+ *  "may not have saved its last change" warning before calling. */
+export const forceTakeVault = () => invoke<void>("force_take_vault");
+
+/** The reason this instance was curtained: it found another writer on open
+ *  ("other-active"), or it handed the baton over on request ("handed-off"). */
+export interface VaultCurtainEvent {
+  reason: "other-active" | "handed-off";
+  other_profile: string | null;
+}
+
+/** Subscribe to the curtain event (this instance stepped back from being the writer). */
+export const onVaultCurtain = (handler: (e: VaultCurtainEvent) => void): Promise<UnlistenFn> =>
+  listen<VaultCurtainEvent>("vault://curtain", (e) => handler(e.payload));
+
+/** Subscribe to the acquired event (this instance became the active writer; lift curtain). */
+export const onVaultAcquired = (handler: () => void): Promise<UnlistenFn> =>
+  listen("vault://acquired", () => handler());
 
 // --- Learning You (Step 4b, spec §4.5) ---
 
