@@ -28,7 +28,7 @@ message). To open it once:
 Once you're on a release build, updates download and install from inside the app — no need
 to revisit this page for each version.
 
-## What's new in 2.1.1-alpha
+## What's new in 2.1.2-alpha
 
 **Shared & portable vaults.** PM can now protect your vault with a passphrase you
 choose, instead of tying it to a single Windows account — so the same vault can be

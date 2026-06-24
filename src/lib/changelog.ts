@@ -19,7 +19,7 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
-    version: "2.1.1-alpha",
+    version: "2.1.2-alpha",
     date: "2026-06-24",
     highlights: [
       "Clearer downloads: the release page now leads with a simple, one-file install guide for Windows and macOS — it's obvious which single file to grab and how to open it. No change to how you use PM.",
