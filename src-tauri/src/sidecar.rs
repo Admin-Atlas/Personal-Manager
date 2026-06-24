@@ -106,8 +106,30 @@ pub enum SidecarStatus {
     Installing,
     /// Ready to convert and embed.
     Ready,
-    /// Setup or the process failed; carries a message for the UI.
-    Error { message: String },
+    /// Setup or the process failed; carries a human message plus a
+    /// machine-readable `kind` so the UI can show a tailored fix-it guide instead
+    /// of only the raw error text.
+    Error {
+        message: String,
+        kind: SidecarErrorKind,
+    },
+}
+
+/// Why setup failed, in a form the UI can switch on. Serializes to the
+/// snake_case strings the frontend matches (see `SidecarErrorKind` in types.ts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidecarErrorKind {
+    /// A Python interpreter was found, but it's older than [`MIN_PYTHON`].
+    PythonTooOld,
+    /// No usable Python interpreter could be found at all.
+    PythonMissing,
+    /// `pip install` failed — network, PyPI, or a dependency problem.
+    PipFailed,
+    /// The bundled sidecar files (script / requirements) are missing.
+    RequirementsMissing,
+    /// Anything not otherwise classified.
+    Unknown,
 }
 
 /// A running sidecar child plus its stdio handles.
@@ -184,44 +206,62 @@ impl SidecarManager {
                 self.set_status(SidecarStatus::Ready);
                 Ok(())
             }
-            Err(e) => {
+            Err(ProvisionError { kind, source }) => {
+                // The UI reads the cause off the polled status; the thrown error
+                // stays a plain string (unchanged for `ensure_sidecar`'s caller).
                 self.set_status(SidecarStatus::Error {
-                    message: e.to_string(),
+                    message: source.to_string(),
+                    kind,
                 });
-                Err(e)
+                Err(source)
             }
         }
     }
 
-    fn provision(&self) -> Result<()> {
+    fn provision(&self) -> std::result::Result<(), ProvisionError> {
         let requirements = self.paths.requirements();
         if !requirements.exists() {
-            return Err(Error::Other(format!(
-                "sidecar requirements not found at {} (is the sidecar/ folder present?)",
-                requirements.display()
-            )));
+            return Err(ProvisionError {
+                kind: SidecarErrorKind::RequirementsMissing,
+                source: Error::Other(format!(
+                    "sidecar requirements not found at {} (is the sidecar/ folder present?)",
+                    requirements.display()
+                )),
+            });
         }
 
-        // Prefer the interpreter bundled with the app (Windows release builds);
-        // fall back to a system Python (dev, or a build with no bundled one).
-        let base = self
-            .paths
-            .bundled_python()
-            .or_else(find_base_python)
-            .ok_or_else(|| {
-                Error::Other(
-                    "No Python interpreter found: the bundled interpreter is missing and no \
-                     system Python is on PATH. Install Python 3.10+ and ensure it is on PATH, \
-                     or set PM_PYTHON to its full path."
-                        .into(),
-                )
-            })?;
+        // A base interpreter that meets MIN_PYTHON (the bundled one on Windows
+        // release builds, else the best system Python — see resolve_base_python).
+        let base = self.resolve_base_python()?;
 
         if let Some(parent) = self.paths.venv_dir.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(unknown)?;
         }
 
-        // Create the venv (skip if the interpreter already exists).
+        // Tear down a venv we can't trust — a previous attempt that died before
+        // stamping the marker, or one whose interpreter is now too old (e.g. it
+        // was first built against macOS's system 3.9, then the user installed
+        // 3.10+). This is what removes the manual "delete the venv and retry".
+        let venv_python_exists = self.paths.venv_python().exists();
+        let detected = venv_python_exists
+            .then(|| detect_python_version(&self.paths.venv_python()))
+            .flatten();
+        if should_rebuild_venv(
+            venv_python_exists,
+            self.paths.ready_marker().exists(),
+            detected,
+        ) {
+            // Drop any live child first: on Windows it would hold a lock on the
+            // venv's python.exe and block removal.
+            *self.proc.lock().unwrap() = None;
+            match std::fs::remove_dir_all(&self.paths.venv_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(unknown(e)),
+            }
+        }
+
+        // Create the venv (skip if a good interpreter is already there).
         if !self.paths.venv_python().exists() {
             run_command(
                 Command::new(&base)
@@ -229,7 +269,8 @@ impl SidecarManager {
                     .arg("venv")
                     .arg(&self.paths.venv_dir),
                 "create venv",
-            )?;
+            )
+            .map_err(unknown)?;
         }
 
         // Install the pinned requirements into the venv.
@@ -239,11 +280,41 @@ impl SidecarManager {
                 .args(["-m", "pip", "install", "--disable-pip-version-check", "-r"])
                 .arg(&requirements),
             "pip install requirements",
-        )?;
+        )
+        .map_err(|e| ProvisionError {
+            kind: classify_pip_failure(&e.to_string()),
+            source: e,
+        })?;
 
         // Stamp the marker with the requirements hash so we can skip next time.
-        std::fs::write(self.paths.ready_marker(), self.requirements_hash()?)?;
+        let hash = self.requirements_hash().map_err(unknown)?;
+        std::fs::write(self.paths.ready_marker(), hash).map_err(unknown)?;
         Ok(())
+    }
+
+    /// Pick a base interpreter that satisfies [`MIN_PYTHON`]: the bundled one
+    /// (Windows release) if present and new enough, else the best system Python
+    /// found by [`probe_base_candidates`]. The bundled interpreter is
+    /// version-checked too, so a mis-fetched bundle can't silently build an old
+    /// venv. Distinguishes "found nothing" from "found only too-old" so the UI
+    /// can show the right guide.
+    fn resolve_base_python(&self) -> std::result::Result<PathBuf, ProvisionError> {
+        if let Some(p) = self.paths.bundled_python() {
+            if detect_python_version(&p).is_some_and(meets_min) {
+                return Ok(p);
+            }
+        }
+        match probe_base_candidates() {
+            BaseProbe::Found(p) => Ok(p),
+            BaseProbe::TooOld => Err(ProvisionError {
+                kind: SidecarErrorKind::PythonTooOld,
+                source: Error::Other(too_old_message()),
+            }),
+            BaseProbe::None => Err(ProvisionError {
+                kind: SidecarErrorKind::PythonMissing,
+                source: Error::Other(missing_message()),
+            }),
+        }
     }
 
     fn requirements_hash(&self) -> Result<String> {
@@ -257,7 +328,14 @@ impl SidecarManager {
             return Ok(false);
         }
         let stamped = std::fs::read_to_string(&marker).unwrap_or_default();
-        Ok(stamped.trim() == self.requirements_hash()?)
+        if stamped.trim() != self.requirements_hash()? {
+            return Ok(false);
+        }
+        // requirements.txt can be unchanged yet the venv's interpreter be too old
+        // (built against macOS system 3.9, then the user installed 3.10+). Don't
+        // report Ready in that case — let provision() rebuild it. This probe runs
+        // only here, in the otherwise-ready branch, not on every status() poll.
+        Ok(detect_python_version(&self.paths.venv_python()).is_some_and(meets_min))
     }
 
     /// Convert a file to Markdown. Returns `(markdown, title)`.
@@ -461,31 +539,223 @@ fn hex_digest(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Find a base Python to build the venv from: `PM_PYTHON` wins, then the usual
-/// names. We only need it once, to create the venv.
-fn find_base_python() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("PM_PYTHON") {
-        let path = PathBuf::from(p);
-        if probe_python(&path) {
-            return Some(path);
-        }
-    }
-    for name in ["python3", "python"] {
-        let path = PathBuf::from(name);
-        if probe_python(&path) {
-            return Some(path);
-        }
-    }
-    None
+/// markitdown 0.1.6 (see requirements.txt) needs Python >= 3.10, so the venv's
+/// base interpreter must too.
+const MIN_PYTHON: (u32, u32) = (3, 10);
+
+/// Highest `python3.N` minor we probe by versioned name. Gives headroom past
+/// today's releases; anything newer is still found via the bare `python3` name.
+const MAX_PROBE_MINOR: u32 = 16;
+
+fn meets_min(v: (u32, u32)) -> bool {
+    v >= MIN_PYTHON
 }
 
-/// True if `candidate --version` runs (a real interpreter, not a Windows Store
-/// shim that just prints a message).
-fn probe_python(candidate: &Path) -> bool {
+/// Whether to delete and rebuild the venv before provisioning. Pure, so it's
+/// unit-tested without real interpreters.
+/// - no venv yet → false (the normal create path handles it)
+/// - venv but no marker → true (a previous attempt died before stamping)
+/// - venv + marker but the interpreter is too old / unprobeable → true (e.g.
+///   built against macOS system 3.9, then the user installed 3.10+)
+fn should_rebuild_venv(
+    venv_python_exists: bool,
+    marker_present: bool,
+    detected_version: Option<(u32, u32)>,
+) -> bool {
+    if !venv_python_exists {
+        return false;
+    }
+    if !marker_present {
+        return true;
+    }
+    !detected_version.is_some_and(meets_min)
+}
+
+/// Parse a `python --version`-style string into `(major, minor)`. Tolerates the
+/// optional `Python ` prefix, a trailing patch / rc / build suffix, and `\r`.
+fn parse_python_version(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim();
+    let rest = s
+        .strip_prefix("Python ")
+        .or_else(|| s.strip_prefix("python "))
+        .unwrap_or(s);
+    let token = rest.split_whitespace().next()?;
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Run `candidate --version` and return its `(major, minor)`. `None` if the
+/// command can't run (a missing path, or a Windows Store shim that exits
+/// non-zero) or the output doesn't parse — so this also serves as the "is it a
+/// real interpreter" probe.
+fn detect_python_version(candidate: &Path) -> Option<(u32, u32)> {
     let mut command = Command::new(candidate);
     command.arg("--version");
     no_window(&mut command);
-    matches!(command.output(), Ok(out) if out.status.success())
+    let out = command.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // CPython has printed --version to stdout or stderr across versions; try both.
+    parse_python_version(&String::from_utf8_lossy(&out.stdout))
+        .or_else(|| parse_python_version(&String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Outcome of scanning for a base interpreter, so the caller can tell "none at
+/// all" (PythonMissing) from "found some, all too old" (PythonTooOld).
+enum BaseProbe {
+    Found(PathBuf),
+    TooOld,
+    None,
+}
+
+/// Probe `path`; accept it if it meets the minimum, else note it was too old.
+fn consider_candidate(path: &Path, saw_too_old: &mut bool) -> Option<PathBuf> {
+    match detect_python_version(path) {
+        Some(v) if meets_min(v) => Some(path.to_path_buf()),
+        Some(_) => {
+            *saw_too_old = true;
+            None
+        }
+        None => None,
+    }
+}
+
+/// Find a base Python that meets [`MIN_PYTHON`]. Probes, first acceptable wins:
+/// `PM_PYTHON`, then versioned names newest-first, then `python3`/`python`, then
+/// common macOS install locations. The macOS absolute paths matter because a
+/// Finder-launched .app gets a PATH stripped to the system dirs (no Homebrew /
+/// python.org); they resolve to nothing on other platforms.
+fn probe_base_candidates() -> BaseProbe {
+    let mut saw_too_old = false;
+
+    if let Some(p) = std::env::var_os("PM_PYTHON") {
+        if let Some(found) = consider_candidate(&PathBuf::from(p), &mut saw_too_old) {
+            return BaseProbe::Found(found);
+        }
+    }
+
+    let mut names: Vec<String> = (MIN_PYTHON.1..=MAX_PROBE_MINOR)
+        .rev()
+        .map(|minor| format!("python{}.{}", MIN_PYTHON.0, minor))
+        .collect();
+    names.push("python3".into());
+    names.push("python".into());
+    for name in &names {
+        if let Some(found) = consider_candidate(Path::new(name), &mut saw_too_old) {
+            return BaseProbe::Found(found);
+        }
+    }
+
+    for path in macos_python_candidates() {
+        if let Some(found) = consider_candidate(&path, &mut saw_too_old) {
+            return BaseProbe::Found(found);
+        }
+    }
+
+    if saw_too_old {
+        BaseProbe::TooOld
+    } else {
+        BaseProbe::None
+    }
+}
+
+/// Absolute locations of a modern Python on macOS, newest-first; empty elsewhere.
+/// These rescue a Finder-launched app whose PATH is stripped to
+/// `/usr/bin:/bin:/usr/sbin:/sbin` (so Homebrew / python.org aren't on it).
+fn macos_python_candidates() -> Vec<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        for minor in (MIN_PYTHON.1..=MAX_PROBE_MINOR).rev() {
+            out.push(PathBuf::from(format!(
+                "{dir}/python{}.{}",
+                MIN_PYTHON.0, minor
+            )));
+        }
+        out.push(PathBuf::from(format!("{dir}/python3")));
+    }
+    // python.org installs under /Library/Frameworks/Python.framework/Versions/X.Y.
+    let versions_dir = Path::new("/Library/Frameworks/Python.framework/Versions");
+    if let Ok(entries) = std::fs::read_dir(versions_dir) {
+        let names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        for (maj, min) in pick_framework_versions(&names) {
+            out.push(
+                versions_dir
+                    .join(format!("{maj}.{min}"))
+                    .join("bin")
+                    .join("python3"),
+            );
+        }
+    }
+    out
+}
+
+/// From `Python.framework/Versions` directory names, the ones that parse as
+/// `MAJOR.MINOR >= MIN_PYTHON`, newest-first (skips `Current` and junk).
+fn pick_framework_versions(names: &[String]) -> Vec<(u32, u32)> {
+    let mut vers: Vec<(u32, u32)> = names
+        .iter()
+        .filter_map(|n| parse_python_version(n))
+        .filter(|&v| meets_min(v))
+        .collect();
+    vers.sort_unstable_by(|a, b| b.cmp(a));
+    vers.dedup();
+    vers
+}
+
+/// A provisioning failure carrying the underlying error (for the message) plus a
+/// machine-readable [`SidecarErrorKind`] for the UI. Private to this module.
+struct ProvisionError {
+    kind: SidecarErrorKind,
+    source: Error,
+}
+
+/// Wrap any error as an unclassified provisioning failure.
+fn unknown(e: impl Into<Error>) -> ProvisionError {
+    ProvisionError {
+        kind: SidecarErrorKind::Unknown,
+        source: e.into(),
+    }
+}
+
+/// Map a pip / `run_command` failure message to a cause. The common one is
+/// markitdown needing Python >= 3.10, which pip reports as "No matching
+/// distribution found" / "requires-python".
+fn classify_pip_failure(msg: &str) -> SidecarErrorKind {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("no matching distribution")
+        || m.contains("requires-python")
+        || m.contains("requires a different python")
+    {
+        SidecarErrorKind::PythonTooOld
+    } else {
+        SidecarErrorKind::PipFailed
+    }
+}
+
+fn missing_message() -> String {
+    "No Python interpreter was found. PM's document engine needs Python 3.10 or newer — \
+     install it and make sure it's on your PATH, or set PM_PYTHON to its full path."
+        .to_string()
+}
+
+fn too_old_message() -> String {
+    let mut m = String::from(
+        "The Python that was found is older than 3.10, which PM's document engine requires. \
+         Install Python 3.10 or newer, then retry.",
+    );
+    if std::env::var_os("PM_PYTHON").is_some() {
+        m.push_str(" (PM_PYTHON points to an interpreter that is too old.)");
+    }
+    m
 }
 
 fn run_command(command: &mut Command, what: &str) -> Result<()> {
@@ -578,5 +848,107 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
 
         assert_eq!(paths_with_source(source_dir).bundled_python(), None);
+    }
+
+    #[test]
+    fn parses_python_versions() {
+        assert_eq!(parse_python_version("Python 3.12.4"), Some((3, 12)));
+        assert_eq!(parse_python_version("Python 3.9.6"), Some((3, 9)));
+        assert_eq!(parse_python_version("3.10.0 (main, foo)"), Some((3, 10)));
+        assert_eq!(parse_python_version("python 3.13"), Some((3, 13)));
+        assert_eq!(parse_python_version("Python 3.12.4\r\n"), Some((3, 12)));
+        assert_eq!(parse_python_version(""), None);
+        assert_eq!(parse_python_version("not a version"), None);
+        assert_eq!(parse_python_version("Python"), None);
+        assert_eq!(parse_python_version("Python 3"), None);
+    }
+
+    #[test]
+    fn enforces_minimum_python() {
+        assert!(meets_min((3, 10)));
+        assert!(meets_min((3, 14)));
+        assert!(meets_min((4, 0)));
+        assert!(!meets_min((3, 9)));
+        assert!(!meets_min((2, 7)));
+    }
+
+    #[test]
+    fn rebuilds_only_stale_or_old_venvs() {
+        // No venv yet → the normal create path handles it.
+        assert!(!should_rebuild_venv(false, false, None));
+        assert!(!should_rebuild_venv(false, true, Some((3, 12))));
+        // Venv but the marker never got stamped → a previous attempt died.
+        assert!(should_rebuild_venv(true, false, Some((3, 12))));
+        assert!(should_rebuild_venv(true, false, None));
+        // Venv + marker but the interpreter is too old / unprobeable.
+        assert!(should_rebuild_venv(true, true, Some((3, 9))));
+        assert!(should_rebuild_venv(true, true, None));
+        // Venv + marker + new enough → keep it.
+        assert!(!should_rebuild_venv(true, true, Some((3, 10))));
+        assert!(!should_rebuild_venv(true, true, Some((3, 12))));
+    }
+
+    #[test]
+    fn classifies_pip_failures() {
+        // The exact symptom we hit: markitdown needs >= 3.10.
+        assert_eq!(
+            classify_pip_failure(
+                "ERROR: No matching distribution found for markitdown[pdf]==0.1.6"
+            ),
+            SidecarErrorKind::PythonTooOld
+        );
+        assert_eq!(
+            classify_pip_failure("NO MATCHING DISTRIBUTION found"), // case-insensitive
+            SidecarErrorKind::PythonTooOld
+        );
+        assert_eq!(
+            classify_pip_failure("x requires a different Python: 3.9.6 not in '>=3.10'"),
+            SidecarErrorKind::PythonTooOld
+        );
+        assert_eq!(
+            classify_pip_failure("Failed to establish a new connection"),
+            SidecarErrorKind::PipFailed
+        );
+        assert_eq!(
+            classify_pip_failure("some other random error"),
+            SidecarErrorKind::PipFailed
+        );
+    }
+
+    #[test]
+    fn picks_framework_versions_newest_first() {
+        let names = vec![
+            "3.9".to_string(),
+            "3.12".to_string(),
+            "3.11".to_string(),
+            "2.7".to_string(),
+            "Current".to_string(),
+            "3.10".to_string(),
+        ];
+        assert_eq!(
+            pick_framework_versions(&names),
+            vec![(3, 12), (3, 11), (3, 10)]
+        );
+
+        let empty: Vec<String> = Vec::new();
+        assert!(pick_framework_versions(&empty).is_empty());
+        let junk = vec!["junk".to_string(), "Current".to_string()];
+        assert!(pick_framework_versions(&junk).is_empty());
+    }
+
+    #[test]
+    fn error_status_serializes_with_kind() {
+        // The exact shape the frontend SidecarStatus union expects.
+        let v = serde_json::to_value(SidecarStatus::Error {
+            message: "boom".into(),
+            kind: SidecarErrorKind::PythonTooOld,
+        })
+        .unwrap();
+        assert_eq!(v["state"], "error");
+        assert_eq!(v["message"], "boom");
+        assert_eq!(v["kind"], "python_too_old");
+
+        let v = serde_json::to_value(SidecarStatus::NotInstalled).unwrap();
+        assert_eq!(v["state"], "not_installed");
     }
 }

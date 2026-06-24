@@ -9,6 +9,7 @@ import type { Document, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
 import { Button, Card, Collapsible, ConfirmDialog, Progress } from "./ui";
+import { DocumentEngineGuide } from "./DocumentEngineGuide";
 
 type ItemStatus = "working" | "done" | "skipped" | "failed";
 interface ProgressItem {
@@ -38,11 +39,17 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmRebuild, setConfirmRebuild] = useState(false);
+  const [guideOpen, setGuideOpen] = useState(false);
   const { showPower } = useDepth();
 
   // `busy` inside the drag-drop listener would be stale; read it via a ref.
   const busyRef = useRef(false);
   busyRef.current = busy;
+
+  // Pop the troubleshooting guide once each time setup enters an error state,
+  // resetting when it leaves so a later failure reopens it (and closing it once
+  // setup succeeds).
+  const guideAutoOpened = useRef(false);
 
   useEffect(() => {
     refresh();
@@ -50,6 +57,18 @@ export function DocumentsView({ onReviewClick }: Props) {
       .then(setStatus)
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (status?.state === "error") {
+      if (!guideAutoOpened.current) {
+        guideAutoOpened.current = true;
+        setGuideOpen(true);
+      }
+    } else {
+      guideAutoOpened.current = false;
+      if (status?.state === "ready") setGuideOpen(false);
+    }
+  }, [status?.state]);
 
   // Window-level file drag-and-drop (Tauri gives us absolute paths).
   useEffect(() => {
@@ -240,10 +259,16 @@ export function DocumentsView({ onReviewClick }: Props) {
           )}
           {status?.state === "error" && (
             <Banner tone="warn">
-              Document engine error: {status.message}{" "}
-              <button onClick={doSetup} className="underline" disabled={busy}>
-                Retry setup
-              </button>
+              <div className="flex items-center justify-between gap-3">
+                <span>The document engine needs setup to finish.</span>
+                <button
+                  onClick={() => setGuideOpen(true)}
+                  className="shrink-0 underline"
+                  disabled={busy}
+                >
+                  Troubleshoot
+                </button>
+              </div>
             </Banner>
           )}
           {status?.state === "not_installed" && (
@@ -251,10 +276,13 @@ export function DocumentsView({ onReviewClick }: Props) {
               The document engine isn't installed yet. It's a one-time setup (needs Python).{" "}
               <button onClick={doSetup} className="underline" disabled={busy}>
                 Set it up now
+              </button>{" "}
+              <button onClick={() => setGuideOpen(true)} className="underline" disabled={busy}>
+                What's needed?
               </button>
             </Banner>
           )}
-          {error && <Banner tone="warn">{error}</Banner>}
+          {error && status?.state !== "error" && <Banner tone="warn">{error}</Banner>}
 
           <div
             onClick={pickFiles}
@@ -367,6 +395,14 @@ export function DocumentsView({ onReviewClick }: Props) {
         This drops the search index and rebuilds it from the Markdown vault. Your documents
         aren&apos;t deleted, but rebuilding can take a while on a large library.
       </ConfirmDialog>
+
+      <DocumentEngineGuide
+        open={guideOpen}
+        onClose={() => setGuideOpen(false)}
+        status={status}
+        busy={busy}
+        onRetry={doSetup}
+      />
     </div>
   );
 }
