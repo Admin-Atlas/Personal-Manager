@@ -22,13 +22,16 @@ pub mod verifier;
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use zeroize::Zeroizing;
 
+use crate::db;
 use crate::error::{Error, Result};
 use crate::paths;
 use crate::secret::Secret;
+use crate::secrets;
 use kdf::{KdfParams, KEY_LEN};
 use pointer::VaultPointer;
 use verifier::Verifier;
@@ -313,6 +316,45 @@ pub fn new_passphrase(
     build_passphrase_meta(passphrase, kdf::calibrate(calibrate_target_ms))
 }
 
+/// Open a passphrase (shareable) vault: derive the master, verify it against the
+/// stored verifier (a clean "wrong passphrase" before SQLCipher's opaque error), then
+/// open the store. Returns the connection plus the 64-hex DB key so the caller can
+/// cache it in this profile's keychain. Keychain-free itself, so it unit-tests.
+pub fn open_with_passphrase(
+    resolved: &ResolvedVault,
+    meta: &VaultMeta,
+    passphrase: &str,
+) -> Result<(Connection, Secret)> {
+    let master = derive_master_from_passphrase(meta, passphrase)?;
+    let verifier = meta
+        .verifier
+        .as_ref()
+        .ok_or_else(|| Error::Other("vault metadata is missing its verifier".into()))?;
+    if !verifier::check(verifier, &master)? {
+        return Err(Error::Other("wrong passphrase".into()));
+    }
+    let key = db_key_hex(&master);
+    let conn = db::open(&resolved.db_path, key.expose())?;
+    Ok((conn, key))
+}
+
+/// Decide how to open a vault at boot from its metadata. Device vaults open with the
+/// keychain key (today's path). Passphrase vaults open only if this profile has the
+/// derived key cached; otherwise return `None` so the store stays locked and the UI
+/// prompts for the passphrase.
+pub fn open_at_boot(resolved: &ResolvedVault, meta: &VaultMeta) -> Result<Option<Connection>> {
+    match meta.key_mode {
+        KeyMode::Device => {
+            let key = secrets::get_or_create_db_key()?;
+            Ok(Some(db::open(&resolved.db_path, key.expose())?))
+        }
+        KeyMode::Passphrase => match secrets::get_cached_vault_key(&meta.vault_id)? {
+            Some(cached) => Ok(Some(db::open(&resolved.db_path, cached.expose())?)),
+            None => Ok(None),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +471,28 @@ mod tests {
         assert_eq!(r.vault_root, shared);
         assert_eq!(r.db_path, shared.join("pm.sqlite"));
         assert_eq!(r.markdown_dir, shared.join("vault"));
+    }
+
+    #[test]
+    fn open_with_passphrase_round_trips_and_rejects_wrong_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = ResolvedVault {
+            vault_root: dir.path().to_path_buf(),
+            db_path: dir.path().join("pm.sqlite"),
+            markdown_dir: dir.path().join("vault"),
+        };
+        let (meta, master) = build_passphrase_meta("open-sesame", cheap_params()).unwrap();
+        store_meta(&resolved.vault_root, &meta).unwrap();
+        // Create the encrypted store with the derived key (as creation/rekey would).
+        {
+            let key = db_key_hex(&master);
+            crate::db::open(&resolved.db_path, key.expose()).unwrap();
+        }
+        // The right passphrase opens it and yields the same key.
+        let (conn, key2) = open_with_passphrase(&resolved, &meta, "open-sesame").unwrap();
+        assert_eq!(key2.expose(), db_key_hex(&master).expose());
+        drop(conn);
+        // The wrong passphrase fails at the verifier, before SQLCipher.
+        assert!(open_with_passphrase(&resolved, &meta, "wrong").is_err());
     }
 }

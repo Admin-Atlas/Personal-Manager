@@ -85,6 +85,21 @@ impl AppState {
         }
         Ok(DbGuard(guard))
     }
+
+    /// Install the connection after an unlock / open-existing succeeds.
+    pub fn set_conn(&self, conn: Connection) -> error::Result<()> {
+        let mut guard = self
+            .db
+            .lock()
+            .map_err(|_| error::Error::Other("database lock poisoned".into()))?;
+        *guard = Some(conn);
+        Ok(())
+    }
+
+    /// Whether the store is currently open (the vault is unlocked this session).
+    pub fn is_unlocked(&self) -> bool {
+        self.db.lock().map(|guard| guard.is_some()).unwrap_or(false)
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -107,14 +122,13 @@ pub fn run() {
             // Resolve where this profile's vault lives — pointer-aware, but defaulting
             // to the per-profile data dir when no pointer is set (today's behaviour).
             let resolved = vault::resolve(handle)?;
-            let key = secrets::get_or_create_db_key()?;
-            let conn = db::open(&resolved.db_path, key.expose())?;
 
-            // Every vault carries a small, non-secret metadata file from creation
-            // (vault id + cipher profile + Markdown policy; spec §6), stored next to
-            // the DB at vault_root/vault-meta.json. On a fresh install this writes
-            // device-mode metadata; the passphrase/shareable path layers on later.
-            vault::ensure_device_meta(&resolved.vault_root)?;
+            // Metadata exists from creation (device-mode on a fresh install; spec §6).
+            // A device vault opens now with the keychain key; a passphrase/shareable
+            // vault opens only if this profile cached its key, otherwise the store stays
+            // locked (None) and the UI prompts to unlock before any DB command runs.
+            let meta = vault::ensure_device_meta(&resolved.vault_root)?;
+            let conn = vault::open_at_boot(&resolved, &meta)?;
 
             // The sidecar source folder is optional at boot — chat works without
             // it; ingestion surfaces a clear error if it (or Python) is missing.
@@ -127,7 +141,7 @@ pub fn run() {
             });
 
             app.manage(AppState {
-                db: Mutex::new(Some(conn)),
+                db: Mutex::new(conn),
                 sidecar,
                 app_unlocked: AtomicBool::new(false),
             });
@@ -151,6 +165,10 @@ pub fn run() {
             commands::app_lock_status,
             commands::set_app_lock,
             commands::unlock_app,
+            commands::vault_status,
+            commands::unlock_vault,
+            commands::open_existing_vault,
+            commands::forget_vault_passphrase,
             commands::list_models,
             commands::get_learning_profile,
             commands::refresh_learning_profile,

@@ -19,7 +19,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, learning, openrouter, paths, recommend, secrets, AppState,
+    applock, briefing, clock, cost, db, learning, openrouter, paths, recommend, secrets, vault,
+    AppState,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -326,6 +327,109 @@ pub async fn unlock_app(state: State<'_, AppState>, window: tauri::WebviewWindow
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(verified)
+}
+
+// --- vault (shareable / portable) ---
+
+/// What the frontend needs to decide whether to show the unlock screen and how to
+/// label the vault. Non-secret: mode, whether the store is currently locked, whether
+/// Markdown is encrypted at rest, the vault location, and the stable vault id.
+#[derive(Serialize)]
+pub struct VaultStatus {
+    pub mode: vault::KeyMode,
+    pub needs_unlock: bool,
+    pub markdown_encrypted: bool,
+    pub location: String,
+    pub vault_id: Option<String>,
+}
+
+/// Report the current vault's mode and whether it needs unlocking (a passphrase vault
+/// whose key isn't cached in this profile yet).
+#[tauri::command]
+pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultStatus> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?;
+    let (mode, markdown_encrypted, vault_id) = match &meta {
+        Some(m) => (
+            m.key_mode,
+            m.markdown.encryption != vault::MarkdownEncryption::None,
+            Some(m.vault_id.clone()),
+        ),
+        None => (vault::KeyMode::Device, false, None),
+    };
+    Ok(VaultStatus {
+        mode,
+        needs_unlock: !state.is_unlocked(),
+        markdown_encrypted,
+        location: resolved.vault_root.to_string_lossy().into_owned(),
+        vault_id,
+    })
+}
+
+/// Unlock the current (passphrase) vault: derive + verify, open the store, and cache
+/// the derived key in this profile so the next launch is silent.
+#[tauri::command]
+pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: String) -> Result<()> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata to unlock".into()))?;
+    let (conn, key) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
+    secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
+    state.set_conn(conn)?;
+    Ok(())
+}
+
+/// Point this profile at an existing vault folder (e.g. a shared one) and open it.
+/// Device-only vaults are bound to their originating profile's keychain, so they can't
+/// be opened here — they must be converted to shareable first.
+#[tauri::command]
+pub fn open_existing_vault(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder: String,
+    passphrase: Option<String>,
+) -> Result<()> {
+    let root = std::path::PathBuf::from(folder);
+    let meta = vault::load_meta(&root)?
+        .ok_or_else(|| Error::Other("no PM vault found in that folder".into()))?;
+    let resolved = vault::ResolvedVault {
+        db_path: root.join("pm.sqlite"),
+        markdown_dir: root.join("vault"),
+        vault_root: root.clone(),
+    };
+    let conn = match meta.key_mode {
+        vault::KeyMode::Device => {
+            return Err(Error::Other(
+                "that vault is device-only and tied to the profile that created it; \
+                 convert it to shareable first"
+                    .into(),
+            ))
+        }
+        vault::KeyMode::Passphrase => {
+            let passphrase = passphrase.ok_or_else(|| {
+                Error::Other("a passphrase is required to open this vault".into())
+            })?;
+            let (conn, key) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
+            secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
+            conn
+        }
+    };
+    // Point this profile here so the next launch opens it directly.
+    let data_dir = paths::data_dir(&app)?;
+    vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
+    state.set_conn(conn)?;
+    Ok(())
+}
+
+/// Forget this profile's cached key for the current vault, so the passphrase is needed
+/// again next launch. Does not lock the current session (the store stays open until exit).
+#[tauri::command]
+pub fn forget_vault_passphrase(app: AppHandle) -> Result<()> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    secrets::clear_cached_vault_key(&meta.vault_id)?;
+    Ok(())
 }
 
 /// The OpenRouter model catalogue (public endpoint, no key needed) so the user can
