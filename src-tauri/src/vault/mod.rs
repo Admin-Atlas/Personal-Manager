@@ -330,6 +330,21 @@ impl MarkdownCipher {
         self.encryption != MarkdownEncryption::None
     }
 
+    /// Whether two ciphers read and write a file identically (same vault id, policy, and
+    /// key). Used by the migration converter to skip a file already in the exact target
+    /// form — but never to skip a re-encode when the key changed (a passphrase change
+    /// keeps the name but moves the subkey). These are our own keys, so plain equality is
+    /// fine (no attacker-controlled timing oracle).
+    pub(crate) fn same_key_as(&self, other: &Self) -> bool {
+        self.vault_id == other.vault_id
+            && self.encryption == other.encryption
+            && match (&self.subkey, &other.subkey) {
+                (Some(a), Some(b)) => a.as_slice() == b.as_slice(),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
     /// The on-disk filename for a logical `<name>.md`: bare under plaintext,
     /// `<name>.md.pmenc` under encryption.
     pub fn on_disk_name(&self, logical_md_name: &str) -> String {

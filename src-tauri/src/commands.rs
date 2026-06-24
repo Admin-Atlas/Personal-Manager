@@ -381,46 +381,105 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
     })
 }
 
-/// Convert this profile's fresh device vault into a shareable, passphrase-protected
-/// one: derive the key from the passphrase, re-key the store in place, and switch the
-/// metadata to passphrase mode. The device-only default is untouched for users who
-/// never opt in.
+/// Convert this profile's device vault into a shareable, passphrase-protected one. Runs
+/// through the one migration routine (derive the key, re-key the store, encrypt the
+/// Markdown), so it is crash-recoverable. The device-only default is untouched for users
+/// who never opt in; changing an existing passphrase is `change_vault_passphrase`.
 #[tauri::command]
-pub fn create_shareable_vault(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    passphrase: String,
-) -> Result<()> {
+pub async fn create_shareable_vault(app: AppHandle, passphrase: String) -> Result<()> {
     if passphrase.trim().is_empty() {
         return Err(Error::Other("a passphrase is required".into()));
     }
-    let resolved = vault::resolve(&app)?;
-    let meta = vault::load_meta(&resolved.vault_root)?
-        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
-    if meta.key_mode == vault::KeyMode::Passphrase {
-        return Err(Error::Other("this vault is already shareable".into()));
-    }
-    let (new_meta, new_key) = vault::prepare_shareable(&meta, &passphrase)?;
-    let master = vault::master_from_db_key_hex(new_key.expose())?;
-    let new_cipher = vault::MarkdownCipher::from_meta(&new_meta, &master);
     {
-        let mut conn = state.conn()?;
-        db::rekey(&conn, new_key.expose())?;
-        // The vault is now passphrase-keyed and encrypted. Record that first (so the
-        // metadata matches the new key for the next boot), then re-encrypt any Markdown
-        // written while it was a plaintext device vault — so "shared ⇒ encrypted at
-        // rest" holds for existing notes, not only new ones.
-        vault::store_meta(&resolved.vault_root, &new_meta)?;
-        let tx = conn.transaction()?;
-        ingest::convert_markdown(&tx, &resolved.markdown_dir, &new_cipher, &new_cipher)?;
-        tx.commit()?;
+        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+        if meta.key_mode == vault::KeyMode::Passphrase {
+            return Err(Error::Other("this vault is already shareable".into()));
+        }
     }
-    secrets::set_cached_vault_key(&new_meta.vault_id, new_key.expose())?;
-    state.set_vault_runtime(VaultRuntime {
-        markdown_dir: resolved.markdown_dir.clone(),
-        cipher: new_cipher,
-    })?;
-    Ok(())
+    let plan = vault::migrate::MigrationPlan {
+        target_key_mode: vault::KeyMode::Passphrase,
+        new_passphrase: Some(passphrase),
+        target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
+        target_location: None,
+    };
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app, plan))
+        .await
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))?
+}
+
+/// Change a shareable vault's passphrase: re-derive the key (new salt + verifier),
+/// re-key the store, and re-encrypt the Markdown under the new subkey — one atomic,
+/// crash-recoverable migration. Only valid for an already-shareable vault.
+#[tauri::command]
+pub async fn change_vault_passphrase(app: AppHandle, new_passphrase: String) -> Result<()> {
+    if new_passphrase.trim().is_empty() {
+        return Err(Error::Other("a passphrase is required".into()));
+    }
+    {
+        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+        if meta.key_mode != vault::KeyMode::Passphrase {
+            return Err(Error::Other(
+                "this vault has no passphrase; make it shareable first".into(),
+            ));
+        }
+    }
+    let plan = vault::migrate::MigrationPlan {
+        target_key_mode: vault::KeyMode::Passphrase,
+        new_passphrase: Some(new_passphrase),
+        target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
+        target_location: None,
+    };
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app, plan))
+        .await
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))?
+}
+
+/// Make a shareable vault private again: re-key it to a random device key (held only in
+/// this profile's keychain) and decrypt the Markdown back to plaintext. Reverses
+/// `create_shareable_vault`; a no-op-style error if the vault is already device-only.
+#[tauri::command]
+pub async fn make_vault_private(app: AppHandle) -> Result<()> {
+    {
+        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+        if meta.key_mode == vault::KeyMode::Device {
+            return Err(Error::Other(
+                "this vault is already private to this device".into(),
+            ));
+        }
+    }
+    let plan = vault::migrate::MigrationPlan {
+        target_key_mode: vault::KeyMode::Device,
+        new_passphrase: None,
+        target_markdown: vault::MarkdownEncryption::None,
+        target_location: None,
+    };
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app, plan))
+        .await
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))?
+}
+
+/// Move the vault to a new folder (e.g. a shared location), keeping its key and Markdown
+/// policy unchanged. Copy-verify-delete with the pointer flipped last, so an interrupted
+/// move leaves the vault safely at its current location.
+#[tauri::command]
+pub async fn move_vault(app: AppHandle, folder: String) -> Result<()> {
+    let target = std::path::PathBuf::from(folder);
+    let plan = {
+        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+        vault::migrate::MigrationPlan {
+            target_key_mode: meta.key_mode,
+            new_passphrase: None,
+            target_markdown: meta.markdown.encryption,
+            target_location: Some(target),
+        }
+    };
+    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app, plan))
+        .await
+        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))?
 }
 
 /// Unlock the current (passphrase) vault: derive + verify, open the store, and cache

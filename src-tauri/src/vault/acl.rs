@@ -166,7 +166,4 @@ mod platform {
     }
 }
 
-pub use platform::grant_access;
-// `restrict_to_owner` is exercised by the migration routine (Build 8); re-exported
-// there. Until then it is reachable as `acl::platform::restrict_to_owner` and kept
-// alive by the module-wide `allow(dead_code)` in `vault/mod.rs`.
+pub use platform::{grant_access, restrict_to_owner};

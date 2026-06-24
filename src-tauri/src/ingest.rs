@@ -896,9 +896,12 @@ pub(crate) fn convert_markdown(
         let old_name = file_name(&path);
         let new_name = write_with.on_disk_name(&MarkdownCipher::logical_name(&old_name));
         let raw = std::fs::read(&path)?;
-        // Already in the target name AND encryption state? Nothing to do (idempotent).
+        // Already in the exact target form? Nothing to do (idempotent). "Exact" means the
+        // same name, the same encryption state, AND the same key — a passphrase change
+        // keeps the name but moves the subkey, so those files must still be re-encoded.
         if new_name == old_name
             && crate::vault::crypto::is_encrypted(&raw) == write_with.encryption_on()
+            && read_with.same_key_as(write_with)
         {
             continue;
         }

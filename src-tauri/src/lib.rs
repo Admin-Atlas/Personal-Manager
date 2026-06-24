@@ -117,6 +117,18 @@ impl AppState {
         Ok(())
     }
 
+    /// Take the open connection out of the session, closing the store (the `Drop` of the
+    /// returned `Connection` releases SQLite's file lock). Used by a vault relocation,
+    /// which must unlock the DB file before it can be copied; the caller reopens at the
+    /// new location afterwards. Leaves the vault locked (`None`) in the meantime.
+    pub fn take_conn(&self) -> error::Result<Option<Connection>> {
+        let mut guard = self
+            .db
+            .lock()
+            .map_err(|_| error::Error::Other("database lock poisoned".into()))?;
+        Ok(guard.take())
+    }
+
     /// Replace the active vault's Markdown runtime in place (the connection stays open).
     /// Used when a transition changes the Markdown policy — e.g. making a vault
     /// shareable flips encryption on without reopening the store.
@@ -166,6 +178,10 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle();
+            // If a vault migration was interrupted, repair it before anything opens the
+            // store: roll the in-place phase back to its backup, or finish/discard a
+            // partial move. A no-op when no migration journal is present.
+            vault::migrate::recover(handle)?;
             // Resolve where this profile's vault lives — pointer-aware, but defaulting
             // to the per-profile data dir when no pointer is set (today's behaviour).
             let resolved = vault::resolve(handle)?;
@@ -227,6 +243,9 @@ pub fn run() {
             commands::unlock_app,
             commands::vault_status,
             commands::create_shareable_vault,
+            commands::change_vault_passphrase,
+            commands::make_vault_private,
+            commands::move_vault,
             commands::unlock_vault,
             commands::open_existing_vault,
             commands::forget_vault_passphrase,
