@@ -46,6 +46,24 @@ export interface AppLockStatus {
   locked: boolean;
 }
 
+// --- Shared & portable vaults (spec §2–6) ---
+
+/** How the vault's SQLCipher key is held: a random key in this device's keychain (the
+ *  default, bound to one OS profile) or one derived from a passphrase (openable from any
+ *  profile/machine that knows it). */
+export type VaultMode = "device" | "passphrase";
+
+/** The vault's current state for the UI: its key mode, whether it needs unlocking on
+ *  this profile (a passphrase vault whose key isn't cached here yet), whether the
+ *  Markdown is encrypted at rest, where it lives on disk, and its stable id. */
+export interface VaultStatus {
+  mode: VaultMode;
+  needs_unlock: boolean;
+  markdown_encrypted: boolean;
+  location: string;
+  vault_id: string | null;
+}
+
 /** A model from the OpenRouter catalogue, for the Settings model picker.
  *  Prices are USD per token (the picker renders them per-million). */
 export interface ModelInfo {
