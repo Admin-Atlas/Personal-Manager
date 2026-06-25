@@ -155,6 +155,11 @@ pub enum SidecarErrorKind {
     PipFailed,
     /// The bundled sidecar files (script / requirements) are missing.
     RequirementsMissing,
+    /// The bundled interpreter is present but can't start — its standard library
+    /// is incomplete (e.g. a packaging defect flattened the tree so `encodings` is
+    /// gone). This is a PM bug, not the user's environment, so the UI tells them to
+    /// report it rather than chase a local fix.
+    PackagingBug,
     /// Anything not otherwise classified.
     Unknown,
 }
@@ -236,10 +241,11 @@ impl SidecarManager {
             Err(ProvisionError { kind, source }) => {
                 // The UI reads the cause off the polled status; the thrown error
                 // stays a plain string (unchanged for `ensure_sidecar`'s caller).
-                self.set_status(SidecarStatus::Error {
-                    message: source.to_string(),
-                    kind,
-                });
+                let message = source.to_string();
+                // Persist the full failure so a user-reported problem can be
+                // diagnosed after the fact (best effort — never masks the error).
+                self.log_failure(kind, &message);
+                self.set_status(SidecarStatus::Error { message, kind });
                 Err(source)
             }
         }
@@ -290,25 +296,32 @@ impl SidecarManager {
 
         // Create the venv (skip if a good interpreter is already there).
         if !self.paths.venv_python().exists() {
-            run_command(
-                Command::new(&base)
-                    .arg("-m")
-                    .arg("venv")
-                    .arg(&self.paths.venv_dir),
-                "create venv",
-            )
-            .map_err(unknown)?;
+            let mut cmd = Command::new(&base);
+            cmd.arg("-m").arg("venv").arg(&self.paths.venv_dir);
+            clean_python_env(&mut cmd);
+            no_window(&mut cmd);
+            run_command(&mut cmd, "create venv").map_err(|e| {
+                // Belt-and-braces: preflight_interpreter (in resolve_base_python)
+                // should already have caught a bundled interpreter that can't boot,
+                // but if venv creation still dies with that signature, classify it
+                // as a packaging bug rather than a generic failure.
+                let kind = if looks_like_packaging_bug(&e.to_string()) {
+                    SidecarErrorKind::PackagingBug
+                } else {
+                    SidecarErrorKind::Unknown
+                };
+                ProvisionError { kind, source: e }
+            })?;
         }
 
         // Install the pinned requirements into the venv.
         let py = self.paths.venv_python();
-        run_command(
-            Command::new(&py)
-                .args(["-m", "pip", "install", "--disable-pip-version-check", "-r"])
-                .arg(&requirements),
-            "pip install requirements",
-        )
-        .map_err(|e| ProvisionError {
+        let mut pip = Command::new(&py);
+        pip.args(["-m", "pip", "install", "--disable-pip-version-check", "-r"])
+            .arg(&requirements);
+        clean_python_env(&mut pip);
+        no_window(&mut pip);
+        run_command(&mut pip, "pip install requirements").map_err(|e| ProvisionError {
             kind: classify_pip_failure(&e.to_string()),
             source: e,
         })?;
@@ -327,6 +340,13 @@ impl SidecarManager {
     /// can show the right guide.
     fn resolve_base_python(&self) -> std::result::Result<PathBuf, ProvisionError> {
         if let Some(p) = self.paths.bundled_python() {
+            // The app ships this interpreter, so we commit to it — but first make
+            // sure it can actually start. A packaging defect that flattened the
+            // bundled stdlib tree (losing Lib/encodings) leaves python.exe unable
+            // to boot; without this check it would resurface three steps later as a
+            // baffling "create venv failed". Fail fast with a precise, reportable
+            // cause instead.
+            preflight_interpreter(&p)?;
             if detect_python_version(&p).is_some_and(meets_min) {
                 return Ok(p);
             }
@@ -363,6 +383,34 @@ impl SidecarManager {
         // report Ready in that case — let provision() rebuild it. This probe runs
         // only here, in the otherwise-ready branch, not on every status() poll.
         Ok(detect_python_version(&self.paths.venv_python()).is_some_and(meets_min))
+    }
+
+    /// `<data_dir>/document-engine.log`. `venv_dir` is `<data_dir>/runtime/venv`,
+    /// so two parents up is the data home.
+    fn engine_log_path(&self) -> Option<PathBuf> {
+        self.paths
+            .venv_dir
+            .parent()? // runtime/
+            .parent() // data home
+            .map(|d| d.join("document-engine.log"))
+    }
+
+    /// Persist the latest document-engine setup failure (cause + full captured
+    /// output) to a log in the data home, so a problem a user reports can be
+    /// diagnosed afterwards. Best effort: a logging failure must never replace the
+    /// real error. Overwrites rather than appends, so the file stays small and
+    /// always holds the most recent failure.
+    fn log_failure(&self, kind: SidecarErrorKind, message: &str) {
+        let Some(path) = self.engine_log_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &path,
+            format!("document-engine setup failed (kind = {kind:?}):\n\n{message}\n"),
+        );
     }
 
     /// Convert a file to Markdown. Returns `(markdown, title)`.
@@ -596,6 +644,7 @@ impl SidecarManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        clean_python_env(&mut command);
         no_window(&mut command);
 
         let mut child = command
@@ -703,6 +752,7 @@ fn parse_python_version(s: &str) -> Option<(u32, u32)> {
 fn detect_python_version(candidate: &Path) -> Option<(u32, u32)> {
     let mut command = Command::new(candidate);
     command.arg("--version");
+    clean_python_env(&mut command);
     no_window(&mut command);
     let out = command.output().ok()?;
     if !out.status.success() {
@@ -868,15 +918,89 @@ fn too_old_message() -> String {
     m
 }
 
+/// Give a spawned Python a clean, predictable environment. Drops the `PYTHON*`
+/// overrides that could point the interpreter at the wrong stdlib (so a poisoned
+/// environment can't break the bundled interpreter or the venv), and forces UTF-8
+/// mode so a non-UTF-8 OEM codepage can't fail interpreter init. Applied to every
+/// Python process PM launches.
+fn clean_python_env(command: &mut Command) {
+    command
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONSTARTUP")
+        .env("PYTHONUTF8", "1");
+}
+
+/// Whether a failure message is the signature of an interpreter that can't boot
+/// because its standard library is missing/incomplete — a packaging defect on our
+/// side, not the user's environment. The flattened-bundle bug produced exactly
+/// this (`No module named 'encodings'` during `init_fs_encoding`).
+fn looks_like_packaging_bug(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("no module named 'encodings'")
+        || m.contains("init_fs_encoding")
+        || m.contains("could not find platform independent libraries")
+        || m.contains("failed to get the python codec of the filesystem encoding")
+}
+
+/// Verify a base interpreter can actually start before we build a venv from it, by
+/// importing a few core modules in a clean environment. If that fails the
+/// interpreter is broken — most often a packaging defect that flattened the
+/// bundled stdlib so `encodings` is gone — and we surface it as a reportable
+/// [`SidecarErrorKind::PackagingBug`] carrying the real interpreter output,
+/// instead of letting it resurface downstream as an inscrutable "create venv
+/// failed". Only ever run against the bundled interpreter.
+fn preflight_interpreter(py: &Path) -> std::result::Result<(), ProvisionError> {
+    let packaging_bug = |source| ProvisionError {
+        kind: SidecarErrorKind::PackagingBug,
+        source,
+    };
+
+    let mut cmd = Command::new(py);
+    cmd.args(["-c", "import encodings, ssl, venv"]);
+    clean_python_env(&mut cmd);
+    no_window(&mut cmd);
+
+    let output = cmd.output().map_err(|e| {
+        packaging_bug(Error::Other(format!(
+            "the bundled document-engine Python could not be launched ({}): {e}",
+            py.display()
+        )))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(packaging_bug(Error::Other(format!(
+            "the bundled document-engine Python is incomplete and can't start — this is a \
+             problem with PM's packaging, not with your computer.\n\n{}",
+            if detail.is_empty() {
+                "(the interpreter produced no output)"
+            } else {
+                detail
+            }
+        ))));
+    }
+    Ok(())
+}
+
 fn run_command(command: &mut Command, what: &str) -> Result<()> {
     let output = command
         .output()
         .map_err(|e| Error::Other(format!("could not run {what}: {e}")))?;
     if !output.status.success() {
+        // Surface the FULL stderr (was: only the last line) so the cause is
+        // diagnosable — the UI tucks it into a collapsible and the engine log
+        // persists it. A misleading trailing line like "<no Python frame>" used to
+        // hide the real fatal error printed above it.
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
         return Err(Error::Other(format!(
-            "{what} failed: {}",
-            stderr.trim().lines().last().unwrap_or("(no output)")
+            "{what} failed:\n{}",
+            if detail.is_empty() {
+                "(no output)"
+            } else {
+                detail
+            }
         )));
     }
     Ok(())
@@ -1023,6 +1147,36 @@ mod tests {
             classify_pip_failure("some other random error"),
             SidecarErrorKind::PipFailed
         );
+    }
+
+    #[test]
+    fn detects_packaging_bug_signature() {
+        // The real fatal output from the flattened-bundle bug.
+        assert!(looks_like_packaging_bug(
+            "Fatal Python error: init_fs_encoding: failed to get the Python codec of the \
+             filesystem encoding\nModuleNotFoundError: No module named 'encodings'"
+        ));
+        assert!(looks_like_packaging_bug(
+            "Could not find platform independent libraries <prefix>"
+        ));
+        // A normal failure must not be mistaken for a packaging bug.
+        assert!(!looks_like_packaging_bug(
+            "create venv failed: [Errno 13] Permission denied"
+        ));
+        assert!(!looks_like_packaging_bug(
+            "Failed to establish a new connection"
+        ));
+    }
+
+    #[test]
+    fn packaging_bug_serializes_to_snake_case() {
+        // The frontend matches this exact string in its SidecarErrorKind union.
+        let v = serde_json::to_value(SidecarStatus::Error {
+            message: "boom".into(),
+            kind: SidecarErrorKind::PackagingBug,
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "packaging_bug");
     }
 
     #[test]

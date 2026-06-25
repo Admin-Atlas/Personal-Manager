@@ -357,6 +357,7 @@ export type SidecarErrorKind =
   | "python_missing"
   | "pip_failed"
   | "requirements_missing"
+  | "packaging_bug"
   | "unknown";
 
 /** Lifecycle of the Python document engine (sidecar). */

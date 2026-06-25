@@ -5,7 +5,7 @@
     "resources": {
       "../sidecar/pm_sidecar.py": "sidecar/pm_sidecar.py",
       "../sidecar/requirements.txt": "sidecar/requirements.txt",
-      "python/**/*": "python/"
+      "python": "python"
     }
   }
 }

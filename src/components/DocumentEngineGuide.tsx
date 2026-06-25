@@ -6,10 +6,18 @@
 // banner), turning the backend's machine-readable failure `kind` into a short,
 // OS-aware fix-it guide. The raw error is tucked into a "Technical details"
 // disclosure for diagnosis. Built entirely from existing ui primitives.
+//
+// One failure class is special: `packaging_bug` means the Python that ships
+// inside PM is incomplete (a defect on our side, not the user's environment), so
+// the primary action becomes "report it" rather than "retry" or "fix your setup".
 
 import { Button, Card, Collapsible, Modal } from "./ui";
+import { useDepth } from "../theme";
 import type { SidecarStatus } from "../lib/types";
+import { CHANGELOG } from "../lib/changelog";
 import { guideFor, IS_MAC, type SetupGuideMode } from "../lib/setupGuide";
+
+const REPO_URL = "https://github.com/Admin-Atlas/Personal-Manager";
 
 interface Props {
   open: boolean;
@@ -38,12 +46,39 @@ function withCode(text: string) {
   );
 }
 
+/** Pre-fill a GitHub issue for a packaging bug: the app version and the captured
+ *  engine output, and nothing from the user's documents. */
+function buildReportUrl(detail: string | null): string {
+  const version = CHANGELOG[0]?.version ?? "unknown";
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "unknown";
+  const title = `Windows: document engine failed to start (bundled Python incomplete) — v${version}`;
+  const body = [
+    "**What happened**",
+    "PM's document engine couldn't start, and PM classified it as a packaging bug.",
+    "",
+    `- **PM version:** ${version}`,
+    `- **System:** ${ua}`,
+    "",
+    "**Engine output**",
+    "```",
+    (detail ?? "(none captured)").slice(0, 4000),
+    "```",
+  ].join("\n");
+  return `${REPO_URL}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+}
+
 export function DocumentEngineGuide({ open, onClose, status, busy, onRetry }: Props) {
+  const { showPower } = useDepth();
   const isError = status?.state === "error";
-  const mode: SetupGuideMode = status?.state === "error" ? status.kind : "install";
+  const kind = status?.state === "error" ? status.kind : null;
+  const isPackagingBug = kind === "packaging_bug";
+  const mode: SetupGuideMode = isError ? status.kind : "install";
   const guide = guideFor(mode, IS_MAC);
   const actionLabel = isError ? "Retry setup" : "Set it up now";
   const rawMessage = status?.state === "error" ? status.message : null;
+  // A packaging bug isn't locally fixable — route the user to a pre-filled report
+  // instead of sending them to chase a fix that can't work.
+  const reportUrl = isPackagingBug ? buildReportUrl(rawMessage) : null;
 
   return (
     <Modal
@@ -78,19 +113,52 @@ export function DocumentEngineGuide({ open, onClose, status, busy, onRetry }: Pr
 
         {rawMessage && (
           <div className="mt-4">
-            <Collapsible title="Technical details" defaultOpen={false}>
+            <Collapsible title="Technical details" defaultOpen={showPower}>
               <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
                 {rawMessage}
               </pre>
             </Collapsible>
           </div>
         )}
+
+        {isPackagingBug && showPower && (
+          <div className="mt-4">
+            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink4">
+              Diagnostic commands
+            </p>
+            <pre className="overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
+              {[
+                "# list the bundled interpreter's files",
+                'Get-ChildItem -Recurse "$env:LOCALAPPDATA\\PM\\python" | Select FullName',
+                "",
+                "# confirm it can import its own standard library",
+                '& "$env:LOCALAPPDATA\\PM\\python\\python.exe" -c "import encodings, venv, ssl"',
+              ].join("\n")}
+            </pre>
+          </div>
+        )}
       </div>
 
-      <div className="flex items-center justify-end border-t border-border px-6 py-4">
-        <Button variant="primary" onClick={onRetry} disabled={busy}>
-          {busy ? "Working…" : actionLabel}
-        </Button>
+      <div className="flex items-center justify-end gap-2 border-t border-border px-6 py-4">
+        {reportUrl ? (
+          <>
+            <Button variant="tertiary" onClick={onRetry} disabled={busy}>
+              {busy ? "Working…" : "Retry anyway"}
+            </Button>
+            <a
+              href={reportUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center justify-center gap-1.5 rounded-[var(--radius-sm)] bg-accent px-3 py-1.5 text-sm font-semibold text-accent-ink transition hover:brightness-105"
+            >
+              Report on GitHub
+            </a>
+          </>
+        ) : (
+          <Button variant="primary" onClick={onRetry} disabled={busy}>
+            {busy ? "Working…" : actionLabel}
+          </Button>
+        )}
       </div>
     </Modal>
   );
