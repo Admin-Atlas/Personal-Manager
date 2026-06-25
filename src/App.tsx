@@ -14,6 +14,7 @@ import { LockScreen } from "./components/LockScreen";
 import { PinboardView } from "./components/PinboardView";
 import { ProjectView } from "./components/ProjectView";
 import { ReviewView } from "./components/ReviewView";
+import { TeachView } from "./components/TeachView";
 import { Sidebar, type View } from "./components/Sidebar";
 import { SettingsView } from "./components/SettingsView";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -24,6 +25,7 @@ import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { useChatStream } from "./lib/useChatStream";
 import { useUpdater } from "./lib/useUpdater";
+import { useTheme } from "./theme";
 
 const LAST_SEEN_VERSION_KEY = "pm:lastSeenVersion";
 import {
@@ -83,6 +85,12 @@ export default function App() {
   // conversation currently on screen.
   const chat = useChatStream(() => activeIdRef.current);
   const update = useUpdater();
+  const { teachVisible } = useTheme();
+  // If the Teach tab gets hidden (minimalist preset, or turned off in Settings) while it's open,
+  // fall back to Focus so the user is never stranded on a view with no nav entry.
+  useEffect(() => {
+    if (view === "teach" && !teachVisible) setView("focus");
+  }, [view, teachVisible]);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [showWhatsNew, setShowWhatsNew] = useState(false);
   const [helpMode, setHelpModeState] = useState(false);
@@ -415,6 +423,10 @@ export default function App() {
           ) : view === "review" ? (
             <main className="flex h-full flex-1 flex-col">
               <ReviewView onChanged={refreshReviewCount} />
+            </main>
+          ) : view === "teach" ? (
+            <main className="flex h-full flex-1 flex-col">
+              <TeachView />
             </main>
           ) : view === "graph" ? (
             <main className="flex h-full flex-1 flex-col">

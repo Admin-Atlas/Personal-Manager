@@ -12,6 +12,7 @@ import type {
   CostSummary,
   DailyBriefing,
   Document,
+  Entity,
   GoogleCalendar,
   IcsFeedInfo,
   Importance,
@@ -284,6 +285,31 @@ export const setDocumentMetadata = (
   tags: string[],
   importance: Importance,
 ) => invoke<Document>("set_document_metadata", { documentId, project, tags, importance });
+
+// --- Canonical entities (the Teach tab; entity-resolution foundation) ---
+
+/** Project entities with their aliases (the Teach tab's list). */
+export const listEntities = (kind?: string) =>
+  invoke<Entity[]>("list_entities", { kind: kind ?? null });
+
+/** Record a forward-going alias for a project entity. Rejected (not folded) if the alias
+ *  already belongs to another project — that's a merge. */
+export const addEntityAlias = (entityId: number, alias: string) =>
+  invoke<void>("add_entity_alias", { entityId, alias });
+
+/** Rename a canonical project — a one-row identity update that also rewrites its documents'
+ *  vault frontmatter + cache to the new name. */
+export const renameEntity = (entityId: number, newName: string) =>
+  invoke<void>("rename_entity", { entityId, newName });
+
+/** Merge `fromId` into `intoId`: fold aliases, repoint every document, delete the source.
+ *  The headline action — folds a name variant into its canonical so it never recurs. */
+export const mergeEntities = (fromId: number, intoId: number) =>
+  invoke<void>("merge_entities", { fromId, intoId });
+
+/** Point one document at a different existing entity — the misfile/reassignment case. */
+export const reassignDocument = (documentId: number, entityId: number) =>
+  invoke<void>("reassign_document", { documentId, entityId });
 
 // --- Personal Assistant: focus view & projects (Step 5, spec §4) ---
 

@@ -233,6 +233,18 @@ export type ReviewEvent =
   | { type: "proposed"; document_id: number; proposal: MetadataProposal }
   | { type: "finished"; proposed: number };
 
+// --- Canonical entities (the Teach tab; entity-resolution foundation) ---
+
+/** A canonical entity with its known aliases — the unit the Teach tab manages. `type` is
+ *  "project" today (the schema reserves "person"/"thing"). The canonical name is itself one of
+ *  `aliases` (stored as a self-alias), so every name a document was filed under is listed. */
+export interface Entity {
+  id: number;
+  type: string;
+  canonical_name: string;
+  aliases: string[];
+}
+
 // --- Personal Assistant: focus view & projects (Step 5, spec §4.1) ---
 
 /** The one status a project shows in the focus view. Exactly one applies. */

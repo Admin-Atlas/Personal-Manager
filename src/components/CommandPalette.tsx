@@ -6,7 +6,7 @@ import { listConversations, listDocuments, listProjectOverviews } from "../lib/i
 import type { Conversation, Document, ProjectOverview } from "../lib/types";
 import type { View } from "./Sidebar";
 import { STATUS_LABEL } from "./ui";
-import { useDepth } from "../theme";
+import { useDepth, useTheme } from "../theme";
 
 interface Props {
   onClose: () => void;
@@ -51,6 +51,7 @@ const NAV_DESTS: { label: string; view: View }[] = [
   { label: "Chat", view: "chat" },
   { label: "Documents", view: "documents" },
   { label: "Review", view: "review" },
+  { label: "Teach", view: "teach" },
   { label: "Map", view: "graph" },
   { label: "Pinboard", view: "pinboard" },
 ];
@@ -68,6 +69,8 @@ export function CommandPalette({
   onOpenSettings,
 }: Props) {
   const { showPower } = useDepth();
+  // The Teach destination is only offered when the tab is visible (same Depth/Settings gate).
+  const { teachVisible } = useTheme();
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const [projects, setProjects] = useState<ProjectOverview[]>([]);
@@ -144,7 +147,7 @@ export function CommandPalette({
     }));
 
     const gotoItems: PaletteItem[] = [
-      ...NAV_DESTS.map((dest) => ({
+      ...NAV_DESTS.filter((dest) => dest.view !== "teach" || teachVisible).map((dest) => ({
         id: `goto:${dest.view}`,
         kind: "goto" as const,
         label: dest.label,
@@ -167,7 +170,7 @@ export function CommandPalette({
     ];
 
     return [...projectItems, ...fileItems, ...convItems, ...gotoItems];
-  }, [projects, docs, convs]);
+  }, [projects, docs, convs, teachVisible]);
 
   // Filter + rank against the query, then regroup in display order. With a query,
   // each group is ordered by match score (best first); empty query keeps the
