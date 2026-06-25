@@ -32,6 +32,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Review",
     body: "The sorting queue. For each new document PM proposes a project, tags, and an importance level — you approve or correct them. Your corrections teach PM how you organise (see Learning You in Settings).",
   },
+  "nav-teach": {
+    title: "Teach",
+    body: "Where you teach PM how your projects are named. Merge a name variant into the real project so it stops reappearing, rename a project everywhere at once, or add a name you know means the same thing — the same thing correcting a project in Review does, just directly. On for the Standard and Power presets; toggle it under Settings → Appearance.",
+  },
   "nav-graph": {
     title: "Map",
     body: "A visual graph of your documents grouped by project. Each project is a hub; the documents around it are its files. Hover any document node to see its details.",
@@ -51,6 +55,28 @@ export const HELP: Record<string, HelpEntry> = {
   "sidebar-search": {
     title: "Search",
     body: "Opens the command palette — a quick-jump to any project, file, or past conversation. You can also open it anytime with Ctrl+K (⌘K on a Mac).",
+  },
+
+  // Teach (entity resolution)
+  "teach-intro": {
+    title: "Teach",
+    body: "PM keeps one canonical name per project, and remembers the other names you've filed things under as aliases. Here you manage them directly — merge, rename, and add names — so the same project never shows up two ways again.",
+  },
+  "teach-entity": {
+    title: "A project",
+    body: "One project PM knows, with the doc count and every other name that resolves to it. Rename it (changes it on every document at once), merge it into another project, or add another name that means the same thing.",
+  },
+  "teach-suggestions": {
+    title: "Look-alikes",
+    body: "Projects whose names are identical once spacing, punctuation, and capitalisation are ignored — likely the same thing filed two ways. Merging folds one into the other so the duplicate stops appearing.",
+  },
+  "teach-future": {
+    title: "Coming here later",
+    body: "Over time, more of how you guide PM — like your Learning You profile — will gather in this one place.",
+  },
+  "settings-teach-tab": {
+    title: "Teach tab",
+    body: "Show or hide the Teach tab in the sidebar. It's on for the Standard and Power presets and off for Minimal — but you can override that here. Hiding it only hides the editor; PM still applies the naming rules you've already taught it.",
   },
 
   // Command palette (Step 5b)

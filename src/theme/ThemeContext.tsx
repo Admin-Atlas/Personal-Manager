@@ -26,11 +26,20 @@ export interface ThemeState {
   setMode: (m: Mode) => void;
   setAccent: (a: string) => void;
   setDepth: (d: Depth) => void;
+  /** Whether the Teach tab is shown — a Depth-keyed feature reveal the user can override. */
+  teachVisible: boolean;
+  setTeachVisible: (v: boolean) => void;
 }
 
 const DEFAULT_SYSTEM: System = "editorial";
 const DEFAULT_MODE: Mode = "dark";
 const DEFAULT_DEPTH: Depth = "standard";
+
+// The Teach-tab visibility override: "auto" follows the Depth preset (hidden for minimalist,
+// shown for standard/power); "show"/"hide" are explicit choices made from Settings.
+type TeachPref = "auto" | "show" | "hide";
+const TEACH_PREFS: readonly TeachPref[] = ["auto", "show", "hide"];
+const DEFAULT_TEACH: TeachPref = "auto";
 
 const KEY = {
   system: "pm:theme:system",
@@ -38,6 +47,7 @@ const KEY = {
   accent: "pm:theme:accent",
   depth: "pm:theme:depth",
   accentBySystem: "pm:theme:accentBySystem",
+  teach: "pm:theme:teach",
 };
 
 // localStorage can throw (locked-down webviews); never let a theme read/write crash the app.
@@ -89,6 +99,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       ? stored
       : defaultAccentFor(initialSystem);
   });
+  const [teachPref, setTeachPrefState] = useState<TeachPref>(() =>
+    oneOf(read(KEY.teach), TEACH_PREFS, DEFAULT_TEACH),
+  );
 
   // Was localStorage empty at boot? If so this is likely a fresh machine (or a
   // restored data folder), so the stored blob should win on hydration. Computed once,
@@ -155,6 +168,15 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.accentBySystem, JSON.stringify(map));
   }
 
+  // The Teach tab is a Depth-keyed feature reveal — hidden for minimalist, shown for
+  // standard/power — until the user makes an explicit choice in Settings, which then wins.
+  const teachVisible = teachPref === "auto" ? depth !== "min" : teachPref === "show";
+  function setTeachVisible(visible: boolean): void {
+    const pref: TeachPref = visible ? "show" : "hide";
+    setTeachPrefState(pref);
+    write(KEY.teach, pref);
+  }
+
   // Apply + persist whenever an axis changes (also runs on mount → themed first paint).
   // localStorage is the fast path; the store is mirrored once hydration has run so the
   // theme survives a folder backup/transfer.
@@ -181,6 +203,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setMode: setModeState,
     setAccent,
     setDepth: setDepthState,
+    teachVisible,
+    setTeachVisible,
   };
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

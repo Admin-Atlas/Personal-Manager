@@ -2,10 +2,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { Conversation } from "../lib/types";
-import { useDepth } from "../theme";
+import { useDepth, useTheme } from "../theme";
 import { NavItem } from "./ui";
 
-export type View = "focus" | "project" | "chat" | "documents" | "review" | "graph" | "pinboard";
+export type View =
+  | "focus"
+  | "project"
+  | "chat"
+  | "documents"
+  | "review"
+  | "teach"
+  | "graph"
+  | "pinboard";
 
 /** The command-palette shortcut hint shown in the sidebar (⌘ on macOS). */
 const SHORTCUT_HINT =
@@ -47,6 +55,9 @@ export function Sidebar({
   backgroundFallbacks,
 }: Props) {
   const { showMeta } = useDepth();
+  // The Teach tab is a Depth-keyed feature reveal (hidden for the minimalist preset), overridable
+  // in Settings. Hiding it hides only the editor — deterministic alias resolution keeps running.
+  const { teachVisible } = useTheme();
   return (
     <aside className="flex h-full w-64 flex-col border-r border-border bg-panel">
       <div className="flex items-center justify-between px-4 py-3">
@@ -108,6 +119,11 @@ export function Sidebar({
         >
           Review
         </NavItem>
+        {teachVisible && (
+          <NavItem active={view === "teach"} onClick={() => onNavigate("teach")} helpId="nav-teach">
+            Teach
+          </NavItem>
+        )}
         <NavItem active={view === "graph"} onClick={() => onNavigate("graph")} helpId="nav-graph">
           Map
         </NavItem>
