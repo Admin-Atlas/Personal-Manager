@@ -1,39 +1,64 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The model gateway (spec §21.4 — retrieval foundation, PR 1): the single chokepoint every
-//! external model-inference call routes through. Today it just forwards to the sidecar — it is
-//! deliberately the *seam*, not the cache. Caching, batching, retries, cost caps, and provider
-//! swaps will live here later without touching call sites. Model ids come from the registry, so
-//! the pipeline references a *role* (the active embedder / reranker), never a hardcoded name.
+//! The model gateway (spec §21.4 — retrieval foundation): the single chokepoint every external
+//! model-inference call routes through. It forwards to the sidecar and applies the registry's
+//! model semantics (the asymmetric retrieval prefixes), so call sites stay model-agnostic.
+//! Caching, batching, retries, cost caps, and provider swaps will live here later without touching
+//! call sites.
+//!
+//! A gateway carries the **resolved** models for an operation — the vault's selected embedder and
+//! the reranker paired with it (`registry::reranker_for`). The caller resolves them once (a short
+//! `db::selected_embedder` read) and hands them in, so the gateway never needs the DB lock and can
+//! be used for the off-lock rerank. Cheap to construct per operation.
 
 use crate::error::Result;
-use crate::registry;
+use crate::registry::{self, EmbedRole, ModelEntry};
 use crate::retrieval::Reranker;
 use crate::sidecar::SidecarManager;
 use crate::splitter::TokenCounter;
 
-/// A borrow of the sidecar with the registry-driven model roles resolved. Cheap to construct
-/// ([`crate::AppState::gateway`]), so callers make one per operation rather than storing it.
+/// A borrow of the sidecar plus this operation's resolved embedder + reranker.
 pub struct ModelGateway<'a> {
     sidecar: &'a SidecarManager,
+    embedder: ModelEntry,
+    reranker: ModelEntry,
 }
 
 impl<'a> ModelGateway<'a> {
-    pub fn new(sidecar: &'a SidecarManager) -> Self {
-        Self { sidecar }
+    /// Build a gateway from an operation's resolved models (the vault's embedder + the reranker
+    /// paired with it via [`registry::reranker_for`]).
+    pub fn new(sidecar: &'a SidecarManager, embedder: ModelEntry, reranker: ModelEntry) -> Self {
+        Self {
+            sidecar,
+            embedder,
+            reranker,
+        }
     }
 
-    /// Embed a batch with the active embedder. PR 1 has exactly one; PR 2 selects the model
-    /// here from the vault's stamp.
-    pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let _embedder = registry::active_embedder();
-        self.sidecar.embed(texts)
+    /// This gateway's resolved embedder — so ingest can read its dimension (the index guard) and
+    /// stamp the vault with it.
+    pub fn embedder(&self) -> &ModelEntry {
+        &self.embedder
+    }
+
+    /// Embed search queries with the active embedder, applying its query-side prefix (e5's
+    /// `query: `; a no-op for symmetric models). Used at query time.
+    pub fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let prefixed = registry::apply_prefix(&self.embedder, EmbedRole::Query, texts);
+        self.sidecar.embed(&prefixed, &self.embedder)
+    }
+
+    /// Embed documents/passages with the active embedder, applying its passage-side prefix (e5's
+    /// `passage: `; a no-op for symmetric models). Used at index time.
+    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let prefixed = registry::apply_prefix(&self.embedder, EmbedRole::Passage, texts);
+        self.sidecar.embed(&prefixed, &self.embedder)
     }
 
     /// Token counts under the active embedder's tokenizer — the splitter sizes chunks by this.
     pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
-        self.sidecar.count_tokens(texts)
+        self.sidecar.count_tokens(texts, &self.embedder)
     }
 }
 
@@ -46,12 +71,16 @@ impl TokenCounter for ModelGateway<'_> {
     }
 }
 
-/// The query-time rerank seam. **Inert in PR 1**: it resolves the active reranker but returns
-/// `None`, leaving the fused order unchanged (no behaviour change for existing users). PR 2
-/// runs the cross-encoder here behind a Settings toggle — stateless, so no Rebuild.
+/// The query-time rerank seam — runs the paired cross-encoder on the candidate passages. It is
+/// **best-effort**: any sidecar failure (e.g. the model is still downloading on first use)
+/// degrades to `Ok(None)`, so the fused order stands and search never breaks. The caller gates
+/// *whether* to rerank (the Settings toggle) by passing the gateway or `None`; when called, this
+/// always executes. Runs off the DB lock (the caller drops the conn guard before reranking).
 impl Reranker for ModelGateway<'_> {
-    fn scores(&self, _query: &str, _passages: &[&str]) -> Result<Option<Vec<f32>>> {
-        let _reranker = registry::active_reranker();
-        Ok(None)
+    fn scores(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+        match self.sidecar.rerank(query, passages, &self.reranker) {
+            Ok(scores) => Ok(Some(scores)),
+            Err(_) => Ok(None),
+        }
     }
 }

@@ -48,10 +48,11 @@ pub struct RetrievalConfig {
 }
 
 impl RetrievalConfig {
-    /// The config this build would produce *now*: embedder fields from the registry, chunk
-    /// fields from the splitter. Compared against a vault's stored stamp on open.
-    pub fn current() -> Self {
-        let embedder = registry::active_embedder();
+    /// The config this build would produce *now* for a **given** embedder: its id + dimension,
+    /// with the chunk fields from the splitter. This is what a vault is stamped with and compared
+    /// against on open — the embedder is per-vault (PR 2), so the caller resolves the vault's
+    /// selection (`db::selected_embedder`) and passes it here.
+    pub fn current_for(embedder: &registry::ModelEntry) -> Self {
         RetrievalConfig {
             version: STAMP_VERSION,
             chunk_target_tokens: splitter::CHUNK_TARGET_TOKENS,
@@ -63,6 +64,14 @@ impl RetrievalConfig {
             dimension: embedder.dimension,
             index_params: "hybrid-rrf-k60-recency90".to_string(),
         }
+    }
+
+    /// The config for the **default** (English) embedder — the build default, used by tests.
+    /// Production resolves the per-vault embedder (`db::selected_embedder`) and calls
+    /// [`current_for`], so this convenience is unused in the lib build itself.
+    #[allow(dead_code)]
+    pub fn current() -> Self {
+        Self::current_for(&registry::active_embedder())
     }
 }
 
@@ -95,5 +104,27 @@ mod tests {
         let mut other = RetrievalConfig::current();
         other.splitter_version += 1;
         assert_ne!(other, RetrievalConfig::current());
+    }
+
+    #[test]
+    fn current_for_takes_the_embedder_id_and_dimension() {
+        let e5 = registry::lookup("intfloat/multilingual-e5-small").unwrap();
+        let cfg = RetrievalConfig::current_for(&e5);
+        assert_eq!(cfg.embedder_id, "intfloat/multilingual-e5-small");
+        assert_eq!(cfg.dimension, 384);
+        // A different embedder ⇒ a different stamp ⇒ a Rebuild is offered.
+        assert_ne!(cfg, RetrievalConfig::current());
+    }
+
+    #[test]
+    fn the_reranker_is_never_in_the_stamp() {
+        // The reranker is query-time/stateless: toggling or swapping it must never change the
+        // stamp (never trigger a Rebuild). Guard the serialized shape so a future field can't
+        // sneak the reranker in.
+        let json = serde_json::to_string(&RetrievalConfig::current()).unwrap();
+        assert!(
+            !json.to_lowercase().contains("rerank"),
+            "the reranker must not appear in the index-time stamp: {json}"
+        );
     }
 }

@@ -12,6 +12,7 @@ import {
   getSettings,
   hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
+  languageOptions,
   openDataFolder,
   refreshLearningProfile,
   refreshPricing,
@@ -22,14 +23,16 @@ import {
   setChatModels,
   setOpenRouterBackgroundKey,
   setOpenRouterKey,
+  setReranking,
   setTimeZone,
+  setVaultEmbedder,
 } from "../lib/ipc";
 import { useHelp } from "../lib/help";
 import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
 import { VaultCard } from "./VaultCard";
-import type { AppLockStatus, CostSummary, LearningProfile } from "../lib/types";
+import type { AppLockStatus, CostSummary, LanguageOptions, LearningProfile } from "../lib/types";
 import { useTheme, useDepth, ACCENTS } from "../theme";
 import { Button, Collapsible, Input, SegmentedControl, Select } from "./ui";
 
@@ -68,6 +71,12 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [vaultMode, setVaultMode] = useState<"device" | "shareable">("device");
   const [vaultPass, setVaultPass] = useState("");
   const [vaultConfirm, setVaultConfirm] = useState("");
+  // Query-time reranking toggle (default on; stateless — never triggers a Rebuild).
+  const [reranking, setRerankingState] = useState(true);
+  // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
+  // non-onboarding shows the current one read-only). Loaded best-effort.
+  const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
+  const [embedderId, setEmbedderId] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -96,9 +105,18 @@ export function SettingsView({ onClose, onboarding }: Props) {
             /* ignore — UTC fallback in the backend */
           }
         }
+        setRerankingState(settings.reranking);
         if (!onboarding) setProfile(await getLearningProfile());
       } catch (e) {
         setError(String(e));
+      }
+      // Search-language options are best-effort: a failure just hides the picker.
+      try {
+        const lo = await languageOptions();
+        setLangOpts(lo);
+        setEmbedderId(lo.selected);
+      } catch {
+        /* ignore — the picker / language line simply won't show */
       }
     })();
   }, [onboarding]);
@@ -126,6 +144,17 @@ export function SettingsView({ onClose, onboarding }: Props) {
       await setAppLock(next);
       setAppLockState((s) => (s ? { ...s, enabled: next } : s));
     } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function toggleReranking(next: boolean) {
+    setError(null);
+    setRerankingState(next); // optimistic — revert if the write fails
+    try {
+      await setReranking(next);
+    } catch (e) {
+      setRerankingState(!next);
       setError(String(e));
     }
   }
@@ -216,6 +245,11 @@ export function SettingsView({ onClose, onboarding }: Props) {
       await setChatAutoSwitch(chatAuto);
       await setBackgroundAutoSwitch(backgroundAuto);
       await setTimeZone(tzAuto ? detectTimeZone() : timeZone);
+      // First-run: record the chosen search language on the still-empty vault (only if the user
+      // changed it from the default). Must happen before any documents exist.
+      if (onboarding && langOpts && embedderId && embedderId !== langOpts.selected) {
+        await setVaultEmbedder(embedderId);
+      }
       // First-run: if the user opted into a shareable vault, convert the fresh (empty)
       // device vault now that the key is saved. Device-only needs nothing — it's default.
       if (onboarding && vaultMode === "shareable") {
@@ -500,6 +534,30 @@ export function SettingsView({ onClose, onboarding }: Props) {
           </div>
         )}
 
+        {onboarding && langOpts && langOpts.options.length > 1 && (
+          <div className="mt-5 border-t border-border pt-4">
+            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+              Search language
+            </label>
+            <p className="mt-1 text-xs text-ink4">
+              How your documents are searched. Choose Multilingual if your notes aren't only in
+              English. Set once per vault — changing it later re-indexes everything.
+            </p>
+            <div className="mt-3">
+              <SegmentedControl
+                value={embedderId}
+                onChange={setEmbedderId}
+                options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
+              />
+            </div>
+            <p className="mt-2 text-xs text-faint">
+              {langOpts.options.find((o) => o.id === embedderId)?.multilingual
+                ? "Multilingual: best for notes across languages. Downloads a larger model on first use."
+                : "English: fastest and smallest — best if your notes are mostly English."}
+            </p>
+          </div>
+        )}
+
         {!onboarding && showMeta && cost && (
           <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
             <div className="flex items-center justify-between">
@@ -614,6 +672,50 @@ export function SettingsView({ onClose, onboarding }: Props) {
         )}
 
         {!onboarding && <CalendarSettings />}
+
+        {!onboarding && (
+          <div className="mt-4 border-t border-border pt-4">
+            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+              Search
+            </label>
+            {langOpts && (
+              <p className="mt-1 text-xs text-ink4">
+                Language:{" "}
+                <span className="text-ink2">
+                  {langOpts.options.find((o) => o.id === langOpts.selected)?.label ?? "English"}
+                </span>
+                . Changing the search language re-indexes your vault — coming in a later update.
+              </p>
+            )}
+            <div className="mt-3 flex items-start justify-between gap-3">
+              <div>
+                <label className="block text-sm font-medium text-ink2">
+                  Re-rank search results
+                </label>
+                <p className="mt-1 text-xs text-ink4">
+                  A second pass re-scores search hits for sharper relevance. First use downloads a
+                  small model; turn off for fastest results.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={reranking}
+                aria-label="Re-rank search results"
+                onClick={() => void toggleReranking(!reranking)}
+                className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                  reranking ? "bg-accent" : "bg-surface"
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                    reranking ? "translate-x-4" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+        )}
 
         {!onboarding && (
           <div

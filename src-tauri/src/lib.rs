@@ -181,11 +181,18 @@ impl AppState {
         self.db.lock().map(|guard| guard.is_some()).unwrap_or(false)
     }
 
-    /// The model gateway for this session — the single seam external model-inference calls
-    /// route through (registry-driven embed / count-tokens / rerank). Borrows the sidecar,
-    /// which self-locks, so it's cheap to make per operation.
-    pub fn gateway(&self) -> model_gateway::ModelGateway<'_> {
-        model_gateway::ModelGateway::new(&self.sidecar)
+    /// Build the model gateway for an operation, resolving this vault's embedder (and the reranker
+    /// paired with it) from an already-open connection. Takes a `&Connection` rather than locking
+    /// `db` itself, so a caller holding the guard doesn't deadlock — and, because the gateway
+    /// captures owned model entries, the caller can drop the guard and still rerank off the lock.
+    pub fn gateway(&self, conn: &Connection) -> error::Result<model_gateway::ModelGateway<'_>> {
+        let embedder = db::selected_embedder(conn)?;
+        let reranker = registry::reranker_for(&embedder);
+        Ok(model_gateway::ModelGateway::new(
+            &self.sidecar,
+            embedder,
+            reranker,
+        ))
     }
 }
 
@@ -270,6 +277,9 @@ pub fn run() {
             commands::set_chat_auto_switch,
             commands::set_background_auto_switch,
             commands::set_help_mode,
+            commands::set_reranking,
+            commands::language_options,
+            commands::set_vault_embedder,
             commands::get_time_zone,
             commands::set_time_zone,
             commands::get_pref,

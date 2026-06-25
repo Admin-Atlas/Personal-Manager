@@ -20,7 +20,8 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
 use crate::error::{Error, Result};
-use crate::registry;
+use crate::model_gateway::ModelGateway;
+use crate::registry::{self, ModelEntry};
 use crate::retrieval_config::RetrievalConfig;
 use crate::splitter::{self, ChunkKind, SplitMeta, Splitter};
 use crate::vault::MarkdownCipher;
@@ -96,6 +97,21 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
     });
     state.sidecar.ensure_installed()?;
 
+    // Resolve this vault's embedder once for the whole run, refuse a dimension the vector index
+    // can't hold (PR 2 keeps every embedder at the frozen 384-d width — changing the dimension is
+    // PR 3's Re-index flow), and build the gateway from it so every chunk is sized and embedded
+    // with the vault's chosen model.
+    let embedder = {
+        let conn = state.conn()?;
+        crate::db::selected_embedder(&conn)?
+    };
+    guard_dimension(&embedder)?;
+    let gateway = ModelGateway::new(
+        &state.sidecar,
+        embedder.clone(),
+        registry::reranker_for(&embedder),
+    );
+
     // The vault's Markdown dir + cipher for this whole run (they don't change mid-run).
     // Snapshotting up front means we never hold the vault lock across a sidecar call.
     let (vault, cipher) = state.markdown_io()?;
@@ -119,7 +135,7 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
             name,
         });
 
-        match ingest_one(&state, &vault, &cipher, &path) {
+        match ingest_one(&state, &gateway, &vault, &cipher, &path) {
             Ok(Outcome::Indexed(document)) => {
                 ingested += 1;
                 let _ = on_event.send(IngestEvent::Done { document });
@@ -143,7 +159,7 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
 
     if was_empty {
         if let Ok(conn) = state.conn() {
-            let _ = crate::db::set_retrieval_stamp(&conn, &RetrievalConfig::current());
+            let _ = crate::db::set_retrieval_stamp(&conn, &RetrievalConfig::current_for(&embedder));
         }
     }
 
@@ -165,6 +181,7 @@ enum Outcome {
 
 fn ingest_one(
     state: &AppState,
+    gateway: &ModelGateway<'_>,
     vault: &Path,
     cipher: &MarkdownCipher,
     path: &Path,
@@ -207,10 +224,10 @@ fn ingest_one(
         (created_at, ingested_at)
     };
 
-    let chunks = split_document(state, &markdown, &title, &content_hash)?;
+    let chunks = split_document(gateway, &markdown, &title, &content_hash)?;
     let texts = leaf_embed_texts(&chunks);
-    let embeddings = state.gateway().embed(&texts)?;
-    check_embeddings(&embeddings, texts.len())?;
+    let embeddings = gateway.embed_documents(&texts)?;
+    check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
 
     // Write the vault file (source of truth) before indexing. A freshly ingested
     // document enters the review queue: project Unsorted, no tags/importance,
@@ -264,6 +281,14 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     });
     state.sidecar.ensure_installed()?;
 
+    // Resolve + guard the embedder before clearing anything, so a dimension the vector index
+    // can't hold fails fast rather than after the store is wiped.
+    let embedder = {
+        let conn = state.conn()?;
+        crate::db::selected_embedder(&conn)?
+    };
+    guard_dimension(&embedder)?;
+
     {
         let conn = state.conn()?;
         // chunk_vec / chunks_fts cascade from chunks via our own inserts, so
@@ -273,6 +298,11 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
         )?;
     }
 
+    let gateway = ModelGateway::new(
+        &state.sidecar,
+        embedder.clone(),
+        registry::reranker_for(&embedder),
+    );
     let (vault, cipher) = state.markdown_io()?;
     let (mut ingested, mut failed) = (0usize, 0usize);
     for entry in std::fs::read_dir(&vault)? {
@@ -287,7 +317,7 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
             path: path.to_string_lossy().into(),
             name,
         });
-        match rebuild_one(&state, &cipher, &path) {
+        match rebuild_one(&state, &gateway, &cipher, &path) {
             Ok(document) => {
                 ingested += 1;
                 let _ = on_event.send(IngestEvent::Done { document });
@@ -306,7 +336,7 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     // this clears the one-time "Rebuild recommended" prompt.
     {
         let conn = state.conn()?;
-        crate::db::set_retrieval_stamp(&conn, &RetrievalConfig::current())?;
+        crate::db::set_retrieval_stamp(&conn, &RetrievalConfig::current_for(&embedder))?;
     }
 
     let _ = on_event.send(IngestEvent::Finished {
@@ -317,7 +347,12 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_one(state: &AppState, cipher: &MarkdownCipher, vault_file: &Path) -> Result<Document> {
+fn rebuild_one(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    cipher: &MarkdownCipher,
+    vault_file: &Path,
+) -> Result<Document> {
     let raw = cipher.read(vault_file)?;
     let (fields, body) = parse_frontmatter(&raw)
         .ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
@@ -331,10 +366,10 @@ fn rebuild_one(state: &AppState, cipher: &MarkdownCipher, vault_file: &Path) -> 
         .cloned()
         .unwrap_or_else(|| "Untitled".into());
 
-    let chunks = split_document(state, body, &title, &content_hash)?;
+    let chunks = split_document(gateway, body, &title, &content_hash)?;
     let texts = leaf_embed_texts(&chunks);
-    let embeddings = state.gateway().embed(&texts)?;
-    check_embeddings(&embeddings, texts.len())?;
+    let embeddings = gateway.embed_documents(&texts)?;
+    check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
 
     let ingested_at = match fields.get("ingested_at").cloned() {
         Some(value) => value,
@@ -465,11 +500,11 @@ fn index_document(
     load_document(&conn, doc_id)
 }
 
-/// Split a document body into chunks with the active splitter, sizing by tokens through the
-/// model gateway (the sidecar's tokenizer). The title + content hash feed the heading
-/// breadcrumb and the stable, rebuild-reproducible chunk uids.
+/// Split a document body into chunks with the active splitter, sizing by tokens through the given
+/// counter (the gateway → the selected embedder's tokenizer). The title + content hash feed the
+/// heading breadcrumb and the stable, rebuild-reproducible chunk uids.
 fn split_document(
-    state: &AppState,
+    counter: &dyn splitter::TokenCounter,
     body: &str,
     title: &str,
     content_hash: &str,
@@ -479,7 +514,7 @@ fn split_document(
         title,
         content_hash,
     };
-    splitter.split(body, &meta, &state.gateway())
+    splitter.split(body, &meta, counter)
 }
 
 /// The text to embed + keyword-index for each leaf chunk (heading-prepended). Parents are
@@ -959,18 +994,33 @@ fn hex_digest(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Guard the index against a model mismatch: one vector per leaf chunk, each of the active
-/// embedder's dimension (read from the registry, never a hardcoded 384).
-fn check_embeddings(embeddings: &[Vec<f32>], leaves: usize) -> Result<()> {
+/// Refuse an embedder whose vector width the vault's `chunk_vec` can't hold. PR 2 keeps every
+/// selectable embedder at the frozen 384-d width, so this only fires defensively — a future
+/// higher-dimension embedder needs PR 3's vec drop+recreate (the Re-index flow) — turning what
+/// would otherwise be a cryptic vec0 insert failure into a clear, early message.
+fn guard_dimension(embedder: &ModelEntry) -> Result<()> {
+    let vec_dim = crate::db::vec0_dim();
+    if embedder.dimension != vec_dim {
+        return Err(Error::Other(format!(
+            "the selected embedder '{}' is {}-dimensional, but this vault's vector index is \
+             {}-dimensional; changing the embedding dimension needs the Re-index flow (a later update)",
+            embedder.id, embedder.dimension, vec_dim
+        )));
+    }
+    Ok(())
+}
+
+/// Guard the index against a model mismatch: one vector per leaf chunk, each of the selected
+/// embedder's dimension (passed in, never a hardcoded 384).
+fn check_embeddings(embeddings: &[Vec<f32>], leaves: usize, expected_dim: usize) -> Result<()> {
     if embeddings.len() != leaves {
         return Err(Error::Other(
             "embedding count did not match leaf-chunk count".into(),
         ));
     }
-    let dim = registry::active_embedder().dimension;
-    if embeddings.iter().any(|v| v.len() != dim) {
+    if embeddings.iter().any(|v| v.len() != expected_dim) {
         return Err(Error::Other(format!(
-            "embedding dimension mismatch (expected {dim}); wrong model?"
+            "embedding dimension mismatch (expected {expected_dim}); wrong model?"
         )));
     }
     Ok(())

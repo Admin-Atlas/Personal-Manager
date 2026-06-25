@@ -94,6 +94,9 @@ pub struct Settings {
     /// The user's IANA time zone (e.g. "Europe/London"), or "" when not yet set —
     /// the focus-view day boundaries and the briefing/agenda "now" reason in it.
     pub time_zone: String,
+    /// Whether query-time reranking is on (a cross-encoder re-scores search hits for sharper
+    /// relevance). Default on; stateless, so toggling it never triggers a Rebuild.
+    pub reranking: bool,
 }
 
 /// Streamed back to the UI over a Tauri channel as the assistant replies.
@@ -156,6 +159,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
             == Some("true"),
         help_mode: db::get_setting(&conn, "help_mode")?.as_deref() == Some("true"),
         time_zone: db::get_setting(&conn, TIME_ZONE_KEY)?.unwrap_or_default(),
+        reranking: db::reranking_enabled(&conn)?,
     })
 }
 
@@ -196,6 +200,81 @@ pub fn set_background_auto_switch(state: State<'_, AppState>, enabled: bool) -> 
 pub fn set_help_mode(state: State<'_, AppState>, enabled: bool) -> Result<()> {
     let conn = state.conn()?;
     db::set_setting(&conn, "help_mode", if enabled { "true" } else { "false" })
+}
+
+/// Turn query-time reranking on or off (a cross-encoder re-scores search hits). Stateless — never
+/// triggers a Rebuild — so this just flips the setting; the effect lands on the next query.
+#[tauri::command]
+pub fn set_reranking(state: State<'_, AppState>, enabled: bool) -> Result<()> {
+    let conn = state.conn()?;
+    db::set_reranking(&conn, enabled)
+}
+
+/// One language/embedder choice offered at vault creation.
+#[derive(Serialize)]
+pub struct LanguageOption {
+    pub id: String,
+    pub label: String,
+    pub multilingual: bool,
+}
+
+/// The vault's search-language choices for the onboarding picker: the selectable embedders, the
+/// current selection, and whether it's locked (the vault already has documents, so changing the
+/// embedder needs PR 3's Re-index flow rather than a silent flip).
+#[derive(Serialize)]
+pub struct LanguageOptions {
+    pub options: Vec<LanguageOption>,
+    pub selected: String,
+    pub locked: bool,
+}
+
+/// The search-language options + current selection for the onboarding picker.
+#[tauri::command]
+pub fn language_options(state: State<'_, AppState>) -> Result<LanguageOptions> {
+    let conn = state.conn()?;
+    let selected = db::selected_embedder(&conn)?.id.to_string();
+    let locked: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?;
+    let options = crate::registry::selectable_embedders()
+        .into_iter()
+        .map(|m| LanguageOption {
+            id: m.id.to_string(),
+            label: m.label.to_string(),
+            multilingual: m.multilingual,
+        })
+        .collect();
+    Ok(LanguageOptions {
+        options,
+        selected,
+        locked,
+    })
+}
+
+/// Choose the vault's embedder (its "search language"). Only valid while the vault is empty —
+/// once documents exist, changing the embedder means re-embedding the whole store (PR 3's
+/// deliberate Re-index flow), not a silent setting flip. Validates the id against the selectable
+/// embedders so an arbitrary/incompatible model can't be stored.
+#[tauri::command]
+pub fn set_vault_embedder(state: State<'_, AppState>, embedder_id: String) -> Result<()> {
+    let conn = state.conn()?;
+    let has_docs: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?;
+    if has_docs {
+        return Err(Error::Other(
+            "the search language can only be chosen for a new vault; re-indexing an existing vault \
+             to a different language is coming in a later update"
+                .into(),
+        ));
+    }
+    if !crate::registry::selectable_embedders()
+        .iter()
+        .any(|m| m.id == embedder_id)
+    {
+        return Err(Error::Other(format!(
+            "'{embedder_id}' is not a selectable embedder"
+        )));
+    }
+    db::set_selected_embedder(&conn, &embedder_id)
 }
 
 /// The stored IANA time zone (empty string = none set; the backend then uses UTC).
@@ -384,9 +463,12 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         let conn = state.conn()?;
         let has_docs: bool =
             conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?;
-        has_docs
-            && crate::db::get_retrieval_stamp(&conn)?.as_ref()
-                != Some(&crate::retrieval_config::RetrievalConfig::current())
+        // Compare against what this build would produce for *this vault's* embedder, so a
+        // multilingual vault isn't wrongly flagged stale against the English default.
+        let current = crate::retrieval_config::RetrievalConfig::current_for(
+            &crate::db::selected_embedder(&conn)?,
+        );
+        has_docs && crate::db::get_retrieval_stamp(&conn)?.as_ref() != Some(&current)
     } else {
         false
     };
@@ -891,12 +973,18 @@ async fn retrieve_grounding(
             return Ok(Vec::new());
         }
 
-        let embeddings = state.gateway().embed(std::slice::from_ref(&query))?;
+        // Resolve the vault's models + the reranking toggle in one short lock, then drop it so
+        // neither the query embed nor the rerank holds the DB lock across a sidecar call (#4).
+        let (gateway, rerank_on) = {
+            let conn = state.conn()?;
+            (state.gateway(&conn)?, crate::db::reranking_enabled(&conn)?)
+        };
+
+        let embeddings = gateway.embed_query(std::slice::from_ref(&query))?;
         let Some(query_vec) = embeddings.into_iter().next() else {
             return Ok(Vec::new());
         };
 
-        let conn = state.conn()?;
         let q = retrieval::RetrieveQuery {
             text: &query,
             embedding: &query_vec,
@@ -907,10 +995,14 @@ async fn retrieve_grounding(
             },
             strategy: retrieval::Strategy::HybridRrf,
         };
-        // The reranker is inert in PR 1 (returns the fused order); PR 2 runs the cross-encoder
-        // here and must do so off the DB lock.
-        let gateway = state.gateway();
-        retrieval::retrieve(&conn, &q, Some(&gateway as &dyn retrieval::Reranker))
+        // Fuse under the lock, then drop it before reranking — the cross-encoder is a sidecar
+        // call that can block on a model download. Reranking off (toggle) skips it entirely.
+        let fused = {
+            let conn = state.conn()?;
+            retrieval::retrieve_fused(&conn, &q)?
+        };
+        let reranker = rerank_on.then_some(&gateway as &dyn retrieval::Reranker);
+        retrieval::rerank(reranker, &query, fused)
     })
     .await;
 
@@ -989,10 +1081,15 @@ pub async fn search_documents(
         let state = app.state::<AppState>();
         state.sidecar.ensure_installed()?;
 
-        let embeddings = state.gateway().embed(std::slice::from_ref(&query))?;
+        // Resolve models + the reranking toggle in one short lock, then drop it so neither the
+        // query embed nor the rerank holds the DB lock across a sidecar call (#4).
+        let (gateway, rerank_on) = {
+            let conn = state.conn()?;
+            (state.gateway(&conn)?, crate::db::reranking_enabled(&conn)?)
+        };
+        let embeddings = gateway.embed_query(std::slice::from_ref(&query))?;
         let query_vec = embeddings.into_iter().next().unwrap_or_default();
 
-        let conn = state.conn()?;
         let q = retrieval::RetrieveQuery {
             text: &query,
             embedding: &query_vec,
@@ -1000,8 +1097,13 @@ pub async fn search_documents(
             filters: retrieval::Filters::default(),
             strategy: retrieval::Strategy::HybridRrf,
         };
-        let gateway = state.gateway();
-        retrieval::retrieve(&conn, &q, Some(&gateway as &dyn retrieval::Reranker))
+        // Fuse under the lock, then rerank off it (the cross-encoder is a sidecar call).
+        let fused = {
+            let conn = state.conn()?;
+            retrieval::retrieve_fused(&conn, &q)?
+        };
+        let reranker = rerank_on.then_some(&gateway as &dyn retrieval::Reranker);
+        retrieval::rerank(reranker, &query, fused)
     })
     .await
     .map_err(|e| Error::Other(format!("search task panicked: {e}")))?

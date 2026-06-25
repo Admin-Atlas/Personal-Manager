@@ -63,6 +63,53 @@ pub fn set_retrieval_stamp(
     set_setting(conn, RETRIEVAL_STAMP_KEY, &json)
 }
 
+/// The `settings` key naming the vault's embedder (seeded by migration v2; chosen at onboarding).
+const EMBEDDING_MODEL_KEY: &str = "embedding_model";
+/// The `settings` key for the query-time reranking toggle (absent ⇒ on).
+const RERANKING_ENABLED_KEY: &str = "reranking_enabled";
+
+/// The embedder this vault indexes with — its stored id resolved against the registry, falling
+/// back to the English default for an unset/unknown value. Per-vault and **index-time**: changing
+/// it (PR 3) re-embeds the vault.
+pub fn selected_embedder(conn: &Connection) -> Result<crate::registry::ModelEntry> {
+    Ok(match get_setting(conn, EMBEDDING_MODEL_KEY)? {
+        Some(id) => crate::registry::embedder_or_default(&id),
+        None => crate::registry::active_embedder(),
+    })
+}
+
+/// Record the vault's embedder selection (onboarding, while the vault is empty). Stores the
+/// canonical model id and its dimension, keeping the long-standing `embedding_model` /
+/// `embedding_dim` rows in step. Caller validates the id is selectable first.
+pub fn set_selected_embedder(conn: &Connection, id: &str) -> Result<()> {
+    let e = crate::registry::embedder_or_default(id);
+    set_setting(conn, EMBEDDING_MODEL_KEY, e.id)?;
+    set_setting(conn, "embedding_dim", &e.dimension.to_string())
+}
+
+/// Whether query-time reranking is on. Default **true** (absent, or anything but `"false"`, ⇒ on),
+/// so existing vaults get reranking after upgrade without needing a settings write.
+pub fn reranking_enabled(conn: &Connection) -> Result<bool> {
+    Ok(get_setting(conn, RERANKING_ENABLED_KEY)?.as_deref() != Some("false"))
+}
+
+/// Turn query-time reranking on or off (stateless — never triggers a Rebuild).
+pub fn set_reranking(conn: &Connection, enabled: bool) -> Result<()> {
+    set_setting(
+        conn,
+        RERANKING_ENABLED_KEY,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// The vector width of `chunk_vec`, frozen at 384 by migration v2 (`float[384]`). PR 2 keeps it
+/// fixed — every selectable embedder is 384-d, so no vec table is recreated — and ingest guards
+/// the selected embedder against it. PR 3 makes the width dynamic (drop+recreate to a new
+/// dimension for higher-dimension embedders); this becomes a read of the live table then.
+pub fn vec0_dim() -> usize {
+    384
+}
+
 /// Distinct project labels across all documents, alphabetical. The one query
 /// behind the review picker, the proposal prompts' "existing projects" list, and
 /// per-project proposals — kept here so those callers can't drift apart.
@@ -431,5 +478,43 @@ mod tests {
             !hits.contains(&parent_id),
             "KNN must never return a structural parent"
         );
+    }
+
+    #[test]
+    fn embedder_selection_and_reranking_toggle_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sel.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        // Fresh vault: migration v2 seeds the English embedder; reranking defaults on.
+        assert_eq!(
+            selected_embedder(&conn).unwrap().id,
+            "BAAI/bge-small-en-v1.5"
+        );
+        assert!(reranking_enabled(&conn).unwrap());
+
+        // Select the multilingual embedder; the id + dimension are recorded.
+        set_selected_embedder(&conn, "intfloat/multilingual-e5-small").unwrap();
+        assert_eq!(
+            selected_embedder(&conn).unwrap().id,
+            "intfloat/multilingual-e5-small"
+        );
+        assert_eq!(
+            get_setting(&conn, "embedding_dim").unwrap().as_deref(),
+            Some("384")
+        );
+
+        // An unknown stored id resolves to the English default rather than breaking ingest.
+        set_setting(&conn, EMBEDDING_MODEL_KEY, "nope/not-a-model").unwrap();
+        assert_eq!(
+            selected_embedder(&conn).unwrap().id,
+            "BAAI/bge-small-en-v1.5"
+        );
+
+        // Reranking toggles off and back on (stateless).
+        set_reranking(&conn, false).unwrap();
+        assert!(!reranking_enabled(&conn).unwrap());
+        set_reranking(&conn, true).unwrap();
+        assert!(reranking_enabled(&conn).unwrap());
     }
 }
