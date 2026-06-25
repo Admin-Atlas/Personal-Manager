@@ -14,6 +14,9 @@ interface Props {
   /** Depth gates: extra cost/capability detail at meta+, the denylist editor at power. */
   showMeta: boolean;
   showPower: boolean;
+  /** Start the section expanded (power depth) or collapsed (min/standard) — the cards/denylist
+   *  are always present, depth only sets the default disclosure state. */
+  defaultExpanded: boolean;
 }
 
 /**
@@ -28,6 +31,7 @@ export function ModelRecommendationCards({
   onUseForBackground,
   showMeta,
   showPower,
+  defaultExpanded,
 }: Props) {
   const [recs, setRecs] = useState<ModelRecommendations | null>(null);
   const [loading, setLoading] = useState(true);
@@ -67,110 +71,112 @@ export function ModelRecommendationCards({
 
   return (
     <div data-help="settings-recommended-models">
-      <div className="flex items-center justify-between">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Recommended models
-        </label>
-        {recs?.stale && (
-          <span
-            title="Couldn't refresh the model list — showing the last known recommendations."
-            aria-label="Recommendations may be out of date"
-            className="font-mono text-[10px] uppercase tracking-wide text-st-due"
-          >
-            may be out of date
-          </span>
-        )}
-      </div>
-      <p className="mt-1 text-xs text-ink4">
-        PM suggests two models from OpenRouter and explains why. Apply either to your chat or
-        background slot above — nothing changes until you Save.
-      </p>
-
-      {loading && (
-        <div className="mt-3 grid gap-3 sm:grid-cols-2">
-          <Skeleton className="h-28 w-full" />
-          <Skeleton className="h-28 w-full" />
-        </div>
-      )}
-
-      {!loading && error && (
-        <p className="mt-3 text-xs text-st-due">
-          Couldn&apos;t load recommendations ({error}). Your chosen models above still work.
+      <Collapsible
+        title="Recommended models"
+        defaultOpen={defaultExpanded}
+        meta={
+          recs?.stale ? (
+            <span
+              title="Couldn't refresh the model list — showing the last known recommendations."
+              aria-label="Recommendations may be out of date"
+              className="font-mono text-[10px] uppercase tracking-wide text-st-due"
+            >
+              may be out of date
+            </span>
+          ) : undefined
+        }
+      >
+        <p className="pt-2 text-xs text-ink4">
+          PM suggests two models from OpenRouter and explains why. Apply either to your chat or
+          background slot above — nothing changes until you Save.
         </p>
-      )}
 
-      {!loading && !error && recs && (
-        <>
-          {!recs.day_to_day && !recs.advanced ? (
-            <p className="mt-3 text-xs text-ink4">
-              No recommendations yet — open this page while online once so PM can fetch the model
-              list.
-            </p>
-          ) : (
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-              <RecCard
-                slot="Day-to-day"
-                tagline="Cheapest reliable — high-volume, low-risk"
-                rec={recs.day_to_day}
-                zdr={recs.zdr_enforced}
-                showMeta={showMeta}
-                onUseForChat={onUseForChat}
-                onUseForBackground={onUseForBackground}
-              />
-              <RecCard
-                slot="Advanced"
-                tagline="Highest faithfulness — high-stakes chat"
-                rec={recs.advanced}
-                zdr={recs.zdr_enforced}
-                showMeta={showMeta}
-                onUseForChat={onUseForChat}
-                onUseForBackground={onUseForBackground}
-              />
-            </div>
-          )}
+        {loading && (
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <Skeleton className="h-28 w-full" />
+            <Skeleton className="h-28 w-full" />
+          </div>
+        )}
 
-          {showPower && (
-            <div className="mt-3">
-              <Collapsible title="Recommendation exclusions">
-                <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
-                  <p>
-                    Every PM request is sent with{" "}
-                    <span className="font-mono text-ink4">zero-data-retention</span> enforced, so a
-                    provider can&apos;t store or train on your prompts — this is the real boundary,
-                    applied to whichever model you pick. (OpenRouter exposes no per-model
-                    data-retention flag, so PM enforces it per request rather than guessing from a
-                    list.)
-                  </p>
-                  <p>
-                    The list below only removes models from the two suggestions above — it does not
-                    block a model you pick yourself (ZDR already protects every request). One slug
-                    per line, e.g. <span className="font-mono text-ink4">openai</span> or{" "}
-                    <span className="font-mono text-ink4">openai/gpt-5.5</span>.
-                  </p>
-                </div>
-                <div className="mt-2">
-                  <Textarea
-                    value={denyText}
-                    onChange={(e) => setDenyText(e.target.value)}
-                    placeholder="provider-or-model slugs, one per line"
-                    className="h-20 font-mono text-xs"
-                  />
-                  <div className="mt-1 flex justify-end">
-                    <Button
-                      variant="tertiary"
-                      onClick={saveDenylist}
-                      disabled={savingDeny}
-                      className="px-2 py-0.5 text-xs"
-                    >
-                      {savingDeny ? "Saving…" : "Save exclusions"}
-                    </Button>
+        {!loading && error && (
+          <p className="mt-3 text-xs text-st-due">
+            Couldn&apos;t load recommendations ({error}). Your chosen models above still work.
+          </p>
+        )}
+
+        {!loading && !error && recs && (
+          <>
+            {!recs.day_to_day && !recs.advanced ? (
+              <p className="mt-3 text-xs text-ink4">
+                No recommendations yet — open this page while online once so PM can fetch the model
+                list.
+              </p>
+            ) : (
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <RecCard
+                  slot="Day-to-day"
+                  tagline="Cheapest reliable — high-volume, low-risk"
+                  rec={recs.day_to_day}
+                  zdr={recs.zdr_enforced}
+                  showMeta={showMeta}
+                  onUseForChat={onUseForChat}
+                  onUseForBackground={onUseForBackground}
+                />
+                <RecCard
+                  slot="Advanced"
+                  tagline="Highest faithfulness — high-stakes chat"
+                  rec={recs.advanced}
+                  zdr={recs.zdr_enforced}
+                  showMeta={showMeta}
+                  onUseForChat={onUseForChat}
+                  onUseForBackground={onUseForBackground}
+                />
+              </div>
+            )}
+
+            {showPower && (
+              <div className="mt-3">
+                <Collapsible title="Recommendation exclusions">
+                  <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
+                    <p>
+                      Every PM request is sent with{" "}
+                      <span className="font-mono text-ink4">zero-data-retention</span> enforced, so
+                      a provider can&apos;t store or train on your prompts — this is the real
+                      boundary, applied to whichever model you pick. (OpenRouter exposes no
+                      per-model data-retention flag, so PM enforces it per request rather than
+                      guessing from a list.)
+                    </p>
+                    <p>
+                      The list below only removes models from the two suggestions above — it does
+                      not block a model you pick yourself (ZDR already protects every request). One
+                      slug per line, e.g. <span className="font-mono text-ink4">openai</span> or{" "}
+                      <span className="font-mono text-ink4">openai/gpt-5.5</span>.
+                    </p>
                   </div>
-                </div>
-              </Collapsible>
-            </div>
-          )}
-        </>
-      )}
+                  <div className="mt-2">
+                    <Textarea
+                      value={denyText}
+                      onChange={(e) => setDenyText(e.target.value)}
+                      placeholder="provider-or-model slugs, one per line"
+                      className="h-20 font-mono text-xs"
+                    />
+                    <div className="mt-1 flex justify-end">
+                      <Button
+                        variant="tertiary"
+                        onClick={saveDenylist}
+                        disabled={savingDeny}
+                        className="px-2 py-0.5 text-xs"
+                      >
+                        {savingDeny ? "Saving…" : "Save exclusions"}
+                      </Button>
+                    </div>
+                  </div>
+                </Collapsible>
+              </div>
+            )}
+          </>
+        )}
+      </Collapsible>
     </div>
   );
 }
