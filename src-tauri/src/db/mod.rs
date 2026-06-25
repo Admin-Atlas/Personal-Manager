@@ -685,4 +685,115 @@ mod tests {
         );
         assert_eq!(vec0_dim(&conn).unwrap(), 1024);
     }
+
+    #[test]
+    fn migration_v10_backfills_one_entity_per_project_no_auto_merge() {
+        // The canonical-entity backfill, exercised over a realistic v9→v10 upgrade: tear the v10
+        // tables back down to a v9-shaped store, seed it with documents carrying name variants,
+        // then re-run migrations so the real backfill processes them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v10.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_documents_entity; \
+             DROP TABLE entity_aliases; \
+             DROP TABLE entities; \
+             ALTER TABLE documents DROP COLUMN entity_id; \
+             ALTER TABLE projects  DROP COLUMN entity_id; \
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+
+        // Two "PM" docs, one "Atlas - PM" variant of the same project, one "Research"; plus a
+        // triage row and a stray chunk vector (to prove the metadata migration leaves vectors be).
+        for (vp, hash, project) in [
+            ("a.md", "ha", "PM"),
+            ("b.md", "hb", "Atlas - PM"),
+            ("c.md", "hc", "Research"),
+            ("d.md", "hd", "PM"),
+        ] {
+            conn.execute(
+                "INSERT INTO documents(vault_path, title, content_hash, project) VALUES (?1,'T',?2,?3)",
+                params![vp, hash, project],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO projects(name) VALUES ('Research')", [])
+            .unwrap();
+        let vec = format!("[{}]", vec!["0.1"; 384].join(", "));
+        conn.execute(
+            "INSERT INTO chunk_vec(rowid, embedding) VALUES (1, ?1)",
+            params![vec],
+        )
+        .unwrap();
+
+        migrations::run(&conn).unwrap();
+
+        // No document is left unresolved.
+        let null_ids: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE entity_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_ids, 0, "every document must resolve to an entity");
+
+        // One entity per distinct project string + the always-seeded 'Unsorted' (NO auto-merge of
+        // the variant into PM — that is the user's call via the Teach tab).
+        let names: Vec<String> = {
+            let mut s = conn
+                .prepare("SELECT canonical_name FROM entities WHERE type='project' ORDER BY canonical_name")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(names, vec!["Atlas - PM", "PM", "Research", "Unsorted"]);
+
+        // Each canonical is its own self-alias; the two PM docs share one entity, the variant has
+        // its own, and the triage row was attached to the same entity by name.
+        let pm: i64 = conn
+            .query_row(
+                "SELECT entity_id FROM entity_aliases WHERE alias='PM'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let variant: i64 = conn
+            .query_row(
+                "SELECT entity_id FROM entity_aliases WHERE alias='Atlas - PM'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(pm, variant);
+        let pm_docs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE entity_id=?1",
+                params![pm],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pm_docs, 2);
+        let research_entity: Option<i64> = conn
+            .query_row(
+                "SELECT entity_id FROM projects WHERE name='Research'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            research_entity.is_some(),
+            "triage row attached to its entity"
+        );
+
+        // The vector index is untouched — a metadata migration must never disturb embeddings.
+        let vecs: i64 = conn
+            .query_row("SELECT count(*) FROM chunk_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 1, "chunk vectors must survive the entity migration");
+    }
 }

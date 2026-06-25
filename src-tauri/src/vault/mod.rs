@@ -524,12 +524,13 @@ pub fn open_with_passphrase(
 /// Decide how to open a vault at boot from its metadata. Device vaults open with the
 /// keychain key (today's path). Passphrase vaults open only if this profile has the
 /// derived key cached; otherwise return `None` so the store stays locked and the UI
-/// prompts for the passphrase. On success also returns the policy-aware Markdown
-/// cipher, so the caller can serve the active session's ingest/rewrite IO.
+/// prompts for the passphrase. On success also returns the resolved 32-byte master, from
+/// which the caller builds the session runtime (the Markdown cipher *and* the always-on
+/// rules cipher are both subkeys of it).
 pub fn open_at_boot(
     resolved: &ResolvedVault,
     meta: &VaultMeta,
-) -> Result<Option<(Connection, MarkdownCipher)>> {
+) -> Result<Option<(Connection, Zeroizing<[u8; KEY_LEN]>)>> {
     let key = match meta.key_mode {
         KeyMode::Device => secrets::get_or_create_db_key()?,
         KeyMode::Passphrase => match secrets::get_cached_vault_key(&meta.vault_id)? {
@@ -539,8 +540,7 @@ pub fn open_at_boot(
     };
     let conn = db::open(&resolved.db_path, key.expose())?;
     let master = master_from_db_key_hex(key.expose())?;
-    let cipher = MarkdownCipher::from_meta(meta, &master);
-    Ok(Some((conn, cipher)))
+    Ok(Some((conn, master)))
 }
 
 #[cfg(test)]

@@ -362,6 +362,10 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
         crate::db::set_retrieval_stamp(&conn, &RetrievalConfig::current_for(&embedder))?;
     }
 
+    // Rebuild re-resolved every document's entity from its frontmatter canonical; push any
+    // resulting entity change out to the portable rules file (a no-op when nothing changed).
+    state.sync_entity_rules();
+
     let _ = on_event.send(IngestEvent::Finished {
         ingested,
         skipped: 0,
@@ -449,11 +453,15 @@ fn index_document(
 
     let tags_json =
         serde_json::to_string(&meta.tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
+    // Resolve the document's entity from its canonical project name (creating one only if it is a
+    // genuinely new project — "Unsorted" and any reviewed canonical already exist). On a rebuild
+    // this is what reassigns `entity_id` from the frontmatter name (the ids are an index detail).
+    let entity_id = crate::entities::resolve_project(&tx, &meta.project, true)?;
     tx.execute(
         "INSERT INTO documents \
          (source_path, vault_path, title, content_hash, ext, byte_size, created_at, ingested_at, \
-          project, tags, importance, reviewed, last_activity) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          project, tags, importance, reviewed, last_activity, entity_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             meta.source_path,
             meta.vault_path,
@@ -468,6 +476,7 @@ fn index_document(
             meta.importance,
             meta.reviewed as i64,
             meta.last_activity,
+            entity_id,
         ],
     )?;
     let doc_id = tx.last_insert_rowid();

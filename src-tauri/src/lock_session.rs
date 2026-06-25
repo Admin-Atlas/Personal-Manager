@@ -92,14 +92,8 @@ fn reopen_store(app: &AppHandle) -> Result<()> {
     let Some(meta) = vault::load_meta(&resolved.vault_root)? else {
         return Ok(());
     };
-    if let Some((conn, cipher)) = vault::open_at_boot(&resolved, &meta)? {
-        state.open_session(
-            conn,
-            VaultRuntime {
-                markdown_dir: resolved.markdown_dir.clone(),
-                cipher,
-            },
-        )?;
+    if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
+        state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
     }
     Ok(())
 }
