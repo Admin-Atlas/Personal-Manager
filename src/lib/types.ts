@@ -46,13 +46,14 @@ export interface LanguageOption {
   multilingual: boolean;
 }
 
-/** The vault's search-language choices for the onboarding picker: the selectable embedders, the
- *  current selection, and whether it's locked (the vault already has documents, so the embedder
- *  is fixed until the Re-index flow ships). */
+/** The vault's search-language choices (onboarding picker + Settings switcher): the selectable
+ *  embedders, the current selection, and whether the vault already has documents. `has_documents`
+ *  is true when switching the language means a re-index (the UI confirms + runs the guided
+ *  Re-index) rather than a free choice on an empty vault. */
 export interface LanguageOptions {
   options: LanguageOption[];
   selected: string;
-  locked: boolean;
+  has_documents: boolean;
 }
 
 /** State of the optional biometric app-lock (a soft UI gate; the store is encrypted at

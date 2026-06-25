@@ -97,15 +97,17 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
     });
     state.sidecar.ensure_installed()?;
 
-    // Resolve this vault's embedder once for the whole run, refuse a dimension the vector index
-    // can't hold (PR 2 keeps every embedder at the frozen 384-d width — changing the dimension is
-    // PR 3's Re-index flow), and build the gateway from it so every chunk is sized and embedded
-    // with the vault's chosen model.
+    // Resolve this vault's embedder once for the whole run and refuse a width the live vector index
+    // can't hold: incremental ingest can't resize the table, so a vault whose selected language no
+    // longer matches its index (switched but not yet re-indexed) is sent to the Re-index flow
+    // rather than producing wrong-width vectors. Build the gateway so every chunk is sized and
+    // embedded with the vault's chosen model.
     let embedder = {
         let conn = state.conn()?;
-        crate::db::selected_embedder(&conn)?
+        let embedder = crate::db::selected_embedder(&conn)?;
+        guard_dimension(&conn, &embedder)?;
+        embedder
     };
-    guard_dimension(&embedder)?;
     let gateway = ModelGateway::new(
         &state.sidecar,
         embedder.clone(),
@@ -281,28 +283,49 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     });
     state.sidecar.ensure_installed()?;
 
-    // Resolve + guard the embedder before clearing anything, so a dimension the vector index
-    // can't hold fails fast rather than after the store is wiped.
+    // Resolve the embedder + its paired reranker before touching the store.
     let embedder = {
         let conn = state.conn()?;
         crate::db::selected_embedder(&conn)?
     };
-    guard_dimension(&embedder)?;
-
-    {
-        let conn = state.conn()?;
-        // chunk_vec / chunks_fts cascade from chunks via our own inserts, so
-        // clear them explicitly. documents → chunks cascades by FK.
-        conn.execute_batch(
-            "DELETE FROM chunks_fts; DELETE FROM chunk_vec; DELETE FROM chunks; DELETE FROM documents;",
-        )?;
-    }
-
     let gateway = ModelGateway::new(
         &state.sidecar,
         embedder.clone(),
         registry::reranker_for(&embedder),
     );
+
+    // WARMUP-BEFORE-DESTROY: load the embedder — downloading a non-bundled model on first use — and
+    // prove it actually emits the expected width *before* clearing the old index. If the user is
+    // offline, or the model's ONNX export is the wrong dimension, this fails here with the existing
+    // index fully intact, never after the store is wiped. A non-bundled model can be ~1 GB, so flag
+    // the one-time download; the bundled English path (model_file: None) stays silent.
+    if embedder.model_file.is_some() {
+        let _ = on_event.send(IngestEvent::Preparing {
+            message: "Downloading the multilingual model (~1 GB, one time)…".into(),
+        });
+    }
+    let warm = gateway.embed_documents(&["warm".to_string()])?;
+    let got = warm.first().map(|v| v.len());
+    if !warmup_ok(got, embedder.dimension) {
+        return Err(Error::Other(format!(
+            "the '{}' search model returned {}-dimensional vectors, expected {}; your vault was \
+             left unchanged",
+            embedder.id,
+            got.unwrap_or(0),
+            embedder.dimension
+        )));
+    }
+
+    // The model is confirmed ready — only now is it safe to be destructive. Clear the store
+    // (chunk_vec / chunks_fts are cleared explicitly; documents → chunks cascades by FK) and resize
+    // the now-empty vector column to this embedder's width before re-embedding.
+    {
+        let conn = state.conn()?;
+        conn.execute_batch(
+            "DELETE FROM chunks_fts; DELETE FROM chunk_vec; DELETE FROM chunks; DELETE FROM documents;",
+        )?;
+        crate::db::ensure_vec_dim(&conn, embedder.dimension)?;
+    }
     let (vault, cipher) = state.markdown_io()?;
     let (mut ingested, mut failed) = (0usize, 0usize);
     for entry in std::fs::read_dir(&vault)? {
@@ -994,20 +1017,29 @@ fn hex_digest(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Refuse an embedder whose vector width the vault's `chunk_vec` can't hold. PR 2 keeps every
-/// selectable embedder at the frozen 384-d width, so this only fires defensively — a future
-/// higher-dimension embedder needs PR 3's vec drop+recreate (the Re-index flow) — turning what
-/// would otherwise be a cryptic vec0 insert failure into a clear, early message.
-fn guard_dimension(embedder: &ModelEntry) -> Result<()> {
-    let vec_dim = crate::db::vec0_dim();
+/// Refuse an embedder whose vector width the vault's **live** `chunk_vec` can't hold. Used by
+/// incremental ingest (`run`) — it can't resize the table, so a populated vault whose selected
+/// language no longer matches its index (switched but not yet re-indexed) is sent to the Re-index
+/// flow with a clear message, rather than hitting a cryptic vec0 insert failure. `rebuild` does not
+/// call this: it resizes the table to fit ([`crate::db::ensure_vec_dim`]) after warming the model.
+fn guard_dimension(conn: &rusqlite::Connection, embedder: &ModelEntry) -> Result<()> {
+    let vec_dim = crate::db::vec0_dim(conn)?;
     if embedder.dimension != vec_dim {
         return Err(Error::Other(format!(
-            "the selected embedder '{}' is {}-dimensional, but this vault's vector index is \
-             {}-dimensional; changing the embedding dimension needs the Re-index flow (a later update)",
+            "the selected search language ('{}', {}-dimensional) doesn't match this vault's index \
+             ({}-dimensional) — re-index the vault from Settings → Search to switch it",
             embedder.id, embedder.dimension, vec_dim
         )));
     }
     Ok(())
+}
+
+/// Whether a warmup embed produced the width we expect. Pure, so the model-free decision is
+/// unit-tested here; the real download+embed (the first live e5-large 1024-d exercise) stays a
+/// documented hardware verification, not a CI test. A `None` (the model returned no vector at all)
+/// is a failure — the warmup proved nothing.
+fn warmup_ok(got_width: Option<usize>, expected: usize) -> bool {
+    got_width == Some(expected)
 }
 
 /// Guard the index against a model mismatch: one vector per leaf chunk, each of the selected
@@ -1067,6 +1099,16 @@ impl OptionalExists for std::result::Result<(), rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warmup_ok_requires_the_exact_expected_width() {
+        // The rebuild warmup only proceeds to wipe the index when the model emits the exact width
+        // we expect — this guards against an offline/absent model (None) and a wrong-dimension
+        // export (e.g. a 384-d export sneaking into the 1024-d slot).
+        assert!(warmup_ok(Some(1024), 1024));
+        assert!(!warmup_ok(Some(384), 1024));
+        assert!(!warmup_ok(None, 1024));
+    }
 
     #[test]
     fn frontmatter_round_trips_organisation_metadata() {
