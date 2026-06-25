@@ -289,13 +289,17 @@ export function DocumentsView({ onReviewClick }: Props) {
           {status?.state === "error" && (
             <Banner tone="warn">
               <div className="flex items-center justify-between gap-3">
-                <span>The document engine needs setup to finish.</span>
+                <span>
+                  {status.kind === "packaging_bug"
+                    ? "The document engine couldn't start — this looks like a problem with PM itself."
+                    : "The document engine needs setup to finish."}
+                </span>
                 <button
                   onClick={() => setGuideOpen(true)}
                   className="shrink-0 underline"
                   disabled={busy}
                 >
-                  Troubleshoot
+                  {status.kind === "packaging_bug" ? "Details & report" : "Troubleshoot"}
                 </button>
               </div>
             </Banner>

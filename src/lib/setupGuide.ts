@@ -96,6 +96,18 @@ export function guideFor(mode: SetupGuideMode, isMac: boolean): SetupGuide {
         ],
       };
 
+    case "packaging_bug":
+      return {
+        title: "This is a problem with PM, not your computer",
+        summary:
+          "PM's document engine couldn't start because the Python that ships inside PM is incomplete on this install. That's a bug in PM's packaging — not your computer or your setup — so there's nothing for you to fix. Reporting it helps us fix it for everyone.",
+        steps: [
+          "Click “Report on GitHub” below — it opens a pre-filled report with the version and the technical details already attached. (Nothing from your documents is included.)",
+          "As a workaround, reinstalling the latest version of PM from the releases page usually lays the files down correctly.",
+          "Open Technical details below if you'd like to see exactly what the engine reported.",
+        ],
+      };
+
     case "unknown":
     default:
       return {
