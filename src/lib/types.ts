@@ -34,6 +34,25 @@ export interface Settings {
    *  auto-detects + persists one on first load. Drives the focus-view day boundaries
    *  and the briefing/agenda "now". */
   time_zone: string;
+  /** Whether query-time reranking is on (a cross-encoder re-scores search hits for sharper
+   *  relevance). Default on; stateless, so toggling it never triggers a Rebuild. */
+  reranking: boolean;
+}
+
+/** One search-language / embedder choice offered at vault creation. */
+export interface LanguageOption {
+  id: string;
+  label: string;
+  multilingual: boolean;
+}
+
+/** The vault's search-language choices for the onboarding picker: the selectable embedders, the
+ *  current selection, and whether it's locked (the vault already has documents, so the embedder
+ *  is fixed until the Re-index flow ships). */
+export interface LanguageOptions {
+  options: LanguageOption[];
+  selected: string;
+  locked: boolean;
 }
 
 /** State of the optional biometric app-lock (a soft UI gate; the store is encrypted at

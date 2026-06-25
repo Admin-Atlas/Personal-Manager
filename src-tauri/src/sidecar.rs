@@ -28,6 +28,33 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::registry::{ModelEntry, Pooling, Source};
+
+/// Build the fastembed `add_custom_model` spec for a non-bundled model, as a JSON object the
+/// sidecar registers on first use. `None` for a bundled model (fastembed already knows it) or a
+/// local-path model (not used in PR 2). One shape serves both embedders and rerankers — the
+/// reranker registration ignores the pooling/normalize/dim fields.
+fn custom_spec(m: &ModelEntry) -> Option<Value> {
+    let model_file = m.model_file?;
+    let hf = match &m.source {
+        Source::HuggingFace(repo) => *repo,
+        Source::LocalPath(_) => return None,
+    };
+    let pooling = match m.pooling {
+        Pooling::Mean => "mean",
+        Pooling::Cls => "cls",
+        Pooling::None => "none",
+    };
+    Some(json!({
+        "model": m.id,
+        "hf": hf,
+        "model_file": model_file,
+        "pooling": pooling,
+        "normalize": m.normalize,
+        "dim": m.dimension,
+    }))
+}
+
 use crate::error::{Error, Result};
 
 /// Hard cap on a single sidecar reply line (see [`read_line_capped`]). A reply
@@ -356,13 +383,19 @@ impl SidecarManager {
         Some(dir.to_string_lossy().into_owned())
     }
 
-    /// Embed a batch of strings into the active embedder's vectors. The first call
-    /// downloads the model (~90 MB) and is slow; subsequent calls are fast and fully local.
-    pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// Embed a batch of strings into the given embedder's vectors. The first call for a model
+    /// downloads its weights and is slow; later calls are fast and fully local. Any retrieval
+    /// prefix has already been applied by the gateway, so the text is embedded as-is. For a custom
+    /// (non-bundled) model the spec registers it with fastembed on first use.
+    pub fn embed(&self, texts: &[String], embedder: &ModelEntry) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let result = self.request("embed", json!({ "texts": texts }))?;
+        let mut params = json!({ "texts": texts, "model": embedder.id });
+        if let Some(spec) = custom_spec(embedder) {
+            params["custom"] = spec;
+        }
+        let result = self.request("embed", params)?;
         let vectors = result["vectors"]
             .as_array()
             .ok_or_else(|| Error::Other("sidecar embed returned no vectors".into()))?
@@ -391,14 +424,18 @@ impl SidecarManager {
         Ok(vectors)
     }
 
-    /// Count tokens for a batch of strings with the active embedder's tokenizer — the
-    /// splitter sizes chunks by this so a chunk never overflows the model's input window.
-    /// Local, batched (one call per document), and uses the same tokenizer that embeds.
-    pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
+    /// Count tokens for a batch of strings with the given embedder's tokenizer — the splitter
+    /// sizes chunks by this so a chunk never overflows the model's input window. Local, batched
+    /// (one call per document), and uses the same tokenizer that embeds.
+    pub fn count_tokens(&self, texts: &[String], embedder: &ModelEntry) -> Result<Vec<usize>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let result = self.request("count_tokens", json!({ "texts": texts }))?;
+        let mut params = json!({ "texts": texts, "model": embedder.id });
+        if let Some(spec) = custom_spec(embedder) {
+            params["custom"] = spec;
+        }
+        let result = self.request("count_tokens", params)?;
         let counts = result["counts"]
             .as_array()
             .ok_or_else(|| Error::Other("sidecar count_tokens returned no counts".into()))?
@@ -415,6 +452,47 @@ impl SidecarManager {
             ));
         }
         Ok(counts)
+    }
+
+    /// Score each passage against the query with the given reranker's cross-encoder (higher =
+    /// more relevant), returning one score per passage. The first call for a model downloads its
+    /// weights and is slow; later calls are fast and fully local. Must run **off the DB lock** —
+    /// it can block on a download. For a custom (non-bundled) reranker the spec registers it on
+    /// first use.
+    pub fn rerank(
+        &self,
+        query: &str,
+        passages: &[&str],
+        reranker: &ModelEntry,
+    ) -> Result<Vec<f32>> {
+        if passages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut params = json!({ "query": query, "passages": passages, "model": reranker.id });
+        if let Some(spec) = custom_spec(reranker) {
+            params["custom"] = spec;
+        }
+        let result = self.request("rerank", params)?;
+        let scores = result["scores"]
+            .as_array()
+            .ok_or_else(|| Error::Other("sidecar rerank returned no scores".into()))?
+            .iter()
+            .map(|n| {
+                // Reject a non-numeric / NaN / infinite score rather than mis-ordering on it.
+                n.as_f64()
+                    .filter(|f| f.is_finite())
+                    .map(|f| f as f32)
+                    .ok_or_else(|| {
+                        Error::Other("sidecar rerank returned a non-numeric score".into())
+                    })
+            })
+            .collect::<Result<Vec<f32>>>()?;
+        if scores.len() != passages.len() {
+            return Err(Error::Other(
+                "sidecar rerank returned the wrong number of scores".into(),
+            ));
+        }
+        Ok(scores)
     }
 
     /// Transcribe an audio clip to text with the local Whisper model. The first

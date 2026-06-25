@@ -16,6 +16,7 @@ import type {
   IcsFeedInfo,
   Importance,
   IngestEvent,
+  LanguageOptions,
   LearningProfile,
   Message,
   ModelInfo,
@@ -42,6 +43,18 @@ export const setOpenRouterBackgroundKey = (key: string) =>
   invoke<void>("set_openrouter_background_key", { key });
 
 export const getSettings = () => invoke<Settings>("get_settings");
+
+/** Turn query-time reranking on/off (a cross-encoder re-scores search hits). Stateless — never
+ *  triggers a Rebuild; the effect lands on the next query. */
+export const setReranking = (enabled: boolean) => invoke<void>("set_reranking", { enabled });
+
+/** The vault's search-language choices + current selection for the onboarding picker. */
+export const languageOptions = () => invoke<LanguageOptions>("language_options");
+
+/** Choose the vault's embedder ("search language"). Only valid while the vault is empty —
+ *  changing it on a populated vault needs the Re-index flow (a later update). */
+export const setVaultEmbedder = (embedderId: string) =>
+  invoke<void>("set_vault_embedder", { embedderId });
 
 /** Persist the user's IANA time zone (e.g. "Europe/London"). An empty string clears
  *  it (the backend then reasons in UTC). Validated against the tz database in Rust. */

@@ -107,25 +107,43 @@ pub struct RetrieveQuery<'a> {
     pub strategy: Strategy,
 }
 
-/// Tool-shaped retrieval (spec §21.4): run the requested strategy and return ranked, citable
-/// passages. Decoupled from chat — chat, the Documents search, and (later) agents all call
-/// this one contract. The rerank stage is **inert in PR 1**: with no reranker (or one that
-/// returns `None`) the fused order is unchanged, so existing behaviour is preserved; PR 2
-/// widens the candidate pool and reorders here.
+/// The fused (pre-rerank) half of retrieval: run the requested strategy's hybrid core and return
+/// the ranked passages. This is the part that needs the DB, so the caller holds the connection
+/// guard only across this; it then drops the guard before [`rerank`], keeping the cross-encoder
+/// **off the DB lock** (AGENTS rule #4 — a sidecar call can block on a model download).
+pub fn retrieve_fused(conn: &Connection, q: &RetrieveQuery) -> Result<Vec<RetrievedChunk>> {
+    match q.strategy {
+        Strategy::HybridRrf => {
+            hybrid_core(conn, q.text, q.embedding, q.k, q.filters.project.as_deref())
+        }
+    }
+}
+
+/// The rerank half of retrieval — conn-free, so it runs after the caller drops the DB guard.
+/// `None` (reranking disabled by the Settings toggle, or a reranker that returns `None`/fails)
+/// leaves the fused order untouched, so search degrades gracefully and never mis-orders.
+pub fn rerank(
+    reranker: Option<&dyn Reranker>,
+    query: &str,
+    chunks: Vec<RetrievedChunk>,
+) -> Result<Vec<RetrievedChunk>> {
+    match reranker {
+        Some(r) => apply_reranker(r, query, chunks),
+        None => Ok(chunks),
+    }
+}
+
+/// Tool-shaped retrieval (spec §21.4): fuse, then rerank — the one contract chat, the Documents
+/// search, and (later) agents share. The production chat/search paths call [`retrieve_fused`] then
+/// [`rerank`] separately so the cross-encoder runs off the DB lock; this combined form is the
+/// stable seam reserved for in-process/agent callers and is exercised by the tests.
+#[allow(dead_code)]
 pub fn retrieve(
     conn: &Connection,
     q: &RetrieveQuery,
     reranker: Option<&dyn Reranker>,
 ) -> Result<Vec<RetrievedChunk>> {
-    let chunks = match q.strategy {
-        Strategy::HybridRrf => {
-            hybrid_core(conn, q.text, q.embedding, q.k, q.filters.project.as_deref())?
-        }
-    };
-    match reranker {
-        Some(r) => apply_reranker(r, q.text, chunks),
-        None => Ok(chunks),
-    }
+    rerank(reranker, q.text, retrieve_fused(conn, q)?)
 }
 
 /// Reorder the fused passages by a reranker's scores. A `None` result (PR 1's inert path) or a
@@ -749,5 +767,37 @@ mod tests {
         let scoped = retrieve(&conn, &q, None).unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].title, "Beta note");
+    }
+
+    #[test]
+    fn fused_then_rerank_equals_combined_retrieve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&path, key).unwrap();
+        insert_doc_chunk(&conn, "First", "alpha cats", &unit_vec(0));
+        insert_doc_chunk(&conn, "Second", "beta cats", &unit_vec(1));
+
+        let query = unit_vec(0);
+        let q = RetrieveQuery {
+            text: "cats",
+            embedding: &query,
+            k: 6,
+            filters: Filters::default(),
+            strategy: Strategy::HybridRrf,
+        };
+        let ids = |v: &[RetrievedChunk]| v.iter().map(|c| c.chunk_id).collect::<Vec<_>>();
+
+        // The production split (fuse under the lock, then rerank off it) reproduces the combined
+        // tool-shaped contract exactly.
+        let fused = retrieve_fused(&conn, &q).unwrap();
+        let split = rerank(Some(&ReverseReranker as &dyn Reranker), q.text, fused).unwrap();
+        let combined = retrieve(&conn, &q, Some(&ReverseReranker as &dyn Reranker)).unwrap();
+        assert_eq!(ids(&split), ids(&combined));
+
+        // rerank(None) — reranking disabled — is the identity on the fused order.
+        let fused2 = retrieve_fused(&conn, &q).unwrap();
+        let passthrough = rerank(None, q.text, fused2.clone()).unwrap();
+        assert_eq!(ids(&passthrough), ids(&fused2));
     }
 }
