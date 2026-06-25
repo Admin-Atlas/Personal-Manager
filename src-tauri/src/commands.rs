@@ -1377,7 +1377,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                 // Resolve the confirmed project to its entity (creating a genuinely new one), and
                 // write its CANONICAL name to the vault + DB cache — never a variant (invariant #2).
                 let (canonical, entity_id) = resolve_canonical(&tx, &d.project)?;
-                let w = ingest::rewrite_vault_metadata(
+                let w = ingest::write_document_truth(
                     &tx,
                     &vault,
                     &cipher,
@@ -1484,7 +1484,7 @@ pub async fn set_document_metadata(
             // Resolve to the canonical name + entity (a typed-in new project creates one), write the
             // canonical to the vault + DB cache, and repoint `entity_id`.
             let (canonical, entity_id) = resolve_canonical(&tx, &project)?;
-            written.push(ingest::rewrite_vault_metadata(
+            written.push(ingest::write_document_truth(
                 &tx,
                 &vault,
                 &cipher,
@@ -1607,7 +1607,7 @@ fn rewrite_entity_documents(
     let mut written = Vec::new();
     for (doc_id, tags_json, importance, reviewed, last_activity) in rows {
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-        written.push(ingest::rewrite_vault_metadata(
+        written.push(ingest::write_document_truth(
             tx,
             vault,
             cipher,
@@ -1691,7 +1691,7 @@ pub async fn reassign_document(app: AppHandle, document_id: i64, entity_id: i64)
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-        Ok(vec![ingest::rewrite_vault_metadata(
+        Ok(vec![ingest::write_document_truth(
             tx,
             vault,
             cipher,

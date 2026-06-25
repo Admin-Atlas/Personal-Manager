@@ -616,22 +616,71 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
     })
 }
 
+/// Where a document keeps its *organisational truth* — the canonical project + tags / importance
+/// it was filed under. Today every document is backed by a Markdown vault file, so its truth is
+/// that file's front-matter. This seam exists so a future **index-only** source (truth in a
+/// manifest, no front-matter — banked on board card 3) is added in ONE place, not retrofitted
+/// across every metadata-write site (the review commit, the single edit, and the entity
+/// merge/rename/reassign).
+enum TruthSource {
+    /// The document's truth is its Markdown vault file's front-matter (every document today).
+    VaultFrontmatter,
+}
+
+/// Pick where a document keeps its truth. For now every document has a Markdown vault file, so the
+/// answer is always its front-matter; the discriminator (a source-type column, or a null
+/// `vault_path`) lands here when index-only sources do.
+fn truth_source(_tx: &Connection, _doc_id: i64) -> Result<TruthSource> {
+    Ok(TruthSource::VaultFrontmatter)
+}
+
+/// Persist a document's organisational truth (canonical project + tags/importance/reviewed/
+/// last_activity) to wherever its source keeps it, returning the file snapshot for rollback. The
+/// single indirection point every metadata write goes through — so hard-coding front-matter can't
+/// creep back in and a future manifest writer is a one-place change (see [`TruthSource`]). Pass a
+/// `rusqlite::Transaction` (it derefs to `&Connection`); commit it only once the whole batch is
+/// written.
+#[allow(clippy::too_many_arguments)]
+pub fn write_document_truth(
+    tx: &Connection,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    doc_id: i64,
+    project: &str,
+    tags: &[String],
+    importance: Option<&str>,
+    reviewed: bool,
+    last_activity: &str,
+) -> Result<(std::path::PathBuf, Vec<u8>)> {
+    match truth_source(tx, doc_id)? {
+        TruthSource::VaultFrontmatter => rewrite_vault_metadata(
+            tx,
+            vault,
+            cipher,
+            doc_id,
+            project,
+            tags,
+            importance,
+            reviewed,
+            last_activity,
+        ),
+    }
+}
+
 /// Rewrite a document's organisation metadata in place, *inside a caller-owned
 /// transaction*: update the vault file's front-matter (preserving the body) and
 /// the `documents` row. No re-chunk / re-embed — the body and `content_hash` are
-/// unchanged, so the existing chunks and vectors stay valid.
+/// unchanged, so the existing chunks and vectors stay valid. The Markdown-vault arm of
+/// [`write_document_truth`]; external callers go through that seam, never here directly.
 ///
 /// Returns `(vault file, its prior raw on-disk bytes)` so the caller can restore the
 /// file (via [`restore_vault_files`]) if a later step in the batch fails; the DB side
 /// rolls back with `tx`. The snapshot is the *raw* bytes, not the decoded text — for an
 /// encrypted vault the file is ciphertext, so restoring decoded text would corrupt it.
-/// This is the building block for an all-or-nothing review commit — pass a
-/// `rusqlite::Transaction` (it derefs to `&Connection`) and only commit it once every
-/// document in the batch has been rewritten.
 // The arguments are the metadata columns being rewritten, not a sign this should
 // be split into smaller functions.
 #[allow(clippy::too_many_arguments)]
-pub fn rewrite_vault_metadata(
+fn rewrite_vault_metadata(
     tx: &Connection,
     vault: &Path,
     cipher: &MarkdownCipher,
