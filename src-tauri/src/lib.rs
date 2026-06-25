@@ -8,6 +8,7 @@ mod clock;
 mod commands;
 mod cost;
 mod db;
+mod entities;
 mod error;
 mod google;
 mod ics;
@@ -46,8 +47,33 @@ use sidecar::{SidecarManager, SidecarPaths};
 pub struct VaultRuntime {
     /// The Markdown vault folder (source of truth) for the active vault.
     pub markdown_dir: PathBuf,
+    /// The vault root (one level up from `markdown_dir`), where `pm.sqlite` and the encrypted
+    /// entity-rules file live.
+    pub vault_root: PathBuf,
     /// Policy-aware reader/writer for this vault's Markdown files.
     pub cipher: vault::MarkdownCipher,
+    /// Always-on cipher for the encrypted entity-rules file (the canonical-entity source of
+    /// truth). Distinct from `cipher`: it encrypts even for device vaults whose Markdown is
+    /// plaintext, since an alias map of projects is more revealing than any one document.
+    pub rules_cipher: entities::RulesCipher,
+}
+
+impl VaultRuntime {
+    /// Build the session runtime from the resolved layout, vault metadata, and the resolved
+    /// 32-byte master: the policy-aware Markdown cipher and the always-on rules cipher are both
+    /// subkeys of the same master, so every open path produces an identical runtime.
+    pub fn build(
+        resolved: &vault::ResolvedVault,
+        meta: &vault::VaultMeta,
+        master: &[u8; 32],
+    ) -> Self {
+        Self {
+            markdown_dir: resolved.markdown_dir.clone(),
+            vault_root: resolved.vault_root.clone(),
+            cipher: vault::MarkdownCipher::from_meta(meta, master),
+            rules_cipher: entities::RulesCipher::from_master(&meta.vault_id, master),
+        }
+    }
 }
 
 /// Shared app state. The SQLite connection is guarded by a mutex; commands lock
@@ -114,16 +140,21 @@ impl AppState {
     /// Open the session after an unlock / open-existing succeeds: install the
     /// connection and its Markdown runtime together, so `db` and `vault` never drift.
     pub fn open_session(&self, conn: Connection, runtime: VaultRuntime) -> error::Result<()> {
-        let mut db = self
-            .db
-            .lock()
-            .map_err(|_| error::Error::Other("database lock poisoned".into()))?;
-        let mut vault = self
-            .vault
-            .lock()
-            .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
-        *db = Some(conn);
-        *vault = Some(runtime);
+        {
+            let mut db = self
+                .db
+                .lock()
+                .map_err(|_| error::Error::Other("database lock poisoned".into()))?;
+            let mut vault = self
+                .vault
+                .lock()
+                .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
+            *db = Some(conn);
+            *vault = Some(runtime);
+        }
+        // Drop the guards before reconciling — it re-locks both to (re)build the rules file or
+        // restore the mirror from it. Best-effort: a hiccup here never blocks the open.
+        self.reconcile_entity_rules();
         Ok(())
     }
 
@@ -143,11 +174,16 @@ impl AppState {
     /// Used when a transition changes the Markdown policy — e.g. making a vault
     /// shareable flips encryption on without reopening the store.
     pub fn set_vault_runtime(&self, runtime: VaultRuntime) -> error::Result<()> {
-        let mut guard = self
-            .vault
-            .lock()
-            .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
-        *guard = Some(runtime);
+        {
+            let mut guard = self
+                .vault
+                .lock()
+                .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
+            *guard = Some(runtime);
+        }
+        // A policy/key transition swaps the rules cipher too; reconcile heals the file under the
+        // new key (the mirror survived the SQLCipher rekey intact). Best-effort.
+        self.reconcile_entity_rules();
         Ok(())
     }
 
@@ -173,6 +209,59 @@ impl AppState {
         match guard.as_ref() {
             Some(rt) => Ok((rt.markdown_dir.clone(), rt.cipher.clone())),
             None => Err(error::Error::Other("the vault is locked".into())),
+        }
+    }
+
+    /// Snapshot the active vault's root + always-on rules cipher, or a friendly error if the vault
+    /// is locked. Cloned so the caller can do file IO off the lock — the single way the entity
+    /// layer reaches the encrypted rules file.
+    pub fn rules_io(&self) -> error::Result<(PathBuf, entities::RulesCipher)> {
+        let guard = self
+            .vault
+            .lock()
+            .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
+        match guard.as_ref() {
+            Some(rt) => Ok((rt.vault_root.clone(), rt.rules_cipher.clone())),
+            None => Err(error::Error::Other("the vault is locked".into())),
+        }
+    }
+
+    /// Reconcile the encrypted rules file with the DB mirror for the active session: write it on
+    /// first run, rebuild the mirror from it on later opens, or heal it after a key rotation. A
+    /// no-op when the vault is locked. Best-effort — the DB mirror is the live truth, so a failure
+    /// is logged, never propagated to block opening the vault.
+    pub fn reconcile_entity_rules(&self) {
+        let (vault_root, rules_cipher) = match self.rules_io() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Err(e) = entities::reconcile_on_open(&conn, &vault_root, &rules_cipher) {
+            eprintln!("entities: rules reconcile skipped ({e})");
+        }
+    }
+
+    /// Push the DB mirror out to the encrypted rules file (the one-way mirror→file direction).
+    /// Called after ingest/rebuild, which only ever resolve an existing entity in practice but may
+    /// create one for a never-seen project — keeping the portable source of truth current. A no-op
+    /// when locked; best-effort (the mirror remains the live truth if the file write hiccups).
+    pub fn sync_entity_rules(&self) {
+        let (vault_root, rules_cipher) = match self.rules_io() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let synced = entities::rules_from_mirror(&conn)
+            .and_then(|rules| entities::write_rules_file(&vault_root, &rules_cipher, &rules))
+            .map(|_| ());
+        if let Err(e) = synced {
+            eprintln!("entities: rules sync skipped ({e})");
         }
     }
 
@@ -230,12 +319,9 @@ pub fn run() {
             // resolved Markdown dir as the session's vault runtime. A locked
             // (passphrase, uncached) vault leaves both `None` until an unlock command.
             let (conn, vault_runtime) = match vault::open_at_boot(&resolved, &meta)? {
-                Some((conn, cipher)) => (
+                Some((conn, master)) => (
                     Some(conn),
-                    Some(VaultRuntime {
-                        markdown_dir: resolved.markdown_dir.clone(),
-                        cipher,
-                    }),
+                    Some(VaultRuntime::build(&resolved, &meta, &master)),
                 ),
                 None => (None, None),
             };
@@ -264,6 +350,11 @@ pub fn run() {
             // for the life of the app. A no-op for a device-only vault.
             lock_session::engage(handle)?;
             lock_session::spawn_watcher(handle.clone());
+
+            // After the writer lock is settled (so a stepped-back profile doesn't write), reconcile
+            // the encrypted entity-rules file with the DB mirror: first run writes it from the v10
+            // backfill; later runs rebuild the mirror from it. No-op when the vault is locked.
+            app.state::<AppState>().reconcile_entity_rules();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -318,6 +409,11 @@ pub fn run() {
             commands::propose_metadata,
             commands::commit_review,
             commands::set_document_metadata,
+            commands::list_entities,
+            commands::add_entity_alias,
+            commands::rename_entity,
+            commands::merge_entities,
+            commands::reassign_document,
             commands::list_project_overviews,
             commands::set_project_metadata,
             commands::propose_project_metadata,

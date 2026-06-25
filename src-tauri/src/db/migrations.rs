@@ -219,6 +219,72 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_chunks_uid    ON chunks(document_id, uid);
     CREATE INDEX idx_chunks_parent ON chunks(parent_id);
     "#,
+    // v10: canonical-entity resolution (Stage 3). Today the *name is the identity* —
+    // `documents.project` is free text and `projects` is keyed by that same string — so name
+    // variants ("PM", "Personal Manager", "Atlas - PM") are offered as three co-equal projects
+    // and keep reappearing. This separates identity from name. `entities` is the stable identity
+    // (generic over project/person/thing; only `project` is populated now — the seam for
+    // people/things banked cheaply). `entity_aliases` maps every known name string — including
+    // each canonical name as a SELF-ALIAS — to exactly one entity, so a review correction becomes
+    // a forward-going rule, not a one-off row-patch. `documents.entity_id` is the resolved pointer;
+    // `documents.project` is KEPT as a denormalised cache of the entity's canonical name (always
+    // written through resolution, never a variant) so existing reads / FTS / the focus-view
+    // group-by keep working untouched. `projects` gains a nullable `entity_id` (purely additive —
+    // its `name` PK and every consumer stay as-is) to bank the entity seam without a destructive
+    // re-key. The encrypted rules file at the data-home root is the portable source of truth; these
+    // tables are its queryable mirror (written/reconciled at boot once the vault key is available).
+    // One-time backfill: one entity per distinct existing project string, each with a self-alias —
+    // NO auto-merge (collapsing variants that are really the same project is the user's call, via
+    // the Teach tab). Chunk vectors are untouched: project is ranking metadata, not part of the
+    // embedding, so no `ensure_vec_dim` / re-index fires. All additive — older rows resolve cleanly
+    // and pre-Step-4 stores just back-fill an 'Unsorted' entity (rule #3).
+    r#"
+    CREATE TABLE entities (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        type           TEXT NOT NULL CHECK (type IN ('project','person','thing')),
+        canonical_name TEXT NOT NULL,
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        UNIQUE(type, canonical_name)
+    );
+
+    -- An alias resolves to exactly one project entity; the canonical name is itself a row here.
+    -- `alias` is globally UNIQUE — correct while only projects exist; becomes per-type when
+    -- person/thing land (a deliberate, documented future refinement, not a silent constraint).
+    CREATE TABLE entity_aliases (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_id  INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+        alias      TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_entity_aliases_entity ON entity_aliases(entity_id);
+
+    ALTER TABLE documents ADD COLUMN entity_id INTEGER REFERENCES entities(id);
+    ALTER TABLE projects  ADD COLUMN entity_id INTEGER REFERENCES entities(id);
+
+    -- One-time backfill: one project entity per distinct existing project string (NO auto-merge).
+    INSERT INTO entities(type, canonical_name)
+        SELECT 'project', project FROM documents GROUP BY project;
+    -- 'Unsorted' is the ingest default + safe fallback, so guarantee its entity always exists (even
+    -- on a brand-new empty vault) — index-time resolution then always finds it instead of creating
+    -- (and de-syncing) one. A no-op when documents already carry an 'Unsorted' string.
+    INSERT OR IGNORE INTO entities(type, canonical_name) VALUES ('project', 'Unsorted');
+    -- The canonical name is itself stored as an alias row (self-alias), so resolution is uniform.
+    INSERT INTO entity_aliases(entity_id, alias)
+        SELECT id, canonical_name FROM entities WHERE type = 'project';
+    -- Point every document at its entity, resolved by its current canonical project string. Every
+    -- distinct project string just became an entity, so no document is left unresolved.
+    UPDATE documents SET entity_id = (
+        SELECT e.id FROM entities e WHERE e.type = 'project' AND e.canonical_name = documents.project
+    );
+    -- Attach existing triage rows to the same entity (additive; `name` stays the PK). A `projects`
+    -- row with no surviving documents simply keeps a NULL entity_id (harmless — the focus view is
+    -- driven by `documents`).
+    UPDATE projects SET entity_id = (
+        SELECT e.id FROM entities e WHERE e.type = 'project' AND e.canonical_name = projects.name
+    );
+    CREATE INDEX idx_documents_entity ON documents(entity_id);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

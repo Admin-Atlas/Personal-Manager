@@ -19,8 +19,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, learning, lock_session, openrouter, paths, recommend,
-    secrets, vault, AppState, VaultRuntime,
+    applock, briefing, clock, cost, db, entities, learning, lock_session, openrouter, paths,
+    recommend, secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -428,10 +428,7 @@ fn vault_runtime_for(
     key_hex: &str,
 ) -> Result<VaultRuntime> {
     let master = vault::master_from_db_key_hex(key_hex)?;
-    Ok(VaultRuntime {
-        markdown_dir: resolved.markdown_dir.clone(),
-        cipher: vault::MarkdownCipher::from_meta(meta, &master),
-    })
+    Ok(VaultRuntime::build(resolved, meta, &master))
 }
 
 /// What the frontend needs to decide whether to show the unlock screen and how to
@@ -1226,7 +1223,9 @@ pub async fn propose_metadata(
         let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let profile = learning::profile_preamble(&conn)?;
-        let projects = db::distinct_projects(&conn)?;
+        // Hand the model CANONICAL project names only (one per entity) — never the raw
+        // `DISTINCT project`, which would offer variants like "PM"/"Atlas - PM" as co-equal.
+        let projects = entities::canonical_project_names(&conn)?;
         let pending = {
             let base_sql = "SELECT d.id, d.title, \
                     COALESCE((SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), '') \
@@ -1272,7 +1271,7 @@ pub async fn propose_metadata(
     let mut proposed = 0;
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
     for p in pending {
-        let (proposal, usage_info) = review::propose(
+        let (mut proposal, usage_info) = review::propose(
             api_key.expose(),
             &models,
             &p.title,
@@ -1284,6 +1283,14 @@ pub async fn propose_metadata(
         if let Some((usage, served)) = usage_info {
             usage_rows.push((served, usage));
         }
+        // Resolve the model's project string to its canonical form for display, so a known variant
+        // is shown (and later committed) as the canonical name — the variant never surfaces. A
+        // short read-only lock, dropped before the next iteration's model call (rule #4).
+        proposal.project = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            entities::resolve_to_canonical(&conn, &proposal.project)?
+        };
         let _ = on_event.send(ReviewEvent::Proposed {
             document_id: p.id,
             proposal,
@@ -1292,6 +1299,45 @@ pub async fn propose_metadata(
     }
     log_background_usage(&app, &models, &usage_rows);
     let _ = on_event.send(ReviewEvent::Finished { proposed });
+    Ok(())
+}
+
+/// Resolve a user-confirmed project name to its entity (creating a genuinely new one only if the
+/// name resolves to nothing), returning the entity's canonical name + id. Blank falls back to the
+/// always-present "Unsorted" entity, so a document always lands on a real entity.
+fn resolve_canonical(conn: &Connection, name: &str) -> Result<(String, i64)> {
+    let name = if name.trim().is_empty() {
+        "Unsorted"
+    } else {
+        name.trim()
+    };
+    let id = entities::resolve_project(conn, name, true)?
+        .ok_or_else(|| Error::Other("could not resolve project".into()))?;
+    Ok((entities::canonical_name(conn, id)?, id))
+}
+
+/// Capture a model-proposed name the user corrected away as a forward-going alias of the chosen
+/// entity — the rule that stops the variant recurring. The merge guard: a proposed name that
+/// already resolves to a *different* entity is a merge, not an alias, so it is surfaced (logged in
+/// PR 1; a Teach-tab button in PR 2), never silently folded (§1.5).
+fn capture_alias(conn: &Connection, chosen_id: i64, proposed: &str) -> Result<()> {
+    let proposed = proposed.trim();
+    if proposed.is_empty() {
+        return Ok(());
+    }
+    match entities::resolve_project(conn, proposed, false)? {
+        Some(other) if other == chosen_id => {} // same entity — nothing new to learn
+        Some(_) => eprintln!(
+            "entities: \"{proposed}\" already names another project — surfaced as a merge \
+             candidate, not folded"
+        ),
+        None => {
+            if let entities::AddAlias::Conflict(_) = entities::add_alias(conn, chosen_id, proposed)?
+            {
+                eprintln!("entities: \"{proposed}\" is owned by another project — not folded");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1304,13 +1350,14 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
     let logged = tokio::task::spawn_blocking(move || -> Result<usize> {
         let state = blocking_app.state::<AppState>();
         let (vault, cipher) = state.markdown_io()?;
+        let (vault_root, rules_cipher) = state.rules_io()?;
         let now = iso_now(&state)?;
 
-        // The whole pass is all-or-nothing: corrections, vault rewrites, and the
-        // `reviewed` flags commit together, or the DB transaction rolls back and
-        // every vault file we touched is restored. Otherwise a failure partway
-        // through would leave earlier docs marked reviewed (dropped from the queue
-        // on retry, their corrections never re-logged) and mid-batch vault/DB drift.
+        // The whole pass is all-or-nothing: corrections, alias rules, vault rewrites, and the
+        // `reviewed` flags commit together, or the DB transaction rolls back and every vault file
+        // (plus the rules file) we touched is restored. Otherwise a failure partway through would
+        // leave earlier docs marked reviewed (dropped from the queue on retry, their corrections
+        // never re-logged) and mid-batch vault/DB drift.
         let mut conn = state.conn()?;
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
@@ -1327,30 +1374,46 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                     .unwrap_or_default();
                 logged += review::log_corrections(&tx, d, &title)?;
                 let importance = review::normalize_importance(d.importance.clone());
-                let w = ingest::rewrite_vault_metadata(
+                // Resolve the confirmed project to its entity (creating a genuinely new one), and
+                // write its CANONICAL name to the vault + DB cache — never a variant (invariant #2).
+                let (canonical, entity_id) = resolve_canonical(&tx, &d.project)?;
+                let w = ingest::write_document_truth(
                     &tx,
                     &vault,
                     &cipher,
                     d.document_id,
-                    &d.project,
+                    &canonical,
                     &d.tags,
                     importance.as_deref(),
                     true,
                     &now,
                 )?;
                 written.push(w);
+                entities::reassign_document(&tx, d.document_id, entity_id)?;
+                // Capture the model's corrected-away name as a forward-going alias (merge-guarded),
+                // so the same variant resolves to this canonical next time instead of recurring.
+                if d.project.trim() != d.proposed_project.trim() {
+                    capture_alias(&tx, entity_id, &d.proposed_project)?;
+                }
             }
             Ok(logged)
         })();
 
         match result {
-            Ok(logged) => match tx.commit() {
-                Ok(()) => Ok(logged),
-                Err(e) => {
-                    ingest::restore_vault_files(written);
-                    Err(e.into())
+            Ok(logged) => {
+                // Write the portable rules file from the (uncommitted) mirror first, so a captured
+                // rule is as durable as the commit; restore it if the commit then fails.
+                let rules = entities::rules_from_mirror(&tx)?;
+                let prior_rules = entities::write_rules_file(&vault_root, &rules_cipher, &rules)?;
+                match tx.commit() {
+                    Ok(()) => Ok(logged),
+                    Err(e) => {
+                        entities::restore_rules_file(&vault_root, &prior_rules);
+                        ingest::restore_vault_files(written);
+                        Err(e.into())
+                    }
                 }
-            },
+            }
             Err(e) => {
                 drop(tx); // roll back the DB side
                 ingest::restore_vault_files(written);
@@ -1386,10 +1449,13 @@ pub async fn set_document_metadata(
     tokio::task::spawn_blocking(move || -> Result<Document> {
         let state = app.state::<AppState>();
         let (vault, cipher) = state.markdown_io()?;
+        let (vault_root, rules_cipher) = state.rules_io()?;
         let now = iso_now(&state)?;
 
-        // Log the correction + rewrite the vault file + update the row atomically,
-        // restoring the vault file if the DB side fails (the file write lands first).
+        // Log the correction + rewrite the vault file + update the row atomically, restoring the
+        // vault file (and rules file) if the DB side fails (the file writes land first). This is a
+        // *reassignment* (one document moves), not a merge: no alias rule is captured — the prior
+        // value is the document's own canonical, not a model-proposed variant.
         let mut conn = state.conn()?;
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
@@ -1415,17 +1481,21 @@ pub async fn set_document_metadata(
                 proposed_importance: cur_importance,
             };
             review::log_corrections(&tx, &decision, &title)?;
-            written.push(ingest::rewrite_vault_metadata(
+            // Resolve to the canonical name + entity (a typed-in new project creates one), write the
+            // canonical to the vault + DB cache, and repoint `entity_id`.
+            let (canonical, entity_id) = resolve_canonical(&tx, &project)?;
+            written.push(ingest::write_document_truth(
                 &tx,
                 &vault,
                 &cipher,
                 document_id,
-                &project,
+                &canonical,
                 &tags,
                 importance.as_deref(),
                 true,
                 &now,
             )?);
+            entities::reassign_document(&tx, document_id, entity_id)?;
             Ok(())
         })();
 
@@ -1434,7 +1504,21 @@ pub async fn set_document_metadata(
             ingest::restore_vault_files(written);
             return Err(e);
         }
+        // Persist the rules file (the resolve above may have created an entity) before committing.
+        let prior_rules = match entities::write_rules_file(
+            &vault_root,
+            &rules_cipher,
+            &entities::rules_from_mirror(&tx)?,
+        ) {
+            Ok(prior) => prior,
+            Err(e) => {
+                drop(tx);
+                ingest::restore_vault_files(written);
+                return Err(e);
+            }
+        };
         if let Err(e) = tx.commit() {
+            entities::restore_rules_file(&vault_root, &prior_rules);
             ingest::restore_vault_files(written);
             return Err(e.into());
         }
@@ -1442,6 +1526,184 @@ pub async fn set_document_metadata(
     })
     .await
     .map_err(|e| Error::Other(format!("update task panicked: {e}")))?
+}
+
+// --- canonical-entity management (the Teach-tab backend; §1.3) ---
+
+/// Run a mirror mutation in a transaction, persist the encrypted rules file from the resulting
+/// mirror (file-first, so a rule is as durable as the commit), then commit — restoring any
+/// rewritten vault files + the rules file if the commit fails. The closure returns the vault-file
+/// snapshots it produced, for rollback. Off-runtime (file IO), like the review commands. This is
+/// the single write path the Teach tab (PR 2) drives, identical to the inline review correction.
+async fn spawn_entity_mutation<F>(app: AppHandle, work: F) -> Result<()>
+where
+    F: FnOnce(
+            &Connection,
+            &std::path::Path,
+            &vault::MarkdownCipher,
+        ) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>>
+        + Send
+        + 'static,
+{
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let state = app.state::<AppState>();
+        let (vault, cipher) = state.markdown_io()?;
+        let (vault_root, rules_cipher) = state.rules_io()?;
+        let mut conn = state.conn()?;
+        let tx = conn.transaction()?;
+
+        let written = match work(&tx, &vault, &cipher) {
+            Ok(w) => w,
+            Err(e) => {
+                drop(tx);
+                return Err(e);
+            }
+        };
+        let prior_rules = match entities::write_rules_file(
+            &vault_root,
+            &rules_cipher,
+            &entities::rules_from_mirror(&tx)?,
+        ) {
+            Ok(prior) => prior,
+            Err(e) => {
+                drop(tx);
+                ingest::restore_vault_files(written);
+                return Err(e);
+            }
+        };
+        if let Err(e) = tx.commit() {
+            entities::restore_rules_file(&vault_root, &prior_rules);
+            ingest::restore_vault_files(written);
+            return Err(e.into());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::Other(format!("entity task panicked: {e}")))?
+}
+
+/// Rewrite every document currently pointing at `entity_id` so its vault frontmatter + `project`
+/// cache show `canonical` (preserving tags/importance/reviewed/last_activity). The mirror pointer
+/// is already set by the caller; this syncs the denormalised cache + vault. Returns the file
+/// snapshots for rollback.
+fn rewrite_entity_documents(
+    tx: &Connection,
+    vault: &std::path::Path,
+    cipher: &vault::MarkdownCipher,
+    entity_id: i64,
+    canonical: &str,
+) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+    let mut stmt = tx.prepare(
+        "SELECT id, tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
+         FROM documents WHERE entity_id = ?1",
+    )?;
+    let rows: Vec<(i64, String, Option<String>, i64, String)> = stmt
+        .query_map(params![entity_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+
+    let mut written = Vec::new();
+    for (doc_id, tags_json, importance, reviewed, last_activity) in rows {
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        written.push(ingest::write_document_truth(
+            tx,
+            vault,
+            cipher,
+            doc_id,
+            canonical,
+            &tags,
+            importance.as_deref(),
+            reviewed != 0,
+            &last_activity,
+        )?);
+    }
+    Ok(written)
+}
+
+/// Every project entity with its aliases — the Teach tab's list (PR 2). Read-only.
+#[tauri::command]
+pub fn list_entities(
+    state: State<'_, AppState>,
+    kind: Option<String>,
+) -> Result<Vec<entities::Entity>> {
+    let conn = state.conn()?;
+    entities::list_entities(&conn, kind.as_deref().unwrap_or(entities::TYPE_PROJECT))
+}
+
+/// Record a forward-going alias for a project entity. Rejected (not silently folded) if the alias
+/// already belongs to another project — that's a merge.
+#[tauri::command]
+pub async fn add_entity_alias(app: AppHandle, entity_id: i64, alias: String) -> Result<()> {
+    spawn_entity_mutation(app, move |tx, _vault, _cipher| {
+        match entities::add_alias(tx, entity_id, &alias)? {
+            entities::AddAlias::Conflict(_) => Err(Error::Other(format!(
+                "\"{}\" already belongs to another project; merge them instead",
+                alias.trim()
+            ))),
+            _ => Ok(Vec::new()),
+        }
+    })
+    .await
+}
+
+/// Rename a canonical project — a one-row identity update plus a frontmatter/cache rewrite of its
+/// documents to the new canonical name (the payoff of identity-not-name).
+#[tauri::command]
+pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> Result<()> {
+    spawn_entity_mutation(app, move |tx, vault, cipher| {
+        let canonical = entities::rename_entity(tx, entity_id, &new_name)?;
+        rewrite_entity_documents(tx, vault, cipher, entity_id, &canonical)
+    })
+    .await
+}
+
+/// Merge `from_id` into `into_id`: fold aliases, repoint every document, rewrite their frontmatter
+/// + cache to the target canonical, and delete the empty source — the headline action that fixes
+/// the variant pain in one move and stops it recurring.
+#[tauri::command]
+pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Result<()> {
+    spawn_entity_mutation(app, move |tx, vault, cipher| {
+        entities::merge_entities(tx, from_id, into_id)?;
+        let canonical = entities::canonical_name(tx, into_id)?;
+        rewrite_entity_documents(tx, vault, cipher, into_id, &canonical)
+    })
+    .await
+}
+
+/// Point one document at a different existing entity — the *misfile* case (a reassignment, not a
+/// merge). Rewrites that document's frontmatter + cache to the target canonical.
+#[tauri::command]
+pub async fn reassign_document(app: AppHandle, document_id: i64, entity_id: i64) -> Result<()> {
+    spawn_entity_mutation(app, move |tx, vault, cipher| {
+        entities::reassign_document(tx, document_id, entity_id)?;
+        let canonical = entities::canonical_name(tx, entity_id)?;
+        let (tags_json, importance, reviewed, last_activity): (
+            String,
+            Option<String>,
+            i64,
+            String,
+        ) = tx.query_row(
+            "SELECT tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
+                 FROM documents WHERE id = ?1",
+            params![document_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        Ok(vec![ingest::write_document_truth(
+            tx,
+            vault,
+            cipher,
+            document_id,
+            &canonical,
+            &tags,
+            importance.as_deref(),
+            reviewed != 0,
+            &last_activity,
+        )?])
+    })
+    .await
 }
 
 // --- personal assistant: projects & focus view (Step 5) ---

@@ -383,11 +383,10 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<()> {
         let _ = std::fs::remove_dir_all(&backup);
         update_keychain(&new_meta, &new_key)?;
 
-        // The connection is still open + valid at this root; just swap the session cipher.
-        state.set_vault_runtime(VaultRuntime {
-            markdown_dir: resolved.markdown_dir.clone(),
-            cipher: new_cipher.clone(),
-        })?;
+        // The connection is still open + valid at this root; just swap the session runtime (the
+        // new master moves both the Markdown subkey and the rules-file subkey). set_vault_runtime
+        // reconciles the rules file under the new key.
+        state.set_vault_runtime(VaultRuntime::build(&resolved, &new_meta, &new_master))?;
     }
 
     // ---- Phase B: relocate (no key change; source kept until the pointer flips) ----
@@ -398,7 +397,7 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<()> {
                 &data_dir,
                 &resolved.vault_root,
                 target,
-                &new_cipher,
+                &new_meta,
                 &new_key,
             )?;
         }
@@ -428,7 +427,7 @@ fn relocate(
     data_dir: &Path,
     from_root: &Path,
     to_root: &Path,
-    new_cipher: &MarkdownCipher,
+    new_meta: &VaultMeta,
     new_key: &Secret,
 ) -> Result<()> {
     write_journal(
@@ -453,14 +452,18 @@ fn relocate(
     pointer::store(data_dir, &pointer::VaultPointer::new(to_root.to_path_buf()))?;
     clear_journal(data_dir)?;
     delete_vault_artifacts(from_root);
-    // Reopen at the new location with the (possibly new) key + cipher.
+    // Reopen at the new location with the (possibly new) key, building the session runtime (both
+    // Markdown + rules ciphers) from the master; open_session reconciles the rules file there.
     let conn = db::open(&to_root.join(DB_FILENAME), new_key.expose())?;
+    let to_resolved = super::ResolvedVault {
+        vault_root: to_root.to_path_buf(),
+        db_path: to_root.join(DB_FILENAME),
+        markdown_dir: to_root.join(MARKDOWN_SUBDIR),
+    };
+    let new_master = master_from_db_key_hex(new_key.expose())?;
     state.open_session(
         conn,
-        VaultRuntime {
-            markdown_dir: to_root.join(MARKDOWN_SUBDIR),
-            cipher: new_cipher.clone(),
-        },
+        VaultRuntime::build(&to_resolved, new_meta, &new_master),
     )?;
     Ok(())
 }
