@@ -767,6 +767,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
                   <ModelRecommendationCards
                     showMeta={showMeta}
                     showPower={showPower}
+                    defaultExpanded={showPower}
                     onUseForChat={(m) =>
                       setChatModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
                     }
@@ -778,7 +779,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
                   />
                 </div>
 
-                {showMeta && cost && (
+                {cost && (
                   <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
                     <div className="flex items-center justify-between">
                       <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
@@ -793,26 +794,32 @@ export function SettingsView({ onClose, onboarding }: Props) {
                         {refreshingPrices ? "Refreshing…" : "Refresh prices"}
                       </Button>
                     </div>
-                    <p className="mt-1 text-xs text-ink4">
-                      Estimated from the tokens each model call used × OpenRouter&apos;s per-token
-                      price
-                      {cost.pricing_updated_at
-                        ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
-                        : ""}
-                      .
-                    </p>
-                    <div className="mt-2 flex gap-6 text-sm">
-                      <div>
-                        <div className="text-xs text-ink4">Last 30 days</div>
-                        <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
-                      </div>
-                      <div>
-                        <div className="text-xs text-ink4">All time</div>
-                        <div className="font-mono text-ink2">{fmtUsd(cost.total_all_time_usd)}</div>
-                      </div>
-                    </div>
-                    <div className="mt-3">
-                      <Collapsible title="How this is calculated" defaultOpen={showPower}>
+                    <div className="mt-2">
+                      <Collapsible
+                        title="Spend & breakdown"
+                        defaultOpen={showPower}
+                        meta={`${fmtUsd(cost.total_30d_usd)} · 30d`}
+                      >
+                        <p className="pt-2 text-xs text-ink4">
+                          Estimated from the tokens each model call used × OpenRouter&apos;s
+                          per-token price
+                          {cost.pricing_updated_at
+                            ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
+                            : ""}
+                          .
+                        </p>
+                        <div className="mt-2 flex gap-6 text-sm">
+                          <div>
+                            <div className="text-xs text-ink4">Last 30 days</div>
+                            <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
+                          </div>
+                          <div>
+                            <div className="text-xs text-ink4">All time</div>
+                            <div className="font-mono text-ink2">
+                              {fmtUsd(cost.total_all_time_usd)}
+                            </div>
+                          </div>
+                        </div>
                         <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
                           <p>
                             Each model reply reports the tokens it used (your prompt + its reply).
@@ -935,21 +942,33 @@ export function SettingsView({ onClose, onboarding }: Props) {
                       {refreshing ? "Refreshing…" : "Refresh now"}
                     </Button>
                   </div>
-                  <p className="mt-1 text-xs text-ink4">
-                    What PM has learned about how you organise, distilled from your review
-                    corrections, and fed into its suggestions and chat.
-                  </p>
-                  <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink2">
-                    {profile?.profile?.trim()
-                      ? profile.profile
-                      : "Nothing learned yet — it builds up as you correct the AI's proposals in Review."}
+                  <div className="mt-2">
+                    <Collapsible
+                      title="Profile"
+                      defaultOpen={showPower}
+                      meta={
+                        profile
+                          ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"}`
+                          : undefined
+                      }
+                    >
+                      <p className="pt-2 text-xs text-ink4">
+                        What PM has learned about how you organise, distilled from your review
+                        corrections, and fed into its suggestions and chat.
+                      </p>
+                      <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink2">
+                        {profile?.profile?.trim()
+                          ? profile.profile
+                          : "Nothing learned yet — it builds up as you correct the AI's proposals in Review."}
+                      </div>
+                      <p className="mt-1 text-xs text-faint">
+                        {profile
+                          ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"} logged`
+                          : ""}
+                        {profile?.updated_at ? ` · updated ${formatWhen(profile.updated_at)}` : ""}
+                      </p>
+                    </Collapsible>
                   </div>
-                  <p className="mt-1 text-xs text-faint">
-                    {profile
-                      ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"} logged`
-                      : ""}
-                    {profile?.updated_at ? ` · updated ${formatWhen(profile.updated_at)}` : ""}
-                  </p>
                 </div>
               </>
             )}
@@ -995,18 +1014,6 @@ export function SettingsView({ onClose, onboarding }: Props) {
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
                   <label className="block text-sm font-medium text-ink2">Data</label>
-                  <p className="mt-1 text-xs text-ink4">
-                    Your documents and the encrypted store live in one folder (
-                    <span className="font-medium">Personal Manager</span>). Open it to back it up by
-                    hand, or export everything to a single <span className="font-medium">.zip</span>{" "}
-                    — the Markdown vault plus the encrypted store (the regenerable runtime is left
-                    out). The store stays encrypted in the archive.
-                  </p>
-                  <p className="mt-1 text-xs text-ink4">
-                    Your documents in the Markdown vault are stored unencrypted so any tool can read
-                    them. To protect them when your machine is off or logged out, turn on full-disk
-                    encryption (BitLocker on Windows, FileVault on macOS).
-                  </p>
                   <div className="mt-2 flex flex-wrap gap-2">
                     <Button variant="tertiary" onClick={revealDataFolder}>
                       Open data folder
@@ -1016,37 +1023,55 @@ export function SettingsView({ onClose, onboarding }: Props) {
                     </Button>
                   </div>
                   {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
+                  <div className="mt-3">
+                    <Collapsible title="About your data & export" defaultOpen={showPower}>
+                      <p className="pt-2 text-xs text-ink4">
+                        Your documents and the encrypted store live in one folder (
+                        <span className="font-medium">Personal Manager</span>). Open it to back it
+                        up by hand, or export everything to a single{" "}
+                        <span className="font-medium">.zip</span> — the Markdown vault plus the
+                        encrypted store (the regenerable runtime is left out). The store stays
+                        encrypted in the archive.
+                      </p>
+                      <p className="mt-1 text-xs text-ink4">
+                        Your documents in the Markdown vault are stored unencrypted so any tool can
+                        read them. To protect them when your machine is off or logged out, turn on
+                        full-disk encryption (BitLocker on Windows, FileVault on macOS).
+                      </p>
+                    </Collapsible>
+                  </div>
                 </div>
 
                 <VaultCard />
 
-                <div
-                  className="mt-5 border-t border-border pt-4 text-xs leading-relaxed text-ink4"
-                  data-help="settings-license"
-                >
-                  <p>
-                    PM is free software, licensed under the{" "}
-                    <a
-                      href="https://www.gnu.org/licenses/agpl-3.0.html"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-ink3 underline hover:text-ink"
-                    >
-                      GNU Affero General Public License v3
-                    </a>
-                    . © 2026 Bobby Yu.
-                  </p>
-                  <p className="mt-1">
-                    Source code:{" "}
-                    <a
-                      href="https://github.com/Admin-Atlas/Personal-Manager"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-ink3 underline hover:text-ink"
-                    >
-                      github.com/Admin-Atlas/Personal-Manager
-                    </a>
-                  </p>
+                <div className="mt-5 border-t border-border pt-4" data-help="settings-license">
+                  <Collapsible title="License" defaultOpen={showPower}>
+                    <div className="pt-2 text-xs leading-relaxed text-ink4">
+                      <p>
+                        PM is free software, licensed under the{" "}
+                        <a
+                          href="https://www.gnu.org/licenses/agpl-3.0.html"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-ink3 underline hover:text-ink"
+                        >
+                          GNU Affero General Public License v3
+                        </a>
+                        . © 2026 Bobby Yu.
+                      </p>
+                      <p className="mt-1">
+                        Source code:{" "}
+                        <a
+                          href="https://github.com/Admin-Atlas/Personal-Manager"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-ink3 underline hover:text-ink"
+                        >
+                          github.com/Admin-Atlas/Personal-Manager
+                        </a>
+                      </p>
+                    </div>
+                  </Collapsible>
                 </div>
               </>
             )}
