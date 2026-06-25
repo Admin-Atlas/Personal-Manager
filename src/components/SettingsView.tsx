@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   appLockStatus,
@@ -35,13 +35,24 @@ import { RebuildProgress } from "./RebuildProgress";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions, LearningProfile } from "../lib/types";
 import { useTheme, useDepth, ACCENTS } from "../theme";
-import { Button, Collapsible, ConfirmDialog, Input, SegmentedControl, Select } from "./ui";
+import { Button, Collapsible, ConfirmDialog, Input, NavItem, SegmentedControl, Select } from "./ui";
 
 interface Props {
   onClose: () => void;
   /** First-run onboarding requires a key before the app is usable. */
   onboarding: boolean;
 }
+
+/** The non-onboarding Settings tabs (left rail). Onboarding stays a single untabbed scroll. */
+type SettingsTab = "general" | "ai" | "search" | "calendar" | "data";
+
+const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
+  { id: "general", label: "General" },
+  { id: "ai", label: "AI & Models" },
+  { id: "search", label: "Search" },
+  { id: "calendar", label: "Calendar" },
+  { id: "data", label: "Data & Security" },
+];
 
 export function SettingsView({ onClose, onboarding }: Props) {
   const help = useHelp();
@@ -95,6 +106,15 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [switching, setSwitching] = useState<{ to: string; from: string } | null>(null);
   const [rebuildOpen, setRebuildOpen] = useState(false);
   const [switchError, setSwitchError] = useState<string | null>(null);
+  // Active tab (non-onboarding only). The scrolling content pane is reset to the top on a
+  // tab change so each tab opens from its first section.
+  const [tab, setTab] = useState<SettingsTab>("general");
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  function selectTab(next: SettingsTab) {
+    setTab(next);
+    contentRef.current?.scrollTo({ top: 0 });
+  }
 
   useEffect(() => {
     (async () => {
@@ -324,159 +344,26 @@ export function SettingsView({ onClose, onboarding }: Props) {
     }
   }
 
-  return (
-    <div className="flex h-full items-center justify-center p-6">
-      <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-[var(--radius)] border border-border bg-panel p-6 shadow-xl">
-        <div className="flex items-center gap-2">
-          <h1 className="font-head text-lg font-semibold text-ink">
-            {onboarding ? "Welcome to PM" : "Settings"}
-          </h1>
-          {onboarding && (
+  // ── Onboarding: a single linear first-run wizard (no tabs). ───────────────────────────────
+  if (onboarding) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-[var(--radius)] border border-border bg-panel p-6 shadow-xl">
+          <div className="flex items-center gap-2">
+            <h1 className="font-head text-lg font-semibold text-ink">Welcome to PM</h1>
             <span
               title="PM is in alpha — under active development; expect rough edges and changes between updates."
               className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wide text-accent-text"
             >
               Alpha
             </span>
-          )}
-        </div>
-        <p className="mt-1 text-sm text-ink3">
-          {onboarding
-            ? "PM is a private, local-first assistant — your documents, notes, and chats live in an encrypted store on this device. Two quick things to set up below: an AI provider key, and how your vault is protected."
-            : "Your API key lives in the OS keychain. The model is swappable anytime."}
-        </p>
-
-        {!onboarding && (
-          <div className="mt-5 border-t border-border pt-4" data-help="settings-appearance">
-            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-              Appearance
-            </label>
-            <p className="mt-1 text-xs text-ink4">
-              Applies instantly and is remembered on this device.
-            </p>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <span className="text-sm text-ink2">System</span>
-              <SegmentedControl
-                value={system}
-                onChange={setSystem}
-                options={[
-                  { value: "editorial", label: "Editorial" },
-                  { value: "slate", label: "Slate" },
-                  { value: "terminal", label: "Terminal" },
-                ]}
-              />
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <span className="text-sm text-ink2">Mode</span>
-              <SegmentedControl
-                value={mode}
-                onChange={setMode}
-                options={[
-                  { value: "dark", label: "Dark" },
-                  { value: "light", label: "Light" },
-                ]}
-              />
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <span className="text-sm text-ink2">Depth</span>
-              <SegmentedControl
-                value={depth}
-                onChange={setDepth}
-                options={[
-                  { value: "min", label: "Min" },
-                  { value: "standard", label: "Standard" },
-                  { value: "power", label: "Power" },
-                ]}
-              />
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <span className="text-sm text-ink2">Accent</span>
-              <div className="flex items-center gap-1.5">
-                {ACCENTS[system].map((hex) => (
-                  <button
-                    key={hex}
-                    type="button"
-                    aria-label={`Accent ${hex}`}
-                    onClick={() => setAccent(hex)}
-                    style={{ background: hex }}
-                    className={`h-5 w-5 rounded-full transition ${
-                      accent === hex
-                        ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
-                        : ""
-                    }`}
-                  />
-                ))}
-              </div>
-            </div>
-            <div
-              className="mt-3 flex items-center justify-between gap-3"
-              data-help="settings-teach-tab"
-            >
-              <span className="text-sm text-ink2">Teach tab</span>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={teachVisible}
-                aria-label="Show the Teach tab"
-                onClick={() => setTeachVisible(!teachVisible)}
-                className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                  teachVisible ? "bg-accent" : "bg-surface"
-                }`}
-              >
-                <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                    teachVisible ? "translate-x-4" : "translate-x-0.5"
-                  }`}
-                />
-              </button>
-            </div>
           </div>
-        )}
+          <p className="mt-1 text-sm text-ink3">
+            PM is a private, local-first assistant — your documents, notes, and chats live in an
+            encrypted store on this device. Two quick things to set up below: an AI provider key,
+            and how your vault is protected.
+          </p>
 
-        {!onboarding && (
-          <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">
-            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-              Time zone
-            </label>
-            <p className="mt-1 text-xs text-ink4">
-              Sets “today”, “due soon”, and your calendar agenda. Auto follows this device.
-            </p>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <span className="text-sm text-ink2">Detection</span>
-              <SegmentedControl
-                value={tzAuto ? "auto" : "manual"}
-                onChange={(v) => setTzAuto(v === "auto")}
-                options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "manual", label: "Manual" },
-                ]}
-              />
-            </div>
-            {!tzAuto && (
-              <div className="mt-3 flex items-center justify-between gap-3">
-                <span className="text-sm text-ink2">Zone</span>
-                <Select
-                  value={timeZone}
-                  onChange={(e) => setTimeZoneState(e.target.value)}
-                  className="max-w-[14rem]"
-                >
-                  {allTimeZones().map((z) => (
-                    <option key={z} value={z}>
-                      {z}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-            )}
-            <p className="mt-2 text-xs text-faint">
-              {tzAuto
-                ? `Following this device: ${detectTimeZone()}`
-                : `Selected: ${timeZone || "—"}`}
-            </p>
-          </div>
-        )}
-
-        {onboarding && (
           <div className="mt-5 border-t border-border pt-4">
             <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
               AI provider
@@ -495,81 +382,47 @@ export function SettingsView({ onClose, onboarding }: Props) {
               PM sends Zero-Data-Retention on every request.
             </p>
           </div>
-        )}
-        <label className={`block text-sm font-medium text-ink2 ${onboarding ? "mt-3" : "mt-5"}`}>
-          OpenRouter API key
-        </label>
-        <Input
-          type="password"
-          autoComplete="off"
-          data-help="settings-api-key"
-          value={key}
-          onChange={(e) => setKey(e.target.value)}
-          placeholder={keyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-          className="mt-1"
-        />
-        <a
-          href="https://openrouter.ai/keys"
-          target="_blank"
-          rel="noreferrer"
-          className="mt-1 inline-block text-xs text-ink4 hover:text-ink2"
-        >
-          Get a key at openrouter.ai/keys →
-        </a>
 
-        {!onboarding && (
-          <>
-            <label className="mt-4 block text-sm font-medium text-ink2">Background API key</label>
-            <Input
-              type="password"
-              autoComplete="off"
-              data-help="settings-background-key"
-              value={bgKey}
-              onChange={(e) => setBgKey(e.target.value)}
-              placeholder={bgKeyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-              className="mt-1"
-            />
-            <p className="mt-1 text-xs text-ink4">
-              Used for background work (sorting proposals, learning). Lets you track that spend
-              separately. Falls back to your main key if blank.
-            </p>
-          </>
-        )}
-
-        <div className="mt-5 space-y-5 border-t border-border pt-4">
-          <ModelListEditor
-            label="Chat model"
-            description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
-            helpId="settings-chat-models"
-            models={chatModels}
-            onChange={setChatModelsState}
-            autoSwitch={chatAuto}
-            onAutoSwitchChange={setChatAuto}
+          <label className="mt-3 block text-sm font-medium text-ink2">OpenRouter API key</label>
+          <Input
+            type="password"
+            autoComplete="off"
+            data-help="settings-api-key"
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+            placeholder={keyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
+            className="mt-1"
           />
-          <ModelListEditor
-            label="Background model"
-            description="Runs sorting proposals and Learning You. Free models work well here; chain a few for daily limits."
-            helpId="settings-background-models"
-            models={backgroundModels}
-            onChange={setBackgroundModelsState}
-            autoSwitch={backgroundAuto}
-            onAutoSwitchChange={setBackgroundAuto}
-          />
-          {!onboarding && (
-            <ModelRecommendationCards
-              showMeta={showMeta}
-              showPower={showPower}
-              onUseForChat={(m) =>
-                setChatModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
-              }
-              onUseForBackground={(m) =>
-                setBackgroundModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
-              }
-            />
-          )}
-        </div>
+          <a
+            href="https://openrouter.ai/keys"
+            target="_blank"
+            rel="noreferrer"
+            className="mt-1 inline-block text-xs text-ink4 hover:text-ink2"
+          >
+            Get a key at openrouter.ai/keys →
+          </a>
 
-        {onboarding && (
+          <div className="mt-5 space-y-5 border-t border-border pt-4">
+            <ModelListEditor
+              label="Chat model"
+              description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
+              helpId="settings-chat-models"
+              models={chatModels}
+              onChange={setChatModelsState}
+              autoSwitch={chatAuto}
+              onAutoSwitchChange={setChatAuto}
+            />
+            <ModelListEditor
+              label="Background model"
+              description="Runs sorting proposals and Learning You. Free models work well here; chain a few for daily limits."
+              helpId="settings-background-models"
+              models={backgroundModels}
+              onChange={setBackgroundModelsState}
+              autoSwitch={backgroundAuto}
+              onAutoSwitchChange={setBackgroundAuto}
+            />
+          </div>
+
           <div className="mt-5 border-t border-border pt-4">
             <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
               Your vault
@@ -615,354 +468,608 @@ export function SettingsView({ onClose, onboarding }: Props) {
               </div>
             )}
           </div>
-        )}
 
-        {onboarding && langOpts && langOpts.options.length > 1 && (
-          <div className="mt-5 border-t border-border pt-4">
-            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-              Search language
-            </label>
-            <p className="mt-1 text-xs text-ink4">
-              How your library is searched. Pick the one that matches your content — not basic vs
-              advanced, just which fits.
-            </p>
-            <div className="mt-3">
-              <SegmentedControl
-                value={embedderId}
-                onChange={setEmbedderId}
-                options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
-              />
-            </div>
-            <p className="mt-2 text-xs text-ink4">
-              {langOpts.options.find((o) => o.id === embedderId)?.multilingual
-                ? "Best for libraries with real non-English content. Understands 100+ languages and finds meaning across them — not just matching words. Downloads a larger model the first time (about 1 GB, once), and uses a little more disk and time per search."
-                : "Best for libraries that are mostly English. Works straight away, stays small and fast. Files in other languages can still be found by keyword."}
-            </p>
-            <div className="mt-3">
-              <Collapsible title="Compare" defaultOpen={false}>
-                <LanguageCompareTable />
-              </Collapsible>
-            </div>
-            <p className="mt-3 text-xs text-faint">
-              You can switch a vault&apos;s language later in Settings — it re-indexes your library
-              to do so (quick on a small vault, longer on a large one). Your original files are
-              never touched or lost.
-            </p>
-          </div>
-        )}
-
-        {!onboarding && showMeta && cost && (
-          <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
-            <div className="flex items-center justify-between">
+          {langOpts && langOpts.options.length > 1 && (
+            <div className="mt-5 border-t border-border pt-4">
               <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                Usage &amp; cost
+                Search language
               </label>
-              <Button
-                variant="tertiary"
-                onClick={refreshPrices}
-                disabled={refreshingPrices}
-                className="px-2 py-0.5 text-xs"
-              >
-                {refreshingPrices ? "Refreshing…" : "Refresh prices"}
-              </Button>
+              <p className="mt-1 text-xs text-ink4">
+                How your library is searched. Pick the one that matches your content — not basic vs
+                advanced, just which fits.
+              </p>
+              <div className="mt-3">
+                <SegmentedControl
+                  value={embedderId}
+                  onChange={setEmbedderId}
+                  options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
+                />
+              </div>
+              <p className="mt-2 text-xs text-ink4">
+                {langOpts.options.find((o) => o.id === embedderId)?.multilingual
+                  ? "Best for libraries with real non-English content. Understands 100+ languages and finds meaning across them — not just matching words. Downloads a larger model the first time (about 1 GB, once), and uses a little more disk and time per search."
+                  : "Best for libraries that are mostly English. Works straight away, stays small and fast. Files in other languages can still be found by keyword."}
+              </p>
+              <div className="mt-3">
+                <Collapsible title="Compare" defaultOpen={false}>
+                  <LanguageCompareTable />
+                </Collapsible>
+              </div>
+              <p className="mt-3 text-xs text-faint">
+                You can switch a vault&apos;s language later in Settings — it re-indexes your
+                library to do so (quick on a small vault, longer on a large one). Your original
+                files are never touched or lost.
+              </p>
             </div>
-            <p className="mt-1 text-xs text-ink4">
-              Estimated from the tokens each model call used × OpenRouter&apos;s per-token price
-              {cost.pricing_updated_at
-                ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
-                : ""}
-              .
+          )}
+
+          {error && (
+            <p
+              className="mt-3 rounded-[var(--radius)] px-3 py-2 text-sm text-st-due"
+              style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+            >
+              {error}
             </p>
-            <div className="mt-2 flex gap-6 text-sm">
-              <div>
-                <div className="text-xs text-ink4">Last 30 days</div>
-                <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
-              </div>
-              <div>
-                <div className="text-xs text-ink4">All time</div>
-                <div className="font-mono text-ink2">{fmtUsd(cost.total_all_time_usd)}</div>
-              </div>
+          )}
+
+          <div className="mt-6 flex justify-end gap-2">
+            <Button variant="primary" onClick={save} disabled={!canSave}>
+              {saving ? "Saving…" : "Get started"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Settings: a left-rail, tabbed surface. State + Save are shared across all tabs. ──────────
+  return (
+    <div className="flex h-full items-center justify-center p-6">
+      <div className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-[var(--radius)] border border-border bg-panel shadow-xl">
+        <div className="shrink-0 border-b border-border px-6 py-4">
+          <h1 className="font-head text-lg font-semibold text-ink">Settings</h1>
+          <p className="mt-1 text-sm text-ink3">
+            Your API key lives in the OS keychain. The model is swappable anytime.
+          </p>
+        </div>
+
+        <div className="flex min-h-0 flex-1">
+          <nav className="w-44 shrink-0 overflow-y-auto border-r border-border p-3">
+            <div className="flex flex-col gap-1">
+              {SETTINGS_TABS.map((t) => (
+                <NavItem key={t.id} active={tab === t.id} onClick={() => selectTab(t.id)}>
+                  {t.label}
+                </NavItem>
+              ))}
             </div>
-            <div className="mt-3">
-              <Collapsible title="How this is calculated" defaultOpen={showPower}>
-                <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
-                  <p>
-                    Each model reply reports the tokens it used (your prompt + its reply). PM logs
-                    those per call. It fetches OpenRouter&apos;s public price list about once a day
-                    and caches it — no extra model call, and your API key is never used for it.
+          </nav>
+
+          <div
+            ref={contentRef}
+            className="min-w-0 flex-1 overflow-y-auto px-6 py-4 [&>*:first-child]:mt-0 [&>*:first-child]:border-t-0 [&>*:first-child]:pt-0"
+          >
+            {tab === "general" && (
+              <>
+                <div className="mt-5 border-t border-border pt-4" data-help="settings-appearance">
+                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                    Appearance
+                  </label>
+                  <p className="mt-1 text-xs text-ink4">
+                    Applies instantly and is remembered on this device.
                   </p>
-                  <p>
-                    Cost per model = prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
-                    reply&nbsp;price, summed over that model&apos;s calls. It&apos;s computed when
-                    you open this page, so a later price change re-prices your history. A model not
-                    yet in the price cache shows <span className="font-mono text-ink4">—</span>,
-                    never an understated&nbsp;$0.
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">System</span>
+                    <SegmentedControl
+                      value={system}
+                      onChange={setSystem}
+                      options={[
+                        { value: "editorial", label: "Editorial" },
+                        { value: "slate", label: "Slate" },
+                        { value: "terminal", label: "Terminal" },
+                      ]}
+                    />
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">Mode</span>
+                    <SegmentedControl
+                      value={mode}
+                      onChange={setMode}
+                      options={[
+                        { value: "dark", label: "Dark" },
+                        { value: "light", label: "Light" },
+                      ]}
+                    />
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">Depth</span>
+                    <SegmentedControl
+                      value={depth}
+                      onChange={setDepth}
+                      options={[
+                        { value: "min", label: "Min" },
+                        { value: "standard", label: "Standard" },
+                        { value: "power", label: "Power" },
+                      ]}
+                    />
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">Accent</span>
+                    <div className="flex items-center gap-1.5">
+                      {ACCENTS[system].map((hex) => (
+                        <button
+                          key={hex}
+                          type="button"
+                          aria-label={`Accent ${hex}`}
+                          onClick={() => setAccent(hex)}
+                          style={{ background: hex }}
+                          className={`h-5 w-5 rounded-full transition ${
+                            accent === hex
+                              ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
+                              : ""
+                          }`}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                  <div
+                    className="mt-3 flex items-center justify-between gap-3"
+                    data-help="settings-teach-tab"
+                  >
+                    <span className="text-sm text-ink2">Teach tab</span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={teachVisible}
+                      aria-label="Show the Teach tab"
+                      onClick={() => setTeachVisible(!teachVisible)}
+                      className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                        teachVisible ? "bg-accent" : "bg-surface"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                          teachVisible ? "translate-x-4" : "translate-x-0.5"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">
+                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                    Time zone
+                  </label>
+                  <p className="mt-1 text-xs text-ink4">
+                    Sets “today”, “due soon”, and your calendar agenda. Auto follows this device.
+                  </p>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">Detection</span>
+                    <SegmentedControl
+                      value={tzAuto ? "auto" : "manual"}
+                      onChange={(v) => setTzAuto(v === "auto")}
+                      options={[
+                        { value: "auto", label: "Auto" },
+                        { value: "manual", label: "Manual" },
+                      ]}
+                    />
+                  </div>
+                  {!tzAuto && (
+                    <div className="mt-3 flex items-center justify-between gap-3">
+                      <span className="text-sm text-ink2">Zone</span>
+                      <Select
+                        value={timeZone}
+                        onChange={(e) => setTimeZoneState(e.target.value)}
+                        className="max-w-[14rem]"
+                      >
+                        {allTimeZones().map((z) => (
+                          <option key={z} value={z}>
+                            {z}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
+                  )}
+                  <p className="mt-2 text-xs text-faint">
+                    {tzAuto
+                      ? `Following this device: ${detectTimeZone()}`
+                      : `Selected: ${timeZone || "—"}`}
                   </p>
                 </div>
-                {cost.all_time.length > 0 ? (
-                  <div className="mt-3">
-                    <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
-                      By model · most expensive first (all time)
+
+                <div
+                  className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4"
+                  data-help="settings-help-mode"
+                >
+                  <div>
+                    <label className="block text-sm font-medium text-ink2">Help mode</label>
+                    <p className="mt-1 text-xs text-ink4">
+                      When on, hovering any highlighted section shows a short explanation of what it
+                      does.
                     </p>
-                    <table className="w-full text-left text-xs">
-                      <thead className="font-mono uppercase tracking-wide text-ink4">
-                        <tr className="border-b border-rule">
-                          <th className="py-1 font-medium">Model</th>
-                          <th className="py-1 text-right font-medium">Reqs</th>
-                          <th className="py-1 text-right font-medium">Tokens in/out</th>
-                          <th className="py-1 text-right font-medium">Cost</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {cost.all_time.map((s) => (
-                          <tr key={s.model} className="border-b border-rule">
-                            <td className="py-1 pr-2 text-ink2">{s.model}</td>
-                            <td className="py-1 text-right text-ink3">{s.request_count}</td>
-                            <td className="py-1 text-right font-mono text-ink4">
-                              {s.prompt_tokens.toLocaleString()} /{" "}
-                              {s.completion_tokens.toLocaleString()}
-                            </td>
-                            <td className="py-1 text-right font-mono text-ink3">
-                              {fmtUsd(s.cost_usd)}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
                   </div>
-                ) : (
-                  <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
-                )}
-              </Collapsible>
-            </div>
-          </div>
-        )}
+                  <button
+                    role="switch"
+                    aria-checked={help.enabled}
+                    onClick={() => help.setEnabled(!help.enabled)}
+                    className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                      help.enabled ? "bg-accent" : "bg-surface"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                        help.enabled ? "translate-x-4" : "translate-x-0.5"
+                      }`}
+                    />
+                  </button>
+                </div>
+              </>
+            )}
 
-        {!onboarding && (
-          <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
-            <div className="flex items-center justify-between">
-              <label className="block text-sm font-medium text-ink2">Learning You</label>
-              <Button variant="tertiary" onClick={refreshProfile} disabled={refreshing}>
-                {refreshing ? "Refreshing…" : "Refresh now"}
-              </Button>
-            </div>
-            <p className="mt-1 text-xs text-ink4">
-              What PM has learned about how you organise, distilled from your review corrections,
-              and fed into its suggestions and chat.
-            </p>
-            <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink2">
-              {profile?.profile?.trim()
-                ? profile.profile
-                : "Nothing learned yet — it builds up as you correct the AI's proposals in Review."}
-            </div>
-            <p className="mt-1 text-xs text-faint">
-              {profile
-                ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"} logged`
-                : ""}
-              {profile?.updated_at ? ` · updated ${formatWhen(profile.updated_at)}` : ""}
-            </p>
-          </div>
-        )}
+            {tab === "ai" && (
+              <>
+                <label className="mt-5 block text-sm font-medium text-ink2">
+                  OpenRouter API key
+                </label>
+                <Input
+                  type="password"
+                  autoComplete="off"
+                  data-help="settings-api-key"
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                  placeholder={keyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
+                  className="mt-1"
+                />
+                <a
+                  href="https://openrouter.ai/keys"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 inline-block text-xs text-ink4 hover:text-ink2"
+                >
+                  Get a key at openrouter.ai/keys →
+                </a>
 
-        {!onboarding && <CalendarSettings />}
+                <label className="mt-4 block text-sm font-medium text-ink2">
+                  Background API key
+                </label>
+                <Input
+                  type="password"
+                  autoComplete="off"
+                  data-help="settings-background-key"
+                  value={bgKey}
+                  onChange={(e) => setBgKey(e.target.value)}
+                  placeholder={bgKeyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
+                  className="mt-1"
+                />
+                <p className="mt-1 text-xs text-ink4">
+                  Used for background work (sorting proposals, learning). Lets you track that spend
+                  separately. Falls back to your main key if blank.
+                </p>
 
-        {!onboarding && (
-          <div className="mt-4 border-t border-border pt-4">
-            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-              Search
-            </label>
-            {langOpts && langOpts.options.length > 1 && (
-              <div className="mt-2">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-xs text-ink4">
-                    Language:{" "}
-                    <span className="text-ink2">
-                      {langOpts.options.find((o) => o.id === embedderId)?.label ?? "English"}
-                    </span>
-                  </p>
-                  <SegmentedControl
-                    value={embedderId}
-                    onChange={requestLanguageSwitch}
-                    options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
+                <div className="mt-5 space-y-5 border-t border-border pt-4">
+                  <ModelListEditor
+                    label="Chat model"
+                    description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
+                    helpId="settings-chat-models"
+                    models={chatModels}
+                    onChange={setChatModelsState}
+                    autoSwitch={chatAuto}
+                    onAutoSwitchChange={setChatAuto}
+                  />
+                  <ModelListEditor
+                    label="Background model"
+                    description="Runs sorting proposals and Learning You. Free models work well here; chain a few for daily limits."
+                    helpId="settings-background-models"
+                    models={backgroundModels}
+                    onChange={setBackgroundModelsState}
+                    autoSwitch={backgroundAuto}
+                    onAutoSwitchChange={setBackgroundAuto}
+                  />
+                  <ModelRecommendationCards
+                    showMeta={showMeta}
+                    showPower={showPower}
+                    onUseForChat={(m) =>
+                      setChatModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
+                    }
+                    onUseForBackground={(m) =>
+                      setBackgroundModelsState((prev) =>
+                        [m, ...prev.filter((x) => x !== m)].slice(0, 50),
+                      )
+                    }
                   />
                 </div>
-                <p className="mt-1 text-xs text-faint">
-                  Switching re-indexes your whole library from your Markdown files — Multilingual
-                  downloads a larger model the first time (about 1 GB, once). Your original files
-                  are never touched.
-                </p>
-                {switchError && <p className="mt-1 text-xs text-st-due">{switchError}</p>}
-              </div>
+
+                {showMeta && cost && (
+                  <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
+                    <div className="flex items-center justify-between">
+                      <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                        Usage &amp; cost
+                      </label>
+                      <Button
+                        variant="tertiary"
+                        onClick={refreshPrices}
+                        disabled={refreshingPrices}
+                        className="px-2 py-0.5 text-xs"
+                      >
+                        {refreshingPrices ? "Refreshing…" : "Refresh prices"}
+                      </Button>
+                    </div>
+                    <p className="mt-1 text-xs text-ink4">
+                      Estimated from the tokens each model call used × OpenRouter&apos;s per-token
+                      price
+                      {cost.pricing_updated_at
+                        ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
+                        : ""}
+                      .
+                    </p>
+                    <div className="mt-2 flex gap-6 text-sm">
+                      <div>
+                        <div className="text-xs text-ink4">Last 30 days</div>
+                        <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-ink4">All time</div>
+                        <div className="font-mono text-ink2">{fmtUsd(cost.total_all_time_usd)}</div>
+                      </div>
+                    </div>
+                    <div className="mt-3">
+                      <Collapsible title="How this is calculated" defaultOpen={showPower}>
+                        <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
+                          <p>
+                            Each model reply reports the tokens it used (your prompt + its reply).
+                            PM logs those per call. It fetches OpenRouter&apos;s public price list
+                            about once a day and caches it — no extra model call, and your API key
+                            is never used for it.
+                          </p>
+                          <p>
+                            Cost per model = prompt&nbsp;tokens × prompt&nbsp;price +
+                            reply&nbsp;tokens × reply&nbsp;price, summed over that model&apos;s
+                            calls. It&apos;s computed when you open this page, so a later price
+                            change re-prices your history. A model not yet in the price cache shows{" "}
+                            <span className="font-mono text-ink4">—</span>, never an
+                            understated&nbsp;$0.
+                          </p>
+                        </div>
+                        {cost.all_time.length > 0 ? (
+                          <div className="mt-3">
+                            <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
+                              By model · most expensive first (all time)
+                            </p>
+                            <table className="w-full text-left text-xs">
+                              <thead className="font-mono uppercase tracking-wide text-ink4">
+                                <tr className="border-b border-rule">
+                                  <th className="py-1 font-medium">Model</th>
+                                  <th className="py-1 text-right font-medium">Reqs</th>
+                                  <th className="py-1 text-right font-medium">Tokens in/out</th>
+                                  <th className="py-1 text-right font-medium">Cost</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {cost.all_time.map((s) => (
+                                  <tr key={s.model} className="border-b border-rule">
+                                    <td className="py-1 pr-2 text-ink2">{s.model}</td>
+                                    <td className="py-1 text-right text-ink3">{s.request_count}</td>
+                                    <td className="py-1 text-right font-mono text-ink4">
+                                      {s.prompt_tokens.toLocaleString()} /{" "}
+                                      {s.completion_tokens.toLocaleString()}
+                                    </td>
+                                    <td className="py-1 text-right font-mono text-ink3">
+                                      {fmtUsd(s.cost_usd)}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
+                        )}
+                      </Collapsible>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
-            <div className="mt-3 flex items-start justify-between gap-3">
-              <div>
-                <label className="block text-sm font-medium text-ink2">
-                  Re-rank search results
-                </label>
-                <p className="mt-1 text-xs text-ink4">
-                  A second pass re-scores search hits for sharper relevance. First use downloads a
-                  small model; turn off for fastest results.
-                </p>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={reranking}
-                aria-label="Re-rank search results"
-                onClick={() => void toggleReranking(!reranking)}
-                className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                  reranking ? "bg-accent" : "bg-surface"
-                }`}
-              >
-                <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                    reranking ? "translate-x-4" : "translate-x-0.5"
-                  }`}
-                />
-              </button>
-            </div>
-          </div>
-        )}
 
-        {!onboarding && (
-          <div
-            className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4"
-            data-help="settings-app-lock"
-          >
-            <div>
-              <label className="block text-sm font-medium text-ink2">App lock</label>
-              <p className="mt-1 text-xs text-ink4">
-                {appLock?.available
-                  ? "Require Windows Hello (face, fingerprint, or PIN) to open PM. A convenience lock for the window — your store is always encrypted at rest. Takes effect next time you open PM."
-                  : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
-              </p>
-            </div>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={appLock?.enabled ?? false}
-              aria-label="App lock"
-              disabled={!appLock?.available}
-              onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
-              className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                appLock?.enabled ? "bg-accent" : "bg-surface"
-              }`}
+            {tab === "search" && (
+              <>
+                <div className="mt-4 border-t border-border pt-4">
+                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                    Search
+                  </label>
+                  {langOpts && langOpts.options.length > 1 && (
+                    <div className="mt-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-xs text-ink4">
+                          Language:{" "}
+                          <span className="text-ink2">
+                            {langOpts.options.find((o) => o.id === embedderId)?.label ?? "English"}
+                          </span>
+                        </p>
+                        <SegmentedControl
+                          value={embedderId}
+                          onChange={requestLanguageSwitch}
+                          options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
+                        />
+                      </div>
+                      <p className="mt-1 text-xs text-faint">
+                        Switching re-indexes your whole library from your Markdown files —
+                        Multilingual downloads a larger model the first time (about 1 GB, once).
+                        Your original files are never touched.
+                      </p>
+                      {switchError && <p className="mt-1 text-xs text-st-due">{switchError}</p>}
+                    </div>
+                  )}
+                  <div className="mt-3 flex items-start justify-between gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-ink2">
+                        Re-rank search results
+                      </label>
+                      <p className="mt-1 text-xs text-ink4">
+                        A second pass re-scores search hits for sharper relevance. First use
+                        downloads a small model; turn off for fastest results.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={reranking}
+                      aria-label="Re-rank search results"
+                      onClick={() => void toggleReranking(!reranking)}
+                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                        reranking ? "bg-accent" : "bg-surface"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                          reranking ? "translate-x-4" : "translate-x-0.5"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-sm font-medium text-ink2">Learning You</label>
+                    <Button variant="tertiary" onClick={refreshProfile} disabled={refreshing}>
+                      {refreshing ? "Refreshing…" : "Refresh now"}
+                    </Button>
+                  </div>
+                  <p className="mt-1 text-xs text-ink4">
+                    What PM has learned about how you organise, distilled from your review
+                    corrections, and fed into its suggestions and chat.
+                  </p>
+                  <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink2">
+                    {profile?.profile?.trim()
+                      ? profile.profile
+                      : "Nothing learned yet — it builds up as you correct the AI's proposals in Review."}
+                  </div>
+                  <p className="mt-1 text-xs text-faint">
+                    {profile
+                      ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"} logged`
+                      : ""}
+                    {profile?.updated_at ? ` · updated ${formatWhen(profile.updated_at)}` : ""}
+                  </p>
+                </div>
+              </>
+            )}
+
+            {tab === "calendar" && (
+              <>
+                <CalendarSettings />
+              </>
+            )}
+
+            {tab === "data" && (
+              <>
+                <div
+                  className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4"
+                  data-help="settings-app-lock"
+                >
+                  <div>
+                    <label className="block text-sm font-medium text-ink2">App lock</label>
+                    <p className="mt-1 text-xs text-ink4">
+                      {appLock?.available
+                        ? "Require Windows Hello (face, fingerprint, or PIN) to open PM. A convenience lock for the window — your store is always encrypted at rest. Takes effect next time you open PM."
+                        : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={appLock?.enabled ?? false}
+                    aria-label="App lock"
+                    disabled={!appLock?.available}
+                    onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
+                    className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                      appLock?.enabled ? "bg-accent" : "bg-surface"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                        appLock?.enabled ? "translate-x-4" : "translate-x-0.5"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
+                  <label className="block text-sm font-medium text-ink2">Data</label>
+                  <p className="mt-1 text-xs text-ink4">
+                    Your documents and the encrypted store live in one folder (
+                    <span className="font-medium">Personal Manager</span>). Open it to back it up by
+                    hand, or export everything to a single <span className="font-medium">.zip</span>{" "}
+                    — the Markdown vault plus the encrypted store (the regenerable runtime is left
+                    out). The store stays encrypted in the archive.
+                  </p>
+                  <p className="mt-1 text-xs text-ink4">
+                    Your documents in the Markdown vault are stored unencrypted so any tool can read
+                    them. To protect them when your machine is off or logged out, turn on full-disk
+                    encryption (BitLocker on Windows, FileVault on macOS).
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Button variant="tertiary" onClick={revealDataFolder}>
+                      Open data folder
+                    </Button>
+                    <Button variant="tertiary" onClick={exportData} disabled={exporting}>
+                      {exporting ? "Exporting…" : "Export all data…"}
+                    </Button>
+                  </div>
+                  {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
+                </div>
+
+                <VaultCard />
+
+                <div
+                  className="mt-5 border-t border-border pt-4 text-xs leading-relaxed text-ink4"
+                  data-help="settings-license"
+                >
+                  <p>
+                    PM is free software, licensed under the{" "}
+                    <a
+                      href="https://www.gnu.org/licenses/agpl-3.0.html"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-ink3 underline hover:text-ink"
+                    >
+                      GNU Affero General Public License v3
+                    </a>
+                    . © 2026 Bobby Yu.
+                  </p>
+                  <p className="mt-1">
+                    Source code:{" "}
+                    <a
+                      href="https://github.com/Admin-Atlas/Personal-Manager"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-ink3 underline hover:text-ink"
+                    >
+                      github.com/Admin-Atlas/Personal-Manager
+                    </a>
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="shrink-0 border-t border-border px-6 py-4">
+          {error && (
+            <p
+              className="mb-3 rounded-[var(--radius)] px-3 py-2 text-sm text-st-due"
+              style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
             >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                  appLock?.enabled ? "translate-x-4" : "translate-x-0.5"
-                }`}
-              />
-            </button>
-          </div>
-        )}
-
-        {!onboarding && (
-          <div
-            className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4"
-            data-help="settings-help-mode"
-          >
-            <div>
-              <label className="block text-sm font-medium text-ink2">Help mode</label>
-              <p className="mt-1 text-xs text-ink4">
-                When on, hovering any highlighted section shows a short explanation of what it does.
-              </p>
-            </div>
-            <button
-              role="switch"
-              aria-checked={help.enabled}
-              onClick={() => help.setEnabled(!help.enabled)}
-              className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                help.enabled ? "bg-accent" : "bg-surface"
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                  help.enabled ? "translate-x-4" : "translate-x-0.5"
-                }`}
-              />
-            </button>
-          </div>
-        )}
-
-        {!onboarding && (
-          <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
-            <label className="block text-sm font-medium text-ink2">Data</label>
-            <p className="mt-1 text-xs text-ink4">
-              Your documents and the encrypted store live in one folder (
-              <span className="font-medium">Personal Manager</span>). Open it to back it up by hand,
-              or export everything to a single <span className="font-medium">.zip</span> — the
-              Markdown vault plus the encrypted store (the regenerable runtime is left out). The
-              store stays encrypted in the archive.
+              {error}
             </p>
-            <p className="mt-1 text-xs text-ink4">
-              Your documents in the Markdown vault are stored unencrypted so any tool can read them.
-              To protect them when your machine is off or logged out, turn on full-disk encryption
-              (BitLocker on Windows, FileVault on macOS).
-            </p>
-            <div className="mt-2 flex flex-wrap gap-2">
-              <Button variant="tertiary" onClick={revealDataFolder}>
-                Open data folder
-              </Button>
-              <Button variant="tertiary" onClick={exportData} disabled={exporting}>
-                {exporting ? "Exporting…" : "Export all data…"}
-              </Button>
-            </div>
-            {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
-          </div>
-        )}
-
-        {!onboarding && <VaultCard />}
-
-        {!onboarding && (
-          <div
-            className="mt-5 border-t border-border pt-4 text-xs leading-relaxed text-ink4"
-            data-help="settings-license"
-          >
-            <p>
-              PM is free software, licensed under the{" "}
-              <a
-                href="https://www.gnu.org/licenses/agpl-3.0.html"
-                target="_blank"
-                rel="noreferrer"
-                className="text-ink3 underline hover:text-ink"
-              >
-                GNU Affero General Public License v3
-              </a>
-              . © 2026 Bobby Yu.
-            </p>
-            <p className="mt-1">
-              Source code:{" "}
-              <a
-                href="https://github.com/Admin-Atlas/Personal-Manager"
-                target="_blank"
-                rel="noreferrer"
-                className="text-ink3 underline hover:text-ink"
-              >
-                github.com/Admin-Atlas/Personal-Manager
-              </a>
-            </p>
-          </div>
-        )}
-
-        {error && (
-          <p
-            className="mt-3 rounded-[var(--radius)] px-3 py-2 text-sm text-st-due"
-            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-          >
-            {error}
-          </p>
-        )}
-
-        <div className="mt-6 flex justify-end gap-2">
-          {!onboarding && (
+          )}
+          <div className="flex justify-end gap-2">
             <Button variant="tertiary" onClick={onClose}>
               Cancel
             </Button>
-          )}
-          <Button variant="primary" onClick={save} disabled={!canSave}>
-            {saving ? "Saving…" : onboarding ? "Get started" : "Save"}
-          </Button>
+            <Button variant="primary" onClick={save} disabled={!canSave}>
+              {saving ? "Saving…" : "Save"}
+            </Button>
+          </div>
         </div>
       </div>
 
