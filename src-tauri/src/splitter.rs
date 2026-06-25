@@ -32,8 +32,9 @@ pub const CHUNK_TARGET_TOKENS: usize = 256;
 /// retrievable.
 pub const CHUNK_OVERLAP_TOKENS: usize = 32;
 /// The splitter implementation version. Bump on any change to chunk boundaries; the retrieval
-/// stamp folds this in, so a bump prompts a one-time Rebuild.
-pub const SPLITTER_VERSION: u32 = 1;
+/// stamp folds this in, so a bump prompts a one-time Rebuild. (Bumped to 2 with the token-count
+/// padding fix: the counter change shifts every chunk boundary, so existing vaults must rechunk.)
+pub const SPLITTER_VERSION: u32 = 2;
 /// The boundary-strategy id recorded in the retrieval stamp.
 pub const BOUNDARY_STRATEGY: &str = "recursive-structure-v1";
 

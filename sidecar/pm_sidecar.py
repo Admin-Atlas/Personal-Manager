@@ -111,8 +111,11 @@ def get_tokenizer(model=None, spec=None):
     versions (the attribute path is internal), falling back to loading the repo's
     tokenizer directly, then to `None` so the caller can estimate. Truncation is
     disabled so an oversized chunk reports its *true* length (the splitter must see
-    it overflow to break it up). Reuses the embedder's already-downloaded weights —
-    no extra download.
+    it overflow to break it up). Padding is deliberately left untouched: this is the
+    SAME tokenizer instance fastembed batches embeddings with, so disabling padding
+    here could break/degrade embedding — `do_count_tokens` strips padding from the
+    count via the attention mask instead. Reuses the embedder's already-downloaded
+    weights — no extra download.
     """
     model = model or EMBED_MODEL
     if model in _tokenizers:
@@ -241,7 +244,15 @@ def do_count_tokens(params):
     if tok is not None:
         try:
             encodings = tok.encode_batch(texts)
-            return {"counts": [len(e.ids) for e in encodings]}
+            # `encode_batch` pads every text to the batch's longest (fastembed
+            # leaves batch padding enabled, and this is the same shared tokenizer
+            # it embeds with, so we must not turn padding off here). `len(e.ids)`
+            # would then count pad tokens and report every text as the longest
+            # one's length — which made the splitter size every block by the
+            # document's largest block and shatter long documents. The attention
+            # mask is 1 for real tokens and 0 for padding, so summing it gives each
+            # text's TRUE length, independent of the rest of the batch.
+            return {"counts": [int(sum(e.attention_mask)) for e in encodings]}
         except Exception:
             pass
     return {"counts": [max(1, len(t) // 4) for t in texts]}
