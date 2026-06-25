@@ -15,7 +15,8 @@
 import { useEffect, useRef, useState } from "react";
 import { rebuildIndex } from "../lib/ipc";
 import type { IngestEvent } from "../lib/types";
-import { Button, Collapsible, Modal, Progress } from "./ui";
+import { Button, Collapsible, Modal } from "./ui";
+import { IngestProgress } from "./IngestProgress";
 
 interface Props {
   /** When true, the modal shows and a rebuild kicks off once. */
@@ -38,6 +39,10 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
   const [phase, setPhase] = useState<Phase>("running");
   const [prep, setPrep] = useState<string | null>(null);
   const [files, setFiles] = useState<string[]>([]);
+  // Determinate-bar inputs: `total` from the `counted` event, `processed` counted up as each
+  // file lands. Null total (model download / warmup) keeps the bar an indeterminate sweep.
+  const [total, setTotal] = useState<number | null>(null);
+  const [processed, setProcessed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   // Callbacks via refs so the run effect can depend only on `open` (no churn when the parent
   // passes fresh inline closures each render).
@@ -53,6 +58,8 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
       setPhase("running");
       setPrep(null);
       setFiles([]);
+      setTotal(null);
+      setProcessed(0);
       setError(null);
       return;
     }
@@ -65,11 +72,19 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
             case "preparing":
               setPrep(event.message);
               break;
+            case "counted":
+              setTotal(event.total);
+              break;
             case "started":
               setPrep(null);
               setFiles((prev) => [...prev, event.name]);
               break;
-            // done/skipped/failed roll into the running list; the final summary line is enough.
+            case "done":
+            case "failed":
+              // Each file's terminal event advances the determinate bar; the names roll into
+              // the running list, and the final summary line is enough for the rest.
+              setProcessed((n) => n + 1);
+              break;
             default:
               break;
           }
@@ -95,7 +110,14 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
         </h2>
         {subtitle && <p className="mt-1 text-xs text-ink4">{subtitle}</p>}
 
-        {running && <Progress className="mt-4" label="Re-indexing" />}
+        {running && (
+          <IngestProgress
+            className="mt-4"
+            label="Re-indexing"
+            processed={processed}
+            total={total}
+          />
+        )}
         {prep && <p className="mt-3 text-sm text-ink3">{prep}</p>}
 
         {files.length > 0 && (
