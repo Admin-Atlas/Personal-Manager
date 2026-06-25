@@ -52,7 +52,8 @@ pub enum Source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pooling {
     Mean,
-    /// Used by the multilingual `bge-m3` embedder (PR 3); a forward seam today.
+    /// A forward seam for a future CLS-pooled embedder (e.g. a verified bge-m3 export, if one ever
+    /// displaces e5-large). Unused today — e5-large, like the English default, is mean-pooled.
     #[allow(dead_code)]
     Cls,
     None,
@@ -119,23 +120,34 @@ const BGE_SMALL_EN: ModelEntry = ModelEntry {
     label: "English",
 };
 
-/// The multilingual embedder (PR 2) — `intfloat/multilingual-e5-small`, **384-d** so it shares the
-/// existing `chunk_vec float[384]` (no schema change). Not bundled: registered via fastembed's
-/// `add_custom_model` from the official ONNX export. e5 is asymmetric — the `query: ` / `passage: `
-/// prefixes are mandatory and applied in Rust.
-const MULTILINGUAL_E5_SMALL: ModelEntry = ModelEntry {
-    id: "intfloat/multilingual-e5-small",
+/// The multilingual embedder (PR 3) — `intfloat/multilingual-e5-large`, **1024-d**. Replaces the
+/// PR 2 `multilingual-e5-small` (384-d), dropped as a dominated middle tier: e5-large is now the
+/// only multilingual embedder, so multilingual lives on the vector-width drop+recreate path
+/// ([`crate::db::ensure_vec_dim`]). Bundled in fastembed's supported list, so `model_file` is
+/// `None` (no `add_custom_model`) — but the weights still **download on first use** (~1 GB combined
+/// with its paired `bge-reranker-v2-m3`). The same proven e5 pattern as the former e5-small (mean
+/// pooling, L2-normalized, asymmetric `query: ` / `passage: ` prefixes applied in Rust by
+/// [`apply_prefix`]), just wider.
+//
+// Native support CONFIRMED: fastembed 0.8.0's `list_supported_models()` lists
+// `intfloat/multilingual-e5-large` (and not e5-small, which is why PR 2 needed a custom export), so
+// `model_file: None` is correct — fastembed downloads + loads it directly. The remaining hardware
+// verification is narrower (the first live 1024 exercise): that the download embeds at 1024-d with
+// sane German-corpus quality. The rebuild warmup width-check catches a wrong/absent export before
+// any index is touched, so even a regression here fails safe.
+const MULTILINGUAL_E5_LARGE: ModelEntry = ModelEntry {
+    id: "intfloat/multilingual-e5-large",
     role: Role::Embedder,
-    dimension: 384,
+    dimension: 1024,
     max_tokens: 512,
-    tokenizer: "intfloat/multilingual-e5-small",
+    tokenizer: "intfloat/multilingual-e5-large",
     runtime: Runtime::OnnxFastembed,
-    source: Source::HuggingFace("intfloat/multilingual-e5-small"),
+    source: Source::HuggingFace("intfloat/multilingual-e5-large"),
     pooling: Pooling::Mean,
     query_prefix: Some("query: "),
     passage_prefix: Some("passage: "),
     normalize: true,
-    model_file: Some("onnx/model.onnx"),
+    model_file: None,
     multilingual: true,
     label: "Multilingual",
 };
@@ -192,7 +204,7 @@ const MULTILINGUAL_RERANKER_ID: &str = "BAAI/bge-reranker-v2-m3";
 pub fn all() -> Vec<ModelEntry> {
     vec![
         BGE_SMALL_EN.clone(),
-        MULTILINGUAL_E5_SMALL.clone(),
+        MULTILINGUAL_E5_LARGE.clone(),
         MS_MARCO_MINILM.clone(),
         BGE_RERANKER_V2_M3.clone(),
     ]
@@ -234,9 +246,10 @@ pub fn reranker_for(embedder: &ModelEntry) -> ModelEntry {
     }
 }
 
-/// The embedders offered at vault creation. PR 2 ships two, both 384-d (so neither changes the
-/// vector schema); a future higher-dimension embedder (PR 3) would gate this on the vault's
-/// dimension.
+/// The embedders offered at vault creation: the bundled 384-d English default and the 1024-d
+/// multilingual `e5-large` (PR 3). They span **different** vector widths now — the vault's
+/// `chunk_vec` is built (or drop+recreated via [`crate::db::ensure_vec_dim`]) to the chosen
+/// embedder's dimension, so selecting multilingual on a populated vault means a re-index.
 pub fn selectable_embedders() -> Vec<ModelEntry> {
     all()
         .into_iter()
@@ -282,10 +295,12 @@ mod tests {
     #[test]
     fn lookup_finds_registered_models_and_misses_unknown() {
         assert!(lookup("BAAI/bge-small-en-v1.5").is_some());
-        assert!(lookup("intfloat/multilingual-e5-small").is_some());
+        assert!(lookup("intfloat/multilingual-e5-large").is_some());
         assert!(lookup("Xenova/ms-marco-MiniLM-L-6-v2").is_some());
         assert!(lookup("BAAI/bge-reranker-v2-m3").is_some());
         assert!(lookup("nope/not-a-model").is_none());
+        // e5-small (the PR 2 384-d multilingual tier) was dropped in PR 3.
+        assert!(lookup("intfloat/multilingual-e5-small").is_none());
     }
 
     #[test]
@@ -299,27 +314,23 @@ mod tests {
     }
 
     #[test]
-    fn the_multilingual_embedder_is_384d_with_asymmetric_prefixes() {
-        let e = lookup("intfloat/multilingual-e5-small").unwrap();
+    fn the_multilingual_embedder_is_1024d_with_asymmetric_prefixes() {
+        let e = lookup("intfloat/multilingual-e5-large").unwrap();
         assert_eq!(e.role, Role::Embedder);
         assert_eq!(
-            e.dimension, 384,
-            "e5-small must share the float[384] vec table"
+            e.dimension, 1024,
+            "e5-large is PR 3's 1024-d multilingual embedder"
         );
         assert!(e.multilingual);
         assert_eq!(e.query_prefix, Some("query: "));
         assert_eq!(e.passage_prefix, Some("passage: "));
-        assert!(
-            e.model_file.is_some(),
-            "e5-small is custom — needs an ONNX file"
-        );
         assert!(matches!(e.source, Source::HuggingFace(_)));
     }
 
     #[test]
     fn reranker_pairing_follows_the_embedder_language() {
         let english = lookup("BAAI/bge-small-en-v1.5").unwrap();
-        let multilingual = lookup("intfloat/multilingual-e5-small").unwrap();
+        let multilingual = lookup("intfloat/multilingual-e5-large").unwrap();
         assert_eq!(reranker_for(&english).id, "Xenova/ms-marco-MiniLM-L-6-v2");
         assert_eq!(reranker_for(&multilingual).id, "BAAI/bge-reranker-v2-m3");
         // The pairing can never put a multilingual reranker on an English embedder.
@@ -342,22 +353,39 @@ mod tests {
     }
 
     #[test]
-    fn selectable_embedders_all_share_the_vector_dimension() {
-        // PR 2 must not introduce an off-dimension selectable embedder (that needs PR 3's vec
-        // drop+recreate); they must all match the default's width.
-        let dim = active_embedder().dimension;
+    fn selectable_embedders_span_the_english_384_and_a_1024_multilingual() {
+        // PR 3 deliberately breaks PR 2's single-width invariant: the picker now offers the bundled
+        // 384-d English default AND a 1024-d multilingual embedder. The vault's vec table is built
+        // (or resized via db::ensure_vec_dim) to whichever is chosen, so mixed widths here are the
+        // whole point, not a bug.
         let selectable = selectable_embedders();
         assert!(selectable.len() >= 2, "expected English + multilingual");
-        for e in selectable {
-            assert_eq!(e.dimension, dim, "{} has an off-dimension width", e.id);
+        assert!(selectable.iter().all(|e| e.role == Role::Embedder));
+        // The English default is still the lean, bundled 384-d model.
+        assert_eq!(active_embedder().dimension, 384);
+        assert!(!active_embedder().multilingual);
+        // There is a selectable multilingual embedder, and it is 1024-d (e5-large).
+        let multilingual: Vec<_> = selectable.iter().filter(|e| e.multilingual).collect();
+        assert!(!multilingual.is_empty(), "expected a multilingual option");
+        assert!(
+            multilingual.iter().any(|e| e.dimension == 1024),
+            "the multilingual embedder is 1024-d (e5-large)"
+        );
+        // Every multilingual selectable still pairs with a multilingual reranker.
+        for e in multilingual {
+            assert!(
+                reranker_for(e).multilingual,
+                "{} lost its multilingual reranker",
+                e.id
+            );
         }
     }
 
     #[test]
     fn embedder_or_default_resolves_and_falls_back() {
         assert_eq!(
-            embedder_or_default("intfloat/multilingual-e5-small").id,
-            "intfloat/multilingual-e5-small"
+            embedder_or_default("intfloat/multilingual-e5-large").id,
+            "intfloat/multilingual-e5-large"
         );
         // Unknown id → English default.
         assert_eq!(
@@ -373,7 +401,7 @@ mod tests {
 
     #[test]
     fn apply_prefix_is_asymmetric_for_e5_and_noop_for_bge() {
-        let e5 = lookup("intfloat/multilingual-e5-small").unwrap();
+        let e5 = lookup("intfloat/multilingual-e5-large").unwrap();
         let bge = lookup("BAAI/bge-small-en-v1.5").unwrap();
         let texts = vec!["hello".to_string(), "world".to_string()];
 

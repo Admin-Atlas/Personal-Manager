@@ -78,13 +78,13 @@ pub fn selected_embedder(conn: &Connection) -> Result<crate::registry::ModelEntr
     })
 }
 
-/// Record the vault's embedder selection (onboarding, while the vault is empty). Stores the
-/// canonical model id and its dimension, keeping the long-standing `embedding_model` /
-/// `embedding_dim` rows in step. Caller validates the id is selectable first.
+/// Record the vault's embedder selection. Stores **only** the canonical model id — the physical
+/// `embedding_dim` is owned by [`ensure_vec_dim`] (the thing that actually resizes the vector
+/// table), so a selection that hasn't been re-indexed yet can never desync the recorded width from
+/// the real one. Caller validates the id is selectable first.
 pub fn set_selected_embedder(conn: &Connection, id: &str) -> Result<()> {
     let e = crate::registry::embedder_or_default(id);
-    set_setting(conn, EMBEDDING_MODEL_KEY, e.id)?;
-    set_setting(conn, "embedding_dim", &e.dimension.to_string())
+    set_setting(conn, EMBEDDING_MODEL_KEY, e.id)
 }
 
 /// Whether query-time reranking is on. Default **true** (absent, or anything but `"false"`, ⇒ on),
@@ -102,12 +102,62 @@ pub fn set_reranking(conn: &Connection, enabled: bool) -> Result<()> {
     )
 }
 
-/// The vector width of `chunk_vec`, frozen at 384 by migration v2 (`float[384]`). PR 2 keeps it
-/// fixed — every selectable embedder is 384-d, so no vec table is recreated — and ingest guards
-/// the selected embedder against it. PR 3 makes the width dynamic (drop+recreate to a new
-/// dimension for higher-dimension embedders); this becomes a read of the live table then.
-pub fn vec0_dim() -> usize {
-    384
+/// The **live** vector width of this vault's `chunk_vec`, read from the table's own DDL. Migration
+/// v2 creates it at `float[384]`; a multilingual vault is drop+recreated to a wider column by
+/// [`ensure_vec_dim`] at re-index time, so this reflects the *current physical* width — the source
+/// of truth the ingest dimension-guard and the resize check both read. We parse the `sqlite_master`
+/// DDL rather than trust the `embedding_dim` setting so the two can never silently disagree.
+pub fn vec0_dim(conn: &Connection) -> Result<usize> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunk_vec'",
+        [],
+        |row| row.get(0),
+    )?;
+    parse_vec_width(&sql)
+        .ok_or_else(|| Error::Other(format!("could not read chunk_vec vector width from: {sql}")))
+}
+
+/// Pull the `N` out of a vec0 column declaration `... float[N] ...` — case- and whitespace-
+/// tolerant, no `regex` dependency. Pure so it can be unit-tested against the exact DDL sqlite-vec
+/// round-trips into `sqlite_master` (which may differ from the `CREATE` string we wrote).
+fn parse_vec_width(ddl: &str) -> Option<usize> {
+    let lower = ddl.to_ascii_lowercase();
+    let start = lower.find("float[")? + "float[".len();
+    let rest = &ddl[start..];
+    let end = rest.find(']')?;
+    rest[..end].trim().parse::<usize>().ok()
+}
+
+/// Resize `chunk_vec` to `target` by drop+recreate — the destructive heart of PR 3's re-index that
+/// deliberately is **not** an additive migration (a vec0 column's width is fixed at creation; you
+/// cannot `ALTER` it, and a migration would wrongly fire for every vault, English ones included).
+/// Called only when the table is **empty**: from [`crate::commands::set_vault_embedder`] on a
+/// brand-new vault, and from `ingest::rebuild` after it has cleared the store. A no-op when the
+/// width already matches, so callers can invoke it unconditionally.
+///
+/// Safety: refuses to drop a **non-empty** `chunk_vec` (that would silently lose vectors with no
+/// rebuild) — the caller clears chunks first. The drop+recreate and the `embedding_dim` mirror
+/// update run in one transaction, so a crash can never leave the vault with no `chunk_vec`. This is
+/// the **sole writer** of `embedding_dim` (the human-readable mirror of the physical width).
+pub fn ensure_vec_dim(conn: &Connection, target: usize) -> Result<()> {
+    if vec0_dim(conn)? == target {
+        return Ok(());
+    }
+    let rows: i64 = conn.query_row("SELECT count(*) FROM chunk_vec", [], |r| r.get(0))?;
+    if rows > 0 {
+        return Err(Error::Other(format!(
+            "refusing to resize a populated vector index ({rows} vectors) to {target}-d; clear the \
+             index first (this is what the Re-index flow does)"
+        )));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "DROP TABLE chunk_vec; \
+         CREATE VIRTUAL TABLE chunk_vec USING vec0(embedding float[{target}]);"
+    ))?;
+    set_setting(&tx, "embedding_dim", &target.to_string())?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Distinct project labels across all documents, alphabetical. The one query
@@ -493,15 +543,19 @@ mod tests {
         );
         assert!(reranking_enabled(&conn).unwrap());
 
-        // Select the multilingual embedder; the id + dimension are recorded.
-        set_selected_embedder(&conn, "intfloat/multilingual-e5-small").unwrap();
+        // Select the multilingual embedder; only the model id is recorded. The physical vec width
+        // (embedding_dim) is owned by ensure_vec_dim, so it stays the seeded 384 until a resize —
+        // a selection without a re-index can never desync the recorded width from the real one.
+        set_selected_embedder(&conn, "intfloat/multilingual-e5-large").unwrap();
         assert_eq!(
             selected_embedder(&conn).unwrap().id,
-            "intfloat/multilingual-e5-small"
+            "intfloat/multilingual-e5-large"
         );
+        assert_eq!(selected_embedder(&conn).unwrap().dimension, 1024);
         assert_eq!(
             get_setting(&conn, "embedding_dim").unwrap().as_deref(),
-            Some("384")
+            Some("384"),
+            "set_selected_embedder must not touch the physical width"
         );
 
         // An unknown stored id resolves to the English default rather than breaking ingest.
@@ -516,5 +570,119 @@ mod tests {
         assert!(!reranking_enabled(&conn).unwrap());
         set_reranking(&conn, true).unwrap();
         assert!(reranking_enabled(&conn).unwrap());
+    }
+
+    #[test]
+    fn parse_vec_width_tolerates_spacing_and_case() {
+        assert_eq!(
+            parse_vec_width("CREATE VIRTUAL TABLE chunk_vec USING vec0(embedding float[384])"),
+            Some(384)
+        );
+        assert_eq!(parse_vec_width("... FLOAT[ 1024 ] ..."), Some(1024));
+        assert_eq!(parse_vec_width("no vector column here"), None);
+    }
+
+    #[test]
+    fn vec0_dim_reads_the_live_table_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecdim.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        // Fresh vault: migration v2 built chunk_vec at float[384].
+        assert_eq!(vec0_dim(&conn).unwrap(), 384);
+
+        // Recreate at a different width by hand — vec0_dim follows the actual table, not a setting.
+        conn.execute_batch(
+            "DROP TABLE chunk_vec; CREATE VIRTUAL TABLE chunk_vec USING vec0(embedding float[512]);",
+        )
+        .unwrap();
+        assert_eq!(vec0_dim(&conn).unwrap(), 512);
+    }
+
+    #[test]
+    fn ensure_vec_dim_resizes_an_empty_table_and_is_idempotent() {
+        // Use 512 — a real, model-independent width — to prove the SQL machinery without any model.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resize.sqlite");
+        let conn = open(&path, KEY).unwrap();
+        assert_eq!(vec0_dim(&conn).unwrap(), 384);
+
+        // Same width: a no-op that leaves the table untouched.
+        ensure_vec_dim(&conn, 384).unwrap();
+        assert_eq!(vec0_dim(&conn).unwrap(), 384);
+
+        // Resize the (empty) table to 512: the width flips and the embedding_dim mirror follows.
+        ensure_vec_dim(&conn, 512).unwrap();
+        assert_eq!(vec0_dim(&conn).unwrap(), 512);
+        assert_eq!(
+            get_setting(&conn, "embedding_dim").unwrap().as_deref(),
+            Some("512")
+        );
+
+        // The recreated table really works: a 512-d KNN round-trips.
+        let v = format!("[{}]", vec!["0.1"; 512].join(", "));
+        conn.execute(
+            "INSERT INTO chunk_vec(rowid, embedding) VALUES (1, ?1)",
+            params![v],
+        )
+        .unwrap();
+        let hit: i64 = conn
+            .query_row(
+                "SELECT rowid FROM chunk_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT 1",
+                params![v],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1);
+
+        // Idempotent at the new width.
+        ensure_vec_dim(&conn, 512).unwrap();
+        assert_eq!(vec0_dim(&conn).unwrap(), 512);
+    }
+
+    #[test]
+    fn ensure_vec_dim_refuses_a_populated_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refuse.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        // One 384-d vector in the table, then try to resize — the safety guard must refuse.
+        let v = format!("[{}]", vec!["0.1"; 384].join(", "));
+        conn.execute(
+            "INSERT INTO chunk_vec(rowid, embedding) VALUES (1, ?1)",
+            params![v],
+        )
+        .unwrap();
+
+        let err = ensure_vec_dim(&conn, 1024).unwrap_err();
+        assert!(err.to_string().contains("refusing to resize"), "got: {err}");
+        // Untouched — still 384-d and still holding its vector.
+        assert_eq!(vec0_dim(&conn).unwrap(), 384);
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM chunk_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn ensure_vec_dim_is_the_sole_writer_of_embedding_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        // Selecting an embedder does NOT move embedding_dim (migration seeded "384").
+        set_selected_embedder(&conn, "intfloat/multilingual-e5-large").unwrap();
+        assert_eq!(
+            get_setting(&conn, "embedding_dim").unwrap().as_deref(),
+            Some("384")
+        );
+
+        // Only ensure_vec_dim advances it (the empty table resizes cleanly).
+        ensure_vec_dim(&conn, 1024).unwrap();
+        assert_eq!(
+            get_setting(&conn, "embedding_dim").unwrap().as_deref(),
+            Some("1024")
+        );
+        assert_eq!(vec0_dim(&conn).unwrap(), 1024);
     }
 }

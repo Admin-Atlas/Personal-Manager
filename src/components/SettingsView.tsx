@@ -31,10 +31,11 @@ import { useHelp } from "../lib/help";
 import { CalendarSettings } from "./CalendarSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
+import { RebuildProgress } from "./RebuildProgress";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions, LearningProfile } from "../lib/types";
 import { useTheme, useDepth, ACCENTS } from "../theme";
-import { Button, Collapsible, Input, SegmentedControl, Select } from "./ui";
+import { Button, Collapsible, ConfirmDialog, Input, SegmentedControl, Select } from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -74,9 +75,15 @@ export function SettingsView({ onClose, onboarding }: Props) {
   // Query-time reranking toggle (default on; stateless — never triggers a Rebuild).
   const [reranking, setRerankingState] = useState(true);
   // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
-  // non-onboarding shows the current one read-only). Loaded best-effort.
+  // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
   const [embedderId, setEmbedderId] = useState("");
+  // Settings language switcher (non-onboarding): the pending confirm target, the in-flight switch
+  // (drives the guided re-index modal: { to, from }), and any error from the switch itself.
+  const [switchTarget, setSwitchTarget] = useState<string | null>(null);
+  const [switching, setSwitching] = useState<{ to: string; from: string } | null>(null);
+  const [rebuildOpen, setRebuildOpen] = useState(false);
+  const [switchError, setSwitchError] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -156,6 +163,49 @@ export function SettingsView({ onClose, onboarding }: Props) {
     } catch (e) {
       setRerankingState(!next);
       setError(String(e));
+    }
+  }
+
+  // Re-sync the language picker with the backend's truth (after a switch lands, or reverts).
+  async function reloadLang() {
+    try {
+      const lo = await languageOptions();
+      setLangOpts(lo);
+      setEmbedderId(lo.selected);
+    } catch {
+      /* ignore — the picker simply keeps its last state */
+    }
+  }
+
+  // A click on the *other* segment in Settings: stage the target and open the confirm. The picker's
+  // value stays on the current selection until the switch actually lands, so a cancel snaps back.
+  function requestLanguageSwitch(newId: string) {
+    if (!langOpts || newId === embedderId) return;
+    setSwitchError(null);
+    setSwitchTarget(newId);
+  }
+
+  // Confirmed: record the new embedder. An empty vault is done immediately (the backend resized its
+  // empty vector table); a populated vault launches the guided re-index, remembering the old id so
+  // a download/offline failure can revert the selection (search keeps working on the old index).
+  async function confirmLanguageSwitch() {
+    if (!langOpts || !switchTarget) return;
+    const to = switchTarget;
+    const from = embedderId;
+    setSwitchTarget(null);
+    setSwitchError(null);
+    try {
+      await setVaultEmbedder(to);
+    } catch (e) {
+      setSwitchError(String(e));
+      return;
+    }
+    if (langOpts.has_documents) {
+      setSwitching({ to, from });
+      setRebuildOpen(true);
+    } else {
+      setEmbedderId(to);
+      await reloadLang();
     }
   }
 
@@ -540,8 +590,8 @@ export function SettingsView({ onClose, onboarding }: Props) {
               Search language
             </label>
             <p className="mt-1 text-xs text-ink4">
-              How your documents are searched. Choose Multilingual if your notes aren't only in
-              English. Set once per vault — changing it later re-indexes everything.
+              How your library is searched. Pick the one that matches your content — not basic vs
+              advanced, just which fits.
             </p>
             <div className="mt-3">
               <SegmentedControl
@@ -550,10 +600,20 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
               />
             </div>
-            <p className="mt-2 text-xs text-faint">
+            <p className="mt-2 text-xs text-ink4">
               {langOpts.options.find((o) => o.id === embedderId)?.multilingual
-                ? "Multilingual: best for notes across languages. Downloads a larger model on first use."
-                : "English: fastest and smallest — best if your notes are mostly English."}
+                ? "Best for libraries with real non-English content. Understands 100+ languages and finds meaning across them — not just matching words. Downloads a larger model the first time (about 1 GB, once), and uses a little more disk and time per search."
+                : "Best for libraries that are mostly English. Works straight away, stays small and fast. Files in other languages can still be found by keyword."}
+            </p>
+            <div className="mt-3">
+              <Collapsible title="Compare" defaultOpen={false}>
+                <LanguageCompareTable />
+              </Collapsible>
+            </div>
+            <p className="mt-3 text-xs text-faint">
+              You can switch a vault&apos;s language later in Settings — it re-indexes your library
+              to do so (quick on a small vault, longer on a large one). Your original files are
+              never touched or lost.
             </p>
           </div>
         )}
@@ -678,14 +738,28 @@ export function SettingsView({ onClose, onboarding }: Props) {
             <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
               Search
             </label>
-            {langOpts && (
-              <p className="mt-1 text-xs text-ink4">
-                Language:{" "}
-                <span className="text-ink2">
-                  {langOpts.options.find((o) => o.id === langOpts.selected)?.label ?? "English"}
-                </span>
-                . Changing the search language re-indexes your vault — coming in a later update.
-              </p>
+            {langOpts && langOpts.options.length > 1 && (
+              <div className="mt-2">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-xs text-ink4">
+                    Language:{" "}
+                    <span className="text-ink2">
+                      {langOpts.options.find((o) => o.id === embedderId)?.label ?? "English"}
+                    </span>
+                  </p>
+                  <SegmentedControl
+                    value={embedderId}
+                    onChange={requestLanguageSwitch}
+                    options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
+                  />
+                </div>
+                <p className="mt-1 text-xs text-faint">
+                  Switching re-indexes your whole library from your Markdown files — Multilingual
+                  downloads a larger model the first time (about 1 GB, once). Your original files
+                  are never touched.
+                </p>
+                {switchError && <p className="mt-1 text-xs text-st-due">{switchError}</p>}
+              </div>
             )}
             <div className="mt-3 flex items-start justify-between gap-3">
               <div>
@@ -858,7 +932,75 @@ export function SettingsView({ onClose, onboarding }: Props) {
           </Button>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={switchTarget !== null}
+        title="Switch search language?"
+        confirmLabel="Switch & re-index"
+        onConfirm={() => void confirmLanguageSwitch()}
+        onClose={() => setSwitchTarget(null)}
+      >
+        This re-indexes your whole library from your Markdown files
+        {langOpts?.options.find((o) => o.id === switchTarget)?.multilingual
+          ? ", and downloads a larger language model the first time (about 1 GB, once)"
+          : ""}
+        . Your original files aren&apos;t changed, and it can take a while on a large library.
+      </ConfirmDialog>
+
+      {switching && (
+        <RebuildProgress
+          open={rebuildOpen}
+          title="Switching search language"
+          subtitle={`Re-indexing your library for ${
+            langOpts?.options.find((o) => o.id === switching.to)?.label ?? "the new language"
+          }.`}
+          onError={() => {
+            // The re-index failed (e.g. offline): revert the selection so search keeps working on
+            // the existing index.
+            void setVaultEmbedder(switching.from).catch(() => {});
+          }}
+          onClose={() => {
+            setRebuildOpen(false);
+            setSwitching(null);
+            void reloadLang();
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+/** The English-vs-Multilingual comparison shown under the onboarding picker's "Compare" expander.
+ *  Framed as "which fits your content", never better/worse. */
+function LanguageCompareTable() {
+  const rows: Array<[string, string, string]> = [
+    ["Best for", "Mostly-English libraries", "Real non-English content"],
+    ["Languages", "English", "100+ languages"],
+    ["Finds meaning in other languages?", "No — keyword matches only", "Yes — understands meaning"],
+    ["First-time download", "None — built in", "~1 GB, once (then cached)"],
+    ["Disk per vault", "Smallest", "Larger (~2.7× the search data)"],
+    ["Speed", "Fastest", "A little slower per search"],
+    ["Model", "bge-small-en", "multilingual-e5-large"],
+  ];
+  return (
+    <table className="mt-1 w-full text-left text-xs">
+      <thead className="font-mono uppercase tracking-wide text-ink4">
+        <tr className="border-b border-rule">
+          <th className="py-1 font-medium" />
+          <th className="py-1 font-medium">English</th>
+          <th className="py-1 font-medium">Multilingual</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map(([label, en, ml]) => (
+          <tr key={label} className="border-b border-rule align-top">
+            <td className="py-1 pr-2 text-ink4">{label}</td>
+            <td className="py-1 pr-2 text-ink2">{en}</td>
+            <td className="py-1 text-ink2">{ml}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 

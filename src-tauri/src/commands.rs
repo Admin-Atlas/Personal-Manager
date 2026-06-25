@@ -218,22 +218,24 @@ pub struct LanguageOption {
     pub multilingual: bool,
 }
 
-/// The vault's search-language choices for the onboarding picker: the selectable embedders, the
-/// current selection, and whether it's locked (the vault already has documents, so changing the
-/// embedder needs PR 3's Re-index flow rather than a silent flip).
+/// The vault's search-language choices: the selectable embedders, the current selection, and
+/// whether the vault already has documents. `has_documents` is true when switching the language
+/// means a re-index (the frontend confirms + launches the guided Re-index) rather than a free
+/// choice on an empty vault.
 #[derive(Serialize)]
 pub struct LanguageOptions {
     pub options: Vec<LanguageOption>,
     pub selected: String,
-    pub locked: bool,
+    pub has_documents: bool,
 }
 
-/// The search-language options + current selection for the onboarding picker.
+/// The search-language options + current selection — for the onboarding picker and the Settings
+/// language switcher.
 #[tauri::command]
 pub fn language_options(state: State<'_, AppState>) -> Result<LanguageOptions> {
     let conn = state.conn()?;
     let selected = db::selected_embedder(&conn)?.id.to_string();
-    let locked: bool =
+    let has_documents: bool =
         conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?;
     let options = crate::registry::selectable_embedders()
         .into_iter()
@@ -246,26 +248,24 @@ pub fn language_options(state: State<'_, AppState>) -> Result<LanguageOptions> {
     Ok(LanguageOptions {
         options,
         selected,
-        locked,
+        has_documents,
     })
 }
 
-/// Choose the vault's embedder (its "search language"). Only valid while the vault is empty —
-/// once documents exist, changing the embedder means re-embedding the whole store (PR 3's
-/// deliberate Re-index flow), not a silent setting flip. Validates the id against the selectable
-/// embedders so an arbitrary/incompatible model can't be stored.
+/// Choose the vault's embedder (its "search language"). Validates the id against the selectable
+/// embedders so an arbitrary/incompatible model can't be stored, then:
+///
+/// - **Empty vault** (onboarding, or nothing ingested yet): record the selection and resize the
+///   empty `chunk_vec` to the chosen embedder's width straight away, so the very first ingest
+///   already matches (a 1024-d multilingual choice would otherwise trip `ingest::run`'s width
+///   guard against the migration's 384-d table).
+/// - **Populated vault**: record the selection only. The retrieval stamp now mismatches (embedder
+///   id + dimension changed), so the vault surfaces its one-time Rebuild prompt and the frontend
+///   launches the guided Re-index — which downloads the model if needed, resizes the vector
+///   column, and re-embeds from the Markdown source of truth. We never resize a populated table
+///   here: that would drop live vectors with no rebuild.
 #[tauri::command]
 pub fn set_vault_embedder(state: State<'_, AppState>, embedder_id: String) -> Result<()> {
-    let conn = state.conn()?;
-    let has_docs: bool =
-        conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?;
-    if has_docs {
-        return Err(Error::Other(
-            "the search language can only be chosen for a new vault; re-indexing an existing vault \
-             to a different language is coming in a later update"
-                .into(),
-        ));
-    }
     if !crate::registry::selectable_embedders()
         .iter()
         .any(|m| m.id == embedder_id)
@@ -274,7 +274,16 @@ pub fn set_vault_embedder(state: State<'_, AppState>, embedder_id: String) -> Re
             "'{embedder_id}' is not a selectable embedder"
         )));
     }
-    db::set_selected_embedder(&conn, &embedder_id)
+    let embedder = crate::registry::embedder_or_default(&embedder_id);
+    let conn = state.conn()?;
+    let has_docs: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?;
+    db::set_selected_embedder(&conn, &embedder_id)?;
+    if !has_docs {
+        // Empty vault: safe to resize the (empty) vector column to the chosen width now.
+        db::ensure_vec_dim(&conn, embedder.dimension)?;
+    }
+    Ok(())
 }
 
 /// The stored IANA time zone (empty string = none set; the backend then uses UTC).

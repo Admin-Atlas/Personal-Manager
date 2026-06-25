@@ -108,10 +108,10 @@ mod tests {
 
     #[test]
     fn current_for_takes_the_embedder_id_and_dimension() {
-        let e5 = registry::lookup("intfloat/multilingual-e5-small").unwrap();
+        let e5 = registry::lookup("intfloat/multilingual-e5-large").unwrap();
         let cfg = RetrievalConfig::current_for(&e5);
-        assert_eq!(cfg.embedder_id, "intfloat/multilingual-e5-small");
-        assert_eq!(cfg.dimension, 384);
+        assert_eq!(cfg.embedder_id, "intfloat/multilingual-e5-large");
+        assert_eq!(cfg.dimension, 1024);
         // A different embedder ⇒ a different stamp ⇒ a Rebuild is offered.
         assert_ne!(cfg, RetrievalConfig::current());
     }

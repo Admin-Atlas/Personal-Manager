@@ -1,0 +1,137 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// The guided Re-index modal. Given `open`, it runs `rebuildIndex` once — dropping the search index
+// and rebuilding it from the Markdown vault — and streams progress over the same IngestEvent
+// channel the Documents view uses. Self-contained so the Settings language switcher can launch it
+// without re-implementing the rebuild plumbing; the Documents "Rebuild" banner remains its own
+// (older, inline) entry point.
+//
+// Safety: a non-bundled multilingual model downloads (~1 GB) at the *start* of the rebuild
+// (warmup-before-destroy in Rust), so an offline failure leaves the existing index intact — we then
+// call `onError` so the caller can revert the just-changed selection. The modal blocks closing
+// while running, so no search is attempted during the brief width-mismatch window.
+
+import { useEffect, useRef, useState } from "react";
+import { rebuildIndex } from "../lib/ipc";
+import type { IngestEvent } from "../lib/types";
+import { Button, Collapsible, Modal, Progress } from "./ui";
+
+interface Props {
+  /** When true, the modal shows and a rebuild kicks off once. */
+  open: boolean;
+  /** Heading (default: "Re-indexing your vault"). */
+  title?: string;
+  /** One-line context under the heading (e.g. what the user just switched to). */
+  subtitle?: string;
+  /** The rebuild finished successfully. */
+  onDone?: () => void;
+  /** The rebuild failed (e.g. offline). The caller should revert any selection it changed. */
+  onError?: () => void;
+  /** The user dismissed the finished/errored modal. */
+  onClose: () => void;
+}
+
+type Phase = "running" | "done" | "error";
+
+export function RebuildProgress({ open, title, subtitle, onDone, onError, onClose }: Props) {
+  const [phase, setPhase] = useState<Phase>("running");
+  const [prep, setPrep] = useState<string | null>(null);
+  const [files, setFiles] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  // Callbacks via refs so the run effect can depend only on `open` (no churn when the parent
+  // passes fresh inline closures each render).
+  const cb = useRef({ onDone, onError });
+  cb.current = { onDone, onError };
+  // Guard against React StrictMode's double-invoke (dev) firing two rebuilds.
+  const started = useRef(false);
+
+  useEffect(() => {
+    if (!open) {
+      // Reset for the next open.
+      started.current = false;
+      setPhase("running");
+      setPrep(null);
+      setFiles([]);
+      setError(null);
+      return;
+    }
+    if (started.current) return;
+    started.current = true;
+    void (async () => {
+      try {
+        await rebuildIndex((event: IngestEvent) => {
+          switch (event.type) {
+            case "preparing":
+              setPrep(event.message);
+              break;
+            case "started":
+              setPrep(null);
+              setFiles((prev) => [...prev, event.name]);
+              break;
+            // done/skipped/failed roll into the running list; the final summary line is enough.
+            default:
+              break;
+          }
+        });
+        setPhase("done");
+        cb.current.onDone?.();
+      } catch (e) {
+        setError(String(e));
+        setPhase("error");
+        cb.current.onError?.();
+      }
+    })();
+  }, [open]);
+
+  if (!open) return null;
+  const running = phase === "running";
+
+  return (
+    <Modal open={open} onClose={running ? () => {} : onClose} widthClassName="max-w-md">
+      <div className="p-6">
+        <h2 className="font-head text-base font-semibold text-ink">
+          {title ?? "Re-indexing your vault"}
+        </h2>
+        {subtitle && <p className="mt-1 text-xs text-ink4">{subtitle}</p>}
+
+        {running && <Progress className="mt-4" label="Re-indexing" />}
+        {prep && <p className="mt-3 text-sm text-ink3">{prep}</p>}
+
+        {files.length > 0 && (
+          <div className="mt-3">
+            <Collapsible title="Files" meta={`${files.length}`} defaultOpen={false}>
+              <ul className="max-h-40 overflow-y-auto pt-1">
+                {files.map((name, i) => (
+                  <li key={i} className="truncate px-1 py-0.5 text-xs text-ink3">
+                    {name}
+                  </li>
+                ))}
+              </ul>
+            </Collapsible>
+          </div>
+        )}
+
+        {phase === "done" && (
+          <p className="mt-4 text-sm text-[var(--st-quick)]">
+            Done — your library is re-indexed with the new search language.
+          </p>
+        )}
+        {phase === "error" && (
+          <p className="mt-4 text-sm text-st-due">
+            {error} You can try again once you&apos;re back online — your documents weren&apos;t
+            touched.
+          </p>
+        )}
+
+        {!running && (
+          <div className="mt-5 flex justify-end">
+            <Button variant="primary" onClick={onClose}>
+              {phase === "error" ? "Close" : "Done"}
+            </Button>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
