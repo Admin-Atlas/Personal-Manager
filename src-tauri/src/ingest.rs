@@ -66,6 +66,12 @@ pub enum IngestEvent {
     Preparing {
         message: String,
     },
+    /// The number of files this run will work through — sent once, right before the
+    /// first `Started`, so the UI can show a determinate bar. Setup + model download
+    /// happen before this and stay indeterminate (no known total yet).
+    Counted {
+        total: usize,
+    },
     Started {
         path: String,
         name: String,
@@ -118,6 +124,7 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
     // Snapshotting up front means we never hold the vault lock across a sidecar call.
     let (vault, cipher) = state.markdown_io()?;
     let files = collect_files(&inputs);
+    let _ = on_event.send(IngestEvent::Counted { total: files.len() });
 
     // If the vault has no documents yet, everything this run indexes is produced under the
     // current retrieval config, so we can stamp it at the end and spare the user a rebuild
@@ -327,14 +334,17 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
         crate::db::ensure_vec_dim(&conn, embedder.dimension)?;
     }
     let (vault, cipher) = state.markdown_io()?;
+    // Collect the vault-markdown files up front so we know the total before the loop — the UI
+    // shows a determinate bar from this count. Accept both plaintext (`.md`) and encrypted
+    // (`.md.pmenc`) files; the cipher decides per file how to read them (read-by-magic). An
+    // unreadable dir entry is skipped rather than aborting the whole rebuild.
+    let files: Vec<PathBuf> = std::fs::read_dir(&vault)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| is_vault_markdown(path))
+        .collect();
+    let _ = on_event.send(IngestEvent::Counted { total: files.len() });
     let (mut ingested, mut failed) = (0usize, 0usize);
-    for entry in std::fs::read_dir(&vault)? {
-        let path = entry?.path();
-        // Accept both plaintext (`.md`) and encrypted (`.md.pmenc`) vault files; the
-        // cipher decides per file how to read them (read-by-magic).
-        if !is_vault_markdown(&path) {
-            continue;
-        }
+    for path in files {
         let name = file_name(&path);
         let _ = on_event.send(IngestEvent::Started {
             path: path.to_string_lossy().into(),

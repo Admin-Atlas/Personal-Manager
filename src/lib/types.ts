@@ -369,6 +369,7 @@ export type SidecarStatus =
 
 export type IngestEvent =
   | { type: "preparing"; message: string }
+  | { type: "counted"; total: number }
   | { type: "started"; path: string; name: string }
   | { type: "skipped"; path: string; reason: string }
   | { type: "done"; document: Document }

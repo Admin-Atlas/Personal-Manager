@@ -15,7 +15,8 @@ import {
 import type { Document, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
-import { Button, Card, Collapsible, ConfirmDialog, Progress } from "./ui";
+import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
+import { IngestProgress } from "./IngestProgress";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
 
 type ItemStatus = "working" | "done" | "skipped" | "failed";
@@ -43,6 +44,10 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [dragging, setDragging] = useState(false);
   const [prep, setPrep] = useState<string | null>(null);
   const [items, setItems] = useState<ProgressItem[]>([]);
+  // Determinate-bar inputs: `total` from the `counted` event, `processed` counted up as
+  // each file lands. Null total (setup / model download) keeps the bar an indeterminate sweep.
+  const [total, setTotal] = useState<number | null>(null);
+  const [processed, setProcessed] = useState(0);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmRebuild, setConfirmRebuild] = useState(false);
@@ -115,11 +120,15 @@ export function DocumentsView({ onReviewClick }: Props) {
       case "preparing":
         setPrep(event.message);
         break;
+      case "counted":
+        setTotal(event.total);
+        break;
       case "started":
         setPrep(null);
         setItems((prev) => [...prev, { name: event.name, status: "working" }]);
         break;
       case "done":
+        setProcessed((n) => n + 1);
         setItems((prev) =>
           replaceLastWorking(prev, {
             name: event.document.title,
@@ -131,6 +140,7 @@ export function DocumentsView({ onReviewClick }: Props) {
         );
         break;
       case "skipped":
+        setProcessed((n) => n + 1);
         setItems((prev) =>
           replaceLastWorking(prev, {
             name: lastName(prev),
@@ -140,6 +150,7 @@ export function DocumentsView({ onReviewClick }: Props) {
         );
         break;
       case "failed":
+        setProcessed((n) => n + 1);
         setItems((prev) =>
           replaceLastWorking(prev, {
             name: lastName(prev),
@@ -162,6 +173,8 @@ export function DocumentsView({ onReviewClick }: Props) {
     if (busy || paths.length === 0) return;
     setBusy(true);
     setItems([]);
+    setTotal(null);
+    setProcessed(0);
     setSummary(null);
     setError(null);
     setPrep(null);
@@ -191,6 +204,8 @@ export function DocumentsView({ onReviewClick }: Props) {
     if (busy) return;
     setBusy(true);
     setItems([]);
+    setTotal(null);
+    setProcessed(0);
     setSummary(null);
     setError(null);
     setPrep(null);
@@ -207,6 +222,8 @@ export function DocumentsView({ onReviewClick }: Props) {
   async function doSetup() {
     setBusy(true);
     setError(null);
+    setTotal(null);
+    setProcessed(0);
     setPrep("Setting up the document engine (one-time)…");
     try {
       await ensureSidecar();
@@ -333,7 +350,14 @@ export function DocumentsView({ onReviewClick }: Props) {
 
           {(prep || items.length > 0 || summary) && (
             <Card className="mt-4 p-3">
-              {busy && <Progress className="mb-2" label="Ingesting documents" />}
+              {busy && (
+                <IngestProgress
+                  className="mb-2"
+                  label="Ingesting documents"
+                  processed={processed}
+                  total={total}
+                />
+              )}
               {prep && <p className="px-1 py-1 text-sm text-ink3">{prep}</p>}
               {items.length > 0 && (
                 <Collapsible title="Activity" meta={`${items.length}`}>
