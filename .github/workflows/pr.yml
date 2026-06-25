@@ -96,6 +96,8 @@ jobs:
         run: just ruff
       - name: Ruff (format --check)
         run: just ruff-fmt
+      - name: Sidecar unit tests
+        run: just sidecar-test
 
   # --- secrets: gitleaks over the working tree ----------------------------
   secrets:

@@ -23,7 +23,7 @@ default:
 check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
-check: check-fast clippy cargo-check rust-test deny pip-audit npm-audit gitleaks zizmor
+check: check-fast clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks zizmor
 
 # Auto-apply every formatter (the writing counterpart to the --check recipes).
 fmt:
@@ -73,6 +73,12 @@ ruff:
 
 ruff-fmt:
     ruff format --check sidecar
+
+# Fast sidecar unit tests (standard library only; the real-tokenizer check
+# self-skips when fastembed isn't installed, e.g. on CI). Locks the token-count
+# padding fix — see sidecar/test_pm_sidecar.py.
+sidecar-test:
+    python sidecar/test_pm_sidecar.py
 
 # --- supply chain & secrets ----------------------------------------------
 
