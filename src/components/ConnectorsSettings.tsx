@@ -3,6 +3,7 @@
 
 import type { ReactNode } from "react";
 import { GoogleCalendarConnection } from "./GoogleCalendarConnection";
+import { GoogleDriveConnection } from "./GoogleDriveConnection";
 import { IcsFeedSubscription } from "./IcsFeedSubscription";
 
 /**
@@ -17,9 +18,9 @@ import { IcsFeedSubscription } from "./IcsFeedSubscription";
  * **independently opt-in and removable** — subscribe to a calendar URL only, connect Drive only,
  * or set up the OAuth client and connect nothing yet; nothing cascades or auto-enables.
  *
- * PR1 ships the Calendar section (Google Calendar OAuth + the zero-auth iCal subscription) plus
- * the Drive / Email scaffolding. Google Drive (the first real OAuth file service) lands in PR2
- * (issue #83), replacing the Drive section's placeholder row.
+ * Calendar (Google OAuth + the zero-auth iCal subscription) and Drive (Google Drive, index-only)
+ * are live; Microsoft, Apple, and Email show as coming-soon placeholders that drop into their
+ * service sections as later cards land — no change to the surrounding structure.
  */
 export function ConnectorsSettings() {
   return (
@@ -47,12 +48,8 @@ export function ConnectorsSettings() {
         title="Drive"
         blurb="Index your cloud files so PM can find them and ground answers in their contents."
       >
-        {/*
-          APPEND POINT (PR2 — issue #83): the Google Drive index-only connection replaces this
-          placeholder row — reusing the provider creds (one-click once configured), Connect →
-          browser, whole-Drive index-only sync, and a multi-account list.
-        */}
-        <ComingSoonRow name="Google Drive" detail="Index-only sync — arriving next." />
+        <GoogleDriveConnection />
+        <Divider />
         <ComingSoonRow name="OneDrive" detail="Microsoft — the connector after Drive." />
         <ComingSoonRow name="iCloud Drive" detail="Apple — coming later." />
       </ServiceSection>

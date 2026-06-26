@@ -204,6 +204,14 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Google Calendar",
     body: "Read-only Google sign-in with your own OAuth client. Once connected, pick which calendars to mirror so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. For a no-sign-in option, use a calendar subscription (iCal) instead. Tokens live only in your keychain.",
   },
+  "settings-drive": {
+    title: "Google Drive",
+    body: "Index your Google Drive (read-only) so PM can find and answer from your files. Everything is 'index-only': PM stores a searchable pointer and a short summary, never the file itself — the full file stays in Drive and is fetched when you open it. Connect more than one account; each syncs independently. Tokens live only in your keychain.",
+  },
+  "settings-drive-firstsync": {
+    title: "First sync",
+    body: "The first sync walks your whole Drive and indexes every file it can read, so it can take a while and use bandwidth on a large Drive. After that, syncing only fetches what changed since last time. Files deleted in Drive are kept findable but marked 'source missing' — never silently dropped.",
+  },
   "settings-data": {
     title: "Data",
     body: "Everything you keep in PM lives in one folder named 'Personal Manager' — the Markdown vault of your documents plus the encrypted store (settings, pinboard, and the search index). Your documents in the vault are stored unencrypted so any tool can read them; their at-rest protection relies on your OS full-disk encryption (BitLocker on Windows, FileVault on macOS), so turn that on. 'Open data folder' reveals it in your file manager so you can copy or back it up by hand. 'Export all data' bundles the vault and the store into a single .zip you choose where to save; the regenerable runtime (the local model environment) is left out, and the store stays encrypted inside the archive.",

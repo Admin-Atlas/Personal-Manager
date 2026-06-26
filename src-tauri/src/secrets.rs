@@ -27,7 +27,16 @@ const DB_KEY: &str = "db_encryption_key";
 /// supplies their own client; everything lives only in the keychain.
 const GOOGLE_CLIENT_ID: &str = "google_oauth_client_id";
 const GOOGLE_CLIENT_SECRET: &str = "google_oauth_client_secret";
+/// Legacy single Google OAuth token key (pre per-service connectors). Migrated once on
+/// startup to the per-service calendar key by [`migrate_legacy_google_token`], then never
+/// written again.
 const GOOGLE_TOKEN: &str = "google_oauth_token";
+/// Per-service Google OAuth token keys. The client credentials above are provider-level
+/// (shared by every Google service), but each SERVICE — and each Drive ACCOUNT — gets its
+/// own token, so connecting or disconnecting one never disturbs another. Calendar has a
+/// fixed key; a Drive account's key is `GOOGLE_TOKEN_DRIVE_PREFIX + <account-email>`.
+pub const GOOGLE_TOKEN_CALENDAR: &str = "google_oauth_token_calendar";
+pub const GOOGLE_TOKEN_DRIVE_PREFIX: &str = "google_oauth_token_drive::";
 /// Subscribed .ics feed URLs (the no-OAuth calendar path). These are secret bearer
 /// links, so the whole JSON list lives in the keychain, not the DB.
 const CALENDAR_ICS_FEEDS: &str = "calendar_ics_feeds";
@@ -104,18 +113,35 @@ pub fn clear_google_client() -> Result<()> {
     delete(GOOGLE_CLIENT_SECRET)
 }
 
-pub fn get_google_token() -> Result<Option<Secret>> {
-    Ok(get(GOOGLE_TOKEN)?.map(Secret::from))
+/// Read a per-service Google OAuth token blob by its keychain key (calendar, or a Drive account).
+pub fn get_google_token_for(key: &str) -> Result<Option<Secret>> {
+    Ok(get(key)?.map(Secret::from))
 }
 
-pub fn set_google_token(value: &str) -> Result<()> {
-    set(GOOGLE_TOKEN, value)
+/// Store a per-service Google OAuth token blob under its keychain key.
+pub fn set_google_token_for(key: &str, value: &str) -> Result<()> {
+    set(key, value)
 }
 
-/// Forget the OAuth token (disconnect). The client credentials are left in place so
-/// the user can reconnect without re-entering them.
-pub fn clear_google_token() -> Result<()> {
-    delete(GOOGLE_TOKEN)
+/// Forget a per-service Google OAuth token (disconnect that service/account). The provider
+/// client credentials are left in place so the user can reconnect without re-entering them.
+/// Absent is success, so disconnect is idempotent.
+pub fn clear_google_token_for(key: &str) -> Result<()> {
+    delete(key)
+}
+
+/// One-time migration: move the calendar token from the legacy shared `google_oauth_token`
+/// key to its per-service key, so an existing Calendar connection survives the move to the
+/// per-service token model without a reconnect. Idempotent — a no-op once migrated (or when
+/// there was never a legacy token).
+pub fn migrate_legacy_google_token() -> Result<()> {
+    if get(GOOGLE_TOKEN_CALENDAR)?.is_none() {
+        if let Some(token) = get(GOOGLE_TOKEN)? {
+            set(GOOGLE_TOKEN_CALENDAR, &token)?;
+            delete(GOOGLE_TOKEN)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn get_ics_feeds() -> Result<Option<Secret>> {

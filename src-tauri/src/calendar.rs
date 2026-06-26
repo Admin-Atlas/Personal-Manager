@@ -86,7 +86,11 @@ pub struct RawCalendar {
 
 /// Fetch the user's calendar list from Google.
 pub async fn fetch_calendar_list() -> Result<Vec<RawCalendar>> {
-    let value = google::authorized_get(&format!("{CALENDAR_API}/users/me/calendarList")).await?;
+    let value = google::authorized_get(
+        google::CALENDAR_TOKEN_KEY,
+        &format!("{CALENDAR_API}/users/me/calendarList"),
+    )
+    .await?;
     Ok(parse_calendars(&value))
 }
 
@@ -107,7 +111,7 @@ pub async fn fetch_events(
         .append_pair("timeMin", time_min)
         .append_pair("timeMax", time_max)
         .append_pair("maxResults", "250");
-    let value = google::authorized_get(url.as_str()).await?;
+    let value = google::authorized_get(google::CALENDAR_TOKEN_KEY, url.as_str()).await?;
     Ok(parse_events(calendar_id, &value))
 }
 

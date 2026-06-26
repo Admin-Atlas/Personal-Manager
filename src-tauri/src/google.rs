@@ -22,6 +22,13 @@ const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 /// Read-only calendar scope — PM reads events, never writes (spec non-goal #4).
 pub const CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar.readonly";
+/// Read-only Drive scope — PM reads file metadata + content, never writes. The full-read
+/// `drive.readonly` (not `drive.metadata.readonly`) because index-only ingestion needs each
+/// file's body to embed it.
+pub const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
+/// The keychain key for the Calendar service's token — passed into the per-service token
+/// helpers below (the connector-generic flow takes a key so Drive accounts get their own).
+pub const CALENDAR_TOKEN_KEY: &str = secrets::GOOGLE_TOKEN_CALENDAR;
 /// How long to wait for the browser consent redirect before giving up.
 const REDIRECT_TIMEOUT_SECS: u64 = 180;
 
@@ -46,9 +53,9 @@ pub fn has_client() -> Result<bool> {
     )
 }
 
-/// True once an OAuth token is stored (the user has completed sign-in).
-pub fn is_connected() -> Result<bool> {
-    Ok(secrets::get_google_token()?.is_some())
+/// True once an OAuth token is stored for the given service/account (sign-in completed).
+pub fn is_connected_for(token_key: &str) -> Result<bool> {
+    Ok(secrets::get_google_token_for(token_key)?.is_some())
 }
 
 fn client_creds() -> Result<(String, Secret)> {
@@ -68,10 +75,13 @@ fn http() -> Result<reqwest::Client> {
         .map_err(Error::from)
 }
 
-/// Run the full connect flow: open the browser to Google's consent screen, catch the
-/// loopback redirect, exchange the code for tokens, and store them. Errors (no client
-/// configured, browser failed to open, user cancelled, timeout) surface to the UI.
-pub async fn connect() -> Result<()> {
+/// Run the OAuth consent flow and RETURN the token without persisting it: open the browser to
+/// Google's consent screen for `scope`, catch the loopback redirect, and exchange the code. The
+/// caller chooses which keychain key to store it under — for a Drive account that key is derived
+/// from the account the token grants (known only after a follow-up `about` call), so persisting is
+/// the caller's job. `success_label` names the connected product on the browser success page.
+/// Errors (no client configured, browser failed, cancelled, timeout) surface to the UI.
+pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
     let (client_id, client_secret) = client_creds()?;
     let (verifier, challenge) = pkce()?;
     let state = random_token(16)?;
@@ -82,21 +92,17 @@ pub async fn connect() -> Result<()> {
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
-    let auth_url = build_auth_url(
-        &client_id,
-        &redirect_uri,
-        &challenge,
-        &state,
-        CALENDAR_SCOPE,
-    )?;
+    let auth_url = build_auth_url(&client_id, &redirect_uri, &challenge, &state, scope)?;
     open::that(&auth_url)
         .map_err(|e| Error::Other(format!("Couldn't open your browser to sign in: {e}")))?;
 
     // Wait for Google to redirect back with the code (blocking accept, off-runtime).
     let expected_state = state.clone();
-    let code = tokio::task::spawn_blocking(move || wait_for_redirect(listener, &expected_state))
-        .await
-        .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
+    let label = success_label.to_string();
+    let code =
+        tokio::task::spawn_blocking(move || wait_for_redirect(listener, &expected_state, &label))
+            .await
+            .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
 
     let token = exchange_code(
         &client_id,
@@ -114,20 +120,58 @@ pub async fn connect() -> Result<()> {
                 .into(),
         ));
     }
-    save_token(&token)
+    Ok(token)
 }
 
-/// GET a Google API URL with a valid bearer token, JSON-decoded. Refreshes the
-/// access token first if it's near expiry, and retries once after a refresh on 401.
-/// Never touches the DB, so callers hold no lock across it (rule #4).
-pub async fn authorized_get(url: &str) -> Result<serde_json::Value> {
-    let (client_id, client_secret) = client_creds()?;
-    let mut token = load_token()?;
+/// Connect Google Calendar (read-only): run consent and store the token under the calendar key.
+pub async fn connect() -> Result<()> {
+    let token = run_consent(CALENDAR_SCOPE, "Google Calendar").await?;
+    save_token(CALENDAR_TOKEN_KEY, &token)
+}
 
-    // Refresh proactively a minute before expiry so a request doesn't fail mid-flight;
-    // the 401 retry below is the backstop for a token that's revoked or expires early.
+/// GET a Google API URL as JSON, authorised with the token under `token_key`. Refreshes the
+/// access token first if it's near expiry, and retries once after a refresh on 401. Never
+/// touches the DB, so callers hold no lock across it (rule #4).
+pub async fn authorized_get(token_key: &str, url: &str) -> Result<serde_json::Value> {
+    let resp = authorized_send(token_key, url).await?;
+    json_or_err(resp).await
+}
+
+/// As [`authorized_get`], but returns the raw response BYTES — for Drive file downloads/exports,
+/// whose bodies are not JSON. Caps the body at `max_bytes` so a huge file can't balloon memory.
+pub async fn authorized_get_bytes(token_key: &str, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    let resp = authorized_send(token_key, url).await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = crate::error::truncate_detail(&resp.text().await.unwrap_or_default());
+        return Err(Error::Other(format!(
+            "Google API request failed ({status}): {detail}"
+        )));
+    }
+    read_capped_bytes(resp, max_bytes).await
+}
+
+/// One-shot authorised JSON GET using an IN-HAND token (not yet persisted) — used right after
+/// consent to learn which account a fresh Drive token grants, before it is saved under that
+/// account's key. No refresh (the token is seconds old).
+pub async fn get_json_with_token(token: &Token, url: &str) -> Result<serde_json::Value> {
+    let resp = http()?
+        .get(url)
+        .bearer_auth(token.access_token.expose())
+        .send()
+        .await?;
+    json_or_err(resp).await
+}
+
+/// Shared authorised GET: proactive refresh a minute before expiry, plus a single
+/// 401-retry-after-refresh (the backstop for a token revoked or expired early). Returns the raw
+/// response so the caller can decode it as JSON or bytes.
+async fn authorized_send(token_key: &str, url: &str) -> Result<reqwest::Response> {
+    let (client_id, client_secret) = client_creds()?;
+    let mut token = load_token(token_key)?;
+
     if token.expiry <= now_unix() + 60 {
-        token = do_refresh(&client_id, client_secret.expose(), &token).await?;
+        token = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
     }
 
     let resp = http()?
@@ -136,15 +180,32 @@ pub async fn authorized_get(url: &str) -> Result<serde_json::Value> {
         .send()
         .await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let token = do_refresh(&client_id, client_secret.expose(), &token).await?;
-        let resp = http()?
+        let token = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
+        return Ok(http()?
             .get(url)
             .bearer_auth(token.access_token.expose())
             .send()
-            .await?;
-        return json_or_err(resp).await;
+            .await?);
     }
-    json_or_err(resp).await
+    Ok(resp)
+}
+
+/// Read a response body into bytes, but never buffer more than `max` — a huge Drive file must
+/// not be able to balloon memory.
+async fn read_capped_bytes(resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buf.len() + chunk.len() > max {
+            return Err(Error::Other(
+                "That Google Drive file is too large to index.".into(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 async fn json_or_err(resp: reqwest::Response) -> Result<serde_json::Value> {
@@ -190,9 +251,14 @@ async fn exchange_code(
     token_from_response(resp).await
 }
 
-/// Refresh the access token; carries the existing refresh token forward when Google
-/// doesn't return a new one (it usually doesn't), and re-persists the blob.
-async fn do_refresh(client_id: &str, client_secret: &str, current: &Token) -> Result<Token> {
+/// Refresh the access token under `token_key`; carries the existing refresh token forward when
+/// Google doesn't return a new one (it usually doesn't), and re-persists the blob.
+async fn do_refresh(
+    client_id: &str,
+    client_secret: &str,
+    current: &Token,
+    token_key: &str,
+) -> Result<Token> {
     let refresh = current
         .refresh_token
         .clone()
@@ -208,7 +274,7 @@ async fn do_refresh(client_id: &str, client_secret: &str, current: &Token) -> Re
     if token.refresh_token.is_none() {
         token.refresh_token = Some(refresh);
     }
-    save_token(&token)?;
+    save_token(token_key, &token)?;
     Ok(token)
 }
 
@@ -229,16 +295,18 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
     })
 }
 
-fn load_token() -> Result<Token> {
-    let raw = secrets::get_google_token()?
+fn load_token(token_key: &str) -> Result<Token> {
+    let raw = secrets::get_google_token_for(token_key)?
         .ok_or_else(|| Error::Other("Not connected to Google. Connect in Settings.".into()))?;
     serde_json::from_str(raw.expose())
         .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))
 }
 
-fn save_token(token: &Token) -> Result<()> {
+/// Persist a token blob under its service/account keychain key. Public so a connector can save
+/// the token returned by [`run_consent`] once it knows which account/key it belongs to.
+pub fn save_token(token_key: &str, token: &Token) -> Result<()> {
     let json = serde_json::to_string(token).map_err(|e| Error::Other(e.to_string()))?;
-    secrets::set_google_token(&json)
+    secrets::set_google_token_for(token_key, &json)
 }
 
 // --- PKCE + auth URL ---
@@ -292,7 +360,11 @@ pub fn build_auth_url(
 /// Accept connections until the OAuth redirect arrives, validate the CSRF `state`,
 /// and return the authorization `code`. Polls with a deadline so it can't hang
 /// forever (browsers also make stray requests like /favicon.ico, which we ignore).
-fn wait_for_redirect(listener: std::net::TcpListener, expected_state: &str) -> Result<String> {
+fn wait_for_redirect(
+    listener: std::net::TcpListener,
+    expected_state: &str,
+    success_label: &str,
+) -> Result<String> {
     use std::io::Read;
 
     listener.set_nonblocking(true)?;
@@ -345,7 +417,9 @@ fn wait_for_redirect(listener: std::net::TcpListener, expected_state: &str) -> R
             {
                 let _ = write_page(
                     &mut stream,
-                    "PM is connected to Google Calendar. You can close this tab and return to PM.",
+                    &format!(
+                        "PM is connected to {success_label}. You can close this tab and return to PM."
+                    ),
                 );
                 return Ok(code.clone());
             }

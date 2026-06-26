@@ -17,6 +17,9 @@ import type {
   DevTablePage,
   Document,
   DraftPreference,
+  DriveAccount,
+  DriveStatus,
+  DriveSyncEvent,
   Entity,
   GoogleCalendar,
   IcsFeedInfo,
@@ -464,6 +467,37 @@ export const syncCalendar = () => invoke<number>("sync_calendar");
 
 /** Upcoming events in the mirror, for the focus-view agenda. */
 export const listCalendarEvents = () => invoke<CalendarEvent[]>("list_calendar_events");
+
+// --- Google Drive (index-only connector, board card 4A) ---
+
+/** The Drive connector's state: whether the shared Google client is set up + connected accounts. */
+export const driveStatus = () => invoke<DriveStatus>("drive_status");
+
+/** The connected Drive accounts (each independent). */
+export const listDriveAccounts = () => invoke<DriveAccount[]>("list_drive_accounts");
+
+/** Connect a Google Drive account — opens the browser; resolves with the connected account. */
+export const connectDrive = () => invoke<DriveAccount>("connect_drive");
+
+/** Disconnect one account: forget its token + flag its items unreachable (kept findable). */
+export const disconnectDrive = (email: string) => invoke<void>("disconnect_drive", { email });
+
+/** Sync one account (or all when `email` is omitted), streaming progress. Returns items touched. */
+export function syncDrive(
+  email: string | null,
+  onEvent: (event: DriveSyncEvent) => void,
+): Promise<number> {
+  const channel = new Channel<DriveSyncEvent>();
+  channel.onmessage = onEvent;
+  return invoke<number>("sync_drive", { account: email, onEvent: channel });
+}
+
+/** Fetch an index-only document's full body live from its source (the body is never stored). */
+export const fetchIndexOnlyBody = (docId: number) =>
+  invoke<string>("fetch_index_only_body", { docId });
+
+/** Open an index-only document's source in the system browser (its Drive link). */
+export const openExternalRef = (docId: number) => invoke<void>("open_external_ref", { docId });
 
 // --- Personal Assistant: Daily briefing (Step 7, spec §4 P1) ---
 

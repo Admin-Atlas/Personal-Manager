@@ -9,6 +9,7 @@ mod commands;
 mod commands_dev;
 mod cost;
 mod db;
+mod drive;
 mod entities;
 mod error;
 mod google;
@@ -362,6 +363,10 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle();
+            // One-time: move the Google Calendar token from the legacy shared keychain key to its
+            // per-service key (the move to per-service connectors). Keychain-only, no vault needed;
+            // idempotent and best-effort, so a keychain hiccup never blocks startup.
+            let _ = secrets::migrate_legacy_google_token();
             // If a vault migration was interrupted, repair it before anything opens the
             // store: roll the in-place phase back to its backup, or finish/discard a
             // partial move. A no-op when no migration journal is present.
@@ -504,6 +509,13 @@ pub fn run() {
             commands::set_google_calendar_ids,
             commands::sync_calendar,
             commands::list_calendar_events,
+            commands::connect_drive,
+            commands::disconnect_drive,
+            commands::list_drive_accounts,
+            commands::drive_status,
+            commands::sync_drive,
+            commands::fetch_index_only_body,
+            commands::open_external_ref,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::cost_summary,

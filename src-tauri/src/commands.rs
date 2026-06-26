@@ -19,8 +19,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, entities, index_only, lock_session, openrouter, paths,
-    preferences, recommend, secrets, vault, AppState, VaultRuntime,
+    applock, briefing, clock, cost, db, drive, entities, index_only, lock_session, openrouter,
+    paths, preferences, recommend, secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -2021,7 +2021,7 @@ pub fn calendar_status(state: State<'_, AppState>) -> Result<CalendarStatus> {
     Ok(CalendarStatus {
         ics_feeds: calendar::load_feeds()?.len(),
         oauth_client_configured: google::has_client()?,
-        oauth_connected: google::is_connected()?,
+        oauth_connected: google::is_connected_for(google::CALENDAR_TOKEN_KEY)?,
         calendars_selected: calendar::selected_calendar_ids(&conn)?.len(),
         last_sync: calendar::last_sync(&conn)?,
         window_days: calendar::AGENDA_DAYS,
@@ -2089,9 +2089,12 @@ pub fn set_google_client(client_id: String, client_secret: String) -> Result<()>
 /// token belongs to that client).
 #[tauri::command]
 pub fn clear_google_client(state: State<'_, AppState>) -> Result<()> {
-    secrets::clear_google_token().ok();
-    secrets::clear_google_client()?;
+    // The provider client is shared by every Google service, so forgetting it invalidates them
+    // all: drop each service's token (calendar + every Drive account) and clear what each mirrors.
+    secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok();
     let conn = state.conn()?;
+    drive::forget_all_accounts(&conn).ok();
+    secrets::clear_google_client()?;
     calendar::clear_all_events(&conn)
 }
 
@@ -2106,7 +2109,7 @@ pub async fn connect_google() -> Result<()> {
 /// so the user can reconnect without re-entering them.
 #[tauri::command]
 pub fn disconnect_google(state: State<'_, AppState>) -> Result<()> {
-    secrets::clear_google_token()?;
+    secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY)?;
     let conn = state.conn()?;
     calendar::clear_all_events(&conn)
 }
@@ -2137,7 +2140,7 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let (oauth_ids, feeds, time_min, time_max, tz) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let oauth_ids = if google::is_connected()? {
+        let oauth_ids = if google::is_connected_for(google::CALENDAR_TOKEN_KEY)? {
             calendar::selected_calendar_ids(&conn)?
         } else {
             Vec::new()
@@ -2211,6 +2214,454 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
     let conn = state.conn()?;
     calendar::list_upcoming(&conn, calendar::AGENDA_DAYS)
+}
+
+// --- Google Drive (index-only connector, board card 4A) ---
+
+/// The Drive connector's state for Settings: whether the shared Google client is configured, plus
+/// every connected account (each independent — its own token, sync, and items).
+#[derive(Serialize)]
+pub struct DriveStatus {
+    pub oauth_client_configured: bool,
+    pub accounts: Vec<drive::DriveAccount>,
+}
+
+#[tauri::command]
+pub fn drive_status(state: State<'_, AppState>) -> Result<DriveStatus> {
+    let conn = state.conn()?;
+    Ok(DriveStatus {
+        oauth_client_configured: google::has_client()?,
+        accounts: drive::list_accounts(&conn)?,
+    })
+}
+
+#[tauri::command]
+pub fn list_drive_accounts(state: State<'_, AppState>) -> Result<Vec<drive::DriveAccount>> {
+    let conn = state.conn()?;
+    drive::list_accounts(&conn)
+}
+
+/// Connect a Google Drive account (read-only): run the consent flow, learn which account it granted
+/// (Drive `about`), store that account's token under its own keychain key, and register it. Returns
+/// the connected account. The shared BYO Google client must already be configured.
+#[tauri::command]
+pub async fn connect_drive(app: AppHandle) -> Result<drive::DriveAccount> {
+    let token = google::run_consent(google::DRIVE_SCOPE, "Google Drive").await?;
+    let (email, name) = drive::about_user(&token).await?;
+    google::save_token(&drive::account_token_key(&email), &token)?;
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    drive::upsert_account(&conn, &email, &name)?;
+    drive::list_accounts(&conn)?
+        .into_iter()
+        .find(|a| a.email == email)
+        .ok_or_else(|| Error::Other("the account registration could not be read back".into()))
+}
+
+/// Disconnect one Drive account: forget its token and registry row, and soft-flag its indexed items
+/// `unreachable` (kept findable — never a hard delete).
+#[tauri::command]
+pub fn disconnect_drive(state: State<'_, AppState>, email: String) -> Result<()> {
+    {
+        let conn = state.conn()?;
+        drive::forget_account(&conn, &email)?;
+    }
+    state.sync_index_only();
+    Ok(())
+}
+
+/// Sync one Drive account (or every account when `account` is `None`) into the index-only store. The
+/// first sync enumerates My Drive and ingests everything (the slow one — the UI warns); later syncs
+/// apply only the Drive changes feed. Every item is index-only: a pointer + embedding, the body
+/// fetched live. Never holds the DB lock across a network/embed call (rule #4). Streams
+/// `DriveSyncEvent` for the shared progress bar. Returns the number of items touched.
+#[tauri::command]
+pub async fn sync_drive(
+    app: AppHandle,
+    account: Option<String>,
+    on_event: Channel<drive::DriveSyncEvent>,
+) -> Result<usize> {
+    // The engine is needed for index-only embedding + binary conversion — ensure it once up front.
+    {
+        let state = app.state::<AppState>();
+        state.sidecar.ensure_installed()?;
+    }
+
+    let emails: Vec<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        match account {
+            Some(e) => vec![e],
+            None => drive::list_accounts(&conn)?
+                .into_iter()
+                .map(|a| a.email)
+                .collect(),
+        }
+    };
+
+    // Phase 1 — gather each account's work off the lock (enumerate, or the changes feed).
+    enum Item {
+        Enumerated(drive::DriveFile),
+        Changed(drive::DriveChange),
+    }
+    struct AccountWork {
+        email: String,
+        token_key: String,
+        items: Vec<Item>,
+        new_cursor: Option<String>,
+        auth_failed: bool,
+    }
+
+    let mut work: Vec<AccountWork> = Vec::new();
+    let mut last_err: Option<Error> = None;
+
+    for email in emails {
+        let token_key = drive::account_token_key(&email);
+        let cursor = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            drive::get_cursor(&conn, &email)?
+        };
+
+        // Helper: a full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
+        let full_relist = |token_key: String| async move {
+            let files = drive::enumerate_drive(&token_key).await?;
+            let cursor = drive::start_page_token(&token_key).await?;
+            Ok::<_, Error>((files, cursor))
+        };
+
+        if cursor.is_none() {
+            match full_relist(token_key.clone()).await {
+                Ok((files, new_cursor)) => work.push(AccountWork {
+                    email,
+                    token_key,
+                    items: files.into_iter().map(Item::Enumerated).collect(),
+                    new_cursor: Some(new_cursor),
+                    auth_failed: false,
+                }),
+                Err(e) => {
+                    let auth = drive::is_auth_failure(&e);
+                    last_err = Some(e);
+                    work.push(AccountWork {
+                        email,
+                        token_key,
+                        items: Vec::new(),
+                        new_cursor: None,
+                        auth_failed: auth,
+                    });
+                }
+            }
+            continue;
+        }
+
+        match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await {
+            Ok((changes, new_cursor)) => work.push(AccountWork {
+                email,
+                token_key,
+                items: changes.into_iter().map(Item::Changed).collect(),
+                new_cursor: Some(new_cursor),
+                auth_failed: false,
+            }),
+            Err(e) if drive::is_cursor_expired(&e) => match full_relist(token_key.clone()).await {
+                Ok((files, new_cursor)) => work.push(AccountWork {
+                    email,
+                    token_key,
+                    items: files.into_iter().map(Item::Enumerated).collect(),
+                    new_cursor: Some(new_cursor),
+                    auth_failed: false,
+                }),
+                Err(e2) => {
+                    let auth = drive::is_auth_failure(&e2);
+                    last_err = Some(e2);
+                    work.push(AccountWork {
+                        email,
+                        token_key,
+                        items: Vec::new(),
+                        new_cursor: None,
+                        auth_failed: auth,
+                    });
+                }
+            },
+            Err(e) => {
+                let auth = drive::is_auth_failure(&e);
+                last_err = Some(e);
+                work.push(AccountWork {
+                    email,
+                    token_key,
+                    items: Vec::new(),
+                    new_cursor: None,
+                    auth_failed: auth,
+                });
+            }
+        }
+    }
+
+    let total: usize = work.iter().map(|w| w.items.len()).sum();
+    let _ = on_event.send(drive::DriveSyncEvent::Counted { total });
+
+    // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
+    let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
+    let mut processed = 0usize;
+
+    for w in &work {
+        // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
+        if w.auth_failed {
+            let actions = index_only::react(
+                index_only::ChangeEvent::SourceFailure {
+                    source: format!("gdrive:{}", w.email),
+                },
+                None,
+            );
+            let app2 = app.clone();
+            let _ = tokio::task::spawn_blocking(move || apply_drive_actions(&app2, &actions, None))
+                .await;
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            drive::set_state(&conn, &w.email, "error")?;
+            continue;
+        }
+
+        for item in &w.items {
+            let (file, source_id, event): (Option<&drive::DriveFile>, String, _) = match item {
+                Item::Enumerated(file) => {
+                    let sid = drive::source_id_for(&w.email, &file.id);
+                    let ev = index_only::ChangeEvent::Add {
+                        source_id: sid.clone(),
+                        modified_at: file.modified_time.clone(),
+                    };
+                    (Some(file), sid, ev)
+                }
+                Item::Changed(change) => {
+                    let sid = drive::source_id_for(&w.email, &change.file_id);
+                    let known = {
+                        let state = app.state::<AppState>();
+                        let conn = state.conn()?;
+                        drive::read_item_state(&conn, &sid)?.is_some()
+                    };
+                    match drive::map_change(change, &w.email, known) {
+                        Some(ev) => (change.file.as_ref(), sid, ev),
+                        None => {
+                            processed += 1;
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let name = file
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| source_id.clone());
+            let current = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                drive::read_item_state(&conn, &source_id)?
+            };
+            let actions = index_only::react(event, current.as_ref());
+            let category = action_category(&actions);
+
+            let needs_body = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    index_only::Action::IngestNew { .. } | index_only::Action::ReEmbed { .. }
+                )
+            });
+            let fetched = if needs_body {
+                let body = match file {
+                    Some(f) => {
+                        let state = app.state::<AppState>();
+                        drive::fetch_body(state.inner(), &w.token_key, f).await
+                    }
+                    None => Ok(None),
+                };
+                match body {
+                    Ok(Some(text)) => file.map(|f| f.pointer(source_id.clone(), text)),
+                    Ok(None) => {
+                        processed += 1;
+                        skipped += 1;
+                        let _ = on_event.send(drive::DriveSyncEvent::Item {
+                            processed,
+                            total,
+                            name,
+                        });
+                        continue;
+                    }
+                    Err(e) => {
+                        processed += 1;
+                        failed += 1;
+                        last_err = Some(e);
+                        let _ = on_event.send(drive::DriveSyncEvent::Item {
+                            processed,
+                            total,
+                            name,
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let app2 = app.clone();
+            let apply =
+                tokio::task::spawn_blocking(move || apply_drive_actions(&app2, &actions, fetched))
+                    .await
+                    .map_err(|e| Error::Other(format!("drive apply task panicked: {e}")))?;
+            match apply {
+                Ok(()) => match category {
+                    DriveActionKind::Indexed => indexed += 1,
+                    DriveActionKind::Updated => updated += 1,
+                    DriveActionKind::Removed => removed += 1,
+                    DriveActionKind::Other => skipped += 1,
+                },
+                Err(e) => {
+                    failed += 1;
+                    last_err = Some(e);
+                }
+            }
+            processed += 1;
+            let _ = on_event.send(drive::DriveSyncEvent::Item {
+                processed,
+                total,
+                name,
+            });
+        }
+
+        // Advance the cursor + stamp the time only on a clean pass for this account.
+        if let Some(cursor) = &w.new_cursor {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            drive::set_synced(&conn, &w.email, cursor)?;
+        }
+    }
+
+    let _ = on_event.send(drive::DriveSyncEvent::Finished {
+        indexed,
+        updated,
+        removed,
+        skipped,
+        failed,
+    });
+
+    // Surface a failure (auth/expired) even when some items succeeded — the good ones are committed.
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+    Ok(indexed + updated + removed)
+}
+
+/// Which tally bucket a reducer's actions fall into, for the sync summary.
+enum DriveActionKind {
+    Indexed,
+    Updated,
+    Removed,
+    Other,
+}
+
+fn action_category(actions: &[index_only::Action]) -> DriveActionKind {
+    if actions
+        .iter()
+        .any(|a| matches!(a, index_only::Action::IngestNew { .. }))
+    {
+        DriveActionKind::Indexed
+    } else if actions
+        .iter()
+        .any(|a| matches!(a, index_only::Action::ReEmbed { .. }))
+    {
+        DriveActionKind::Updated
+    } else if actions.iter().any(|a| {
+        matches!(
+            a,
+            index_only::Action::SetState {
+                state: index_only::SourceState::SourceMissing,
+                ..
+            }
+        )
+    }) {
+        DriveActionKind::Removed
+    } else {
+        DriveActionKind::Other
+    }
+}
+
+/// Run a reducer's actions against the store + manifest, on a blocking thread (the index-only
+/// executor embeds via the sidecar). Mirrors `dev_apply_change_event`'s execution shape.
+fn apply_drive_actions(
+    app: &AppHandle,
+    actions: &[index_only::Action],
+    fetched: Option<index_only::PointerInput>,
+) -> Result<()> {
+    let state = app.state::<AppState>();
+    let (vault_root, cipher) = state.manifest_io()?;
+    let gateway = {
+        let conn = state.conn()?;
+        state.gateway(&conn)?
+    };
+    index_only::apply_actions(
+        state.inner(),
+        &gateway,
+        &vault_root,
+        &cipher,
+        actions,
+        fetched.as_ref(),
+    )
+}
+
+/// Fetch an index-only document's full body live from its source (Drive), for the "show full text"
+/// affordance. The body is never stored — only the short summary lives offline.
+#[tauri::command]
+pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String> {
+    let (source_type, source_id, source_state): (String, Option<String>, String) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        conn.query_row(
+            "SELECT source_type, source_id, source_state FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+    };
+    if source_type != "index_only" {
+        return Err(Error::Other(
+            "This document is stored locally — open it directly.".into(),
+        ));
+    }
+    let source_id =
+        source_id.ok_or_else(|| Error::Other("This indexed item has no source pointer.".into()))?;
+    if source_state == "source_missing" {
+        return Err(Error::Other(
+            "This file was removed at the source; only its saved summary is available.".into(),
+        ));
+    }
+    let email = drive::account_of(&source_id)
+        .ok_or_else(|| Error::Other("Unrecognised index-only source.".into()))?;
+    let file_id = source_id
+        .rsplit_once(':')
+        .map(|(_, id)| id.to_string())
+        .ok_or_else(|| Error::Other("Malformed source id.".into()))?;
+    let token_key = drive::account_token_key(&email);
+
+    let state = app.state::<AppState>();
+    state.sidecar.ensure_installed()?;
+    let file = drive::fetch_file(&token_key, &file_id).await?;
+    drive::fetch_body(state.inner(), &token_key, &file)
+        .await?
+        .ok_or_else(|| Error::Other("This file has no extractable text to show.".into()))
+}
+
+/// Open an index-only document's source in the system browser (its Drive `webViewLink`).
+#[tauri::command]
+pub fn open_external_ref(state: State<'_, AppState>, doc_id: i64) -> Result<()> {
+    let external_ref: Option<String> = {
+        let conn = state.conn()?;
+        conn.query_row(
+            "SELECT external_ref FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| r.get(0),
+        )?
+    };
+    let url = external_ref.ok_or_else(|| Error::Other("This item has no source link.".into()))?;
+    open::that(&url).map_err(|e| Error::Other(format!("Couldn't open the link: {e}")))?;
+    Ok(())
 }
 
 // --- structured preferences (§4.5 — the typed model that replaces the Learning-You blob) ---
