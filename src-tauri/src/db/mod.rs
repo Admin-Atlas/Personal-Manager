@@ -810,9 +810,11 @@ mod tests {
 
     #[test]
     fn migration_v11_defaults_existing_rows_to_stored_vault_documents() {
-        // Tear the v11 columns/indexes back down to a v10-shaped store, seed a document the way v10
-        // wrote them (no source_* columns), then re-run migrations so the real v11 step processes a
-        // pre-existing row.
+        // Tear the store back down to a v10-shaped store, seed a document the way v10 wrote them (no
+        // source_* columns), then re-run migrations so the real v11 step processes a pre-existing
+        // row. Every migration ABOVE v10 must be reverted — v11's source_* columns AND v12's
+        // `entities.confidence`/`user_confirmed` — otherwise their re-run ADD COLUMNs collide with
+        // columns still on disk from the initial `open`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v11.sqlite");
         let conn = open(&path, KEY).unwrap();
@@ -827,6 +829,8 @@ mod tests {
              ALTER TABLE documents DROP COLUMN source_modified_at; \
              ALTER TABLE documents DROP COLUMN source_content_hash; \
              ALTER TABLE documents DROP COLUMN stored_summary; \
+             ALTER TABLE entities DROP COLUMN confidence; \
+             ALTER TABLE entities DROP COLUMN user_confirmed; \
              PRAGMA user_version = 10;",
         )
         .unwrap();

@@ -22,6 +22,23 @@
 //! ALWAYS, even for device vaults whose Markdown is plaintext: an alias map of projects (and
 //! later people) is more revealing than any single document, so it gets parity with the
 //! always-encrypted SQLCipher store.
+//!
+//! ## Lean-spine rule (Stage-3 spine hardening, §8.5)
+//! `entities` is the GENERIC canonical-identity spine and nothing more — `id`, `type`, canonical
+//! name, timestamps, `confidence`, `user_confirmed`. **Type-specific attributes never live here.**
+//! Per-type facts (a person's email/phone, a place's coordinates/work-suitability, a project's
+//! deadline/size) belong in dedicated TYPE TABLES keyed to `entities.id` (Stage 4, the
+//! "Entity relational model" card) — never smeared onto this spine, and never as a shapeless JSON
+//! blob. Code written against this table must assume the lean shape so the Stage-4 decomposition
+//! stays a free extension, not a migration of hardened assumptions.
+//!
+//! The two hardening columns split by who owns them:
+//! - **`user_confirmed`** is PORTABLE user truth — a deliberate user vouch that cannot be
+//!   regenerated from the documents — so it is carried in the rules file (schema 2) and survives a
+//!   device copy / index drop-recreate, exactly like the aliases.
+//! - **`confidence`** is DB-only DERIVED state — under today's deterministic exact-match resolution
+//!   it is always 1.0, it re-seeds to its column DEFAULT on a mirror rebuild (the rules file does
+//!   NOT carry it), and it is the seam for the Stage-5 auto-merge scorer.
 
 use std::path::{Path, PathBuf};
 
@@ -35,8 +52,10 @@ use crate::vault::crypto;
 /// The only entity type populated in PR 1 (the `person`/`thing` seam is banked in the schema).
 pub const TYPE_PROJECT: &str = "project";
 
-/// Current rules-file schema version.
-const RULES_SCHEMA: u32 = 1;
+/// Current rules-file schema version. Bumped 1 → 2 by spine hardening (§8.5): a `RuleEntity` now
+/// also carries `user_confirmed`. A schema-1 file (field absent) still deserializes — the field is
+/// `#[serde(default)]` false — and is rewritten to schema 2 on first reconcile.
+const RULES_SCHEMA: u32 = 2;
 /// Filename of the encrypted rules file, at the data-home root next to `pm.sqlite`.
 pub const RULES_FILENAME: &str = "entities.pmrules";
 /// AAD stem binding the rules ciphertext to its logical identity (mirrors the Markdown AAD).
@@ -45,7 +64,7 @@ const RULES_AAD_STEM: &str = "entities";
 // --- mirror types -----------------------------------------------------------
 
 /// One entity with its aliases, as exposed to the command surface / Teach tab (PR 2).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Entity {
     pub id: i64,
     #[serde(rename = "type")]
@@ -53,6 +72,12 @@ pub struct Entity {
     pub canonical_name: String,
     /// All known aliases for this entity, the canonical self-alias included.
     pub aliases: Vec<String>,
+    /// DB-only derived confidence in [0,1] (1.0 under today's exact-match resolution). Surfaced for
+    /// future use; not yet shown in the Teach tab.
+    pub confidence: f64,
+    /// Whether the user has deliberately vouched for this entity (rename / merge-survivor /
+    /// add-alias / explicit review correction). Portable truth, carried in the rules file.
+    pub user_confirmed: bool,
 }
 
 /// The portable rules-file shape (the encrypted source of truth). Integer ids are an index
@@ -69,6 +94,10 @@ pub struct RuleEntity {
     pub kind: String,
     pub canonical_name: String,
     pub aliases: Vec<String>,
+    /// Portable user-confirmed flag (spine hardening, schema 2). `#[serde(default)]` so a schema-1
+    /// file with the field absent deserializes to `false` — the one-time upgrade then persists it.
+    #[serde(default)]
+    pub user_confirmed: bool,
 }
 
 // --- deterministic resolution (the heart of the fix) ------------------------
@@ -178,7 +207,8 @@ pub fn add_alias(conn: &Connection, entity_id: i64, alias: &str) -> Result<AddAl
                 "INSERT INTO entity_aliases(entity_id, alias) VALUES (?1, ?2)",
                 params![entity_id, alias],
             )?;
-            touch_entity(conn, entity_id)?;
+            // Teaching a variant is a deliberate vouch for the target entity — confirm it.
+            set_confirmed(conn, entity_id)?;
             Ok(AddAlias::Added)
         }
     }
@@ -224,6 +254,8 @@ pub fn rename_entity(conn: &Connection, entity_id: i64, new_canonical: &str) -> 
         params![entity_id, new_canonical],
     )?;
     ensure_alias_row(conn, entity_id, new_canonical)?;
+    // Renaming a canonical is a deliberate vouch for the entity's identity — confirm it.
+    set_confirmed(conn, entity_id)?;
     Ok(new_canonical.to_string())
 }
 
@@ -250,27 +282,33 @@ pub fn merge_entities(conn: &Connection, from_id: i64, into_id: i64) -> Result<(
         params![from_id, into_id],
     )?;
     conn.execute("DELETE FROM entities WHERE id = ?1", params![from_id])?;
-    touch_entity(conn, into_id)?;
+    // Merging variants into a survivor is a deliberate vouch for it — confirm the survivor.
+    set_confirmed(conn, into_id)?;
     Ok(())
 }
 
 /// Every entity of a type with its aliases, alphabetical by canonical name (the Teach tab's list).
 pub fn list_entities(conn: &Connection, kind: &str) -> Result<Vec<Entity>> {
     let mut stmt = conn.prepare(
-        "SELECT id, type, canonical_name FROM entities WHERE type = ?1 ORDER BY canonical_name",
+        "SELECT id, type, canonical_name, confidence, user_confirmed FROM entities \
+         WHERE type = ?1 ORDER BY canonical_name",
     )?;
-    let heads: Vec<(i64, String, String)> = stmt
-        .query_map(params![kind], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let heads: Vec<(i64, String, String, f64, bool)> = stmt
+        .query_map(params![kind], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
         .collect::<std::result::Result<_, _>>()?;
     drop(stmt);
 
     let mut out = Vec::with_capacity(heads.len());
-    for (id, kind, canonical_name) in heads {
+    for (id, kind, canonical_name, confidence, user_confirmed) in heads {
         out.push(Entity {
             id,
             kind,
             canonical_name,
             aliases: aliases_of(conn, id)?,
+            confidence,
+            user_confirmed,
         });
     }
     Ok(out)
@@ -318,9 +356,14 @@ pub fn resolve_to_canonical(conn: &Connection, name: &str) -> Result<String> {
     }
 }
 
-fn touch_entity(conn: &Connection, entity_id: i64) -> Result<()> {
+/// Record that the user has deliberately vouched for `entity_id` (a rename, a merge survivor, an
+/// added alias, or an explicit review correction). Turns confirmation from an *action* into recorded
+/// *state*. Portable: the surrounding mutation re-writes the rules file from the mirror, so the flag
+/// lands in `entities.pmrules` and survives a device copy / mirror rebuild.
+pub fn set_confirmed(conn: &Connection, entity_id: i64) -> Result<()> {
     conn.execute(
-        "UPDATE entities SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+        "UPDATE entities SET user_confirmed = 1, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
         params![entity_id],
     )?;
     Ok(())
@@ -403,19 +446,23 @@ pub fn restore_rules_file(vault_root: &Path, prior: &[u8]) {
 
 /// Serialize the whole mirror (entities + their aliases) into the portable rules shape.
 pub fn rules_from_mirror(conn: &Connection) -> Result<Rules> {
-    let mut stmt = conn
-        .prepare("SELECT id, type, canonical_name FROM entities ORDER BY type, canonical_name")?;
-    let heads: Vec<(i64, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    // `confidence` is deliberately NOT read — it is DB-only derived state, not portable truth.
+    let mut stmt = conn.prepare(
+        "SELECT id, type, canonical_name, user_confirmed FROM entities \
+         ORDER BY type, canonical_name",
+    )?;
+    let heads: Vec<(i64, String, String, bool)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<std::result::Result<_, _>>()?;
     drop(stmt);
 
     let mut entities = Vec::with_capacity(heads.len());
-    for (id, kind, canonical_name) in heads {
+    for (id, kind, canonical_name, user_confirmed) in heads {
         entities.push(RuleEntity {
             kind,
             canonical_name,
             aliases: aliases_of(conn, id)?,
+            user_confirmed,
         });
     }
     Ok(Rules {
@@ -443,9 +490,11 @@ pub fn rebuild_mirror_from_rules(conn: &Connection, rules: &Rules) -> Result<()>
     conn.execute("DELETE FROM entities", [])?;
 
     for e in &rules.entities {
+        // `user_confirmed` is restored from the portable file; `confidence` is intentionally NOT set
+        // here, so it re-seeds to the column DEFAULT (1.0) — the documented DB-only-derived reset.
         conn.execute(
-            "INSERT INTO entities(type, canonical_name) VALUES (?1, ?2)",
-            params![e.kind, e.canonical_name],
+            "INSERT INTO entities(type, canonical_name, user_confirmed) VALUES (?1, ?2, ?3)",
+            params![e.kind, e.canonical_name, e.user_confirmed],
         )?;
         let id = conn.last_insert_rowid();
         for alias in &e.aliases {
@@ -483,6 +532,13 @@ pub fn reconcile_on_open(conn: &Connection, vault_root: &Path, cipher: &RulesCip
                 let tx = conn.unchecked_transaction()?;
                 rebuild_mirror_from_rules(&tx, &rules)?;
                 tx.commit()?;
+            }
+            // One-time on-disk format upgrade (e.g. schema 1 → 2, which added `user_confirmed`):
+            // rewrite the file from the now-correct mirror so it carries the current shape. A v1
+            // file's missing field deserialized to `false`, matching the post-migration mirror, so
+            // this only restamps the format — idempotent, and a no-op once the file is current.
+            if rules.schema < RULES_SCHEMA {
+                write_rules_file(vault_root, cipher, &rules_from_mirror(conn)?)?;
             }
             Ok(())
         }
@@ -651,6 +707,7 @@ mod tests {
                 kind: TYPE_PROJECT.into(),
                 canonical_name: "Medical".into(),
                 aliases: vec!["Medical".into(), "Health".into()],
+                user_confirmed: true,
             }],
         };
         let prior = write_rules_file(dir.path(), &cipher, &rules).unwrap();
@@ -699,5 +756,128 @@ mod tests {
             )
             .unwrap();
         assert_eq!(doc_entity, resolve_project(&conn, "PM", false).unwrap());
+    }
+
+    // --- spine hardening (§8.5): confidence + user_confirmed -----------------
+
+    fn confirmed(conn: &Connection, id: i64) -> bool {
+        conn.query_row(
+            "SELECT user_confirmed FROM entities WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+    }
+
+    fn confidence(conn: &Connection, id: i64) -> f64 {
+        conn.query_row(
+            "SELECT confidence FROM entities WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn confirmation_actions_record_state() {
+        let (_d, conn) = store_with_doc("PM");
+        let pm = resolve_project(&conn, "PM", false).unwrap().unwrap();
+        // A backfilled / freshly-created entity is NOT confirmed — confirmation is a deliberate act.
+        assert!(!confirmed(&conn, pm));
+        let r = resolve_project(&conn, "Research", true).unwrap().unwrap();
+        assert!(!confirmed(&conn, r));
+
+        // Adding an alias confirms the target...
+        add_alias(&conn, pm, "Atlas - PM").unwrap();
+        assert!(confirmed(&conn, pm));
+        // ...renaming confirms the renamed entity...
+        rename_entity(&conn, r, "Research Lab").unwrap();
+        assert!(confirmed(&conn, r));
+        // ...and a merge confirms the survivor.
+        let a = resolve_project(&conn, "Alpha", true).unwrap().unwrap();
+        let b = resolve_project(&conn, "Beta", true).unwrap().unwrap();
+        merge_entities(&conn, a, b).unwrap();
+        assert!(confirmed(&conn, b));
+    }
+
+    #[test]
+    fn user_confirmed_is_portable_and_round_trips_through_the_rules_file() {
+        let (_d, conn) = store_with_doc("PM");
+        let pm = resolve_project(&conn, "PM", false).unwrap().unwrap();
+        set_confirmed(&conn, pm).unwrap();
+
+        // The portable rules shape carries the flag (it survives a device copy / mirror rebuild).
+        let rules = rules_from_mirror(&conn).unwrap();
+        let pm_rule = rules
+            .entities
+            .iter()
+            .find(|e| e.canonical_name == "PM")
+            .unwrap();
+        assert!(pm_rule.user_confirmed);
+
+        // Rebuilding the mirror from the file restores it (ids may be reassigned).
+        rebuild_mirror_from_rules(&conn, &rules).unwrap();
+        let pm2 = resolve_project(&conn, "PM", false).unwrap().unwrap();
+        assert!(confirmed(&conn, pm2));
+        // The unconfirmed 'Unsorted' fallback stays unconfirmed across the round-trip.
+        let unsorted = resolve_project(&conn, "Unsorted", false).unwrap().unwrap();
+        assert!(!confirmed(&conn, unsorted));
+    }
+
+    #[test]
+    fn confidence_is_db_only_and_reseeds_on_rebuild() {
+        let (_d, conn) = store_with_doc("PM");
+        let pm = resolve_project(&conn, "PM", false).unwrap().unwrap();
+        // New entities seed to the default 1.0 (deterministic exact-match origin).
+        assert_eq!(confidence(&conn, pm), 1.0);
+
+        // It is deliberately absent from the portable rules shape.
+        let rules = rules_from_mirror(&conn).unwrap();
+        let json = serde_json::to_string(&rules).unwrap();
+        assert!(
+            !json.contains("confidence"),
+            "confidence is DB-only and must not appear in the rules file"
+        );
+
+        // A non-default value re-seeds to the column DEFAULT on a mirror rebuild (derived state).
+        conn.execute(
+            "UPDATE entities SET confidence = 0.5 WHERE id = ?1",
+            params![pm],
+        )
+        .unwrap();
+        assert_eq!(confidence(&conn, pm), 0.5);
+        rebuild_mirror_from_rules(&conn, &rules).unwrap();
+        let pm2 = resolve_project(&conn, "PM", false).unwrap().unwrap();
+        assert_eq!(confidence(&conn, pm2), 1.0);
+    }
+
+    #[test]
+    fn schema_one_rules_file_deserializes_and_upgrades_to_v2() {
+        // A schema-1 rule has no `user_confirmed` field; serde defaults it to false.
+        let v1 = r#"{"schema":1,"entities":[{"type":"project","canonical_name":"PM","aliases":["PM"]}]}"#;
+        let parsed: Rules = serde_json::from_str(v1).unwrap();
+        assert_eq!(parsed.schema, 1);
+        assert!(!parsed.entities[0].user_confirmed);
+
+        // On disk: a genuine schema-1 encrypted file is upgraded in place on first reconcile.
+        let (dir, conn) = store_with_doc("PM");
+        let cipher = RulesCipher::from_master("vault-xyz", &[3u8; 32]);
+        let bytes = crypto::encrypt(
+            v1.as_bytes(),
+            &cipher.subkey,
+            &cipher.vault_id,
+            RULES_AAD_STEM,
+        )
+        .unwrap();
+        std::fs::write(rules_path(dir.path()), &bytes).unwrap();
+
+        reconcile_on_open(&conn, dir.path(), &cipher).unwrap();
+        let on_disk = read_rules_file(dir.path(), &cipher).unwrap().unwrap();
+        assert_eq!(
+            on_disk.schema, RULES_SCHEMA,
+            "the file was restamped to schema 2"
+        );
+        // PM still resolves after the rebuild-from-v1-file.
+        assert_eq!(resolve_to_canonical(&conn, "PM").unwrap(), "PM");
     }
 }

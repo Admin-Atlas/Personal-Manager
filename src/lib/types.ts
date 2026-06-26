@@ -258,6 +258,12 @@ export interface Entity {
   type: string;
   canonical_name: string;
   aliases: string[];
+  /** DB-only derived confidence in [0,1] (1.0 under today's exact-match resolution). Surfaced for
+   *  future use; not yet shown in the Teach tab. */
+  confidence: number;
+  /** Whether the user has deliberately vouched for this entity (rename / merge / add-alias /
+   *  explicit review correction). Portable truth, carried in the encrypted rules file. */
+  user_confirmed: boolean;
 }
 
 // --- Personal Assistant: focus view & projects (Step 5, spec §4.1) ---

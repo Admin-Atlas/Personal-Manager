@@ -1526,8 +1526,11 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                 entities::reassign_document(&tx, d.document_id, entity_id)?;
                 // Capture the model's corrected-away name as a forward-going alias (merge-guarded),
                 // so the same variant resolves to this canonical next time instead of recurring.
+                // A correction is also a deliberate vouch for the chosen entity — record it as
+                // confirmed STATE (accepting the proposal unchanged does not confirm).
                 if d.project.trim() != d.proposed_project.trim() {
                     capture_alias(&tx, entity_id, &d.proposed_project)?;
+                    entities::set_confirmed(&tx, entity_id)?;
                 }
             }
             Ok(logged)
@@ -1633,6 +1636,8 @@ pub async fn set_document_metadata(
                 &manifest_cipher,
             )?);
             entities::reassign_document(&tx, document_id, entity_id)?;
+            // A deliberate after-the-fact metadata edit vouches for the chosen entity — confirm it.
+            entities::set_confirmed(&tx, entity_id)?;
             Ok(())
         })();
 
