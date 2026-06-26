@@ -32,6 +32,7 @@ import { ModelRecommendationCards } from "./ModelRecommendationCards";
 import { RebuildProgress } from "./RebuildProgress";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
+import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { useTheme, useDepth, ACCENTS } from "../theme";
 import { Button, Collapsible, ConfirmDialog, Input, NavItem, SegmentedControl, Select } from "./ui";
 
@@ -39,10 +40,12 @@ interface Props {
   onClose: () => void;
   /** First-run onboarding requires a key before the app is usable. */
   onboarding: boolean;
+  /** Jump to the Dev tab (issue #78) — closes Settings and navigates. Non-onboarding only. */
+  onOpenDev?: () => void;
 }
 
 /** The non-onboarding Settings tabs (left rail). Onboarding stays a single untabbed scroll. */
-type SettingsTab = "general" | "ai" | "search" | "calendar" | "data";
+type SettingsTab = "general" | "ai" | "search" | "calendar" | "data" | "developer";
 
 const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },
@@ -50,9 +53,10 @@ const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: "search", label: "Search" },
   { id: "calendar", label: "Calendar" },
   { id: "data", label: "Data & Security" },
+  { id: "developer", label: "Developer" },
 ];
 
-export function SettingsView({ onClose, onboarding }: Props) {
+export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const help = useHelp();
   const {
     system,
@@ -66,6 +70,7 @@ export function SettingsView({ onClose, onboarding }: Props) {
     teachVisible,
     setTeachVisible,
   } = useTheme();
+  const { devMode, setDevMode } = useDevMode();
   const { showMeta, showPower } = useDepth();
   const [key, setKey] = useState("");
   const [bgKey, setBgKey] = useState("");
@@ -1031,6 +1036,52 @@ export function SettingsView({ onClose, onboarding }: Props) {
                   </Collapsible>
                 </div>
               </>
+            )}
+
+            {tab === "developer" && (
+              <div className="mt-5 border-t border-border pt-4" data-help="settings-developer">
+                <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                  Developer mode
+                </label>
+                <p className="mt-1 text-xs text-ink4">
+                  Reveals read-only inspection surfaces — a dedicated Dev tab (raw tables, row
+                  counts, the corrections log, system &amp; build info) plus internals shown in
+                  place — for debugging and watching how PM works. Strictly read-only: it never
+                  changes your data. Independent of the density preset, and off by default.
+                </p>
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <span className="text-sm text-ink2">Developer mode</span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={devMode}
+                    aria-label="Developer mode"
+                    onClick={() => setDevMode(!devMode)}
+                    className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                      devMode ? "bg-accent" : "bg-surface"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                        devMode ? "translate-x-4" : "translate-x-0.5"
+                      }`}
+                    />
+                  </button>
+                </div>
+                <div className="mt-3 flex items-center justify-between gap-3 text-xs">
+                  <span className="text-ink3">Signals</span>
+                  <span className="font-mono text-ink4">
+                    build: {isDevBuild ? "dev" : "release"} · runtime: {devMode ? "on" : "off"}
+                  </span>
+                </div>
+                {devMode && onOpenDev && (
+                  <div className="mt-3">
+                    <Button variant="tertiary" onClick={onOpenDev}>
+                      Open Dev tab →
+                    </Button>
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </div>

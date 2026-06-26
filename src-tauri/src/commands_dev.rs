@@ -1,0 +1,563 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Developer-mode inspection commands — the STRICTLY READ-ONLY backend for the runtime
+//! Developer mode (issue #78). Every command here reads internal state and returns a
+//! redacted, allow-listed view of it; none mutates the store or the schema.
+//!
+//! Security model — the feature ships to ALL users from a PUBLIC repo, so the real risk is
+//! outward leakage (a screenshot or a pasted bug report), not on-device viewing:
+//!  * Redaction happens HERE, in the backend, so a withheld value never even crosses IPC.
+//!  * The raw-table browser uses a fixed `(table → projected columns)` allow-list — never
+//!    `SELECT *`, never an interpolated table name — so a column added by a future migration
+//!    can never auto-appear; surfacing one is a deliberate edit to [`TABLES`] in this file.
+//!  * Free-text/personal columns are truncated or shown only as a length; the `settings`
+//!    grab-bag (which also holds the archived `learning_profile` and the UI blobs) shows
+//!    key + type + length, with only a small safe-list of operational scalar keys rendered.
+//!  * No keychain read and no portable-file (`*.pmrules` / `*.pmindex`) decrypt lives here —
+//!    OAuth tokens, feed URLs and the encryption keys are never reachable from this module.
+
+use rusqlite::types::Value;
+use rusqlite::{params, Connection};
+use serde::Serialize;
+use tauri::State;
+
+use crate::error::{Error, Result};
+use crate::{db, AppState};
+
+/// How a column's value is rendered into the read-only browser. Applied to TEXT values
+/// only; numbers/nulls/blobs are formatted directly, so a render can only ever *narrow*
+/// what is shown, never widen it.
+#[derive(Clone, Copy)]
+enum Render {
+    /// Short, non-personal value shown as-is (ids, enums, flags, timestamps, counts).
+    Plain,
+    /// Free text shown as its first `n` chars (a `…` is appended when it was longer).
+    Trunc(usize),
+    /// Personal/large free text shown only as a length — never its content.
+    Len,
+}
+
+struct Column {
+    name: &'static str,
+    render: Render,
+}
+
+const fn plain(name: &'static str) -> Column {
+    Column {
+        name,
+        render: Render::Plain,
+    }
+}
+const fn trunc(name: &'static str, n: usize) -> Column {
+    Column {
+        name,
+        render: Render::Trunc(n),
+    }
+}
+const fn len(name: &'static str) -> Column {
+    Column {
+        name,
+        render: Render::Len,
+    }
+}
+
+struct Table {
+    name: &'static str,
+    columns: &'static [Column],
+}
+
+/// The ONE reviewed allow-list. Each entry is a browsable table and the exact columns
+/// (with their redaction) exposed for it. To surface a new table or column, add it HERE —
+/// that deliberate edit is the review step the security model relies on. `settings` is
+/// intentionally absent: it routes to [`settings_page`], which redacts by default.
+const TABLES: &[Table] = &[
+    Table {
+        name: "documents",
+        columns: &[
+            plain("id"),
+            trunc("title", 80),
+            plain("project"),
+            plain("entity_id"),
+            plain("source_type"),
+            plain("source_state"),
+            plain("importance"),
+            plain("reviewed"),
+            trunc("content_hash", 12),
+            trunc("external_ref", 60),
+            plain("source_id"),
+            plain("ingested_at"),
+        ],
+    },
+    Table {
+        name: "chunks",
+        columns: &[
+            plain("id"),
+            plain("document_id"),
+            plain("ordinal"),
+            trunc("heading", 60),
+            plain("kind"),
+            plain("char_count"),
+            trunc("uid", 12),
+            plain("parent_id"),
+            len("content"),
+        ],
+    },
+    Table {
+        name: "entities",
+        columns: &[
+            plain("id"),
+            plain("type"),
+            trunc("canonical_name", 80),
+            plain("confidence"),
+            plain("user_confirmed"),
+            plain("created_at"),
+            plain("updated_at"),
+        ],
+    },
+    Table {
+        name: "entity_aliases",
+        columns: &[
+            plain("id"),
+            plain("entity_id"),
+            trunc("alias", 80),
+            plain("created_at"),
+        ],
+    },
+    Table {
+        name: "preferences",
+        columns: &[
+            plain("id"),
+            plain("scope"),
+            plain("entity_id"),
+            trunc("condition", 80),
+            trunc("value", 80),
+            plain("source"),
+            plain("confidence"),
+            plain("user_confirmed"),
+            plain("created_at"),
+            plain("updated_at"),
+        ],
+    },
+    Table {
+        name: "corrections",
+        columns: &[
+            plain("id"),
+            plain("document_id"),
+            plain("field"),
+            trunc("before_val", 60),
+            trunc("after_val", 60),
+            trunc("title", 60),
+            plain("created_at"),
+        ],
+    },
+    Table {
+        name: "projects",
+        columns: &[
+            plain("name"),
+            plain("entity_id"),
+            plain("deadline"),
+            plain("size"),
+            trunc("blocked_by", 40),
+            trunc("parent", 40),
+            plain("created_at"),
+            plain("updated_at"),
+        ],
+    },
+    Table {
+        name: "conversations",
+        columns: &[
+            plain("id"),
+            trunc("title", 60),
+            plain("project"),
+            plain("created_at"),
+            plain("updated_at"),
+        ],
+    },
+    Table {
+        name: "messages",
+        columns: &[
+            plain("id"),
+            plain("conversation_id"),
+            plain("role"),
+            plain("model"),
+            plain("created_at"),
+            // Chat bodies are personal and large — length only, never content.
+            len("content"),
+            len("citations"),
+        ],
+    },
+    Table {
+        name: "calendar_events",
+        columns: &[
+            plain("id"),
+            plain("calendar_id"),
+            trunc("summary", 60),
+            plain("start"),
+            plain("end"),
+            plain("all_day"),
+            // Personal free text — length only.
+            len("description"),
+            len("location"),
+            plain("synced_at"),
+        ],
+    },
+    Table {
+        name: "usage_log",
+        columns: &[
+            plain("id"),
+            plain("model"),
+            plain("kind"),
+            plain("prompt_tokens"),
+            plain("completion_tokens"),
+            plain("created_at"),
+        ],
+    },
+    Table {
+        name: "model_pricing",
+        columns: &[
+            plain("model"),
+            trunc("name", 40),
+            plain("prompt_price"),
+            plain("completion_price"),
+            plain("cache_read_price"),
+            plain("context_length"),
+            plain("intelligence_index"),
+            plain("fetched_at"),
+        ],
+    },
+];
+
+/// Every table whose row count the counts dashboard reports: the browsable tables plus the
+/// derived indexes (`chunk_vec`/`chunks_fts`, count-only — their rows are binary/index noise)
+/// and `settings`. A count is harmless and answers "is the index populated?" at a glance.
+const COUNT_TABLES: &[&str] = &[
+    "documents",
+    "chunks",
+    "chunk_vec",
+    "chunks_fts",
+    "entities",
+    "entity_aliases",
+    "preferences",
+    "corrections",
+    "projects",
+    "conversations",
+    "messages",
+    "calendar_events",
+    "usage_log",
+    "model_pricing",
+    "settings",
+];
+
+/// `settings` is a key/value grab-bag that also holds personal blobs — the archived
+/// `learning_profile`, the `appearance`/`pinboard` UI blobs, the cached daily briefing — so
+/// its values are REDACTED BY DEFAULT. Only these short, operational, non-personal scalar
+/// keys are rendered in full; every other key shows type + length only.
+const SETTINGS_VALUE_SAFE: &[&str] = &[
+    "embedding_model",
+    "embedding_dim",
+    "reranking_enabled",
+    "help_mode",
+    "time_zone",
+    "app_lock_enabled",
+    "preferences_migrated_at",
+    "google_last_sync",
+    "chat_auto_switch",
+    "background_auto_switch",
+    "dev_mode",
+];
+
+/// The running vault's index-time + runtime facts for the Dev tab's System panel. The app
+/// version and sidecar status are composed on the frontend from their existing commands, so
+/// this stays a pure read of the store.
+#[derive(Serialize)]
+pub struct DevSystemInfo {
+    pub migration_version: i64,
+    pub embedder_id: String,
+    pub embedder_label: String,
+    pub vector_dim: usize,
+    pub reranking_enabled: bool,
+    pub retrieval_stamp: Option<crate::retrieval_config::RetrievalConfig>,
+}
+
+#[derive(Serialize)]
+pub struct DevTableCount {
+    pub table: String,
+    pub rows: i64,
+}
+
+/// One redacted page of a table: the projected column names and the rendered cell values
+/// (already redacted — these strings are exactly what the UI may display).
+#[derive(Serialize)]
+pub struct DevTablePage {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub total: i64,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+/// Render one cell. Numbers/nulls/blobs are formatted structurally; only TEXT is subject to
+/// the column's redaction policy.
+fn render_value(value: Value, render: Render) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Blob(b) => format!("<blob {} bytes>", b.len()),
+        Value::Text(s) => match render {
+            Render::Plain => s,
+            Render::Trunc(n) => truncate(&s, n),
+            Render::Len => format!("<{} chars>", s.chars().count()),
+        },
+    }
+}
+
+// ---- Pure cores (testable with a bare in-memory connection) -------------------------------
+
+fn system_info(conn: &Connection) -> Result<DevSystemInfo> {
+    let migration_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let embedder = db::selected_embedder(conn)?;
+    Ok(DevSystemInfo {
+        migration_version,
+        embedder_id: embedder.id.to_string(),
+        embedder_label: embedder.label.to_string(),
+        vector_dim: db::vec0_dim(conn)?,
+        reranking_enabled: db::reranking_enabled(conn)?,
+        retrieval_stamp: db::get_retrieval_stamp(conn)?,
+    })
+}
+
+fn table_counts(conn: &Connection) -> Result<Vec<DevTableCount>> {
+    let mut out = Vec::with_capacity(COUNT_TABLES.len());
+    for &t in COUNT_TABLES {
+        // `t` is a compile-time constant from our own list — never user input.
+        let rows: i64 = conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))?;
+        out.push(DevTableCount {
+            table: t.to_string(),
+            rows,
+        });
+    }
+    Ok(out)
+}
+
+/// Browsable table names for the picker (`settings` appended — it browses through the
+/// redacting [`settings_page`]).
+fn table_names() -> Vec<String> {
+    let mut names: Vec<String> = TABLES.iter().map(|t| t.name.to_string()).collect();
+    names.push("settings".to_string());
+    names
+}
+
+fn table_page(conn: &Connection, table: &str, limit: u32, offset: u32) -> Result<DevTablePage> {
+    let limit = limit.clamp(1, 200);
+    if table == "settings" {
+        return settings_page(conn, limit, offset);
+    }
+    // The allow-list guard: reject anything not declared in TABLES *before* any SQL is built,
+    // and only ever interpolate the matched static `spec.name` — never the caller's string.
+    let spec = TABLES
+        .iter()
+        .find(|t| t.name == table)
+        .ok_or_else(|| Error::Other(format!("table '{table}' is not inspectable")))?;
+
+    let total: i64 = conn.query_row(&format!("SELECT count(*) FROM {}", spec.name), [], |r| {
+        r.get(0)
+    })?;
+    let col_list = spec
+        .columns
+        .iter()
+        .map(|c| c.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    // rowid DESC surfaces the newest rows first — the most useful order for debugging.
+    let sql = format!(
+        "SELECT {col_list} FROM {} ORDER BY rowid DESC LIMIT ?1 OFFSET ?2",
+        spec.name
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![limit, offset], |row| {
+            let mut cells = Vec::with_capacity(spec.columns.len());
+            for (i, col) in spec.columns.iter().enumerate() {
+                let v: Value = row.get(i)?;
+                cells.push(render_value(v, col.render));
+            }
+            Ok(cells)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(DevTablePage {
+        table: spec.name.to_string(),
+        columns: spec.columns.iter().map(|c| c.name.to_string()).collect(),
+        rows,
+        total,
+        limit,
+        offset,
+    })
+}
+
+/// `settings` browser: key + value type + length, with the value shown only for the
+/// operational safe-list keys and `<redacted>` for everything else (redact-by-default).
+fn settings_page(conn: &Connection, limit: u32, offset: u32) -> Result<DevTablePage> {
+    let total: i64 = conn.query_row("SELECT count(*) FROM settings", [], |r| r.get(0))?;
+    let mut stmt =
+        conn.prepare("SELECT key, value FROM settings ORDER BY key LIMIT ?1 OFFSET ?2")?;
+    let rows = stmt
+        .query_map(params![limit, offset], |row| {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            let vtype = if serde_json::from_str::<serde_json::Value>(&value).is_ok() {
+                "json"
+            } else {
+                "text"
+            };
+            let length = value.chars().count().to_string();
+            let shown = if SETTINGS_VALUE_SAFE.contains(&key.as_str()) {
+                truncate(&value, 120)
+            } else {
+                "<redacted>".to_string()
+            };
+            Ok(vec![key, vtype.to_string(), length, shown])
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(DevTablePage {
+        table: "settings".to_string(),
+        columns: vec![
+            "key".to_string(),
+            "type".to_string(),
+            "length".to_string(),
+            "value".to_string(),
+        ],
+        rows,
+        total,
+        limit,
+        offset,
+    })
+}
+
+// ---- Command wrappers (thin: acquire the store, call a pure core) --------------------------
+
+/// One-call snapshot of the running vault's index-time + runtime facts (System panel).
+#[tauri::command]
+pub fn dev_system_info(state: State<'_, AppState>) -> Result<DevSystemInfo> {
+    let conn = state.conn()?;
+    system_info(&conn)
+}
+
+/// Row counts for every inspected table (incl. the derived indexes and `settings`).
+#[tauri::command]
+pub fn dev_table_counts(state: State<'_, AppState>) -> Result<Vec<DevTableCount>> {
+    let conn = state.conn()?;
+    table_counts(&conn)
+}
+
+/// The browsable table names for the Dev tab's table picker.
+#[tauri::command]
+pub fn dev_table_list() -> Vec<String> {
+    table_names()
+}
+
+/// A redacted page of one allow-listed table. Rejects any table not in the allow-list.
+#[tauri::command]
+pub fn dev_table_rows(
+    state: State<'_, AppState>,
+    table: String,
+    limit: u32,
+    offset: u32,
+) -> Result<DevTablePage> {
+    let conn = state.conn()?;
+    table_page(&conn, &table, limit, offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    // A bare in-memory store with just the two tables the guards need — no vec0/FTS5/migrations
+    // required, so the security guards are tested in isolation.
+    fn fixture() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE entities (
+                 id INTEGER PRIMARY KEY, type TEXT, canonical_name TEXT,
+                 confidence REAL, user_confirmed INTEGER, created_at TEXT, updated_at TEXT
+             );
+             INSERT INTO entities(type,canonical_name,confidence,user_confirmed,created_at,updated_at)
+                 VALUES ('project','Personal Manager',1.0,1,'t0','t0');
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO settings VALUES ('learning_profile','a distilled personal profile (synthetic)');
+             INSERT INTO settings VALUES ('embedding_model','BAAI/bge-small-en-v1.5');",
+        )
+        .unwrap();
+        c
+    }
+
+    #[test]
+    fn rejects_a_table_not_in_the_allow_list() {
+        let c = fixture();
+        // A real table that exists in the store but is NOT declared inspectable.
+        assert!(table_page(&c, "sqlite_master", 50, 0).is_err());
+        assert!(table_page(&c, "secrets", 50, 0).is_err());
+    }
+
+    #[test]
+    fn an_allowed_table_returns_only_its_projected_columns() {
+        let c = fixture();
+        let page = table_page(&c, "entities", 50, 0).unwrap();
+        assert_eq!(
+            page.columns,
+            vec![
+                "id",
+                "type",
+                "canonical_name",
+                "confidence",
+                "user_confirmed",
+                "created_at",
+                "updated_at"
+            ]
+        );
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows.len(), 1);
+        // canonical_name is shown (short, under the truncation limit).
+        assert_eq!(page.rows[0][2], "Personal Manager");
+    }
+
+    #[test]
+    fn settings_redacts_unlisted_keys_and_never_returns_their_value() {
+        let c = fixture();
+        let page = table_page(&c, "settings", 50, 0).unwrap();
+        assert_eq!(page.columns, vec!["key", "type", "length", "value"]);
+        let learning = page
+            .rows
+            .iter()
+            .find(|r| r[0] == "learning_profile")
+            .unwrap();
+        // The personal blob's value is never returned — only its shape.
+        assert_eq!(learning[3], "<redacted>");
+        assert_ne!(learning[2], "0"); // length is still reported
+        let embed = page
+            .rows
+            .iter()
+            .find(|r| r[0] == "embedding_model")
+            .unwrap();
+        // The operational safe-list key is shown in full.
+        assert_eq!(embed[3], "BAAI/bge-small-en-v1.5");
+    }
+
+    #[test]
+    fn truncate_marks_overflow_and_counts_chars() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 5), "hello…");
+    }
+}

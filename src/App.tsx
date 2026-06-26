@@ -6,6 +6,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { ChatView } from "./components/ChatView";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
+import { DevView } from "./components/DevView";
 import { DocumentsView } from "./components/DocumentsView";
 import { FocusView } from "./components/FocusView";
 import { GraphView } from "./components/GraphView";
@@ -25,6 +26,7 @@ import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { useChatStream } from "./lib/useChatStream";
 import { useUpdater } from "./lib/useUpdater";
+import { useDevMode } from "./lib/capabilities";
 import { useTheme } from "./theme";
 
 const LAST_SEEN_VERSION_KEY = "pm:lastSeenVersion";
@@ -86,11 +88,13 @@ export default function App() {
   const chat = useChatStream(() => activeIdRef.current);
   const update = useUpdater();
   const { teachVisible } = useTheme();
-  // If the Teach tab gets hidden (minimalist preset, or turned off in Settings) while it's open,
-  // fall back to Focus so the user is never stranded on a view with no nav entry.
+  const { devMode } = useDevMode();
+  // If the Teach or Dev tab gets hidden (preset change, or the toggle turned off in Settings)
+  // while it's open, fall back to Focus so the user is never stranded on a view with no nav entry.
   useEffect(() => {
     if (view === "teach" && !teachVisible) setView("focus");
-  }, [view, teachVisible]);
+    if (view === "dev" && !devMode) setView("focus");
+  }, [view, teachVisible, devMode]);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [showWhatsNew, setShowWhatsNew] = useState(false);
   const [helpMode, setHelpModeState] = useState(false);
@@ -436,6 +440,10 @@ export default function App() {
             <main className="flex h-full flex-1 flex-col">
               <PinboardView />
             </main>
+          ) : view === "dev" ? (
+            <main className="flex h-full flex-1 flex-col">
+              <DevView />
+            </main>
           ) : (
             <main className="flex h-full flex-1 flex-col">
               {chat.error && (
@@ -460,6 +468,10 @@ export default function App() {
                 onClose={() => {
                   setShowSettings(false);
                   refreshSettings();
+                }}
+                onOpenDev={() => {
+                  setShowSettings(false);
+                  setView("dev");
                 }}
               />
             </div>

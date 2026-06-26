@@ -6,6 +6,7 @@ mod briefing;
 mod calendar;
 mod clock;
 mod commands;
+mod commands_dev;
 mod cost;
 mod db;
 mod entities;
@@ -512,6 +513,12 @@ pub fn run() {
             commands::open_data_folder,
             commands::export_all_data,
             commands::export_plaintext_markdown,
+            // Developer mode (issue #78) — read-only inspection. Always registered (the
+            // commands are harmless reads); only the UI is gated by the runtime `devMode`.
+            commands_dev::dev_system_info,
+            commands_dev::dev_table_counts,
+            commands_dev::dev_table_list,
+            commands_dev::dev_table_rows,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

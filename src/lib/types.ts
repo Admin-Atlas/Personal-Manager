@@ -426,3 +426,48 @@ export type IngestEvent =
   | { type: "done"; document: Document }
   | { type: "failed"; path: string; error: string }
   | { type: "finished"; ingested: number; skipped: number; failed: number };
+
+// --- Developer mode (issue #78): read-only inspection surfaces ---
+// Mirrors the structs in src-tauri/src/commands_dev.rs. Every value is already redacted by the
+// backend, so these are exactly what the Dev tab may display.
+
+/** The vault's stored retrieval-config stamp (index-time config); mirrors `RetrievalConfig`. */
+export interface RetrievalStamp {
+  version: number;
+  chunk_target_tokens: number;
+  chunk_overlap_tokens: number;
+  prepend_headings: boolean;
+  boundary_strategy: string;
+  splitter_version: number;
+  embedder_id: string;
+  dimension: number;
+  index_params: string;
+}
+
+/** Index-time + runtime facts for the Dev tab's System panel. */
+export interface DevSystemInfo {
+  /** The store's `PRAGMA user_version` (the applied migration level). */
+  migration_version: number;
+  embedder_id: string;
+  embedder_label: string;
+  /** The live physical vector width of `chunk_vec`. */
+  vector_dim: number;
+  reranking_enabled: boolean;
+  retrieval_stamp: RetrievalStamp | null;
+}
+
+/** One row of the counts dashboard. */
+export interface DevTableCount {
+  table: string;
+  rows: number;
+}
+
+/** A redacted page of one inspected table: projected column names + rendered cell strings. */
+export interface DevTablePage {
+  table: string;
+  columns: string[];
+  rows: string[][];
+  total: number;
+  limit: number;
+  offset: number;
+}
