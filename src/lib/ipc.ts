@@ -233,16 +233,18 @@ export const ensureSidecar = () => invoke<void>("ensure_sidecar");
 export const listDocuments = () => invoke<Document[]>("list_documents");
 
 /**
- * Dev-only (debug builds): register a pasted body as an index-only document, to drive the index-only
- * substrate without a real connector (board card 3). The backend command is compiled out of release
- * builds, so only call this behind `import.meta.env.DEV`.
+ * Dev-only (debug builds): drive the index-only substrate (board card 3) through its reducer without
+ * a real connector. `kind` is "add" (ingest `body` as a new index-only item titled `title`), "update"
+ * (re-embed from `body`), "delete", "rename" (to `externalRef`), or "source_failure". The backend
+ * command is compiled out of release builds, so only call this behind `import.meta.env.DEV`.
  */
-export const devRegisterPointer = (
+export const devApplyChangeEvent = (
+  kind: "add" | "update" | "delete" | "rename" | "source_failure",
   sourceId: string,
-  title: string,
-  body: string,
+  title: string | null,
+  body: string | null,
   externalRef: string | null,
-) => invoke<Document>("dev_register_pointer", { sourceId, title, body, externalRef });
+) => invoke<void>("dev_apply_change_event", { kind, sourceId, title, body, externalRef });
 
 /** Hybrid search over the store, returning the top-k matching chunks. */
 export const searchDocuments = (query: string, k?: number) =>

@@ -58,6 +58,9 @@ pub struct Document {
     pub source_type: String,
     pub source_state: String,
     pub external_ref: Option<String>,
+    /// The stable source id for an index-only item (`None` for a vault document) — its manifest key
+    /// and the handle the observe-and-react layer targets.
+    pub source_id: Option<String>,
 }
 
 /// Streamed to the UI over a Tauri channel as ingestion proceeds (mirrors the
@@ -527,14 +530,34 @@ pub(crate) fn index_document(
     )?;
     let doc_id = tx.last_insert_rowid();
 
-    // Map a chunk uid → its inserted row id so a leaf can resolve its parent (which the
-    // splitter always emits first). Only leaves get a vector + FTS row, on the same rowid as
-    // their `chunks.id`, so the rowid-mirrors-chunks.id invariant holds; parents are gaps.
-    // An index-only document keeps its leaf embeddings (vector-findable) but never the body bytes:
-    // every chunk row stores a placeholder instead of the text, and keyword search is served by the
-    // short summary (indexed once below) rather than the body. A vault document indexes its body as
-    // before.
-    let index_only = meta.source.is_index_only();
+    insert_chunks(
+        &tx,
+        doc_id,
+        chunks,
+        embeddings,
+        meta.source.is_index_only(),
+        meta.source.stored_summary.as_deref(),
+    )?;
+
+    tx.commit()?;
+    load_document(&conn, doc_id)
+}
+
+/// Insert a document's chunk rows + leaf vectors + FTS rows (the shared body of [`index_document`]
+/// and [`replace_chunks`]). `embeddings` are the leaf embeddings in leaf order; the splitter emits
+/// parents before their children, so one ordered pass resolves `parent_uid` → row id. Only leaves
+/// get a vector + FTS row, on the same rowid as their `chunks.id`, so the rowid-mirrors-chunks.id
+/// invariant holds (parents are gaps). An index-only document keeps its leaf embeddings
+/// (vector-findable) but never the body bytes: every chunk row stores a placeholder, and keyword
+/// search is served by `stored_summary` (indexed once on the first leaf rowid) rather than the body.
+fn insert_chunks(
+    tx: &Connection,
+    doc_id: i64,
+    chunks: &[splitter::Chunk],
+    embeddings: &[Vec<f32>],
+    index_only: bool,
+    stored_summary: Option<&str>,
+) -> Result<()> {
     let mut uid_to_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     let mut leaf_idx = 0usize;
     let mut first_leaf_id: Option<i64> = None;
@@ -590,11 +613,8 @@ pub(crate) fn index_document(
         }
     }
 
-    // Keyword-index an index-only document by its short summary (on its first leaf rowid, so an FTS
-    // hit resolves to a real chunk). The body bytes are never FTS-indexed.
     if index_only {
-        if let (Some(rowid), Some(summary)) = (first_leaf_id, meta.source.stored_summary.as_deref())
-        {
+        if let (Some(rowid), Some(summary)) = (first_leaf_id, stored_summary) {
             if !summary.trim().is_empty() {
                 tx.execute(
                     "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
@@ -603,9 +623,32 @@ pub(crate) fn index_document(
             }
         }
     }
+    Ok(())
+}
 
-    tx.commit()?;
-    load_document(&conn, doc_id)
+/// Replace an existing document's chunks/vectors/FTS rows in place (keeping the `documents` row, so
+/// its id + classification + entity link survive), then re-insert from new `chunks`/`embeddings`.
+/// The re-embed path for an index-only item whose source content changed — `chunk_vec` and
+/// `chunks_fts` are keyed by `chunks.id`, so the stale rows for this doc are cleared explicitly
+/// before [`insert_chunks`] repopulates them. Caller owns the transaction.
+pub(crate) fn replace_chunks(
+    tx: &Connection,
+    doc_id: i64,
+    chunks: &[splitter::Chunk],
+    embeddings: &[Vec<f32>],
+    index_only: bool,
+    stored_summary: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM chunk_vec WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
+        params![doc_id],
+    )?;
+    tx.execute(
+        "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
+        params![doc_id],
+    )?;
+    tx.execute("DELETE FROM chunks WHERE document_id = ?1", params![doc_id])?;
+    insert_chunks(tx, doc_id, chunks, embeddings, index_only, stored_summary)
 }
 
 /// Split a document body into chunks with the active splitter, sizing by tokens through the given
@@ -640,7 +683,7 @@ pub(crate) fn leaf_embed_texts(chunks: &[splitter::Chunk]) -> Vec<String> {
 const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_path, d.ext, d.byte_size, \
      (SELECT count(*) FROM chunks c WHERE c.document_id = d.id), \
      d.created_at, d.ingested_at, d.project, d.tags, d.importance, d.reviewed, d.last_activity, \
-     d.source_type, d.source_state, d.external_ref";
+     d.source_type, d.source_state, d.external_ref, d.source_id";
 
 /// All documents, most-recent first, with their chunk counts.
 pub fn list_documents(conn: &Connection) -> Result<Vec<Document>> {
@@ -693,6 +736,7 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
         source_type: row.get(13)?,
         source_state: row.get(14)?,
         external_ref: row.get(15)?,
+        source_id: row.get(16)?,
     })
 }
 
@@ -1039,6 +1083,13 @@ pub(crate) const SOURCE_TYPE_VAULT: &str = "vault";
 pub(crate) const SOURCE_TYPE_INDEX_ONLY: &str = "index_only";
 /// `documents.source_state` for a reachable source (the default for every document).
 pub(crate) const SOURCE_STATE_OK: &str = "ok";
+/// `documents.source_state` for an index-only item whose source was deleted: a soft state — the
+/// metadata + embedding stay (so it's still findable) but the body is flagged unretrievable. Never a
+/// hard drop.
+pub(crate) const SOURCE_STATE_MISSING: &str = "source_missing";
+/// `documents.source_state` for an index-only item whose whole source can't be reached (expired
+/// OAuth, an unmounted drive). First-class, never masquerading as mass deletion.
+pub(crate) const SOURCE_STATE_UNREACHABLE: &str = "unreachable";
 /// Stand-in stored for an index-only chunk's body text: we hold the embedding (vector-findable) but
 /// never persist the bytes, so the readable body is a live fetch. The short `stored_summary` on the
 /// document is what stays legible offline.

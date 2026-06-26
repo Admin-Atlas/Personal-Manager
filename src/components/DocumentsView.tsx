@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
-  devRegisterPointer,
+  devApplyChangeEvent,
   ensureSidecar,
   ingestPaths,
   listDocuments,
@@ -232,9 +232,36 @@ export function DocumentsView({ onReviewClick }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await devRegisterPointer(`dev:${title}`, title, body, `dev://${encodeURIComponent(title)}`);
+      await devApplyChangeEvent(
+        "add",
+        `dev:${title}`,
+        title,
+        body,
+        `dev://${encodeURIComponent(title)}`,
+      );
       setDevTitle("");
       setDevBody("");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  }
+
+  // Dev-only: fire a simulated change event at an existing index-only item (board card 3, PR B) and
+  // watch its badge/state react. "update" re-embeds from the body box (or a default tweak).
+  async function devFire(
+    kind: "update" | "delete" | "rename" | "source_failure",
+    sourceId: string,
+  ) {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const body = kind === "update" ? devBody.trim() || `${sourceId} — edited` : null;
+      const externalRef = kind === "rename" ? `dev://renamed/${sourceId}` : null;
+      await devApplyChangeEvent(kind, sourceId, null, body, externalRef);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -402,6 +429,38 @@ export function DocumentsView({ onReviewClick }: Props) {
               </div>
             </Card>
           )}
+
+          {import.meta.env.DEV &&
+            documents.some((d) => d.source_type === "index_only" && d.source_id) && (
+              <Card className="mt-4 p-3">
+                <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
+                  Dev — simulate a source change (observe-and-react)
+                </p>
+                <ul className="flex flex-col gap-1.5">
+                  {documents
+                    .filter((d) => d.source_type === "index_only" && d.source_id)
+                    .map((d) => (
+                      <li key={d.id} className="flex items-center justify-between gap-2 text-sm">
+                        <span className="truncate text-ink2" title={d.title}>
+                          {d.title}
+                        </span>
+                        <span className="flex shrink-0 gap-1 font-mono text-xs">
+                          {(["update", "delete", "rename", "source_failure"] as const).map((k) => (
+                            <button
+                              key={k}
+                              onClick={() => devFire(k, d.source_id!)}
+                              disabled={busy}
+                              className="rounded border border-border px-1.5 py-0.5 text-ink3 hover:text-ink disabled:opacity-50"
+                            >
+                              {k === "source_failure" ? "fail" : k}
+                            </button>
+                          ))}
+                        </span>
+                      </li>
+                    ))}
+                </ul>
+              </Card>
+            )}
 
           {(prep || items.length > 0 || summary) && (
             <Card className="mt-4 p-3">

@@ -464,7 +464,7 @@ pub fn run() {
             commands::ingest_paths,
             commands::rebuild_index,
             #[cfg(debug_assertions)]
-            commands::dev_register_pointer,
+            commands::dev_apply_change_event,
             commands::list_documents,
             commands::search_documents,
             commands::transcribe_audio,

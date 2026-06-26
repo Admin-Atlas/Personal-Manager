@@ -1062,45 +1062,135 @@ pub async fn rebuild_index(app: AppHandle, on_event: Channel<IngestEvent>) -> Re
         .map_err(|e| Error::Other(format!("rebuild task panicked: {e}")))?
 }
 
-/// Dev-only: register a pasted body as an **index-only** document, so the index-only substrate (board
-/// card 3) can be driven end-to-end before any real connector exists — register a pointer, see it
-/// badged "Indexed-only", find it by search, confirm no vault file was written. Compiled into debug
-/// builds only; the real "add a source" flow ships with the connector cards.
+/// Dev-only: drive the index-only substrate (board card 3) through its reducer, without a real
+/// connector. `kind` is `add` (ingest a pasted body as a new index-only item), `update` (re-embed
+/// from a new body), `delete` (→ soft source-missing), `rename` (update the external ref), or
+/// `source_failure` (→ unreachable for every item of the source). The real "add a source" + change
+/// detection ship with the connector cards; this routes a hand-made event through `react` +
+/// `apply_actions`, so the whole observe-and-react path — Add included — is exercised. Debug only.
 #[cfg(debug_assertions)]
 #[tauri::command]
-pub async fn dev_register_pointer(
+pub async fn dev_apply_change_event(
     app: AppHandle,
+    kind: String,
     source_id: String,
-    title: String,
-    body: String,
+    title: Option<String>,
+    body: Option<String>,
     external_ref: Option<String>,
-) -> Result<Document> {
-    tokio::task::spawn_blocking(move || -> Result<Document> {
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let state = app.state::<AppState>();
-        // Warm + resolve the gateway like ingest does, then embed off the lock.
         state.sidecar.ensure_installed()?;
         let gateway = {
             let conn = state.conn()?;
             state.gateway(&conn)?
         };
         let (vault_root, manifest_cipher) = state.manifest_io()?;
-        index_only::register_pointer(
+
+        // The item's current persisted state (for the reducer). `None` if the source id is unknown.
+        let current: Option<(String, Option<String>, Option<String>, String)> = {
+            let conn = state.conn()?;
+            match conn.query_row(
+                "SELECT title, source_modified_at, source_content_hash, source_state \
+                 FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
+                params![source_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            ) {
+                Ok(row) => Some(row),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let now = {
+            let conn = state.conn()?;
+            ingest::iso_now(&conn)?
+        };
+        // The title for a fetched body: an explicit one (add), else the stored one (update).
+        let item_title = title
+            .clone()
+            .or_else(|| current.as_ref().map(|c| c.0.clone()))
+            .unwrap_or_else(|| source_id.clone());
+
+        let (event, fetched) = match kind.as_str() {
+            "add" => {
+                let body = body.unwrap_or_default();
+                let new_hash = ingest::hex_digest(body.as_bytes());
+                (
+                    index_only::ChangeEvent::Add {
+                        source_id: source_id.clone(),
+                        modified_at: Some(now.clone()),
+                    },
+                    Some(index_only::PointerInput {
+                        source_id: source_id.clone(),
+                        title: item_title,
+                        external_ref,
+                        source_modified_at: Some(now.clone()),
+                        source_content_hash: Some(new_hash),
+                        body,
+                    }),
+                )
+            }
+            "update" => {
+                let body = body.unwrap_or_default();
+                // Stand in for the source's reported content hash with a digest of the new body
+                // (deterministic, so re-firing the same body is a no-op — the debounce/hash guard).
+                let new_hash = ingest::hex_digest(body.as_bytes());
+                (
+                    index_only::ChangeEvent::Update {
+                        source_id: source_id.clone(),
+                        modified_at: Some(now.clone()),
+                        new_content_hash: Some(new_hash.clone()),
+                    },
+                    Some(index_only::PointerInput {
+                        source_id: source_id.clone(),
+                        title: item_title,
+                        external_ref: None,
+                        source_modified_at: Some(now.clone()),
+                        source_content_hash: Some(new_hash),
+                        body,
+                    }),
+                )
+            }
+            "delete" => (
+                index_only::ChangeEvent::Delete {
+                    source_id: source_id.clone(),
+                },
+                None,
+            ),
+            "rename" => (
+                index_only::ChangeEvent::Rename {
+                    source_id: source_id.clone(),
+                    new_external_ref: external_ref,
+                },
+                None,
+            ),
+            "source_failure" => (
+                index_only::ChangeEvent::SourceFailure {
+                    source: source_id.clone(),
+                },
+                None,
+            ),
+            other => return Err(Error::Other(format!("unknown dev event kind: {other}"))),
+        };
+
+        let item_state = current.map(|(_, smod, shash, sstate)| index_only::ItemState {
+            source_id: source_id.clone(),
+            source_modified_at: smod,
+            source_content_hash: shash,
+            source_state: index_only::SourceState::from_db(&sstate),
+        });
+        let actions = index_only::react(event, item_state.as_ref());
+        index_only::apply_actions(
             &state,
             &gateway,
             &vault_root,
             &manifest_cipher,
-            index_only::PointerInput {
-                source_id,
-                title,
-                external_ref,
-                source_modified_at: None,
-                source_content_hash: None,
-                body,
-            },
+            &actions,
+            fetched.as_ref(),
         )
     })
     .await
-    .map_err(|e| Error::Other(format!("dev register task panicked: {e}")))?
+    .map_err(|e| Error::Other(format!("dev change task panicked: {e}")))?
 }
 
 #[tauri::command]
