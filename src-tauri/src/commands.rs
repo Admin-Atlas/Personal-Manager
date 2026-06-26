@@ -19,8 +19,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, entities, learning, lock_session, openrouter, paths,
-    recommend, secrets, vault, AppState, VaultRuntime,
+    applock, briefing, clock, cost, db, entities, index_only, learning, lock_session, openrouter,
+    paths, recommend, secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -1062,6 +1062,47 @@ pub async fn rebuild_index(app: AppHandle, on_event: Channel<IngestEvent>) -> Re
         .map_err(|e| Error::Other(format!("rebuild task panicked: {e}")))?
 }
 
+/// Dev-only: register a pasted body as an **index-only** document, so the index-only substrate (board
+/// card 3) can be driven end-to-end before any real connector exists — register a pointer, see it
+/// badged "Indexed-only", find it by search, confirm no vault file was written. Compiled into debug
+/// builds only; the real "add a source" flow ships with the connector cards.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub async fn dev_register_pointer(
+    app: AppHandle,
+    source_id: String,
+    title: String,
+    body: String,
+    external_ref: Option<String>,
+) -> Result<Document> {
+    tokio::task::spawn_blocking(move || -> Result<Document> {
+        let state = app.state::<AppState>();
+        // Warm + resolve the gateway like ingest does, then embed off the lock.
+        state.sidecar.ensure_installed()?;
+        let gateway = {
+            let conn = state.conn()?;
+            state.gateway(&conn)?
+        };
+        let (vault_root, manifest_cipher) = state.manifest_io()?;
+        index_only::register_pointer(
+            &state,
+            &gateway,
+            &vault_root,
+            &manifest_cipher,
+            index_only::PointerInput {
+                source_id,
+                title,
+                external_ref,
+                source_modified_at: None,
+                source_content_hash: None,
+                body,
+            },
+        )
+    })
+    .await
+    .map_err(|e| Error::Other(format!("dev register task panicked: {e}")))?
+}
+
 #[tauri::command]
 pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<Document>> {
     let conn = state.conn()?;
@@ -1351,6 +1392,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         let state = blocking_app.state::<AppState>();
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, rules_cipher) = state.rules_io()?;
+        let (_, manifest_cipher) = state.manifest_io()?;
         let now = iso_now(&state)?;
 
         // The whole pass is all-or-nothing: corrections, alias rules, vault rewrites, and the
@@ -1387,6 +1429,8 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                     importance.as_deref(),
                     true,
                     &now,
+                    &vault_root,
+                    &manifest_cipher,
                 )?;
                 written.push(w);
                 entities::reassign_document(&tx, d.document_id, entity_id)?;
@@ -1450,6 +1494,7 @@ pub async fn set_document_metadata(
         let state = app.state::<AppState>();
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, rules_cipher) = state.rules_io()?;
+        let (_, manifest_cipher) = state.manifest_io()?;
         let now = iso_now(&state)?;
 
         // Log the correction + rewrite the vault file + update the row atomically, restoring the
@@ -1494,6 +1539,8 @@ pub async fn set_document_metadata(
                 importance.as_deref(),
                 true,
                 &now,
+                &vault_root,
+                &manifest_cipher,
             )?);
             entities::reassign_document(&tx, document_id, entity_id)?;
             Ok(())
@@ -1541,6 +1588,8 @@ where
             &Connection,
             &std::path::Path,
             &vault::MarkdownCipher,
+            &std::path::Path,
+            &index_only::ManifestCipher,
         ) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>>
         + Send
         + 'static,
@@ -1549,10 +1598,11 @@ where
         let state = app.state::<AppState>();
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, rules_cipher) = state.rules_io()?;
+        let (_, manifest_cipher) = state.manifest_io()?;
         let mut conn = state.conn()?;
         let tx = conn.transaction()?;
 
-        let written = match work(&tx, &vault, &cipher) {
+        let written = match work(&tx, &vault, &cipher, &vault_root, &manifest_cipher) {
             Ok(w) => w,
             Err(e) => {
                 drop(tx);
@@ -1586,10 +1636,13 @@ where
 /// cache show `canonical` (preserving tags/importance/reviewed/last_activity). The mirror pointer
 /// is already set by the caller; this syncs the denormalised cache + vault. Returns the file
 /// snapshots for rollback.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_entity_documents(
     tx: &Connection,
     vault: &std::path::Path,
     cipher: &vault::MarkdownCipher,
+    vault_root: &std::path::Path,
+    manifest_cipher: &index_only::ManifestCipher,
     entity_id: i64,
     canonical: &str,
 ) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
@@ -1617,6 +1670,8 @@ fn rewrite_entity_documents(
             importance.as_deref(),
             reviewed != 0,
             &last_activity,
+            vault_root,
+            manifest_cipher,
         )?);
     }
     Ok(written)
@@ -1636,15 +1691,18 @@ pub fn list_entities(
 /// already belongs to another project — that's a merge.
 #[tauri::command]
 pub async fn add_entity_alias(app: AppHandle, entity_id: i64, alias: String) -> Result<()> {
-    spawn_entity_mutation(app, move |tx, _vault, _cipher| {
-        match entities::add_alias(tx, entity_id, &alias)? {
+    spawn_entity_mutation(
+        app,
+        move |tx, _vault, _cipher, _vault_root, _manifest_cipher| match entities::add_alias(
+            tx, entity_id, &alias,
+        )? {
             entities::AddAlias::Conflict(_) => Err(Error::Other(format!(
                 "\"{}\" already belongs to another project; merge them instead",
                 alias.trim()
             ))),
             _ => Ok(Vec::new()),
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -1652,10 +1710,21 @@ pub async fn add_entity_alias(app: AppHandle, entity_id: i64, alias: String) -> 
 /// documents to the new canonical name (the payoff of identity-not-name).
 #[tauri::command]
 pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> Result<()> {
-    spawn_entity_mutation(app, move |tx, vault, cipher| {
-        let canonical = entities::rename_entity(tx, entity_id, &new_name)?;
-        rewrite_entity_documents(tx, vault, cipher, entity_id, &canonical)
-    })
+    spawn_entity_mutation(
+        app,
+        move |tx, vault, cipher, vault_root, manifest_cipher| {
+            let canonical = entities::rename_entity(tx, entity_id, &new_name)?;
+            rewrite_entity_documents(
+                tx,
+                vault,
+                cipher,
+                vault_root,
+                manifest_cipher,
+                entity_id,
+                &canonical,
+            )
+        },
+    )
     .await
 }
 
@@ -1664,11 +1733,22 @@ pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> 
 /// the variant pain in one move and stops it recurring.
 #[tauri::command]
 pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Result<()> {
-    spawn_entity_mutation(app, move |tx, vault, cipher| {
-        entities::merge_entities(tx, from_id, into_id)?;
-        let canonical = entities::canonical_name(tx, into_id)?;
-        rewrite_entity_documents(tx, vault, cipher, into_id, &canonical)
-    })
+    spawn_entity_mutation(
+        app,
+        move |tx, vault, cipher, vault_root, manifest_cipher| {
+            entities::merge_entities(tx, from_id, into_id)?;
+            let canonical = entities::canonical_name(tx, into_id)?;
+            rewrite_entity_documents(
+                tx,
+                vault,
+                cipher,
+                vault_root,
+                manifest_cipher,
+                into_id,
+                &canonical,
+            )
+        },
+    )
     .await
 }
 
@@ -1676,33 +1756,38 @@ pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Resul
 /// merge). Rewrites that document's frontmatter + cache to the target canonical.
 #[tauri::command]
 pub async fn reassign_document(app: AppHandle, document_id: i64, entity_id: i64) -> Result<()> {
-    spawn_entity_mutation(app, move |tx, vault, cipher| {
-        entities::reassign_document(tx, document_id, entity_id)?;
-        let canonical = entities::canonical_name(tx, entity_id)?;
-        let (tags_json, importance, reviewed, last_activity): (
-            String,
-            Option<String>,
-            i64,
-            String,
-        ) = tx.query_row(
-            "SELECT tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
+    spawn_entity_mutation(
+        app,
+        move |tx, vault, cipher, vault_root, manifest_cipher| {
+            entities::reassign_document(tx, document_id, entity_id)?;
+            let canonical = entities::canonical_name(tx, entity_id)?;
+            let (tags_json, importance, reviewed, last_activity): (
+                String,
+                Option<String>,
+                i64,
+                String,
+            ) = tx.query_row(
+                "SELECT tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
                  FROM documents WHERE id = ?1",
-            params![document_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?;
-        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-        Ok(vec![ingest::write_document_truth(
-            tx,
-            vault,
-            cipher,
-            document_id,
-            &canonical,
-            &tags,
-            importance.as_deref(),
-            reviewed != 0,
-            &last_activity,
-        )?])
-    })
+                params![document_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            Ok(vec![ingest::write_document_truth(
+                tx,
+                vault,
+                cipher,
+                document_id,
+                &canonical,
+                &tags,
+                importance.as_deref(),
+                reviewed != 0,
+                &last_activity,
+                vault_root,
+                manifest_cipher,
+            )?])
+        },
+    )
     .await
 }
 

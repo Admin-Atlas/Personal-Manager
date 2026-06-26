@@ -52,6 +52,12 @@ pub struct Document {
     pub importance: Option<String>,
     pub reviewed: bool,
     pub last_activity: Option<String>,
+    /// `"vault"` (a fully-stored document) or `"index_only"` (a pointer we index but don't hold) —
+    /// the UI badges the difference. `external_ref` is the source URL/id shown for an index-only
+    /// item in place of a local `source_path`; `source_state` flags whether its body is reachable.
+    pub source_type: String,
+    pub source_state: String,
+    pub external_ref: Option<String>,
 }
 
 /// Streamed to the UI over a Tauri channel as ingestion proceeds (mirrors the
@@ -275,6 +281,7 @@ fn ingest_one(
         tags: Vec::new(),
         importance: None,
         reviewed: false,
+        source: SourceMeta::default(),
     };
     let document = index_document(state, &meta, &chunks, &embeddings)?;
     Ok(Outcome::Indexed(document))
@@ -376,6 +383,24 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     // resulting entity change out to the portable rules file (a no-op when nothing changed).
     state.sync_entity_rules();
 
+    // Index-only documents have no Markdown file, so the walk above skipped them; restore them from
+    // the encrypted manifest, re-embedded from their stored summaries (their bodies are remote). The
+    // gateway is already warmed and `chunk_vec` already sized, so this reuses both.
+    if let Ok((vault_root, manifest_cipher)) = state.manifest_io() {
+        match crate::index_only::rebuild_from_manifest(
+            &state,
+            &gateway,
+            &vault_root,
+            &manifest_cipher,
+        ) {
+            Ok((restored, idx_failed)) => {
+                ingested += restored;
+                failed += idx_failed;
+            }
+            Err(e) => eprintln!("index_only: manifest rebuild skipped ({e})"),
+        }
+    }
+
     let _ = on_event.send(IngestEvent::Finished {
         ingested,
         skipped: 0,
@@ -444,6 +469,7 @@ fn rebuild_one(
             .cloned()
             .or_else(|| Some(ingested_at.clone())),
         ingested_at,
+        source: SourceMeta::default(),
     };
     index_document(state, &meta, &chunks, &embeddings)
 }
@@ -452,7 +478,7 @@ fn rebuild_one(
 /// leaf embeddings in leaf order (parents are structural-only and carry none); the loop pairs
 /// them with leaves as it walks the chunk list. The splitter emits parents before their
 /// children, so a single ordered pass resolves `parent_uid` → row id from a uid map.
-fn index_document(
+pub(crate) fn index_document(
     state: &AppState,
     meta: &DocMeta,
     chunks: &[splitter::Chunk],
@@ -470,8 +496,11 @@ fn index_document(
     tx.execute(
         "INSERT INTO documents \
          (source_path, vault_path, title, content_hash, ext, byte_size, created_at, ingested_at, \
-          project, tags, importance, reviewed, last_activity, entity_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+          project, tags, importance, reviewed, last_activity, entity_id, \
+          source_type, source_state, source_id, external_ref, source_modified_at, \
+          source_content_hash, stored_summary) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             meta.source_path,
             meta.vault_path,
@@ -487,6 +516,13 @@ fn index_document(
             meta.reviewed as i64,
             meta.last_activity,
             entity_id,
+            meta.source.source_type,
+            meta.source.source_state,
+            meta.source.source_id,
+            meta.source.external_ref,
+            meta.source.source_modified_at,
+            meta.source.source_content_hash,
+            meta.source.stored_summary,
         ],
     )?;
     let doc_id = tx.last_insert_rowid();
@@ -494,13 +530,24 @@ fn index_document(
     // Map a chunk uid → its inserted row id so a leaf can resolve its parent (which the
     // splitter always emits first). Only leaves get a vector + FTS row, on the same rowid as
     // their `chunks.id`, so the rowid-mirrors-chunks.id invariant holds; parents are gaps.
+    // An index-only document keeps its leaf embeddings (vector-findable) but never the body bytes:
+    // every chunk row stores a placeholder instead of the text, and keyword search is served by the
+    // short summary (indexed once below) rather than the body. A vault document indexes its body as
+    // before.
+    let index_only = meta.source.is_index_only();
     let mut uid_to_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     let mut leaf_idx = 0usize;
+    let mut first_leaf_id: Option<i64> = None;
     for (ordinal, chunk) in chunks.iter().enumerate() {
         let parent_id = chunk
             .parent_uid
             .as_deref()
             .and_then(|uid| uid_to_id.get(uid).copied());
+        let content: &str = if index_only {
+            INDEX_ONLY_BODY_PLACEHOLDER
+        } else {
+            &chunk.display_content
+        };
         tx.execute(
             "INSERT INTO chunks \
              (document_id, ordinal, heading, content, char_count, uid, parent_id, kind, start_offset, end_offset) \
@@ -509,8 +556,8 @@ fn index_document(
                 doc_id,
                 ordinal as i64,
                 chunk.heading,
-                chunk.display_content,
-                chunk.display_content.chars().count() as i64,
+                content,
+                content.chars().count() as i64,
                 chunk.uid,
                 parent_id,
                 chunk.kind.as_str(),
@@ -528,13 +575,32 @@ fn index_document(
                 "INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)",
                 params![chunk_id, vector],
             )?;
-            // Index the heading-prepended text so keyword search also benefits from the
-            // breadcrumb, while `chunks.content` stays clean for display + citations.
-            tx.execute(
-                "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
-                params![chunk_id, chunk.embed_content],
-            )?;
+            // Vault docs index the heading-prepended text so keyword search benefits from the
+            // breadcrumb, while `chunks.content` stays clean for display + citations. Index-only
+            // docs index nothing here — keeping the body out of the index — and become
+            // keyword-findable by their summary, attached to the first leaf rowid below.
+            if !index_only {
+                tx.execute(
+                    "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
+                    params![chunk_id, chunk.embed_content],
+                )?;
+            }
+            first_leaf_id.get_or_insert(chunk_id);
             leaf_idx += 1;
+        }
+    }
+
+    // Keyword-index an index-only document by its short summary (on its first leaf rowid, so an FTS
+    // hit resolves to a real chunk). The body bytes are never FTS-indexed.
+    if index_only {
+        if let (Some(rowid), Some(summary)) = (first_leaf_id, meta.source.stored_summary.as_deref())
+        {
+            if !summary.trim().is_empty() {
+                tx.execute(
+                    "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
+                    params![rowid, summary],
+                )?;
+            }
         }
     }
 
@@ -545,7 +611,7 @@ fn index_document(
 /// Split a document body into chunks with the active splitter, sizing by tokens through the given
 /// counter (the gateway → the selected embedder's tokenizer). The title + content hash feed the
 /// heading breadcrumb and the stable, rebuild-reproducible chunk uids.
-fn split_document(
+pub(crate) fn split_document(
     counter: &dyn splitter::TokenCounter,
     body: &str,
     title: &str,
@@ -561,7 +627,7 @@ fn split_document(
 
 /// The text to embed + keyword-index for each leaf chunk (heading-prepended). Parents are
 /// structural-only and contribute none, so this lines up 1:1 with the leaf rows.
-fn leaf_embed_texts(chunks: &[splitter::Chunk]) -> Vec<String> {
+pub(crate) fn leaf_embed_texts(chunks: &[splitter::Chunk]) -> Vec<String> {
     chunks
         .iter()
         .filter(|c| c.kind == ChunkKind::Leaf)
@@ -573,7 +639,8 @@ fn leaf_embed_texts(chunks: &[splitter::Chunk]) -> Vec<String> {
 /// single-document loads so the two never drift.
 const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_path, d.ext, d.byte_size, \
      (SELECT count(*) FROM chunks c WHERE c.document_id = d.id), \
-     d.created_at, d.ingested_at, d.project, d.tags, d.importance, d.reviewed, d.last_activity";
+     d.created_at, d.ingested_at, d.project, d.tags, d.importance, d.reviewed, d.last_activity, \
+     d.source_type, d.source_state, d.external_ref";
 
 /// All documents, most-recent first, with their chunk counts.
 pub fn list_documents(conn: &Connection) -> Result<Vec<Document>> {
@@ -623,33 +690,47 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
         importance: row.get(10)?,
         reviewed: reviewed != 0,
         last_activity: row.get(12)?,
+        source_type: row.get(13)?,
+        source_state: row.get(14)?,
+        external_ref: row.get(15)?,
     })
 }
 
-/// Where a document keeps its *organisational truth* — the canonical project + tags / importance
-/// it was filed under. Today every document is backed by a Markdown vault file, so its truth is
-/// that file's front-matter. This seam exists so a future **index-only** source (truth in a
-/// manifest, no front-matter — banked on board card 3) is added in ONE place, not retrofitted
-/// across every metadata-write site (the review commit, the single edit, and the entity
-/// merge/rename/reassign).
+/// Where a document keeps its *organisational truth* — the canonical project + tags / importance it
+/// was filed under. A fully-stored vault document keeps it in its Markdown front-matter; an
+/// index-only document (board card 3) has no Markdown file, so its truth lives in the encrypted
+/// index-only manifest at the data-home root. This seam is the ONE place that dispatch lives, so
+/// every metadata-write site (the review commit, the single edit, the entity merge/rename/reassign)
+/// routes to the right writer instead of hard-coding front-matter.
 enum TruthSource {
-    /// The document's truth is its Markdown vault file's front-matter (every document today).
+    /// The document's truth is its Markdown vault file's front-matter (every fully-stored document).
     VaultFrontmatter,
+    /// The document is index-only (no Markdown file); its truth is the encrypted manifest.
+    IndexManifest,
 }
 
-/// Pick where a document keeps its truth. For now every document has a Markdown vault file, so the
-/// answer is always its front-matter; the discriminator (a source-type column, or a null
-/// `vault_path`) lands here when index-only sources do.
-fn truth_source(_tx: &Connection, _doc_id: i64) -> Result<TruthSource> {
-    Ok(TruthSource::VaultFrontmatter)
+/// Pick where a document keeps its truth, by its `source_type` discriminator.
+fn truth_source(tx: &Connection, doc_id: i64) -> Result<TruthSource> {
+    let source_type: String = tx.query_row(
+        "SELECT source_type FROM documents WHERE id = ?1",
+        params![doc_id],
+        |r| r.get(0),
+    )?;
+    Ok(match source_type.as_str() {
+        SOURCE_TYPE_INDEX_ONLY => TruthSource::IndexManifest,
+        _ => TruthSource::VaultFrontmatter,
+    })
 }
 
 /// Persist a document's organisational truth (canonical project + tags/importance/reviewed/
 /// last_activity) to wherever its source keeps it, returning the file snapshot for rollback. The
 /// single indirection point every metadata write goes through — so hard-coding front-matter can't
-/// creep back in and a future manifest writer is a one-place change (see [`TruthSource`]). Pass a
-/// `rusqlite::Transaction` (it derefs to `&Connection`); commit it only once the whole batch is
-/// written.
+/// creep back in: a vault document rewrites its Markdown front-matter, an index-only document
+/// rewrites the encrypted manifest (see [`TruthSource`]). `vault`/`cipher` reach the Markdown layer;
+/// `vault_root`/`manifest_cipher` reach the manifest — a caller passes both and the dispatch picks.
+/// Pass a `rusqlite::Transaction` (it derefs to `&Connection`); commit it only once the whole batch
+/// is written. The returned `(path, prior_bytes)` rolls back via [`restore_vault_files`] for either
+/// arm (an empty prior means the file was freshly created — it gets removed, not zeroed).
 #[allow(clippy::too_many_arguments)]
 pub fn write_document_truth(
     tx: &Connection,
@@ -661,12 +742,25 @@ pub fn write_document_truth(
     importance: Option<&str>,
     reviewed: bool,
     last_activity: &str,
+    vault_root: &Path,
+    manifest_cipher: &crate::index_only::ManifestCipher,
 ) -> Result<(std::path::PathBuf, Vec<u8>)> {
     match truth_source(tx, doc_id)? {
         TruthSource::VaultFrontmatter => rewrite_vault_metadata(
             tx,
             vault,
             cipher,
+            doc_id,
+            project,
+            tags,
+            importance,
+            reviewed,
+            last_activity,
+        ),
+        TruthSource::IndexManifest => rewrite_manifest_metadata(
+            tx,
+            vault_root,
+            manifest_cipher,
             doc_id,
             project,
             tags,
@@ -751,14 +845,60 @@ fn rewrite_vault_metadata(
     Ok((file, original))
 }
 
-/// Restore vault files overwritten by [`rewrite_vault_metadata`] to their prior raw
-/// bytes — the vault half of rolling back an abandoned metadata batch (the DB half
-/// rolls back by dropping the uncommitted transaction). Writing back the exact
-/// on-disk bytes keeps an encrypted file's ciphertext intact. Best-effort per file
-/// (a failed restore on one shouldn't stop the rest); applied newest-first.
+/// Rewrite an index-only document's organisation metadata, *inside a caller-owned transaction*:
+/// update the `documents` row (the mirror), then regenerate the encrypted manifest from that
+/// uncommitted mirror so the portable truth tracks the edit. The manifest arm of
+/// [`write_document_truth`] — the analog of [`rewrite_vault_metadata`] for a document with no
+/// Markdown file. No re-chunk / re-embed: the body and pointer are unchanged, so the existing chunks
+/// and vectors stay valid. Returns `(manifest file, its prior raw bytes)` for rollback via
+/// [`restore_vault_files`]; an empty prior (the manifest's first write in this batch) restores by
+/// removing the file. The per-write snapshot stack unwinds a mixed batch — several vault files plus
+/// the single manifest — correctly newest-first, because each manifest write reads-current then
+/// writes-new.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_manifest_metadata(
+    tx: &Connection,
+    vault_root: &Path,
+    manifest_cipher: &crate::index_only::ManifestCipher,
+    doc_id: i64,
+    project: &str,
+    tags: &[String],
+    importance: Option<&str>,
+    reviewed: bool,
+    last_activity: &str,
+) -> Result<(std::path::PathBuf, Vec<u8>)> {
+    let tags_json =
+        serde_json::to_string(tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
+    tx.execute(
+        "UPDATE documents SET project = ?1, tags = ?2, importance = ?3, reviewed = ?4, \
+         last_activity = ?5 WHERE id = ?6 AND source_type = 'index_only'",
+        params![
+            project,
+            tags_json,
+            importance,
+            reviewed as i64,
+            last_activity,
+            doc_id
+        ],
+    )?;
+    let prior = crate::index_only::write_synced(tx, vault_root, manifest_cipher)?;
+    Ok((crate::index_only::manifest_path(vault_root), prior))
+}
+
+/// Restore truth files overwritten during an abandoned metadata batch to their prior raw bytes — the
+/// file half of the rollback (the DB half rolls back by dropping the uncommitted transaction).
+/// Writing back the exact on-disk bytes keeps an encrypted file's ciphertext intact. An EMPTY prior
+/// means the file did not exist when the snapshot was taken (e.g. the first write to the index-only
+/// manifest in this batch), so restoring it means REMOVING the file, not leaving a 0-byte one a
+/// reader would choke on — a vault-frontmatter rewrite always has non-empty prior bytes, so this only
+/// ever fires for a freshly-created truth file. Best-effort per file; applied newest-first.
 pub fn restore_vault_files(written: Vec<(std::path::PathBuf, Vec<u8>)>) {
     for (file, original) in written.into_iter().rev() {
-        let _ = std::fs::write(&file, original);
+        if original.is_empty() {
+            let _ = std::fs::remove_file(&file);
+        } else {
+            let _ = std::fs::write(&file, original);
+        }
     }
 }
 
@@ -892,20 +1032,67 @@ fn yaml_unquote(value: &str) -> String {
 
 // --- helpers ---
 
-struct DocMeta {
-    source_path: Option<String>,
-    vault_path: String,
-    title: String,
-    content_hash: String,
-    ext: Option<String>,
-    byte_size: Option<i64>,
-    created_at: Option<String>,
-    ingested_at: String,
-    project: String,
-    tags: Vec<String>,
-    importance: Option<String>,
-    reviewed: bool,
-    last_activity: Option<String>,
+/// `documents.source_type` for a fully-stored vault document (its body lives in a Markdown file).
+pub(crate) const SOURCE_TYPE_VAULT: &str = "vault";
+/// `documents.source_type` for an index-only document (body lives at the remote source; we keep a
+/// pointer + embedding + summary, never the bytes — board card 3 / spec §8.1).
+pub(crate) const SOURCE_TYPE_INDEX_ONLY: &str = "index_only";
+/// `documents.source_state` for a reachable source (the default for every document).
+pub(crate) const SOURCE_STATE_OK: &str = "ok";
+/// Stand-in stored for an index-only chunk's body text: we hold the embedding (vector-findable) but
+/// never persist the bytes, so the readable body is a live fetch. The short `stored_summary` on the
+/// document is what stays legible offline.
+pub(crate) const INDEX_ONLY_BODY_PLACEHOLDER: &str = "(body available at the source)";
+
+/// The source discriminator + live pointer for a document. `Default` describes a fully-stored vault
+/// document; pointer-ingest overrides these for an index-only item whose body stays at the source.
+#[derive(Clone)]
+pub(crate) struct SourceMeta {
+    pub source_type: String,
+    pub source_state: String,
+    pub source_id: Option<String>,
+    pub external_ref: Option<String>,
+    pub source_modified_at: Option<String>,
+    pub source_content_hash: Option<String>,
+    pub stored_summary: Option<String>,
+}
+
+impl Default for SourceMeta {
+    fn default() -> Self {
+        Self {
+            source_type: SOURCE_TYPE_VAULT.into(),
+            source_state: SOURCE_STATE_OK.into(),
+            source_id: None,
+            external_ref: None,
+            source_modified_at: None,
+            source_content_hash: None,
+            stored_summary: None,
+        }
+    }
+}
+
+impl SourceMeta {
+    fn is_index_only(&self) -> bool {
+        self.source_type == SOURCE_TYPE_INDEX_ONLY
+    }
+}
+
+pub(crate) struct DocMeta {
+    pub source_path: Option<String>,
+    pub vault_path: String,
+    pub title: String,
+    pub content_hash: String,
+    pub ext: Option<String>,
+    pub byte_size: Option<i64>,
+    pub created_at: Option<String>,
+    pub ingested_at: String,
+    pub project: String,
+    pub tags: Vec<String>,
+    pub importance: Option<String>,
+    pub reviewed: bool,
+    pub last_activity: Option<String>,
+    /// Source discriminator + pointer. Vault ingest leaves this at `SourceMeta::default()`.
+    pub source: SourceMeta,
 }
 
 /// Bounds on the directory walk so a deep, huge, or symlink-looped tree can't
@@ -1079,7 +1266,7 @@ fn vault_filename(title: &str, content_hash: &str) -> String {
     format!("{slug}-{short}.md")
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
+pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
@@ -1112,7 +1299,11 @@ fn warmup_ok(got_width: Option<usize>, expected: usize) -> bool {
 
 /// Guard the index against a model mismatch: one vector per leaf chunk, each of the selected
 /// embedder's dimension (passed in, never a hardcoded 384).
-fn check_embeddings(embeddings: &[Vec<f32>], leaves: usize, expected_dim: usize) -> Result<()> {
+pub(crate) fn check_embeddings(
+    embeddings: &[Vec<f32>],
+    leaves: usize,
+    expected_dim: usize,
+) -> Result<()> {
     if embeddings.len() != leaves {
         return Err(Error::Other(
             "embedding count did not match leaf-chunk count".into(),
@@ -1126,7 +1317,7 @@ fn check_embeddings(embeddings: &[Vec<f32>], leaves: usize, expected_dim: usize)
     Ok(())
 }
 
-fn iso_now(conn: &Connection) -> Result<String> {
+pub(crate) fn iso_now(conn: &Connection) -> Result<String> {
     Ok(
         conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
             r.get(0)
@@ -1176,6 +1367,98 @@ mod tests {
         assert!(warmup_ok(Some(1024), 1024));
         assert!(!warmup_ok(Some(384), 1024));
         assert!(!warmup_ok(None, 1024));
+    }
+
+    const TEST_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// Hand-insert a vault row and an index-only row (no embedder needed) and return their ids.
+    fn store_with_one_of_each() -> (tempfile::TempDir, Connection, i64, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('v.md','V','hv')",
+            [],
+        )
+        .unwrap();
+        let vault_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type, source_id, \
+                    project, stored_summary) \
+             VALUES ('idx://s1','Pointer','hp','index_only','s1','Unsorted','a short summary')",
+            [],
+        )
+        .unwrap();
+        let index_id = conn.last_insert_rowid();
+        (dir, conn, vault_id, index_id)
+    }
+
+    #[test]
+    fn truth_source_discriminates_on_source_type() {
+        let (_d, conn, vault_id, index_id) = store_with_one_of_each();
+        assert!(matches!(
+            truth_source(&conn, vault_id).unwrap(),
+            TruthSource::VaultFrontmatter
+        ));
+        assert!(matches!(
+            truth_source(&conn, index_id).unwrap(),
+            TruthSource::IndexManifest
+        ));
+    }
+
+    #[test]
+    fn write_document_truth_routes_an_index_only_doc_to_the_manifest() {
+        use crate::index_only::{manifest_path, read_manifest, ManifestCipher};
+        let (dir, mut conn, _vault_id, index_id) = store_with_one_of_each();
+        let cipher = ManifestCipher::from_master("vault-test", &[9u8; 32]);
+        let vault_dir = dir.path().join("vault"); // never written for an index-only doc
+
+        let tx = conn.transaction().unwrap();
+        let (path, prior) = write_document_truth(
+            &tx,
+            &vault_dir,
+            // The Markdown cipher is unused on the manifest arm; a plaintext one satisfies the
+            // signature without touching the vault.
+            &crate::vault::MarkdownCipher::plaintext("vault-test"),
+            index_id,
+            "Project X",
+            &["urgent".to_string()],
+            Some("high"),
+            true,
+            "2026-06-26T00:00:00Z",
+            dir.path(),
+            &cipher,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // It wrote the manifest (first write → empty prior), not a vault file.
+        assert_eq!(path, manifest_path(dir.path()));
+        assert!(prior.is_empty());
+        assert!(
+            !vault_dir.exists(),
+            "no Markdown vault file for an index-only doc"
+        );
+
+        // The manifest carries the new classification, and the documents row (mirror) matches.
+        let manifest = read_manifest(dir.path(), &cipher).unwrap().unwrap();
+        let item = manifest
+            .items
+            .iter()
+            .find(|i| i.source_id == "s1")
+            .expect("the index-only item is in the manifest");
+        assert_eq!(item.project, "Project X");
+        assert_eq!(item.tags, vec!["urgent".to_string()]);
+        assert_eq!(item.importance.as_deref(), Some("high"));
+        assert!(item.reviewed);
+
+        let row_project: String = conn
+            .query_row(
+                "SELECT project FROM documents WHERE id = ?1",
+                params![index_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_project, "Project X");
     }
 
     #[test]

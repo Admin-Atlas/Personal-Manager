@@ -12,6 +12,7 @@ mod entities;
 mod error;
 mod google;
 mod ics;
+mod index_only;
 mod ingest;
 mod learning;
 mod lock_session;
@@ -56,6 +57,10 @@ pub struct VaultRuntime {
     /// truth). Distinct from `cipher`: it encrypts even for device vaults whose Markdown is
     /// plaintext, since an alias map of projects is more revealing than any one document.
     pub rules_cipher: entities::RulesCipher,
+    /// Always-on cipher for the encrypted index-only manifest (the portable classification of
+    /// sources we index but don't fully import). Same primitive as `rules_cipher`, a distinct AAD
+    /// stem apart; sits next to the rules file at the vault root.
+    pub manifest_cipher: index_only::ManifestCipher,
 }
 
 impl VaultRuntime {
@@ -72,6 +77,7 @@ impl VaultRuntime {
             vault_root: resolved.vault_root.clone(),
             cipher: vault::MarkdownCipher::from_meta(meta, master),
             rules_cipher: entities::RulesCipher::from_master(&meta.vault_id, master),
+            manifest_cipher: index_only::ManifestCipher::from_master(&meta.vault_id, master),
         }
     }
 }
@@ -153,8 +159,11 @@ impl AppState {
             *vault = Some(runtime);
         }
         // Drop the guards before reconciling — it re-locks both to (re)build the rules file or
-        // restore the mirror from it. Best-effort: a hiccup here never blocks the open.
+        // restore the mirror from it. Best-effort: a hiccup here never blocks the open. The
+        // index-only manifest reconcile runs AFTER the rules one (it resolves item projects through
+        // the rebuilt aliases).
         self.reconcile_entity_rules();
+        self.reconcile_index_only();
         Ok(())
     }
 
@@ -181,9 +190,10 @@ impl AppState {
                 .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
             *guard = Some(runtime);
         }
-        // A policy/key transition swaps the rules cipher too; reconcile heals the file under the
-        // new key (the mirror survived the SQLCipher rekey intact). Best-effort.
+        // A policy/key transition swaps the rules + manifest ciphers too; reconcile heals each file
+        // under the new key (the mirror survived the SQLCipher rekey intact). Best-effort.
         self.reconcile_entity_rules();
+        self.reconcile_index_only();
         Ok(())
     }
 
@@ -226,6 +236,20 @@ impl AppState {
         }
     }
 
+    /// Snapshot the active vault's root + always-on manifest cipher, or a friendly error if the
+    /// vault is locked. The single way the index-only layer reaches its encrypted manifest, off the
+    /// lock — parity with [`AppState::rules_io`].
+    pub fn manifest_io(&self) -> error::Result<(PathBuf, index_only::ManifestCipher)> {
+        let guard = self
+            .vault
+            .lock()
+            .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
+        match guard.as_ref() {
+            Some(rt) => Ok((rt.vault_root.clone(), rt.manifest_cipher.clone())),
+            None => Err(error::Error::Other("the vault is locked".into())),
+        }
+    }
+
     /// Reconcile the encrypted rules file with the DB mirror for the active session: write it on
     /// first run, rebuild the mirror from it on later opens, or heal it after a key rotation. A
     /// no-op when the vault is locked. Best-effort — the DB mirror is the live truth, so a failure
@@ -262,6 +286,41 @@ impl AppState {
             .map(|_| ());
         if let Err(e) = synced {
             eprintln!("entities: rules sync skipped ({e})");
+        }
+    }
+
+    /// Reconcile the encrypted index-only manifest with the DB mirror for the active session. Runs
+    /// AFTER [`AppState::reconcile_entity_rules`] (it resolves each item's project through the
+    /// rebuilt aliases). A no-op when the vault is locked; best-effort, like the rules reconcile —
+    /// the DB mirror is the live truth, so a hiccup never blocks the open.
+    pub fn reconcile_index_only(&self) {
+        let (vault_root, cipher) = match self.manifest_io() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Err(e) = index_only::reconcile_on_open(&conn, &vault_root, &cipher) {
+            eprintln!("index_only: manifest reconcile skipped ({e})");
+        }
+    }
+
+    /// Push the DB mirror out to the encrypted index-only manifest (mirror→file). Called after a
+    /// pointer is registered / re-embedded so the portable classification stays current. A no-op
+    /// when locked; best-effort.
+    pub fn sync_index_only(&self) {
+        let (vault_root, cipher) = match self.manifest_io() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Err(e) = index_only::write_synced(&conn, &vault_root, &cipher).map(|_| ()) {
+            eprintln!("index_only: manifest sync skipped ({e})");
         }
     }
 
@@ -353,8 +412,11 @@ pub fn run() {
 
             // After the writer lock is settled (so a stepped-back profile doesn't write), reconcile
             // the encrypted entity-rules file with the DB mirror: first run writes it from the v10
-            // backfill; later runs rebuild the mirror from it. No-op when the vault is locked.
+            // backfill; later runs rebuild the mirror from it. No-op when the vault is locked. The
+            // index-only manifest reconcile runs AFTER it (it resolves item projects through the
+            // rebuilt aliases).
             app.state::<AppState>().reconcile_entity_rules();
+            app.state::<AppState>().reconcile_index_only();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -401,6 +463,8 @@ pub fn run() {
             commands::ensure_sidecar,
             commands::ingest_paths,
             commands::rebuild_index,
+            #[cfg(debug_assertions)]
+            commands::dev_register_pointer,
             commands::list_documents,
             commands::search_documents,
             commands::transcribe_audio,

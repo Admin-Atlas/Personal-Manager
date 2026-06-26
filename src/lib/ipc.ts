@@ -232,6 +232,18 @@ export const ensureSidecar = () => invoke<void>("ensure_sidecar");
 
 export const listDocuments = () => invoke<Document[]>("list_documents");
 
+/**
+ * Dev-only (debug builds): register a pasted body as an index-only document, to drive the index-only
+ * substrate without a real connector (board card 3). The backend command is compiled out of release
+ * builds, so only call this behind `import.meta.env.DEV`.
+ */
+export const devRegisterPointer = (
+  sourceId: string,
+  title: string,
+  body: string,
+  externalRef: string | null,
+) => invoke<Document>("dev_register_pointer", { sourceId, title, body, externalRef });
+
 /** Hybrid search over the store, returning the top-k matching chunks. */
 export const searchDocuments = (query: string, k?: number) =>
   invoke<RetrievedChunk[]>("search_documents", { query, k });
