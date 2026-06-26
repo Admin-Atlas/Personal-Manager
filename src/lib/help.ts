@@ -70,9 +70,17 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Look-alikes",
     body: "Projects whose names are identical once spacing, punctuation, and capitalisation are ignored — likely the same thing filed two ways. Merging folds one into the other so the duplicate stops appearing.",
   },
-  "teach-future": {
-    title: "Coming here later",
-    body: "Over time, more of how you guide PM — like your Learning You profile — will gather in this one place.",
+  "teach-preferences": {
+    title: "Preferences",
+    body: "Your typed preferences — how you like things filed, named, and answered. PM brings just the relevant ones into chat, sorting, and your briefing, instead of one long note. The “Suggested” ones were carried over from your old Learning You profile; keep, edit, or remove them.",
+  },
+  "teach-pref": {
+    title: "A preference",
+    body: "One rule, with where it applies — everywhere, one project, or a situation. Edit it, delete it, or “Keep” a suggested one to vouch for it.",
+  },
+  "teach-pref-nl": {
+    title: "In your own words",
+    body: "Type a preference as a plain sentence and PM fills in the fields for you. Check them before saving — nothing is stored until you do.",
   },
   "settings-teach-tab": {
     title: "Teach tab",
