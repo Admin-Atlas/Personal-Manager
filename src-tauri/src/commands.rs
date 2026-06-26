@@ -3583,8 +3583,15 @@ fn cached_catalogue(conn: &Connection) -> Result<Vec<openrouter::ModelDetail>> {
 /// so errors are swallowed. `model = None` is allowed (an unreported served model).
 fn log_usage(conn: &Connection, kind: &str, model: Option<&str>, usage: &openrouter::Usage) {
     let _ = conn.execute(
-        "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens) VALUES (?1, ?2, ?3, ?4)",
-        params![model, kind, usage.prompt_tokens, usage.completion_tokens],
+        "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            model,
+            kind,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cost
+        ],
     );
 }
 
@@ -3748,7 +3755,8 @@ fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
                 COALESCE(SUM(u.prompt_tokens), 0), \
                 COALESCE(SUM(u.completion_tokens), 0), \
                 COUNT(*), \
-                p.prompt_price, p.completion_price \
+                p.prompt_price, p.completion_price, \
+                SUM(u.cost_usd), COUNT(u.cost_usd) \
          FROM usage_log u LEFT JOIN model_pricing p ON p.model = u.model \
          WHERE u.model IS NOT NULL {window} \
          GROUP BY u.model \
@@ -3759,19 +3767,30 @@ fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
         .query_map([], |r| {
             let prompt_tokens: i64 = r.get(1)?;
             let completion_tokens: i64 = r.get(2)?;
+            let request_count: i64 = r.get(3)?;
             let prompt_price: Option<f64> = r.get(4)?;
             let completion_price: Option<f64> = r.get(5)?;
-            Ok(ModelSpend {
-                model: r.get(0)?,
-                prompt_tokens,
-                completion_tokens,
-                request_count: r.get(3)?,
-                cost_usd: cost::call_cost(
+            let actual_cost: Option<f64> = r.get(6)?; // SUM(cost_usd); NULL when no call reported one
+            let actual_count: i64 = r.get(7)?; // calls in this group that reported an actual cost
+                                               // Prefer OpenRouter's reported cost when EVERY call in the group reported one (so a
+                                               // partial actual sum is never mixed with rows that lack it); otherwise fall back to the
+                                               // tokens × cached-price estimate (which is `None` — shown "unknown" — when unpriced).
+            let cost_usd = if actual_count == request_count && actual_count > 0 {
+                actual_cost
+            } else {
+                cost::call_cost(
                     Some(prompt_tokens),
                     Some(completion_tokens),
                     prompt_price,
                     completion_price,
-                ),
+                )
+            };
+            Ok(ModelSpend {
+                model: r.get(0)?,
+                prompt_tokens,
+                completion_tokens,
+                request_count,
+                cost_usd,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

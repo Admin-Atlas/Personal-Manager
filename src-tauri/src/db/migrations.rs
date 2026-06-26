@@ -416,6 +416,14 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_connector_sources_service ON connector_sources(provider, service);
     "#,
+    // v15: record the **actual** USD cost OpenRouter reports per call (its usage-accounting
+    // `usage.cost`), so the Usage tab can show real spend — including prompt-cache discounts — rather
+    // than only a tokens × cached-price estimate that goes blank when a model isn't in the price
+    // cache. Nullable: older rows (and any provider that doesn't report cost) stay NULL and fall back
+    // to the estimate. Additive, regenerable, no backfill (rule #3).
+    r#"
+    ALTER TABLE usage_log ADD COLUMN cost_usd REAL;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -454,8 +462,8 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 14,
-            "the connector registry is the latest migration"
+            version, 15,
+            "migration count pin (connector registry is v14; usage cost_usd is v15)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

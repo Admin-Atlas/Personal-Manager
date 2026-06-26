@@ -19,13 +19,16 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// Token usage OpenRouter reports for one completion. Either field may be absent
+/// Token usage OpenRouter reports for one completion. Any field may be absent
 /// (a provider that doesn't report usage, or a degraded/early-terminated response),
 /// so the cost logger stores NULLs and shows the spend as unknown rather than zero.
+/// `cost` is OpenRouter's own usage-accounting figure (actual USD charged, net of any
+/// prompt-cache discount) — preferred over the local tokens × price estimate when present.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Usage {
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    pub cost: Option<f64>,
 }
 
 /// The result of a chat call: the assembled text, the model that actually served it
@@ -38,11 +41,13 @@ pub struct Completion {
     pub usage: Usage,
 }
 
-/// Extract token usage from a response/chunk's `usage` object (absent fields → None).
+/// Extract token usage from a response/chunk's `usage` object (absent fields → None). `cost` is
+/// present only when we asked for usage accounting (`usage.include`) and the provider reports it.
 fn parse_usage(value: &serde_json::Value) -> Usage {
     Usage {
         prompt_tokens: value["usage"]["prompt_tokens"].as_i64(),
         completion_tokens: value["usage"]["completion_tokens"].as_i64(),
+        cost: value["usage"]["cost"].as_f64(),
     }
 }
 
@@ -241,10 +246,43 @@ fn request_error(status: reqwest::StatusCode, detail: &str) -> Error {
 /// one model we send `"model"`; with several we send `"models"` (an ordered
 /// fallback list — OpenRouter advances to the next on a rate-limit/quota/provider
 /// error, which is how auto-switch works). Callers guarantee a non-empty list.
-fn chat_body(models: &[String], messages: &[ChatMessage], stream: bool) -> serde_json::Value {
+fn chat_body(
+    models: &[String],
+    messages: &[ChatMessage],
+    stream: bool,
+    cache_prefix: bool,
+) -> serde_json::Value {
+    // Build the messages array by hand so we can optionally mark the first message (the stable
+    // system prefix) with an ephemeral prompt-cache breakpoint. OpenRouter forwards `cache_control`
+    // to providers that support prompt caching (e.g. Anthropic), which then bill the reused prefix at
+    // the cheap cache-read rate — a big saving when the same prefix repeats across many calls (the
+    // per-document review loop). Providers without caching, or a prefix below their minimum cacheable
+    // size, simply ignore it. Non-prefixed messages serialise exactly as before.
+    let msgs: Vec<serde_json::Value> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if cache_prefix && i == 0 {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": [{
+                        "type": "text",
+                        "text": m.content,
+                        "cache_control": { "type": "ephemeral" },
+                    }],
+                })
+            } else {
+                serde_json::json!({ "role": m.role, "content": m.content })
+            }
+        })
+        .collect();
+
     let mut body = serde_json::json!({
-        "messages": messages,
+        "messages": msgs,
         "stream": stream,
+        // Usage accounting: have OpenRouter report the actual USD cost (net of any prompt-cache
+        // discount) so the cost logger can store real spend, not just a tokens × price estimate.
+        "usage": { "include": true },
     });
     if stream {
         // Ask OpenRouter to emit a final usage chunk so we can log token spend.
@@ -281,7 +319,9 @@ pub async fn stream_chat<F>(
 where
     F: FnMut(&str),
 {
-    let body = chat_body(models, messages, true);
+    // Chat context (retrieved chunks) differs every turn, so prefix caching wouldn't hit — don't pay
+    // the cache-write premium here.
+    let body = chat_body(models, messages, true, false);
 
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -397,13 +437,16 @@ fn drain_lines(buffer: &mut Vec<u8>) -> Vec<String> {
 /// A single non-streaming chat completion — used for background work (sorting
 /// proposals, the Learning-You profile) where we want the whole answer at once,
 /// not a token stream. Takes an ordered model list (one model, or several for
-/// auto-switch fallback). Returns the assistant message content.
+/// auto-switch fallback). Returns the assistant message content. Set `cache_prefix`
+/// when the first message is a stable prefix reused across many back-to-back calls
+/// (the review loop) so providers cache + cheaply reuse it.
 pub async fn complete(
     api_key: &str,
     models: &[String],
     messages: &[ChatMessage],
+    cache_prefix: bool,
 ) -> Result<Completion> {
-    let body = chat_body(models, messages, false);
+    let body = chat_body(models, messages, false, cache_prefix);
 
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -484,9 +527,9 @@ mod tests {
 
     #[test]
     fn chat_body_enforces_zdr_and_keeps_model_routing() {
-        // Single model: the "model" field, the ZDR provider object, and the streaming
-        // usage opt-in. chat_body is PM's only ZDR enforcement point, so this guards it.
-        let one = chat_body(&["a/b".to_string()], &[], true);
+        // Single model: the "model" field, the ZDR provider object, usage accounting, and the
+        // streaming usage opt-in. chat_body is PM's only ZDR enforcement point, so this guards it.
+        let one = chat_body(&["a/b".to_string()], &[], true, false);
         assert_eq!(one["provider"]["zdr"], serde_json::json!(true));
         assert_eq!(
             one["provider"]["data_collection"],
@@ -494,16 +537,53 @@ mod tests {
         );
         assert_eq!(one["model"], serde_json::json!("a/b"));
         assert!(one.get("models").is_none());
+        assert_eq!(one["usage"]["include"], serde_json::json!(true));
         assert_eq!(
             one["stream_options"]["include_usage"],
             serde_json::json!(true)
         );
-        // Several models: the ordered "models" fallback list, still ZDR-enforced, no "model"
-        // and (non-streaming) no usage opt-in.
-        let many = chat_body(&["a/b".to_string(), "c/d".to_string()], &[], false);
+        // Several models: the ordered "models" fallback list, still ZDR-enforced + usage-accounted,
+        // no "model" and (non-streaming) no stream_options.
+        let many = chat_body(&["a/b".to_string(), "c/d".to_string()], &[], false, false);
         assert_eq!(many["models"], serde_json::json!(["a/b", "c/d"]));
         assert!(many.get("model").is_none());
         assert_eq!(many["provider"]["zdr"], serde_json::json!(true));
+        assert_eq!(many["usage"]["include"], serde_json::json!(true));
         assert!(many.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn chat_body_caches_only_the_prefix_when_asked() {
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "stable instructions".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "the document".into(),
+            },
+        ];
+        // cache_prefix=false → plain string content, no cache_control anywhere.
+        let plain = chat_body(&["a/b".to_string()], &msgs, false, false);
+        assert_eq!(
+            plain["messages"][0]["content"],
+            serde_json::json!("stable instructions")
+        );
+        // cache_prefix=true → message[0] becomes a content block carrying the ephemeral breakpoint;
+        // later messages stay plain strings (only the stable prefix is cached).
+        let cached = chat_body(&["a/b".to_string()], &msgs, false, true);
+        assert_eq!(
+            cached["messages"][0]["content"][0]["cache_control"]["type"],
+            serde_json::json!("ephemeral")
+        );
+        assert_eq!(
+            cached["messages"][0]["content"][0]["text"],
+            serde_json::json!("stable instructions")
+        );
+        assert_eq!(
+            cached["messages"][1]["content"],
+            serde_json::json!("the document")
+        );
     }
 }

@@ -722,6 +722,7 @@ mod tests {
              DROP TABLE entities; \
              ALTER TABLE documents DROP COLUMN entity_id; \
              ALTER TABLE projects  DROP COLUMN entity_id; \
+             ALTER TABLE usage_log DROP COLUMN cost_usd; \
              PRAGMA user_version = 9;",
         )
         .unwrap();
@@ -844,6 +845,7 @@ mod tests {
              ALTER TABLE documents DROP COLUMN stored_summary; \
              ALTER TABLE entities DROP COLUMN confidence; \
              ALTER TABLE entities DROP COLUMN user_confirmed; \
+             ALTER TABLE usage_log DROP COLUMN cost_usd; \
              PRAGMA user_version = 10;",
         )
         .unwrap();

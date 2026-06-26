@@ -211,6 +211,7 @@ const TABLES: &[Table] = &[
             plain("kind"),
             plain("prompt_tokens"),
             plain("completion_tokens"),
+            plain("cost_usd"),
             plain("created_at"),
         ],
     },

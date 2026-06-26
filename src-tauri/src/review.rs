@@ -87,7 +87,9 @@ pub async fn propose(
     profile: Option<&str>,
 ) -> (Proposal, Option<(openrouter::Usage, Option<String>)>) {
     let messages = build_messages(title, body, existing_projects, profile);
-    match openrouter::complete(api_key, models, &messages).await {
+    // cache_prefix: the system message is the same across every document in a review run, so cache it
+    // once and reuse it cheaply for the rest of the batch.
+    match openrouter::complete(api_key, models, &messages, true).await {
         Ok(c) => (parse_proposal(&c.text), Some((c.usage, c.model))),
         Err(e) => (
             Proposal::fallback(format!("Proposal request failed: {e}")),

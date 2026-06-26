@@ -8,9 +8,11 @@
 //! isolation (in the spirit of [`crate::retrieval::decay_factor`] /
 //! [`crate::projects::derive_status`]).
 //!
-//! Cost is **never stored** — it's derived from token counts × the cached per-token
-//! price at read time, so a later price correction reprices history, and a model
-//! that isn't in the price cache yet shows as "unknown" rather than an understated $0.
+//! Two cost paths: OpenRouter's **actual** reported cost (its usage-accounting `usage.cost`, net of
+//! prompt-cache discounts) is stored per call in `usage_log.cost_usd` and preferred when present; the
+//! **estimate** here ([`call_cost`]) is the fallback — derived from token counts × the cached
+//! per-token price at read time (so a later price correction reprices history). A model with neither
+//! an actual cost nor a cached price shows as "unknown" rather than an understated $0.
 
 /// Cached pricing older than this many hours is re-pulled on read (check-on-read,
 /// mirroring [`crate::briefing`]'s staleness rule — no scheduler, no model call).
