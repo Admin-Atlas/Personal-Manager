@@ -306,6 +306,7 @@ pub fn reconcile_on_open(
 /// A request to index a source by pointer only: its body is fetched once for embedding + summary but
 /// never persisted. The body is supplied by the caller (a connector, or the dev affordance); the
 /// detection of WHEN to call this lives in the connector cards, not here.
+#[derive(Clone)]
 pub struct PointerInput {
     pub source_id: String,
     pub title: String,
@@ -489,12 +490,567 @@ fn restore_item(state: &AppState, gateway: &ModelGateway<'_>, item: &ManifestIte
     Ok(())
 }
 
+// --- observe-and-react: the source-agnostic change-event semantics ---
+//
+// PM owns the vault as a single writer, but it does NOT own an index-only source — it is a read-only
+// OBSERVER reacting to an external writer it cannot lock (the user, a cloud web UI, another sync
+// daemon). So the concurrency model inverts: no lock applies here, and the vault's single-writer
+// baton-pass must never be reached for. Connectors (the cloud + local-folder cards) supply the
+// per-source *detection*; this module owns the *semantics* — the pure [`react`] reducer below, plus
+// the [`apply_actions`] executor that performs its decisions.
+
+/// The reachability of an index-only item's source.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SourceState {
+    /// Reachable — the body can be fetched (the default).
+    Ok,
+    /// The item was deleted at the source: kept findable (metadata + embedding stay), body flagged
+    /// unretrievable. A soft state, never a hard drop.
+    SourceMissing,
+    /// The whole source can't be reached (expired auth, unmounted drive). First-class, distinct from
+    /// a per-item deletion.
+    Unreachable,
+}
+
+impl SourceState {
+    /// The `documents.source_state` string this maps to.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceState::Ok => ingest::SOURCE_STATE_OK,
+            SourceState::SourceMissing => ingest::SOURCE_STATE_MISSING,
+            SourceState::Unreachable => ingest::SOURCE_STATE_UNREACHABLE,
+        }
+    }
+
+    /// Parse a stored `source_state`; anything unrecognised reads as `Ok` (the safe default).
+    pub fn from_db(s: &str) -> Self {
+        if s == ingest::SOURCE_STATE_MISSING {
+            SourceState::SourceMissing
+        } else if s == ingest::SOURCE_STATE_UNREACHABLE {
+            SourceState::Unreachable
+        } else {
+            SourceState::Ok
+        }
+    }
+}
+
+/// The persisted state of an index-only item, as the reducer needs to see it. `None` to the reducer
+/// means "never seen this source id before".
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ItemState {
+    pub source_id: String,
+    pub source_modified_at: Option<String>,
+    pub source_content_hash: Option<String>,
+    pub source_state: SourceState,
+}
+
+/// A change reported by some source, normalised. Connectors translate their native events (a notify
+/// fs event, the Drive changes feed, the OneDrive delta query) into this; the reducer stays
+/// source-agnostic. Items are keyed by a **stable source id** — a connector that namespaces its ids
+/// as `<source>:<localid>` lets [`SourceFailure`](ChangeEvent::SourceFailure) group an account's
+/// items. A naive watcher reporting a rename as delete-plus-add would strip classification; stable-id
+/// keying + [`Rename`](ChangeEvent::Rename) is what prevents that.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ChangeEvent {
+    /// A new item appeared at the source.
+    Add {
+        source_id: String,
+        modified_at: Option<String>,
+    },
+    /// An item changed. `new_content_hash` is the SOURCE's content hash (the pointer), `None` when a
+    /// watcher fires mid-write before the file is stable.
+    Update {
+        source_id: String,
+        modified_at: Option<String>,
+        new_content_hash: Option<String>,
+    },
+    /// An item was deleted at the source.
+    Delete { source_id: String },
+    /// An item was renamed/moved — the stable id is unchanged, only its external ref moved.
+    Rename {
+        source_id: String,
+        new_external_ref: Option<String>,
+    },
+    /// A whole source became unreachable (expired OAuth, unmounted drive, revoked permission).
+    SourceFailure { source: String },
+}
+
+/// What the executor should do. Pure data — [`react`] returns these; [`apply_actions`] performs them.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Action {
+    /// Ingest a never-seen item (the connector supplies its body).
+    IngestNew { source_id: String },
+    /// The embedding is stale — re-embed from the connector-supplied body; classification persists.
+    ReEmbed {
+        source_id: String,
+        new_content_hash: String,
+    },
+    /// A watcher fired mid-write (no stable hash yet): re-stat after a quiet interval and only
+    /// proceed once mtime/size settle. The connector re-fires a hashed `Update` when stable.
+    DebounceThenCheck {
+        source_id: String,
+        modified_at: Option<String>,
+    },
+    /// Transition one item's reachability state.
+    SetState {
+        source_id: String,
+        state: SourceState,
+    },
+    /// Transition every item of a source (the `SourceFailure` fan-out).
+    SetSourceState { source: String, state: SourceState },
+    /// A rename/move kept the identity; update the shown external ref.
+    UpdatePointer {
+        source_id: String,
+        external_ref: Option<String>,
+    },
+    /// Nothing to do (an idempotent re-fire, or a touch that didn't change the content).
+    Noop,
+}
+
+/// Decide what a change means for an index-only item — the heart of observe-and-react. **PURE**: no
+/// DB, no IO, no clock; the same `(event, current)` always yields the same actions, which is what
+/// makes it exhaustively unit-testable. `current` is the item's persisted state, or `None` if its
+/// source id has never been seen.
+pub fn react(event: ChangeEvent, current: Option<&ItemState>) -> Vec<Action> {
+    match event {
+        ChangeEvent::Add { source_id, .. } => match current {
+            // Never seen → ingest + stage like any new item.
+            None => vec![Action::IngestNew { source_id }],
+            // Present and reachable → idempotent against a watcher double-fire; never re-stage a
+            // classified item.
+            Some(s) if s.source_state == SourceState::Ok => vec![Action::Noop],
+            // It came back (was missing/unreachable) → mark reachable; a following Update re-embeds
+            // if the content actually changed.
+            Some(_) => vec![Action::SetState {
+                source_id,
+                state: SourceState::Ok,
+            }],
+        },
+        ChangeEvent::Update {
+            source_id,
+            modified_at,
+            new_content_hash,
+        } => match (current, new_content_hash) {
+            // Unknown item → treat as an Add.
+            (None, _) => vec![Action::IngestNew { source_id }],
+            // No stable hash yet (watcher mid-write) → debounce, re-stat, proceed only once stable.
+            (Some(_), None) => vec![Action::DebounceThenCheck {
+                source_id,
+                modified_at,
+            }],
+            // Hash differs → the embedding is stale; re-embed only (classification persists). If the
+            // item was missing/unreachable, it has effectively come back, so clear that first.
+            (Some(s), Some(h)) if Some(&h) != s.source_content_hash.as_ref() => {
+                let mut acts = Vec::new();
+                if s.source_state != SourceState::Ok {
+                    acts.push(Action::SetState {
+                        source_id: source_id.clone(),
+                        state: SourceState::Ok,
+                    });
+                }
+                acts.push(Action::ReEmbed {
+                    source_id,
+                    new_content_hash: h,
+                });
+                acts
+            }
+            // Same hash → a touch, not an edit.
+            (Some(_), Some(_)) => vec![Action::Noop],
+        },
+        // Soft delete: keep metadata + embedding (still findable), flag the body unretrievable. Never
+        // a hard drop. Unknown id → nothing to mark.
+        ChangeEvent::Delete { source_id } => match current {
+            Some(_) => vec![Action::SetState {
+                source_id,
+                state: SourceState::SourceMissing,
+            }],
+            None => vec![Action::Noop],
+        },
+        // Stable id preserves identity + classification; only the external ref moved. If it was
+        // missing/unreachable, a rename means it's reachable again.
+        ChangeEvent::Rename {
+            source_id,
+            new_external_ref,
+        } => match current {
+            None => vec![Action::Noop],
+            Some(s) => {
+                let mut acts = Vec::new();
+                if s.source_state != SourceState::Ok {
+                    acts.push(Action::SetState {
+                        source_id: source_id.clone(),
+                        state: SourceState::Ok,
+                    });
+                }
+                acts.push(Action::UpdatePointer {
+                    source_id,
+                    external_ref: new_external_ref,
+                });
+                acts
+            }
+        },
+        // The whole source is unreachable — fan out to every item of it, never a per-item deletion.
+        ChangeEvent::SourceFailure { source } => vec![Action::SetSourceState {
+            source,
+            state: SourceState::Unreachable,
+        }],
+    }
+}
+
+// --- the executor: perform a reducer's decisions against the store + manifest ---
+
+/// The connector-supplied current content for the item an `IngestNew`/`ReEmbed` concerns, asserting
+/// its source id matches the action's (the connector fetches the body before applying the change).
+fn require_fetched<'a>(
+    fetched: Option<&'a PointerInput>,
+    source_id: &str,
+) -> Result<&'a PointerInput> {
+    match fetched {
+        Some(f) if f.source_id == source_id => Ok(f),
+        Some(_) => Err(Error::Other(
+            "the fetched content's source id does not match the change".into(),
+        )),
+        None => Err(Error::Other(
+            "this change needs the item's body, but none was supplied".into(),
+        )),
+    }
+}
+
+/// Re-embed an existing index-only item from freshly-fetched content (its source changed), keeping
+/// its classification (project/tags/importance/reviewed/entity) — only the chunks, pointer hashes,
+/// summary, and title are replaced. Embeds OFF the DB lock (like ingest), then swaps the chunks in
+/// one short transaction.
+fn reembed_item(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    source_id: &str,
+    new_content_hash: &str,
+    input: &PointerInput,
+) -> Result<()> {
+    let body = input.body.trim();
+    if body.is_empty() {
+        return Err(Error::Other("re-embed received an empty body".into()));
+    }
+    let content_hash = pointer_content_hash(source_id, body);
+    let chunks = ingest::split_document(gateway, body, &input.title, &content_hash)?;
+    let texts = ingest::leaf_embed_texts(&chunks);
+    let embeddings = gateway.embed_documents(&texts)?;
+    ingest::check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
+    let summary = summarize(body);
+
+    let mut conn = state.conn()?;
+    let tx = conn.transaction()?;
+    let doc_id: i64 = tx.query_row(
+        "SELECT id FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
+        params![source_id],
+        |r| r.get(0),
+    )?;
+    ingest::replace_chunks(&tx, doc_id, &chunks, &embeddings, true, Some(&summary))?;
+    tx.execute(
+        "UPDATE documents SET content_hash = ?2, source_content_hash = ?3, source_modified_at = ?4, \
+                stored_summary = ?5, title = ?6, source_state = 'ok' \
+         WHERE id = ?1",
+        params![
+            doc_id,
+            content_hash,
+            new_content_hash,
+            input.source_modified_at,
+            summary,
+            input.title,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Set one index-only item's reachability state (`documents.source_state`).
+fn set_item_state(conn: &Connection, source_id: &str, state: SourceState) -> Result<()> {
+    conn.execute(
+        "UPDATE documents SET source_state = ?2 WHERE source_id = ?1 AND source_type = 'index_only'",
+        params![source_id, state.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Set the reachability state of EVERY item of a source — the source-failure fan-out. Matches an
+/// exact `source_id`, or any id namespaced as `<source>:<localid>` (the convention a connector
+/// follows so an account's items move together). Never deletes: a failed source must not read as a
+/// deletion.
+fn set_source_state(conn: &Connection, source: &str, state: SourceState) -> Result<()> {
+    conn.execute(
+        "UPDATE documents SET source_state = ?2 \
+         WHERE source_type = 'index_only' AND (source_id = ?1 OR source_id LIKE ?1 || ':%')",
+        params![source, state.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Update one index-only item's external ref (a rename/move kept the stable id, so its
+/// classification + chunks are untouched).
+fn set_external_ref(conn: &Connection, source_id: &str, external_ref: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE documents SET external_ref = ?2 WHERE source_id = ?1 AND source_type = 'index_only'",
+        params![source_id, external_ref],
+    )?;
+    Ok(())
+}
+
+/// Perform the [`Action`]s [`react`] produced, against the live store + manifest. `fetched` is the
+/// connector-supplied current content for the item an `IngestNew`/`ReEmbed` concerns (the dev
+/// affordance passes a pasted body). State/pointer transitions are short synchronous DB writes; a
+/// re-embed runs the sidecar OFF the DB lock, exactly like ingest. The manifest is re-synced once at
+/// the end if anything changed (an `IngestNew` syncs itself via [`register_pointer`]).
+pub fn apply_actions(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    vault_root: &Path,
+    cipher: &ManifestCipher,
+    actions: &[Action],
+    fetched: Option<&PointerInput>,
+) -> Result<()> {
+    let mut changed = false;
+    for action in actions {
+        match action {
+            Action::IngestNew { source_id } => {
+                let input = require_fetched(fetched, source_id)?.clone();
+                register_pointer(state, gateway, vault_root, cipher, input)?;
+            }
+            Action::ReEmbed {
+                source_id,
+                new_content_hash,
+            } => {
+                let input = require_fetched(fetched, source_id)?;
+                reembed_item(state, gateway, source_id, new_content_hash, input)?;
+                changed = true;
+            }
+            // Nothing to do in the substrate: the connector re-stats and re-fires a hashed Update
+            // once the source is stable. This arm is where that decision lands.
+            Action::DebounceThenCheck { .. } => {}
+            Action::SetState {
+                source_id,
+                state: new_state,
+            } => {
+                let conn = state.conn()?;
+                set_item_state(&conn, source_id, *new_state)?;
+                changed = true;
+            }
+            Action::SetSourceState {
+                source,
+                state: new_state,
+            } => {
+                let conn = state.conn()?;
+                set_source_state(&conn, source, *new_state)?;
+                changed = true;
+            }
+            Action::UpdatePointer {
+                source_id,
+                external_ref,
+            } => {
+                let conn = state.conn()?;
+                set_external_ref(&conn, source_id, external_ref.as_deref())?;
+                changed = true;
+            }
+            Action::Noop => {}
+        }
+    }
+    if changed {
+        let conn = state.conn()?;
+        write_synced(&conn, vault_root, cipher)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MASTER: [u8; 32] = [7u8; 32];
     const VAULT_ID: &str = "vault-abc";
+
+    // --- reducer (pure) ---
+
+    fn st(state: SourceState, hash: Option<&str>) -> ItemState {
+        ItemState {
+            source_id: "s1".into(),
+            source_modified_at: None,
+            source_content_hash: hash.map(String::from),
+            source_state: state,
+        }
+    }
+
+    #[test]
+    fn add_ingests_new_but_is_idempotent_and_recovers() {
+        assert_eq!(
+            react(
+                ChangeEvent::Add {
+                    source_id: "s1".into(),
+                    modified_at: None
+                },
+                None
+            ),
+            vec![Action::IngestNew {
+                source_id: "s1".into()
+            }]
+        );
+        // A watcher double-fire on a present, reachable item must not re-stage it.
+        assert_eq!(
+            react(
+                ChangeEvent::Add {
+                    source_id: "s1".into(),
+                    modified_at: None
+                },
+                Some(&st(SourceState::Ok, Some("h1")))
+            ),
+            vec![Action::Noop]
+        );
+        // A previously-missing item reappearing comes back to reachable.
+        assert_eq!(
+            react(
+                ChangeEvent::Add {
+                    source_id: "s1".into(),
+                    modified_at: None
+                },
+                Some(&st(SourceState::SourceMissing, Some("h1")))
+            ),
+            vec![Action::SetState {
+                source_id: "s1".into(),
+                state: SourceState::Ok
+            }]
+        );
+    }
+
+    fn update(hash: Option<&str>) -> ChangeEvent {
+        ChangeEvent::Update {
+            source_id: "s1".into(),
+            modified_at: Some("2026-06-26T00:00:00Z".into()),
+            new_content_hash: hash.map(String::from),
+        }
+    }
+
+    #[test]
+    fn update_debounces_without_a_hash_and_re_embeds_only_on_a_real_change() {
+        // Unknown item → treat as an Add.
+        assert_eq!(
+            react(update(Some("h1")), None),
+            vec![Action::IngestNew {
+                source_id: "s1".into()
+            }]
+        );
+        // No hash (watcher mid-write) → debounce, don't touch the index.
+        assert_eq!(
+            react(update(None), Some(&st(SourceState::Ok, Some("h1")))),
+            vec![Action::DebounceThenCheck {
+                source_id: "s1".into(),
+                modified_at: Some("2026-06-26T00:00:00Z".into())
+            }]
+        );
+        // Same hash → a touch, not an edit.
+        assert_eq!(
+            react(update(Some("h1")), Some(&st(SourceState::Ok, Some("h1")))),
+            vec![Action::Noop]
+        );
+        // Changed hash → re-embed only (classification persists).
+        assert_eq!(
+            react(update(Some("h2")), Some(&st(SourceState::Ok, Some("h1")))),
+            vec![Action::ReEmbed {
+                source_id: "s1".into(),
+                new_content_hash: "h2".into()
+            }]
+        );
+        // Changed hash on a missing item → recover, then re-embed.
+        assert_eq!(
+            react(
+                update(Some("h2")),
+                Some(&st(SourceState::SourceMissing, Some("h1")))
+            ),
+            vec![
+                Action::SetState {
+                    source_id: "s1".into(),
+                    state: SourceState::Ok
+                },
+                Action::ReEmbed {
+                    source_id: "s1".into(),
+                    new_content_hash: "h2".into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_is_soft_and_rename_preserves_identity() {
+        // Delete → soft source-missing, never a hard drop.
+        assert_eq!(
+            react(
+                ChangeEvent::Delete {
+                    source_id: "s1".into()
+                },
+                Some(&st(SourceState::Ok, Some("h1")))
+            ),
+            vec![Action::SetState {
+                source_id: "s1".into(),
+                state: SourceState::SourceMissing
+            }]
+        );
+        // Delete of an unknown id → nothing.
+        assert_eq!(
+            react(
+                ChangeEvent::Delete {
+                    source_id: "s1".into()
+                },
+                None
+            ),
+            vec![Action::Noop]
+        );
+        // Rename → only the external ref moves; classification untouched.
+        assert_eq!(
+            react(
+                ChangeEvent::Rename {
+                    source_id: "s1".into(),
+                    new_external_ref: Some("drive://new".into())
+                },
+                Some(&st(SourceState::Ok, Some("h1")))
+            ),
+            vec![Action::UpdatePointer {
+                source_id: "s1".into(),
+                external_ref: Some("drive://new".into())
+            }]
+        );
+        // Rename of a missing item → recover then update the ref.
+        assert_eq!(
+            react(
+                ChangeEvent::Rename {
+                    source_id: "s1".into(),
+                    new_external_ref: None
+                },
+                Some(&st(SourceState::SourceMissing, None))
+            ),
+            vec![
+                Action::SetState {
+                    source_id: "s1".into(),
+                    state: SourceState::Ok
+                },
+                Action::UpdatePointer {
+                    source_id: "s1".into(),
+                    external_ref: None
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn source_failure_fans_out_to_unreachable() {
+        assert_eq!(
+            react(
+                ChangeEvent::SourceFailure {
+                    source: "gdrive-acct".into()
+                },
+                None
+            ),
+            vec![Action::SetSourceState {
+                source: "gdrive-acct".into(),
+                state: SourceState::Unreachable
+            }]
+        );
+    }
 
     fn sample() -> Manifest {
         Manifest {
@@ -671,5 +1227,135 @@ mod tests {
             ids.contains(&"s2"),
             "the awaiting-Rebuild file item is preserved, not dropped"
         );
+    }
+
+    // --- executor state transitions (no embedder needed) ---
+
+    #[test]
+    fn delete_is_soft_and_keeps_the_item_and_its_index_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        insert_index_only(&conn, "s1", "Unsorted");
+        let doc_id: i64 = conn
+            .query_row("SELECT id FROM documents WHERE source_id='s1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // A chunk + vector + FTS row, so we can prove the soft delete leaves it findable.
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count, kind) \
+             VALUES (?1, 0, '(body available at the source)', 1, 'leaf')",
+            params![doc_id],
+        )
+        .unwrap();
+        let chunk_id = conn.last_insert_rowid();
+        let vec = format!("[{}]", vec!["0.1"; 384].join(", "));
+        conn.execute(
+            "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+            params![chunk_id, vec],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?1, 'a short summary')",
+            params![chunk_id],
+        )
+        .unwrap();
+
+        set_item_state(&conn, "s1", SourceState::SourceMissing).unwrap();
+
+        let state: String = conn
+            .query_row(
+                "SELECT source_state FROM documents WHERE source_id='s1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "source_missing");
+        // The row, its vector, and its FTS entry all survive — a soft delete, never a hard drop.
+        let docs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE source_id='s1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let vecs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunk_vec WHERE rowid=?1",
+                params![chunk_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks_fts WHERE rowid=?1",
+                params![chunk_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (docs, vecs, fts),
+            (1, 1, 1),
+            "a soft delete keeps the item + its index rows so it stays findable"
+        );
+    }
+
+    #[test]
+    fn source_failure_fans_out_only_to_that_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        insert_index_only(&conn, "acct:1", "Unsorted");
+        insert_index_only(&conn, "acct:2", "Unsorted");
+        insert_index_only(&conn, "other:1", "Unsorted");
+
+        set_source_state(&conn, "acct", SourceState::Unreachable).unwrap();
+
+        let unreachable: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE source_state='unreachable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unreachable, 2,
+            "both items of the failed source go unreachable"
+        );
+        let other: String = conn
+            .query_row(
+                "SELECT source_state FROM documents WHERE source_id='other:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, "ok", "a different source is untouched");
+    }
+
+    #[test]
+    fn rename_updates_ref_without_disturbing_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        insert_index_only(&conn, "s1", "Taxes");
+        let entity = crate::entities::resolve_project(&conn, "Taxes", true)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE documents SET entity_id = ?1 WHERE source_id = 's1'",
+            params![entity],
+        )
+        .unwrap();
+
+        set_external_ref(&conn, "s1", Some("drive://moved")).unwrap();
+
+        let (ext, proj, ent): (Option<String>, String, Option<i64>) = conn
+            .query_row(
+                "SELECT external_ref, project, entity_id FROM documents WHERE source_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ext.as_deref(), Some("drive://moved"));
+        assert_eq!(proj, "Taxes", "a rename leaves classification untouched");
+        assert_eq!(ent, Some(entity), "the entity link survives a rename");
     }
 }

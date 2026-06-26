@@ -219,6 +219,8 @@ export interface Document {
   source_state: "ok" | "source_missing" | "unreachable";
   /** Source URL / id shown for an index-only item in place of a local `source_path`. */
   external_ref: string | null;
+  /** The stable source id for an index-only item (`null` for a vault document). */
+  source_id: string | null;
 }
 
 /** The AI's proposed organisation for a document, shown in the Review view. */
