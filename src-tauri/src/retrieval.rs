@@ -24,11 +24,11 @@ const BRANCH_LIMIT: usize = 20;
 /// Reciprocal Rank Fusion constant (the value from the original RRF paper). It
 /// damps low-ranked hits without needing to normalize the two branches' scores,
 /// which live on entirely different scales (cosine distance vs. BM25).
-const RRF_K: f64 = 60.0;
+pub const RRF_K: f64 = 60.0;
 
 /// Recency decay (spec §3): how fast a document's pull fades once it goes quiet.
 /// At one half-life the *decayable* part of its score halves.
-const HALF_LIFE_DAYS: f64 = 90.0;
+pub const HALF_LIFE_DAYS: f64 = 90.0;
 
 /// The floor on the recency multiplier: even an infinitely stale document keeps
 /// half its fused score. This guarantees decay is a gentle re-ordering nudge, not
@@ -236,6 +236,30 @@ fn vector_search(conn: &Connection, embedding: &[f32], limit: usize) -> Result<V
     Ok(rows)
 }
 
+/// KNN over `chunk_vec` keeping the raw `vec0` distance alongside each id (nearest first). Used
+/// only by the read-only [`explain`] path; the production [`vector_search`] discards distance and
+/// keeps order. Distance is `vec0`'s metric (lower = nearer), surfaced for diagnostics only.
+fn vector_search_scored(
+    conn: &Connection,
+    embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<(i64, f32)>> {
+    if embedding.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json = serde_json::to_string(embedding)
+        .map_err(|e| Error::Other(format!("encode query embedding: {e}")))?;
+    let mut stmt = conn.prepare(
+        "SELECT rowid, distance FROM chunk_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![json, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// BM25-ranked keyword search over `chunks_fts`. Returns chunk ids best-first.
 fn keyword_search(conn: &Connection, query_text: &str, limit: usize) -> Result<Vec<i64>> {
     let Some(match_query) = fts_query(query_text) else {
@@ -294,28 +318,24 @@ fn sort_scored(ranked: &mut [(i64, f64)]) {
     });
 }
 
-/// Multiply each candidate's fused score by its document's recency decay, re-sort,
-/// and return the top-k chunk ids. A document with no parseable timestamp (or a
-/// vanished chunk) is left undecayed. One batched query for all candidates.
-fn apply_recency(conn: &Connection, fused: Vec<(i64, f64)>, k: usize) -> Result<Vec<i64>> {
+/// Age (in days) for each chunk's document, in a single batched query. A document with no
+/// parseable timestamp (or a vanished chunk) is simply absent from the map (caller leaves it
+/// undecayed). Strip the trailing `Z` our timestamps carry — older SQLite builds don't parse the
+/// zone suffix in julianday, and our times are already UTC. Deliberately UTC, not the user's zone:
+/// recency is a continuous half-life over an *instant* age (UTC-now minus a UTC-stored timestamp),
+/// not a civil-day "today" boundary like the focus-view deltas — so don't thread the user's zone.
+fn fetch_ages(conn: &Connection, ids: &[i64]) -> Result<std::collections::HashMap<i64, f64>> {
     use std::collections::HashMap;
-    if fused.is_empty() {
-        return Ok(Vec::new());
+    if ids.is_empty() {
+        return Ok(HashMap::new());
     }
-    // Age (in days) for every candidate in a single query rather than one round-trip
-    // per candidate. Strip the trailing `Z` our timestamps carry — older SQLite
-    // builds don't parse the zone suffix in julianday, and our times are already UTC.
-    // Deliberately UTC, not the user's zone: recency is a continuous half-life over an
-    // *instant* age (UTC-now minus a UTC-stored timestamp), not a civil-day "today"
-    // boundary like the focus-view deltas — so don't thread the user's zone here.
-    let placeholders = vec!["?"; fused.len()].join(",");
+    let placeholders = vec!["?"; ids.len()].join(",");
     let mut stmt = conn.prepare(&format!(
         "SELECT c.id, julianday('now') \
          - julianday(replace(COALESCE(d.last_activity, d.ingested_at), 'Z', '')) \
          FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id IN ({placeholders})",
     ))?;
-    let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
-    let mut ages: HashMap<i64, f64> = HashMap::with_capacity(fused.len());
+    let mut ages: HashMap<i64, f64> = HashMap::with_capacity(ids.len());
     let rows = stmt.query_map(params_from_iter(ids.iter()), |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?))
     })?;
@@ -325,6 +345,18 @@ fn apply_recency(conn: &Connection, fused: Vec<(i64, f64)>, k: usize) -> Result<
             ages.insert(id, age);
         }
     }
+    Ok(ages)
+}
+
+/// Multiply each candidate's fused score by its document's recency decay, re-sort,
+/// and return the top-k chunk ids. A document with no parseable timestamp (or a
+/// vanished chunk) is left undecayed. One batched query for all candidates.
+fn apply_recency(conn: &Connection, fused: Vec<(i64, f64)>, k: usize) -> Result<Vec<i64>> {
+    if fused.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+    let ages = fetch_ages(conn, &ids)?;
 
     let mut scored: Vec<(i64, f64)> = fused
         .into_iter()
@@ -374,6 +406,125 @@ fn load_chunks(conn: &Connection, ids: &[i64]) -> Result<Vec<RetrievedChunk>> {
             Err(rusqlite::Error::QueryReturnedNoRows) => {} // chunk vanished; skip
             Err(e) => return Err(Error::from(e)),
         }
+    }
+    Ok(out)
+}
+
+/// A retrieval candidate carrying every per-stage score the hybrid pipeline computes — the
+/// read-only diagnostic behind the Developer-mode "Retrieval explain" panel (issue #81). Mirrors
+/// [`hybrid_core`] but *keeps* the scores the production path discards, and reuses the very same
+/// fusion / recency / chunk-load helpers so it can never drift from real retrieval.
+#[derive(Clone, Serialize)]
+pub struct ExplainCandidate {
+    pub chunk: RetrievedChunk,
+    /// Rank (0-based) in the vector KNN branch + the raw `vec0` distance (lower = nearer); `None`
+    /// when the chunk surfaced only via the keyword branch.
+    pub vector_rank: Option<usize>,
+    pub vector_distance: Option<f32>,
+    /// Rank (0-based) in the keyword/FTS branch; `None` when it surfaced only via the vector branch.
+    pub keyword_rank: Option<usize>,
+    /// RRF fused score (post-fusion, pre-decay).
+    pub fused_score: f64,
+    /// Document age in days (`None` when undated), the recency multiplier applied, and the final
+    /// decayed score the top-k cut ranks by.
+    pub age_days: Option<f64>,
+    pub decay_factor: f64,
+    pub decayed_score: f64,
+}
+
+/// Run the hybrid retriever for `query` and return the top-k candidates **with** their per-stage
+/// scores, in fused + recency order (reranking, if enabled, is applied off the DB lock by the
+/// caller). The production [`retrieve_fused`] path is left untouched; this is a parallel,
+/// instrumented read used only by the Developer-mode panel. Pure SQL + a supplied embedding, like
+/// [`hybrid_core`], so it is unit-testable without Python.
+pub fn explain(
+    conn: &Connection,
+    query_text: &str,
+    query_embedding: &[f32],
+    k: usize,
+    project: Option<&str>,
+) -> Result<Vec<ExplainCandidate>> {
+    use std::collections::HashMap;
+
+    let branch_limit = BRANCH_LIMIT.max(k);
+    let allowed = match project {
+        Some(p) => Some(project_chunk_ids(conn, p)?),
+        None => None,
+    };
+    let fetch = if allowed.is_some() {
+        SCOPED_POOL.max(branch_limit)
+    } else {
+        branch_limit
+    };
+
+    let mut vec_scored = vector_search_scored(conn, query_embedding, fetch)?;
+    let mut fts_hits = keyword_search(conn, query_text, fetch)?;
+    if let Some(allowed) = &allowed {
+        vec_scored.retain(|(id, _)| allowed.contains(id));
+        fts_hits.retain(|id| allowed.contains(id));
+        vec_scored.truncate(branch_limit);
+        fts_hits.truncate(branch_limit);
+    }
+
+    // Per-branch rank + (vector) distance, keeping the best (first) rank for any duplicate id.
+    let mut vector_rank: HashMap<i64, usize> = HashMap::new();
+    let mut vector_distance: HashMap<i64, f32> = HashMap::new();
+    for (rank, (id, dist)) in vec_scored.iter().enumerate() {
+        vector_rank.entry(*id).or_insert(rank);
+        vector_distance.entry(*id).or_insert(*dist);
+    }
+    let mut keyword_rank: HashMap<i64, usize> = HashMap::new();
+    for (rank, id) in fts_hits.iter().enumerate() {
+        keyword_rank.entry(*id).or_insert(rank);
+    }
+
+    // Fuse with the SAME function production uses, so the ranking can't drift.
+    let vec_hits: Vec<i64> = vec_scored.iter().map(|(id, _)| *id).collect();
+    let fused = fuse_scored(&[vec_hits, fts_hits]);
+    let fused_score: HashMap<i64, f64> = fused.iter().copied().collect();
+
+    // Recency: age + factor per candidate, then the top-k cut by decayed score (mirrors apply_recency).
+    let fused_ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+    let ages = fetch_ages(conn, &fused_ids)?;
+    let mut decayed: Vec<(i64, Option<f64>, f64, f64)> = fused
+        .into_iter()
+        .map(|(id, score)| {
+            let age = ages.get(&id).copied();
+            let factor = age
+                .map(|a| decay_factor(a.max(0.0), HALF_LIFE_DAYS))
+                .unwrap_or(1.0);
+            (id, age, factor, score * factor)
+        })
+        .collect();
+    decayed.sort_by(|a, b| {
+        b.3.partial_cmp(&a.3)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    decayed.truncate(k);
+
+    // Load full chunk provenance for the survivors, preserving the ranked order.
+    let ids: Vec<i64> = decayed.iter().map(|(id, ..)| *id).collect();
+    let by_id: HashMap<i64, RetrievedChunk> = load_chunks(conn, &ids)?
+        .into_iter()
+        .map(|c| (c.chunk_id, c))
+        .collect();
+
+    let mut out = Vec::with_capacity(decayed.len());
+    for (id, age, factor, decayed_score) in decayed {
+        let Some(chunk) = by_id.get(&id) else {
+            continue;
+        };
+        out.push(ExplainCandidate {
+            chunk: chunk.clone(),
+            vector_rank: vector_rank.get(&id).copied(),
+            vector_distance: vector_distance.get(&id).copied(),
+            keyword_rank: keyword_rank.get(&id).copied(),
+            fused_score: fused_score.get(&id).copied().unwrap_or(0.0),
+            age_days: age,
+            decay_factor: factor,
+            decayed_score,
+        });
     }
     Ok(out)
 }
@@ -799,5 +950,48 @@ mod tests {
         let fused2 = retrieve_fused(&conn, &q).unwrap();
         let passthrough = rerank(None, q.text, fused2.clone()).unwrap();
         assert_eq!(ids(&passthrough), ids(&fused2));
+    }
+
+    #[test]
+    fn explain_reports_every_per_stage_score_in_ranked_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&path, key).unwrap();
+
+        insert_doc_chunk(
+            &conn,
+            "Cat facts",
+            "Cats purr when they are content.",
+            &unit_vec(0),
+        );
+        insert_doc_chunk(
+            &conn,
+            "Tax guide",
+            "File your taxes before April 15th.",
+            &unit_vec(1),
+        );
+
+        // A query matching the first chunk in BOTH branches (semantically + the word "purr").
+        let rows = explain(&conn, "purr", &unit_vec(0), 6, None).unwrap();
+        assert!(rows.len() >= 2, "both chunks should be candidates");
+
+        // The best match leads and carries scores from both branches.
+        let top = &rows[0];
+        assert_eq!(top.chunk.title, "Cat facts");
+        assert_eq!(top.vector_rank, Some(0));
+        assert!(top.vector_distance.is_some());
+        assert_eq!(top.keyword_rank, Some(0));
+        assert!(top.fused_score > 0.0, "fused score should be populated");
+        assert!(top.decay_factor > 0.0 && top.decay_factor <= 1.0);
+        assert!(top.decayed_score > 0.0);
+
+        // The keyword-only miss (the tax doc) still appears, scored by the vector branch alone.
+        assert!(rows.iter().any(|r| r.keyword_rank.is_none()));
+
+        // Candidates come back ranked by decayed score, descending.
+        for w in rows.windows(2) {
+            assert!(w[0].decayed_score >= w[1].decayed_score);
+        }
     }
 }

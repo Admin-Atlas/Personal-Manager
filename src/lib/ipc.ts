@@ -11,6 +11,7 @@ import type {
   Conversation,
   CostSummary,
   DailyBriefing,
+  DevRetrievalExplain,
   DevSystemInfo,
   DevTableCount,
   DevTablePage,
@@ -302,9 +303,9 @@ export function rebuildIndex(onEvent: (event: IngestEvent) => void): Promise<voi
 }
 
 // --- Developer mode (issue #78): read-only inspection surfaces ---
-// All four are harmless reads (always registered in the backend); the UI that calls them is
-// gated by the runtime `devMode` (see lib/capabilities). The backend redacts before returning,
-// so these payloads are already safe to display.
+// All are harmless reads (always registered in the backend); the UI that calls them is gated by
+// the runtime `devMode` (see lib/capabilities). The backend redacts before returning, so these
+// payloads are already safe to display.
 
 /** Running vault's index-time + runtime facts for the Dev tab's System panel. */
 export const devSystemInfo = () => invoke<DevSystemInfo>("dev_system_info");
@@ -323,6 +324,12 @@ export const devTableRows = (table: string, limit: number, offset: number) =>
  *  length-only (the `chunks` projection), ordered by ordinal, capped at 500. */
 export const devDocumentChunks = (documentId: number) =>
   invoke<DevTablePage>("dev_document_chunks", { documentId });
+
+/** Run a query through the live hybrid retriever and return each candidate's per-stage scores
+ *  (issue #81). Read-only; chunk bodies come back as truncated previews. `k` defaults to 6,
+ *  clamped 1–50. Embeds via the sidecar, so it needs the document engine ready. */
+export const devRetrievalExplain = (query: string, project?: string, k?: number) =>
+  invoke<DevRetrievalExplain>("dev_retrieval_explain", { query, project, k });
 
 // --- Archivist: sorting review & organisation (Step 4) ---
 
