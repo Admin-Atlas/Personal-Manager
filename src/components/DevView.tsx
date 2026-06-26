@@ -19,6 +19,7 @@ import {
 import type { DevSystemInfo, DevTableCount, DevTablePage, SidecarStatus } from "../lib/types";
 import { Button, Select } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
+import { DevTableGrid } from "./dev/DevTableGrid";
 
 const PAGE = 50;
 
@@ -41,37 +42,6 @@ function Row({ label, value }: { label: string; value: string }) {
     <div className="flex items-baseline justify-between gap-4 border-b border-rule py-1 last:border-0">
       <span className="text-xs text-ink3">{label}</span>
       <span className="break-all text-right font-mono text-xs text-ink2">{value}</span>
-    </div>
-  );
-}
-
-/** A redacted table page rendered as a horizontally-scrollable grid. */
-function TableGrid({ page }: { page: DevTablePage }) {
-  if (page.rows.length === 0) return <p className="text-xs text-ink4">No rows.</p>;
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full border-collapse text-left font-mono text-xs">
-        <thead>
-          <tr className="border-b border-border2 text-ink3">
-            {page.columns.map((c) => (
-              <th key={c} className="whitespace-nowrap px-2 py-1 font-medium">
-                {c}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {page.rows.map((row, i) => (
-            <tr key={i} className="border-b border-rule text-ink2 last:border-0">
-              {row.map((cell, j) => (
-                <td key={j} className="whitespace-nowrap px-2 py-1 align-top">
-                  {cell || "—"}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
     </div>
   );
 }
@@ -199,7 +169,7 @@ export function DevView() {
               </Select>
             }
           >
-            {page ? <TableGrid page={page} /> : <p className="text-xs text-ink4">Loading…</p>}
+            {page ? <DevTableGrid page={page} /> : <p className="text-xs text-ink4">Loading…</p>}
             {page && page.total > PAGE && (
               <div className="mt-3 flex items-center justify-between text-xs text-ink3">
                 <span>

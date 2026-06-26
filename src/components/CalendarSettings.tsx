@@ -16,7 +16,9 @@ import {
   syncCalendar,
 } from "../lib/ipc";
 import type { CalendarStatus, GoogleCalendar, IcsFeedInfo } from "../lib/types";
+import { useDevMode } from "../lib/capabilities";
 import { Button, ConfirmDialog, Input, Skeleton } from "./ui";
+import { DevPanel } from "./dev/DevPanel";
 
 type Confirm = { kind: "disconnect" } | { kind: "remove-feed"; id: string; label: string };
 
@@ -31,6 +33,7 @@ type Confirm = { kind: "disconnect" } | { kind: "remove-feed"; id: string; label
  * and the focus view's "Due soon" status. Tokens/feed URLs live in the keychain.
  */
 export function CalendarSettings() {
+  const { devMode } = useDevMode();
   const [status, setStatus] = useState<CalendarStatus | null>(null);
   const [feeds, setFeeds] = useState<IcsFeedInfo[]>([]);
   const [feedLabel, setFeedLabel] = useState("");
@@ -370,6 +373,38 @@ export function CalendarSettings() {
         >
           {error}
         </p>
+      )}
+
+      {devMode && status && (
+        <DevPanel
+          title="Calendar sync state"
+          helpId="dev-calendar"
+          subtitle="Connection + last-sync diagnostics. No tokens or feed URLs (keychain-only) are ever shown."
+          className="mt-4"
+        >
+          <div className="grid grid-cols-1 gap-x-6 gap-y-1 font-mono text-[11px] text-ink4 sm:grid-cols-2">
+            <span>
+              ics_feeds: <span className="text-ink3">{status.ics_feeds}</span>
+            </span>
+            <span>
+              calendars_selected: <span className="text-ink3">{status.calendars_selected}</span>
+            </span>
+            <span>
+              oauth_client_configured:{" "}
+              <span className="text-ink3">{status.oauth_client_configured ? "yes" : "no"}</span>
+            </span>
+            <span>
+              oauth_connected:{" "}
+              <span className="text-ink3">{status.oauth_connected ? "yes" : "no"}</span>
+            </span>
+            <span>
+              window_days: <span className="text-ink3">{status.window_days}</span>
+            </span>
+            <span>
+              last_sync: <span className="text-ink3">{status.last_sync ?? "never"}</span>
+            </span>
+          </div>
+        </DevPanel>
       )}
 
       <ConfirmDialog

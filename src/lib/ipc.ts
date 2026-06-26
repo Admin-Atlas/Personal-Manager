@@ -319,6 +319,11 @@ export const devTableList = () => invoke<string[]>("dev_table_list");
 export const devTableRows = (table: string, limit: number, offset: number) =>
   invoke<DevTablePage>("dev_table_rows", { table, limit, offset });
 
+/** The chunk breakdown for one document — the in-context Documents inspector. Content is
+ *  length-only (the `chunks` projection), ordered by ordinal, capped at 500. */
+export const devDocumentChunks = (documentId: number) =>
+  invoke<DevTablePage>("dev_document_chunks", { documentId });
+
 // --- Archivist: sorting review & organisation (Step 4) ---
 
 /** Distinct project labels across all documents. */

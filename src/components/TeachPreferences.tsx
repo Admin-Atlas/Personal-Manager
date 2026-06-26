@@ -17,7 +17,9 @@ import {
   updatePreference,
 } from "../lib/ipc";
 import type { Entity, Preference } from "../lib/types";
+import { useDevMode } from "../lib/capabilities";
 import { useDepth } from "../theme";
+import { DevRaw } from "./dev/DevRaw";
 import { Button, Card, ConfirmDialog, Input, Modal, Select, Skeleton, Textarea } from "./ui";
 
 const SCOPE_GLOBAL = "global";
@@ -204,6 +206,7 @@ function PreferenceRow({
 }) {
   // A migrated/inferred record the user hasn't vouched for yet — offer a one-click confirm.
   const unconfirmed = pref.source === "inferred" && !pref.user_confirmed;
+  const { devMode } = useDevMode();
 
   return (
     <li>
@@ -226,6 +229,19 @@ function PreferenceRow({
               </span>
             )}
           </div>
+          {devMode && (
+            <DevRaw
+              label="preference"
+              fields={[
+                ["id", pref.id],
+                ["scope", pref.scope],
+                ["entity_id", pref.entity_id],
+                ["source", pref.source],
+                ["confidence", `${Math.round(pref.confidence * 100)}%`],
+                ["user_confirmed", pref.user_confirmed ? "yes" : "no"],
+              ]}
+            />
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {unconfirmed && (

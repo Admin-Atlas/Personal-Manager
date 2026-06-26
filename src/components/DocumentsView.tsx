@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   devApplyChangeEvent,
+  devDocumentChunks,
   ensureSidecar,
   ingestPaths,
   listDocuments,
@@ -13,11 +14,12 @@ import {
   sidecarStatus,
   vaultStatus,
 } from "../lib/ipc";
-import type { Document, IngestEvent, SidecarStatus } from "../lib/types";
+import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
-import { isDevBuild } from "../lib/capabilities";
+import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { useDepth } from "../theme";
 import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
+import { DevTableGrid } from "./dev/DevTableGrid";
 import { IngestProgress } from "./IngestProgress";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
 
@@ -59,6 +61,26 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [devTitle, setDevTitle] = useState("");
   const [devBody, setDevBody] = useState("");
   const { showPower } = useDepth();
+  // Developer mode (issue #78): an in-place chunk inspector. Clicking a document's chunk count
+  // (when devMode is on) expands its leaf/parent chunk breakdown, fetched read-only on demand.
+  const { devMode } = useDevMode();
+  const [chunksFor, setChunksFor] = useState<number | null>(null);
+  const [chunkPage, setChunkPage] = useState<DevTablePage | null>(null);
+
+  async function toggleChunks(docId: number) {
+    if (chunksFor === docId) {
+      setChunksFor(null);
+      setChunkPage(null);
+      return;
+    }
+    setChunksFor(docId);
+    setChunkPage(null);
+    try {
+      setChunkPage(await devDocumentChunks(docId));
+    } catch {
+      /* read-only diagnostic — leave the panel empty on failure */
+    }
+  }
 
   // `busy` inside the drag-drop listener would be stale; read it via a ref.
   const busyRef = useRef(false);
@@ -517,42 +539,77 @@ export function DocumentsView({ onReviewClick }: Props) {
                 </thead>
                 <tbody>
                   {documents.map((doc) => (
-                    <tr key={doc.id} className="border-b border-rule">
-                      <td className="py-2 pr-3">
-                        <div className="flex items-center gap-2">
-                          <div className="truncate text-ink" title={doc.title}>
-                            {doc.title}
-                          </div>
-                          {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
-                        </div>
-                        {(() => {
-                          const ref =
-                            doc.source_type === "index_only" ? doc.external_ref : doc.source_path;
-                          return ref ? (
-                            <div className="truncate text-xs text-ink4" title={ref}>
-                              {ref}
+                    <Fragment key={doc.id}>
+                      <tr className="border-b border-rule">
+                        <td className="py-2 pr-3">
+                          <div className="flex items-center gap-2">
+                            <div className="truncate text-ink" title={doc.title}>
+                              {doc.title}
                             </div>
-                          ) : null;
-                        })()}
-                      </td>
-                      <td className="py-2 pr-3 text-ink3">
-                        <span className="inline-flex items-center gap-1.5">
-                          {!doc.reviewed && (
-                            <span
-                              className="inline-block h-1.5 w-1.5 rounded-full"
-                              style={{ background: "var(--st-due)" }}
-                              title="Awaiting review"
-                            />
+                            {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
+                          </div>
+                          {(() => {
+                            const ref =
+                              doc.source_type === "index_only" ? doc.external_ref : doc.source_path;
+                            return ref ? (
+                              <div className="truncate text-xs text-ink4" title={ref}>
+                                {ref}
+                              </div>
+                            ) : null;
+                          })()}
+                        </td>
+                        <td className="py-2 pr-3 text-ink3">
+                          <span className="inline-flex items-center gap-1.5">
+                            {!doc.reviewed && (
+                              <span
+                                className="inline-block h-1.5 w-1.5 rounded-full"
+                                style={{ background: "var(--st-due)" }}
+                                title="Awaiting review"
+                              />
+                            )}
+                            {doc.project}
+                          </span>
+                        </td>
+                        <td className="py-2 pr-3 capitalize text-ink3">{doc.importance ?? "—"}</td>
+                        <td className="py-2 pr-3 text-right text-ink3">
+                          {devMode ? (
+                            <button
+                              type="button"
+                              onClick={() => toggleChunks(doc.id)}
+                              className="font-mono text-ink3 underline decoration-dotted underline-offset-2 hover:text-ink"
+                              title="Inspect this document's chunk breakdown"
+                            >
+                              {doc.chunk_count}
+                            </button>
+                          ) : (
+                            doc.chunk_count
                           )}
-                          {doc.project}
-                        </span>
-                      </td>
-                      <td className="py-2 pr-3 capitalize text-ink3">{doc.importance ?? "—"}</td>
-                      <td className="py-2 pr-3 text-right text-ink3">{doc.chunk_count}</td>
-                      {showPower && (
-                        <td className="py-2 text-right text-ink4">{formatDate(doc.ingested_at)}</td>
+                        </td>
+                        {showPower && (
+                          <td className="py-2 text-right text-ink4">
+                            {formatDate(doc.ingested_at)}
+                          </td>
+                        )}
+                      </tr>
+                      {/* Dev-mode chunk breakdown, expanded directly under its document (read-only). */}
+                      {devMode && chunksFor === doc.id && (
+                        <tr>
+                          <td colSpan={showPower ? 5 : 4} className="pb-3">
+                            <div className="rounded-[var(--radius-sm)] border border-border bg-surface p-3">
+                              <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
+                                chunks · doc_id {doc.id}
+                                {chunkPage ? ` · ${chunkPage.total} total` : ""}
+                              </p>
+                              {chunkPage ? (
+                                <DevTableGrid page={chunkPage} />
+                              ) : (
+                                <p className="text-xs text-ink4">Loading…</p>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
                       )}
-                    </tr>
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
