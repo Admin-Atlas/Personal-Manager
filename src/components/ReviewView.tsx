@@ -326,7 +326,7 @@ function ReviewRow({
         )}
 
         <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-3">
-          <label className="flex items-center gap-2 text-xs text-ink3">
+          <label className="flex items-center gap-2 text-xs text-ink3" data-help="review-project">
             Project
             <Input
               list={PROJECTS_LIST_ID}
@@ -336,7 +336,7 @@ function ReviewRow({
             />
           </label>
 
-          <div className="flex items-center gap-2 text-xs text-ink3">
+          <div className="flex items-center gap-2 text-xs text-ink3" data-help="review-importance">
             Importance
             <ImportancePicker
               value={value.importance}
@@ -345,7 +345,7 @@ function ReviewRow({
           </div>
         </div>
 
-        <div className="mt-3">
+        <div className="mt-3" data-help="review-tags">
           <TagEditor tags={value.tags} onChange={(tags) => onChange({ tags })} />
         </div>
       </Card>

@@ -126,7 +126,19 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "review-row": {
     title: "Reviewing a document",
-    body: "Set the project (start typing to reuse an existing one), pick an importance, and add short tags. The grey line is the AI's reasoning for its suggestion.",
+    body: "Set the project (start typing to reuse an existing one), pick an importance, and add short tags. The grey line is the AI's reasoning for its suggestion. Hover the Project, Importance, and Tags fields for what each one does.",
+  },
+  "review-project": {
+    title: "Project",
+    body: "Which body of work this document belongs to — the bucket it's filed and found under (one document, one project). Start typing to reuse an existing project; a new name creates one. Projects are what the Focus and Map views group by, so consistent names matter more than perfect ones.",
+  },
+  "review-importance": {
+    title: "Importance",
+    body: "How much this document matters to you — NOT how new it is or how often you open it. High: a core reference you'd be set back without; it can surface in Focus and nudge a project toward 'due soon'. Medium: useful, you'll want it sometimes. Low: keep-but-peripheral — it's auto-filed out of the review queue so it never becomes a chore, and stays fully searchable. Rules of thumb for the tricky cases: an active project but an outdated/unused file → Low (the project being live doesn't make the file significant); something you open often but that isn't significant → Medium is fine; something you rarely touch but would be stuck without → High. When unsure, Medium is the safe middle — you can change it anytime.",
+  },
+  "review-tags": {
+    title: "Tags",
+    body: "Short, free-form labels for finding and grouping documents later — topics, people, or types like 'invoice', 'tax', 'spec', 'meeting'. They're extra handles for search and don't change a document's project or importance. Keep them lowercase and short; press Enter or comma to add, × to remove. A document can have many; none is fine too.",
   },
 
   // Chat
