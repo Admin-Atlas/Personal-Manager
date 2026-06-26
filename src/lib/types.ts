@@ -471,3 +471,36 @@ export interface DevTablePage {
   limit: number;
   offset: number;
 }
+
+/** One ranked candidate from a "Retrieval explain" run, with every per-stage score (issue #81).
+ *  `preview` is the chunk's body text truncated to a char cap — never the full body. */
+export interface DevRetrievalRow {
+  final_rank: number;
+  chunk_id: number;
+  document_id: number;
+  title: string;
+  heading: string | null;
+  preview: string;
+  /** 0-based rank in the vector KNN branch + the raw `vec0` distance; null if keyword-only. */
+  vector_rank: number | null;
+  vector_distance: number | null;
+  /** 0-based rank in the keyword/FTS branch; null if vector-only. */
+  keyword_rank: number | null;
+  fused_score: number;
+  decay_factor: number;
+  decayed_score: number;
+  reranker_score: number | null;
+}
+
+/** Result of a "Retrieval explain" run: the ranked rows + the engine context to read them by. */
+export interface DevRetrievalExplain {
+  embedder_id: string;
+  embedder_label: string;
+  reranking_enabled: boolean;
+  /** Whether the reranker actually ran and reordered (vs. left the fused order). */
+  reranked: boolean;
+  rrf_k: number;
+  half_life_days: number;
+  k: number;
+  rows: DevRetrievalRow[];
+}

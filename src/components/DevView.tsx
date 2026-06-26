@@ -10,13 +10,21 @@
 import { useCallback, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import {
+  devRetrievalExplain,
   devSystemInfo,
   devTableCounts,
   devTableList,
   devTableRows,
   sidecarStatus,
 } from "../lib/ipc";
-import type { DevSystemInfo, DevTableCount, DevTablePage, SidecarStatus } from "../lib/types";
+import type {
+  DevRetrievalExplain,
+  DevRetrievalRow,
+  DevSystemInfo,
+  DevTableCount,
+  DevTablePage,
+  SidecarStatus,
+} from "../lib/types";
 import { Button, Select } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
 import { DevTableGrid } from "./dev/DevTableGrid";
@@ -35,6 +43,14 @@ function sidecarLabel(s: SidecarStatus | null): string {
     case "error":
       return `error (${s.kind})`;
   }
+}
+
+// The vector branch's cell: the raw `vec0` distance (lower = nearer), with its KNN rank on hover.
+// "—" when the chunk surfaced via the keyword branch only.
+function vecCell(r: DevRetrievalRow): { text: string; title: string } {
+  if (r.vector_rank == null) return { text: "—", title: "not in the vector branch" };
+  const dist = r.vector_distance != null ? r.vector_distance.toFixed(3) : "?";
+  return { text: dist, title: `vector rank ${r.vector_rank}` };
 }
 
 function Row({ label, value }: { label: string; value: string }) {
@@ -57,6 +73,27 @@ export function DevView() {
   const [page, setPage] = useState<DevTablePage | null>(null);
   const [corrections, setCorrections] = useState<DevTablePage | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Retrieval explain (issue #81): button-triggered so the sidecar embed never fires on its own.
+  const [query, setQuery] = useState("");
+  const [topK, setTopK] = useState(6);
+  const [explain, setExplain] = useState<DevRetrievalExplain | null>(null);
+  const [explaining, setExplaining] = useState(false);
+  const [explainErr, setExplainErr] = useState<string | null>(null);
+
+  const runExplain = useCallback(() => {
+    const q = query.trim();
+    if (!q) return;
+    setExplaining(true);
+    setExplainErr(null);
+    devRetrievalExplain(q, undefined, topK)
+      .then(setExplain)
+      .catch((e) => {
+        setExplain(null);
+        setExplainErr(String(e));
+      })
+      .finally(() => setExplaining(false));
+  }, [query, topK]);
 
   const refresh = useCallback(() => {
     setError(null);
@@ -129,6 +166,117 @@ export function DevView() {
               />
               <Row label="Document engine" value={sidecarLabel(sidecar)} />
             </div>
+          </DevPanel>
+
+          <DevPanel
+            title="Retrieval explain"
+            helpId="dev-retrieval"
+            subtitle="Run a query through the live hybrid retriever and see why each chunk ranks. Read-only; chunk text is a truncated preview."
+          >
+            <form
+              className="flex flex-wrap items-end gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                runExplain();
+              }}
+            >
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Query to explain…"
+                className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
+              />
+              <label className="flex items-center gap-1 text-xs text-ink3">
+                k
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={topK}
+                  onChange={(e) =>
+                    setTopK(Math.max(1, Math.min(50, Math.trunc(Number(e.target.value)) || 6)))
+                  }
+                  className="w-14 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
+                />
+              </label>
+              <Button type="submit" disabled={explaining || !query.trim()}>
+                {explaining ? "Running…" : "Run"}
+              </Button>
+            </form>
+
+            {explainErr && <p className="mt-2 text-xs text-[var(--st-due)]">{explainErr}</p>}
+
+            {explain && (
+              <div className="mt-3">
+                <p className="font-mono text-[11px] text-ink4">
+                  {explain.embedder_label} · rerank {explain.reranking_enabled ? "on" : "off"}
+                  {explain.reranking_enabled
+                    ? ` (applied: ${explain.reranked ? "yes" : "no"})`
+                    : ""}{" "}
+                  · rrf k={explain.rrf_k} · half-life {explain.half_life_days}d · k={explain.k}
+                </p>
+                {explain.rows.length === 0 ? (
+                  <p className="mt-2 text-xs text-ink4">
+                    No candidates — nothing indexed matches this query.
+                  </p>
+                ) : (
+                  <div className="mt-2 overflow-x-auto">
+                    <table className="w-full border-collapse text-left text-xs">
+                      <thead>
+                        <tr className="text-ink4">
+                          <th className="py-1 pr-2 font-medium">#</th>
+                          <th className="py-1 pr-2 font-medium">chunk</th>
+                          <th className="py-1 pr-2 text-right font-medium">vec</th>
+                          <th className="py-1 pr-2 text-right font-medium">kw</th>
+                          <th className="py-1 pr-2 text-right font-medium">fused</th>
+                          <th className="py-1 pr-2 text-right font-medium">decay</th>
+                          <th className="py-1 text-right font-medium">rerank</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {explain.rows.map((r) => {
+                          const vec = vecCell(r);
+                          return (
+                            <tr key={r.chunk_id} className="border-t border-rule align-top">
+                              <td className="py-1 pr-2 font-mono text-ink3">{r.final_rank + 1}</td>
+                              <td className="py-1 pr-2">
+                                <div className="text-ink2">
+                                  {r.title}
+                                  {r.heading ? (
+                                    <span className="text-ink4"> §{r.heading}</span>
+                                  ) : null}
+                                </div>
+                                <div className="max-w-md whitespace-pre-wrap break-words text-ink4">
+                                  {r.preview}
+                                </div>
+                              </td>
+                              <td
+                                className="py-1 pr-2 text-right font-mono text-ink3"
+                                title={vec.title}
+                              >
+                                {vec.text}
+                              </td>
+                              <td className="py-1 pr-2 text-right font-mono text-ink3">
+                                {r.keyword_rank ?? "—"}
+                              </td>
+                              <td className="py-1 pr-2 text-right font-mono text-ink3">
+                                {r.fused_score.toFixed(4)}
+                              </td>
+                              <td className="py-1 pr-2 text-right font-mono text-ink3">
+                                {r.decay_factor.toFixed(2)}
+                              </td>
+                              <td className="py-1 text-right font-mono text-ink3">
+                                {r.reranker_score != null ? r.reranker_score.toFixed(3) : "—"}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
           </DevPanel>
 
           <DevPanel

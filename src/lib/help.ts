@@ -222,6 +222,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Corrections log",
     body: "Every change you've made to a proposed project, tag, or importance — the raw signal PM learns your filing habits from. Shown as before → after with the document and when.",
   },
+  "dev-retrieval": {
+    title: "Retrieval explain",
+    body: "Type a query and PM runs it through the same hybrid retriever that grounds chat, then shows why each chunk ranked: its vector distance, keyword rank, fused score, recency decay, and reranker score. Read-only — chunk text is a short truncated preview and nothing is changed. Use it to confirm the index returns the right passages and to see what reranking does.",
+  },
   "dev-calendar": {
     title: "Calendar sync state",
     body: "Developer-mode read-out of the calendar connector's state: how many feeds/calendars are connected, whether Google OAuth is configured and connected, the sync window, and when it last synced. Tokens and feed URLs live in your keychain and are never shown here.",

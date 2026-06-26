@@ -520,6 +520,7 @@ pub fn run() {
             commands_dev::dev_table_list,
             commands_dev::dev_table_rows,
             commands_dev::dev_document_chunks,
+            commands_dev::dev_retrieval_explain,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

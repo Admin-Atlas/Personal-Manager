@@ -20,10 +20,11 @@
 use rusqlite::types::Value;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::{Error, Result};
-use crate::{db, AppState};
+use crate::sidecar::SidecarStatus;
+use crate::{db, retrieval, AppState};
 
 /// How a column's value is rendered into the read-only browser. Applied to TEXT values
 /// only; numbers/nulls/blobs are formatted directly, so a render can only ever *narrow*
@@ -298,6 +299,46 @@ pub struct DevTablePage {
     pub offset: u32,
 }
 
+/// How many characters of a matched chunk the "Retrieval explain" panel previews. The preview is
+/// the chunk's real body text cut to this many *chars* by [`truncate`] (char-boundary-safe, so it
+/// can't panic on the multilingual tier) — a walk-up-convenience truncation, NOT a redaction
+/// boundary; the boundary is that no full body and no outward path exist.
+const PREVIEW_CHARS: usize = 160;
+
+/// One ranked candidate in a "Retrieval explain" run, with every per-stage score. Mirrors
+/// [`crate::retrieval::ExplainCandidate`] but with the chunk body replaced by a truncated preview
+/// and the reranker score attached. Every value here is safe to display.
+#[derive(Serialize)]
+pub struct DevRetrievalRow {
+    pub final_rank: usize,
+    pub chunk_id: i64,
+    pub document_id: i64,
+    pub title: String,
+    pub heading: Option<String>,
+    pub preview: String,
+    pub vector_rank: Option<usize>,
+    pub vector_distance: Option<f32>,
+    pub keyword_rank: Option<usize>,
+    pub fused_score: f64,
+    pub decay_factor: f64,
+    pub decayed_score: f64,
+    pub reranker_score: Option<f32>,
+}
+
+/// The result of a "Retrieval explain" run: the ranked rows plus the engine context needed to read
+/// them (embedder, whether reranking is on and actually ran, the RRF constant and half-life).
+#[derive(Serialize)]
+pub struct DevRetrievalExplain {
+    pub embedder_id: String,
+    pub embedder_label: String,
+    pub reranking_enabled: bool,
+    pub reranked: bool,
+    pub rrf_k: f64,
+    pub half_life_days: f64,
+    pub k: usize,
+    pub rows: Vec<DevRetrievalRow>,
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -528,6 +569,114 @@ pub fn dev_document_chunks(state: State<'_, AppState>, document_id: i64) -> Resu
     document_chunks(&conn, document_id)
 }
 
+/// Read-only "Retrieval explain" (issue #81): run `query` through the live hybrid retriever and
+/// return each candidate chunk's per-stage scores — vector distance, keyword rank, RRF fused
+/// score, recency decay, and the reranker score (when reranking is on). A parallel, instrumented
+/// read; the production chat/search path is untouched. Embeds via the sidecar exactly as chat does
+/// and never holds the DB lock across a sidecar call (AGENTS rule #4). Strictly read-only — chunk
+/// bodies are previewed (truncated), never returned in full; no secret or outward path exists.
+#[tauri::command]
+pub async fn dev_retrieval_explain(
+    app: AppHandle,
+    query: String,
+    project: Option<String>,
+    k: Option<usize>,
+) -> Result<DevRetrievalExplain> {
+    tokio::task::spawn_blocking(move || -> Result<DevRetrievalExplain> {
+        let state = app.state::<AppState>();
+        let k = k.unwrap_or(retrieval::DEFAULT_TOP_K).clamp(1, 50);
+
+        // Don't trigger a slow first-run install mid-inspection — require the engine ready.
+        if !matches!(state.sidecar.status(), SidecarStatus::Ready) {
+            return Err(Error::Other(
+                "the document engine isn't ready yet — finish setup first".into(),
+            ));
+        }
+
+        // Resolve the vault's models + reranking toggle + embedder identity in one short lock, then
+        // drop it so neither the embed nor the rerank holds the DB lock across a sidecar call (#4).
+        let (gateway, rerank_on, embedder) = {
+            let conn = state.conn()?;
+            (
+                state.gateway(&conn)?,
+                db::reranking_enabled(&conn)?,
+                db::selected_embedder(&conn)?,
+            )
+        };
+
+        let embeddings = gateway.embed_query(std::slice::from_ref(&query))?;
+        let Some(query_vec) = embeddings.into_iter().next() else {
+            return Err(Error::Other("failed to embed the query".into()));
+        };
+
+        // Fused + recency-decayed candidates with per-stage scores, under one short lock.
+        let candidates = {
+            let conn = state.conn()?;
+            retrieval::explain(&conn, &query, &query_vec, k, project.as_deref())?
+        };
+
+        // Off-lock reranking: capture each candidate's score and reorder, mirroring production but
+        // keeping the scores. A `None`/mismatched result leaves the fused order (`reranked=false`).
+        let mut scored: Vec<(retrieval::ExplainCandidate, Option<f32>)> =
+            candidates.into_iter().map(|c| (c, None)).collect();
+        let mut reranked = false;
+        if rerank_on {
+            let texts: Vec<&str> = scored
+                .iter()
+                .map(|(c, _)| c.chunk.content.as_str())
+                .collect();
+            let reranker = &gateway as &dyn retrieval::Reranker;
+            if let Some(scores) = reranker.scores(&query, &texts)? {
+                if scores.len() == scored.len() {
+                    for ((_, slot), s) in scored.iter_mut().zip(scores.iter()) {
+                        *slot = Some(*s);
+                    }
+                    scored.sort_by(|a, b| {
+                        b.1.unwrap_or(f32::MIN)
+                            .partial_cmp(&a.1.unwrap_or(f32::MIN))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.0.chunk.chunk_id.cmp(&b.0.chunk.chunk_id))
+                    });
+                    reranked = true;
+                }
+            }
+        }
+
+        let rows = scored
+            .into_iter()
+            .enumerate()
+            .map(|(i, (c, reranker_score))| DevRetrievalRow {
+                final_rank: i,
+                chunk_id: c.chunk.chunk_id,
+                document_id: c.chunk.document_id,
+                title: c.chunk.title,
+                heading: c.chunk.heading,
+                preview: truncate(&c.chunk.content, PREVIEW_CHARS),
+                vector_rank: c.vector_rank,
+                vector_distance: c.vector_distance,
+                keyword_rank: c.keyword_rank,
+                fused_score: c.fused_score,
+                decay_factor: c.decay_factor,
+                decayed_score: c.decayed_score,
+                reranker_score,
+            })
+            .collect();
+
+        Ok(DevRetrievalExplain {
+            embedder_id: embedder.id.to_string(),
+            embedder_label: embedder.label.to_string(),
+            reranking_enabled: rerank_on,
+            reranked,
+            rrf_k: retrieval::RRF_K,
+            half_life_days: retrieval::HALF_LIFE_DAYS,
+            k,
+            rows,
+        })
+    })
+    .await
+    .map_err(|e| Error::Other(format!("retrieval explain task panicked: {e}")))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +757,16 @@ mod tests {
     fn truncate_marks_overflow_and_counts_chars() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn truncate_is_char_safe_on_multibyte() {
+        // The multilingual embedder tier can produce multi-byte text; the preview cap counts CHARS
+        // and must never slice a UTF-8 boundary (a naive byte slice would panic). "日本語テキスト"
+        // is 7 chars / 21 bytes; "café" is 4 chars / 5 bytes.
+        assert_eq!(truncate("日本語テキスト", 3), "日本語…");
+        // A short multi-byte string is returned whole — the cap is a ceiling, not a cut length.
+        assert_eq!(truncate("café", 10), "café");
     }
 
     #[test]
