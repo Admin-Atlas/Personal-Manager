@@ -20,7 +20,7 @@ use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
     applock, briefing, clock, cost, db, entities, index_only, learning, lock_session, openrouter,
-    paths, recommend, secrets, vault, AppState, VaultRuntime,
+    paths, preferences, recommend, secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -856,7 +856,15 @@ pub async fn send_message(
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let profile = learning::profile_preamble(&conn)?;
+        // Surface only the preferences that apply here — global + context always, plus this chat's
+        // project (Step 5) when it is scoped — the structured, condition-scoped replacement for the
+        // old whole-blob "Learning You" injection (§4.5). A scoped name resolving to no entity (a
+        // brand-new project label) just yields global+context.
+        let pref_ctx = preferences::PrefContext::for_entity(match &scope {
+            Some(name) => entities::resolve_project(&conn, name, false)?,
+            None => None,
+        });
+        let profile = preferences::preferences_preamble(&conn, pref_ctx)?;
         // Give a global (unscoped) chat the user's upcoming agenda so it can answer
         // "what's on at 3pm?" (Step 6). A project-scoped chat stays on its documents.
         let agenda = if scope.is_none() {
@@ -1353,7 +1361,10 @@ pub async fn propose_metadata(
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
-        let profile = learning::profile_preamble(&conn)?;
+        // Global + context filing preferences only: the target project isn't chosen until the model
+        // proposes it, so per-project preferences have nothing to key on yet (a deferred refinement).
+        // Still a strict improvement on dumping the whole blob (§4.5).
+        let profile = preferences::preferences_preamble(&conn, preferences::PrefContext::global())?;
         // Hand the model CANONICAL project names only (one per entity) — never the raw
         // `DISTINCT project`, which would offer variants like "PM"/"Atlas - PM" as co-equal.
         let projects = entities::canonical_project_names(&conn)?;
@@ -1478,7 +1489,7 @@ fn capture_alias(conn: &Connection, chosen_id: i64, proposed: &str) -> Result<()
 #[tauri::command]
 pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Result<()> {
     let blocking_app = app.clone();
-    let logged = tokio::task::spawn_blocking(move || -> Result<usize> {
+    tokio::task::spawn_blocking(move || -> Result<usize> {
         let state = blocking_app.state::<AppState>();
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, rules_cipher) = state.rules_io()?;
@@ -1561,14 +1572,12 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
     .await
     .map_err(|e| Error::Other(format!("commit task panicked: {e}")))??;
 
-    // If the user corrected anything, refresh the Learning-You profile in the
-    // background — one model call per review pass (not per document), best-effort
-    // and non-blocking so the UI returns immediately (Step 4b, spec §4.5).
-    if logged > 0 {
-        tauri::async_runtime::spawn(async move {
-            let _ = run_profile_refresh(app).await;
-        });
-    }
+    // The legacy correction→blob distiller is retired: the free-text "Learning You" profile is
+    // frozen and the structured preference model (§4.5) replaces it. `corrections` keep logging
+    // above — they feed the entity-alias loop and are the seam for the deferred Stage-5
+    // inferred-preference learning. The one thing still owed once is migrating the legacy blob into
+    // records; attempt it here too (a guaranteed-unlocked moment) — idempotent + best-effort.
+    spawn_preferences_migration(app);
     Ok(())
 }
 
@@ -2214,52 +2223,176 @@ pub fn get_learning_profile(state: State<'_, AppState>) -> Result<learning::Lear
     learning::get_profile(&conn)
 }
 
-/// Re-distil the Learning-You profile from the logged corrections, on demand
-/// (the "Refresh now" button). Returns the refreshed profile.
-#[tauri::command]
-pub async fn refresh_learning_profile(app: AppHandle) -> Result<learning::LearningProfile> {
-    run_profile_refresh(app.clone()).await?;
-    let state = app.state::<AppState>();
-    let conn = state.conn()?;
-    learning::get_profile(&conn)
-}
+// --- structured preferences (§4.5 — the typed model that replaces the Learning-You blob) ---
 
-/// Gather corrections + the current profile, distil an updated profile via the
-/// background model, and persist it. Background work: runs on the background API
-/// key and never holds the DB lock across the model call (rule #4). A no-op when
-/// there are no corrections to learn from yet.
-async fn run_profile_refresh(app: AppHandle) -> Result<()> {
-    let api_key = secrets::get_background_or_primary_key()?
-        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
-
-    let (current, corrections, models) = {
+/// One-time migration of the legacy free-text "Learning You" blob into structured preference
+/// records, so accumulated profile content isn't lost. Idempotent: guarded by the
+/// `preferences_migrated_at` flag and a no-op once it's set or the blob is empty. Background work —
+/// runs on the background key and never holds the DB lock across the model call (rule #4),
+/// best-effort. The legacy blob is kept ARCHIVED (never deleted). Records land `inferred` +
+/// unconfirmed, awaiting the user's vouch in the Teach tab.
+async fn migrate_preferences_once(app: AppHandle) -> Result<()> {
+    let (blob, models) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
+        if db::get_setting(&conn, preferences::MIGRATED_FLAG_KEY)?.is_some() {
+            return Ok(()); // already migrated
+        }
+        let blob = db::get_setting(&conn, preferences::LEGACY_PROFILE_KEY)?.unwrap_or_default();
+        if blob.trim().is_empty() {
+            // Nothing to migrate — stamp the flag so we don't re-read an empty blob each launch.
+            let now = iso_now(&state)?;
+            db::set_setting(&conn, preferences::MIGRATED_FLAG_KEY, &now)?;
+            return Ok(());
+        }
         let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
-        let current = learning::get_profile(&conn)?.profile;
-        let corrections = learning::recent_corrections(&conn, learning::MAX_CORRECTIONS)?;
-        (current, corrections, models)
+        (blob, models)
     };
 
-    if corrections.is_empty() {
+    // No key yet → leave the blob untouched and unstamped; a later trigger retries.
+    let Some(api_key) = secrets::get_background_or_primary_key()? else {
         return Ok(());
-    }
+    };
 
-    let (updated, usage, served) =
-        learning::distill(api_key.expose(), &models, &current, &corrections).await?;
+    let drafts = preferences::distill_blob(api_key.expose(), &models, &blob).await?;
 
     let state = app.state::<AppState>();
     let now = iso_now(&state)?;
     let conn = state.conn()?;
-    log_usage(
+    let tx = conn.unchecked_transaction()?;
+    for d in &drafts {
+        // The blob has no entity to resolve a project against, so distilled records are global/
+        // context (entity_id None) — see `preferences::distill_blob`.
+        preferences::add_preference(
+            &tx,
+            &d.scope,
+            None,
+            d.condition.as_deref(),
+            &d.value,
+            preferences::SOURCE_INFERRED,
+            preferences::inferred_seed_confidence(),
+            false,
+        )?;
+    }
+    db::set_setting(&tx, preferences::MIGRATED_FLAG_KEY, &now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Fire-and-forget the one-time preferences migration: background, idempotent, best-effort. Called
+/// at startup and after a review commit (both guaranteed-unlocked moments).
+pub fn spawn_preferences_migration(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = migrate_preferences_once(app).await {
+            eprintln!("preferences: one-time blob migration skipped ({e})");
+        }
+    });
+}
+
+/// Every structured preference record, for the Teach tab.
+#[tauri::command]
+pub fn list_preferences(state: State<'_, AppState>) -> Result<Vec<preferences::Preference>> {
+    let conn = state.conn()?;
+    preferences::list_preferences(&conn)
+}
+
+/// Add a preference the user has explicitly stated (the structured form, or a confirmed
+/// natural-language parse): stored as user-stated + confirmed. `entity_id` is required for a
+/// project-scoped record.
+#[tauri::command]
+pub fn add_preference(
+    state: State<'_, AppState>,
+    scope: String,
+    entity_id: Option<i64>,
+    condition: Option<String>,
+    value: String,
+) -> Result<i64> {
+    let conn = state.conn()?;
+    preferences::add_preference(
         &conn,
-        "background",
-        served
+        &scope,
+        entity_id,
+        condition.as_deref(),
+        &value,
+        preferences::SOURCE_USER,
+        1.0,
+        true,
+    )
+}
+
+/// Edit a preference's scope / target / condition / value (also marks it user-confirmed).
+#[tauri::command]
+pub fn update_preference(
+    state: State<'_, AppState>,
+    id: i64,
+    scope: String,
+    entity_id: Option<i64>,
+    condition: Option<String>,
+    value: String,
+) -> Result<()> {
+    let conn = state.conn()?;
+    preferences::update_preference(&conn, id, &scope, entity_id, condition.as_deref(), &value)
+}
+
+/// Mark an inferred preference as user-confirmed — the Teach-tab "✓ Confirm" that promotes a
+/// migrated/blob-derived record to a trusted one.
+#[tauri::command]
+pub fn confirm_preference(state: State<'_, AppState>, id: i64) -> Result<()> {
+    let conn = state.conn()?;
+    preferences::confirm_preference(&conn, id)
+}
+
+/// Delete a preference.
+#[tauri::command]
+pub fn delete_preference(state: State<'_, AppState>, id: i64) -> Result<()> {
+    let conn = state.conn()?;
+    preferences::delete_preference(&conn, id)
+}
+
+/// Parse a free-text sentence into a draft preference (the "in your own words" path). One
+/// background model call, then resolve any named project to its entity (read-only — no entity is
+/// created for an unconfirmed parse; a name that doesn't resolve falls back to a global preference).
+/// The frontend prefills the structured form with the result for the user to confirm before storing.
+#[tauri::command]
+pub async fn parse_preference_statement(
+    app: AppHandle,
+    text: String,
+) -> Result<preferences::DraftPreference> {
+    let (models, projects) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
+        let projects = entities::canonical_project_names(&conn)?;
+        (models, projects)
+    };
+    let api_key = secrets::get_background_or_primary_key()?
+        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+
+    let mut draft =
+        preferences::parse_statement(api_key.expose(), &models, &text, &projects).await?;
+
+    if draft.scope == preferences::SCOPE_PROJECT {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let resolved = draft
+            .project_name
             .as_deref()
-            .or_else(|| models.first().map(String::as_str)),
-        &usage,
-    );
-    learning::save_profile(&conn, &updated, &now)
+            .and_then(|n| entities::resolve_project(&conn, n, false).ok().flatten());
+        match resolved {
+            Some(id) => {
+                draft.entity_id = Some(id);
+                draft.project_name = Some(entities::canonical_name(&conn, id)?);
+            }
+            None => {
+                // Named a project that doesn't exist yet — keep it as a global preference rather
+                // than silently inventing an entity the user hasn't confirmed.
+                draft.scope = preferences::SCOPE_GLOBAL.to_string();
+                draft.entity_id = None;
+                draft.project_name = None;
+            }
+        }
+    }
+    Ok(draft)
 }
 
 // --- daily briefing (Step 7, spec §4 P1) ---
@@ -2292,7 +2425,8 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         let projects = projects::list_overviews(&conn, &today)?;
         let events = calendar::list_upcoming(&conn, briefing::BRIEFING_AGENDA_DAYS)?;
         let snapshot = briefing::build_snapshot(&projects, &events, &now, zone);
-        let profile = learning::profile_preamble(&conn)?;
+        // The briefing is the whole-picture view, so global + context preferences shape its voice.
+        let profile = preferences::preferences_preamble(&conn, preferences::PrefContext::global())?;
         (snapshot, profile, models)
     };
 

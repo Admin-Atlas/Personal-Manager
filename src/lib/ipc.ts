@@ -12,6 +12,7 @@ import type {
   CostSummary,
   DailyBriefing,
   Document,
+  DraftPreference,
   Entity,
   GoogleCalendar,
   IcsFeedInfo,
@@ -22,6 +23,7 @@ import type {
   Message,
   ModelInfo,
   ModelRecommendations,
+  Preference,
   ProjectOverview,
   ProjectProposalEvent,
   ProjectSize,
@@ -191,13 +193,44 @@ export const onVaultCurtain = (handler: (e: VaultCurtainEvent) => void): Promise
 export const onVaultAcquired = (handler: () => void): Promise<UnlistenFn> =>
   listen("vault://acquired", () => handler());
 
-// --- Learning You (Step 4b, spec §4.5) ---
+// --- Learning You (legacy, frozen — superseded by structured preferences) ---
 
-/** The distilled profile of how the user organises, for display in Settings. */
+/** The archived legacy profile of how the user organises, for the legacy Settings view. */
 export const getLearningProfile = () => invoke<LearningProfile>("get_learning_profile");
 
-/** Re-distil the profile from logged corrections; returns the refreshed profile. */
-export const refreshLearningProfile = () => invoke<LearningProfile>("refresh_learning_profile");
+// --- Structured preferences (spec §4.5 — the typed model that replaces the Learning-You blob) ---
+
+/** Every structured preference record (the Teach tab's list). */
+export const listPreferences = () => invoke<Preference[]>("list_preferences");
+
+/** Add a preference the user has explicitly stated (structured form or confirmed parse). Stored as
+ *  user-stated + confirmed. `entityId` is required for a project-scoped preference. */
+export const addPreference = (
+  scope: string,
+  entityId: number | null,
+  condition: string | null,
+  value: string,
+) => invoke<number>("add_preference", { scope, entityId, condition, value });
+
+/** Edit a preference's scope/target/condition/value (also marks it confirmed). */
+export const updatePreference = (
+  id: number,
+  scope: string,
+  entityId: number | null,
+  condition: string | null,
+  value: string,
+) => invoke<void>("update_preference", { id, scope, entityId, condition, value });
+
+/** Mark an inferred preference as user-confirmed (the Teach-tab "✓ Confirm"). */
+export const confirmPreference = (id: number) => invoke<void>("confirm_preference", { id });
+
+/** Delete a preference. */
+export const deletePreference = (id: number) => invoke<void>("delete_preference", { id });
+
+/** Parse a free-text sentence into a draft preference (the "in your own words" path); the form
+ *  prefills with the result for the user to confirm before it is stored. */
+export const parsePreferenceStatement = (text: string) =>
+  invoke<DraftPreference>("parse_preference_statement", { text });
 
 export const listConversations = () => invoke<Conversation[]>("list_conversations");
 

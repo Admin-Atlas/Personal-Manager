@@ -194,10 +194,9 @@ fn push_group(out: &mut String, label: &str, items: &[String]) {
     out.push_str(&format!("{label}: {line}\n"));
 }
 
-/// Generate the briefing text via the background model. Returns the cleaned text; the
-/// caller decides what to do on error (best-effort, like `learning::distill`).
-/// Returns the cleaned briefing text plus the served model + token usage (for the
-/// cost logger). The caller decides what to do on error (best-effort, like `learning::distill`).
+/// Generate the briefing text via the background model. Returns the cleaned briefing text plus the
+/// served model + token usage (for the cost logger). The caller decides what to do on error
+/// (best-effort — a hiccup just leaves the prior briefing in place).
 pub async fn generate(
     api_key: &str,
     models: &[String],
