@@ -11,6 +11,9 @@ import type {
   Conversation,
   CostSummary,
   DailyBriefing,
+  DevSystemInfo,
+  DevTableCount,
+  DevTablePage,
   Document,
   DraftPreference,
   Entity,
@@ -263,7 +266,9 @@ export const listDocuments = () => invoke<Document[]>("list_documents");
  * Dev-only (debug builds): drive the index-only substrate (board card 3) through its reducer without
  * a real connector. `kind` is "add" (ingest `body` as a new index-only item titled `title`), "update"
  * (re-embed from `body`), "delete", "rename" (to `externalRef`), or "source_failure". The backend
- * command is compiled out of release builds, so only call this behind `import.meta.env.DEV`.
+ * command is compiled out of release builds, so only call this behind `isDevBuild`
+ * (the central build-time signal in `lib/capabilities`) — a TEST HARNESS, never the runtime
+ * Developer mode (issue #78).
  */
 export const devApplyChangeEvent = (
   kind: "add" | "update" | "delete" | "rename" | "source_failure",
@@ -295,6 +300,24 @@ export function rebuildIndex(onEvent: (event: IngestEvent) => void): Promise<voi
   channel.onmessage = onEvent;
   return invoke<void>("rebuild_index", { onEvent: channel });
 }
+
+// --- Developer mode (issue #78): read-only inspection surfaces ---
+// All four are harmless reads (always registered in the backend); the UI that calls them is
+// gated by the runtime `devMode` (see lib/capabilities). The backend redacts before returning,
+// so these payloads are already safe to display.
+
+/** Running vault's index-time + runtime facts for the Dev tab's System panel. */
+export const devSystemInfo = () => invoke<DevSystemInfo>("dev_system_info");
+
+/** Row counts for every inspected table (incl. the derived indexes + `settings`). */
+export const devTableCounts = () => invoke<DevTableCount[]>("dev_table_counts");
+
+/** The browsable table names for the Dev tab's table picker. */
+export const devTableList = () => invoke<string[]>("dev_table_list");
+
+/** A redacted page of one allow-listed table (newest rows first). `limit` is capped at 200. */
+export const devTableRows = (table: string, limit: number, offset: number) =>
+  invoke<DevTablePage>("dev_table_rows", { table, limit, offset });
 
 // --- Archivist: sorting review & organisation (Step 4) ---
 

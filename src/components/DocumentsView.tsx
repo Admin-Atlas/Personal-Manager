@@ -15,6 +15,7 @@ import {
 } from "../lib/ipc";
 import type { Document, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
+import { isDevBuild } from "../lib/capabilities";
 import { useDepth } from "../theme";
 import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
@@ -399,7 +400,9 @@ export function DocumentsView({ onReviewClick }: Props) {
             </p>
           </div>
 
-          {import.meta.env.DEV && (
+          {/* TEST HARNESS — build-time only (writes synthetic state); never promoted to the
+              runtime Developer mode. Gated via the central `isDevBuild` (issue #78). */}
+          {isDevBuild && (
             <Card className="mt-4 p-3">
               <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
                 Dev — add an indexed-only item
@@ -430,37 +433,36 @@ export function DocumentsView({ onReviewClick }: Props) {
             </Card>
           )}
 
-          {import.meta.env.DEV &&
-            documents.some((d) => d.source_type === "index_only" && d.source_id) && (
-              <Card className="mt-4 p-3">
-                <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
-                  Dev — simulate a source change (observe-and-react)
-                </p>
-                <ul className="flex flex-col gap-1.5">
-                  {documents
-                    .filter((d) => d.source_type === "index_only" && d.source_id)
-                    .map((d) => (
-                      <li key={d.id} className="flex items-center justify-between gap-2 text-sm">
-                        <span className="truncate text-ink2" title={d.title}>
-                          {d.title}
-                        </span>
-                        <span className="flex shrink-0 gap-1 font-mono text-xs">
-                          {(["update", "delete", "rename", "source_failure"] as const).map((k) => (
-                            <button
-                              key={k}
-                              onClick={() => devFire(k, d.source_id!)}
-                              disabled={busy}
-                              className="rounded border border-border px-1.5 py-0.5 text-ink3 hover:text-ink disabled:opacity-50"
-                            >
-                              {k === "source_failure" ? "fail" : k}
-                            </button>
-                          ))}
-                        </span>
-                      </li>
-                    ))}
-                </ul>
-              </Card>
-            )}
+          {isDevBuild && documents.some((d) => d.source_type === "index_only" && d.source_id) && (
+            <Card className="mt-4 p-3">
+              <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
+                Dev — simulate a source change (observe-and-react)
+              </p>
+              <ul className="flex flex-col gap-1.5">
+                {documents
+                  .filter((d) => d.source_type === "index_only" && d.source_id)
+                  .map((d) => (
+                    <li key={d.id} className="flex items-center justify-between gap-2 text-sm">
+                      <span className="truncate text-ink2" title={d.title}>
+                        {d.title}
+                      </span>
+                      <span className="flex shrink-0 gap-1 font-mono text-xs">
+                        {(["update", "delete", "rename", "source_failure"] as const).map((k) => (
+                          <button
+                            key={k}
+                            onClick={() => devFire(k, d.source_id!)}
+                            disabled={busy}
+                            className="rounded border border-border px-1.5 py-0.5 text-ink3 hover:text-ink disabled:opacity-50"
+                          >
+                            {k === "source_failure" ? "fail" : k}
+                          </button>
+                        ))}
+                      </span>
+                    </li>
+                  ))}
+              </ul>
+            </Card>
+          )}
 
           {(prep || items.length > 0 || summary) && (
             <Card className="mt-4 p-3">

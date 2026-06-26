@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { Conversation } from "../lib/types";
+import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme } from "../theme";
 import { NavItem } from "./ui";
 
@@ -13,7 +14,8 @@ export type View =
   | "review"
   | "teach"
   | "graph"
-  | "pinboard";
+  | "pinboard"
+  | "dev";
 
 /** The command-palette shortcut hint shown in the sidebar (⌘ on macOS). */
 const SHORTCUT_HINT =
@@ -58,6 +60,9 @@ export function Sidebar({
   // The Teach tab is a Depth-keyed feature reveal (hidden for the minimalist preset), overridable
   // in Settings. Hiding it hides only the editor — deterministic alias resolution keeps running.
   const { teachVisible } = useTheme();
+  // The Dev tab is an orthogonal capability reveal (issue #78) — independent of Depth, shown only
+  // when the user turns Developer mode on in Settings.
+  const { devMode } = useDevMode();
   return (
     <aside className="flex h-full w-64 flex-col border-r border-border bg-panel">
       <div className="flex items-center justify-between px-4 py-3">
@@ -134,6 +139,11 @@ export function Sidebar({
         >
           Pinboard
         </NavItem>
+        {devMode && (
+          <NavItem active={view === "dev"} onClick={() => onNavigate("dev")} helpId="nav-dev">
+            Dev
+          </NavItem>
+        )}
       </nav>
 
       <div className="flex-1 overflow-y-auto px-2">

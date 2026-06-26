@@ -44,6 +44,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Pinboard",
     body: "A free-form planning board: pin sticky notes and simple timelines, drag them around, and resize them. It's a scratch space for thinking — saved on this device, separate from your documents.",
   },
+  "nav-dev": {
+    title: "Dev",
+    body: "Developer mode's inspection tab: read-only views of PM's internal state — raw tables, row counts, the corrections log, and system & build info. For debugging and watching how PM works; nothing here changes your data. Turn it on or off under Settings → Developer.",
+  },
   "conversations-list": {
     title: "Conversations",
     body: "Your past chats. Click one to reopen it; '+ New' starts a fresh conversation.",
@@ -195,6 +199,28 @@ export const HELP: Record<string, HelpEntry> = {
   "settings-license": {
     title: "License",
     body: "PM is free and open-source software under the GNU AGPL v3 — you're free to use, study, share, and modify it, and any networked version must offer its source. The link opens the full project source on GitHub.",
+  },
+  "settings-developer": {
+    title: "Developer mode",
+    body: "A plainly-labelled switch for technical and curious users. When on, it adds a read-only Dev tab and shows PM's internals in place — raw rows, ids, and confidence values — so a problem is diagnosable where it happens. It's strictly read-only (it never changes your data), independent of the density preset, and off by default. 'Build' shows whether this is a dev or release build; 'runtime' is your toggle.",
+  },
+
+  // Developer mode (issue #78) — read-only inspection
+  "dev-system": {
+    title: "System & build",
+    body: "The running app version, this store's schema migration level, the embedder and its vector dimension, whether reranking is on, the splitter version, and the document engine's status. A quick health read of the running vault.",
+  },
+  "dev-counts": {
+    title: "Table counts",
+    body: "Row counts across the store — documents, chunks, the vector and keyword indexes, entities, preferences, and more. The fastest way to confirm the index is populated and nothing is empty that shouldn't be.",
+  },
+  "dev-tables": {
+    title: "Raw table browser",
+    body: "Browse the store's tables, newest rows first. Only an allow-listed set of columns is shown; personal or large fields (chat bodies, document text) are truncated or shown as a length, and the settings grab-bag hides all but a few operational values — so the browser stays a safe, read-only window.",
+  },
+  "dev-corrections": {
+    title: "Corrections log",
+    body: "Every change you've made to a proposed project, tag, or importance — the raw signal PM learns your filing habits from. Shown as before → after with the document and when.",
   },
 
   // Graph
