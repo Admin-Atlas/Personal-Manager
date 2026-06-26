@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -52,16 +52,32 @@ fn account_id(email: &str) -> String {
     format!("gdrive:{email}")
 }
 
-/// The stable index-only `source_id` for one Drive file under one account: `gdrive:<email>:<fileId>`.
+/// The stable index-only `source_id` for one **My Drive** file under one account:
+/// `gdrive:<email>:<fileId>`.
 pub fn source_id_for(email: &str, file_id: &str) -> String {
     format!("gdrive:{email}:{file_id}")
 }
 
-/// Recover the account email from a `gdrive:<email>:<fileId>` source id (emails carry no `:`, Drive
-/// fileIds carry no `:`, so the last `:` splits cleanly).
+/// The stable index-only `source_id` for a file in a **shared drive**:
+/// `gdrive:<email>:sd:<driveId>:<fileId>`. The `sd:<driveId>` segment namespaces shared-drive items
+/// so a sync can reconcile one shared drive in isolation (deletion-by-difference) without touching My
+/// Drive or other shared drives — while still living under the account's `gdrive:<email>:%` fan-out.
+pub fn shared_source_id(email: &str, drive_id: &str, file_id: &str) -> String {
+    format!("gdrive:{email}:sd:{drive_id}:{file_id}")
+}
+
+/// The `source_id` prefix that matches every indexed item of one shared drive (for reconcile +
+/// per-drive cleanup): `gdrive:<email>:sd:<driveId>:`.
+fn shared_prefix(email: &str, drive_id: &str) -> String {
+    format!("gdrive:{email}:sd:{drive_id}:")
+}
+
+/// Recover the account email from any Drive source id. Both shapes start `gdrive:<email>:…`, and an
+/// email carries no `:`, so the **first** `:` after the prefix splits the email off cleanly —
+/// covering `gdrive:<email>:<fileId>` and `gdrive:<email>:sd:<driveId>:<fileId>` alike.
 pub fn account_of(source_id: &str) -> Option<String> {
     let rest = source_id.strip_prefix("gdrive:")?;
-    rest.rsplit_once(':').map(|(email, _)| email.to_string())
+    rest.split_once(':').map(|(email, _)| email.to_string())
 }
 
 // --- account registry (connector_sources rows for provider=google service=drive) ----------------
@@ -223,6 +239,98 @@ pub fn read_item_state(conn: &Connection, source_id: &str) -> Result<Option<Item
     })
 }
 
+// --- per-account indexing scope (which drives/folders to index) ----------------------------------
+
+/// One shared drive the account opted into, and how much of it to index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedSelection {
+    /// The shared drive's id (its root folder id, too).
+    pub drive_id: String,
+    /// Display name (cached from `drives.list` so the UI/label needs no extra call).
+    pub name: String,
+    /// `None` = the **entire** shared drive; `Some(ids)` = only these folders (recursively). The
+    /// default in the UI is folder-scoped (shared drives are often huge and org-wide).
+    #[serde(default)]
+    pub folders: Option<Vec<String>>,
+}
+
+/// What an account indexes: My Drive (the whole personal drive, the existing default) plus any
+/// opted-in shared drives. Persisted as JSON in `connector_sources.folder_ids` (no migration — the
+/// column already exists and was nullable/unused). A missing/empty value means the default scope
+/// (My Drive on, no shared drives) so every pre-existing account behaves exactly as before.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveScope {
+    /// Index the personal My Drive (delta-cursor sync). Default `true`.
+    #[serde(default = "yes")]
+    pub my_drive: bool,
+    /// Opted-in shared drives (each re-enumerated + reconciled per sync).
+    #[serde(default)]
+    pub shared: Vec<SharedSelection>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for DriveScope {
+    fn default() -> Self {
+        DriveScope {
+            my_drive: true,
+            shared: Vec::new(),
+        }
+    }
+}
+
+/// Read an account's indexing scope (the default scope when none is stored yet).
+pub fn get_scope(conn: &Connection, email: &str) -> Result<DriveScope> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT folder_ids FROM connector_sources WHERE id = ?1",
+            params![account_id(email)],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)?;
+    match raw {
+        Some(s) if !s.trim().is_empty() => {
+            serde_json::from_str(&s).map_err(|e| Error::Other(format!("bad drive scope: {e}")))
+        }
+        _ => Ok(DriveScope::default()),
+    }
+}
+
+/// Persist an account's indexing scope.
+pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<()> {
+    let json = serde_json::to_string(scope)
+        .map_err(|e| Error::Other(format!("encode drive scope: {e}")))?;
+    conn.execute(
+        "UPDATE connector_sources SET folder_ids = ?2 WHERE id = ?1",
+        params![account_id(email), json],
+    )?;
+    Ok(())
+}
+
+/// Every **currently-healthy** (`source_state = 'ok'`) indexed item id belonging to one shared drive
+/// — the set the reconcile diffs the live enumeration against. A present id in this set gets an
+/// `Update` (catches edits, no-ops otherwise); a present id NOT in it gets an `Add` (ingests a new
+/// file, or reactivates one that was previously flagged missing/unreachable — e.g. a folder the user
+/// removed and re-added); an id in this set that is no longer present is a deletion.
+pub fn known_shared_source_ids(
+    conn: &Connection,
+    email: &str,
+    drive_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_id FROM documents \
+         WHERE source_type = 'index_only' AND source_state = 'ok' \
+           AND source_id LIKE ?1 || '%'",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(params![shared_prefix(email, drive_id)], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
 // --- Drive file model + pure parsing/mapping (the unit-tested core) ------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +371,74 @@ pub struct DriveChange {
     pub file_id: String,
     pub removed: bool,
     pub file: Option<DriveFile>,
+}
+
+/// A shared drive the account can see (`drives.list`) — for the "add shared drives" picker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SharedDrive {
+    pub id: String,
+    pub name: String,
+}
+
+/// A folder inside a (shared) drive — one node of the folder picker's lazy tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DriveFolder {
+    pub id: String,
+    pub name: String,
+}
+
+/// Parse a `drives.list` page → its shared drives + the next page token.
+pub fn parse_shared_drives(value: &Value) -> (Vec<SharedDrive>, Option<String>) {
+    let drives = value
+        .get("drives")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    Some(SharedDrive {
+                        id: d.get("id")?.as_str()?.to_string(),
+                        name: d
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Shared drive")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = value
+        .get("nextPageToken")
+        .and_then(Value::as_str)
+        .map(String::from);
+    (drives, next)
+}
+
+/// Parse a `files.list` folder page → its folders + the next page token (only id/name projected).
+pub fn parse_folders(value: &Value) -> (Vec<DriveFolder>, Option<String>) {
+    let folders = value
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    Some(DriveFolder {
+                        id: f.get("id")?.as_str()?.to_string(),
+                        name: f
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Untitled folder")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = value
+        .get("nextPageToken")
+        .and_then(Value::as_str)
+        .map(String::from);
+    (folders, next)
 }
 
 fn parse_file(v: &Value) -> Option<DriveFile> {
@@ -456,6 +632,169 @@ pub async fn enumerate_drive(token_key: &str) -> Result<Vec<DriveFile>> {
     Ok(out)
 }
 
+// --- shared drives (Team Drives) — a separate corpus from My Drive ------------------------------
+
+fn shared_drives_url(page: Option<&str>) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/drives"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("pageSize", "100");
+        q.append_pair("fields", "nextPageToken,drives(id,name)");
+        if let Some(t) = page {
+            q.append_pair("pageToken", t);
+        }
+    }
+    Ok(url.to_string())
+}
+
+/// Every shared drive this account can see (`drives.list`) — for the "add shared drives" picker.
+pub async fn list_shared_drives(token_key: &str) -> Result<Vec<SharedDrive>> {
+    let mut out = Vec::new();
+    let mut page: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let v = google::authorized_get(token_key, &shared_drives_url(page.as_deref())?).await?;
+        let (drives, next) = parse_shared_drives(&v);
+        out.extend(drives);
+        match next {
+            Some(t) => page = Some(t),
+            None => return Ok(out),
+        }
+    }
+    Ok(out)
+}
+
+/// A `files.list` URL scoped to one shared drive (`corpora=drive` + the all-drives flags) for an
+/// arbitrary `q`. Shared drives need `supportsAllDrives`/`includeItemsFromAllDrives`; without them the
+/// call silently returns nothing.
+fn shared_files_url(
+    drive_id: &str,
+    q: &str,
+    fields_inner: &str,
+    order_by: &str,
+    page: Option<&str>,
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/files"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("q", q);
+        qp.append_pair("corpora", "drive");
+        qp.append_pair("driveId", drive_id);
+        qp.append_pair("includeItemsFromAllDrives", "true");
+        qp.append_pair("supportsAllDrives", "true");
+        qp.append_pair("spaces", "drive");
+        qp.append_pair("pageSize", "200");
+        if !order_by.is_empty() {
+            qp.append_pair("orderBy", order_by);
+        }
+        qp.append_pair("fields", &format!("nextPageToken,files({fields_inner})"));
+        if let Some(t) = page {
+            qp.append_pair("pageToken", t);
+        }
+    }
+    Ok(url.to_string())
+}
+
+/// The immediate subfolders of `parent_id` within a shared drive — one lazy level of the folder
+/// picker (the drive root's id == the drive id, so the top level passes `parent_id == drive_id`).
+pub async fn list_folders(
+    token_key: &str,
+    drive_id: &str,
+    parent_id: &str,
+) -> Result<Vec<DriveFolder>> {
+    let q = format!(
+        "'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    );
+    let mut out = Vec::new();
+    let mut page: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let url = shared_files_url(drive_id, &q, "id,name", "name", page.as_deref())?;
+        let v = google::authorized_get(token_key, &url).await?;
+        let (folders, next) = parse_folders(&v);
+        out.extend(folders);
+        match next {
+            Some(t) => page = Some(t),
+            None => return Ok(out),
+        }
+    }
+    Ok(out)
+}
+
+/// Enumerate the files of a shared drive to index: the **whole** drive (`folders == None`), or only
+/// the selected folders walked recursively (`Some`). Folders themselves are never indexed — only the
+/// files beneath them. Deduplicates files reachable from more than one selected folder.
+pub async fn enumerate_shared(
+    token_key: &str,
+    drive_id: &str,
+    folders: Option<&[String]>,
+) -> Result<Vec<DriveFile>> {
+    match folders {
+        None => {
+            let mut out = Vec::new();
+            let mut page: Option<String> = None;
+            for _ in 0..MAX_PAGES {
+                let url = shared_files_url(
+                    drive_id,
+                    "trashed = false",
+                    FILE_FIELDS,
+                    "modifiedTime desc",
+                    page.as_deref(),
+                )?;
+                let v = google::authorized_get(token_key, &url).await?;
+                let (files, next) = parse_files(&v);
+                out.extend(files);
+                match next {
+                    Some(t) => page = Some(t),
+                    None => return Ok(out),
+                }
+            }
+            eprintln!("drive: shared whole-drive enumerate hit the page guard");
+            Ok(out)
+        }
+        Some(roots) => {
+            use std::collections::HashSet;
+            let folder_mime = "application/vnd.google-apps.folder";
+            let mut out: Vec<DriveFile> = Vec::new();
+            let mut seen_folders: HashSet<String> = HashSet::new();
+            let mut seen_files: HashSet<String> = HashSet::new();
+            let mut queue: Vec<String> = roots.to_vec();
+            let mut nodes = 0usize;
+            while let Some(folder) = queue.pop() {
+                if !seen_folders.insert(folder.clone()) {
+                    continue; // a folder reachable two ways (nested selections) — walk it once.
+                }
+                nodes += 1;
+                if nodes > MAX_PAGES {
+                    eprintln!(
+                        "drive: shared folder walk hit the node guard at {MAX_PAGES} folders"
+                    );
+                    break;
+                }
+                let q = format!("'{folder}' in parents and trashed = false");
+                let mut page: Option<String> = None;
+                loop {
+                    let url = shared_files_url(drive_id, &q, FILE_FIELDS, "", page.as_deref())?;
+                    let v = google::authorized_get(token_key, &url).await?;
+                    let (children, next) = parse_files(&v);
+                    for child in children {
+                        if child.mime_type == folder_mime {
+                            queue.push(child.id);
+                        } else if seen_files.insert(child.id.clone()) {
+                            out.push(child);
+                        }
+                    }
+                    match next {
+                        Some(t) => page = Some(t),
+                        None => break,
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
 /// The delta baseline cursor (`changes.getStartPageToken`).
 pub async fn start_page_token(token_key: &str) -> Result<String> {
     let v =
@@ -504,8 +843,9 @@ pub async fn list_changes(token_key: &str, cursor: &str) -> Result<(Vec<DriveCha
 }
 
 /// Fetch one file's metadata (for body-on-demand, where we hold only the stored pointer).
+/// `supportsAllDrives` so a shared-drive file resolves too (harmless for My Drive files).
 pub async fn fetch_file(token_key: &str, file_id: &str) -> Result<DriveFile> {
-    let url = format!("{DRIVE_API}/files/{file_id}?fields={FILE_FIELDS}");
+    let url = format!("{DRIVE_API}/files/{file_id}?fields={FILE_FIELDS}&supportsAllDrives=true");
     let v = google::authorized_get(token_key, &url).await?;
     parse_file(&v).ok_or_else(|| Error::Other("Drive returned no file for that id.".into()))
 }
@@ -537,18 +877,26 @@ pub async fn fetch_body(
         FetchPlan::Export { mime } => {
             let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/files/{}/export", file.id))
                 .map_err(|e| Error::Other(e.to_string()))?;
-            url.query_pairs_mut().append_pair("mimeType", mime);
+            url.query_pairs_mut()
+                .append_pair("mimeType", mime)
+                .append_pair("supportsAllDrives", "true");
             let bytes =
                 google::authorized_get_bytes(token_key, url.as_str(), MAX_FILE_BYTES).await?;
             Ok(non_empty(&String::from_utf8_lossy(&bytes)))
         }
         FetchPlan::DownloadText => {
-            let url = format!("{DRIVE_API}/files/{}?alt=media", file.id);
+            let url = format!(
+                "{DRIVE_API}/files/{}?alt=media&supportsAllDrives=true",
+                file.id
+            );
             let bytes = google::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await?;
             Ok(non_empty(&String::from_utf8_lossy(&bytes)))
         }
         FetchPlan::DownloadBinary => {
-            let url = format!("{DRIVE_API}/files/{}?alt=media", file.id);
+            let url = format!(
+                "{DRIVE_API}/files/{}?alt=media&supportsAllDrives=true",
+                file.id
+            );
             let bytes = match google::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await {
                 Ok(b) => b,
                 // An over-cap download is a skip (kept findable via its title), not a hard error.
@@ -638,6 +986,78 @@ mod tests {
         assert!(sid.starts_with("gdrive:a@b.com:"));
         assert_eq!(account_of(&sid).as_deref(), Some("a@b.com"));
         assert_eq!(account_of("not-a-drive-id"), None);
+    }
+
+    #[test]
+    fn shared_source_ids_namespace_per_drive_and_still_resolve_the_account() {
+        let sid = shared_source_id("a@b.com", "0ADrive", "FILE123");
+        assert_eq!(sid, "gdrive:a@b.com:sd:0ADrive:FILE123");
+        // Lives under the account fan-out (so an auth failure flips it with the rest)…
+        assert!(sid.starts_with("gdrive:a@b.com:"));
+        // …and under its own per-drive prefix (so reconcile can isolate one shared drive).
+        assert!(sid.starts_with(&shared_prefix("a@b.com", "0ADrive")));
+        assert!(!sid.starts_with(&shared_prefix("a@b.com", "0BOther")));
+        // The first-colon split recovers the email from BOTH the My-Drive and shared shapes.
+        assert_eq!(account_of(&sid).as_deref(), Some("a@b.com"));
+        // A My-Drive file is not mistaken for a shared one.
+        assert!(!source_id_for("a@b.com", "FILE123").starts_with(&shared_prefix("a@b.com", "X")));
+    }
+
+    #[test]
+    fn drive_scope_defaults_to_my_drive_only_and_tolerates_partial_json() {
+        // The default (no row value) indexes My Drive and no shared drives.
+        let def = DriveScope::default();
+        assert!(def.my_drive);
+        assert!(def.shared.is_empty());
+        // A stored blob with only `shared` still defaults `my_drive` to true (serde `default = yes`).
+        let parsed: DriveScope =
+            serde_json::from_str(r#"{"shared":[{"drive_id":"0A","name":"Team"}]}"#).unwrap();
+        assert!(parsed.my_drive);
+        assert_eq!(parsed.shared.len(), 1);
+        assert_eq!(parsed.shared[0].drive_id, "0A");
+        assert_eq!(parsed.shared[0].folders, None); // missing → whole drive
+                                                    // Folder-scoped round-trips.
+        let scoped: DriveScope = serde_json::from_str(
+            r#"{"my_drive":false,"shared":[{"drive_id":"0A","name":"Team","folders":["f1","f2"]}]}"#,
+        )
+        .unwrap();
+        assert!(!scoped.my_drive);
+        assert_eq!(
+            scoped.shared[0].folders.as_deref(),
+            Some(&["f1".to_string(), "f2".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn parse_shared_drives_and_folders_read_the_shapes() {
+        let drives = serde_json::json!({
+            "nextPageToken": "P2",
+            "drives": [{"id": "0A", "name": "Team A"}, {"id": "0B"}]
+        });
+        let (parsed, next) = parse_shared_drives(&drives);
+        assert_eq!(next.as_deref(), Some("P2"));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "Team A");
+        assert_eq!(parsed[1].name, "Shared drive"); // name defaulted
+
+        let folders = serde_json::json!({
+            "files": [{"id": "f1", "name": "Reports"}, {"id": "f2", "name": "Archive"}]
+        });
+        let (parsed, next) = parse_folders(&folders);
+        assert!(next.is_none());
+        assert_eq!(
+            parsed,
+            vec![
+                DriveFolder {
+                    id: "f1".into(),
+                    name: "Reports".into()
+                },
+                DriveFolder {
+                    id: "f2".into(),
+                    name: "Archive".into()
+                },
+            ]
+        );
     }
 
     #[test]

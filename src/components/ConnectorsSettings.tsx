@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { ReactNode } from "react";
+import { useDepth } from "../theme";
+import { Collapsible } from "./ui";
 import { GoogleCalendarConnection } from "./GoogleCalendarConnection";
 import { GoogleDriveConnection } from "./GoogleDriveConnection";
 import { IcsFeedSubscription } from "./IcsFeedSubscription";
@@ -65,7 +67,12 @@ export function ConnectorsSettings() {
   );
 }
 
-/** A capability group (Calendar / Drive / Email) holding one or more provider connections. */
+/**
+ * A capability group (Calendar / Drive / Email) holding one or more provider connections. These
+ * sections get large (multi-account Drive, calendar feeds), so each is **collapsible**: it opens by
+ * default for Standard/Power density and starts **collapsed at Minimal** (so the tab stays scannable),
+ * and can always be toggled either way. The disclosure state is per-section local UI.
+ */
 function ServiceSection({
   title,
   blurb,
@@ -75,12 +82,20 @@ function ServiceSection({
   blurb?: string;
   children: ReactNode;
 }) {
+  const { minimal } = useDepth();
   return (
-    <section className="mt-4 rounded-[var(--radius)] border border-border p-3">
-      <div className="font-mono text-xs font-medium uppercase tracking-wide text-ink3">{title}</div>
+    <Collapsible
+      className="mt-4 rounded-[var(--radius)] border border-border p-3"
+      defaultOpen={!minimal}
+      title={
+        <span className="font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+          {title}
+        </span>
+      }
+    >
       {blurb && <p className="mt-1 text-xs text-ink4">{blurb}</p>}
       <div className="mt-3">{children}</div>
-    </section>
+    </Collapsible>
   );
 }
 

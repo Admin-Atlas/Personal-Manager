@@ -4,9 +4,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { connectDrive, disconnectDrive, driveStatus, syncDrive } from "../lib/ipc";
 import type { DriveAccount, DriveStatus } from "../lib/types";
-import { Button, ConfirmDialog } from "./ui";
+import { Button, Collapsible, ConfirmDialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 import { GoogleCredentialBlock } from "./GoogleCredentialBlock";
+import { SharedDrivesManager } from "./DriveSharedDrives";
 
 /**
  * **Google Drive** (read-only, index-only) — the first cloud-API connector (board card 4A), under
@@ -90,7 +91,9 @@ export function GoogleDriveConnection() {
       <span className="text-sm font-medium text-ink">Google Drive</span>
       <p className="mt-1 text-xs text-ink4">
         Index your Drive files (read-only). Everything is <em>index-only</em> — a searchable pointer
-        and a short summary; the full file stays in Drive and is fetched on demand.
+        and a short summary; the full file stays in Drive and is fetched on demand. Each account
+        indexes your personal <strong>My Drive</strong> by default; expand an account to add{" "}
+        <strong>shared drives</strong> (folder-scoped by default).
       </p>
 
       {!configured ? (
@@ -111,14 +114,28 @@ export function GoogleDriveConnection() {
           {accounts.length > 0 && (
             <ul className="mt-3 divide-y divide-rule rounded-[var(--radius)] border border-border">
               {accounts.map((a) => (
-                <AccountRow
-                  key={a.id}
-                  account={a}
-                  busy={busy != null}
-                  syncingThis={busy === `sync:${a.email}`}
-                  onSync={() => sync(a.email)}
-                  onDisconnect={() => setConfirmEmail(a.email)}
-                />
+                <li key={a.id} className="px-3 py-2">
+                  <AccountRow
+                    account={a}
+                    busy={busy != null}
+                    syncingThis={busy === `sync:${a.email}`}
+                    onSync={() => sync(a.email)}
+                    onDisconnect={() => setConfirmEmail(a.email)}
+                  />
+                  {a.state === "ok" && (
+                    <Collapsible
+                      className="mt-2"
+                      defaultOpen={false}
+                      title={<span className="text-xs text-ink3">Shared drives & scope</span>}
+                    >
+                      <SharedDrivesManager
+                        email={a.email}
+                        busy={busy != null}
+                        onApply={() => sync(a.email)}
+                      />
+                    </Collapsible>
+                  )}
+                </li>
               ))}
             </ul>
           )}
@@ -193,7 +210,7 @@ function AccountRow({
 }) {
   const unreachable = account.state !== "ok";
   return (
-    <li className="flex items-center justify-between gap-2 px-3 py-2">
+    <div className="flex items-center justify-between gap-2">
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <span className="truncate text-sm text-ink">{account.label || account.email}</span>
@@ -225,7 +242,7 @@ function AccountRow({
           Disconnect
         </Button>
       </div>
-    </li>
+    </div>
   );
 }
 

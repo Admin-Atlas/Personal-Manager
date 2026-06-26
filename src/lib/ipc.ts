@@ -18,6 +18,8 @@ import type {
   Document,
   DraftPreference,
   DriveAccount,
+  DriveFolder,
+  DriveScope,
   DriveStatus,
   DriveSyncEvent,
   Entity,
@@ -37,6 +39,7 @@ import type {
   ReviewEvent,
   RetrievedChunk,
   Settings,
+  SharedDrive,
   SidecarStatus,
   VaultLockStatus,
   VaultStatus,
@@ -491,6 +494,22 @@ export function syncDrive(
   channel.onmessage = onEvent;
   return invoke<number>("sync_drive", { account: email, onEvent: channel });
 }
+
+/** The shared drives one account can see (for the "add shared drives" picker). */
+export const listDriveSharedDrives = (email: string) =>
+  invoke<SharedDrive[]>("list_drive_shared_drives", { email });
+
+/** Immediate subfolders of a folder in a shared drive (one lazy picker level). Pass the shared
+ *  drive's id as `parentId` for the top level. */
+export const listDriveFolders = (email: string, driveId: string, parentId: string) =>
+  invoke<DriveFolder[]>("list_drive_folders", { email, driveId, parentId });
+
+/** Read one account's indexing scope (My Drive on/off + opted-in shared drives and folders). */
+export const getDriveScope = (email: string) => invoke<DriveScope>("get_drive_scope", { email });
+
+/** Persist one account's indexing scope; follow with `syncDrive(email)` to apply it. */
+export const setDriveScope = (email: string, scope: DriveScope) =>
+  invoke<void>("set_drive_scope", { email, scope });
 
 /** Fetch an index-only document's full body live from its source (the body is never stored). */
 export const fetchIndexOnlyBody = (docId: number) =>

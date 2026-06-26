@@ -2270,10 +2270,131 @@ pub fn disconnect_drive(state: State<'_, AppState>, email: String) -> Result<()>
     Ok(())
 }
 
-/// Sync one Drive account (or every account when `account` is `None`) into the index-only store. The
-/// first sync enumerates My Drive and ingests everything (the slow one — the UI warns); later syncs
-/// apply only the Drive changes feed. Every item is index-only: a pointer + embedding, the body
-/// fetched live. Never holds the DB lock across a network/embed call (rule #4). Streams
+/// The shared drives one connected account can see (`drives.list`) — for the "add shared drives"
+/// picker. Read-only enumeration over the account's own token; no DB and no sidecar needed.
+#[tauri::command]
+pub async fn list_drive_shared_drives(email: String) -> Result<Vec<drive::SharedDrive>> {
+    drive::list_shared_drives(&drive::account_token_key(&email)).await
+}
+
+/// The immediate subfolders of `parent_id` inside a shared drive — one lazy level of the folder
+/// picker. Pass the shared drive's id as `parent_id` for the top level.
+#[tauri::command]
+pub async fn list_drive_folders(
+    email: String,
+    drive_id: String,
+    parent_id: String,
+) -> Result<Vec<drive::DriveFolder>> {
+    drive::list_folders(&drive::account_token_key(&email), &drive_id, &parent_id).await
+}
+
+/// One account's indexing scope (My Drive on/off + opted-in shared drives and their folders).
+#[tauri::command]
+pub fn get_drive_scope(state: State<'_, AppState>, email: String) -> Result<drive::DriveScope> {
+    let conn = state.conn()?;
+    drive::get_scope(&conn, &email)
+}
+
+/// Persist one account's indexing scope. The UI follows this with a `sync_drive` to apply it (index
+/// newly-in-scope files, soft-remove files that fell out of scope).
+#[tauri::command]
+pub fn set_drive_scope(
+    state: State<'_, AppState>,
+    email: String,
+    scope: drive::DriveScope,
+) -> Result<()> {
+    let conn = state.conn()?;
+    drive::set_scope(&conn, &email, &scope)
+}
+
+/// One unit of sync work for an account, gathered off the lock in phase 1.
+enum DriveItem {
+    /// A My-Drive first-sync file → `Add`.
+    Enumerated(drive::DriveFile),
+    /// A My-Drive changes-feed entry → mapped via `map_change`.
+    Changed(drive::DriveChange),
+    /// A shared-drive reconcile result with its event pre-built: `Add` for a new/reactivating file
+    /// (reducer: unknown→ingest, missing/unreachable→reachable), `Update` for a present healthy file
+    /// (same-hash→noop, changed→re-embed), or `Delete` for a file that vanished from the enumeration.
+    Reconciled {
+        source_id: String,
+        event: index_only::ChangeEvent,
+        file: Option<drive::DriveFile>,
+    },
+}
+
+/// All of one account's gathered work for a sync pass (My Drive + shared drives together).
+struct AccountWork {
+    email: String,
+    token_key: String,
+    items: Vec<DriveItem>,
+    /// The advanced My-Drive delta cursor — set only when My Drive was synced this pass.
+    new_cursor: Option<String>,
+    auth_failed: bool,
+}
+
+/// Reconcile one opted-in shared drive: enumerate it live (whole drive, or just the selected folders
+/// walked recursively) and diff against the currently-healthy known set. A present file already
+/// healthy → `Update` (catches edits); a present file new or previously missing/unreachable → `Add`
+/// (ingests, or reactivates a folder the user removed and re-added); a known file no longer present →
+/// `Delete`. Same observe-and-react path My Drive uses, just driven by a full re-enumeration instead
+/// of a delta cursor (the changes feed can't scope to folders). Reads the known set under a brief
+/// lock; the enumeration itself is off the lock.
+async fn gather_shared(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    sel: &drive::SharedSelection,
+) -> Result<Vec<DriveItem>> {
+    let files = drive::enumerate_shared(token_key, &sel.drive_id, sel.folders.as_deref()).await?;
+    let known: std::collections::HashSet<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        drive::known_shared_source_ids(&conn, email, &sel.drive_id)?
+            .into_iter()
+            .collect()
+    };
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut items: Vec<DriveItem> = Vec::with_capacity(files.len());
+    for f in files {
+        let source_id = drive::shared_source_id(email, &sel.drive_id, &f.id);
+        present.insert(source_id.clone());
+        let event = if known.contains(&source_id) {
+            index_only::ChangeEvent::Update {
+                source_id: source_id.clone(),
+                modified_at: f.modified_time.clone(),
+                new_content_hash: f.content_hash(),
+            }
+        } else {
+            index_only::ChangeEvent::Add {
+                source_id: source_id.clone(),
+                modified_at: f.modified_time.clone(),
+            }
+        };
+        items.push(DriveItem::Reconciled {
+            source_id,
+            event,
+            file: Some(f),
+        });
+    }
+    for source_id in known {
+        if !present.contains(&source_id) {
+            items.push(DriveItem::Reconciled {
+                source_id: source_id.clone(),
+                event: index_only::ChangeEvent::Delete { source_id },
+                file: None,
+            });
+        }
+    }
+    Ok(items)
+}
+
+/// Sync one Drive account (or every account when `account` is `None`) into the index-only store,
+/// honouring each account's scope. **My Drive** (on by default) uses the efficient delta cursor — the
+/// first sync enumerates everything (the slow one the UI warns about), later syncs apply only the
+/// changes feed. **Shared drives** the account opted into are re-enumerated and reconciled each pass
+/// (whole drive, or just the selected folders). Every item is index-only: a pointer + embedding, the
+/// body fetched live. Never holds the DB lock across a network/embed call (rule #4). Streams
 /// `DriveSyncEvent` for the shared progress bar. Returns the number of items touched.
 #[tauri::command]
 pub async fn sync_drive(
@@ -2299,101 +2420,92 @@ pub async fn sync_drive(
         }
     };
 
-    // Phase 1 — gather each account's work off the lock (enumerate, or the changes feed).
-    enum Item {
-        Enumerated(drive::DriveFile),
-        Changed(drive::DriveChange),
-    }
-    struct AccountWork {
-        email: String,
-        token_key: String,
-        items: Vec<Item>,
-        new_cursor: Option<String>,
-        auth_failed: bool,
-    }
-
     let mut work: Vec<AccountWork> = Vec::new();
     let mut last_err: Option<Error> = None;
 
+    // Phase 1 — gather each account's work off the lock: My Drive via its delta cursor, then each
+    // opted-in shared drive via a reconcile. One AccountWork per account carries both.
     for email in emails {
         let token_key = drive::account_token_key(&email);
-        let cursor = {
+        let scope = {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            drive::get_cursor(&conn, &email)?
+            drive::get_scope(&conn, &email)?
         };
 
-        // Helper: a full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
-        let full_relist = |token_key: String| async move {
-            let files = drive::enumerate_drive(&token_key).await?;
-            let cursor = drive::start_page_token(&token_key).await?;
-            Ok::<_, Error>((files, cursor))
-        };
+        let mut items: Vec<DriveItem> = Vec::new();
+        let mut new_cursor: Option<String> = None;
+        let mut auth_failed = false;
 
-        if cursor.is_none() {
-            match full_relist(token_key.clone()).await {
-                Ok((files, new_cursor)) => work.push(AccountWork {
-                    email,
-                    token_key,
-                    items: files.into_iter().map(Item::Enumerated).collect(),
-                    new_cursor: Some(new_cursor),
-                    auth_failed: false,
-                }),
+        // --- My Drive (delta cursor) ---
+        if scope.my_drive {
+            let cursor = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                drive::get_cursor(&conn, &email)?
+            };
+            // A full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
+            let full_relist = |token_key: String| async move {
+                let files = drive::enumerate_drive(&token_key).await?;
+                let cursor = drive::start_page_token(&token_key).await?;
+                Ok::<_, Error>((files, cursor))
+            };
+            let outcome: Result<(Vec<DriveItem>, String)> = if cursor.is_none() {
+                full_relist(token_key.clone())
+                    .await
+                    .map(|(files, c)| (files.into_iter().map(DriveItem::Enumerated).collect(), c))
+            } else {
+                match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await {
+                    Ok((changes, c)) => {
+                        Ok((changes.into_iter().map(DriveItem::Changed).collect(), c))
+                    }
+                    Err(e) if drive::is_cursor_expired(&e) => {
+                        full_relist(token_key.clone()).await.map(|(files, c)| {
+                            (files.into_iter().map(DriveItem::Enumerated).collect(), c)
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            match outcome {
+                Ok((mut my_items, c)) => {
+                    items.append(&mut my_items);
+                    new_cursor = Some(c);
+                }
                 Err(e) => {
-                    let auth = drive::is_auth_failure(&e);
+                    if drive::is_auth_failure(&e) {
+                        auth_failed = true;
+                    }
                     last_err = Some(e);
-                    work.push(AccountWork {
-                        email,
-                        token_key,
-                        items: Vec::new(),
-                        new_cursor: None,
-                        auth_failed: auth,
-                    });
                 }
             }
-            continue;
         }
 
-        match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await {
-            Ok((changes, new_cursor)) => work.push(AccountWork {
-                email,
-                token_key,
-                items: changes.into_iter().map(Item::Changed).collect(),
-                new_cursor: Some(new_cursor),
-                auth_failed: false,
-            }),
-            Err(e) if drive::is_cursor_expired(&e) => match full_relist(token_key.clone()).await {
-                Ok((files, new_cursor)) => work.push(AccountWork {
-                    email,
-                    token_key,
-                    items: files.into_iter().map(Item::Enumerated).collect(),
-                    new_cursor: Some(new_cursor),
-                    auth_failed: false,
-                }),
-                Err(e2) => {
-                    let auth = drive::is_auth_failure(&e2);
-                    last_err = Some(e2);
-                    work.push(AccountWork {
-                        email,
-                        token_key,
-                        items: Vec::new(),
-                        new_cursor: None,
-                        auth_failed: auth,
-                    });
+        // --- shared drives (reconcile). Skip if the account already auth-failed (same token). ---
+        if !auth_failed {
+            for sel in &scope.shared {
+                match gather_shared(&app, &token_key, &email, sel).await {
+                    Ok(mut recon) => items.append(&mut recon),
+                    Err(e) => {
+                        if drive::is_auth_failure(&e) {
+                            auth_failed = true;
+                        }
+                        last_err = Some(e);
+                        if auth_failed {
+                            break;
+                        }
+                    }
                 }
-            },
-            Err(e) => {
-                let auth = drive::is_auth_failure(&e);
-                last_err = Some(e);
-                work.push(AccountWork {
-                    email,
-                    token_key,
-                    items: Vec::new(),
-                    new_cursor: None,
-                    auth_failed: auth,
-                });
             }
         }
+
+        work.push(AccountWork {
+            email,
+            token_key,
+            items,
+            new_cursor,
+            auth_failed,
+        });
     }
 
     let total: usize = work.iter().map(|w| w.items.len()).sum();
@@ -2423,7 +2535,7 @@ pub async fn sync_drive(
 
         for item in &w.items {
             let (file, source_id, event): (Option<&drive::DriveFile>, String, _) = match item {
-                Item::Enumerated(file) => {
+                DriveItem::Enumerated(file) => {
                     let sid = drive::source_id_for(&w.email, &file.id);
                     let ev = index_only::ChangeEvent::Add {
                         source_id: sid.clone(),
@@ -2431,7 +2543,7 @@ pub async fn sync_drive(
                     };
                     (Some(file), sid, ev)
                 }
-                Item::Changed(change) => {
+                DriveItem::Changed(change) => {
                     let sid = drive::source_id_for(&w.email, &change.file_id);
                     let known = {
                         let state = app.state::<AppState>();
@@ -2447,6 +2559,12 @@ pub async fn sync_drive(
                         }
                     }
                 }
+                // Shared-drive reconcile: the event (Update/Delete) is already built.
+                DriveItem::Reconciled {
+                    source_id,
+                    event,
+                    file,
+                } => (file.as_ref(), source_id.clone(), event.clone()),
             };
 
             let name = file

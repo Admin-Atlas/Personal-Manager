@@ -391,6 +391,33 @@ export interface DriveStatus {
   accounts: DriveAccount[];
 }
 
+/** A shared drive (Team Drive) an account can see — from `drives.list`, for the "add" picker. */
+export interface SharedDrive {
+  id: string;
+  name: string;
+}
+
+/** A folder inside a (shared) drive — one node of the folder picker's lazy tree. */
+export interface DriveFolder {
+  id: string;
+  name: string;
+}
+
+/** One shared drive an account opted into, and how much of it to index. */
+export interface SharedSelection {
+  drive_id: string;
+  name: string;
+  /** `null` = the entire shared drive; otherwise index only these folders (recursively). */
+  folders: string[] | null;
+}
+
+/** What one account indexes: the personal My Drive plus any opted-in shared drives. Default scope is
+ *  My Drive on, no shared drives — so a freshly-connected account behaves exactly as before. */
+export interface DriveScope {
+  my_drive: boolean;
+  shared: SharedSelection[];
+}
+
 /** Streamed progress while a Drive sync runs (mapped onto the shared IngestProgress bar). */
 export type DriveSyncEvent =
   | { type: "counted"; total: number }
