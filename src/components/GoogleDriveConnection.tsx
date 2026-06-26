@@ -1,16 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   connectDrive,
   disconnectDrive,
   driveStatus,
   driveSyncStatus,
   onDriveSync,
+  stopDriveSync,
   syncDrive,
 } from "../lib/ipc";
-import type { DriveAccount, DriveStatus } from "../lib/types";
+import type { DriveAccount, DriveStatus, DriveSyncReport } from "../lib/types";
 import { Button, Collapsible, ConfirmDialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 import { GoogleCredentialBlock } from "./GoogleCredentialBlock";
@@ -29,13 +30,18 @@ import { SharedDrivesManager } from "./DriveSharedDrives";
 export function GoogleDriveConnection() {
   const [status, setStatus] = useState<DriveStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ processed: number; total: number | null } | null>(
     null,
   );
   const [syncAccount, setSyncAccount] = useState<string | null>(null);
+  const [report, setReport] = useState<DriveSyncReport | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [confirmEmail, setConfirmEmail] = useState<string | null>(null);
+  // Live mirror of "a sync is on screen", so a callback created in an earlier render (the connect
+  // tail, which may fire mid-sync) can tell whether it owns the visible progress without hijacking
+  // a running sync's bar.
+  const syncingRef = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -49,9 +55,15 @@ export function GoogleDriveConnection() {
     refresh();
   }, [refresh]);
 
+  // Mirror "is a sync on screen" into a ref for callbacks that outlive their render (see `sync`).
+  useEffect(() => {
+    syncingRef.current = progress != null;
+  }, [progress]);
+
   // The sync runs detached in the backend (it keeps going if you leave Settings). Follow its global
   // progress events, and — if a sync is already in flight when this view (re)mounts — restore the bar
-  // from the backend snapshot so it never looks stalled or stopped.
+  // from the backend snapshot so it never looks stalled or stopped. If it already finished, show the
+  // last report so a returning user still sees the result.
   useEffect(() => {
     let mounted = true;
     const unlisten = onDriveSync((ev) => {
@@ -59,18 +71,21 @@ export function GoogleDriveConnection() {
       if (ev.type === "counted") setProgress({ processed: 0, total: ev.total });
       else if (ev.type === "item") setProgress({ processed: ev.processed, total: ev.total });
       else if (ev.type === "finished") {
-        const n = ev.indexed + ev.updated + ev.removed;
         setProgress(null);
         setSyncAccount(null);
-        setNote(`Synced — ${n} item${n === 1 ? "" : "s"} added or updated.`);
+        setStopping(false);
+        setReport(ev.report);
         void refresh();
       }
     });
     void driveSyncStatus()
       .then((s) => {
-        if (mounted && s.running) {
+        if (!mounted) return;
+        if (s.running) {
           setProgress({ processed: s.processed, total: s.total });
           setSyncAccount(s.account);
+        } else if (s.last_report) {
+          setReport(s.last_report);
         }
       })
       .catch(() => {});
@@ -83,7 +98,6 @@ export function GoogleDriveConnection() {
   async function run(label: string, fn: () => Promise<void>) {
     setBusy(label);
     setError(null);
-    setNote(null);
     try {
       await fn();
     } catch (e) {
@@ -94,17 +108,32 @@ export function GoogleDriveConnection() {
   }
 
   // Start a background sync for one account (or all). Fire-and-forget: progress arrives via the
-  // global event listener above, and the sync survives navigating away.
+  // global event listener above, and the sync survives navigating away. The backend single-flights
+  // syncs, so a request made while one is already running (e.g. the connect tail after adding an
+  // account mid-index) is folded into a follow-up pass — we must not hijack the running bar, so only
+  // the call that *starts* a sync drives the optimistic progress + error rollback.
   const sync = (email: string | null) => {
     setError(null);
-    setNote(null);
-    setSyncAccount(email);
-    setProgress({ processed: 0, total: null });
+    const startsIt = !syncingRef.current;
+    if (startsIt) {
+      setReport(null);
+      setSyncAccount(email);
+      setProgress({ processed: 0, total: null });
+    }
     void syncDrive(email).catch((e) => {
-      setError(String(e));
-      setProgress(null);
-      setSyncAccount(null);
+      if (startsIt) {
+        setError(String(e));
+        setProgress(null);
+        setSyncAccount(null);
+      }
     });
+  };
+
+  // Stop the running sync. The backend halts after the current file and keeps everything indexed so
+  // far; the "finished" event (with a `cancelled` report) clears the bar.
+  const stop = () => {
+    setStopping(true);
+    void stopDriveSync().catch(() => setStopping(false));
   };
 
   const connect = () =>
@@ -177,10 +206,12 @@ export function GoogleDriveConnection() {
           )}
 
           <div className="mt-3">
+            {/* Deliberately gated on `busy` only, not `anyBusy` — adding another account stays
+                available while a sync runs, so you can connect one you forgot mid-index. */}
             <Button
               variant={accounts.length === 0 ? "primary" : "secondary"}
               onClick={connect}
-              disabled={anyBusy}
+              disabled={busy != null}
               className="disabled:opacity-40"
             >
               {busy === "connect"
@@ -202,12 +233,31 @@ export function GoogleDriveConnection() {
                 Indexing keeps running in the background — you can leave this page and come back
                 later; we’ll keep working.
               </p>
+              <div
+                className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-ink3"
+                style={{ background: "color-mix(in oklab, var(--st-due) 12%, transparent)" }}
+              >
+                Changed your mind about the size of this?{" "}
+                <span className="text-ink2">Stopping keeps everything indexed so far</span> — those
+                files stay searchable; the rest just won’t be indexed until you sync again.
+                <div className="mt-2">
+                  <Button
+                    variant="tertiary"
+                    onClick={stop}
+                    disabled={stopping}
+                    className="px-2 py-1 text-xs hover:text-st-due disabled:opacity-40"
+                  >
+                    {stopping ? "Stopping…" : "Stop indexing"}
+                  </Button>
+                </div>
+              </div>
             </div>
           )}
+
+          {!syncing && report && <SyncReport report={report} onDismiss={() => setReport(null)} />}
         </>
       )}
 
-      {note && <p className="mt-2 text-xs text-st-quick">{note}</p>}
       {error && (
         <p
           className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
@@ -290,4 +340,74 @@ function AccountRow({
 function formatWhen(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+/** The post-sync summary: how many files were indexed, and an expandable list of any that couldn't
+ *  be (unsupported types, fetch errors) so the user knows exactly what was left out. */
+function SyncReport({ report, onDismiss }: { report: DriveSyncReport; onDismiss: () => void }) {
+  const [showIssues, setShowIssues] = useState(false);
+  const touched = report.indexed + report.updated + report.removed;
+  const issueCount = report.issues.length;
+  return (
+    <div
+      className="mt-3 rounded-[var(--radius)] border border-border p-3"
+      data-help="settings-drive-report"
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="text-xs text-ink2">
+          {report.cancelled ? (
+            <span className="font-medium text-ink">Indexing stopped.</span>
+          ) : (
+            <span className="font-medium text-ink">Sync complete.</span>
+          )}{" "}
+          <span className="text-ink3">
+            Indexed {report.indexed} · updated {report.updated} · removed {report.removed}
+            {touched === 0 && " · nothing new"}.
+          </span>
+          {report.cancelled && (
+            <span className="text-ink4">
+              {" "}
+              Everything indexed so far is kept — sync again to finish.
+            </span>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss summary"
+          className="shrink-0 text-ink4 hover:text-ink2"
+        >
+          ×
+        </button>
+      </div>
+
+      {report.issues.length > 0 && (
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={() => setShowIssues((v) => !v)}
+            className="font-mono text-[10px] uppercase tracking-wide text-ink3 hover:text-ink"
+          >
+            {showIssues ? "▾" : "▸"} {issueCount}
+            {report.issues_truncated ? "+" : ""} file
+            {issueCount === 1 && !report.issues_truncated ? "" : "s"} not indexed
+          </button>
+          {showIssues && (
+            <ul className="mt-1.5 max-h-40 space-y-1 overflow-auto">
+              {report.issues.map((iss, i) => (
+                <li key={i} className="text-[11px] leading-tight">
+                  <span className="text-ink2">{iss.name}</span>
+                  <span className="text-ink4"> — {iss.reason}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <p className="mt-2 text-[11px] text-ink4">
+        Indexed files are searchable and appear in Documents.
+      </p>
+    </div>
+  );
 }

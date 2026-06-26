@@ -214,6 +214,14 @@ function ClientSetupGuide() {
         <span className="text-ink2">Desktop app</span>.
       </li>
       <li>5. Copy the Client ID + Client secret and paste them below.</li>
+      <li>
+        6. <span className="text-ink2">More than one Google account?</span> You don’t need a new
+        project or new credentials — reuse the same Client ID + secret (it stays saved here, shared
+        by every account). For each extra account, add its email under{" "}
+        <span className="text-ink2">Audience → Test users</span> (step 3), then in PM use{" "}
+        <span className="text-ink2">Add another account</span> and sign in with it. (A separate
+        project is only needed if you’d rather keep accounts fully isolated.)
+      </li>
       <li className="text-ink4">
         If a sign-in fails:{" "}
         <span className="text-ink2">“…API has not been used… or is disabled” (403)</span> means you

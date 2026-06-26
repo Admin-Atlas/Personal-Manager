@@ -7,6 +7,7 @@
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::sync::atomic::Ordering;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -2516,7 +2517,11 @@ fn emit_drive_progress(app: &AppHandle, ev: drive::DriveSyncEvent) {
             snap.processed = *processed;
             snap.total = Some(*total);
         }
-        drive::DriveSyncEvent::Finished { .. } => {}
+        // Keep the last result in the snapshot too, so a user returning to Settings after the sync
+        // finished still sees the summary (the live event only reaches a mounted listener).
+        drive::DriveSyncEvent::Finished { report } => {
+            snap.last_report = Some(report.clone());
+        }
     });
     let _ = app.emit("drive://sync", ev);
 }
@@ -2532,32 +2537,179 @@ pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::DriveSyncS
         .map_err(|_| Error::Other("drive sync state poisoned".into()))
 }
 
-/// Sync one Drive account (or every account when `account` is `None`) into the index-only store,
-/// honouring each account's scope. **My Drive** (on by default) uses the efficient delta cursor — the
-/// first sync enumerates everything (the slow one the UI warns about), later syncs apply only the
-/// changes feed. **Shared drives** the account opted into are re-enumerated and reconciled each pass
-/// (whole drive, or just the selected folders). Every item is index-only: a pointer + embedding, the
-/// body fetched live. Never holds the DB lock across a network/embed call (rule #4).
+/// Key in the `settings` table marking a sync that was started but not cleanly finished. Set when a
+/// sync begins and removed when it ends (completed or stopped); a value surviving across a restart
+/// therefore means the app was closed/crashed mid-index, and [`resume_drive_sync`] picks it back up.
+const DRIVE_SYNC_PENDING_KEY: &str = "drive_sync_pending";
+
+/// Cap on how many not-indexed files a report lists (memory-bounded; the count of extras beyond this
+/// is still conveyed via `issues_truncated`).
+const MAX_REPORT_ISSUES: usize = 200;
+
+/// True if the running sync has been asked to stop.
+fn sync_cancelled(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .drive_sync_cancel
+        .load(Ordering::SeqCst)
+}
+
+/// Record a file that couldn't be indexed, up to the cap (after which we just flag truncation).
+fn record_issue(
+    issues: &mut Vec<drive::DriveSyncIssue>,
+    truncated: &mut bool,
+    name: &str,
+    reason: &str,
+) {
+    if issues.len() < MAX_REPORT_ISSUES {
+        issues.push(drive::DriveSyncIssue {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        });
+    } else {
+        *truncated = true;
+    }
+}
+
+/// Sync one Drive account (or every account when `account` is `None`) into the index-only store. See
+/// [`drive_sync_core`] for the behaviour; this is the command the UI's "Sync now" calls.
+#[tauri::command]
+pub async fn sync_drive(app: AppHandle, account: Option<String>) -> Result<usize> {
+    drive_sync_core(&app, account).await
+}
+
+/// Ask the running sync to stop after the current file. Already-indexed files are kept; the rest are
+/// left for the next sync. A no-op when nothing is running (the flag resets at the next sync start).
+#[tauri::command]
+pub fn stop_drive_sync(state: State<'_, AppState>) -> Result<()> {
+    state.drive_sync_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Resume a sync a previous app session started but didn't finish (the app was closed/crashed
+/// mid-index). Called once on launch. Returns whether a resume was kicked off. Already-indexed files
+/// were persisted as they went, so the resumed pass re-checks the source and only does the work that
+/// was left — it never re-embeds what's already there. No marker → nothing to resume.
+#[tauri::command]
+pub fn resume_drive_sync(app: AppHandle) -> Result<bool> {
+    let marker: Option<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, DRIVE_SYNC_PENDING_KEY)?
+    };
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    // Don't stack on a sync the user may already have started this session.
+    let running = app
+        .state::<AppState>()
+        .drive_sync
+        .lock()
+        .map(|s| s.running)
+        .unwrap_or(false);
+    if running {
+        return Ok(false);
+    }
+    let account: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = drive_sync_core(&app2, account).await;
+    });
+    Ok(true)
+}
+
+/// The sync engine behind both [`sync_drive`] and [`resume_drive_sync`], honouring each account's
+/// scope. **My Drive** (on by default) uses the efficient delta cursor — the first sync enumerates
+/// everything (the slow one the UI warns about), later syncs apply only the changes feed. **Shared
+/// drives** the account opted into are re-enumerated and reconciled each pass (whole drive, or just
+/// the selected folders). Every item is index-only: a pointer + embedding, the body fetched live.
+/// Never holds the DB lock across a network/embed call (rule #4).
 ///
 /// **Runs detached**: progress is broadcast via the global `drive://sync` event (not a per-call
 /// Channel) and mirrored into [`AppState::drive_sync`], so the sync keeps running — and the UI keeps
-/// reflecting it — even if the user leaves the Settings page. Returns the number of items touched.
-#[tauri::command]
-pub async fn sync_drive(app: AppHandle, account: Option<String>) -> Result<usize> {
-    with_drive_snap(&app, |snap| {
+/// reflecting it — even if the user leaves the Settings page.
+///
+/// **Single-flight**: a request arriving while a sync is already running (e.g. the user connected
+/// another account mid-index, or a stray button press) is folded into one follow-up all-accounts
+/// pass rather than starting a second, racy sync — backend-enforced, so the UI can't break it. The
+/// follow-up cheaply re-checks already-synced accounts (delta) and fully indexes any new one.
+///
+/// **Durable**: a crash-resume marker is persisted while running and cleared on a clean exit, so an
+/// interrupted run is resumed on next launch. Already-indexed files survive (each is committed as it
+/// goes), so a stop or crash never loses work. Returns the number of items touched by the last pass.
+async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
+    // Claim the single-flight slot, or fold this request into a follow-up pass if one is running.
+    {
+        let state = app.state::<AppState>();
+        let mut snap = state
+            .drive_sync
+            .lock()
+            .map_err(|_| Error::Other("drive sync state poisoned".into()))?;
+        if snap.running {
+            snap.rerun = true;
+            return Ok(0);
+        }
         *snap = crate::DriveSyncState {
             running: true,
-            processed: 0,
-            total: None,
             account: account.clone(),
+            ..Default::default()
         };
-    });
-    let result = run_drive_sync(&app, account).await;
-    with_drive_snap(&app, |snap| snap.running = false);
+    }
+    // Fresh stop flag for this run; persist a crash-resume marker (cleared on the clean exit below).
+    {
+        let state = app.state::<AppState>();
+        state.drive_sync_cancel.store(false, Ordering::SeqCst);
+        // Bind the guard to a named local before `if let`, so the `Result` temporary (which borrows
+        // `state`) is dropped before `state` is — otherwise it outlives the borrow (E0597).
+        let conn = state.conn();
+        if let Ok(conn) = conn {
+            let marker = serde_json::to_string(&account).unwrap_or_else(|_| "null".to_string());
+            let _ = db::set_setting(&conn, DRIVE_SYNC_PENDING_KEY, &marker);
+        }
+    }
+
+    let mut pass_account = account;
+    let mut result;
+    loop {
+        result = run_drive_sync(app, pass_account).await;
+        let stopped = sync_cancelled(app);
+        // Check-and-clear `rerun` and clear `running` under one lock, so a request landing exactly as
+        // we finish isn't lost to a race against `running = false`.
+        let again = {
+            let state = app.state::<AppState>();
+            let mut snap = state
+                .drive_sync
+                .lock()
+                .map_err(|_| Error::Other("drive sync state poisoned".into()))?;
+            if snap.rerun && !stopped {
+                snap.rerun = false;
+                snap.processed = 0;
+                snap.total = None;
+                snap.account = None;
+                true
+            } else {
+                snap.running = false;
+                false
+            }
+        };
+        if !again {
+            break;
+        }
+        pass_account = None;
+    }
+
+    // Clean exit (finished or stopped): drop the crash-resume marker so launch doesn't re-run it.
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn();
+        if let Ok(conn) = conn {
+            let _ = db::delete_setting(&conn, DRIVE_SYNC_PENDING_KEY);
+        }
+    }
     result
 }
 
-/// The body of [`sync_drive`], split out so the wrapper clears the running flag on every exit path.
+/// One sync pass: gather each account's work, then process it. Split out so [`drive_sync_core`] can
+/// run it more than once (the follow-up sweep) and so the wrapper owns the running/marker lifecycle.
 async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usize> {
     // The engine is needed for index-only embedding + binary conversion — ensure it once up front.
     {
@@ -2679,8 +2831,21 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
     // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
     let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
     let mut processed = 0usize;
+    // Files we attempted but couldn't index (unsupported/empty, or a fetch error), for the report.
+    let mut issues: Vec<drive::DriveSyncIssue> = Vec::new();
+    let mut issues_truncated = false;
+    // Set if the user pressed Stop. Already-applied items stay committed; we stop early and skip the
+    // interrupted account's cursor advance, so the next sync re-checks it.
+    let mut cancelled = false;
 
-    for w in &work {
+    'accounts: for w in &work {
+        // Stop requested (before this account, or after finishing the previous one)? Halt — keeping
+        // everything indexed so far. The interrupted account's cursor is left unadvanced below.
+        if sync_cancelled(app) {
+            cancelled = true;
+            break 'accounts;
+        }
+
         // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
         if w.auth_failed {
             let actions = index_only::react(
@@ -2699,6 +2864,11 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
         }
 
         for item in &w.items {
+            // Stop requested mid-account? Halt after the current file — already-indexed files stay.
+            if sync_cancelled(app) {
+                cancelled = true;
+                break 'accounts;
+            }
             let (file, source_id, event): (Option<&drive::DriveFile>, String, _) = match item {
                 DriveItem::Enumerated(file) => {
                     let sid = drive::source_id_for(&w.email, &file.id);
@@ -2762,6 +2932,12 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                     Ok(None) => {
                         processed += 1;
                         skipped += 1;
+                        record_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            "No extractable text (unsupported file type or empty)",
+                        );
                         emit_drive_progress(
                             app,
                             drive::DriveSyncEvent::Item {
@@ -2775,6 +2951,12 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                     Err(e) => {
                         processed += 1;
                         failed += 1;
+                        record_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            &format!("Couldn't fetch from Drive: {e}"),
+                        );
                         last_err = Some(e);
                         emit_drive_progress(
                             app,
@@ -2805,6 +2987,12 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                 },
                 Err(e) => {
                     failed += 1;
+                    record_issue(
+                        &mut issues,
+                        &mut issues_truncated,
+                        &name,
+                        &format!("Indexing failed: {e}"),
+                    );
                     last_err = Some(e);
                 }
             }
@@ -2834,20 +3022,24 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
         }
     }
 
-    emit_drive_progress(
-        app,
-        drive::DriveSyncEvent::Finished {
-            indexed,
-            updated,
-            removed,
-            skipped,
-            failed,
-        },
-    );
+    let report = drive::DriveSyncReport {
+        indexed,
+        updated,
+        removed,
+        skipped,
+        failed,
+        cancelled,
+        issues,
+        issues_truncated,
+    };
+    emit_drive_progress(app, drive::DriveSyncEvent::Finished { report });
 
-    // Surface a failure (auth/expired) even when some items succeeded — the good ones are committed.
-    if let Some(e) = last_err {
-        return Err(e);
+    // A deliberate stop isn't an error. Otherwise surface a failure (auth/expired) even when some
+    // items succeeded — the good ones are already committed.
+    if !cancelled {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
     }
     Ok(indexed + updated + removed)
 }

@@ -418,28 +418,46 @@ export interface DriveScope {
   shared: SharedSelection[];
 }
 
+/** A file a Drive sync tried to index but couldn't (e.g. an unsupported type, or a fetch error),
+ *  surfaced in the post-sync report so the user knows what was left out. */
+export interface DriveSyncIssue {
+  name: string;
+  reason: string;
+}
+
+/** The outcome of a Drive sync pass: how many items were indexed/updated/removed, the not-indexed
+ *  list, and whether the user stopped it early. */
+export interface DriveSyncReport {
+  indexed: number;
+  updated: number;
+  removed: number;
+  skipped: number;
+  failed: number;
+  /** The user pressed Stop — already-indexed files are kept; the rest were left for next time. */
+  cancelled: boolean;
+  /** Files attempted but not indexed (capped; see `issues_truncated`). */
+  issues: DriveSyncIssue[];
+  /** True when more files couldn't be indexed than `issues` lists. */
+  issues_truncated: boolean;
+}
+
 /** Snapshot of an in-flight Drive sync, so the UI can resume showing progress after navigating away
- *  and back. `running` is false when nothing is syncing. */
+ *  and back. `running` is false when nothing is syncing; `last_report` holds the most recent result
+ *  (so a user returning after it finished still sees the summary). */
 export interface DriveSyncState {
   running: boolean;
   processed: number;
   total: number | null;
   /** The account (email) being synced, or null for an all-accounts pass. */
   account: string | null;
+  last_report: DriveSyncReport | null;
 }
 
 /** Streamed progress while a Drive sync runs (mapped onto the shared IngestProgress bar). */
 export type DriveSyncEvent =
   | { type: "counted"; total: number }
   | { type: "item"; processed: number; total: number; name: string }
-  | {
-      type: "finished";
-      indexed: number;
-      updated: number;
-      removed: number;
-      skipped: number;
-      failed: number;
-    };
+  | { type: "finished"; report: DriveSyncReport };
 
 /** A mirrored calendar event (the agenda list). `start` is an ISO datetime, or a
  *  plain date for all-day events. */

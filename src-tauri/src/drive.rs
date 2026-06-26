@@ -1062,6 +1062,33 @@ fn stage_temp(name: &str, bytes: &[u8]) -> Result<PathBuf> {
 /// Sync progress for the Settings UI. Distinct from `IngestEvent` because a sync also re-embeds and
 /// removes (which carry no freshly-ingested `Document`); the frontend maps `processed`/`total` onto
 /// the shared `IngestProgress` bar.
+/// A file PM tried to index but couldn't, surfaced in the post-sync report so the user knows what was
+/// left out (e.g. an unsupported file type MarkItDown can't read, or a fetch error). Not a fatal
+/// error — the sync carries on; these are just reported.
+#[derive(Clone, Serialize, Default)]
+pub struct DriveSyncIssue {
+    pub name: String,
+    pub reason: String,
+}
+
+/// The outcome of a sync pass: how many items were indexed/updated/removed, the list of files that
+/// couldn't be indexed (capped), and whether the user stopped it early. Shown in Settings after a
+/// sync and stashed in the live snapshot so a user returning after it finished still sees the result.
+#[derive(Clone, Serialize, Default)]
+pub struct DriveSyncReport {
+    pub indexed: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// The user pressed Stop — already-indexed files are kept; the rest were left for next time.
+    pub cancelled: bool,
+    /// Files attempted but not indexed (unsupported/empty, or a fetch error), capped for memory.
+    pub issues: Vec<DriveSyncIssue>,
+    /// True when more files couldn't be indexed than the capped `issues` list holds.
+    pub issues_truncated: bool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DriveSyncEvent {
@@ -1073,14 +1100,8 @@ pub enum DriveSyncEvent {
         total: usize,
         name: String,
     },
-    /// The run is done, with a breakdown.
-    Finished {
-        indexed: usize,
-        updated: usize,
-        removed: usize,
-        skipped: usize,
-        failed: usize,
-    },
+    /// The run is done; `report` carries the breakdown + the not-indexed list (+ a `cancelled` flag).
+    Finished { report: DriveSyncReport },
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@ import {
   onVaultAcquired,
   onVaultCurtain,
   openUrl,
+  resumeDriveSync,
   reviewQueue,
   setHelpMode,
   vaultLockStatus,
@@ -288,6 +289,13 @@ export default function App() {
   useEffect(() => {
     if (keySet) void refreshReviewCount();
   }, [keySet, view, refreshReviewCount]);
+
+  // Resume a Drive sync interrupted by a previous close/crash mid-index. Runs once the vault is open
+  // (keySet implies an unlocked store), detached in the backend — already-indexed files survive, so
+  // it just finishes the outstanding work. A no-op when there's nothing pending.
+  useEffect(() => {
+    if (keySet) void resumeDriveSync().catch(() => {});
+  }, [keySet]);
 
   async function selectConversation(id: number) {
     setActiveId(id);

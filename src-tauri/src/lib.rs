@@ -98,6 +98,14 @@ pub struct DriveSyncState {
     pub total: Option<usize>,
     /// The account being synced (email), or `None` for an all-accounts pass.
     pub account: Option<String>,
+    /// Internal single-flight flag: a sync was requested while one was already running (e.g. the user
+    /// connected another account mid-index). The running pass drains it with one more all-accounts
+    /// sweep so the new account is still picked up. Not exposed to the UI.
+    #[serde(skip)]
+    pub rerun: bool,
+    /// The most recent finished sync's report (counts + the not-indexed list), so a user returning to
+    /// Settings after a sync has completed still sees the result. Cleared when a new sync starts.
+    pub last_report: Option<drive::DriveSyncReport>,
 }
 
 pub struct AppState {
@@ -123,6 +131,9 @@ pub struct AppState {
     /// Snapshot of the currently-running Drive sync (so the UI can resume showing progress after the
     /// user navigates away and back). Empty/`running:false` when no sync is in flight.
     pub drive_sync: Mutex<DriveSyncState>,
+    /// Cooperative stop flag for the running Drive sync. `stop_drive_sync` sets it; the sync loop
+    /// checks it between files and halts, keeping everything indexed so far. Reset at each sync start.
+    pub drive_sync_cancel: AtomicBool,
 }
 
 /// A borrow of the open connection. Derefs to [`Connection`], so call sites read just
@@ -425,6 +436,7 @@ pub fn run() {
                 instance_id: vault::lock::new_instance_id(),
                 lock_session: Mutex::new(lock_session::LockSession::default()),
                 drive_sync: Mutex::new(DriveSyncState::default()),
+                drive_sync_cancel: AtomicBool::new(false),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -532,6 +544,8 @@ pub fn run() {
             commands::drive_status,
             commands::sync_drive,
             commands::drive_sync_status,
+            commands::stop_drive_sync,
+            commands::resume_drive_sync,
             commands::list_drive_shared_drives,
             commands::list_drive_folders,
             commands::get_drive_scope,

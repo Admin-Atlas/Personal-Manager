@@ -492,8 +492,16 @@ export const disconnectDrive = (email: string) => invoke<void>("disconnect_drive
  *  when this call's sync finishes; it's fine to ignore it (the events + status drive the UI). */
 export const syncDrive = (email: string | null) => invoke<number>("sync_drive", { account: email });
 
-/** The current background-sync snapshot — used to restore the progress UI on returning to Settings. */
+/** The current background-sync snapshot — used to restore the progress UI on returning to Settings,
+ *  and to show the last finished sync's report. */
 export const driveSyncStatus = () => invoke<DriveSyncState>("drive_sync_status");
+
+/** Ask the running sync to stop after the current file. Already-indexed files are kept. */
+export const stopDriveSync = () => invoke<void>("stop_drive_sync");
+
+/** Resume a sync interrupted by a previous app close/crash mid-index. Called once on launch; resolves
+ *  true if a resume was started. Already-indexed files survive, so it only does the outstanding work. */
+export const resumeDriveSync = () => invoke<boolean>("resume_drive_sync");
 
 /** Subscribe to global Drive sync progress (fires regardless of which view started the sync). */
 export const onDriveSync = (handler: (e: DriveSyncEvent) => void): Promise<UnlistenFn> =>

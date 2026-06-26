@@ -36,6 +36,12 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove a key from the `settings` table (a no-op if it isn't present).
+pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 /// The `settings` key holding the retrieval-config stamp (spec §21.4). One JSON row capturing
 /// the index-time config that produced this vault's index.
 const RETRIEVAL_STAMP_KEY: &str = "retrieval_config";
