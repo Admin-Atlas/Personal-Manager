@@ -520,6 +520,7 @@ pub fn run() {
             commands::set_drive_scope,
             commands::fetch_index_only_body,
             commands::open_external_ref,
+            commands::open_url,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::cost_summary,

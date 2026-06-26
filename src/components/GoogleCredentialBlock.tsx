@@ -192,9 +192,14 @@ function ClientSetupGuide() {
       </li>
       <li>4. Copy the Client ID + Client secret and paste them below.</li>
       <li className="text-ink4">
-        Note: you’ll see an “unverified app” screen — that’s expected for your own client (just
-        continue). If your account uses Advanced Protection, Google blocks this — use a calendar
-        subscription (iCal) instead.
+        Tips: the “unverified app” screen is expected for your own client — continue past it. If you
+        get{" "}
+        <span className="text-ink2">“Access blocked… developer-approved testers” (Error 403)</span>,
+        the account you signed in with isn’t listed under{" "}
+        <span className="text-ink2">Test users</span> in step 2 — add that exact account. Accounts
+        on <span className="text-ink2">Advanced Protection</span> block unverified apps from Drive
+        and Calendar entirely; use a different Google account rather than turning protection off
+        (for Calendar you can use an iCal subscription instead).
       </li>
     </ol>
   );

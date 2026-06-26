@@ -518,6 +518,10 @@ export const fetchIndexOnlyBody = (docId: number) =>
 /** Open an index-only document's source in the system browser (its Drive link). */
 export const openExternalRef = (docId: number) => invoke<void>("open_external_ref", { docId });
 
+/** Open an arbitrary http(s) URL in the system browser. Used by the app-wide external-link handler
+ *  (the webview can't open `target="_blank"` itself); the backend guards the scheme to http/https. */
+export const openUrl = (url: string) => invoke<void>("open_url", { url });
+
 // --- Personal Assistant: Daily briefing (Step 7, spec §4 P1) ---
 
 /** The stored "here's your picture today" briefing + whether it's due a refresh. */

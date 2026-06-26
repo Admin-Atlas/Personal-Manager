@@ -2883,6 +2883,25 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
         .ok_or_else(|| Error::Other("This file has no extractable text to show.".into()))
 }
 
+/// Open a URL in the system browser, but ONLY if it's http/https — never a `file:`, app, or custom
+/// scheme, so a stray or injected href can't launch a local handler (the inputs are app constants and
+/// Drive-supplied links, treated as untrusted — rule #6).
+fn open_external_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| Error::Other("That doesn't look like a valid link.".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(Error::Other("Only http(s) links can be opened.".into()));
+    }
+    open::that(parsed.as_str()).map_err(|e| Error::Other(format!("Couldn't open the link: {e}")))
+}
+
+/// Open an arbitrary http(s) URL in the system browser. The webview can't open `target="_blank"`
+/// links itself (no shell/opener plugin), so the frontend's app-wide link handler routes them here.
+#[tauri::command]
+pub fn open_url(url: String) -> Result<()> {
+    open_external_url(&url)
+}
+
 /// Open an index-only document's source in the system browser (its Drive `webViewLink`).
 #[tauri::command]
 pub fn open_external_ref(state: State<'_, AppState>, doc_id: i64) -> Result<()> {
@@ -2895,8 +2914,7 @@ pub fn open_external_ref(state: State<'_, AppState>, doc_id: i64) -> Result<()> 
         )?
     };
     let url = external_ref.ok_or_else(|| Error::Other("This item has no source link.".into()))?;
-    open::that(&url).map_err(|e| Error::Other(format!("Couldn't open the link: {e}")))?;
-    Ok(())
+    open_external_url(&url)
 }
 
 // --- structured preferences (§4.5 — the typed model that replaces the Learning-You blob) ---
@@ -3747,6 +3765,15 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_external_url_allows_only_http_schemes() {
+        // Rejected before any launch — a stray/injected href can't open a local handler.
+        assert!(open_external_url("file:///etc/passwd").is_err());
+        assert!(open_external_url("javascript:alert(1)").is_err());
+        assert!(open_external_url("not a url").is_err());
+        // The http/https success path is deliberately not exercised (it would launch a browser).
+    }
 
     /// A throwaway encrypted store (also exercises the migration-in-transaction
     /// path in `db::open`).

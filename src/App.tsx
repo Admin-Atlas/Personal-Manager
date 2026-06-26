@@ -39,6 +39,7 @@ import {
   listConversations,
   onVaultAcquired,
   onVaultCurtain,
+  openUrl,
   reviewQueue,
   setHelpMode,
   vaultLockStatus,
@@ -132,6 +133,24 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // External links open in the system browser. The webview can't honour an `<a target="_blank">`
+  // on its own (no shell/opener plugin), so intercept clicks on any such link app-wide and hand the
+  // URL to the OS browser via the backend (which guards to http/https). One handler covers every
+  // link — existing and future — so individual `<a>`s need no special wiring.
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (e.defaultPrevented || e.button !== 0) return;
+      const anchor = (e.target as HTMLElement | null)?.closest?.("a");
+      const href = anchor?.getAttribute("href");
+      if (anchor?.target === "_blank" && href && /^https?:\/\//i.test(href)) {
+        e.preventDefault();
+        void openUrl(href).catch(() => {});
+      }
+    }
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
   }, []);
 
   // Auto-open "What's New" once after the app updates to a version the user
