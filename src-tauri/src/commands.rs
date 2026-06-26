@@ -2330,34 +2330,56 @@ struct AccountWork {
     items: Vec<DriveItem>,
     /// The advanced My-Drive delta cursor — set only when My Drive was synced this pass.
     new_cursor: Option<String>,
+    /// Advanced delta cursors for whole-drive shared selections — `(driveId, newCursor)`, one per
+    /// whole-drive shared drive that synced cleanly this pass. Folder-scoped selections add nothing.
+    shared_new_cursors: Vec<(String, String)>,
     auth_failed: bool,
 }
 
-/// Reconcile one opted-in shared drive: enumerate it live (whole drive, or just the selected folders
-/// walked recursively) and diff against the currently-healthy known set. A present file already
-/// healthy → `Update` (catches edits); a present file new or previously missing/unreachable → `Add`
-/// (ingests, or reactivates a folder the user removed and re-added); a known file no longer present →
-/// `Delete`. Same observe-and-react path My Drive uses, just driven by a full re-enumeration instead
-/// of a delta cursor (the changes feed can't scope to folders). Reads the known set under a brief
-/// lock; the enumeration itself is off the lock.
+/// Gather one opted-in shared drive's work, dispatching on how much of it is in scope:
+/// - **Folder-scoped** (`folders = Some`) → [`gather_shared_folders`] (re-enumerate + reconcile; the
+///   changes feed can't be scoped to folders). No cursor.
+/// - **Whole drive** (`folders = None`) → [`gather_shared_whole`] (the same efficient delta-cursor
+///   path My Drive uses). Returns the advanced `(driveId, cursor)` to persist on a clean pass.
 async fn gather_shared(
     app: &AppHandle,
     token_key: &str,
     email: &str,
     sel: &drive::SharedSelection,
+) -> Result<(Vec<DriveItem>, Option<(String, String)>)> {
+    match sel.folders.as_deref() {
+        Some(folders) => Ok((
+            gather_shared_folders(app, token_key, email, &sel.drive_id, folders).await?,
+            None,
+        )),
+        None => gather_shared_whole(app, token_key, email, &sel.drive_id).await,
+    }
+}
+
+/// Folder-scoped reconcile: enumerate the selected folders live and diff against the currently-healthy
+/// known set. A present file already healthy → `Update` (catches edits); a present file new or
+/// previously missing/unreachable → `Add` (ingests, or reactivates a folder the user removed and
+/// re-added); a known file no longer present → `Delete`. Reads the known set under a brief lock; the
+/// enumeration itself is off the lock.
+async fn gather_shared_folders(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    drive_id: &str,
+    folders: &[String],
 ) -> Result<Vec<DriveItem>> {
-    let files = drive::enumerate_shared(token_key, &sel.drive_id, sel.folders.as_deref()).await?;
+    let files = drive::enumerate_shared(token_key, drive_id, Some(folders)).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        drive::known_shared_source_ids(&conn, email, &sel.drive_id)?
+        drive::known_shared_source_ids(&conn, email, drive_id)?
             .into_iter()
             .collect()
     };
     let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut items: Vec<DriveItem> = Vec::with_capacity(files.len());
     for f in files {
-        let source_id = drive::shared_source_id(email, &sel.drive_id, &f.id);
+        let source_id = drive::shared_source_id(email, drive_id, &f.id);
         present.insert(source_id.clone());
         let event = if known.contains(&source_id) {
             index_only::ChangeEvent::Update {
@@ -2387,6 +2409,86 @@ async fn gather_shared(
         }
     }
     Ok(items)
+}
+
+/// Whole-drive sync via a **per-drive delta cursor** — the same cheap path My Drive uses, so a large
+/// shared drive isn't fully re-listed every sync. First pass (no stored cursor, or a 410 reset)
+/// enumerates the drive as `Add`s and baselines a fresh start token; later passes pull only the
+/// drive's own changes feed and advance the cursor. Returns the items plus `(driveId, newCursor)` to
+/// persist after the pass commits.
+async fn gather_shared_whole(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    drive_id: &str,
+) -> Result<(Vec<DriveItem>, Option<(String, String)>)> {
+    let cursor = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        drive::get_shared_cursor(&conn, email, drive_id)?
+    };
+
+    // First sync / 410 reset: the whole drive enumerated as Adds + a fresh baseline cursor.
+    async fn baseline(
+        token_key: &str,
+        email: &str,
+        drive_id: &str,
+    ) -> Result<(Vec<DriveItem>, String)> {
+        let files = drive::enumerate_shared(token_key, drive_id, None).await?;
+        let new_cursor = drive::start_page_token(token_key, Some(drive_id)).await?;
+        let items = files
+            .into_iter()
+            .map(|f| {
+                let source_id = drive::shared_source_id(email, drive_id, &f.id);
+                let event = index_only::ChangeEvent::Add {
+                    source_id: source_id.clone(),
+                    modified_at: f.modified_time.clone(),
+                };
+                DriveItem::Reconciled {
+                    source_id,
+                    event,
+                    file: Some(f),
+                }
+            })
+            .collect();
+        Ok((items, new_cursor))
+    }
+
+    let cursor = match cursor {
+        None => {
+            let (items, c) = baseline(token_key, email, drive_id).await?;
+            return Ok((items, Some((drive_id.to_string(), c))));
+        }
+        Some(c) => c,
+    };
+
+    let (changes, new_cursor) = match drive::list_shared_changes(token_key, drive_id, &cursor).await
+    {
+        Ok(v) => v,
+        Err(e) if drive::is_cursor_expired(&e) => {
+            let (items, c) = baseline(token_key, email, drive_id).await?;
+            return Ok((items, Some((drive_id.to_string(), c))));
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut items: Vec<DriveItem> = Vec::with_capacity(changes.len());
+    for change in &changes {
+        let source_id = drive::shared_source_id(email, drive_id, &change.file_id);
+        let known = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            drive::read_item_state(&conn, &source_id)?.is_some()
+        };
+        if let Some(event) = drive::map_shared_change(change, email, drive_id, known) {
+            items.push(DriveItem::Reconciled {
+                source_id,
+                event,
+                file: change.file.clone(),
+            });
+        }
+    }
+    Ok((items, Some((drive_id.to_string(), new_cursor))))
 }
 
 /// Sync one Drive account (or every account when `account` is `None`) into the index-only store,
@@ -2435,6 +2537,7 @@ pub async fn sync_drive(
 
         let mut items: Vec<DriveItem> = Vec::new();
         let mut new_cursor: Option<String> = None;
+        let mut shared_new_cursors: Vec<(String, String)> = Vec::new();
         let mut auth_failed = false;
 
         // --- My Drive (delta cursor) ---
@@ -2447,7 +2550,7 @@ pub async fn sync_drive(
             // A full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
             let full_relist = |token_key: String| async move {
                 let files = drive::enumerate_drive(&token_key).await?;
-                let cursor = drive::start_page_token(&token_key).await?;
+                let cursor = drive::start_page_token(&token_key, None).await?;
                 Ok::<_, Error>((files, cursor))
             };
             let outcome: Result<(Vec<DriveItem>, String)> = if cursor.is_none() {
@@ -2481,11 +2584,17 @@ pub async fn sync_drive(
             }
         }
 
-        // --- shared drives (reconcile). Skip if the account already auth-failed (same token). ---
+        // --- shared drives. Skip if the account already auth-failed (same token). Whole-drive
+        // selections return an advanced cursor to persist; folder-scoped ones return None. ---
         if !auth_failed {
             for sel in &scope.shared {
                 match gather_shared(&app, &token_key, &email, sel).await {
-                    Ok(mut recon) => items.append(&mut recon),
+                    Ok((mut recon, cursor)) => {
+                        items.append(&mut recon);
+                        if let Some(advanced) = cursor {
+                            shared_new_cursors.push(advanced);
+                        }
+                    }
                     Err(e) => {
                         if drive::is_auth_failure(&e) {
                             auth_failed = true;
@@ -2504,6 +2613,7 @@ pub async fn sync_drive(
             token_key,
             items,
             new_cursor,
+            shared_new_cursors,
             auth_failed,
         });
     }
@@ -2645,11 +2755,18 @@ pub async fn sync_drive(
             });
         }
 
-        // Advance the cursor + stamp the time only on a clean pass for this account.
-        if let Some(cursor) = &w.new_cursor {
+        // Persist the pass: advance My Drive's cursor (if synced) + each whole-drive shared cursor,
+        // stamp the time, and clear failure state. Auth-failed accounts already `continue`d above, so
+        // reaching here means the pass was healthy enough to commit its cursors.
+        {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            drive::set_synced(&conn, &w.email, cursor)?;
+            drive::finalize_sync(
+                &conn,
+                &w.email,
+                w.new_cursor.as_deref(),
+                &w.shared_new_cursors,
+            )?;
         }
     }
 

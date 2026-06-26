@@ -144,25 +144,82 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<DriveAccount>> {
     Ok(out)
 }
 
-/// The stored delta cursor (Drive changes page token) for an account, if any.
-pub fn get_cursor(conn: &Connection, email: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT cursor FROM connector_sources WHERE id = ?1",
-        params![account_id(email)],
-        |r| r.get(0),
-    )
-    .optional()
-    .map(Option::flatten)
-    .map_err(Error::from)
+// --- delta cursors -------------------------------------------------------------------------------
+//
+// The `connector_sources.cursor` column holds a JSON **map** of changes-feed page tokens, one per
+// independently-tracked corpus: key `"my"` for the personal My Drive, and one key per *whole-drive*
+// shared selection (its driveId). Folder-scoped shared selections have no cursor — the changes feed
+// can't be scoped to folders, so they re-enumerate + reconcile instead (see `gather_shared`). A
+// legacy bare token (pre-shared-drives, when the column held just the My-Drive token) is still read
+// as the `"my"` cursor and upgraded to the map shape on the next clean sync.
+
+/// The cursor-map key for the personal My Drive changes feed (shared selections key on their driveId,
+/// which is never the literal `"my"`).
+const MY_DRIVE_CURSOR_KEY: &str = "my";
+
+type CursorMap = std::collections::BTreeMap<String, String>;
+
+/// Decode the `cursor` column: a JSON object → that map; a non-empty bare string → a legacy My-Drive
+/// token; absent/empty/garbage → an empty map.
+fn decode_cursors(raw: Option<String>) -> CursorMap {
+    match raw {
+        Some(s) if s.trim_start().starts_with('{') => serde_json::from_str(&s).unwrap_or_default(),
+        Some(s) if !s.trim().is_empty() => {
+            let mut m = CursorMap::new();
+            m.insert(MY_DRIVE_CURSOR_KEY.to_string(), s);
+            m
+        }
+        _ => CursorMap::new(),
+    }
 }
 
-/// Record a clean sync: advance the cursor, stamp the time, and clear any failure state.
-pub fn set_synced(conn: &Connection, email: &str, cursor: &str) -> Result<()> {
+/// Read an account's whole cursor map.
+fn read_cursors(conn: &Connection, email: &str) -> Result<CursorMap> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT cursor FROM connector_sources WHERE id = ?1",
+            params![account_id(email)],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)?;
+    Ok(decode_cursors(raw))
+}
+
+/// The stored My-Drive delta cursor for an account, if any.
+pub fn get_cursor(conn: &Connection, email: &str) -> Result<Option<String>> {
+    Ok(read_cursors(conn, email)?.remove(MY_DRIVE_CURSOR_KEY))
+}
+
+/// The stored delta cursor for one whole-drive shared selection (keyed on its driveId), if any.
+pub fn get_shared_cursor(conn: &Connection, email: &str, drive_id: &str) -> Result<Option<String>> {
+    Ok(read_cursors(conn, email)?.remove(drive_id))
+}
+
+/// Record a clean sync: advance the My-Drive cursor (when My Drive synced this pass) and any
+/// whole-drive shared cursors that advanced, stamp the time, and clear any failure state. Cursors for
+/// corpora not touched this pass are left as-is, so a drive that errored mid-pass retries from its
+/// existing token next time.
+pub fn finalize_sync(
+    conn: &Connection,
+    email: &str,
+    my_cursor: Option<&str>,
+    shared_cursors: &[(String, String)],
+) -> Result<()> {
+    let mut cursors = read_cursors(conn, email)?;
+    if let Some(c) = my_cursor {
+        cursors.insert(MY_DRIVE_CURSOR_KEY.to_string(), c.to_string());
+    }
+    for (drive_id, cursor) in shared_cursors {
+        cursors.insert(drive_id.clone(), cursor.clone());
+    }
+    let json = serde_json::to_string(&cursors)
+        .map_err(|e| Error::Other(format!("encode drive cursors: {e}")))?;
     conn.execute(
         "UPDATE connector_sources \
          SET cursor = ?2, last_synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), state = 'ok' \
          WHERE id = ?1",
-        params![account_id(email), cursor],
+        params![account_id(email), json],
     )?;
     Ok(())
 }
@@ -299,13 +356,27 @@ pub fn get_scope(conn: &Connection, email: &str) -> Result<DriveScope> {
     }
 }
 
-/// Persist an account's indexing scope.
+/// Persist an account's indexing scope, and **prune stale delta cursors** to match: keep My Drive's
+/// and the cursor of any drive that is still a *whole-drive* selection; drop the rest. A drive that
+/// was removed, or switched to folder-scoped (which uses no cursor), thus loses its cursor — so a
+/// later switch back to whole-drive re-baselines with a fresh enumeration instead of resuming from a
+/// token that predates out-of-scope soft-deletes.
 pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<()> {
     let json = serde_json::to_string(scope)
         .map_err(|e| Error::Other(format!("encode drive scope: {e}")))?;
+    let keep: std::collections::HashSet<&str> = scope
+        .shared
+        .iter()
+        .filter(|s| s.folders.is_none())
+        .map(|s| s.drive_id.as_str())
+        .collect();
+    let mut cursors = read_cursors(conn, email)?;
+    cursors.retain(|k, _| k == MY_DRIVE_CURSOR_KEY || keep.contains(k.as_str()));
+    let cursor_json = serde_json::to_string(&cursors)
+        .map_err(|e| Error::Other(format!("encode drive cursors: {e}")))?;
     conn.execute(
-        "UPDATE connector_sources SET folder_ids = ?2 WHERE id = ?1",
-        params![account_id(email), json],
+        "UPDATE connector_sources SET folder_ids = ?2, cursor = ?3 WHERE id = ?1",
+        params![account_id(email), json, cursor_json],
     )?;
     Ok(())
 }
@@ -521,12 +592,11 @@ pub fn parse_changes(value: &Value) -> (Vec<DriveChange>, Option<String>, Option
     (changes, next, new_start)
 }
 
-/// Map a Drive change onto a foundation [`ChangeEvent`] — the **pure heart of detection**. `None`
-/// means "skip" (a non-removal change with no file payload — nothing actionable). A rename in Drive
-/// keeps the same fileId (the stable source id), so classification is preserved either way; a
-/// content edit bumps the hash and re-embeds, carrying the new title along.
-pub fn map_change(change: &DriveChange, email: &str, known: bool) -> Option<ChangeEvent> {
-    let source_id = source_id_for(email, &change.file_id);
+/// Map a Drive change onto a foundation [`ChangeEvent`], given the change's already-namespaced source
+/// id — the **pure heart of detection**. `None` means "skip" (a non-removal change with no file
+/// payload — nothing actionable). A rename in Drive keeps the same fileId (the stable source id), so
+/// classification is preserved either way; a content edit bumps the hash and re-embeds.
+fn change_event(source_id: String, change: &DriveChange, known: bool) -> Option<ChangeEvent> {
     if change.removed {
         return Some(ChangeEvent::Delete { source_id });
     }
@@ -542,6 +612,25 @@ pub fn map_change(change: &DriveChange, email: &str, known: bool) -> Option<Chan
         modified_at: file.modified_time.clone(),
         new_content_hash: file.content_hash(),
     })
+}
+
+/// Map a **My Drive** change (the `gdrive:<email>:<fileId>` namespace).
+pub fn map_change(change: &DriveChange, email: &str, known: bool) -> Option<ChangeEvent> {
+    change_event(source_id_for(email, &change.file_id), change, known)
+}
+
+/// Map a **shared-drive** change (the `gdrive:<email>:sd:<driveId>:<fileId>` namespace).
+pub fn map_shared_change(
+    change: &DriveChange,
+    email: &str,
+    drive_id: &str,
+    known: bool,
+) -> Option<ChangeEvent> {
+    change_event(
+        shared_source_id(email, drive_id, &change.file_id),
+        change,
+        known,
+    )
 }
 
 /// How to turn a Drive file's bytes into indexable text, decided purely by its MIME type.
@@ -795,17 +884,26 @@ pub async fn enumerate_shared(
     }
 }
 
-/// The delta baseline cursor (`changes.getStartPageToken`).
-pub async fn start_page_token(token_key: &str) -> Result<String> {
-    let v =
-        google::authorized_get(token_key, &format!("{DRIVE_API}/changes/startPageToken")).await?;
+/// The delta baseline cursor (`changes.getStartPageToken`). `drive_id: Some` scopes it to one shared
+/// drive's change feed; `None` is the personal My Drive.
+pub async fn start_page_token(token_key: &str, drive_id: Option<&str>) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/changes/startPageToken"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("supportsAllDrives", "true");
+        if let Some(d) = drive_id {
+            q.append_pair("driveId", d);
+        }
+    }
+    let v = google::authorized_get(token_key, url.as_str()).await?;
     v.get("startPageToken")
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| Error::Other("Drive didn't return a change cursor.".into()))
 }
 
-fn changes_url(page_token: &str) -> Result<String> {
+fn changes_url(page_token: &str, drive_id: Option<&str>) -> Result<String> {
     let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/changes"))
         .map_err(|e| Error::Other(e.to_string()))?;
     {
@@ -814,6 +912,12 @@ fn changes_url(page_token: &str) -> Result<String> {
         q.append_pair("pageSize", "200");
         q.append_pair("includeRemoved", "true");
         q.append_pair("spaces", "drive");
+        // Scope to a shared drive's own change feed (My Drive omits these → its own feed).
+        if let Some(d) = drive_id {
+            q.append_pair("driveId", d);
+            q.append_pair("includeItemsFromAllDrives", "true");
+            q.append_pair("supportsAllDrives", "true");
+        }
         q.append_pair(
             "fields",
             &format!("nextPageToken,newStartPageToken,changes(fileId,removed,file({FILE_FIELDS}))"),
@@ -822,14 +926,15 @@ fn changes_url(page_token: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-/// Pull every change since `cursor`, following pages, and return the changes + the next baseline
-/// cursor (`newStartPageToken`). On an expired cursor Google returns HTTP 410 — surfaced as an error
-/// the caller detects ([`is_cursor_expired`]) to fall back to a full re-list.
-pub async fn list_changes(token_key: &str, cursor: &str) -> Result<(Vec<DriveChange>, String)> {
+async fn list_changes_for(
+    token_key: &str,
+    drive_id: Option<&str>,
+    cursor: &str,
+) -> Result<(Vec<DriveChange>, String)> {
     let mut all = Vec::new();
     let mut page = cursor.to_string();
     for _ in 0..MAX_PAGES {
-        let v = google::authorized_get(token_key, &changes_url(&page)?).await?;
+        let v = google::authorized_get(token_key, &changes_url(&page, drive_id)?).await?;
         let (changes, next, new_start) = parse_changes(&v);
         all.extend(changes);
         match (next, new_start) {
@@ -840,6 +945,22 @@ pub async fn list_changes(token_key: &str, cursor: &str) -> Result<(Vec<DriveCha
     }
     eprintln!("drive: changes hit the page guard at {MAX_PAGES} pages");
     Ok((all, page))
+}
+
+/// Pull every **My Drive** change since `cursor` + the next baseline cursor (`newStartPageToken`). On
+/// an expired cursor Google returns HTTP 410 — surfaced as an error the caller detects
+/// ([`is_cursor_expired`]) to fall back to a full re-list.
+pub async fn list_changes(token_key: &str, cursor: &str) -> Result<(Vec<DriveChange>, String)> {
+    list_changes_for(token_key, None, cursor).await
+}
+
+/// Pull every change since `cursor` for one **shared drive's** own change feed + its next cursor.
+pub async fn list_shared_changes(
+    token_key: &str,
+    drive_id: &str,
+    cursor: &str,
+) -> Result<(Vec<DriveChange>, String)> {
+    list_changes_for(token_key, Some(drive_id), cursor).await
 }
 
 /// Fetch one file's metadata (for body-on-demand, where we hold only the stored pointer).
@@ -1026,6 +1147,24 @@ mod tests {
             scoped.shared[0].folders.as_deref(),
             Some(&["f1".to_string(), "f2".to_string()][..])
         );
+    }
+
+    #[test]
+    fn cursor_column_decodes_map_legacy_and_empty() {
+        // The current shape: a JSON object of per-corpus tokens.
+        let m = decode_cursors(Some(r#"{"my":"T1","0ADrive":"T2"}"#.to_string()));
+        assert_eq!(m.get("my").map(String::as_str), Some("T1"));
+        assert_eq!(m.get("0ADrive").map(String::as_str), Some("T2"));
+        // A legacy bare token (pre-shared-drives) reads as the My-Drive cursor and upgrades on write.
+        let legacy = decode_cursors(Some("LEGACYTOKEN".to_string()));
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(
+            legacy.get(MY_DRIVE_CURSOR_KEY).map(String::as_str),
+            Some("LEGACYTOKEN")
+        );
+        // Absent / blank → empty (a first sync).
+        assert!(decode_cursors(None).is_empty());
+        assert!(decode_cursors(Some("   ".to_string())).is_empty());
     }
 
     #[test]
