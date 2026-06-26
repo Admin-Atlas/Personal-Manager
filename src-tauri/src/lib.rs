@@ -19,6 +19,7 @@ mod lock_session;
 mod model_gateway;
 mod openrouter;
 mod paths;
+mod preferences;
 mod projects;
 mod recommend;
 mod registry;
@@ -417,6 +418,12 @@ pub fn run() {
             // rebuilt aliases).
             app.state::<AppState>().reconcile_entity_rules();
             app.state::<AppState>().reconcile_index_only();
+
+            // One-time: distil the legacy "Learning You" blob into structured preference records
+            // (§4.5) so nothing accumulated is lost. Background, idempotent (a settings flag guards
+            // it), best-effort; a no-op when the vault is locked or it has already run. Also retried
+            // after a review commit, so a vault locked at startup still migrates once unlocked.
+            commands::spawn_preferences_migration(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -454,7 +461,12 @@ pub fn run() {
             commands::force_take_vault,
             commands::list_models,
             commands::get_learning_profile,
-            commands::refresh_learning_profile,
+            commands::list_preferences,
+            commands::add_preference,
+            commands::update_preference,
+            commands::confirm_preference,
+            commands::delete_preference,
+            commands::parse_preference_statement,
             commands::list_conversations,
             commands::create_conversation,
             commands::get_messages,

@@ -14,7 +14,6 @@ import {
   hasOpenRouterKey,
   languageOptions,
   openDataFolder,
-  refreshLearningProfile,
   refreshPricing,
   setAppLock,
   setBackgroundAutoSwitch,
@@ -80,7 +79,6 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [profile, setProfile] = useState<LearningProfile | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
   const [timeZone, setTimeZoneState] = useState("");
   const [tzAuto, setTzAuto] = useState(true);
   const [cost, setCost] = useState<CostSummary | null>(null);
@@ -237,18 +235,6 @@ export function SettingsView({ onClose, onboarding }: Props) {
     } else {
       setEmbedderId(to);
       await reloadLang();
-    }
-  }
-
-  async function refreshProfile() {
-    setRefreshing(true);
-    setError(null);
-    try {
-      setProfile(await refreshLearningProfile());
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setRefreshing(false);
     }
   }
 
@@ -936,12 +922,9 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
-                  <div className="flex items-center justify-between">
-                    <label className="block text-sm font-medium text-ink2">Learning You</label>
-                    <Button variant="tertiary" onClick={refreshProfile} disabled={refreshing}>
-                      {refreshing ? "Refreshing…" : "Refresh now"}
-                    </Button>
-                  </div>
+                  <label className="block text-sm font-medium text-ink2">
+                    Learning You (legacy)
+                  </label>
                   <div className="mt-2">
                     <Collapsible
                       title="Profile"
@@ -953,13 +936,14 @@ export function SettingsView({ onClose, onboarding }: Props) {
                       }
                     >
                       <p className="pt-2 text-xs text-ink4">
-                        What PM has learned about how you organise, distilled from your review
-                        corrections, and fed into its suggestions and chat.
+                        The earlier free-text profile of how you organise. It's now frozen and being
+                        replaced by structured, editable preferences in the Teach tab — your
+                        accumulated profile is carried over into them automatically.
                       </p>
                       <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink2">
                         {profile?.profile?.trim()
                           ? profile.profile
-                          : "Nothing learned yet — it builds up as you correct the AI's proposals in Review."}
+                          : "Nothing here — this earlier profile was empty."}
                       </div>
                       <p className="mt-1 text-xs text-faint">
                         {profile

@@ -281,6 +281,13 @@ pub fn merge_entities(conn: &Connection, from_id: i64, into_id: i64) -> Result<(
         "UPDATE projects SET entity_id = ?2 WHERE entity_id = ?1",
         params![from_id, into_id],
     )?;
+    // Project-scoped preferences follow the survivor (they FK `entities` with ON DELETE CASCADE, so
+    // repointing here is what stops the DELETE below from cascade-deleting the folded project's
+    // preferences). Structured preferences (the §4.5 model) are a no-op on a vault without any.
+    conn.execute(
+        "UPDATE preferences SET entity_id = ?2 WHERE entity_id = ?1",
+        params![from_id, into_id],
+    )?;
     conn.execute("DELETE FROM entities WHERE id = ?1", params![from_id])?;
     // Merging variants into a survivor is a deliberate vouch for it — confirm the survivor.
     set_confirmed(conn, into_id)?;

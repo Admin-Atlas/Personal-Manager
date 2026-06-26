@@ -691,14 +691,17 @@ mod tests {
         // The canonical-entity backfill, exercised over a realistic v9→v10 upgrade: tear the v10
         // tables back down to a v9-shaped store, seed it with documents carrying name variants,
         // then re-run migrations so the real backfill processes them. Because `migrations::run`
-        // re-applies EVERY step from the reset `user_version` forward, the later v11 columns must be
-        // reverted too — otherwise v11's ADD COLUMNs would collide with the columns still on disk.
+        // re-applies EVERY step from the reset `user_version` forward, every later step must be
+        // reverted too — otherwise v11's/v12's ADD COLUMNs and v13's CREATE TABLE would collide with
+        // schema still on disk. `preferences` (v13) is dropped FIRST: it FKs `entities`, so it must
+        // go before the entity tables it references.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v10.sqlite");
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP INDEX idx_documents_source_id; \
+            "DROP TABLE preferences; \
+             DROP INDEX idx_documents_source_id; \
              DROP INDEX idx_documents_source_type; \
              ALTER TABLE documents DROP COLUMN source_type; \
              ALTER TABLE documents DROP COLUMN source_state; \
@@ -812,15 +815,17 @@ mod tests {
     fn migration_v11_defaults_existing_rows_to_stored_vault_documents() {
         // Tear the store back down to a v10-shaped store, seed a document the way v10 wrote them (no
         // source_* columns), then re-run migrations so the real v11 step processes a pre-existing
-        // row. Every migration ABOVE v10 must be reverted — v11's source_* columns AND v12's
-        // `entities.confidence`/`user_confirmed` — otherwise their re-run ADD COLUMNs collide with
-        // columns still on disk from the initial `open`.
+        // row. Every migration ABOVE v10 must be reverted — v11's source_* columns, v12's
+        // `entities.confidence`/`user_confirmed`, AND v13's `preferences` table — otherwise their
+        // re-run ADD COLUMNs / CREATE TABLE collide with schema still on disk from the initial
+        // `open`. `preferences` is dropped first (it FKs `entities`).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v11.sqlite");
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP INDEX idx_documents_source_id; \
+            "DROP TABLE preferences; \
+             DROP INDEX idx_documents_source_id; \
              DROP INDEX idx_documents_source_type; \
              ALTER TABLE documents DROP COLUMN source_type; \
              ALTER TABLE documents DROP COLUMN source_state; \

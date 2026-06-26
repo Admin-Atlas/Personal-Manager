@@ -337,6 +337,45 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE entities ADD COLUMN user_confirmed INTEGER NOT NULL DEFAULT 0
         CHECK (user_confirmed IN (0,1));
     "#,
+    // v13: the structured preference model (spec §4.5 / §291, Stage 3) — replaces the single
+    // free-text "Learning You" blob (`settings.learning_profile`, dumped WHOLE into every
+    // chat/proposal/briefing prompt) with TYPED, QUERYABLE preference records. The blob can't be
+    // queried by condition, can't be selectively retrieved, and silently loses the rule that
+    // applied at the decision point as preferences accumulate — the "blob-in-context" failure mode.
+    // A preference is now a row whose fields mirror the card's minimum model: `scope`
+    // (global / per-project / per-context), `condition` (when it applies — the predicate text for
+    // context scope), `value` (the preference itself), `source` (user-stated vs PM-inferred), and a
+    // revisable `confidence`. Retrieval becomes a QUERY (`preferences::relevant_preferences`) that
+    // injects only the records whose scope+condition match the current situation, so the applicable
+    // rule is guaranteed-surfaced rather than hoped-for.
+    //   * `entity_id` reuses the canonical `entities` spine (just hardened in v12) for per-project
+    //     scope — a deterministic id match, never a name string — and is NULL for global/context.
+    //     ON DELETE CASCADE cleans up a project's preferences if its entity is ever deleted; a
+    //     MERGE repoints them first (`entities::merge_entities`) so they follow the survivor.
+    //   * `user_confirmed` mirrors the entity convention: a user-stated preference is confirmed;
+    //     records distilled once from the legacy blob land `source='inferred'`, unconfirmed, awaiting
+    //     the user's vouch in the Teach tab. The ongoing inference loop is deferred (→ Stage 5).
+    // DB-resident on purpose (NOT a portable `.pmrules` file): SQLCipher encrypts it at rest, the
+    // table is never dropped (additive migrations, rule #3), and it already travels with a
+    // shared/portable vault — the rules-file pattern exists to survive entity mirror-rebuilds +
+    // id reassignment, which preferences don't face. Vectors are untouched. All additive — an
+    // existing store just gains an empty table (rule #3).
+    r#"
+    CREATE TABLE preferences (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope          TEXT NOT NULL CHECK (scope IN ('global','project','context')),
+        entity_id      INTEGER REFERENCES entities(id) ON DELETE CASCADE, -- set iff scope='project'
+        condition      TEXT,                            -- when it applies (context scope; optional otherwise)
+        value          TEXT NOT NULL,                   -- the preference itself
+        source         TEXT NOT NULL DEFAULT 'user'  CHECK (source IN ('user','inferred')),
+        confidence     REAL NOT NULL DEFAULT 1.0     CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        user_confirmed INTEGER NOT NULL DEFAULT 0    CHECK (user_confirmed IN (0,1)),
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_preferences_scope  ON preferences(scope);
+    CREATE INDEX idx_preferences_entity ON preferences(entity_id);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

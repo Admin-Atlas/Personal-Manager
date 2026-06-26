@@ -266,6 +266,43 @@ export interface Entity {
   user_confirmed: boolean;
 }
 
+// --- Structured preferences (spec §4.5 — the typed model that replaces the Learning-You blob) ---
+
+/** One structured preference record — PM's memory of the user as a typed, queryable rule, retrieved
+ *  by scope+condition at the decision point instead of one prose blob injected whole. The Teach tab
+ *  manages these. */
+export interface Preference {
+  id: number;
+  /** "global" (always) | "project" (one entity) | "context" (a stated situation). */
+  scope: string;
+  /** Set iff `scope === "project"` — the canonical entity this is about. */
+  entity_id: number | null;
+  /** Joined canonical name for `entity_id` (display-only). */
+  project_name: string | null;
+  /** When it applies — the predicate text for a context preference (null for global/project). */
+  condition: string | null;
+  value: string;
+  /** "user" (explicitly stated) | "inferred" (distilled from the legacy blob / behaviour). */
+  source: string;
+  /** Revisable confidence in [0,1] (1.0 for user-stated; lower for inferred). */
+  confidence: number;
+  /** Whether the user has vouched for this record (stated, edited, or confirmed in Teach). */
+  user_confirmed: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A preference without an id yet — what the natural-language parse returns (for the form to
+ *  prefill) and the shape the structured add path builds. `project_name` is display-only; the
+ *  backend has resolved it to `entity_id` for a project-scoped record. */
+export interface DraftPreference {
+  scope: string;
+  entity_id: number | null;
+  project_name: string | null;
+  condition: string | null;
+  value: string;
+}
+
 // --- Personal Assistant: focus view & projects (Step 5, spec §4.1) ---
 
 /** The one status a project shows in the focus view. Exactly one applies. */
