@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useCallback, useEffect, useState } from "react";
-import { connectDrive, disconnectDrive, driveStatus, syncDrive } from "../lib/ipc";
+import {
+  connectDrive,
+  disconnectDrive,
+  driveStatus,
+  driveSyncStatus,
+  onDriveSync,
+  syncDrive,
+} from "../lib/ipc";
 import type { DriveAccount, DriveStatus } from "../lib/types";
 import { Button, Collapsible, ConfirmDialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
@@ -27,6 +34,7 @@ export function GoogleDriveConnection() {
   const [progress, setProgress] = useState<{ processed: number; total: number | null } | null>(
     null,
   );
+  const [syncAccount, setSyncAccount] = useState<string | null>(null);
   const [confirmEmail, setConfirmEmail] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -41,6 +49,37 @@ export function GoogleDriveConnection() {
     refresh();
   }, [refresh]);
 
+  // The sync runs detached in the backend (it keeps going if you leave Settings). Follow its global
+  // progress events, and — if a sync is already in flight when this view (re)mounts — restore the bar
+  // from the backend snapshot so it never looks stalled or stopped.
+  useEffect(() => {
+    let mounted = true;
+    const unlisten = onDriveSync((ev) => {
+      if (!mounted) return;
+      if (ev.type === "counted") setProgress({ processed: 0, total: ev.total });
+      else if (ev.type === "item") setProgress({ processed: ev.processed, total: ev.total });
+      else if (ev.type === "finished") {
+        const n = ev.indexed + ev.updated + ev.removed;
+        setProgress(null);
+        setSyncAccount(null);
+        setNote(`Synced — ${n} item${n === 1 ? "" : "s"} added or updated.`);
+        void refresh();
+      }
+    });
+    void driveSyncStatus()
+      .then((s) => {
+        if (mounted && s.running) {
+          setProgress({ processed: s.processed, total: s.total });
+          setSyncAccount(s.account);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+      void unlisten.then((fn) => fn());
+    };
+  }, [refresh]);
+
   async function run(label: string, fn: () => Promise<void>) {
     setBusy(label);
     setError(null);
@@ -51,30 +90,30 @@ export function GoogleDriveConnection() {
       setError(String(e));
     } finally {
       setBusy(null);
-      setProgress(null);
     }
   }
 
-  const runSync = async (email: string | null) => {
+  // Start a background sync for one account (or all). Fire-and-forget: progress arrives via the
+  // global event listener above, and the sync survives navigating away.
+  const sync = (email: string | null) => {
+    setError(null);
+    setNote(null);
+    setSyncAccount(email);
     setProgress({ processed: 0, total: null });
-    const n = await syncDrive(email, (ev) => {
-      if (ev.type === "counted") setProgress({ processed: 0, total: ev.total });
-      else if (ev.type === "item") setProgress({ processed: ev.processed, total: ev.total });
+    void syncDrive(email).catch((e) => {
+      setError(String(e));
+      setProgress(null);
+      setSyncAccount(null);
     });
-    setNote(`Synced — ${n} item${n === 1 ? "" : "s"} added or updated.`);
-    await refresh();
   };
 
   const connect = () =>
     run("connect", async () => {
       const account = await connectDrive();
       await refresh();
-      // Kick off the (slow) first sync immediately — the banner above sets the expectation.
-      await runSync(account.email).catch((e) => setError(String(e)));
-      setNote((prev) => prev ?? `Connected ${account.email}.`);
+      // Kick off the (slow) first sync in the background — the banner above sets the expectation.
+      sync(account.email);
     });
-
-  const sync = (email: string) => run(`sync:${email}`, () => runSync(email));
 
   const disconnect = (email: string) =>
     run("disconnect", async () => {
@@ -84,7 +123,8 @@ export function GoogleDriveConnection() {
 
   const configured = status?.oauth_client_configured ?? false;
   const accounts = status?.accounts ?? [];
-  const syncing = busy === "connect" || busy?.startsWith("sync:");
+  const syncing = progress != null;
+  const anyBusy = busy != null || syncing;
 
   return (
     <div data-help="settings-drive">
@@ -117,8 +157,8 @@ export function GoogleDriveConnection() {
                 <li key={a.id} className="px-3 py-2">
                   <AccountRow
                     account={a}
-                    busy={busy != null}
-                    syncingThis={busy === `sync:${a.email}`}
+                    busy={anyBusy}
+                    syncingThis={syncAccount === a.email}
                     onSync={() => sync(a.email)}
                     onDisconnect={() => setConfirmEmail(a.email)}
                   />
@@ -128,11 +168,7 @@ export function GoogleDriveConnection() {
                       defaultOpen={false}
                       title={<span className="text-xs text-ink3">Shared drives & scope</span>}
                     >
-                      <SharedDrivesManager
-                        email={a.email}
-                        busy={busy != null}
-                        onApply={() => sync(a.email)}
-                      />
+                      <SharedDrivesManager email={a.email} busy={anyBusy} onSaved={refresh} />
                     </Collapsible>
                   )}
                 </li>
@@ -144,7 +180,7 @@ export function GoogleDriveConnection() {
             <Button
               variant={accounts.length === 0 ? "primary" : "secondary"}
               onClick={connect}
-              disabled={busy != null}
+              disabled={anyBusy}
               className="disabled:opacity-40"
             >
               {busy === "connect"
@@ -156,12 +192,17 @@ export function GoogleDriveConnection() {
           </div>
 
           {syncing && progress && (
-            <IngestProgress
-              className="mt-3"
-              processed={progress.processed}
-              total={progress.total}
-              label="Syncing Google Drive"
-            />
+            <div className="mt-3">
+              <IngestProgress
+                processed={progress.processed}
+                total={progress.total}
+                label={syncAccount ? `Indexing ${syncAccount}` : "Indexing your Drive"}
+              />
+              <p className="mt-1 text-xs text-ink4">
+                Indexing keeps running in the background — you can leave this page and come back
+                later; we’ll keep working.
+              </p>
+            </div>
           )}
         </>
       )}
@@ -213,7 +254,7 @@ function AccountRow({
     <div className="flex items-center justify-between gap-2">
       <div className="min-w-0">
         <div className="flex items-center gap-2">
-          <span className="truncate text-sm text-ink">{account.label || account.email}</span>
+          <span className="truncate text-sm text-ink">{account.email}</span>
           {unreachable ? (
             <span className="shrink-0 text-[10px] uppercase tracking-wide text-st-due">
               unreachable

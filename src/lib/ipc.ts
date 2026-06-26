@@ -22,6 +22,7 @@ import type {
   DriveScope,
   DriveStatus,
   DriveSyncEvent,
+  DriveSyncState,
   Entity,
   GoogleCalendar,
   IcsFeedInfo,
@@ -485,15 +486,18 @@ export const connectDrive = () => invoke<DriveAccount>("connect_drive");
 /** Disconnect one account: forget its token + flag its items unreachable (kept findable). */
 export const disconnectDrive = (email: string) => invoke<void>("disconnect_drive", { email });
 
-/** Sync one account (or all when `email` is omitted), streaming progress. Returns items touched. */
-export function syncDrive(
-  email: string | null,
-  onEvent: (event: DriveSyncEvent) => void,
-): Promise<number> {
-  const channel = new Channel<DriveSyncEvent>();
-  channel.onmessage = onEvent;
-  return invoke<number>("sync_drive", { account: email, onEvent: channel });
-}
+/** Start syncing one account (or all when `email` is null). Runs **detached** in the backend, so it
+ *  keeps going if the user leaves Settings — progress arrives via the global `drive://sync` event
+ *  (subscribe with {@link onDriveSync}). The returned promise resolves with the items-touched count
+ *  when this call's sync finishes; it's fine to ignore it (the events + status drive the UI). */
+export const syncDrive = (email: string | null) => invoke<number>("sync_drive", { account: email });
+
+/** The current background-sync snapshot — used to restore the progress UI on returning to Settings. */
+export const driveSyncStatus = () => invoke<DriveSyncState>("drive_sync_status");
+
+/** Subscribe to global Drive sync progress (fires regardless of which view started the sync). */
+export const onDriveSync = (handler: (e: DriveSyncEvent) => void): Promise<UnlistenFn> =>
+  listen<DriveSyncEvent>("drive://sync", (e) => handler(e.payload));
 
 /** The shared drives one account can see (for the "add shared drives" picker). */
 export const listDriveSharedDrives = (email: string) =>

@@ -8,7 +8,7 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::calendar::{self, CalendarEvent, CalendarInfo, IcsFeedInfo};
 use crate::error::{Error, Result};
@@ -2491,19 +2491,74 @@ async fn gather_shared_whole(
     Ok((items, Some((drive_id.to_string(), new_cursor))))
 }
 
+/// Apply `f` to the shared drive-sync snapshot, best-effort (a poisoned lock is skipped). Binding the
+/// lock guard to a named local first sidesteps the `if let` temporary-lifetime pitfall.
+fn with_drive_snap(app: &AppHandle, f: impl FnOnce(&mut crate::DriveSyncState)) {
+    let state = app.state::<AppState>();
+    let guard = state.drive_sync.lock();
+    if let Ok(mut snap) = guard {
+        f(&mut snap);
+    }
+}
+
+/// Update the shared drive-sync snapshot and broadcast a `drive://sync` progress event globally. The
+/// snapshot lets the UI restore an in-flight sync after navigating away; the global event (vs a
+/// per-call Channel) means progress reaches whatever component is mounted, not just the starter.
+fn emit_drive_progress(app: &AppHandle, ev: drive::DriveSyncEvent) {
+    with_drive_snap(app, |snap| match &ev {
+        drive::DriveSyncEvent::Counted { total } => {
+            snap.total = Some(*total);
+            snap.processed = 0;
+        }
+        drive::DriveSyncEvent::Item {
+            processed, total, ..
+        } => {
+            snap.processed = *processed;
+            snap.total = Some(*total);
+        }
+        drive::DriveSyncEvent::Finished { .. } => {}
+    });
+    let _ = app.emit("drive://sync", ev);
+}
+
+/// The currently-running Drive sync snapshot (empty / `running:false` when idle), so the Settings UI
+/// can resume showing progress after the user leaves and returns.
+#[tauri::command]
+pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::DriveSyncState> {
+    state
+        .drive_sync
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|_| Error::Other("drive sync state poisoned".into()))
+}
+
 /// Sync one Drive account (or every account when `account` is `None`) into the index-only store,
 /// honouring each account's scope. **My Drive** (on by default) uses the efficient delta cursor — the
 /// first sync enumerates everything (the slow one the UI warns about), later syncs apply only the
 /// changes feed. **Shared drives** the account opted into are re-enumerated and reconciled each pass
 /// (whole drive, or just the selected folders). Every item is index-only: a pointer + embedding, the
-/// body fetched live. Never holds the DB lock across a network/embed call (rule #4). Streams
-/// `DriveSyncEvent` for the shared progress bar. Returns the number of items touched.
+/// body fetched live. Never holds the DB lock across a network/embed call (rule #4).
+///
+/// **Runs detached**: progress is broadcast via the global `drive://sync` event (not a per-call
+/// Channel) and mirrored into [`AppState::drive_sync`], so the sync keeps running — and the UI keeps
+/// reflecting it — even if the user leaves the Settings page. Returns the number of items touched.
 #[tauri::command]
-pub async fn sync_drive(
-    app: AppHandle,
-    account: Option<String>,
-    on_event: Channel<drive::DriveSyncEvent>,
-) -> Result<usize> {
+pub async fn sync_drive(app: AppHandle, account: Option<String>) -> Result<usize> {
+    with_drive_snap(&app, |snap| {
+        *snap = crate::DriveSyncState {
+            running: true,
+            processed: 0,
+            total: None,
+            account: account.clone(),
+        };
+    });
+    let result = run_drive_sync(&app, account).await;
+    with_drive_snap(&app, |snap| snap.running = false);
+    result
+}
+
+/// The body of [`sync_drive`], split out so the wrapper clears the running flag on every exit path.
+async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usize> {
     // The engine is needed for index-only embedding + binary conversion — ensure it once up front.
     {
         let state = app.state::<AppState>();
@@ -2588,7 +2643,7 @@ pub async fn sync_drive(
         // selections return an advanced cursor to persist; folder-scoped ones return None. ---
         if !auth_failed {
             for sel in &scope.shared {
-                match gather_shared(&app, &token_key, &email, sel).await {
+                match gather_shared(app, &token_key, &email, sel).await {
                     Ok((mut recon, cursor)) => {
                         items.append(&mut recon);
                         if let Some(advanced) = cursor {
@@ -2619,7 +2674,7 @@ pub async fn sync_drive(
     }
 
     let total: usize = work.iter().map(|w| w.items.len()).sum();
-    let _ = on_event.send(drive::DriveSyncEvent::Counted { total });
+    emit_drive_progress(app, drive::DriveSyncEvent::Counted { total });
 
     // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
     let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
@@ -2707,22 +2762,28 @@ pub async fn sync_drive(
                     Ok(None) => {
                         processed += 1;
                         skipped += 1;
-                        let _ = on_event.send(drive::DriveSyncEvent::Item {
-                            processed,
-                            total,
-                            name,
-                        });
+                        emit_drive_progress(
+                            app,
+                            drive::DriveSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
                         continue;
                     }
                     Err(e) => {
                         processed += 1;
                         failed += 1;
                         last_err = Some(e);
-                        let _ = on_event.send(drive::DriveSyncEvent::Item {
-                            processed,
-                            total,
-                            name,
-                        });
+                        emit_drive_progress(
+                            app,
+                            drive::DriveSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
                         continue;
                     }
                 }
@@ -2748,11 +2809,14 @@ pub async fn sync_drive(
                 }
             }
             processed += 1;
-            let _ = on_event.send(drive::DriveSyncEvent::Item {
-                processed,
-                total,
-                name,
-            });
+            emit_drive_progress(
+                app,
+                drive::DriveSyncEvent::Item {
+                    processed,
+                    total,
+                    name,
+                },
+            );
         }
 
         // Persist the pass: advance My Drive's cursor (if synced) + each whole-drive shared cursor,
@@ -2770,13 +2834,16 @@ pub async fn sync_drive(
         }
     }
 
-    let _ = on_event.send(drive::DriveSyncEvent::Finished {
-        indexed,
-        updated,
-        removed,
-        skipped,
-        failed,
-    });
+    emit_drive_progress(
+        app,
+        drive::DriveSyncEvent::Finished {
+            indexed,
+            updated,
+            removed,
+            skipped,
+            failed,
+        },
+    );
 
     // Surface a failure (auth/expired) even when some items succeeded — the good ones are committed.
     if let Some(e) = last_err {

@@ -10,18 +10,19 @@ import { Button, SegmentedControl } from "./ui";
  * Per-account **shared-drives** manager (Connectors → Drive). My Drive (personal) is indexed whole by
  * default; shared drives (Team Drives) are **opt-in and folder-scoped by default** — they're often
  * huge and org-wide, so picking folders is the safer default, with an "entire drive" escape hatch.
- * Everything stays index-only (a pointer + summary, never the bytes). Saving persists the scope and
- * triggers a sync so the change applies: newly-in-scope files are indexed, files that fell out of
- * scope are soft-removed (kept findable, flagged source-missing).
+ * Everything stays index-only (a pointer + summary, never the bytes). **Save** only persists the
+ * scope; the account's single **Sync now** then applies it (indexes newly-in-scope files, soft-removes
+ * — kept findable, flagged source-missing — those that fell out of scope), so there's one sync action
+ * for the whole account rather than a separate one per shared drive.
  */
 export function SharedDrivesManager({
   email,
   busy,
-  onApply,
+  onSaved,
 }: {
   email: string;
   busy: boolean;
-  onApply: () => void;
+  onSaved: () => void;
 }) {
   const [scope, setScope] = useState<DriveScope | null>(null);
   const [drives, setDrives] = useState<SharedDrive[] | null>(null);
@@ -97,7 +98,7 @@ export function SharedDrivesManager({
     setError(null);
     try {
       await setDriveScope(email, scope);
-      onApply();
+      onSaved();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -172,9 +173,14 @@ export function SharedDrivesManager({
 
       {error && <p className="text-xs text-st-due">{error}</p>}
 
-      <Button onClick={save} disabled={busy || saving} className="px-2 py-1 text-xs">
-        {saving ? "Saving…" : "Save & sync"}
-      </Button>
+      <div className="flex items-center gap-2">
+        <Button onClick={save} disabled={busy || saving} className="px-2 py-1 text-xs">
+          {saving ? "Saving…" : "Save"}
+        </Button>
+        <span className="text-[11px] text-ink4">
+          Saved here, then indexed when you <span className="text-ink3">Sync now</span> above.
+        </span>
+      </div>
     </div>
   );
 }

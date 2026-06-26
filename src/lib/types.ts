@@ -418,6 +418,16 @@ export interface DriveScope {
   shared: SharedSelection[];
 }
 
+/** Snapshot of an in-flight Drive sync, so the UI can resume showing progress after navigating away
+ *  and back. `running` is false when nothing is syncing. */
+export interface DriveSyncState {
+  running: boolean;
+  processed: number;
+  total: number | null;
+  /** The account (email) being synced, or null for an all-accounts pass. */
+  account: string | null;
+}
+
 /** Streamed progress while a Drive sync runs (mapped onto the shared IngestProgress bar). */
 export type DriveSyncEvent =
   | { type: "counted"; total: number }
