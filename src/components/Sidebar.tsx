@@ -116,14 +116,17 @@ export function Sidebar({
         >
           Documents
         </NavItem>
-        <NavItem
-          active={view === "review"}
-          onClick={() => onNavigate("review")}
-          helpId="nav-review"
-          trailing={<CountBadge count={reviewCount} />}
-        >
-          Review
-        </NavItem>
+        {/* Review + Teach are the "learning tools" — shown/hidden together by `teachVisible`. */}
+        {teachVisible && (
+          <NavItem
+            active={view === "review"}
+            onClick={() => onNavigate("review")}
+            helpId="nav-review"
+            trailing={<CountBadge count={reviewCount} />}
+          >
+            Review
+          </NavItem>
+        )}
         {teachVisible && (
           <NavItem active={view === "teach"} onClick={() => onNavigate("teach")} helpId="nav-teach">
             Teach

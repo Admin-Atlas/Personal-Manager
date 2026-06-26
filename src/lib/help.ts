@@ -87,8 +87,8 @@ export const HELP: Record<string, HelpEntry> = {
     body: "Type a preference as a plain sentence and PM fills in the fields for you. Check them before saving — nothing is stored until you do.",
   },
   "settings-teach-tab": {
-    title: "Teach tab",
-    body: "Show or hide the Teach tab in the sidebar. It's on for the Standard and Power presets and off for Minimal — but you can override that here. Hiding it only hides the editor; PM still applies the naming rules you've already taught it.",
+    title: "Review & Teach tabs",
+    body: "Show or hide the two 'learning tools' — Review (approve the assistant's filing of new items) and Teach (correct its naming rules and preferences) — together in the sidebar. They're on for the Standard and Power presets and off for Minimal, but you can override that here. Turn them off once the assistant files things well enough on its own that you no longer want to curate; nothing is lost — new items still index and auto-file, and PM keeps applying what you've already taught it. Turn them back on any time.",
   },
 
   // Command palette (Step 5b)

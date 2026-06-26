@@ -603,12 +603,12 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     className="mt-3 flex items-center justify-between gap-3"
                     data-help="settings-teach-tab"
                   >
-                    <span className="text-sm text-ink2">Teach tab</span>
+                    <span className="text-sm text-ink2">Review &amp; Teach tabs</span>
                     <button
                       type="button"
                       role="switch"
                       aria-checked={teachVisible}
-                      aria-label="Show the Teach tab"
+                      aria-label="Show the Review and Teach tabs"
                       onClick={() => setTeachVisible(!teachVisible)}
                       className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
                         teachVisible ? "bg-accent" : "bg-surface"

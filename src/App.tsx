@@ -91,10 +91,11 @@ export default function App() {
   const update = useUpdater();
   const { teachVisible } = useTheme();
   const { devMode } = useDevMode();
-  // If the Teach or Dev tab gets hidden (preset change, or the toggle turned off in Settings)
-  // while it's open, fall back to Focus so the user is never stranded on a view with no nav entry.
+  // If the Review/Teach (learning tools) or Dev tab gets hidden — a preset change, or the toggle
+  // turned off in Settings — while it's open, fall back to Focus so the user is never stranded on a
+  // view with no nav entry.
   useEffect(() => {
-    if (view === "teach" && !teachVisible) setView("focus");
+    if ((view === "teach" || view === "review") && !teachVisible) setView("focus");
     if (view === "dev" && !devMode) setView("focus");
   }, [view, teachVisible, devMode]);
   const [appVersion, setAppVersion] = useState<string | null>(null);
@@ -449,7 +450,8 @@ export default function App() {
             </main>
           ) : view === "documents" ? (
             <main className="flex h-full flex-1 flex-col">
-              <DocumentsView onReviewClick={() => setView("review")} />
+              {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
+              <DocumentsView onReviewClick={teachVisible ? () => setView("review") : undefined} />
             </main>
           ) : view === "review" ? (
             <main className="flex h-full flex-1 flex-col">

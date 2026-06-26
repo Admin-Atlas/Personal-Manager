@@ -147,7 +147,9 @@ export function CommandPalette({
     }));
 
     const gotoItems: PaletteItem[] = [
-      ...NAV_DESTS.filter((dest) => dest.view !== "teach" || teachVisible).map((dest) => ({
+      ...NAV_DESTS.filter(
+        (dest) => (dest.view !== "teach" && dest.view !== "review") || teachVisible,
+      ).map((dest) => ({
         id: `goto:${dest.view}`,
         kind: "goto" as const,
         label: dest.label,
