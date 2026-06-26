@@ -8,8 +8,10 @@ import {
   devApplyChangeEvent,
   devDocumentChunks,
   ensureSidecar,
+  fetchIndexOnlyBody,
   ingestPaths,
   listDocuments,
+  openExternalRef,
   rebuildIndex,
   sidecarStatus,
   vaultStatus,
@@ -71,6 +73,28 @@ export function DocumentsView({ onReviewClick }: Props) {
   const showHarness = isDevBuild && devMode;
   const [chunksFor, setChunksFor] = useState<number | null>(null);
   const [chunkPage, setChunkPage] = useState<DevTablePage | null>(null);
+  // Index-only "show full text": an index-only document's body is never stored — fetch it live from
+  // the source (Drive) on demand and show it inline.
+  const [bodyFor, setBodyFor] = useState<number | null>(null);
+  const [bodyText, setBodyText] = useState<string | null>(null);
+  const [bodyError, setBodyError] = useState<string | null>(null);
+
+  async function toggleBody(docId: number) {
+    if (bodyFor === docId) {
+      setBodyFor(null);
+      setBodyText(null);
+      setBodyError(null);
+      return;
+    }
+    setBodyFor(docId);
+    setBodyText(null);
+    setBodyError(null);
+    try {
+      setBodyText(await fetchIndexOnlyBody(docId));
+    } catch (e) {
+      setBodyError(String(e));
+    }
+  }
 
   async function toggleChunks(docId: number) {
     if (chunksFor === docId) {
@@ -554,15 +578,34 @@ export function DocumentsView({ onReviewClick }: Props) {
                             </div>
                             {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
                           </div>
-                          {(() => {
-                            const ref =
-                              doc.source_type === "index_only" ? doc.external_ref : doc.source_path;
-                            return ref ? (
-                              <div className="truncate text-xs text-ink4" title={ref}>
-                                {ref}
+                          {doc.source_type === "index_only" ? (
+                            <div className="mt-0.5 flex items-center gap-3 text-xs">
+                              {doc.external_ref && (
+                                <button
+                                  type="button"
+                                  onClick={() => void openExternalRef(doc.id)}
+                                  className="text-accent-text hover:brightness-110"
+                                >
+                                  Open in Drive
+                                </button>
+                              )}
+                              {doc.source_state !== "source_missing" && (
+                                <button
+                                  type="button"
+                                  onClick={() => void toggleBody(doc.id)}
+                                  className="text-accent-text hover:brightness-110"
+                                >
+                                  {bodyFor === doc.id ? "Hide text" : "Show full text"}
+                                </button>
+                              )}
+                            </div>
+                          ) : (
+                            doc.source_path && (
+                              <div className="truncate text-xs text-ink4" title={doc.source_path}>
+                                {doc.source_path}
                               </div>
-                            ) : null;
-                          })()}
+                            )
+                          )}
                         </td>
                         <td className="py-2 pr-3 text-ink3">
                           <span className="inline-flex items-center gap-1.5">
@@ -597,6 +640,24 @@ export function DocumentsView({ onReviewClick }: Props) {
                           </td>
                         )}
                       </tr>
+                      {/* Index-only "show full text": the live-fetched body, expanded under its row. */}
+                      {bodyFor === doc.id && (
+                        <tr>
+                          <td colSpan={showPower ? 5 : 4} className="pb-3">
+                            <div className="rounded-[var(--radius-sm)] border border-border bg-surface p-3">
+                              {bodyError ? (
+                                <p className="text-xs text-st-due">{bodyError}</p>
+                              ) : bodyText == null ? (
+                                <p className="text-xs text-ink4">Fetching from the source…</p>
+                              ) : (
+                                <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words font-sans text-xs text-ink3">
+                                  {bodyText}
+                                </pre>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
                       {/* Dev-mode chunk breakdown, expanded directly under its document (read-only). */}
                       {devMode && chunksFor === doc.id && (
                         <tr>

@@ -372,6 +372,38 @@ export interface GoogleCalendar {
   selected: boolean;
 }
 
+/** A connected Google Drive account (Connectors → Drive). Each is independent — its own token,
+ *  sync cursor, and indexed items. */
+export interface DriveAccount {
+  id: string;
+  email: string;
+  label: string;
+  last_synced_at: string | null;
+  state: "ok" | "unreachable" | "error";
+  /** How many index-only documents this account currently has. */
+  indexed: number;
+}
+
+/** The Drive connector's state for Settings. */
+export interface DriveStatus {
+  /** The shared BYO Google client is configured (provider-level). */
+  oauth_client_configured: boolean;
+  accounts: DriveAccount[];
+}
+
+/** Streamed progress while a Drive sync runs (mapped onto the shared IngestProgress bar). */
+export type DriveSyncEvent =
+  | { type: "counted"; total: number }
+  | { type: "item"; processed: number; total: number; name: string }
+  | {
+      type: "finished";
+      indexed: number;
+      updated: number;
+      removed: number;
+      skipped: number;
+      failed: number;
+    };
+
 /** A mirrored calendar event (the agenda list). `start` is an ISO datetime, or a
  *  plain date for all-day events. */
 export interface CalendarEvent {
