@@ -173,7 +173,8 @@ pub fn relevant_preferences(conn: &Connection, ctx: PrefContext) -> Result<Vec<P
 }
 
 /// A preamble describing the user's relevant preferences, ready to prepend to a system prompt —
-/// the deterministic replacement for `learning::profile_preamble`. `None` when nothing applies (so
+/// the deterministic replacement for the old whole-blob profile injection. `None` when nothing
+/// applies (so
 /// prompts are unchanged until there's something worth saying). Framed as DATA/preferences (never
 /// instructions) and length-capped, because these records carry correction-derived (untrusted) text
 /// into a system prompt.

@@ -14,7 +14,6 @@ mod google;
 mod ics;
 mod index_only;
 mod ingest;
-mod learning;
 mod lock_session;
 mod model_gateway;
 mod openrouter;
@@ -460,7 +459,6 @@ pub fn run() {
             commands::continue_here,
             commands::force_take_vault,
             commands::list_models,
-            commands::get_learning_profile,
             commands::list_preferences,
             commands::add_preference,
             commands::update_preference,

@@ -246,8 +246,7 @@ fn build_messages(snapshot: &str, profile: Option<&str>) -> Vec<ChatMessage> {
 }
 
 /// Strip surrounding code fences and whitespace from the model reply, so the stored
-/// briefing is clean plain text even if the model wraps it (shape borrowed from
-/// `learning::clean`).
+/// briefing is clean plain text even if the model wraps it.
 fn clean(raw: &str) -> String {
     let mut t = raw.trim();
     if let Some(rest) = t.strip_prefix("```") {

@@ -19,6 +19,7 @@ import {
 } from "../lib/ipc";
 import type { Entity } from "../lib/types";
 import { useDepth } from "../theme";
+import { TeachPreferences } from "./TeachPreferences";
 import { Button, Card, Input, Modal, Skeleton } from "./ui";
 
 /** The always-present fallback bucket; we don't nudge merges for it. */
@@ -224,16 +225,12 @@ export function TeachView() {
                   />
                 ))}
               </ul>
-
-              <p
-                className="mt-6 border-t border-rule pt-4 text-xs text-faint"
-                data-help="teach-future"
-              >
-                More of how you teach PM — like your Learning&nbsp;You profile — will gather here
-                over time.
-              </p>
             </>
           )}
+
+          {/* Structured preferences (§4.5) live here too — shown even with no projects yet, since a
+              global/context preference (or one migrated from the old profile) needs no project. */}
+          {entities != null && <TeachPreferences projects={entities} />}
         </div>
       </div>
 

@@ -19,7 +19,6 @@ import type {
   Importance,
   IngestEvent,
   LanguageOptions,
-  LearningProfile,
   Message,
   ModelInfo,
   ModelRecommendations,
@@ -192,11 +191,6 @@ export const onVaultCurtain = (handler: (e: VaultCurtainEvent) => void): Promise
 /** Subscribe to the acquired event (this instance became the active writer; lift curtain). */
 export const onVaultAcquired = (handler: () => void): Promise<UnlistenFn> =>
   listen("vault://acquired", () => handler());
-
-// --- Learning You (legacy, frozen — superseded by structured preferences) ---
-
-/** The archived legacy profile of how the user organises, for the legacy Settings view. */
-export const getLearningProfile = () => invoke<LearningProfile>("get_learning_profile");
 
 // --- Structured preferences (spec §4.5 — the typed model that replaces the Learning-You blob) ---
 

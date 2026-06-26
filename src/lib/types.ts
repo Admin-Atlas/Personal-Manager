@@ -156,13 +156,6 @@ export interface ModelRecommendations {
   stale: boolean;
 }
 
-/** The distilled Learning-You profile shown in Settings (Step 4b, spec §4.5). */
-export interface LearningProfile {
-  profile: string;
-  updated_at: string | null;
-  correction_count: number;
-}
-
 /** A document an answer cited — the provenance shown under it. */
 export interface Citation {
   document_id: number;

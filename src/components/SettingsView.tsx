@@ -8,7 +8,6 @@ import {
   costSummary,
   createShareableVault,
   exportAllData,
-  getLearningProfile,
   getSettings,
   hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
@@ -32,7 +31,7 @@ import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
 import { RebuildProgress } from "./RebuildProgress";
 import { VaultCard } from "./VaultCard";
-import type { AppLockStatus, CostSummary, LanguageOptions, LearningProfile } from "../lib/types";
+import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
 import { useTheme, useDepth, ACCENTS } from "../theme";
 import { Button, Collapsible, ConfirmDialog, Input, NavItem, SegmentedControl, Select } from "./ui";
 
@@ -78,7 +77,6 @@ export function SettingsView({ onClose, onboarding }: Props) {
   const [bgKeyAlreadySet, setBgKeyAlreadySet] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [profile, setProfile] = useState<LearningProfile | null>(null);
   const [timeZone, setTimeZoneState] = useState("");
   const [tzAuto, setTzAuto] = useState(true);
   const [cost, setCost] = useState<CostSummary | null>(null);
@@ -142,7 +140,6 @@ export function SettingsView({ onClose, onboarding }: Props) {
           }
         }
         setRerankingState(settings.reranking);
-        if (!onboarding) setProfile(await getLearningProfile());
       } catch (e) {
         setError(String(e));
       }
@@ -922,37 +919,13 @@ export function SettingsView({ onClose, onboarding }: Props) {
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
-                  <label className="block text-sm font-medium text-ink2">
-                    Learning You (legacy)
-                  </label>
-                  <div className="mt-2">
-                    <Collapsible
-                      title="Profile"
-                      defaultOpen={showPower}
-                      meta={
-                        profile
-                          ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"}`
-                          : undefined
-                      }
-                    >
-                      <p className="pt-2 text-xs text-ink4">
-                        The earlier free-text profile of how you organise. It's now frozen and being
-                        replaced by structured, editable preferences in the Teach tab — your
-                        accumulated profile is carried over into them automatically.
-                      </p>
-                      <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink2">
-                        {profile?.profile?.trim()
-                          ? profile.profile
-                          : "Nothing here — this earlier profile was empty."}
-                      </div>
-                      <p className="mt-1 text-xs text-faint">
-                        {profile
-                          ? `${profile.correction_count} correction${profile.correction_count === 1 ? "" : "s"} logged`
-                          : ""}
-                        {profile?.updated_at ? ` · updated ${formatWhen(profile.updated_at)}` : ""}
-                      </p>
-                    </Collapsible>
-                  </div>
+                  <label className="block text-sm font-medium text-ink2">Preferences</label>
+                  <p className="mt-1 text-xs text-ink4">
+                    What PM has learned about how you work — what belongs where, how things are
+                    named, how answers should read — now lives in the{" "}
+                    <span className="text-ink2">Teach</span> tab as editable preferences. Your
+                    earlier “Learning&nbsp;You” profile was carried over into them automatically.
+                  </p>
                 </div>
               </>
             )}

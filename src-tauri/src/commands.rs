@@ -19,8 +19,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, entities, index_only, learning, lock_session, openrouter,
-    paths, preferences, recommend, secrets, vault, AppState, VaultRuntime,
+    applock, briefing, clock, cost, db, entities, index_only, lock_session, openrouter, paths,
+    preferences, recommend, secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -2211,16 +2211,6 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
     let conn = state.conn()?;
     calendar::list_upcoming(&conn, calendar::AGENDA_DAYS)
-}
-
-// --- learning you (Step 4b) ---
-
-/// The distilled Learning-You profile + when it was last updated and how many
-/// corrections back it, for display in Settings.
-#[tauri::command]
-pub fn get_learning_profile(state: State<'_, AppState>) -> Result<learning::LearningProfile> {
-    let conn = state.conn()?;
-    learning::get_profile(&conn)
 }
 
 // --- structured preferences (§4.5 — the typed model that replaces the Learning-You blob) ---
