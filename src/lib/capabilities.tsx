@@ -5,12 +5,15 @@
 // code never reads `import.meta.env.DEV` directly nor smears a bare `if (devMode)` through render
 // logic (issue #78). Two distinct signals for two audiences:
 //
-//   * `isDevBuild`  — BUILD-TIME (`import.meta.env.DEV`), re-exposed here. Gates maintainer-only
-//     TEST HARNESSES that must never ship (they write synthetic state); dead-code-eliminated from
-//     release bundles. This module is the single place that literal is read.
-//   * `useDevMode()` — RUNTIME, user-flippable, persisted. Gates the ship-safe, read-only
-//     INSPECTION surfaces. A normal supported setting (default off), NOT a build-time gate — so it
-//     ships in the release and can still be switched on by a curious/technical user.
+//   * `useDevMode()` — RUNTIME, user-flippable, persisted. The MASTER switch for every developer
+//     surface: when off, nothing developer-facing shows, in any build. Gates the ship-safe,
+//     read-only INSPECTION surfaces directly. A normal supported setting (default off), NOT a
+//     build-time gate — so it ships in the release and can be switched on by a curious user.
+//   * `isDevBuild`  — BUILD-TIME (`import.meta.env.DEV`), re-exposed here. The hard FLOOR under the
+//     maintainer-only TEST HARNESSES that must never ship (they write synthetic state): they are
+//     dead-code-eliminated from release bundles. Harnesses gate on `isDevBuild && devMode` — the
+//     build gate strips them from release, and the runtime toggle still hides them in a dev build.
+//     This module is the single place that literal is read.
 //
 // devMode persists like the theme (ThemeContext): localStorage is the fast path so the Dev tab
 // never flashes on first paint, mirrored into the encrypted `settings` table (`set_pref`) so it

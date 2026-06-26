@@ -64,6 +64,11 @@ export function DocumentsView({ onReviewClick }: Props) {
   // Developer mode (issue #78): an in-place chunk inspector. Clicking a document's chunk count
   // (when devMode is on) expands its leaf/parent chunk breakdown, fetched read-only on demand.
   const { devMode } = useDevMode();
+  // The index-only test harnesses below need BOTH gates: `isDevBuild` is the hard floor (they
+  // write synthetic state, so they are tree-shaken out of release builds), and `devMode` makes the
+  // runtime toggle the single master switch for every developer surface — so turning dev mode off
+  // hides them even in a `tauri dev` build, like every other developer surface.
+  const showHarness = isDevBuild && devMode;
   const [chunksFor, setChunksFor] = useState<number | null>(null);
   const [chunkPage, setChunkPage] = useState<DevTablePage | null>(null);
 
@@ -422,9 +427,10 @@ export function DocumentsView({ onReviewClick }: Props) {
             </p>
           </div>
 
-          {/* TEST HARNESS — build-time only (writes synthetic state); never promoted to the
-              runtime Developer mode. Gated via the central `isDevBuild` (issue #78). */}
-          {isDevBuild && (
+          {/* TEST HARNESS — writes synthetic state, so it is build-time gated (tree-shaken from
+              release) AND respects the runtime devMode toggle (the master developer switch). See
+              `showHarness` above (issue #78). */}
+          {showHarness && (
             <Card className="mt-4 p-3">
               <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
                 Dev — add an indexed-only item
@@ -455,7 +461,7 @@ export function DocumentsView({ onReviewClick }: Props) {
             </Card>
           )}
 
-          {isDevBuild && documents.some((d) => d.source_type === "index_only" && d.source_id) && (
+          {showHarness && documents.some((d) => d.source_type === "index_only" && d.source_id) && (
             <Card className="mt-4 p-3">
               <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
                 Dev — simulate a source change (observe-and-react)
