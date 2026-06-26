@@ -355,11 +355,21 @@ function EntityCard({
                 </Button>
               </div>
             ) : (
-              <div
-                className="truncate font-head text-sm font-medium text-ink"
-                title={entity.canonical_name}
-              >
-                {entity.canonical_name}
+              <div className="flex items-center gap-1.5">
+                <span
+                  className="min-w-0 truncate font-head text-sm font-medium text-ink"
+                  title={entity.canonical_name}
+                >
+                  {entity.canonical_name}
+                </span>
+                {entity.user_confirmed && (
+                  <span
+                    className="inline-flex shrink-0 items-center gap-0.5 rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 text-xs text-accent-text"
+                    title="You've confirmed this project"
+                  >
+                    ✓ Confirmed
+                  </span>
+                )}
               </div>
             )}
             <p className="mt-1 font-mono text-xs text-ink4">

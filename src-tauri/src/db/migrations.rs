@@ -317,6 +317,26 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX idx_documents_source_id ON documents(source_id) WHERE source_id IS NOT NULL;
     CREATE INDEX idx_documents_source_type ON documents(source_type);
     "#,
+    // v12: entity spine hardening (Stage 3, §8.5). The entity-resolution foundation (v10) left
+    // `entities` a flat generic spine with no way to record two facts the audit flagged: how
+    // CONFIDENT we are in an entity, and whether the USER has confirmed it. Confirmation was an
+    // action with no recorded STATE. Shape the spine now — while the entity row count is small —
+    // rather than retrofitting live, encrypted, user-held rows + the rules file later. Two columns,
+    // nothing type-specific: per-type attributes (people/places/projects) will live in TYPE TABLES
+    // keyed to `entities.id` (Stage 4, the relational-model card), never smeared onto this spine.
+    //   * `confidence` is DB-only DERIVED state: today every entity originates from deterministic
+    //     exact-match filing, so 1.0 is the honest seed; it re-seeds to the DEFAULT on a mirror
+    //     rebuild (the rules file does not carry it) and is the seam for Stage-5 auto-merge scoring.
+    //   * `user_confirmed` is PORTABLE user truth: it is mirrored into the encrypted `entities.pmrules`
+    //     file (schema 2) so it survives a device copy or an index drop-recreate, like the aliases.
+    // Both are additive with safe defaults — existing rows fill as confidence 1.0 / unconfirmed,
+    // no backfill loop, every existing query untouched (rule #3). Vectors are unaffected.
+    r#"
+    ALTER TABLE entities ADD COLUMN confidence     REAL    NOT NULL DEFAULT 1.0
+        CHECK (confidence >= 0.0 AND confidence <= 1.0);
+    ALTER TABLE entities ADD COLUMN user_confirmed INTEGER NOT NULL DEFAULT 0
+        CHECK (user_confirmed IN (0,1));
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
