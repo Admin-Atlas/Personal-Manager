@@ -690,13 +690,24 @@ mod tests {
     fn migration_v10_backfills_one_entity_per_project_no_auto_merge() {
         // The canonical-entity backfill, exercised over a realistic v9→v10 upgrade: tear the v10
         // tables back down to a v9-shaped store, seed it with documents carrying name variants,
-        // then re-run migrations so the real backfill processes them.
+        // then re-run migrations so the real backfill processes them. Because `migrations::run`
+        // re-applies EVERY step from the reset `user_version` forward, the later v11 columns must be
+        // reverted too — otherwise v11's ADD COLUMNs would collide with the columns still on disk.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v10.sqlite");
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP INDEX IF EXISTS idx_documents_entity; \
+            "DROP INDEX idx_documents_source_id; \
+             DROP INDEX idx_documents_source_type; \
+             ALTER TABLE documents DROP COLUMN source_type; \
+             ALTER TABLE documents DROP COLUMN source_state; \
+             ALTER TABLE documents DROP COLUMN source_id; \
+             ALTER TABLE documents DROP COLUMN external_ref; \
+             ALTER TABLE documents DROP COLUMN source_modified_at; \
+             ALTER TABLE documents DROP COLUMN source_content_hash; \
+             ALTER TABLE documents DROP COLUMN stored_summary; \
+             DROP INDEX IF EXISTS idx_documents_entity; \
              DROP TABLE entity_aliases; \
              DROP TABLE entities; \
              ALTER TABLE documents DROP COLUMN entity_id; \
@@ -795,5 +806,86 @@ mod tests {
             .query_row("SELECT count(*) FROM chunk_vec", [], |r| r.get(0))
             .unwrap();
         assert_eq!(vecs, 1, "chunk vectors must survive the entity migration");
+    }
+
+    #[test]
+    fn migration_v11_defaults_existing_rows_to_stored_vault_documents() {
+        // Tear the v11 columns/indexes back down to a v10-shaped store, seed a document the way v10
+        // wrote them (no source_* columns), then re-run migrations so the real v11 step processes a
+        // pre-existing row.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v11.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        conn.execute_batch(
+            "DROP INDEX idx_documents_source_id; \
+             DROP INDEX idx_documents_source_type; \
+             ALTER TABLE documents DROP COLUMN source_type; \
+             ALTER TABLE documents DROP COLUMN source_state; \
+             ALTER TABLE documents DROP COLUMN source_id; \
+             ALTER TABLE documents DROP COLUMN external_ref; \
+             ALTER TABLE documents DROP COLUMN source_modified_at; \
+             ALTER TABLE documents DROP COLUMN source_content_hash; \
+             ALTER TABLE documents DROP COLUMN stored_summary; \
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('a.md','A','ha')",
+            [],
+        )
+        .unwrap();
+
+        migrations::run(&conn).unwrap();
+
+        // The pre-existing row reads as a fully-stored vault document with an empty pointer — no
+        // backfill needed (rule #3).
+        let (st, state, sid): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT source_type, source_state, source_id FROM documents WHERE vault_path='a.md'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(st, "vault");
+        assert_eq!(state, "ok");
+        assert_eq!(sid, None);
+
+        // An index-only row keyed by a stable source id coexists, using the synthetic vault_path
+        // sentinel to satisfy NOT NULL UNIQUE without a real Markdown file.
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type, source_id) \
+             VALUES ('idx://src-1','Pointer','hp','index_only','src-1')",
+            [],
+        )
+        .unwrap();
+
+        // The partial unique index permits many NULL-source_id vault rows but rejects a duplicate
+        // stable id.
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('b.md','B','hb')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type, source_id) \
+             VALUES ('idx://src-1-dup','Dup','hd','index_only','src-1')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "a duplicate stable source_id must be rejected"
+        );
+
+        // The CHECK constraints reject an out-of-range discriminator / state.
+        assert!(
+            conn.execute(
+                "INSERT INTO documents(vault_path, title, content_hash, source_type) \
+                 VALUES ('z.md','Z','hz','bogus')",
+                [],
+            )
+            .is_err(),
+            "source_type CHECK must reject an unknown value"
+        );
     }
 }

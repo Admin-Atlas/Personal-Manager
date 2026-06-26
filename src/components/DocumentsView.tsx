@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
+  devRegisterPointer,
   ensureSidecar,
   ingestPaths,
   listDocuments,
@@ -53,6 +54,9 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [confirmRebuild, setConfirmRebuild] = useState(false);
   const [rebuildNeeded, setRebuildNeeded] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
+  // Dev-only (debug builds): drive the index-only substrate without a real connector.
+  const [devTitle, setDevTitle] = useState("");
+  const [devBody, setDevBody] = useState("");
   const { showPower } = useDepth();
 
   // `busy` inside the drag-drop listener would be stale; read it via a ref.
@@ -219,6 +223,26 @@ export function DocumentsView({ onReviewClick }: Props) {
     }
   }
 
+  // Dev-only: register a pasted body as an index-only document (board card 3). The source id is
+  // derived from the title so registering the same title twice exercises the stable-id dedupe.
+  async function devAddPointer() {
+    const title = devTitle.trim();
+    const body = devBody.trim();
+    if (busy || !title || !body) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await devRegisterPointer(`dev:${title}`, title, body, `dev://${encodeURIComponent(title)}`);
+      setDevTitle("");
+      setDevBody("");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  }
+
   async function doSetup() {
     setBusy(true);
     setError(null);
@@ -348,6 +372,37 @@ export function DocumentsView({ onReviewClick }: Props) {
             </p>
           </div>
 
+          {import.meta.env.DEV && (
+            <Card className="mt-4 p-3">
+              <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
+                Dev — add an indexed-only item
+              </p>
+              <div className="flex flex-col gap-2">
+                <input
+                  value={devTitle}
+                  onChange={(e) => setDevTitle(e.target.value)}
+                  placeholder="Title"
+                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
+                />
+                <textarea
+                  value={devBody}
+                  onChange={(e) => setDevBody(e.target.value)}
+                  placeholder="Body — embedded + summarised, never stored (the index-only pointer)"
+                  rows={3}
+                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
+                />
+                <div className="flex justify-end">
+                  <Button
+                    onClick={devAddPointer}
+                    disabled={busy || !devTitle.trim() || !devBody.trim()}
+                  >
+                    Register indexed-only
+                  </Button>
+                </div>
+              </div>
+            </Card>
+          )}
+
           {(prep || items.length > 0 || summary) && (
             <Card className="mt-4 p-3">
               {busy && (
@@ -403,14 +458,21 @@ export function DocumentsView({ onReviewClick }: Props) {
                   {documents.map((doc) => (
                     <tr key={doc.id} className="border-b border-rule">
                       <td className="py-2 pr-3">
-                        <div className="truncate text-ink" title={doc.title}>
-                          {doc.title}
-                        </div>
-                        {doc.source_path && (
-                          <div className="truncate text-xs text-ink4" title={doc.source_path}>
-                            {doc.source_path}
+                        <div className="flex items-center gap-2">
+                          <div className="truncate text-ink" title={doc.title}>
+                            {doc.title}
                           </div>
-                        )}
+                          {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
+                        </div>
+                        {(() => {
+                          const ref =
+                            doc.source_type === "index_only" ? doc.external_ref : doc.source_path;
+                          return ref ? (
+                            <div className="truncate text-xs text-ink4" title={ref}>
+                              {ref}
+                            </div>
+                          ) : null;
+                        })()}
                       </td>
                       <td className="py-2 pr-3 text-ink3">
                         <span className="inline-flex items-center gap-1.5">
@@ -507,6 +569,41 @@ function statusColor(status: ItemStatus): string {
     case "failed":
       return "text-[var(--st-due)]";
   }
+}
+
+/** Badge marking a document as indexed-only (and, once observe-and-react lands, whether its source
+ *  has gone missing or unreachable). A vault document shows nothing. */
+function SourceBadge({ doc }: { doc: Document }) {
+  const warn = doc.source_state !== "ok";
+  const label =
+    doc.source_state === "source_missing"
+      ? "Source missing"
+      : doc.source_state === "unreachable"
+        ? "Source unreachable"
+        : "Indexed-only";
+  const title =
+    doc.source_state === "source_missing"
+      ? "The source was deleted — kept findable, but its body can't be fetched"
+      : doc.source_state === "unreachable"
+        ? "The source can't be reached right now (offline, or access expired)"
+        : "Indexed by pointer — body fetched live on demand, summary readable offline";
+  return (
+    <span
+      className="shrink-0 rounded-full border border-border bg-surface px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ink3"
+      style={
+        warn
+          ? {
+              borderColor: "color-mix(in oklab, var(--st-due) 50%, transparent)",
+              background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
+              color: "var(--st-due)",
+            }
+          : undefined
+      }
+      title={title}
+    >
+      {label}
+    </span>
+  );
 }
 
 function Banner({ tone, children }: { tone: "info" | "warn"; children: React.ReactNode }) {

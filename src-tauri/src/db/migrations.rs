@@ -285,6 +285,38 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_documents_entity ON documents(entity_id);
     "#,
+    // v11: index-only foundation (Stage 3, §8.1) — the shared substrate for sources we index but
+    // don't fully import (cloud connectors, local-folder watch). An index-only document stores a
+    // metadata row + an embedding + a POINTER (stable source id, external ref/URL, the source's
+    // last-modified + content hash) but NOT the body bytes; the body is fetched live on demand and
+    // only a short `stored_summary` stays readable offline. `source_type` discriminates where a
+    // document's organisational truth lives — `'vault'` (Markdown front-matter, every document
+    // today) vs `'index_only'` (the encrypted index-only manifest at the data-home root, next to
+    // `entities.pmrules`). `source_state` is the first-class reachability state: a deleted source
+    // goes soft `'source_missing'` (kept findable, body flagged unretrievable — never a hard drop)
+    // and an unreachable source (expired OAuth, unmounted drive) goes `'unreachable'`, never
+    // masquerading as mass deletion. All columns are additive/nullable with safe defaults, so every
+    // existing row reads as a fully-stored vault document with no backfill (rule #3). Index-only
+    // rows reuse the NOT-NULL-UNIQUE `vault_path` with a synthetic `'idx://'||source_id` sentinel:
+    // it satisfies the constraint for free, carries no `.md`/`.pmenc` extension so the rebuild
+    // vault-walk (`is_vault_markdown`) skips it, and the truth dispatch keys on `source_type`, never
+    // on parsing it. Vectors are unaffected — index-only leaves share `chunk_vec`, so a model/dim
+    // switch re-embeds them on the next Rebuild like any other row.
+    r#"
+    ALTER TABLE documents ADD COLUMN source_type  TEXT NOT NULL DEFAULT 'vault'
+        CHECK (source_type IN ('vault','index_only'));
+    ALTER TABLE documents ADD COLUMN source_state TEXT NOT NULL DEFAULT 'ok'
+        CHECK (source_state IN ('ok','source_missing','unreachable'));
+    ALTER TABLE documents ADD COLUMN source_id           TEXT;
+    ALTER TABLE documents ADD COLUMN external_ref        TEXT;
+    ALTER TABLE documents ADD COLUMN source_modified_at  TEXT;
+    ALTER TABLE documents ADD COLUMN source_content_hash TEXT;
+    ALTER TABLE documents ADD COLUMN stored_summary      TEXT;
+    -- The stable source id is the manifest key + the rename-survives identity; unique only where
+    -- present (vault documents leave it NULL), so a partial unique index is the right constraint.
+    CREATE UNIQUE INDEX idx_documents_source_id ON documents(source_id) WHERE source_id IS NOT NULL;
+    CREATE INDEX idx_documents_source_type ON documents(source_type);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

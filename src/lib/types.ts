@@ -206,6 +206,19 @@ export interface Document {
   importance: Importance;
   reviewed: boolean;
   last_activity: string | null;
+  /**
+   * "vault" — a fully-stored document (its body lives in the Markdown vault); "index_only" — a
+   * pointer we index but don't hold (body fetched live, only a summary readable offline).
+   */
+  source_type: "vault" | "index_only";
+  /**
+   * Reachability of an index-only item's source. "ok" normally; "source_missing" (deleted at the
+   * source, kept findable) and "unreachable" (expired auth / offline drive) are set by the
+   * observe-and-react layer. Always "ok" for a vault document.
+   */
+  source_state: "ok" | "source_missing" | "unreachable";
+  /** Source URL / id shown for an index-only item in place of a local `source_path`. */
+  external_ref: string | null;
 }
 
 /** The AI's proposed organisation for a document, shown in the Review view. */

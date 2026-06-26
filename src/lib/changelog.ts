@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.9.0-alpha",
+    date: "2026-06-26",
+    highlights: [
+      'Groundwork for a new "index-only" mode: PM will be able to make cloud files and watched folders searchable by keeping a short summary and a pointer to the original, instead of importing a full copy. This release lands the storage + search foundation; the connectors that add real sources come next.',
+      'Documents that work this way are clearly badged "Indexed-only" — they stay findable and their summary reads offline, while the full document is fetched from its source when you open it.',
+    ],
+  },
+  {
     version: "2.8.0-alpha",
     date: "2026-06-25",
     highlights: [
