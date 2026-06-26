@@ -466,6 +466,7 @@ pub fn run() {
             commands::has_openrouter_background_key,
             commands::set_openrouter_background_key,
             commands::get_settings,
+            commands::set_indexing_speed,
             commands::set_chat_models,
             commands::set_background_models,
             commands::set_chat_auto_switch,

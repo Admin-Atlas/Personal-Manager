@@ -172,6 +172,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Background model",
     body: "Which model does PM's behind-the-scenes work — the sorting proposals in Review and the Learning You profile. It can differ from your chat model; free models work well here. Chain several with auto-switch so background work keeps going when a free model's daily cap is reached.",
   },
+  "settings-indexing-speed": {
+    title: "Indexing speed",
+    body: "How hard PM works your machine when it indexes documents (a Drive sync, or files you add). Fast indexes at full speed. Gentle paces the work — it pauses briefly between files so embedding doesn't pin your CPU continuously — so a low-end computer stays usable while a big index runs in the background. It only changes how fast indexing goes, never what gets indexed, and applies to the next sync/import.",
+  },
   "settings-learning": {
     title: "Learning You",
     body: "A short, readable profile of how you organise — distilled from the corrections you make in Review. PM injects it into its suggestions and chat so it gets more like you over time. 'Refresh now' rebuilds it from your latest corrections.",

@@ -37,6 +37,9 @@ export interface Settings {
   /** Whether query-time reranking is on (a cross-encoder re-scores search hits for sharper
    *  relevance). Default on; stateless, so toggling it never triggers a Rebuild. */
   reranking: boolean;
+  /** Indexing speed: "fast" (default, max throughput) or "gentle" (paced so a low-end machine
+   *  stays usable while indexing runs in the background). */
+  indexing_speed: string;
 }
 
 /** One search-language / embedder choice offered at vault creation. */

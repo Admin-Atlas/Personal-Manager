@@ -42,6 +42,24 @@ pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Settings key for the indexing-speed preference: "fast" (default, max throughput) or "gentle"
+/// (paced so a low-end machine stays usable while it indexes in the background).
+pub const INDEXING_SPEED_KEY: &str = "indexing_speed";
+
+/// Pause (ms) inserted after each indexed file in "gentle" mode, so embedding doesn't pin the CPU
+/// continuously. A balance: enough idle for the machine to stay responsive, not so much that a large
+/// index never finishes. "fast" inserts no pause.
+const GENTLE_INDEX_PAUSE_MS: u64 = 250;
+
+/// How long indexing should pause between files for the current speed setting (0 unless "gentle").
+/// Read once per ingest/sync run, off the hot path.
+pub fn indexing_pause_ms(conn: &Connection) -> u64 {
+    match get_setting(conn, INDEXING_SPEED_KEY) {
+        Ok(Some(v)) if v == "gentle" => GENTLE_INDEX_PAUSE_MS,
+        _ => 0,
+    }
+}
+
 /// The `settings` key holding the retrieval-config stamp (spec §21.4). One JSON row capturing
 /// the index-time config that produced this vault's index.
 const RETRIEVAL_STAMP_KEY: &str = "retrieval_config";

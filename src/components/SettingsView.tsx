@@ -19,6 +19,7 @@ import {
   setBackgroundModels,
   setChatAutoSwitch,
   setChatModels,
+  setIndexingSpeed,
   setOpenRouterBackgroundKey,
   setOpenRouterKey,
   setReranking,
@@ -97,6 +98,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [vaultConfirm, setVaultConfirm] = useState("");
   // Query-time reranking toggle (default on; stateless — never triggers a Rebuild).
   const [reranking, setRerankingState] = useState(true);
+  // Indexing speed: "fast" (default) or "gentle" (paced for low-end machines).
+  const [indexingSpeed, setIndexingSpeedState] = useState<"fast" | "gentle">("fast");
   // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
   // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
@@ -145,6 +148,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
           }
         }
         setRerankingState(settings.reranking);
+        setIndexingSpeedState(settings.indexing_speed === "gentle" ? "gentle" : "fast");
       } catch (e) {
         setError(String(e));
       }
@@ -193,6 +197,18 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       await setReranking(next);
     } catch (e) {
       setRerankingState(!next);
+      setError(String(e));
+    }
+  }
+
+  async function changeIndexingSpeed(next: "fast" | "gentle") {
+    setError(null);
+    const prev = indexingSpeed;
+    setIndexingSpeedState(next); // optimistic — revert if the write fails
+    try {
+      await setIndexingSpeed(next);
+    } catch (e) {
+      setIndexingSpeedState(prev);
       setError(String(e));
     }
   }
@@ -920,6 +936,28 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                         }`}
                       />
                     </button>
+                  </div>
+
+                  <div
+                    className="mt-3 flex items-start justify-between gap-3"
+                    data-help="settings-indexing-speed"
+                  >
+                    <div>
+                      <label className="block text-sm font-medium text-ink2">Indexing speed</label>
+                      <p className="mt-1 text-xs text-ink4">
+                        Gentle paces indexing so your computer stays responsive while it works in
+                        the background — for slower machines. Fast indexes at full speed.
+                      </p>
+                    </div>
+                    <SegmentedControl
+                      className="mt-0.5 shrink-0"
+                      value={indexingSpeed}
+                      onChange={(v) => void changeIndexingSpeed(v as "fast" | "gentle")}
+                      options={[
+                        { value: "fast", label: "Fast" },
+                        { value: "gentle", label: "Gentle" },
+                      ]}
+                    />
                   </div>
                 </div>
 

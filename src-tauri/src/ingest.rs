@@ -145,6 +145,13 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
         n == 0
     };
 
+    // "Gentle" indexing pause between indexed files (0 = fast), so a large import leaves a low-end
+    // machine usable while it works. Read once up front.
+    let pause_ms = {
+        let conn = state.conn()?;
+        crate::db::indexing_pause_ms(&conn)
+    };
+
     let (mut ingested, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for path in files {
         let name = file_name(&path);
@@ -157,6 +164,10 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
             Ok(Outcome::Indexed(document)) => {
                 ingested += 1;
                 let _ = on_event.send(IngestEvent::Done { document });
+                // Gentle mode: breathe between files so embedding doesn't pin the CPU continuously.
+                if pause_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+                }
             }
             Ok(Outcome::Skipped(reason)) => {
                 skipped += 1;

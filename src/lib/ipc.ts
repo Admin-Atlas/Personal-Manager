@@ -61,6 +61,11 @@ export const getSettings = () => invoke<Settings>("get_settings");
  *  triggers a Rebuild; the effect lands on the next query. */
 export const setReranking = (enabled: boolean) => invoke<void>("set_reranking", { enabled });
 
+/** Set the indexing-speed preference: "fast" (max throughput) or "gentle" (paced for low-end
+ *  machines). Applies to the next Drive sync / file import. */
+export const setIndexingSpeed = (speed: "fast" | "gentle") =>
+  invoke<void>("set_indexing_speed", { speed });
+
 /** The vault's search-language choices + current selection for the onboarding picker. */
 export const languageOptions = () => invoke<LanguageOptions>("language_options");
 

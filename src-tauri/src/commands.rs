@@ -98,6 +98,9 @@ pub struct Settings {
     /// Whether query-time reranking is on (a cross-encoder re-scores search hits for sharper
     /// relevance). Default on; stateless, so toggling it never triggers a Rebuild.
     pub reranking: bool,
+    /// Indexing speed: "fast" (default, max throughput) or "gentle" (paced so a low-end machine
+    /// stays usable while indexing runs in the background).
+    pub indexing_speed: String,
 }
 
 /// Streamed back to the UI over a Tauri channel as the assistant replies.
@@ -161,7 +164,19 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
         help_mode: db::get_setting(&conn, "help_mode")?.as_deref() == Some("true"),
         time_zone: db::get_setting(&conn, TIME_ZONE_KEY)?.unwrap_or_default(),
         reranking: db::reranking_enabled(&conn)?,
+        indexing_speed: db::get_setting(&conn, db::INDEXING_SPEED_KEY)?
+            .unwrap_or_else(|| "fast".into()),
     })
+}
+
+/// Set the indexing-speed preference. "gentle" paces indexing (Drive sync + file import) so a low-end
+/// machine stays usable while it works in the background; "fast" runs at full throughput. Anything
+/// else is treated as "fast".
+#[tauri::command]
+pub fn set_indexing_speed(state: State<'_, AppState>, speed: String) -> Result<()> {
+    let value = if speed == "gentle" { "gentle" } else { "fast" };
+    let conn = state.conn()?;
+    db::set_setting(&conn, db::INDEXING_SPEED_KEY, value)
 }
 
 #[tauri::command]
@@ -2837,6 +2852,12 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
     // Set if the user pressed Stop. Already-applied items stay committed; we stop early and skip the
     // interrupted account's cursor advance, so the next sync re-checks it.
     let mut cancelled = false;
+    // "Gentle" indexing pause between files, so a big sync doesn't pin a low-end machine (read once).
+    let pause_ms = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::indexing_pause_ms(&conn)
+    };
 
     'accounts: for w in &work {
         // Stop requested (before this account, or after finishing the previous one)? Halt — keeping
@@ -3005,6 +3026,11 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                     name,
                 },
             );
+            // Gentle mode: breathe between files so embedding doesn't pin the CPU continuously. Only
+            // items that reached here did real work (the cheap no-op/skip paths `continue` above).
+            if pause_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            }
         }
 
         // Persist the pass: advance My Drive's cursor (if synced) + each whole-drive shared cursor,
