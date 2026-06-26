@@ -376,6 +376,46 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_preferences_scope  ON preferences(scope);
     CREATE INDEX idx_preferences_entity ON preferences(entity_id);
     "#,
+    // v14: the connector source registry (Stage 3, §8.1) — the per-service connection record the
+    // index-only foundation (v11) deliberately left to the connector cards. The foundation owns the
+    // source-agnostic SEMANTICS (pointer ingest, the change reducer, the encrypted manifest) and keys
+    // items by a free-text `documents.source_id`; it intentionally has no table for the *accounts /
+    // folders* a connector syncs from. This is that table: one row per connected service account
+    // (e.g. a Google Drive account), holding what only the connector knows — the delta `cursor` (the
+    // Drive changes page-token / OneDrive delta token), `last_synced_at`, the reachability `state`,
+    // and the per-source `mode`. Generic on purpose so the sibling cards reuse it unchanged: 4A Drive
+    // (`provider='google', service='drive'`), 4B OneDrive (`provider='microsoft'`), 4C local-folder
+    // (`provider='local'`), and later Calendar/Gmail service rows under the same Google provider.
+    //   * `id` is the stable row key a connector namespaces its item ids under — `documents.source_id`
+    //     is `'<id>:<fileId>'`, so the foundation's `source_id LIKE '<id>:%'` fan-out flips a whole
+    //     account to `unreachable` on an auth failure. For Drive: `'gdrive:<account-email>'`.
+    //   * `provider`/`service` are free TEXT (documented, not CHECK-constrained) so a new connector
+    //     class — a local folder is not an OAuth "provider" in the same sense — needs no constraint
+    //     relaxation later. `mode`/`state` ARE closed enums I control, so they keep a CHECK.
+    //   * `mode` defaults `index_only` (the only mode built now; the `import`-into-vault option is a
+    //     deferred follow-up that needs no schema change). `folder_ids` is nullable JSON — NULL means
+    //     "the whole source" (Drive's whole-My-Drive default); a narrowed selection lands later.
+    // OAuth tokens never live here — they stay in the OS keychain, keyed per service+account; this
+    // table holds only non-secret connection state. All additive — an existing store just gains an
+    // empty table, no backfill (rule #3). Vectors and every existing query are untouched.
+    r#"
+    CREATE TABLE connector_sources (
+        id             TEXT PRIMARY KEY,    -- stable account key, e.g. 'gdrive:<account-email>'
+        provider       TEXT NOT NULL,       -- 'google' | 'microsoft' | 'apple' | 'local'
+        service        TEXT NOT NULL,       -- 'drive' | 'calendar' | 'gmail' | 'folder'
+        label          TEXT NOT NULL,       -- user-facing name (the account email / folder name)
+        account_email  TEXT,
+        mode           TEXT NOT NULL DEFAULT 'index_only'
+                         CHECK (mode IN ('import','index_only')),
+        folder_ids     TEXT,                -- JSON array of source-scoped folder ids; NULL = whole source
+        cursor         TEXT,                -- opaque delta cursor (Drive changes page-token, etc.)
+        last_synced_at TEXT,
+        state          TEXT NOT NULL DEFAULT 'ok'
+                         CHECK (state IN ('ok','unreachable','error')),
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_connector_sources_service ON connector_sources(provider, service);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -393,4 +433,47 @@ pub fn run(conn: &Connection) -> Result<()> {
         version += 1;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A freshly-opened store reaches the latest `user_version` and carries the v14 connector
+    /// registry with its documented defaults — the table 4A's Drive connector writes account state to.
+    #[test]
+    fn connector_sources_lands_with_defaults() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version,
+            super::MIGRATIONS.len() as i64,
+            "every migration applied"
+        );
+        assert_eq!(
+            version, 14,
+            "the connector registry is the latest migration"
+        );
+
+        // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
+        conn.execute(
+            "INSERT INTO connector_sources(id, provider, service, label) \
+             VALUES ('gdrive:a@b.com', 'google', 'drive', 'a@b.com')",
+            [],
+        )
+        .unwrap();
+        let (mode, state, cursor): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT mode, state, cursor FROM connector_sources WHERE id = 'gdrive:a@b.com'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "index_only");
+        assert_eq!(state, "ok");
+        assert_eq!(cursor, None);
+    }
 }

@@ -700,7 +700,8 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE preferences; \
+            "DROP TABLE connector_sources; \
+             DROP TABLE preferences; \
              DROP INDEX idx_documents_source_id; \
              DROP INDEX idx_documents_source_type; \
              ALTER TABLE documents DROP COLUMN source_type; \
@@ -824,7 +825,8 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE preferences; \
+            "DROP TABLE connector_sources; \
+             DROP TABLE preferences; \
              DROP INDEX idx_documents_source_id; \
              DROP INDEX idx_documents_source_type; \
              ALTER TABLE documents DROP COLUMN source_type; \

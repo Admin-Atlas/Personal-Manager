@@ -1,0 +1,228 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { useCallback, useEffect, useState } from "react";
+import { addIcsFeed, calendarStatus, listIcsFeeds, removeIcsFeed, syncCalendar } from "../lib/ipc";
+import type { CalendarStatus, IcsFeedInfo } from "../lib/types";
+import { Button, ConfirmDialog, Input } from "./ui";
+
+/**
+ * The **zero-auth calendar subscription**: paste a calendar's private "secret address
+ * in iCal format". No sign-in, no Google Cloud project — works even on accounts under
+ * Google's Advanced Protection Program (which blocks unverified OAuth apps).
+ *
+ * Self-contained (owns its state + status fetch) so it can live under the Connectors
+ * tab's Google section, **fully independent of the OAuth path** — subscribing here
+ * connects nothing else, and the OAuth client can be set up without touching this. The
+ * feed URLs are secret bearer links and never leave Rust (the keychain holds them);
+ * only `{id,label}` reach the UI. The backend (`add/list/remove_ics_feed`,
+ * `sync_calendar`, the `calendar_events` mirror) is unchanged — this only relocates
+ * the UI out of the Calendar tab.
+ */
+export function IcsFeedSubscription() {
+  const [feeds, setFeeds] = useState<IcsFeedInfo[]>([]);
+  const [status, setStatus] = useState<CalendarStatus | null>(null);
+  const [feedLabel, setFeedLabel] = useState("");
+  const [feedUrl, setFeedUrl] = useState("");
+  const [showGuide, setShowGuide] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<{ id: string; label: string } | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [f, s] = await Promise.all([listIcsFeeds(), calendarStatus()]);
+      setFeeds(f);
+      setStatus(s);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  async function run(label: string, fn: () => Promise<void>) {
+    setBusy(label);
+    setError(null);
+    setNote(null);
+    try {
+      await fn();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const addFeed = () =>
+    run("add-feed", async () => {
+      await addIcsFeed(feedLabel.trim(), feedUrl.trim());
+      setFeedLabel("");
+      setFeedUrl("");
+      await refresh();
+      setNote("Calendar feed added and synced.");
+    });
+
+  const removeFeed = (id: string) =>
+    run("remove-feed", async () => {
+      await removeIcsFeed(id);
+      await refresh();
+    });
+
+  const sync = () =>
+    run("sync", async () => {
+      const n = await syncCalendar();
+      setNote(`Synced ${n} event${n === 1 ? "" : "s"}.`);
+      await refresh();
+    });
+
+  return (
+    <div data-help="connectors-ics">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium text-ink">Calendar subscription (iCal)</span>
+        <span
+          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-st-quick"
+          style={{ background: "color-mix(in oklab, var(--st-quick) 18%, transparent)" }}
+        >
+          no sign-in
+        </span>
+      </div>
+      <p className="mt-1 text-xs text-ink4">
+        Paste a calendar’s private “secret address in iCal format”. No OAuth — works even with
+        Advanced Protection. Read-only; powers your agenda, schedule questions in chat, and the “Due
+        soon” status when an event names a project.
+      </p>
+      <button
+        onClick={() => setShowGuide((s) => !s)}
+        className="mt-1 text-xs text-accent-text hover:brightness-110"
+      >
+        {showGuide ? "Hide" : "Where do I find this? →"}
+      </button>
+      {showGuide && <FeedGuide />}
+
+      {feeds.length > 0 && (
+        <ul className="mt-2 divide-y divide-rule rounded-[var(--radius)] border border-border">
+          {feeds.map((f) => (
+            <li
+              key={f.id}
+              className="flex items-center justify-between px-3 py-1.5 text-sm text-ink"
+            >
+              <span className="truncate">{f.label}</span>
+              <Button
+                variant="tertiary"
+                onClick={() => setConfirm({ id: f.id, label: f.label })}
+                disabled={busy != null}
+                className="shrink-0 px-2 py-0.5 text-xs hover:text-st-due"
+              >
+                Remove
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="mt-2 space-y-2">
+        <Input
+          type="text"
+          value={feedLabel}
+          onChange={(e) => setFeedLabel(e.target.value)}
+          placeholder="Label (optional, e.g. Work)"
+        />
+        <Input
+          type="text"
+          autoComplete="off"
+          value={feedUrl}
+          onChange={(e) => setFeedUrl(e.target.value)}
+          placeholder="https://calendar.google.com/calendar/ical/…/basic.ics"
+        />
+        <Button
+          onClick={addFeed}
+          disabled={busy != null || !feedUrl.trim()}
+          className="disabled:opacity-40"
+        >
+          {busy === "add-feed" ? "Adding…" : "Add feed"}
+        </Button>
+      </div>
+
+      {feeds.length > 0 && (
+        <div className="mt-3 flex items-center justify-between">
+          <p className="text-xs text-ink4">
+            {status?.last_sync
+              ? `Last synced ${formatWhen(status.last_sync)} · ${status.window_days} days ahead`
+              : `Not synced yet · ${status?.window_days ?? 21} days ahead`}
+          </p>
+          <Button
+            onClick={sync}
+            disabled={busy != null}
+            className="px-2 py-1 text-xs disabled:opacity-40"
+          >
+            {busy === "sync" ? "Syncing…" : "Sync now"}
+          </Button>
+        </div>
+      )}
+
+      {note && <p className="mt-2 text-xs text-st-quick">{note}</p>}
+      {error && (
+        <p
+          className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
+          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+        >
+          {error}
+        </p>
+      )}
+
+      <ConfirmDialog
+        open={confirm != null}
+        title="Remove this calendar feed?"
+        danger
+        confirmLabel="Remove"
+        onConfirm={() => {
+          const c = confirm;
+          setConfirm(null);
+          if (c) void removeFeed(c.id);
+        }}
+        onClose={() => setConfirm(null)}
+      >
+        This removes “{confirm?.label}” and its mirrored events. You can re-add the feed URL
+        anytime.
+      </ConfirmDialog>
+    </div>
+  );
+}
+
+/** How to find a Google Calendar's private iCal address. */
+function FeedGuide() {
+  return (
+    <ol className="mt-2 space-y-1 rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink3">
+      <li>
+        1. Open{" "}
+        <a
+          href="https://calendar.google.com/"
+          target="_blank"
+          rel="noreferrer"
+          className="text-accent-text underline hover:brightness-110"
+        >
+          Google Calendar
+        </a>{" "}
+        on the web.
+      </li>
+      <li>
+        2. Hover the calendar in the left list → ⋮ →{" "}
+        <span className="text-ink2">Settings and sharing</span>.
+      </li>
+      <li>
+        3. Scroll to <span className="text-ink2">Integrate calendar</span> → copy the{" "}
+        <span className="text-ink2">Secret address in iCal format</span>.
+      </li>
+      <li>4. Paste it below. (Keep it private — anyone with the link can read that calendar.)</li>
+    </ol>
+  );
+}
+
+function formatWhen(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}

@@ -26,7 +26,7 @@ import {
   setVaultEmbedder,
 } from "../lib/ipc";
 import { useHelp } from "../lib/help";
-import { CalendarSettings } from "./CalendarSettings";
+import { ConnectorsSettings } from "./ConnectorsSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
 import { RebuildProgress } from "./RebuildProgress";
@@ -45,13 +45,13 @@ interface Props {
 }
 
 /** The non-onboarding Settings tabs (left rail). Onboarding stays a single untabbed scroll. */
-type SettingsTab = "general" | "ai" | "search" | "calendar" | "data" | "developer";
+type SettingsTab = "general" | "ai" | "search" | "connectors" | "data" | "developer";
 
 const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },
   { id: "ai", label: "AI & Models" },
   { id: "search", label: "Search" },
-  { id: "calendar", label: "Calendar" },
+  { id: "connectors", label: "Connectors" },
   { id: "data", label: "Data & Security" },
   { id: "developer", label: "Developer" },
 ];
@@ -935,9 +935,9 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
               </>
             )}
 
-            {tab === "calendar" && (
+            {tab === "connectors" && (
               <>
-                <CalendarSettings />
+                <ConnectorsSettings />
               </>
             )}
 
