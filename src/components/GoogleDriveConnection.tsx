@@ -37,6 +37,7 @@ export function GoogleDriveConnection() {
   const [syncAccount, setSyncAccount] = useState<string | null>(null);
   const [report, setReport] = useState<DriveSyncReport | null>(null);
   const [stopping, setStopping] = useState(false);
+  const [confirmStop, setConfirmStop] = useState(false);
   const [confirmEmail, setConfirmEmail] = useState<string | null>(null);
   // Live mirror of "a sync is on screen", so a callback created in an earlier render (the connect
   // tail, which may fire mid-sync) can tell whether it owns the visible progress without hijacking
@@ -129,8 +130,9 @@ export function GoogleDriveConnection() {
     });
   };
 
-  // Stop the running sync. The backend halts after the current file and keeps everything indexed so
-  // far; the "finished" event (with a `cancelled` report) clears the bar.
+  // Stop the running sync (after a confirm, so an accidental click doesn't halt a long index). The
+  // backend halts after the current file and keeps everything indexed so far; the "finished" event
+  // (with a `cancelled` report) clears the bar.
   const stop = () => {
     setStopping(true);
     void stopDriveSync().catch(() => setStopping(false));
@@ -243,7 +245,7 @@ export function GoogleDriveConnection() {
                 <div className="mt-2">
                   <Button
                     variant="tertiary"
-                    onClick={stop}
+                    onClick={() => setConfirmStop(true)}
                     disabled={stopping}
                     className="px-2 py-1 text-xs hover:text-st-due disabled:opacity-40"
                   >
@@ -281,6 +283,22 @@ export function GoogleDriveConnection() {
       >
         This forgets the account's sign-in. Its indexed items are kept and stay findable, but marked
         “source unreachable” until you reconnect — they are never deleted.
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={confirmStop}
+        title="Stop indexing?"
+        danger
+        confirmLabel="Stop indexing"
+        onConfirm={() => {
+          setConfirmStop(false);
+          stop();
+        }}
+        onClose={() => setConfirmStop(false)}
+      >
+        Everything indexed so far is kept and stays searchable — only the files not yet reached will
+        be left out, and a later sync picks them up where this one stopped. You can resume any time
+        with “Sync now”.
       </ConfirmDialog>
     </div>
   );
