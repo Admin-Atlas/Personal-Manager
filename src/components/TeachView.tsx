@@ -18,8 +18,10 @@ import {
   renameEntity,
 } from "../lib/ipc";
 import type { Entity } from "../lib/types";
+import { useDevMode } from "../lib/capabilities";
 import { useDepth } from "../theme";
 import { TeachPreferences } from "./TeachPreferences";
+import { DevRaw } from "./dev/DevRaw";
 import { Button, Card, Input, Modal, Skeleton } from "./ui";
 
 /** The always-present fallback bucket; we don't nudge merges for it. */
@@ -325,6 +327,7 @@ function EntityCard({
   // The aliases are every known name; drop the canonical self-alias to show only the *variants*
   // that resolve to it.
   const variants = entity.aliases.filter((a) => a !== entity.canonical_name);
+  const { devMode } = useDevMode();
 
   return (
     <li>
@@ -422,6 +425,18 @@ function EntityCard({
             )}
           </div>
         </div>
+
+        {devMode && (
+          <DevRaw
+            label="entity"
+            fields={[
+              ["entity_id", entity.id],
+              ["confidence", `${Math.round(entity.confidence * 100)}%`],
+              ["user_confirmed", entity.user_confirmed ? "yes" : "no"],
+              ["aliases", entity.aliases.length],
+            ]}
+          />
+        )}
       </Card>
     </li>
   );

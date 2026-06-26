@@ -519,6 +519,7 @@ pub fn run() {
             commands_dev::dev_table_counts,
             commands_dev::dev_table_list,
             commands_dev::dev_table_rows,
+            commands_dev::dev_document_chunks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -445,6 +445,48 @@ fn settings_page(conn: &Connection, limit: u32, offset: u32) -> Result<DevTableP
     })
 }
 
+/// The chunk breakdown for ONE document (the in-context Documents inspector). Reuses the `chunks`
+/// allow-list projection (so `content` stays length-only) and binds `document_id` as a typed
+/// parameter; ordered by `ordinal` (natural reading order), capped at 500 chunks.
+fn document_chunks(conn: &Connection, document_id: i64) -> Result<DevTablePage> {
+    let spec = TABLES
+        .iter()
+        .find(|t| t.name == "chunks")
+        .expect("the chunks table is declared in TABLES");
+    let total: i64 = conn.query_row(
+        "SELECT count(*) FROM chunks WHERE document_id = ?1",
+        params![document_id],
+        |r| r.get(0),
+    )?;
+    let col_list = spec
+        .columns
+        .iter()
+        .map(|c| c.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql =
+        format!("SELECT {col_list} FROM chunks WHERE document_id = ?1 ORDER BY ordinal LIMIT 500");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![document_id], |row| {
+            let mut cells = Vec::with_capacity(spec.columns.len());
+            for (i, col) in spec.columns.iter().enumerate() {
+                let v: Value = row.get(i)?;
+                cells.push(render_value(v, col.render));
+            }
+            Ok(cells)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(DevTablePage {
+        table: "chunks".to_string(),
+        columns: spec.columns.iter().map(|c| c.name.to_string()).collect(),
+        rows,
+        total,
+        limit: 500,
+        offset: 0,
+    })
+}
+
 // ---- Command wrappers (thin: acquire the store, call a pure core) --------------------------
 
 /// One-call snapshot of the running vault's index-time + runtime facts (System panel).
@@ -477,6 +519,13 @@ pub fn dev_table_rows(
 ) -> Result<DevTablePage> {
     let conn = state.conn()?;
     table_page(&conn, &table, limit, offset)
+}
+
+/// The chunk breakdown for one document — the in-context Documents inspector (issue #78, PR 2).
+#[tauri::command]
+pub fn dev_document_chunks(state: State<'_, AppState>, document_id: i64) -> Result<DevTablePage> {
+    let conn = state.conn()?;
+    document_chunks(&conn, document_id)
 }
 
 #[cfg(test)]
@@ -559,5 +608,29 @@ mod tests {
     fn truncate_marks_overflow_and_counts_chars() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn document_chunks_scopes_to_one_document_and_hides_content() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE chunks (
+                 id INTEGER PRIMARY KEY, document_id INTEGER, ordinal INTEGER, heading TEXT,
+                 kind TEXT, char_count INTEGER, uid TEXT, parent_id INTEGER, content TEXT
+             );
+             INSERT INTO chunks(document_id,ordinal,heading,kind,char_count,uid,parent_id,content)
+                 VALUES (1,0,'Intro','leaf',120,'uid-a',NULL,'the full secret body of chunk one'),
+                        (1,1,'Body','leaf',90,'uid-b',NULL,'second chunk body'),
+                        (2,0,'Other','leaf',50,'uid-c',NULL,'a different document');",
+        )
+        .unwrap();
+        let page = document_chunks(&c, 1).unwrap();
+        // Scoped to document 1 only (document 2's chunk is excluded).
+        assert_eq!(page.total, 2);
+        assert_eq!(page.rows.len(), 2);
+        // `content` is shown as a length, never the body text (the chunks projection's Render::Len).
+        let idx = page.columns.iter().position(|c| c == "content").unwrap();
+        assert!(page.rows[0][idx].ends_with("chars>"));
+        assert!(!page.rows[0][idx].contains("secret body"));
     }
 }
