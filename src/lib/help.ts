@@ -188,9 +188,21 @@ export const HELP: Record<string, HelpEntry> = {
     title: "App lock",
     body: "Optionally require an OS check — Windows Hello (face, fingerprint, or PIN) — before PM opens. It's a convenience lock for the window only: your store is always encrypted at rest, so this isn't a second password on your data. It's off until you turn it on, only available where your device can actually verify, and takes effect the next time you open PM. If your device can't verify, you can still get in — you're never locked out of your own app.",
   },
+  "settings-connectors": {
+    title: "Connectors",
+    body: "Connect external accounts so PM can find and use what's in them, grouped by what they do — Calendar, Drive, and email. Each provider keeps its own sign-in; every connection is independently opt-in and removable, and nothing cascades or auto-enables. Credentials and tokens live only in your keychain.",
+  },
+  "connectors-google-client": {
+    title: "Google sign-in (one-time setup)",
+    body: "One Google Cloud 'Desktop app' OAuth client — your own, pasted once and shared by every Google service (Calendar, Drive). PM ships no Google secret, so you supply your own; it stays in your keychain. Setting it up connects nothing on its own. If your account uses Advanced Protection, Google blocks this — use a calendar subscription (iCal) instead.",
+  },
+  "connectors-ics": {
+    title: "Calendar subscription (iCal)",
+    body: "Paste a calendar's private 'secret address in iCal format' — no sign-in, no Google Cloud project, and it works even with Advanced Protection. Read-only: it powers your agenda, schedule questions in chat, and the 'Due soon' status when an event names a project. The feed URL is a secret link and lives only in your keychain.",
+  },
   "settings-calendar": {
-    title: "Calendar",
-    body: "Connect a calendar (read-only) so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. Two ways: paste a calendar's private iCal feed URL (simplest — no sign-in, works with Advanced Protection), or use Google sign-in with your own OAuth credentials (advanced). Feed URLs and tokens live only in your keychain.",
+    title: "Google Calendar",
+    body: "Read-only Google sign-in with your own OAuth client. Once connected, pick which calendars to mirror so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. For a no-sign-in option, use a calendar subscription (iCal) instead. Tokens live only in your keychain.",
   },
   "settings-data": {
     title: "Data",
