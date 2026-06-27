@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::calendar::{self, CalendarEvent, CalendarInfo, IcsFeedInfo};
+use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::error::{Error, Result};
 use crate::google;
 use crate::ingest::{self, Document, IngestEvent};
@@ -2402,95 +2402,6 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
     let conn = state.conn()?;
     calendar::list_upcoming(&conn, calendar::AGENDA_DAYS)
-}
-
-// --- back-compat: the single-account Google calendar commands (over the new model) ---
-//
-// The current Settings UI still calls these; they're thin wrappers retired when the UI is rewired
-// (PR2). `CalendarStatus` keeps its old shape so the existing component compiles unchanged.
-
-/// The calendar connector's state, for the legacy Settings panel.
-#[derive(Serialize)]
-pub struct CalendarStatus {
-    pub ics_feeds: usize,
-    pub oauth_client_configured: bool,
-    pub oauth_connected: bool,
-    pub calendars_selected: usize,
-    pub last_sync: Option<String>,
-    pub window_days: i64,
-}
-
-#[tauri::command]
-pub fn calendar_status(state: State<'_, AppState>) -> Result<CalendarStatus> {
-    let conn = state.conn()?;
-    let google_accounts = calendar::list_sources(&conn, Some("google"))?;
-    let calendars_selected = calendar::list_calendars(&conn)?
-        .into_iter()
-        .filter(|c| c.provider == "google" && c.selected)
-        .count();
-    Ok(CalendarStatus {
-        ics_feeds: calendar::load_feeds()?.len(),
-        oauth_client_configured: google::has_client()?,
-        // "Connected" if any Google account is registered, or a not-yet-migrated legacy token exists.
-        oauth_connected: !google_accounts.is_empty()
-            || google::is_connected_for(google::CALENDAR_TOKEN_KEY)?,
-        calendars_selected,
-        last_sync: calendar::last_sync(&conn)?,
-        window_days: calendar::AGENDA_DAYS,
-    })
-}
-
-/// Back-compat: connect one Google Calendar account into the new model.
-#[tauri::command]
-pub async fn connect_google(app: AppHandle) -> Result<()> {
-    do_connect_google_calendar(&app).await.map(|_| ())
-}
-
-/// Back-compat: disconnect every Google Calendar account (+ any leftover legacy token/events).
-#[tauri::command]
-pub fn disconnect_google(state: State<'_, AppState>) -> Result<()> {
-    let conn = state.conn()?;
-    for acc in calendar::list_sources(&conn, Some("google"))? {
-        calendar::remove_source(&conn, &acc.id)?;
-        if let Some(email) = acc.email {
-            secrets::clear_google_token_for(&google_calendar_token_key(&email)).ok();
-        }
-    }
-    secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok();
-    // Drop leftover events for calendars no longer present/selected (incl. pre-migration Google rows).
-    let active: Vec<String> = calendar::selected_calendars(&conn)?
-        .into_iter()
-        .map(|c| c.id)
-        .collect();
-    calendar::prune_unselected(&conn, &active)
-}
-
-/// Back-compat: the connected Google account's calendars (id == the provider's own id, so the legacy
-/// "primary id == account email" mapping holds).
-#[tauri::command]
-pub async fn list_google_calendars(app: AppHandle) -> Result<Vec<CalendarInfo>> {
-    let _ = migrate_legacy_google_calendar(&app).await;
-    let state = app.state::<AppState>();
-    let conn = state.conn()?;
-    calendar::calendar_infos_for_provider(&conn, "google")
-}
-
-/// Back-compat: choose which Google calendars sync, by their provider calendar ids (`remote_id`).
-#[tauri::command]
-pub fn set_google_calendar_ids(state: State<'_, AppState>, ids: Vec<String>) -> Result<()> {
-    let conn = state.conn()?;
-    for cal in calendar::list_calendars(&conn)?
-        .into_iter()
-        .filter(|c| c.provider == "google")
-    {
-        let on = cal
-            .remote_id
-            .as_deref()
-            .is_some_and(|r| ids.iter().any(|id| id == r));
-        calendar::set_calendar_selected(&conn, &cal.id, on)?;
-    }
-    // Keep the legacy selection setting consistent (read by the migration on a fresh device).
-    calendar::set_selected_calendar_ids(&conn, &ids)
 }
 
 // --- Google Drive (index-only connector, board card 4A) ---

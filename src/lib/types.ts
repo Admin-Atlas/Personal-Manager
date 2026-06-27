@@ -344,36 +344,51 @@ export type ProjectProposalEvent =
   | { type: "proposed"; project: string; proposal: ProjectProposal }
   | { type: "finished"; proposed: number };
 
-// --- Personal Assistant: Google Calendar connector (Step 6, spec §8.6) ---
+// --- Personal Assistant: Calendar connectors (multi-provider, read-only — cards 6A/6B) ---
 
-/** State of the calendar connector, covering both paths (iCal feeds + Google OAuth). */
-export interface CalendarStatus {
-  /** How many .ics feeds are subscribed (the no-OAuth path). */
-  ics_feeds: number;
-  /** The user has saved a Google client ID + secret. */
-  oauth_client_configured: boolean;
-  /** A Google OAuth token is stored (sign-in completed). */
-  oauth_connected: boolean;
-  /** How many Google calendars are selected to sync. */
-  calendars_selected: number;
+/** A connected calendar account (Google/Outlook) or iCal subscription — one connector source. */
+export interface CalendarAccount {
+  /** Stable source id: `gcal:<email>` | `outlook:<email>` | `ics:<hex>`. */
+  id: string;
+  /** `google` | `microsoft` | `apple` | `other`. */
+  provider: string;
+  email: string | null;
+  label: string;
+  state: "ok" | "unreachable" | "error";
+  last_synced_at: string | null;
+}
+
+/** One calendar within an account/subscription — the picker + unified-view unit. */
+export interface Calendar {
+  /** Stable mirror id: `<source>:<remoteId>` for OAuth, the feed id for a subscription. */
+  id: string;
+  source_id: string;
+  provider: string;
+  remote_id: string | null;
+  name: string;
+  color: string | null;
+  selected: boolean;
+  is_primary: boolean;
+}
+
+/** The whole calendar surface in one read (every provider). */
+export interface CalendarOverview {
+  google_client_configured: boolean;
+  microsoft_client_configured: boolean;
+  accounts: CalendarAccount[];
+  calendars: Calendar[];
   /** ISO timestamp of the last successful sync, if any. */
   last_sync: string | null;
   /** How far ahead PM mirrors events (and the agenda horizon), in days. */
   window_days: number;
 }
 
-/** A subscribed .ics feed, without its secret URL (for display). */
+/** A subscribed iCal feed, without its secret URL (for display). `provider` tags it for grouping. */
 export interface IcsFeedInfo {
   id: string;
   label: string;
-}
-
-/** One of the user's calendars (for the Settings picker). */
-export interface GoogleCalendar {
-  id: string;
-  summary: string;
-  primary: boolean;
-  selected: boolean;
+  /** `apple` | `outlook` | `google` | `other`. */
+  provider: string;
 }
 
 /** A connected Google Drive account (Connectors → Drive). Each is independent — its own token,

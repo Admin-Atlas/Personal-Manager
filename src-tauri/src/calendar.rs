@@ -35,16 +35,6 @@ const MAX_AGENDA_EVENTS: usize = 20;
 /// Cap on a fetched feed body (10 MiB) so a hostile feed can't balloon memory.
 const MAX_FEED_BYTES: usize = 10 * 1024 * 1024;
 
-/// One of the user's calendars, for the Settings picker. `selected` reflects PM's
-/// stored choice, not Google's own "selected" flag.
-#[derive(Clone, Serialize)]
-pub struct CalendarInfo {
-    pub id: String,
-    pub summary: String,
-    pub primary: bool,
-    pub selected: bool,
-}
-
 /// A mirrored event (also the shape sent to the agenda UI). `calendar_id` is the owning
 /// [`Calendar::id`] (e.g. `gcal:<email>:<calId>`); `uid` is the provider's iCal UID — the durable
 /// cross-provider anchor stored for the Stage-4 correspondence card. The DB also carries a nullable
@@ -476,21 +466,13 @@ fn parse_when(node: Option<&serde_json::Value>) -> Option<(String, bool)> {
 
 // --- settings ---
 
+/// The legacy `google_calendar_ids` selection (pre-PR1). Read once by the multi-account migration to
+/// carry the user's old calendar choices forward; never written any more.
 pub fn selected_calendar_ids(conn: &Connection) -> Result<Vec<String>> {
     match db::get_setting(conn, SELECTED_KEY)? {
         Some(raw) => Ok(serde_json::from_str(&raw).unwrap_or_default()),
         None => Ok(Vec::new()),
     }
-}
-
-pub fn set_selected_calendar_ids(conn: &Connection, ids: &[String]) -> Result<()> {
-    let cleaned: Vec<&str> = ids
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let json = serde_json::to_string(&cleaned).map_err(|e| Error::Other(e.to_string()))?;
-    db::set_setting(conn, SELECTED_KEY, &json)
 }
 
 pub fn last_sync(conn: &Connection) -> Result<Option<String>> {
@@ -870,21 +852,6 @@ pub fn register_feed_source(conn: &Connection, feed: &IcsFeed) -> Result<()> {
             is_primary: false,
         },
     )
-}
-
-/// Back-compat view of one account's calendars as the old [`CalendarInfo`] shape (id = the provider's
-/// own calendar id, so the legacy single-account UI's "primary id == account email" mapping holds).
-pub fn calendar_infos_for_provider(conn: &Connection, provider: &str) -> Result<Vec<CalendarInfo>> {
-    Ok(list_calendars(conn)?
-        .into_iter()
-        .filter(|c| c.provider == provider)
-        .map(|c| CalendarInfo {
-            id: c.remote_id.clone().unwrap_or_else(|| c.id.clone()),
-            summary: c.name,
-            primary: c.is_primary,
-            selected: c.selected,
-        })
-        .collect())
 }
 
 // --- mirror table ---

@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  calendarStatus,
+  calendarOverview,
   getDailyBriefing,
   listCalendarEvents,
   listProjectOverviews,
@@ -127,8 +127,8 @@ export function FocusView({ onOpenProject }: Props) {
   useEffect(() => {
     (async () => {
       try {
-        const status = await calendarStatus();
-        if (status.ics_feeds > 0 || status.oauth_connected) {
+        const overview = await calendarOverview();
+        if (overview.accounts.length > 0) {
           await syncCalendar().catch(() => {});
           const evts = await listCalendarEvents();
           if (aliveRef.current) {

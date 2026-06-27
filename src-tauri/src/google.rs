@@ -53,11 +53,6 @@ pub fn has_client() -> Result<bool> {
     )
 }
 
-/// True once an OAuth token is stored for the given service/account (sign-in completed).
-pub fn is_connected_for(token_key: &str) -> Result<bool> {
-    Ok(secrets::get_google_token_for(token_key)?.is_some())
-}
-
 fn client_creds() -> Result<(String, Secret)> {
     let id = secrets::get_google_client_id()?.ok_or_else(|| {
         Error::Other("Add your Google client ID and secret in Settings first.".into())

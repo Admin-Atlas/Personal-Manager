@@ -5,8 +5,9 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppLockStatus,
+  CalendarAccount,
   CalendarEvent,
-  CalendarStatus,
+  CalendarOverview,
   ChatEvent,
   Conversation,
   CostSummary,
@@ -24,7 +25,6 @@ import type {
   DriveSyncEvent,
   DriveSyncState,
   Entity,
-  GoogleCalendar,
   IcsFeedInfo,
   Importance,
   IngestEvent,
@@ -445,19 +445,40 @@ export function proposeProjectMetadata(
   return invoke<void>("propose_project_metadata", { names: names ?? null, onEvent: channel });
 }
 
-// --- Personal Assistant: Calendar (Step 6, spec §8.6) ---
+// --- Personal Assistant: Calendar connectors (multi-provider, read-only — cards 6A/6B) ---
 
-/** State of the calendar connector (both .ics feeds and Google OAuth). */
-export const calendarStatus = () => invoke<CalendarStatus>("calendar_status");
+/** The whole calendar surface in one read: provider clients, connected accounts/subscriptions, and
+ *  every registered calendar (with its selection). Migrates a legacy single-account Google connection
+ *  on first call. */
+export const calendarOverview = () => invoke<CalendarOverview>("calendar_overview");
 
-// .ics feeds — the simple no-OAuth path (works under Advanced Protection).
+/** Tick/untick one calendar (by its `calendars.id`) for syncing. */
+export const setCalendarSelected = (calendarId: string, selected: boolean) =>
+  invoke<void>("set_calendar_selected", { calendarId, selected });
+
+/** Connect a Google Calendar account (multi-account) — opens the browser; resolves on sign-in. */
+export const connectGoogleCalendarAccount = () =>
+  invoke<CalendarAccount>("connect_google_calendar_account");
+
+/** Disconnect one Google Calendar account (by email). */
+export const disconnectGoogleCalendarAccount = (email: string) =>
+  invoke<void>("disconnect_google_calendar_account", { email });
+
+/** Connect an Outlook / Microsoft 365 calendar account (Graph OAuth) — opens the browser. */
+export const connectOutlookCalendar = () => invoke<CalendarAccount>("connect_outlook_calendar");
+
+/** Disconnect one Outlook calendar account (by email). */
+export const disconnectOutlookCalendar = (email: string) =>
+  invoke<void>("disconnect_outlook_calendar", { email });
+
+// iCal subscriptions — the no-OAuth path (works under Advanced Protection).
 
 /** Subscribed feeds (without their secret URLs). */
 export const listIcsFeeds = () => invoke<IcsFeedInfo[]>("list_ics_feeds");
 
-/** Add an .ics feed (e.g. a Google "secret address in iCal format") and sync it. */
-export const addIcsFeed = (label: string, url: string) =>
-  invoke<void>("add_ics_feed", { label, url });
+/** Add an iCal subscription and sync it. `provider` tags it (apple/outlook/google/other). */
+export const addIcsFeed = (label: string, url: string, provider?: string) =>
+  invoke<void>("add_ics_feed", { label, url, provider });
 
 /** Remove a feed and its synced events. */
 export const removeIcsFeed = (id: string) => invoke<void>("remove_ics_feed", { id });
@@ -466,23 +487,10 @@ export const removeIcsFeed = (id: string) => invoke<void>("remove_ics_feed", { i
 export const setGoogleClient = (clientId: string, clientSecret: string) =>
   invoke<void>("set_google_client", { clientId, clientSecret });
 
-/** Forget the client credentials (also disconnects + clears the mirror). */
+/** Forget the Google client credentials (also disconnects every Google service + clears the mirror). */
 export const clearGoogleClient = () => invoke<void>("clear_google_client");
 
-/** Run the OAuth consent flow — opens the system browser; resolves on sign-in. */
-export const connectGoogle = () => invoke<void>("connect_google");
-
-/** Sign out: forget the token and clear mirrored events (creds kept). */
-export const disconnectGoogle = () => invoke<void>("disconnect_google");
-
-/** The user's calendars, with PM's selection applied (for the picker). */
-export const listGoogleCalendars = () => invoke<GoogleCalendar[]>("list_google_calendars");
-
-/** Choose which calendars to sync. */
-export const setGoogleCalendarIds = (ids: string[]) =>
-  invoke<void>("set_google_calendar_ids", { ids });
-
-/** Pull events from the selected calendars into the local mirror; returns the count. */
+/** Pull events from every selected calendar (all providers) into the local mirror; returns the count. */
 export const syncCalendar = () => invoke<number>("sync_calendar");
 
 /** Upcoming events in the mirror, for the focus-view agenda. */

@@ -2,26 +2,30 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useCallback, useEffect, useState } from "react";
-import { addIcsFeed, calendarStatus, listIcsFeeds, removeIcsFeed, syncCalendar } from "../lib/ipc";
-import type { CalendarStatus, IcsFeedInfo } from "../lib/types";
+import {
+  addIcsFeed,
+  calendarOverview,
+  listIcsFeeds,
+  removeIcsFeed,
+  syncCalendar,
+} from "../lib/ipc";
+import type { CalendarOverview, IcsFeedInfo } from "../lib/types";
 import { Button, ConfirmDialog, Input } from "./ui";
 
 /**
- * The **zero-auth calendar subscription**: paste a calendar's private "secret address
- * in iCal format". No sign-in, no Google Cloud project — works even on accounts under
- * Google's Advanced Protection Program (which blocks unverified OAuth apps).
+ * The **zero-auth calendar subscription**: paste a calendar's private "secret address in iCal format".
+ * No sign-in, no Cloud project — works even on accounts under Advanced Protection.
  *
- * Self-contained (owns its state + status fetch) so it can live under the Connectors
- * tab's Google section, **fully independent of the OAuth path** — subscribing here
- * connects nothing else, and the OAuth client can be set up without touching this. The
- * feed URLs are secret bearer links and never leave Rust (the keychain holds them);
- * only `{id,label}` reach the UI. The backend (`add/list/remove_ics_feed`,
- * `sync_calendar`, the `calendar_events` mirror) is unchanged — this only relocates
- * the UI out of the Calendar tab.
+ * **Provider-parameterised.** With `provider` set (the Apple group) it manages just that provider's
+ * subscriptions and tags new ones accordingly; with no `provider` (the general "Calendar
+ * subscriptions" section) it manages every feed NOT owned by a dedicated provider group (i.e. not
+ * Apple) and tags new ones `other`. The feed URLs are secret bearer links and never leave Rust (the
+ * keychain holds them); only `{id,label,provider}` reach the UI.
  */
-export function IcsFeedSubscription() {
+export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
+  const scoped = provider != null;
   const [feeds, setFeeds] = useState<IcsFeedInfo[]>([]);
-  const [status, setStatus] = useState<CalendarStatus | null>(null);
+  const [overview, setOverview] = useState<CalendarOverview | null>(null);
   const [feedLabel, setFeedLabel] = useState("");
   const [feedUrl, setFeedUrl] = useState("");
   const [showGuide, setShowGuide] = useState(false);
@@ -32,9 +36,9 @@ export function IcsFeedSubscription() {
 
   const refresh = useCallback(async () => {
     try {
-      const [f, s] = await Promise.all([listIcsFeeds(), calendarStatus()]);
+      const [f, o] = await Promise.all([listIcsFeeds(), calendarOverview()]);
       setFeeds(f);
-      setStatus(s);
+      setOverview(o);
     } catch (e) {
       setError(String(e));
     }
@@ -59,7 +63,7 @@ export function IcsFeedSubscription() {
 
   const addFeed = () =>
     run("add-feed", async () => {
-      await addIcsFeed(feedLabel.trim(), feedUrl.trim());
+      await addIcsFeed(feedLabel.trim(), feedUrl.trim(), provider ?? "other");
       setFeedLabel("");
       setFeedUrl("");
       await refresh();
@@ -79,10 +83,18 @@ export function IcsFeedSubscription() {
       await refresh();
     });
 
+  // Scoped (Apple) shows just that provider's feeds; the general section shows everything NOT owned by
+  // a dedicated provider group (Apple has its own), so each feed lives in exactly one place.
+  const shown = scoped
+    ? feeds.filter((f) => f.provider === provider)
+    : feeds.filter((f) => f.provider !== "apple");
+
   return (
-    <div data-help="connectors-ics">
+    <div data-help={scoped ? `connectors-ics-${provider}` : "connectors-ics"}>
       <div className="flex items-center gap-2">
-        <span className="text-sm font-medium text-ink">Calendar subscription (iCal)</span>
+        <span className="text-sm font-medium text-ink">
+          {scoped ? "Apple Calendar" : "Calendar subscription (iCal)"}
+        </span>
         <span
           className="rounded-[var(--radius-sm)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-st-quick"
           style={{ background: "color-mix(in oklab, var(--st-quick) 18%, transparent)" }}
@@ -91,10 +103,21 @@ export function IcsFeedSubscription() {
         </span>
       </div>
       <p className="mt-1 text-xs text-ink4">
-        Paste a calendar’s private iCal/ICS link — from <span className="text-ink2">Google</span>,{" "}
-        <span className="text-ink2">Outlook</span>, <span className="text-ink2">Apple</span>, or any
-        provider. No OAuth — works even with Advanced Protection. Read-only; powers your agenda,
-        schedule questions in chat, and the “Due soon” status when an event names a project.
+        {scoped ? (
+          <>
+            iCloud has no desktop sign-in, so add an Apple calendar by its public iCal/ICS link — no
+            account needed. Read-only; powers your agenda, schedule questions in chat, and the “Due
+            soon” status when an event names a project.
+          </>
+        ) : (
+          <>
+            Paste any calendar’s private iCal/ICS link — from{" "}
+            <span className="text-ink2">Google</span>, <span className="text-ink2">Outlook</span>,
+            or any provider. No OAuth — works even with Advanced Protection. Read-only; powers your
+            agenda, schedule questions in chat, and the “Due soon” status when an event names a
+            project.
+          </>
+        )}
       </p>
       <button
         onClick={() => setShowGuide((s) => !s)}
@@ -102,11 +125,11 @@ export function IcsFeedSubscription() {
       >
         {showGuide ? "Hide" : "Where do I find this? →"}
       </button>
-      {showGuide && <FeedGuide />}
+      {showGuide && <FeedGuide only={provider} />}
 
-      {feeds.length > 0 && (
+      {shown.length > 0 && (
         <ul className="mt-2 divide-y divide-rule rounded-[var(--radius)] border border-border">
-          {feeds.map((f) => (
+          {shown.map((f) => (
             <li
               key={f.id}
               className="flex items-center justify-between px-3 py-1.5 text-sm text-ink"
@@ -148,12 +171,12 @@ export function IcsFeedSubscription() {
         </Button>
       </div>
 
-      {feeds.length > 0 && (
+      {shown.length > 0 && (
         <div className="mt-3 flex items-center justify-between">
           <p className="text-xs text-ink4">
-            {status?.last_sync
-              ? `Last synced ${formatWhen(status.last_sync)} · ${status.window_days} days ahead`
-              : `Not synced yet · ${status?.window_days ?? 21} days ahead`}
+            {overview?.last_sync
+              ? `Last synced ${formatWhen(overview.last_sync)} · ${overview.window_days} days ahead`
+              : `Not synced yet · ${overview?.window_days ?? 21} days ahead`}
           </p>
           <Button
             onClick={sync}
@@ -194,9 +217,9 @@ export function IcsFeedSubscription() {
   );
 }
 
-/** How to find a calendar's private iCal/ICS address across the common providers. One borderless
- *  panel (no nested box) with a short section per provider. */
-function FeedGuide() {
+/** How to find a calendar's private iCal/ICS address. `only` narrows it to one provider (the Apple
+ *  group shows just the iCloud steps); otherwise every common provider is listed. */
+function FeedGuide({ only }: { only?: "apple" }) {
   const link = "text-accent-text underline hover:brightness-110";
   return (
     <div className="mt-2 space-y-2.5 rounded-[var(--radius)] bg-surface px-3 py-2 text-xs text-ink3">
@@ -205,58 +228,63 @@ function FeedGuide() {
         link can read that calendar.
       </p>
 
-      <div>
-        <div className="font-medium text-ink2">Google Calendar</div>
-        <ol className="mt-1 space-y-0.5">
-          <li>
-            1. Open{" "}
-            <a
-              href="https://calendar.google.com/"
-              target="_blank"
-              rel="noreferrer"
-              className={link}
-            >
-              Google Calendar
-            </a>{" "}
-            on the web.
-          </li>
-          <li>
-            2. Hover the calendar in the left list → ⋮ →{" "}
-            <span className="text-ink2">Settings and sharing</span>.
-          </li>
-          <li>
-            3. Under <span className="text-ink2">Integrate calendar</span>, copy the{" "}
-            <span className="text-ink2">Secret address in iCal format</span>.
-          </li>
-        </ol>
-      </div>
+      {!only && (
+        <div>
+          <div className="font-medium text-ink2">Google Calendar</div>
+          <ol className="mt-1 space-y-0.5">
+            <li>
+              1. Open{" "}
+              <a
+                href="https://calendar.google.com/"
+                target="_blank"
+                rel="noreferrer"
+                className={link}
+              >
+                Google Calendar
+              </a>{" "}
+              on the web.
+            </li>
+            <li>
+              2. Hover the calendar in the left list → ⋮ →{" "}
+              <span className="text-ink2">Settings and sharing</span>.
+            </li>
+            <li>
+              3. Under <span className="text-ink2">Integrate calendar</span>, copy the{" "}
+              <span className="text-ink2">Secret address in iCal format</span>.
+            </li>
+          </ol>
+        </div>
+      )}
 
-      <div>
-        <div className="font-medium text-ink2">Outlook (outlook.com / Microsoft 365)</div>
-        <ol className="mt-1 space-y-0.5">
-          <li>
-            1. Open{" "}
-            <a
-              href="https://outlook.office.com/calendar/"
-              target="_blank"
-              rel="noreferrer"
-              className={link}
-            >
-              Outlook Calendar
-            </a>{" "}
-            on the web → <span className="text-ink2">Settings</span> (gear) →{" "}
-            <span className="text-ink2">Calendar → Shared calendars</span>.
-          </li>
-          <li>
-            2. Under <span className="text-ink2">Publish a calendar</span>, pick the calendar and{" "}
-            <span className="text-ink2">Can view all details</span>, then{" "}
-            <span className="text-ink2">Publish</span>.
-          </li>
-          <li>
-            3. Copy the <span className="text-ink2">ICS</span> link (not the HTML one).
-          </li>
-        </ol>
-      </div>
+      {!only && (
+        <div>
+          <div className="font-medium text-ink2">Outlook (outlook.com / Microsoft 365)</div>
+          <ol className="mt-1 space-y-0.5">
+            <li>
+              1. Open{" "}
+              <a
+                href="https://outlook.office.com/calendar/"
+                target="_blank"
+                rel="noreferrer"
+                className={link}
+              >
+                Outlook Calendar
+              </a>{" "}
+              on the web → <span className="text-ink2">Settings</span> (gear) →{" "}
+              <span className="text-ink2">Calendar → Shared calendars</span>.
+            </li>
+            <li>
+              2. Under <span className="text-ink2">Publish a calendar</span>, pick the calendar and{" "}
+              <span className="text-ink2">Can view all details</span>, then{" "}
+              <span className="text-ink2">Publish</span>.
+            </li>
+            <li>
+              3. Copy the <span className="text-ink2">ICS</span> link (not the HTML one). Or connect
+              Outlook above for an automatic sign-in instead.
+            </li>
+          </ol>
+        </div>
+      )}
 
       <div>
         <div className="font-medium text-ink2">Apple iCloud</div>
