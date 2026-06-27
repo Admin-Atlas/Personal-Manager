@@ -3,36 +3,47 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { quadtree, type Quadtree } from "d3-quadtree";
-import { listDocuments } from "../lib/ipc";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import {
+  installOptionalTsne,
+  listDocuments,
+  onLayoutProgress,
+  optionalTsneStatus,
+  prioritiseSemanticLayout,
+  semanticLayout,
+} from "../lib/ipc";
 import { formatDate } from "../lib/format";
 import {
+  buildSemanticLayout,
   getProjectLayout,
   type BaseLayout,
   type Bounds,
   type PositionedNode,
 } from "../lib/mapLayout";
 import { Skeleton } from "./ui";
-import type { Document } from "../lib/types";
+import type { Document, SemanticLayout } from "../lib/types";
 import { graphColor, useTheme, useDepth } from "../theme";
 
 /**
- * A map of the store: every project is a hub node, and each document is a small node linked to its
- * project's hub, so the grouping is visible at a glance. Hover a document node for its details; click
- * one to open its project's focused view.
+ * A map of the store, in one of two arrangements the user switches between:
+ *   - **By project** — every project is a hub, each document a node linked to it (the d3-force layout).
+ *   - **Semantic proximity** — documents laid out by meaning (nearby = similar), from a UMAP/t-SNE-style
+ *     projection of their embeddings computed in the background (see `src/lib/layout.rs`); no edges.
  *
- * Rendering is on a single `<canvas>` rather than per-node SVG, so a vault with thousands of nodes (a
- * full Drive sync inflates the count with index-only files) stays smooth: one draw call per frame, and
- * hover/click hit-testing via a d3-quadtree (O(log n)) instead of N DOM listeners. The heavy force
- * layout runs off the main thread on a worker and is pre-warmed at launch (see `src/lib/mapLayout.ts`),
- * so opening the Map doesn't stutter the app. Two efficiency seams carry over: the layout is keyed on
- * the document set only (a theme change re-colours without re-running it), and colour is applied in the
- * draw call (a theme toggle is a redraw, not a recompute).
+ * Rendering is on a single `<canvas>` (one draw call per frame, d3-quadtree hit-testing) so thousands
+ * of nodes — index-only Drive files inflate the count — stay smooth. Hover a node for its details;
+ * click one to open its project's focused view. Colour is applied in the draw call, so a theme toggle
+ * is a redraw, not a relayout.
  */
 
-/**
- * Themed values the canvas needs as concrete strings, resolved from the document root. Canvas can't
- * read CSS `var(--…)` directly (unlike the old SVG), so we resolve the colours and the UI font here.
- */
+type LayoutMode = "project" | "semantic";
+const MODE_KEY = "pm.map.layoutMode";
+
+function initialMode(): LayoutMode {
+  return localStorage.getItem(MODE_KEY) === "semantic" ? "semantic" : "project";
+}
+
+/** Themed values the canvas needs as concrete strings (canvas can't read CSS `var(--…)`). */
 interface ThemeColors {
   border: string;
   bg: string;
@@ -79,9 +90,13 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   const [base, setBase] = useState<BaseLayout | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<Document | null>(null);
-  // Distinguish "still loading" from "genuinely empty": without this the view would flash
-  // "No documents yet" on every open (documents starts []), before the fetch lands.
   const [loading, setLoading] = useState(true);
+
+  const [layoutMode, setLayoutMode] = useState<LayoutMode>(initialMode);
+  const [semantic, setSemantic] = useState<SemanticLayout | null>(null);
+  const [computing, setComputing] = useState(false);
+  const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
+  const [installingTsne, setInstallingTsne] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -94,22 +109,75 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       .finally(() => setLoading(false));
   }, []);
 
-  // The layout is async (the force sim runs on a worker, pre-warmed at launch). A cache hit on the
-  // same document set resolves immediately. Guard against a stale set landing after a newer one.
+  useEffect(() => {
+    optionalTsneStatus()
+      .then((s) => setTsneInstalled(s.installed))
+      .catch(() => setTsneInstalled(false));
+  }, []);
+
+  // Persist the chosen arrangement (per-device, like the theme/depth prefs).
+  useEffect(() => {
+    localStorage.setItem(MODE_KEY, layoutMode);
+  }, [layoutMode]);
+
+  // Semantic mode: fetch the cached coords, ask the backend to prioritise a recompute if stale, and
+  // follow the global progress event so the map refreshes when a new layout lands.
+  useEffect(() => {
+    if (layoutMode !== "semantic") return;
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    const load = () =>
+      semanticLayout()
+        .then((d) => {
+          if (!cancelled) {
+            setSemantic(d);
+            setComputing(d.computing);
+          }
+        })
+        .catch(() => {});
+    void load();
+    void prioritiseSemanticLayout().catch(() => {});
+    void onLayoutProgress((e) => {
+      if (cancelled) return;
+      if (e.state === "done") {
+        setComputing(false);
+        void load();
+      } else if (e.state === "preparing" || e.state === "reducing") {
+        setComputing(true);
+      } else {
+        setComputing(false); // deferred / error
+      }
+    }).then((u) => {
+      unlisten = u;
+      if (cancelled) u();
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [layoutMode]);
+
+  // The render layout. Project mode runs the (worker-backed, cached) force layout; semantic mode joins
+  // the backend coords to the documents. A stale async result can't overwrite a newer one.
   useEffect(() => {
     let cancelled = false;
-    const job = getProjectLayout(documents);
-    if (!job) {
-      setBase(null);
-      return;
+    if (layoutMode === "project") {
+      const job = getProjectLayout(documents);
+      if (!job) {
+        setBase(null);
+        return;
+      }
+      job.then((b) => !cancelled && setBase(b)).catch(() => !cancelled && setBase(null));
+    } else {
+      // Don't render a pile of centroids before any coords exist — show the preparing state instead.
+      const coords = semantic?.coords ?? [];
+      setBase(coords.length > 0 ? buildSemanticLayout(documents, coords) : null);
     }
-    job.then((b) => !cancelled && setBase(b)).catch(() => !cancelled && setBase(null));
     return () => {
       cancelled = true;
     };
-  }, [documents]);
+  }, [documents, layoutMode, semantic]);
 
-  // Project → palette index, for colouring nodes + the legend. Keyed on the layout only.
   const projectIndex = useMemo(() => {
     const m = new Map<string, number>();
     base?.projectNames.forEach((name, i) => m.set(name, i));
@@ -119,14 +187,11 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     (project: string) => graphColor(projectIndex.get(project) ?? 0, mode),
     [projectIndex, mode],
   );
-
   const legend = useMemo(
     () => base?.projectNames.map((name) => ({ name, color: colorFor(name) })) ?? [],
     [base, colorFor],
   );
 
-  // Hit-testing index over the document nodes (project hubs aren't interactive), in world coords so
-  // it survives resize/zoom. O(log n) lookup is the scale win that keeps thousands of nodes smooth.
   const docQuadtree = useMemo<Quadtree<PositionedNode> | null>(() => {
     if (!base) return null;
     const docs = base.nodes.filter((n) => n.kind === "doc");
@@ -149,7 +214,6 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     const cssH = wrap.clientHeight;
     if (cssW === 0 || cssH === 0) return;
 
-    // Size the backing store for crisp nodes on HiDPI; draw in CSS pixels.
     if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
       canvas.width = Math.round(cssW * dpr);
       canvas.height = Math.round(cssH * dpr);
@@ -163,19 +227,20 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     const sy = (y: number) => y * t.scale + t.offsetY;
     const colors = readThemeColors();
 
-    // Edges (one path, single stroke). Node radii scale with the fit (size = content volume, a real
-    // signal); stroke/edge widths stay fixed in screen pixels so they read as crisp chrome at any zoom.
-    ctx.strokeStyle = colors.border;
-    ctx.lineWidth = 0.75;
-    ctx.beginPath();
-    for (const e of base.edges) {
-      ctx.moveTo(sx(e.sx), sy(e.sy));
-      ctx.lineTo(sx(e.tx), sy(e.ty));
+    // Edges (project mode only; one path, single stroke). Node radii scale with the fit (size =
+    // content volume, a real signal); stroke/edge widths stay fixed in screen pixels as crisp chrome.
+    if (base.edges.length > 0) {
+      ctx.strokeStyle = colors.border;
+      ctx.lineWidth = 0.75;
+      ctx.beginPath();
+      for (const e of base.edges) {
+        ctx.moveTo(sx(e.sx), sy(e.sy));
+        ctx.lineTo(sx(e.tx), sy(e.ty));
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
     }
-    ctx.stroke();
-    ctx.setLineDash([]);
 
-    // Nodes.
     for (const n of base.nodes) {
       const color = colorFor(n.project);
       const r = n.radius * t.scale;
@@ -196,7 +261,8 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
         ctx.fillText(n.label, sx(n.x), sy(n.y) - r - 4);
       } else {
         const dashed = isDashed(n.doc);
-        ctx.globalAlpha = 0.85;
+        // Transient (not-yet-projected) semantic nodes sit at a project centroid; draw them faded.
+        ctx.globalAlpha = n.transient ? 0.32 : 0.85;
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.arc(sx(n.x), sy(n.y), r, 0, Math.PI * 2);
@@ -210,7 +276,6 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       }
     }
 
-    // Hovered node redrawn last, fully opaque with an --ink halo (the old SVG overlay, now a draw call).
     if (hovered) {
       const n = base.nodes.find((x) => x.doc?.id === hovered.id);
       if (n) {
@@ -227,13 +292,11 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     }
   }, [base, colorFor, hovered]);
 
-  // Redraw on layout / theme / hover change, batched into a frame.
   useEffect(() => {
     const id = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(id);
   }, [draw]);
 
-  // Redraw on resize (the canvas, unlike the old SVG viewBox, doesn't rescale itself).
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return;
@@ -276,23 +339,55 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     [nodeAt, onOpenProject],
   );
 
+  const installTsne = useCallback(() => {
+    setInstallingTsne(true);
+    installOptionalTsne()
+      .then(() => optionalTsneStatus())
+      .then((s) => setTsneInstalled(s.installed))
+      .catch((e) => setError(String(e)))
+      .finally(() => setInstallingTsne(false));
+  }, []);
+
+  const placed = semantic?.coords.length ?? 0;
+  const subtitle =
+    layoutMode === "semantic"
+      ? placed > 0 && placed < documents.length
+        ? `showing the top ${placed} of ${documents.length} documents by meaning · click to open a project`
+        : `${documents.length} document${documents.length === 1 ? "" : "s"} by meaning · click to open a project`
+      : `${documents.length} document${documents.length === 1 ? "" : "s"} across ${legend.length} project${legend.length === 1 ? "" : "s"} · hover for details, click to open`;
+
+  // The toggle's help differs by whether t-SNE is installed (explain what it is vs that it's running).
+  const toggleHelp = tsneInstalled ? "map-layout-toggle-tsne" : "map-layout-toggle";
+
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between border-b border-border px-6 py-3">
-        <div data-help="nav-graph">
-          <h1 className="text-sm font-semibold font-head text-ink">Map</h1>
-          {loading ? (
-            <Skeleton className="mt-1 h-3 w-56" />
-          ) : (
-            <p className="text-xs text-ink3">
-              {documents.length} document{documents.length === 1 ? "" : "s"} across {legend.length}{" "}
-              project{legend.length === 1 ? "" : "s"} · hover a node for details, click to open its
-              project
-            </p>
-          )}
+      <header className="flex items-center justify-between gap-4 border-b border-border px-6 py-3">
+        <div className="flex items-center gap-4">
+          <div data-help="nav-graph">
+            <h1 className="text-sm font-semibold font-head text-ink">Map</h1>
+            {loading ? (
+              <Skeleton className="mt-1 h-3 w-56" />
+            ) : (
+              <p className="text-xs text-ink3">{subtitle}</p>
+            )}
+          </div>
+          <div
+            className="flex rounded-[var(--radius-sm)] border border-border p-0.5 text-xs"
+            data-help={toggleHelp}
+          >
+            <ModeButton
+              active={layoutMode === "semantic"}
+              onClick={() => setLayoutMode("semantic")}
+            >
+              Semantic
+            </ModeButton>
+            <ModeButton active={layoutMode === "project"} onClick={() => setLayoutMode("project")}>
+              By project
+            </ModeButton>
+          </div>
         </div>
         {base && (
-          <div className="flex max-w-[60%] flex-wrap justify-end gap-x-3 gap-y-1">
+          <div className="flex max-w-[50%] flex-wrap justify-end gap-x-3 gap-y-1">
             {legend.map((p) => (
               <span key={p.name} className="inline-flex items-center gap-1.5 text-xs text-ink2">
                 <span
@@ -305,6 +400,15 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
           </div>
         )}
       </header>
+
+      {layoutMode === "semantic" && (
+        <SemanticBar
+          computing={computing}
+          tsneInstalled={tsneInstalled}
+          installing={installingTsne}
+          onInstall={installTsne}
+        />
+      )}
 
       <div className="relative flex-1 overflow-hidden" data-help="graph-canvas" ref={wrapRef}>
         {error && (
@@ -321,25 +425,20 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
         )}
 
         {loading ? (
-          // A node-cluster shimmer that mirrors the map's shape, so the load reads as
-          // "your map is coming" rather than "you have nothing".
-          <div className="flex h-full items-center justify-center">
-            <div className="flex flex-col items-center gap-8" aria-hidden>
-              <div className="flex items-end gap-10">
-                <Skeleton className="h-9 w-9" style={{ borderRadius: "9999px" }} />
-                <Skeleton className="h-16 w-16" style={{ borderRadius: "9999px" }} />
-                <Skeleton className="h-11 w-11" style={{ borderRadius: "9999px" }} />
-              </div>
-              <div className="flex items-center gap-12">
-                <Skeleton className="h-7 w-7" style={{ borderRadius: "9999px" }} />
-                <Skeleton className="h-14 w-14" style={{ borderRadius: "9999px" }} />
-                <Skeleton className="h-8 w-8" style={{ borderRadius: "9999px" }} />
-              </div>
-            </div>
-          </div>
-        ) : !base ? (
+          <MapSkeleton />
+        ) : documents.length === 0 ? (
           <div className="flex h-full items-center justify-center text-sm text-ink4">
             No documents yet. Ingest some in the Documents view and they'll appear here.
+          </div>
+        ) : !base ? (
+          // Semantic mode with no coords yet: the background job is preparing the first layout.
+          <div className="flex h-full flex-col items-center justify-center gap-5 text-sm text-ink4">
+            <div className="flex items-end gap-8" aria-hidden>
+              <Skeleton className="h-8 w-8" style={{ borderRadius: "9999px" }} />
+              <Skeleton className="h-12 w-12" style={{ borderRadius: "9999px" }} />
+              <Skeleton className="h-9 w-9" style={{ borderRadius: "9999px" }} />
+            </div>
+            <span>Preparing the semantic map…</span>
           </div>
         ) : (
           <canvas
@@ -353,6 +452,93 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
         )}
 
         {hovered && <DetailCard doc={hovered} />}
+      </div>
+    </div>
+  );
+}
+
+function ModeButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-[calc(var(--radius-sm)-2px)] px-2.5 py-1 transition-colors ${
+        active ? "bg-accent text-accent-ink" : "text-ink3 hover:text-ink"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** The strip under the header in semantic mode: a recompute indicator, or the optional-t-SNE nudge. */
+function SemanticBar({
+  computing,
+  tsneInstalled,
+  installing,
+  onInstall,
+}: {
+  computing: boolean;
+  tsneInstalled: boolean | null;
+  installing: boolean;
+  onInstall: () => void;
+}) {
+  if (computing) {
+    return (
+      <div className="flex items-center gap-2 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
+        <Skeleton className="h-2 w-2" style={{ borderRadius: "9999px" }} />
+        Updating the map by meaning…
+      </div>
+    );
+  }
+  if (installing) {
+    return (
+      <div className="flex items-center gap-2 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
+        <Skeleton className="h-2 w-2" style={{ borderRadius: "9999px" }} />
+        Downloading the enhanced (t-SNE) layout…
+      </div>
+    );
+  }
+  if (tsneInstalled === false) {
+    return (
+      <div className="flex items-center gap-2 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
+        <span>Using the basic layout.</span>
+        <button
+          type="button"
+          onClick={onInstall}
+          className="font-medium text-accent hover:underline"
+        >
+          Enable enhanced (t-SNE) →
+        </button>
+      </div>
+    );
+  }
+  return null;
+}
+
+/** A node-cluster shimmer that mirrors the map's shape, so a load reads as "your map is coming". */
+function MapSkeleton() {
+  return (
+    <div className="flex h-full items-center justify-center">
+      <div className="flex flex-col items-center gap-8" aria-hidden>
+        <div className="flex items-end gap-10">
+          <Skeleton className="h-9 w-9" style={{ borderRadius: "9999px" }} />
+          <Skeleton className="h-16 w-16" style={{ borderRadius: "9999px" }} />
+          <Skeleton className="h-11 w-11" style={{ borderRadius: "9999px" }} />
+        </div>
+        <div className="flex items-center gap-12">
+          <Skeleton className="h-7 w-7" style={{ borderRadius: "9999px" }} />
+          <Skeleton className="h-14 w-14" style={{ borderRadius: "9999px" }} />
+          <Skeleton className="h-8 w-8" style={{ borderRadius: "9999px" }} />
+        </div>
       </div>
     </div>
   );

@@ -70,6 +70,12 @@ const MAX_SIDECAR_LINE: usize = 64 * 1024 * 1024;
 /// to a failed call instead of an infinite loop.
 const MAX_SKIP_LINES: usize = 1024;
 
+/// The OPTIONAL t-SNE reducer for the semantic memory map, pinned. **Not** in `requirements.txt` —
+/// the base venv stays lean; the user installs it on demand from Settings (see
+/// [`SidecarManager::install_optional_tsne`]). openTSNE pulls scikit-learn + scipy (numpy is already
+/// present via fastembed) and ships a binary wheel for our pinned Python, so there's no compile step.
+const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
+
 /// Where the sidecar script and its requirements live, and where the venv goes.
 pub struct SidecarPaths {
     /// Directory containing `pm_sidecar.py` + `requirements.txt`.
@@ -114,6 +120,13 @@ impl SidecarPaths {
 
     fn ready_marker(&self) -> PathBuf {
         self.venv_dir.join(".pm-ready")
+    }
+
+    /// Marker that the OPTIONAL t-SNE component is installed in this venv. Separate from
+    /// `.pm-ready` so the base requirements hash is untouched and an existing user never re-installs
+    /// the base venv just because t-SNE became available. Holds the pin, so a future bump re-installs.
+    fn tsne_marker(&self) -> PathBuf {
+        self.venv_dir.join(".pm-tsne")
     }
 
     /// Where the speech model's weights are cached — a sibling of the venv under
@@ -565,6 +578,78 @@ impl SidecarManager {
             }),
         )?;
         Ok(result["text"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Project per-document vectors to 2-D for the semantic memory map. `method` is `"pca"` (the
+    /// numpy-only default) or `"tsne"` (only requested when the optional component is installed; the
+    /// sidecar falls back to PCA if it isn't, so this always returns a usable layout). Returns the
+    /// coordinates (already scaled into `[0,1]²`) and the method actually used. Blocking — run off the
+    /// async runtime and never while holding the DB lock, like every other sidecar call.
+    pub fn reduce(&self, vectors: &[Vec<f32>], method: &str) -> Result<(Vec<[f32; 2]>, String)> {
+        if vectors.is_empty() {
+            return Ok((Vec::new(), "none".to_string()));
+        }
+        let result = self.request("reduce", json!({ "vectors": vectors, "method": method }))?;
+        let used = result["method"].as_str().unwrap_or("pca").to_string();
+        let coords = result["coords"]
+            .as_array()
+            .ok_or_else(|| Error::Other("sidecar reduce returned no coords".into()))?
+            .iter()
+            .map(|row| {
+                let point = row.as_array().ok_or_else(|| {
+                    Error::Other("sidecar reduce returned a malformed point".into())
+                })?;
+                // Reject a non-finite coordinate rather than placing a node at infinity.
+                let at = |i: usize| {
+                    point
+                        .get(i)
+                        .and_then(|n| n.as_f64())
+                        .filter(|f| f.is_finite())
+                        .map(|f| f as f32)
+                        .ok_or_else(|| {
+                            Error::Other("sidecar reduce returned a non-finite coordinate".into())
+                        })
+                };
+                Ok([at(0)?, at(1)?])
+            })
+            .collect::<Result<Vec<[f32; 2]>>>()?;
+        Ok((coords, used))
+    }
+
+    /// Whether the OPTIONAL t-SNE reducer is installed in this venv at the pinned version. Cheap (a
+    /// marker read) so it can be polled on every layout request to decide PCA-vs-t-SNE.
+    pub fn optional_tsne_ready(&self) -> bool {
+        self.paths.venv_python().exists()
+            && std::fs::read_to_string(self.paths.tsne_marker())
+                .map(|s| s.trim() == OPTIONAL_TSNE_PIN)
+                .unwrap_or(false)
+    }
+
+    /// Install the OPTIONAL t-SNE reducer (openTSNE) into the managed venv on demand. The base venv
+    /// must exist first, so this provisions it if needed, then `pip install`s the pin and stamps the
+    /// t-SNE marker. Blocking and slow (a download); serialised by the install lock. Idempotent — a
+    /// no-op once the marker is current.
+    pub fn install_optional_tsne(&self) -> Result<()> {
+        // openTSNE goes into the base venv, which must exist with its requirements first.
+        self.ensure_installed()?;
+        let _install = self.install.lock().unwrap();
+        if self.optional_tsne_ready() {
+            return Ok(());
+        }
+        let py = self.paths.venv_python();
+        let mut pip = Command::new(&py);
+        pip.args([
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            OPTIONAL_TSNE_PIN,
+        ]);
+        clean_python_env(&mut pip);
+        no_window(&mut pip);
+        run_command(&mut pip, "pip install openTSNE")?;
+        std::fs::write(self.paths.tsne_marker(), OPTIONAL_TSNE_PIN)?;
+        Ok(())
     }
 
     /// Send one request to the child and read its reply. Spawns the child lazily.

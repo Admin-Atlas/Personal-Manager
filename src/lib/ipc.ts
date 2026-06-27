@@ -29,6 +29,7 @@ import type {
   Importance,
   IngestEvent,
   LanguageOptions,
+  LayoutProgressEvent,
   Message,
   ModelInfo,
   ModelRecommendations,
@@ -39,9 +40,11 @@ import type {
   ReviewDecision,
   ReviewEvent,
   RetrievedChunk,
+  SemanticLayout,
   Settings,
   SharedDrive,
   SidecarStatus,
+  TsneStatus,
   VaultLockStatus,
   VaultStatus,
 } from "./types";
@@ -531,6 +534,28 @@ export const setDriveScope = (email: string, scope: DriveScope) =>
 /** Fetch an index-only document's full body live from its source (the body is never stored). */
 export const fetchIndexOnlyBody = (docId: number) =>
   invoke<string>("fetch_index_only_body", { docId });
+
+// ---- Semantic memory map (UMAP/t-SNE) ----
+
+/** The cached semantic layout — coordinates by meaning, plus whether a recompute is in flight. Always
+ *  returns immediately (stale-but-cached); the background job does the recompute. */
+export const semanticLayout = () => invoke<SemanticLayout>("semantic_layout");
+
+/** Kick off the background layout precompute after unlock (idle priority; defers to a Drive sync). */
+export const startSemanticLayout = () => invoke<boolean>("start_semantic_layout");
+
+/** Recompute the layout now if stale, jumping ahead of a Drive sync (called when the Map opens). */
+export const prioritiseSemanticLayout = () => invoke<void>("prioritise_semantic_layout");
+
+/** Whether the optional t-SNE reducer (an on-demand download) is installed. */
+export const optionalTsneStatus = () => invoke<TsneStatus>("optional_tsne_status");
+
+/** Install the optional t-SNE reducer into the managed venv, then recompute the layout with it. */
+export const installOptionalTsne = () => invoke<void>("install_optional_tsne");
+
+/** Subscribe to global semantic-layout progress (fires regardless of which view started the job). */
+export const onLayoutProgress = (handler: (e: LayoutProgressEvent) => void): Promise<UnlistenFn> =>
+  listen<LayoutProgressEvent>("layout://progress", (e) => handler(e.payload));
 
 /** Open an index-only document's source in the system browser (its Drive link). */
 export const openExternalRef = (docId: number) => invoke<void>("open_external_ref", { docId });

@@ -16,11 +16,13 @@
 
 import { listDocuments } from "./ipc";
 import { simulate, type LayoutRequest, type LayoutResponse } from "./forceLayout";
-import type { Document } from "./types";
+import type { Document, SemanticCoord } from "./types";
 
 export const MAP_WIDTH = 960;
 export const MAP_HEIGHT = 640;
 const PAD = 50;
+/** The semantic coords arrive in [0,1]²; spread them over a square this wide before the fit transform. */
+const SEMANTIC_SPAN = 900;
 
 /** A node with its final position, ready to colour + draw. Theme-independent (no colour here). */
 export interface PositionedNode {
@@ -32,6 +34,9 @@ export interface PositionedNode {
   x: number;
   y: number;
   doc?: Document;
+  /** Semantic mode: this document has no real coordinate yet (new since the last compute, or beyond
+   *  the node cap), so it's parked at its project's centroid and drawn faded until the recompute lands. */
+  transient?: boolean;
 }
 
 export interface Edge {
@@ -202,6 +207,75 @@ export function getProjectLayout(documents: Document[]): Promise<BaseLayout> | n
   const promise = compute(documents);
   cached = { hash, promise };
   return promise;
+}
+
+// ---- semantic layout (coords from the backend) ----------------------------
+
+/**
+ * Build a "by meaning" layout from the backend's 2-D coordinates: each document sits where its
+ * embedding projects, so nearby = similar. No project hubs or edges (proximity itself is the signal),
+ * but documents are still coloured by project for the legend. A document with no coordinate yet (added
+ * since the last compute, or beyond the node cap) is parked at its project's centroid and marked
+ * transient, so it still appears — grouped — and snaps into place when the next recompute lands.
+ */
+export function buildSemanticLayout(
+  documents: Document[],
+  coords: SemanticCoord[],
+): BaseLayout | null {
+  if (documents.length === 0) return null;
+
+  const projectNames = Array.from(new Set(documents.map((d) => d.project || "Unsorted")));
+  const coordById = new Map(coords.map((c) => [c.id, c]));
+
+  // Project centroids (from the documents that do have coords) + an overall fallback.
+  const sums = new Map<string, { x: number; y: number; n: number }>();
+  let ox = 0;
+  let oy = 0;
+  for (const d of documents) {
+    const c = coordById.get(d.id);
+    if (!c) continue;
+    const proj = d.project || "Unsorted";
+    const s = sums.get(proj) ?? { x: 0, y: 0, n: 0 };
+    s.x += c.x;
+    s.y += c.y;
+    s.n += 1;
+    sums.set(proj, s);
+    ox += c.x;
+    oy += c.y;
+  }
+  const overall =
+    coords.length > 0 ? { x: ox / coords.length, y: oy / coords.length } : { x: 0.5, y: 0.5 };
+  const centroidFor = (proj: string) => {
+    const s = sums.get(proj);
+    return s && s.n > 0 ? { x: s.x / s.n, y: s.y / s.n } : overall;
+  };
+
+  const nodes: PositionedNode[] = documents.map((d) => {
+    const proj = d.project || "Unsorted";
+    const c = coordById.get(d.id);
+    const p = c ?? centroidFor(proj);
+    return {
+      id: `doc:${d.id}`,
+      kind: "doc",
+      label: d.title,
+      project: proj,
+      radius: docRadius(d.chunk_count),
+      x: p.x * SEMANTIC_SPAN,
+      y: p.y * SEMANTIC_SPAN,
+      doc: d,
+      transient: !c,
+    };
+  });
+
+  const xs = nodes.map((n) => n.x);
+  const ys = nodes.map((n) => n.y);
+  const minX = Math.min(...xs) - PAD;
+  const minY = Math.min(...ys) - PAD;
+  const width = Math.max(...xs) - minX + PAD;
+  const height = Math.max(...ys) - minY + PAD;
+  const bounds: Bounds = { minX, minY, width, height };
+
+  return { nodes, edges: [], bounds, viewBox: `${minX} ${minY} ${width} ${height}`, projectNames };
 }
 
 let warming = false;

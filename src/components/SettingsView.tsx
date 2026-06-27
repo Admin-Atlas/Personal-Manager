@@ -8,12 +8,17 @@ import {
   costSummary,
   createShareableVault,
   exportAllData,
+  getPref,
   getSettings,
   hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
+  installOptionalTsne,
   languageOptions,
   openDataFolder,
+  optionalTsneStatus,
   refreshPricing,
+  setPref,
+  startSemanticLayout,
   setAppLock,
   setBackgroundAutoSwitch,
   setBackgroundModels,
@@ -100,6 +105,15 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [reranking, setRerankingState] = useState(true);
   // Indexing speed: "fast" (default) or "gentle" (paced for low-end machines).
   const [indexingSpeed, setIndexingSpeedState] = useState<"fast" | "gentle">("fast");
+  // Memory map (the Map tab): the default grouping (per-device, shared with the Map header toggle via
+  // localStorage), the node cap (a vault-travelling pref the backend reads), and the optional t-SNE
+  // component's install state.
+  const [mapGrouping, setMapGrouping] = useState<"semantic" | "project">(() =>
+    localStorage.getItem("pm.map.layoutMode") === "semantic" ? "semantic" : "project",
+  );
+  const [mapNodeCap, setMapNodeCap] = useState(1000);
+  const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
+  const [installingTsne, setInstallingTsne] = useState(false);
   // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
   // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
@@ -179,6 +193,47 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       .then(setAppLockState)
       .catch(() => {});
   }, [onboarding]);
+
+  // Memory-map prefs + optional-t-SNE install state (non-onboarding only — there's no Map yet at setup).
+  useEffect(() => {
+    if (onboarding) return;
+    getPref("map")
+      .then((v) => {
+        if (!v) return;
+        try {
+          const cap = JSON.parse(v)?.nodeCap;
+          if (typeof cap === "number") setMapNodeCap(cap);
+        } catch {
+          /* ignore a malformed pref */
+        }
+      })
+      .catch(() => {});
+    optionalTsneStatus()
+      .then((s) => setTsneInstalled(s.installed))
+      .catch(() => setTsneInstalled(false));
+  }, [onboarding]);
+
+  function changeMapGrouping(next: "semantic" | "project") {
+    setMapGrouping(next);
+    localStorage.setItem("pm.map.layoutMode", next); // shared with the Map header toggle
+  }
+
+  function changeMapNodeCap(next: number) {
+    setMapNodeCap(next);
+    // The cap is part of the layout fingerprint; recompute in the background so the change takes hold.
+    void setPref("map", JSON.stringify({ nodeCap: next }))
+      .then(() => startSemanticLayout())
+      .catch(() => {});
+  }
+
+  function downloadTsne() {
+    setInstallingTsne(true);
+    installOptionalTsne()
+      .then(() => optionalTsneStatus())
+      .then((s) => setTsneInstalled(s.installed))
+      .catch((e) => setError(String(e)))
+      .finally(() => setInstallingTsne(false));
+  }
 
   async function toggleAppLock(next: boolean) {
     setError(null);
@@ -637,6 +692,55 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       />
                     </button>
                   </div>
+                </div>
+
+                <div className="mt-5 border-t border-border pt-4" data-help="settings-memory-map">
+                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                    Memory map
+                  </label>
+                  <p className="mt-1 text-xs text-ink4">
+                    The Map tab — how documents are arranged and how many are plotted.
+                  </p>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">Default grouping</span>
+                    <SegmentedControl
+                      value={mapGrouping}
+                      onChange={changeMapGrouping}
+                      options={[
+                        { value: "semantic", label: "Semantic" },
+                        { value: "project", label: "By project" },
+                      ]}
+                    />
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">Maximum nodes</span>
+                    <Select
+                      value={String(mapNodeCap)}
+                      onChange={(e) => changeMapNodeCap(Number(e.target.value))}
+                    >
+                      {[200, 500, 1000, 2000, 3500, 5000].map((n) => (
+                        <option key={n} value={n}>
+                          {n.toLocaleString()}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">Enhanced layout (t-SNE)</span>
+                    {tsneInstalled === null ? (
+                      <span className="text-xs text-ink4">…</span>
+                    ) : tsneInstalled ? (
+                      <span className="text-xs text-ink3">Installed</span>
+                    ) : (
+                      <Button variant="secondary" onClick={downloadTsne} disabled={installingTsne}>
+                        {installingTsne ? "Downloading…" : "Download"}
+                      </Button>
+                    )}
+                  </div>
+                  <p className="mt-2 text-xs text-ink4">
+                    Semantic proximity uses a basic on-device layout by default. The optional t-SNE
+                    component (a one-time download) produces tighter clusters of related documents.
+                  </p>
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">

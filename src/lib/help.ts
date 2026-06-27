@@ -184,6 +184,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Appearance",
     body: "Switch the visual System (Editorial / Slate / Terminal), Light or Dark mode, the accent colour, and Depth (how much detail is shown). Changes apply instantly and are remembered on this device.",
   },
+  "settings-memory-map": {
+    title: "Memory map",
+    body: "Settings for the Map tab. Default grouping picks how the Map opens — Semantic proximity (similar documents sit together) or By project (each project a hub). Maximum nodes caps how many documents are individually plotted; above it, the rest are gathered at their project's spot — raise it for a fuller picture, lower it on a slower machine. Enhanced layout (t-SNE) is a one-time, on-device download that gives the semantic view tighter, clearer clusters than the built-in basic layout.",
+  },
   "settings-timezone": {
     title: "Time zone",
     body: "The zone PM reasons about dates in — which day is 'today', when something is 'due soon', and the times in your calendar agenda and briefing. Auto follows this device; switch to Manual to pin a specific zone (useful when you travel and don't want the boundaries to shift).",
@@ -278,7 +282,15 @@ export const HELP: Record<string, HelpEntry> = {
   // Graph
   "graph-canvas": {
     title: "Document map",
-    body: "Each large labelled node is a project hub; the smaller nodes linked to it are its documents. A node's size is how much content it holds (its number of chunks), and its colour is its project — matching the legend. A dashed ring means a document is still awaiting review, or is index-only (it lives in a connected source like Drive, not stored on this device). Hover a document for its details, or click it to open its project.",
+    body: "Each node is a document. Its size is how much content it holds (its number of chunks), and its colour is its project — matching the legend. A dashed ring means a document is still awaiting review, or is index-only (it lives in a connected source like Drive, not stored on this device). In Semantic proximity, documents that sit close together are about similar things; in By project, each project is a hub with its documents gathered around it. Hover a node for its details, or click it to open its project.",
+  },
+  "map-layout-toggle": {
+    title: "How the map is arranged",
+    body: "Switch how documents are laid out. Semantic proximity places them so that similar ones sit close together, worked out from their meaning (a basic layout, computed on your device). By project gathers each document around its project hub. An optional enhanced layout — t-SNE, which finds tighter, clearer clusters of related documents — can be downloaded from the bar below the header (or Settings → Memory map); it's a one-time download that then runs fully on your device.",
+  },
+  "map-layout-toggle-tsne": {
+    title: "How the map is arranged",
+    body: "Switch how documents are laid out. Semantic proximity places similar documents close together — it's using t-SNE, the enhanced layout you installed, which arranges documents by learned neighbourhoods so related ones form tighter, clearer clusters. By project gathers each document around its project hub instead. The semantic layout is computed in the background and cached, so the first run after big changes can take a moment on a large library.",
   },
 
   // Focus view & projects (Step 5)

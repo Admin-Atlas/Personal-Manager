@@ -299,6 +299,89 @@ def do_transcribe(params):
     return {"text": clean_text(text)}
 
 
+def _pca(x, k):
+    """Project mean-centred rows `x` (n, d) onto their top-`k` principal axes via SVD.
+
+    numpy only (already a dependency via fastembed), so this path needs no extra install. Used both
+    as the default 2-D reducer and as the 50-d initialisation for t-SNE.
+    """
+    import numpy as np
+
+    k = min(k, x.shape[1], x.shape[0])
+    # Economy SVD: columns of Vt are the principal directions; U*S is the projection onto them.
+    u, s, _vt = np.linalg.svd(x, full_matrices=False)
+    return (u[:, :k] * s[:k]).astype(np.float32)
+
+
+def _fit_unit(coords):
+    """Min-max scale each axis into [0,1] so the Rust/TS side never guesses the coord range."""
+    import numpy as np
+
+    c = np.asarray(coords, dtype=np.float32)
+    mn = c.min(axis=0)
+    mx = c.max(axis=0)
+    span = np.where((mx - mn) > 1e-9, mx - mn, 1.0)
+    return (c - mn) / span
+
+
+def _reduce(vecs, method):
+    """Reduce per-document vectors to 2-D. Returns (coords, method_actually_used).
+
+    `pca` (the bundled default) is numpy-only and instant. `tsne` uses openTSNE — an OPTIONAL
+    component the user downloads from Settings; if it isn't installed (or fails) we fall back to
+    PCA and report `pca`, so the map is always usable. The marker the Rust side checks decides what
+    to *request*; this decides what actually ran.
+    """
+    import numpy as np
+
+    x = vecs - vecs.mean(axis=0, keepdims=True)  # mean-centre
+    if method != "tsne":
+        return _pca(x, 2), "pca"
+    try:
+        from openTSNE import TSNE
+
+        n, d = x.shape
+        # Pre-reduce to 50-d with PCA to speed up the neighbour search (a standard t-SNE step); the
+        # 2-D start is PCA-initialised, which keeps the layout deterministic given random_state.
+        x_in = _pca(x, 50) if d > 50 else x
+        ts = TSNE(
+            n_components=2,
+            perplexity=min(30, max(5, (n - 1) // 3)),
+            metric="cosine",
+            initialization="pca",
+            n_jobs=1,
+            random_state=42,
+            verbose=False,
+        )
+        return np.asarray(ts.fit(x_in), dtype=np.float32), "tsne"
+    except Exception:
+        # Not installed, or a runtime failure — a usable PCA map beats no map.
+        return _pca(x, 2), "pca"
+
+
+def do_reduce(params):
+    """Project a batch of per-document vectors to 2-D for the semantic memory map.
+
+    params: {"vectors": [[float]...], "method": "pca"|"tsne"}
+    returns: {"coords": [[x,y]...] in [0,1]^2, "method": <actually used>}
+
+    Untrusted-data rule still holds: numbers in, numbers out, never executed.
+    """
+    raw = params.get("vectors") or []
+    n = len(raw)
+    if n == 0:
+        return {"coords": [], "method": "none"}
+    if n <= 3:
+        # t-SNE/PCA degenerate for a handful of points; a deterministic spread keeps the map sane.
+        # (These guards stay numpy-free so a tiny map needs no scientific stack at all.)
+        return {"coords": [[float(i), 0.0] for i in range(n)], "method": "trivial"}
+    import numpy as np
+
+    vecs = np.asarray(raw, dtype=np.float32)
+    coords, used = _reduce(vecs, (params.get("method") or "pca").lower())
+    return {"coords": _fit_unit(coords).tolist(), "method": used}
+
+
 HANDLERS = {
     "ping": lambda params: {"ok": True},
     "convert": do_convert,
@@ -306,6 +389,7 @@ HANDLERS = {
     "count_tokens": do_count_tokens,
     "rerank": do_rerank,
     "transcribe": do_transcribe,
+    "reduce": do_reduce,
 }
 
 
