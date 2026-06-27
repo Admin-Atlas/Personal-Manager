@@ -304,6 +304,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Move around the map",
     body: "Zoom in or out, or fit the whole map back into view. You can also scroll to zoom (scroll sideways to pan left/right), drag anywhere to pan, and double-click to reset the framing.",
   },
+  "map-labels": {
+    title: "Show file names",
+    body: "Label each document on the map with its file name, so you can tell nodes apart without hovering. The text rides each node — small when you're zoomed out, larger as you zoom in (it isn't held at a fixed size) — and is shortened to fit the node, so zoom into a node to read a long name in full. Off by default to keep a busy map uncluttered; your choice is remembered on this device.",
+  },
 
   // Focus view & projects (Step 5)
   "focus-header": {

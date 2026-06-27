@@ -42,6 +42,7 @@ import { graphColor, useTheme, useDepth } from "../theme";
 type LayoutMode = "project" | "semantic";
 const MODE_KEY = "pm.map.layoutMode";
 const COHESION_KEY = "pm.map.cohesion";
+const LABELS_KEY = "pm.map.labels";
 
 function initialMode(): LayoutMode {
   return localStorage.getItem(MODE_KEY) === "semantic" ? "semantic" : "project";
@@ -51,6 +52,25 @@ function initialMode(): LayoutMode {
 function initialCohesion(): number {
   const raw = Number(localStorage.getItem(COHESION_KEY));
   return Number.isFinite(raw) ? Math.max(0, Math.min(0.5, raw)) : 0;
+}
+
+/** Show each document's file name on its node? Off by default (keeps a dense map clean); per-device. */
+function initialShowLabels(): boolean {
+  return localStorage.getItem(LABELS_KEY) === "1";
+}
+
+/** The widest prefix of `text` (with a trailing … if shortened) that fits `maxWidth` px in the ctx's
+ *  current font — "" if not even one character fits. A proportional first guess keeps the trim short. */
+function fitLabel(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (maxWidth <= 0 || !text) return "";
+  const full = ctx.measureText(text).width;
+  if (full <= maxWidth) return text;
+  let keep = Math.min(
+    text.length - 1,
+    Math.max(0, Math.floor((text.length * maxWidth) / full) - 1),
+  );
+  while (keep > 0 && ctx.measureText(text.slice(0, keep) + "…").width > maxWidth) keep--;
+  return keep > 0 ? text.slice(0, keep) + "…" : "";
 }
 
 /** Themed values the canvas needs as concrete strings (canvas can't read CSS `var(--…)`). */
@@ -104,6 +124,7 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
 
   const [layoutMode, setLayoutMode] = useState<LayoutMode>(initialMode);
   const [cohesion, setCohesion] = useState<number>(initialCohesion);
+  const [showLabels, setShowLabels] = useState<boolean>(initialShowLabels);
   const [semantic, setSemantic] = useState<SemanticLayout | null>(null);
   const [computing, setComputing] = useState(false);
   const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
@@ -149,6 +170,9 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   useEffect(() => {
     localStorage.setItem(COHESION_KEY, String(cohesion));
   }, [cohesion]);
+  useEffect(() => {
+    localStorage.setItem(LABELS_KEY, showLabels ? "1" : "0");
+  }, [showLabels]);
 
   // Follow the optional-t-SNE download's progress (it can be triggered here or from Settings).
   useEffect(() => {
@@ -336,6 +360,28 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       }
     }
 
+    // File-name labels under each document node (opt-in). The text is world-scaled — tiny when zoomed
+    // out, larger as you zoom in (no fixed screen size) — and truncated to the node's width, so a long
+    // name reads in full only once you zoom into it. We skip nodes that are off-screen or too small to
+    // read, which both declutters the map and bounds the per-frame cost on a big library.
+    if (showLabels) {
+      ctx.fillStyle = colors.ink2;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      const fontPx = 10 * t.scale;
+      ctx.font = `500 ${fontPx}px ${colors.uiFont}`;
+      for (const n of base.nodes) {
+        if (n.kind !== "doc") continue;
+        const r = n.radius * t.scale;
+        if (r < 4) continue; // unreadable when zoomed out — skip
+        const cx = sx(n.x);
+        const cy = sy(n.y);
+        if (cx < -60 || cx > cssW + 60 || cy < -20 || cy > cssH + fontPx + 20) continue;
+        const text = fitLabel(ctx, n.label, r * 2);
+        if (text) ctx.fillText(text, cx, cy + r + 1);
+      }
+    }
+
     if (hovered) {
       const n = base.nodes.find((x) => x.doc?.id === hovered.id);
       if (n) {
@@ -350,7 +396,7 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
         ctx.stroke();
       }
     }
-  }, [base, colorFor, hovered]);
+  }, [base, colorFor, hovered, showLabels]);
 
   useEffect(() => {
     const id = requestAnimationFrame(draw);
@@ -536,59 +582,81 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between gap-4 border-b border-border px-6 py-3">
-        <div className="flex items-center gap-4">
-          <div data-help="nav-graph">
-            <h1 className="text-sm font-semibold font-head text-ink">Map</h1>
-            {loading ? (
-              <Skeleton className="mt-1 h-3 w-56" />
-            ) : (
-              <p className="text-xs text-ink3">{subtitle}</p>
-            )}
-          </div>
-          <div
-            className="flex rounded-[var(--radius-sm)] border border-border p-0.5 text-xs"
-            data-help={toggleHelp}
-          >
-            <ModeButton active={layoutMode === "project"} onClick={() => setLayoutMode("project")}>
-              By project
-            </ModeButton>
-            <ModeButton
-              active={layoutMode === "semantic"}
-              onClick={() => setLayoutMode("semantic")}
-            >
-              Semantic
-            </ModeButton>
-          </div>
-          {layoutMode === "semantic" && (
-            <label className="flex items-center gap-1.5 text-xs text-ink3" data-help="map-cohesion">
-              <span>Cohesion</span>
-              <select
-                value={String(cohesion)}
-                onChange={(e) => setCohesion(Number(e.target.value))}
-                className="rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 text-xs text-ink2 outline-none transition focus:border-accent"
-              >
-                <option value="0">Off</option>
-                <option value="0.15">Low</option>
-                <option value="0.3">Medium</option>
-                <option value="0.5">High</option>
-              </select>
-            </label>
+      <header className="flex items-center gap-4 border-b border-border px-6 py-3">
+        <div data-help="nav-graph" className="shrink-0">
+          <h1 className="text-sm font-semibold font-head text-ink">Map</h1>
+          {loading ? (
+            <Skeleton className="mt-1 h-3 w-56" />
+          ) : (
+            <p className="text-xs text-ink3">{subtitle}</p>
           )}
         </div>
-        {base && (
-          <div className="flex max-w-[50%] flex-wrap justify-end gap-x-3 gap-y-1">
-            {legend.map((p) => (
-              <span key={p.name} className="inline-flex items-center gap-1.5 text-xs text-ink2">
-                <span
-                  className="inline-block h-2.5 w-2.5 rounded-full"
-                  style={{ background: p.color }}
-                />
-                {p.name}
-              </span>
-            ))}
+        <div className="flex min-w-0 flex-1 items-center justify-end gap-4">
+          {base && (
+            <div className="flex min-w-0 flex-wrap justify-end gap-x-3 gap-y-1 overflow-hidden">
+              {legend.map((p) => (
+                <span key={p.name} className="inline-flex items-center gap-1.5 text-xs text-ink2">
+                  <span
+                    className="inline-block h-2.5 w-2.5 rounded-full"
+                    style={{ background: p.color }}
+                  />
+                  {p.name}
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="flex shrink-0 items-center gap-3">
+            {layoutMode === "semantic" && (
+              <label
+                className="flex items-center gap-1.5 text-xs text-ink3"
+                data-help="map-cohesion"
+              >
+                <span>Cohesion</span>
+                <select
+                  value={String(cohesion)}
+                  onChange={(e) => setCohesion(Number(e.target.value))}
+                  className="rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 text-xs text-ink2 outline-none transition focus:border-accent"
+                >
+                  <option value="0">Off</option>
+                  <option value="0.15">Low</option>
+                  <option value="0.3">Medium</option>
+                  <option value="0.5">High</option>
+                </select>
+              </label>
+            )}
+            <button
+              type="button"
+              onClick={() => setShowLabels((v) => !v)}
+              aria-pressed={showLabels}
+              title={showLabels ? "Hide file names" : "Show file names"}
+              data-help="map-labels"
+              className={`rounded-[var(--radius-sm)] border px-2.5 py-1.5 text-xs transition-colors ${
+                showLabels
+                  ? "border-accent bg-accent text-accent-ink"
+                  : "border-border text-ink3 hover:text-ink"
+              }`}
+            >
+              Names
+            </button>
+            <div
+              className="flex rounded-[var(--radius-sm)] border border-border p-0.5 text-xs"
+              data-help={toggleHelp}
+            >
+              <ModeButton
+                active={layoutMode === "project"}
+                onClick={() => setLayoutMode("project")}
+              >
+                By project
+              </ModeButton>
+              <ModeButton
+                active={layoutMode === "semantic"}
+                onClick={() => setLayoutMode("semantic")}
+              >
+                Semantic
+              </ModeButton>
+            </div>
           </div>
-        )}
+        </div>
       </header>
 
       {layoutMode === "semantic" && (
