@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.20.1-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "Behind the scenes: PM's design-system primitives — buttons, cards, list rows, badges, dialogs and the rest — are now mirrored to Claude Design, so on-brand mockups can be built from the app's real components. No change to the app itself.",
+    ],
+  },
+  {
     version: "2.20.0-alpha",
     date: "2026-06-27",
     highlights: [
