@@ -52,10 +52,7 @@ export function MicrosoftCredentialBlock({
   const clearCreds = () => run("clear", () => clearMicrosoftClient());
 
   return (
-    <div
-      className="rounded-[var(--radius)] border border-border p-3"
-      data-help="connectors-microsoft-client"
-    >
+    <div data-help="connectors-microsoft-client">
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-medium text-ink">Microsoft sign-in (one-time setup)</span>
         {configured && (
@@ -141,7 +138,7 @@ export function MicrosoftCredentialBlock({
 function ClientSetupGuide() {
   const link = "text-accent-text underline hover:brightness-110";
   return (
-    <ol className="mt-2 space-y-1 rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink3">
+    <ol className="mt-2 space-y-1 rounded-[var(--radius)] bg-surface px-3 py-2 text-xs text-ink3">
       <li>
         1. Open{" "}
         <a

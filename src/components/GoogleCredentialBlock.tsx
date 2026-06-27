@@ -54,10 +54,7 @@ export function GoogleCredentialBlock({
   const clearCreds = () => run("clear", () => clearGoogleClient());
 
   return (
-    <div
-      className="rounded-[var(--radius)] border border-border p-3"
-      data-help="connectors-google-client"
-    >
+    <div data-help="connectors-google-client">
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-medium text-ink">Google sign-in (one-time setup)</span>
         {configured && (
@@ -150,7 +147,7 @@ export function GoogleCredentialBlock({
 function ClientSetupGuide() {
   const link = "text-accent-text underline hover:brightness-110";
   return (
-    <ol className="mt-2 space-y-1 rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink3">
+    <ol className="mt-2 space-y-1 rounded-[var(--radius)] bg-surface px-3 py-2 text-xs text-ink3">
       <li>
         1. Open the{" "}
         <a
@@ -188,7 +185,7 @@ function ClientSetupGuide() {
       <li>
         3. Configure the{" "}
         <a
-          href="https://console.cloud.google.com/apis/credentials/consent"
+          href="https://console.cloud.google.com/auth/audience"
           target="_blank"
           rel="noreferrer"
           className={link}

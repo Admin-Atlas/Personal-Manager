@@ -19,6 +19,19 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.28.0-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "The Connectors tab got a visual tidy-up — far fewer nested boxes — so each provider's sign-in, accounts, and options are easier to follow at a glance.",
+      "Indexing speed (Fast / Gentle) now tucks its explanation behind a short “What do Fast and Gentle do?” toggle, open by default only on Power density. The summary also makes clear it paces Drive and file indexing (email later) — calendars are tiny and always sync at full speed.",
+      "The “Using more than one Google account?” help now links straight to the right Google Cloud page (Audience → Test users); the old link landed on a dead overview screen. It also explains that an app left in Testing mode signs accounts out after 7 days, and recommends publishing it to Production for a connection that lasts.",
+      "The “first sync indexes your entire Drive” note now appears only while that first indexing is actually running — right by the progress bar — and tucks itself away when it finishes, reappearing when you add a new account. Same for OneDrive.",
+      "You can now start a sync for another connected account while one is already indexing: its “Sync now” stays enabled and the account joins the queue (it shows “Queued” until its turn). Same for OneDrive.",
+      "Google Calendar now shows which account you're signed in as, above the list of calendars to sync — handy when you have several Google accounts.",
+      "The calendar-subscription guide now covers Outlook and Apple iCloud as well as Google, with step-by-step instructions for finding each one's private iCal/ICS link.",
+    ],
+  },
+  {
     version: "2.27.0-alpha",
     date: "2026-06-27",
     highlights: [

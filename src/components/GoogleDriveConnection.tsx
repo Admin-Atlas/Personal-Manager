@@ -38,6 +38,10 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
     null,
   );
   const [syncAccount, setSyncAccount] = useState<string | null>(null);
+  // Accounts whose "Sync now" was clicked *while another account was already syncing* — the backend
+  // folds them into a follow-up pass (it can't run two at once), so the row shows "Queued" until the
+  // current run ends. Cleared when a run starts fresh or finishes.
+  const [queued, setQueued] = useState<Set<string>>(new Set());
   const [report, setReport] = useState<DriveSyncReport | null>(null);
   const [stopping, setStopping] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
@@ -78,6 +82,7 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
       else if (ev.type === "finished") {
         setProgress(null);
         setSyncAccount(null);
+        setQueued(new Set());
         setStopping(false);
         setReport(ev.report);
         void refresh();
@@ -123,7 +128,11 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
     if (startsIt) {
       setReport(null);
       setSyncAccount(email);
+      setQueued(new Set());
       setProgress({ processed: 0, total: null });
+    } else if (email != null) {
+      // A sync is already on screen; this click queues `email` for the backend's follow-up pass.
+      setQueued((q) => new Set(q).add(email));
     }
     void syncDrive(email).catch((e) => {
       if (startsIt) {
@@ -160,6 +169,13 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
   const accounts = status?.accounts ?? [];
   const syncing = progress != null;
   const anyBusy = busy != null || syncing;
+  // The "first sync is slow" banner only makes sense while a *first* sync runs — the account being
+  // indexed has never synced before (a freshly-added account; an all-accounts follow-up counts if any
+  // account is still unsynced). It clears when indexing finishes and returns when a new account is added.
+  const syncingAccount = accounts.find((a) => a.email === syncAccount);
+  const firstSync =
+    syncing &&
+    (syncingAccount ? !syncingAccount.last_synced_at : accounts.some((a) => !a.last_synced_at));
 
   return (
     <div data-help="settings-drive">
@@ -177,23 +193,18 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
         </p>
       ) : (
         <>
-          <div
-            className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-ink3"
-            style={{ background: "color-mix(in oklab, var(--st-look) 14%, transparent)" }}
-            data-help="settings-drive-firstsync"
-          >
-            The <span className="text-ink2">first sync indexes your entire Drive</span> — it can
-            take a while and use bandwidth. Later syncs only fetch what changed.
-          </div>
-
           {accounts.length > 0 && (
             <ul className="mt-3 divide-y divide-rule rounded-[var(--radius)] border border-border">
               {accounts.map((a) => (
                 <li key={a.id} className="px-3 py-2">
                   <AccountRow
                     account={a}
-                    busy={anyBusy}
                     syncingThis={syncAccount === a.email}
+                    queued={syncing && queued.has(a.email)}
+                    // Sync stays clickable for accounts *not* currently syncing, so you can queue
+                    // one mid-index; only the syncing row and in-flight connect/disconnect block it.
+                    syncDisabled={syncAccount === a.email || busy != null}
+                    disconnectDisabled={anyBusy}
                     onSync={() => sync(a.email)}
                     onDisconnect={() => setConfirmEmail(a.email)}
                   />
@@ -218,23 +229,6 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
               independently.
             </p>
           )}
-
-          <div className="mt-3">
-            {/* Deliberately gated on `busy` only, not `anyBusy` — adding another account stays
-                available while a sync runs, so you can connect one you forgot mid-index. */}
-            <Button
-              variant={accounts.length === 0 ? "primary" : "secondary"}
-              onClick={connect}
-              disabled={busy != null}
-              className="disabled:opacity-40"
-            >
-              {busy === "connect"
-                ? "Waiting for Google…"
-                : accounts.length === 0
-                  ? "Connect Google Drive"
-                  : "Add another account"}
-            </Button>
-          </div>
 
           {syncing && progress && (
             <div className="mt-3">
@@ -267,6 +261,37 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
               </div>
             </div>
           )}
+
+          {/* The "first sync is slow" expectation-setter — contextual now: it sits between the
+              progress bar and the add-account button only while a first sync runs, and clears when
+              indexing finishes (returning when a newly-added account starts its own first sync). */}
+          {firstSync && (
+            <div
+              className="mt-3 rounded-[var(--radius)] px-3 py-2 text-xs text-ink3"
+              style={{ background: "color-mix(in oklab, var(--st-look) 14%, transparent)" }}
+              data-help="settings-drive-firstsync"
+            >
+              The <span className="text-ink2">first sync indexes your entire Drive</span> — it can
+              take a while and use bandwidth. Later syncs only fetch what changed.
+            </div>
+          )}
+
+          <div className="mt-3">
+            {/* Deliberately gated on `busy` only, not `anyBusy` — adding another account stays
+                available while a sync runs, so you can connect one you forgot mid-index. */}
+            <Button
+              variant={accounts.length === 0 ? "primary" : "secondary"}
+              onClick={connect}
+              disabled={busy != null}
+              className="disabled:opacity-40"
+            >
+              {busy === "connect"
+                ? "Waiting for Google…"
+                : accounts.length === 0
+                  ? "Connect Google Drive"
+                  : "Add another account"}
+            </Button>
+          </div>
 
           {!syncing && report && <SyncReport report={report} onDismiss={() => setReport(null)} />}
         </>
@@ -318,14 +343,18 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
 
 function AccountRow({
   account,
-  busy,
   syncingThis,
+  queued,
+  syncDisabled,
+  disconnectDisabled,
   onSync,
   onDisconnect,
 }: {
   account: DriveAccount;
-  busy: boolean;
   syncingThis: boolean;
+  queued: boolean;
+  syncDisabled: boolean;
+  disconnectDisabled: boolean;
   onSync: () => void;
   onDisconnect: () => void;
 }) {
@@ -351,13 +380,17 @@ function AccountRow({
         </p>
       </div>
       <div className="flex shrink-0 items-center gap-1">
-        <Button onClick={onSync} disabled={busy} className="px-2 py-1 text-xs disabled:opacity-40">
-          {syncingThis ? "Syncing…" : "Sync now"}
+        <Button
+          onClick={onSync}
+          disabled={syncDisabled}
+          className="px-2 py-1 text-xs disabled:opacity-40"
+        >
+          {syncingThis ? "Syncing…" : queued ? "Queued" : "Sync now"}
         </Button>
         <Button
           variant="tertiary"
           onClick={onDisconnect}
-          disabled={busy}
+          disabled={disconnectDisabled}
           className="px-2 py-1 text-xs hover:text-st-due"
         >
           Disconnect

@@ -172,7 +172,7 @@ function CalendarSubscriptions() {
   return (
     <ConnectorGroup
       title="Calendar subscriptions"
-      blurb="Add any calendar by its private iCal URL — no sign-in and no provider account, even under Advanced Protection. Read-only: it powers your agenda, schedule questions in chat, and the “Due soon” status."
+      blurb="Add any calendar — Google, Outlook, Apple, or any iCal/ICS link — by its private URL. No sign-in and no provider account, even under Advanced Protection. Read-only: it powers your agenda, schedule questions in chat, and the “Due soon” status."
     >
       <IcsFeedSubscription />
     </ConnectorGroup>
@@ -195,7 +195,7 @@ function GoogleMultiAccountHelp() {
       title={<span className="text-xs text-ink3">Using more than one Google account?</span>}
     >
       <div
-        className="mt-1.5 space-y-1.5 rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink3"
+        className="mt-1.5 space-y-1.5 rounded-[var(--radius)] bg-surface px-3 py-2 text-xs text-ink3"
         data-help="connectors-google-multiaccount"
       >
         <p>
@@ -203,22 +203,40 @@ function GoogleMultiAccountHelp() {
           secret you saved above.
         </p>
         <p>
-          1. If your OAuth app is still in <span className="text-ink2">Testing</span> mode, add each
-          account’s email under{" "}
+          <span className="text-ink2">1. Authorise the account in Google Cloud.</span> If your OAuth
+          app is still in <span className="text-ink2">Testing</span> mode, add each account’s email
+          under{" "}
           <a
-            href="https://console.cloud.google.com/apis/credentials/consent"
+            href="https://console.cloud.google.com/auth/audience"
             target="_blank"
             rel="noreferrer"
             className={link}
           >
             Audience → Test users
           </a>{" "}
-          in the Google Cloud Console (a published app skips this).
+          (<span className="text-ink2">+ Add users</span>) in the Google Cloud Console.
+        </p>
+        <p className="text-ink4">
+          Testing mode signs accounts out after <span className="text-ink2">7 days</span>. For a
+          connection that lasts, <span className="text-ink2">publish to Production</span> on that
+          same{" "}
+          <a
+            href="https://console.cloud.google.com/auth/audience"
+            target="_blank"
+            rel="noreferrer"
+            className={link}
+          >
+            Audience
+          </a>{" "}
+          page (<span className="text-ink2">Publish app</span>) instead — no test-user list to keep
+          and no 7-day expiry. The “unverified app” screen is expected for your own client; continue
+          past it.
         </p>
         <p>
-          2. Use <span className="text-ink2">Add another account</span> on Drive below — Google
-          shows its account chooser, so pick the <em>different</em> account. (Calendar connects one
-          Google account for now; multiple-calendar accounts are coming.)
+          <span className="text-ink2">2. Add it in PM.</span> Use{" "}
+          <span className="text-ink2">Add another account</span> on Drive below — Google shows its
+          account chooser, so pick the <em>different</em> account. (Calendar connects one Google
+          account for now; multiple-calendar accounts are coming.)
         </p>
         <p className="text-ink4">
           Prefer to keep accounts fully separate? You can instead make a second Google Cloud project
@@ -275,6 +293,10 @@ function IndexingSpeedControl({
   value: "fast" | "gentle";
   onChange: (speed: "fast" | "gentle") => void;
 }) {
+  // The Fast/Gentle detail is a wall of text most people set once and forget, so it's collapsed by
+  // default — but **open for Power** density (who tune this kind of thing), collapsed at Minimal/
+  // Standard. The control + one-line summary stay visible at every depth.
+  const { showPower } = useDepth();
   return (
     <div
       className="mt-4 rounded-[var(--radius)] border border-border p-3"
@@ -284,7 +306,8 @@ function IndexingSpeedControl({
         <div>
           <label className="block text-sm font-medium text-ink2">Indexing speed</label>
           <p className="mt-1 text-xs text-ink4">
-            How hard PM works your machine while it indexes — connected accounts and imported files.
+            How hard PM works your machine while it indexes <strong>Drive files and imports</strong>{" "}
+            (email later). Calendars are tiny and always sync at full speed.
           </p>
         </div>
         <SegmentedControl
@@ -297,28 +320,34 @@ function IndexingSpeedControl({
           ]}
         />
       </div>
-      <dl className="mt-2.5 space-y-1.5 text-xs leading-relaxed text-ink4">
-        <div>
-          <dt className="inline font-medium text-ink3">Fast</dt>
-          <dd className="inline">
-            {" "}
-            — indexes at full speed, using as much CPU and memory as it needs. Best on a capable
-            machine, or when you just want it finished.
-          </dd>
-        </div>
-        <div>
-          <dt className="inline font-medium text-ink3">Gentle</dt>
-          <dd className="inline">
-            {" "}
-            — pauses briefly between files and embeds in smaller batches, so it uses less CPU and
-            less memory and your computer stays responsive. Best for slower or low-memory machines,
-            or when you’re working while it runs. Indexing takes longer.
-          </dd>
-        </div>
-      </dl>
-      <p className="mt-2 text-xs text-faint">
-        Changes apply right away — even partway through a sync.
-      </p>
+      <Collapsible
+        className="mt-2.5"
+        defaultOpen={showPower}
+        title={<span className="text-xs text-ink3">What do Fast and Gentle do?</span>}
+      >
+        <dl className="mt-1.5 space-y-1.5 text-xs leading-relaxed text-ink4">
+          <div>
+            <dt className="inline font-medium text-ink3">Fast</dt>
+            <dd className="inline">
+              {" "}
+              — indexes at full speed, using as much CPU and memory as it needs. Best on a capable
+              machine, or when you just want it finished.
+            </dd>
+          </div>
+          <div>
+            <dt className="inline font-medium text-ink3">Gentle</dt>
+            <dd className="inline">
+              {" "}
+              — pauses briefly between files and embeds in smaller batches, so it uses less CPU and
+              less memory and your computer stays responsive. Best for slower or low-memory
+              machines, or when you’re working while it runs. Indexing takes longer.
+            </dd>
+          </div>
+        </dl>
+        <p className="mt-2 text-xs text-faint">
+          Changes apply right away — even partway through a sync.
+        </p>
+      </Collapsible>
     </div>
   );
 }
