@@ -456,9 +456,11 @@ export const calendarOverview = () => invoke<CalendarOverview>("calendar_overvie
 export const setCalendarSelected = (calendarId: string, selected: boolean) =>
   invoke<void>("set_calendar_selected", { calendarId, selected });
 
-/** Connect a Google Calendar account (multi-account) — opens the browser; resolves on sign-in. */
-export const connectGoogleCalendarAccount = () =>
-  invoke<CalendarAccount>("connect_google_calendar_account");
+/** Connect a Google Calendar account (multi-account) — opens the browser; resolves on sign-in.
+ *  Pass an account's own project `clientId`/`clientSecret` to sign in with it (Advanced-Protection
+ *  path); omit both to use the shared group client. */
+export const connectGoogleCalendarAccount = (clientId?: string, clientSecret?: string) =>
+  invoke<CalendarAccount>("connect_google_calendar_account", { clientId, clientSecret });
 
 /** Disconnect one Google Calendar account (by email). */
 export const disconnectGoogleCalendarAccount = (email: string) =>
@@ -504,8 +506,11 @@ export const driveStatus = () => invoke<DriveStatus>("drive_status");
 /** The connected Drive accounts (each independent). */
 export const listDriveAccounts = () => invoke<DriveAccount[]>("list_drive_accounts");
 
-/** Connect a Google Drive account — opens the browser; resolves with the connected account. */
-export const connectDrive = () => invoke<DriveAccount>("connect_drive");
+/** Connect a Google Drive account — opens the browser; resolves with the connected account. Pass an
+ *  account's own project `clientId`/`clientSecret` to sign in with it (Advanced-Protection path);
+ *  omit both to use the shared group client. */
+export const connectDrive = (clientId?: string, clientSecret?: string) =>
+  invoke<DriveAccount>("connect_drive", { clientId, clientSecret });
 
 /** Disconnect one account: forget its token + flag its items unreachable (kept findable). */
 export const disconnectDrive = (email: string) => invoke<void>("disconnect_drive", { email });

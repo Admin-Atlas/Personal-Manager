@@ -15,6 +15,7 @@ import type { DriveAccount, DriveStatus, DriveSyncReport } from "../lib/types";
 import { Button, Collapsible, ConfirmDialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 import { SharedDrivesManager } from "./DriveSharedDrives";
+import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
 
 /**
  * **Google Drive** (read-only, index-only) — the first cloud-API connector (board card 4A), under
@@ -310,6 +311,11 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
                   ? "Connect Google Drive"
                   : "Add another account"}
             </Button>
+            <GoogleOwnProjectConnect
+              service="drive"
+              disabled={busy != null}
+              onConnected={refresh}
+            />
           </div>
 
           {!syncing && report && <SyncReport report={report} onDismiss={() => setReport(null)} />}
