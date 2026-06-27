@@ -174,7 +174,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-indexing-speed": {
     title: "Indexing speed",
-    body: "How hard PM works your machine when it indexes documents (a Drive sync, or files you add). Fast indexes at full speed. Gentle paces the work — it pauses briefly between files so embedding doesn't pin your CPU continuously — so a low-end computer stays usable while a big index runs in the background. It only changes how fast indexing goes, never what gets indexed, and applies to the next sync/import.",
+    body: "How hard PM works your machine when it indexes documents (a Drive sync, or files you add). Fast indexes at full speed, using as much CPU and memory as it needs. Gentle paces the work — it pauses briefly between files and embeds in smaller batches — so it uses less CPU and less memory and your computer stays usable while a big index runs in the background. It only changes how fast indexing goes, never what gets indexed, and a change applies right away — even partway through a sync.",
   },
   "settings-learning": {
     title: "Learning You",

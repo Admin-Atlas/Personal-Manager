@@ -2852,12 +2852,6 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
     // Set if the user pressed Stop. Already-applied items stay committed; we stop early and skip the
     // interrupted account's cursor advance, so the next sync re-checks it.
     let mut cancelled = false;
-    // "Gentle" indexing pause between files, so a big sync doesn't pin a low-end machine (read once).
-    let pause_ms = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        db::indexing_pause_ms(&conn)
-    };
 
     'accounts: for w in &work {
         // Stop requested (before this account, or after finishing the previous one)? Halt — keeping
@@ -3026,8 +3020,15 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                     name,
                 },
             );
-            // Gentle mode: breathe between files so embedding doesn't pin the CPU continuously. Only
+            // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously. Re-read
+            // the setting each item (a cheap read, dropped before the await per rule #4) so flipping
+            // Fast/Gentle mid-sync takes effect on the very next file, not only on the next run. Only
             // items that reached here did real work (the cheap no-op/skip paths `continue` above).
+            let pause_ms = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                db::indexing_pause_ms(&conn)
+            };
             if pause_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
             }
@@ -3113,9 +3114,13 @@ fn apply_drive_actions(
 ) -> Result<()> {
     let state = app.state::<AppState>();
     let (vault_root, cipher) = state.manifest_io()?;
+    // Gentle mode caps the embedding batch to bound peak memory. `apply_drive_actions` runs once per
+    // item, so reading it here also makes gentle batching engage mid-sync (alongside the pause).
     let gateway = {
         let conn = state.conn()?;
-        state.gateway(&conn)?
+        state
+            .gateway(&conn)?
+            .with_embed_batch(db::indexing_embed_batch(&conn))
     };
     index_only::apply_actions(
         state.inner(),
@@ -3776,13 +3781,21 @@ fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
     } else {
         ""
     };
+    // Split the token sums by whether the row carried OpenRouter's reported cost, so cost is
+    // computed ROW-ADDITIVELY: real reported spend (`SUM(cost_usd)` over the rows that have it) plus
+    // a tokens × cached-price estimate for ONLY the rows that don't. The earlier all-or-nothing rule
+    // abandoned the whole group's real cost the moment a single pre-feature row (NULL `cost_usd`) was
+    // present — so a model with both old and new calls fell back to the estimate and went blank when
+    // it wasn't in the price cache. Additive costing keeps the known real spend visible regardless.
     let sql = format!(
         "SELECT u.model, \
                 COALESCE(SUM(u.prompt_tokens), 0), \
                 COALESCE(SUM(u.completion_tokens), 0), \
                 COUNT(*), \
                 p.prompt_price, p.completion_price, \
-                SUM(u.cost_usd), COUNT(u.cost_usd) \
+                SUM(u.cost_usd), COUNT(u.cost_usd), \
+                COALESCE(SUM(CASE WHEN u.cost_usd IS NULL THEN u.prompt_tokens     ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN u.cost_usd IS NULL THEN u.completion_tokens ELSE 0 END), 0) \
          FROM usage_log u LEFT JOIN model_pricing p ON p.model = u.model \
          WHERE u.model IS NOT NULL {window} \
          GROUP BY u.model \
@@ -3796,20 +3809,30 @@ fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
             let request_count: i64 = r.get(3)?;
             let prompt_price: Option<f64> = r.get(4)?;
             let completion_price: Option<f64> = r.get(5)?;
-            let actual_cost: Option<f64> = r.get(6)?; // SUM(cost_usd); NULL when no call reported one
-            let actual_count: i64 = r.get(7)?; // calls in this group that reported an actual cost
-                                               // Prefer OpenRouter's reported cost when EVERY call in the group reported one (so a
-                                               // partial actual sum is never mixed with rows that lack it); otherwise fall back to the
-                                               // tokens × cached-price estimate (which is `None` — shown "unknown" — when unpriced).
-            let cost_usd = if actual_count == request_count && actual_count > 0 {
-                actual_cost
-            } else {
+            let reported_cost: Option<f64> = r.get(6)?; // SUM(cost_usd); NULL when no call reported one
+            let reported_count: i64 = r.get(7)?; // calls in this group that reported an actual cost
+            let est_prompt_tokens: i64 = r.get(8)?; // tokens from ONLY the rows lacking a reported cost
+            let est_completion_tokens: i64 = r.get(9)?;
+            // Estimate the unreported rows (tokens × cached price); `None` when that model isn't
+            // priced. Some(0.0) when every row reported an actual cost (nothing left to estimate).
+            let estimate = if request_count - reported_count > 0 {
                 cost::call_cost(
-                    Some(prompt_tokens),
-                    Some(completion_tokens),
+                    Some(est_prompt_tokens),
+                    Some(est_completion_tokens),
                     prompt_price,
                     completion_price,
                 )
+            } else {
+                Some(0.0)
+            };
+            // Real reported spend is always honoured; the estimate only fills in the rows that
+            // lacked a reported cost. "Unknown" (`None`) survives only when NOTHING is known — no
+            // reported cost and the leftover rows are unpriced — never just because of an old row.
+            let cost_usd = match (reported_cost, estimate) {
+                (Some(actual), Some(est)) => Some(actual + est),
+                (Some(actual), None) => Some(actual), // real cost known; unpriced remainder omitted
+                (None, Some(est)) => Some(est),
+                (None, None) => None,
             };
             Ok(ModelSpend {
                 model: r.get(0)?,
@@ -4108,5 +4131,56 @@ mod tests {
             1,
             "de-duped"
         );
+    }
+
+    /// Cost is ROW-ADDITIVE: a model's real reported spend always shows, with an estimate filling in
+    /// only the rows that lacked one. The earlier all-or-nothing rule went blank for any model that
+    /// mixed a reported call with an older unreported one and wasn't in the price cache — this pins
+    /// the fix.
+    #[test]
+    fn spend_rows_adds_real_cost_and_estimates_only_unreported_rows() {
+        let (_dir, conn) = temp_db();
+        let priced_now = |model: &str| {
+            conn.execute(
+                "INSERT INTO model_pricing(model, prompt_price, completion_price, fetched_at) \
+                 VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                params![model, 3e-6_f64, 15e-6_f64],
+            )
+            .unwrap();
+        };
+        let log = |model: &str, pt: i64, ct: i64, cost: Option<f64>| {
+            conn.execute(
+                "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
+                 VALUES (?1, 'chat', ?2, ?3, ?4)",
+                params![model, pt, ct, cost],
+            )
+            .unwrap();
+        };
+
+        // Priced model, mixed rows: a reported $0.05 call + an older unreported one (1000/500 tokens).
+        priced_now("vendor/priced");
+        log("vendor/priced", 2000, 1000, Some(0.05));
+        log("vendor/priced", 1000, 500, None);
+
+        // Unpriced model, mixed rows — the regression case: a reported $0.02 call + an unreported one.
+        log("vendor/unpriced", 100, 100, Some(0.02));
+        log("vendor/unpriced", 100, 100, None);
+
+        // Unpriced model, only an old unreported row — genuinely unknown.
+        log("vendor/unknown", 100, 100, None);
+
+        let rows = spend_rows(&conn, false).unwrap();
+        let cost_of = |m: &str| rows.iter().find(|r| r.model == m).unwrap().cost_usd;
+
+        // Reported 0.05 + estimate(1000·3e-6 + 500·15e-6 = 0.0105) = 0.0605.
+        assert!((cost_of("vendor/priced").unwrap() - 0.0605).abs() < 1e-9);
+        // The fix: the real reported cost shows as a floor even though the model isn't priced —
+        // never blank. The unpriced unreported row is omitted (unknown), not understated to $0.
+        assert!((cost_of("vendor/unpriced").unwrap() - 0.02).abs() < 1e-9);
+        // Nothing known at all → still "unknown".
+        assert!(cost_of("vendor/unknown").is_none());
+
+        // And the grand total is the sum of the known rows (0.0605 + 0.02), not blank.
+        assert!((total_cost(&rows).unwrap() - 0.0805).abs() < 1e-9);
     }
 }

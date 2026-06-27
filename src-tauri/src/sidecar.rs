@@ -434,14 +434,24 @@ impl SidecarManager {
     /// Embed a batch of strings into the given embedder's vectors. The first call for a model
     /// downloads its weights and is slow; later calls are fast and fully local. Any retrieval
     /// prefix has already been applied by the gateway, so the text is embedded as-is. For a custom
-    /// (non-bundled) model the spec registers it with fastembed on first use.
-    pub fn embed(&self, texts: &[String], embedder: &ModelEntry) -> Result<Vec<Vec<f32>>> {
+    /// (non-bundled) model the spec registers it with fastembed on first use. `batch` caps how many
+    /// texts the embedder processes per forward pass (`None` = its own default); a small cap is the
+    /// "gentle" memory lever — it bounds peak activation memory at index time.
+    pub fn embed(
+        &self,
+        texts: &[String],
+        embedder: &ModelEntry,
+        batch: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         let mut params = json!({ "texts": texts, "model": embedder.id });
         if let Some(spec) = custom_spec(embedder) {
             params["custom"] = spec;
+        }
+        if let Some(b) = batch {
+            params["batch_size"] = json!(b);
         }
         let result = self.request("embed", params)?;
         let vectors = result["vectors"]

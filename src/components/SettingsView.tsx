@@ -805,7 +805,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                         meta={`${fmtUsd(cost.total_30d_usd)} · 30d`}
                       >
                         <p className="pt-2 text-xs text-ink4">
-                          Estimated from the tokens each model call used × OpenRouter&apos;s
+                          Your real per-call cost as reported by OpenRouter where available,
+                          otherwise estimated from the tokens each call used × OpenRouter&apos;s
                           per-token price
                           {cost.pricing_updated_at
                             ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
@@ -832,10 +833,12 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                             is never used for it.
                           </p>
                           <p>
-                            Cost per model = prompt&nbsp;tokens × prompt&nbsp;price +
-                            reply&nbsp;tokens × reply&nbsp;price, summed over that model&apos;s
-                            calls. It&apos;s computed when you open this page, so a later price
-                            change re-prices your history. A model not yet in the price cache shows{" "}
+                            Where OpenRouter reports a call&apos;s actual cost (reflecting any
+                            prompt-cache discount) PM shows that; for older calls without it, cost =
+                            prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
+                            reply&nbsp;price. It&apos;s computed when you open this page, so a later
+                            price change re-prices your history. A model with no reported cost and
+                            not yet in the price cache shows{" "}
                             <span className="font-mono text-ink4">—</span>, never an
                             understated&nbsp;$0.
                           </p>
@@ -937,28 +940,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       />
                     </button>
                   </div>
-
-                  <div
-                    className="mt-3 flex items-start justify-between gap-3"
-                    data-help="settings-indexing-speed"
-                  >
-                    <div>
-                      <label className="block text-sm font-medium text-ink2">Indexing speed</label>
-                      <p className="mt-1 text-xs text-ink4">
-                        Gentle paces indexing so your computer stays responsive while it works in
-                        the background — for slower machines. Fast indexes at full speed.
-                      </p>
-                    </div>
-                    <SegmentedControl
-                      className="mt-0.5 shrink-0"
-                      value={indexingSpeed}
-                      onChange={(v) => void changeIndexingSpeed(v as "fast" | "gentle")}
-                      options={[
-                        { value: "fast", label: "Fast" },
-                        { value: "gentle", label: "Gentle" },
-                      ]}
-                    />
-                  </div>
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
@@ -975,7 +956,10 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
 
             {tab === "connectors" && (
               <>
-                <ConnectorsSettings />
+                <ConnectorsSettings
+                  indexingSpeed={indexingSpeed}
+                  onChangeIndexingSpeed={(s) => void changeIndexingSpeed(s)}
+                />
               </>
             )}
 

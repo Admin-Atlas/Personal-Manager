@@ -51,12 +51,30 @@ pub const INDEXING_SPEED_KEY: &str = "indexing_speed";
 /// index never finishes. "fast" inserts no pause.
 const GENTLE_INDEX_PAUSE_MS: u64 = 250;
 
+/// Embedding batch cap in "gentle" mode: the sidecar embeds at most this many chunks per forward
+/// pass, bounding peak activation memory so indexing on a low-memory machine doesn't spike RAM.
+/// "fast" passes `None` (the embedder's own default batch — max throughput). Small enough to bound
+/// memory, large enough that per-batch overhead stays negligible.
+const GENTLE_EMBED_BATCH: usize = 8;
+
 /// How long indexing should pause between files for the current speed setting (0 unless "gentle").
-/// Read once per ingest/sync run, off the hot path.
+/// Cheap to read, so callers re-read it between files — flipping Fast/Gentle then takes effect on
+/// the very next file, even partway through a sync.
 pub fn indexing_pause_ms(conn: &Connection) -> u64 {
     match get_setting(conn, INDEXING_SPEED_KEY) {
         Ok(Some(v)) if v == "gentle" => GENTLE_INDEX_PAUSE_MS,
         _ => 0,
+    }
+}
+
+/// The index-time embedding batch cap for the current speed setting: `Some(GENTLE_EMBED_BATCH)` in
+/// "gentle" mode (bounded memory), `None` otherwise (embedder default). Read alongside
+/// [`indexing_pause_ms`]; the Drive path re-reads it per item, so gentle batching also engages
+/// mid-sync.
+pub fn indexing_embed_batch(conn: &Connection) -> Option<usize> {
+    match get_setting(conn, INDEXING_SPEED_KEY) {
+        Ok(Some(v)) if v == "gentle" => Some(GENTLE_EMBED_BATCH),
+        _ => None,
     }
 }
 

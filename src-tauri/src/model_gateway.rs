@@ -23,6 +23,10 @@ pub struct ModelGateway<'a> {
     sidecar: &'a SidecarManager,
     embedder: ModelEntry,
     reranker: ModelEntry,
+    /// Max chunks embedded per sidecar forward pass at index time; `None` = the embedder's own
+    /// default (max throughput). Set small in "gentle" indexing mode to cap peak memory. Only
+    /// affects passage (document) embedding — query embedding is a single text, never batched down.
+    embed_batch: Option<usize>,
 }
 
 impl<'a> ModelGateway<'a> {
@@ -33,7 +37,15 @@ impl<'a> ModelGateway<'a> {
             sidecar,
             embedder,
             reranker,
+            embed_batch: None,
         }
+    }
+
+    /// Cap the index-time embedding batch (the "gentle" memory lever). Fluent so call sites read
+    /// top-down: `state.gateway(&conn)?.with_embed_batch(db::indexing_embed_batch(&conn))`.
+    pub fn with_embed_batch(mut self, batch: Option<usize>) -> Self {
+        self.embed_batch = batch;
+        self
     }
 
     /// This gateway's resolved embedder — so ingest can read its dimension (the index guard) and
@@ -43,17 +55,20 @@ impl<'a> ModelGateway<'a> {
     }
 
     /// Embed search queries with the active embedder, applying its query-side prefix (e5's
-    /// `query: `; a no-op for symmetric models). Used at query time.
+    /// `query: `; a no-op for symmetric models). Used at query time. A query is a single text, so
+    /// the gentle batch cap never applies here — always the embedder default.
     pub fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let prefixed = registry::apply_prefix(&self.embedder, EmbedRole::Query, texts);
-        self.sidecar.embed(&prefixed, &self.embedder)
+        self.sidecar.embed(&prefixed, &self.embedder, None)
     }
 
     /// Embed documents/passages with the active embedder, applying its passage-side prefix (e5's
-    /// `passage: `; a no-op for symmetric models). Used at index time.
+    /// `passage: `; a no-op for symmetric models). Used at index time, so it honours the gentle
+    /// batch cap (bounded peak memory) when one is set.
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let prefixed = registry::apply_prefix(&self.embedder, EmbedRole::Passage, texts);
-        self.sidecar.embed(&prefixed, &self.embedder)
+        self.sidecar
+            .embed(&prefixed, &self.embedder, self.embed_batch)
     }
 
     /// Token counts under the active embedder's tokenizer — the splitter sizes chunks by this.

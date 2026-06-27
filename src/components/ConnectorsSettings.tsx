@@ -3,7 +3,7 @@
 
 import type { ReactNode } from "react";
 import { useDepth } from "../theme";
-import { Collapsible } from "./ui";
+import { Collapsible, SegmentedControl } from "./ui";
 import { GoogleCalendarConnection } from "./GoogleCalendarConnection";
 import { GoogleDriveConnection } from "./GoogleDriveConnection";
 import { IcsFeedSubscription } from "./IcsFeedSubscription";
@@ -24,7 +24,13 @@ import { IcsFeedSubscription } from "./IcsFeedSubscription";
  * are live; Microsoft, Apple, and Email show as coming-soon placeholders that drop into their
  * service sections as later cards land — no change to the surrounding structure.
  */
-export function ConnectorsSettings() {
+export function ConnectorsSettings({
+  indexingSpeed,
+  onChangeIndexingSpeed,
+}: {
+  indexingSpeed: "fast" | "gentle";
+  onChangeIndexingSpeed: (speed: "fast" | "gentle") => void;
+}) {
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-connectors">
       <label className="block text-sm font-medium text-ink2">Connectors</label>
@@ -33,6 +39,8 @@ export function ConnectorsSettings() {
         Every connection is independently opt-in and removable — nothing cascades. Credentials and
         tokens live only in your keychain.
       </p>
+
+      <IndexingSpeedControl value={indexingSpeed} onChange={onChangeIndexingSpeed} />
 
       <ServiceSection
         title="Calendar"
@@ -96,6 +104,68 @@ function ServiceSection({
       {blurb && <p className="mt-1 text-xs text-ink4">{blurb}</p>}
       <div className="mt-3">{children}</div>
     </Collapsible>
+  );
+}
+
+/**
+ * The **Indexing speed** control — the Fast/Gentle pacing toggle, surfaced here at the top of the
+ * Connectors hub because that's where it bites most (a Drive sync is the big, long-running index).
+ * Fast runs at full throughput; Gentle paces each file AND embeds in smaller batches so a low-end
+ * machine stays responsive on both CPU and memory. The setting is re-read mid-run, so a switch
+ * applies to the very next file — even partway through a sync.
+ */
+function IndexingSpeedControl({
+  value,
+  onChange,
+}: {
+  value: "fast" | "gentle";
+  onChange: (speed: "fast" | "gentle") => void;
+}) {
+  return (
+    <div
+      className="mt-4 rounded-[var(--radius)] border border-border p-3"
+      data-help="settings-indexing-speed"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <label className="block text-sm font-medium text-ink2">Indexing speed</label>
+          <p className="mt-1 text-xs text-ink4">
+            How hard PM works your machine while it indexes — connected accounts and imported files.
+          </p>
+        </div>
+        <SegmentedControl
+          className="mt-0.5 shrink-0"
+          value={value}
+          onChange={(v) => onChange(v as "fast" | "gentle")}
+          options={[
+            { value: "fast", label: "Fast" },
+            { value: "gentle", label: "Gentle" },
+          ]}
+        />
+      </div>
+      <dl className="mt-2.5 space-y-1.5 text-xs leading-relaxed text-ink4">
+        <div>
+          <dt className="inline font-medium text-ink3">Fast</dt>
+          <dd className="inline">
+            {" "}
+            — indexes at full speed, using as much CPU and memory as it needs. Best on a capable
+            machine, or when you just want it finished.
+          </dd>
+        </div>
+        <div>
+          <dt className="inline font-medium text-ink3">Gentle</dt>
+          <dd className="inline">
+            {" "}
+            — pauses briefly between files and embeds in smaller batches, so it uses less CPU and
+            less memory and your computer stays responsive. Best for slower or low-memory machines,
+            or when you’re working while it runs. Indexing takes longer.
+          </dd>
+        </div>
+      </dl>
+      <p className="mt-2 text-xs text-faint">
+        Changes apply right away — even partway through a sync.
+      </p>
+    </div>
   );
 }
 

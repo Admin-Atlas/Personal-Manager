@@ -217,14 +217,23 @@ def do_embed(params):
     Rust prepends any asymmetric retrieval prefix (e5's `query:` / `passage:`)
     before sending, so the text is embedded as-is. `model`/`custom` select and
     (for a custom model) register the embedder; both default to the English model.
+    `batch_size`, when present, caps how many texts the embedder processes per
+    forward pass — the "gentle" indexing lever, which bounds peak activation
+    memory on a low-memory machine. Absent → fastembed's own default batch.
     """
     # Sanitize before tokenizing: one chunk with a stray surrogate would
     # otherwise fail the entire batch (and thus the whole document).
     texts = [clean_text(t) for t in params.get("texts", [])]
     model = params.get("model") or EMBED_MODEL
     spec = params.get("custom")
+    embedder = get_embedder(model, spec)
+    batch_size = params.get("batch_size")
     # fastembed yields numpy arrays; hand back plain lists so they serialize.
-    vectors = [vec.tolist() for vec in get_embedder(model, spec).embed(texts)]
+    if batch_size:
+        vecs = embedder.embed(texts, batch_size=int(batch_size))
+    else:
+        vecs = embedder.embed(texts)
+    vectors = [vec.tolist() for vec in vecs]
     dim = int(spec["dim"]) if spec and spec.get("dim") else EMBED_DIM
     return {"vectors": vectors, "dim": dim, "model": model}
 
