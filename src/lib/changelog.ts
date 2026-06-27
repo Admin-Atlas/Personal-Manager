@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.32.0-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "You can now connect a Google account that signs in with its own Cloud project, separate from the shared one. This is what makes Google Advanced Protection accounts work — Google blocks those from using any shared third-party project. Under the Drive or Calendar connect button, open “Advanced Protection account? Use its own project”, paste that project's Client ID + secret, and sign in; PM remembers it for that account and uses it for every later refresh.",
+      "Because two Advanced-Protection accounts can't share a project, each can carry its own — so you can connect several of them, one project apiece. A project entered for an account's Drive also covers its Calendar (same Google account).",
+    ],
+  },
+  {
     version: "2.31.0-alpha",
     date: "2026-06-27",
     highlights: [

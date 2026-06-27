@@ -229,8 +229,10 @@ function ClientSetupGuide() {
         out every 7 days; to avoid that you can <span className="text-ink2">Publish app</span>{" "}
         (Audience → Publish app), which makes your consent screen public — though only your saved
         client secret can actually use it. <span className="text-ink2">Advanced Protection</span>{" "}
-        accounts block unverified apps from Drive and Calendar entirely; use a different Google
-        account (for Calendar, an iCal subscription works instead).
+        accounts can’t use a shared project at all — connect each one with{" "}
+        <span className="text-ink2">“Advanced Protection account? Use its own project”</span> under
+        the Drive/Calendar connect button, pasting a Client ID + secret from a project that account
+        owns (one project per such account; it can’t be shared).
       </li>
     </ol>
   );

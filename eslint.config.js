@@ -28,6 +28,9 @@ export default tseslint.config(
       "src-tauri/target",
       "src-tauri/python",
       "design-system-docs",
+      // The spec + decision log + scratch notes (git-ignored, local-only — not first-party
+      // source). Lint shouldn't reach into it (e.g. a stray docs/calendar-view/*.js prototype).
+      "docs",
       "node_modules",
       // design-sync (claude.ai/design) build output & staged converter scripts —
       // regenerated, vendored, git-ignored. The hand-authored .design-sync/previews/

@@ -119,6 +119,42 @@ pub fn clear_google_client() -> Result<()> {
     delete(GOOGLE_CLIENT_SECRET)
 }
 
+/// **Per-account** Google client (id + secret). Most users share the one client above, but a Google
+/// **Advanced Protection** account can't authorize a third-party Cloud project — it must use a client
+/// from a project the account itself owns. So each such account can carry its OWN client, keyed by its
+/// email; the OAuth flow and every later token refresh for that account use it instead of the shared
+/// one (resolved in `google::client_creds_for_key`). Absent → the account falls back to the shared
+/// client. The `::` keeps these distinct from the shared keys (which have no suffix).
+const GOOGLE_CLIENT_ID_PREFIX: &str = "google_oauth_client_id::";
+const GOOGLE_CLIENT_SECRET_PREFIX: &str = "google_oauth_client_secret::";
+
+pub fn get_google_client_id_for_account(email: &str) -> Result<Option<String>> {
+    get(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"))
+}
+
+pub fn get_google_client_secret_for_account(email: &str) -> Result<Option<Secret>> {
+    Ok(get(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"))?.map(Secret::from))
+}
+
+/// Store an account's own client credentials together (overwrites — reconnecting re-sets the same).
+pub fn set_google_client_for_account(
+    email: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<()> {
+    set(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"), client_id)?;
+    set(
+        &format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"),
+        client_secret,
+    )
+}
+
+/// Forget an account's own client credentials (idempotent).
+pub fn clear_google_client_for_account(email: &str) -> Result<()> {
+    delete(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"))?;
+    delete(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"))
+}
+
 /// Read a per-service Google OAuth token blob by its keychain key (calendar, or a Drive account).
 pub fn get_google_token_for(key: &str) -> Result<Option<Secret>> {
     Ok(get(key)?.map(Secret::from))
