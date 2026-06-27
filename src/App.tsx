@@ -42,6 +42,7 @@ import {
   onVaultCurtain,
   openUrl,
   resumeDriveSync,
+  resumeOneDriveSync,
   reviewQueue,
   setHelpMode,
   startSemanticLayout,
@@ -298,6 +299,11 @@ export default function App() {
   // it just finishes the outstanding work. A no-op when there's nothing pending.
   useEffect(() => {
     if (keySet) void resumeDriveSync().catch(() => {});
+  }, [keySet]);
+
+  // Same for an interrupted OneDrive sync (independent connector, its own resume marker).
+  useEffect(() => {
+    if (keySet) void resumeOneDriveSync().catch(() => {});
   }, [keySet]);
 
   // Pre-compute the Map's layouts in the background after unlock, at idle priority: the by-project

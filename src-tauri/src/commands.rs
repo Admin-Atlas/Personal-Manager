@@ -20,8 +20,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, drive, entities, index_only, lock_session, openrouter,
-    paths, preferences, recommend, secrets, vault, AppState, VaultRuntime,
+    applock, briefing, clock, cost, db, drive, entities, index_only, lock_session, microsoft,
+    onedrive, openrouter, paths, preferences, recommend, secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -3212,20 +3212,31 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
             "This file was removed at the source; only its saved summary is available.".into(),
         ));
     }
-    let email = drive::account_of(&source_id)
-        .ok_or_else(|| Error::Other("Unrecognised index-only source.".into()))?;
-    let file_id = source_id
+    // Dispatch on the source-id provider prefix (Drive vs OneDrive). Both fetch the body live from
+    // the source and never store it; the trailing segment after the last `:` is the provider's file id
+    // (Drive fileIds and Graph itemIds both carry no `:`).
+    let state = app.state::<AppState>();
+    state.sidecar.ensure_installed()?;
+    let item_id = source_id
         .rsplit_once(':')
         .map(|(_, id)| id.to_string())
         .ok_or_else(|| Error::Other("Malformed source id.".into()))?;
-    let token_key = drive::account_token_key(&email);
-
-    let state = app.state::<AppState>();
-    state.sidecar.ensure_installed()?;
-    let file = drive::fetch_file(&token_key, &file_id).await?;
-    drive::fetch_body(state.inner(), &token_key, &file)
-        .await?
-        .ok_or_else(|| Error::Other("This file has no extractable text to show.".into()))
+    let no_text = || Error::Other("This file has no extractable text to show.".into());
+    if let Some(email) = drive::account_of(&source_id) {
+        let token_key = drive::account_token_key(&email);
+        let file = drive::fetch_file(&token_key, &item_id).await?;
+        drive::fetch_body(state.inner(), &token_key, &file)
+            .await?
+            .ok_or_else(no_text)
+    } else if let Some(email) = onedrive::account_of(&source_id) {
+        let token_key = onedrive::account_token_key(&email);
+        let item = onedrive::fetch_item(&token_key, &item_id).await?;
+        onedrive::fetch_body(state.inner(), &token_key, &item)
+            .await?
+            .ok_or_else(no_text)
+    } else {
+        Err(Error::Other("Unrecognised index-only source.".into()))
+    }
 }
 
 /// Open a URL in the system browser, but ONLY if it's http/https — never a `file:`, app, or custom
@@ -3260,6 +3271,702 @@ pub fn open_external_ref(state: State<'_, AppState>, doc_id: i64) -> Result<()> 
     };
     let url = external_ref.ok_or_else(|| Error::Other("This item has no source link.".into()))?;
     open_external_url(&url)
+}
+
+// --- Microsoft OneDrive (index-only connector, board card 4B) ---
+//
+// A near-mirror of the Google Drive block above, for OneDrive via Microsoft Graph. The differences
+// are mechanical: a public client (no secret), the Graph delta query (one endpoint does first-sync
+// AND incremental), and a single personal-drive corpus (no shared drives) that is either whole-drive
+// (delta cursor) or folder-scoped (re-enumerate + reconcile). It reuses the index-only foundation,
+// the gentle-mode pacing, and `apply_drive_actions` / `action_category` unchanged.
+
+/// The OneDrive connector's state for Settings: whether the BYO Microsoft client id is configured,
+/// plus every connected account (each independent — its own token, sync, and items).
+#[derive(Serialize)]
+pub struct OneDriveStatus {
+    pub oauth_client_configured: bool,
+    pub accounts: Vec<onedrive::OneDriveAccount>,
+}
+
+#[tauri::command]
+pub fn onedrive_status(state: State<'_, AppState>) -> Result<OneDriveStatus> {
+    let conn = state.conn()?;
+    Ok(OneDriveStatus {
+        oauth_client_configured: microsoft::has_client()?,
+        accounts: onedrive::list_accounts(&conn)?,
+    })
+}
+
+#[tauri::command]
+pub fn list_onedrive_accounts(
+    state: State<'_, AppState>,
+) -> Result<Vec<onedrive::OneDriveAccount>> {
+    let conn = state.conn()?;
+    onedrive::list_accounts(&conn)
+}
+
+/// Save the user's BYO Microsoft client id (public client — no secret). Keychain-only; provider-level
+/// (shared by every OneDrive account). Setting it connects nothing on its own.
+#[tauri::command]
+pub fn set_microsoft_client(client_id: String) -> Result<()> {
+    secrets::set_microsoft_client(client_id.trim())
+}
+
+/// Clear the Microsoft client id and sign out every OneDrive account (they all depend on it). Indexed
+/// items are kept but flagged unreachable (never deleted), matching the Google-client clear.
+#[tauri::command]
+pub fn clear_microsoft_client(state: State<'_, AppState>) -> Result<()> {
+    {
+        let conn = state.conn()?;
+        onedrive::forget_all_accounts(&conn)?;
+    }
+    secrets::clear_microsoft_client()?;
+    state.sync_index_only();
+    Ok(())
+}
+
+/// Connect a Microsoft OneDrive account (read-only): run the consent flow, learn which account it
+/// granted (Graph `/me`), store that account's token under its own keychain key, and register it.
+/// Returns the connected account. The BYO Microsoft client id must already be configured.
+#[tauri::command]
+pub async fn connect_onedrive(app: AppHandle) -> Result<onedrive::OneDriveAccount> {
+    let token = microsoft::run_consent(microsoft::ONEDRIVE_SCOPE, "OneDrive").await?;
+    let (email, name) = onedrive::me_account(&token).await?;
+    microsoft::save_token(&onedrive::account_token_key(&email), &token)?;
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    onedrive::upsert_account(&conn, &email, &name)?;
+    onedrive::list_accounts(&conn)?
+        .into_iter()
+        .find(|a| a.email == email)
+        .ok_or_else(|| Error::Other("the account registration could not be read back".into()))
+}
+
+/// Disconnect one OneDrive account: forget its token and registry row, and soft-flag its indexed
+/// items `unreachable` (kept findable — never a hard delete).
+#[tauri::command]
+pub fn disconnect_onedrive(state: State<'_, AppState>, email: String) -> Result<()> {
+    {
+        let conn = state.conn()?;
+        onedrive::forget_account(&conn, &email)?;
+    }
+    state.sync_index_only();
+    Ok(())
+}
+
+/// The immediate subfolders of `parent_id` (or the drive root when `parent_id` is `None`) — one lazy
+/// level of the OneDrive folder picker.
+#[tauri::command]
+pub async fn list_onedrive_folders(
+    email: String,
+    parent_id: Option<String>,
+) -> Result<Vec<onedrive::OneDriveFolder>> {
+    onedrive::list_folders(&onedrive::account_token_key(&email), parent_id.as_deref()).await
+}
+
+/// One account's indexing scope (whole drive, or the chosen folders).
+#[tauri::command]
+pub fn get_onedrive_scope(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<onedrive::OneDriveScope> {
+    let conn = state.conn()?;
+    onedrive::get_scope(&conn, &email)
+}
+
+/// Persist one account's indexing scope. The UI follows this with a `sync_onedrive` to apply it.
+#[tauri::command]
+pub fn set_onedrive_scope(
+    state: State<'_, AppState>,
+    email: String,
+    scope: onedrive::OneDriveScope,
+) -> Result<()> {
+    let conn = state.conn()?;
+    onedrive::set_scope(&conn, &email, &scope)
+}
+
+/// One unit of OneDrive sync work for an account, gathered off the lock in phase 1.
+enum OneDriveItem {
+    /// A whole-drive first-sync / re-baseline file → `Add` (reactivates a previously-missing item).
+    Enumerated(onedrive::DriveItem),
+    /// A whole-drive incremental delta entry → mapped via `map_change` in phase 2.
+    Delta(onedrive::DriveDelta),
+    /// A folder-scoped reconcile result with its event pre-built (`Add`/`Update`/`Delete`).
+    Reconciled {
+        source_id: String,
+        event: index_only::ChangeEvent,
+        item: Option<onedrive::DriveItem>,
+    },
+}
+
+/// All of one account's gathered work for a sync pass.
+struct OneDriveAccountWork {
+    email: String,
+    token_key: String,
+    items: Vec<OneDriveItem>,
+    /// The advanced whole-drive delta link — set only when the whole drive synced this pass.
+    new_cursor: Option<String>,
+    auth_failed: bool,
+}
+
+/// Folder-scoped reconcile for OneDrive: enumerate the selected folders live and diff against the
+/// account's currently-healthy items. Present+known → `Update` (catches edits); present+new/missing →
+/// `Add` (ingests, or reactivates a folder removed then re-added); known-but-absent → `Delete`. Reads
+/// the known set under a brief lock; the enumeration itself is off the lock.
+async fn gather_onedrive_folders(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    folders: &[String],
+) -> Result<Vec<OneDriveItem>> {
+    let items = onedrive::enumerate_folders(token_key, folders).await?;
+    let known: std::collections::HashSet<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        onedrive::known_source_ids(&conn, email)?
+            .into_iter()
+            .collect()
+    };
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<OneDriveItem> = Vec::with_capacity(items.len());
+    for it in items {
+        let source_id = onedrive::source_id_for(email, &it.id);
+        present.insert(source_id.clone());
+        let event = if known.contains(&source_id) {
+            index_only::ChangeEvent::Update {
+                source_id: source_id.clone(),
+                modified_at: it.modified_time.clone(),
+                new_content_hash: it.content_hash(),
+            }
+        } else {
+            index_only::ChangeEvent::Add {
+                source_id: source_id.clone(),
+                modified_at: it.modified_time.clone(),
+            }
+        };
+        out.push(OneDriveItem::Reconciled {
+            source_id,
+            event,
+            item: Some(it),
+        });
+    }
+    for source_id in known {
+        if !present.contains(&source_id) {
+            out.push(OneDriveItem::Reconciled {
+                source_id: source_id.clone(),
+                event: index_only::ChangeEvent::Delete { source_id },
+                item: None,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Apply `f` to the shared OneDrive-sync snapshot, best-effort (a poisoned lock is skipped).
+fn with_onedrive_snap(app: &AppHandle, f: impl FnOnce(&mut crate::OneDriveSyncState)) {
+    let state = app.state::<AppState>();
+    let guard = state.onedrive_sync.lock();
+    if let Ok(mut snap) = guard {
+        f(&mut snap);
+    }
+}
+
+/// Update the OneDrive-sync snapshot and broadcast a `onedrive://sync` progress event globally (so
+/// progress reaches whatever component is mounted, and the UI can restore an in-flight sync).
+fn emit_onedrive_progress(app: &AppHandle, ev: onedrive::OneDriveSyncEvent) {
+    with_onedrive_snap(app, |snap| match &ev {
+        onedrive::OneDriveSyncEvent::Counted { total } => {
+            snap.total = Some(*total);
+            snap.processed = 0;
+        }
+        onedrive::OneDriveSyncEvent::Item {
+            processed, total, ..
+        } => {
+            snap.processed = *processed;
+            snap.total = Some(*total);
+        }
+        onedrive::OneDriveSyncEvent::Finished { report } => {
+            snap.last_report = Some(report.clone());
+        }
+    });
+    let _ = app.emit("onedrive://sync", ev);
+}
+
+/// The currently-running OneDrive sync snapshot, so the Settings UI can resume showing progress.
+#[tauri::command]
+pub fn onedrive_sync_status(state: State<'_, AppState>) -> Result<crate::OneDriveSyncState> {
+    state
+        .onedrive_sync
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|_| Error::Other("onedrive sync state poisoned".into()))
+}
+
+/// Marker key for a OneDrive sync started but not cleanly finished (crash-resume); see the Drive
+/// equivalent.
+const ONEDRIVE_SYNC_PENDING_KEY: &str = "onedrive_sync_pending";
+
+/// True if the running OneDrive sync has been asked to stop.
+fn onedrive_sync_cancelled(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .onedrive_sync_cancel
+        .load(Ordering::SeqCst)
+}
+
+/// Record a file that couldn't be indexed, up to the cap (after which we just flag truncation).
+fn record_onedrive_issue(
+    issues: &mut Vec<onedrive::OneDriveSyncIssue>,
+    truncated: &mut bool,
+    name: &str,
+    reason: &str,
+) {
+    if issues.len() < MAX_REPORT_ISSUES {
+        issues.push(onedrive::OneDriveSyncIssue {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        });
+    } else {
+        *truncated = true;
+    }
+}
+
+/// Sync one OneDrive account (or every account when `account` is `None`). The command the UI's
+/// "Sync now" calls; see [`onedrive_sync_core`] for the behaviour.
+#[tauri::command]
+pub async fn sync_onedrive(app: AppHandle, account: Option<String>) -> Result<usize> {
+    onedrive_sync_core(&app, account).await
+}
+
+/// Ask the running OneDrive sync to stop after the current file (kept-so-far stays indexed).
+#[tauri::command]
+pub fn stop_onedrive_sync(state: State<'_, AppState>) -> Result<()> {
+    state.onedrive_sync_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Resume a OneDrive sync a previous app session started but didn't finish. Called once on launch.
+#[tauri::command]
+pub fn resume_onedrive_sync(app: AppHandle) -> Result<bool> {
+    let marker: Option<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, ONEDRIVE_SYNC_PENDING_KEY)?
+    };
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    let running = app
+        .state::<AppState>()
+        .onedrive_sync
+        .lock()
+        .map(|s| s.running)
+        .unwrap_or(false);
+    if running {
+        return Ok(false);
+    }
+    let account: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = onedrive_sync_core(&app2, account).await;
+    });
+    Ok(true)
+}
+
+/// The OneDrive sync engine (mirrors [`drive_sync_core`]): detached, single-flight, durable. The
+/// whole drive uses the efficient Graph delta cursor (first sync enumerates everything, later syncs
+/// apply only changes); a folder-scoped account is re-enumerated + reconciled each pass. Every item is
+/// index-only: a pointer + embedding, the body fetched live. Never holds the DB lock across a
+/// network/embed call (rule #4).
+async fn onedrive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
+    {
+        let state = app.state::<AppState>();
+        let mut snap = state
+            .onedrive_sync
+            .lock()
+            .map_err(|_| Error::Other("onedrive sync state poisoned".into()))?;
+        if snap.running {
+            snap.rerun = true;
+            return Ok(0);
+        }
+        *snap = crate::OneDriveSyncState {
+            running: true,
+            account: account.clone(),
+            ..Default::default()
+        };
+    }
+    {
+        let state = app.state::<AppState>();
+        state.onedrive_sync_cancel.store(false, Ordering::SeqCst);
+        let conn = state.conn();
+        if let Ok(conn) = conn {
+            let marker = serde_json::to_string(&account).unwrap_or_else(|_| "null".to_string());
+            let _ = db::set_setting(&conn, ONEDRIVE_SYNC_PENDING_KEY, &marker);
+        }
+    }
+
+    let mut pass_account = account;
+    let mut result;
+    loop {
+        result = run_onedrive_sync(app, pass_account).await;
+        let stopped = onedrive_sync_cancelled(app);
+        let again = {
+            let state = app.state::<AppState>();
+            let mut snap = state
+                .onedrive_sync
+                .lock()
+                .map_err(|_| Error::Other("onedrive sync state poisoned".into()))?;
+            if snap.rerun && !stopped {
+                snap.rerun = false;
+                snap.processed = 0;
+                snap.total = None;
+                snap.account = None;
+                true
+            } else {
+                snap.running = false;
+                false
+            }
+        };
+        if !again {
+            break;
+        }
+        pass_account = None;
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn();
+        if let Ok(conn) = conn {
+            let _ = db::delete_setting(&conn, ONEDRIVE_SYNC_PENDING_KEY);
+        }
+    }
+    result
+}
+
+/// One OneDrive sync pass: gather each account's work, then process it.
+async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<usize> {
+    {
+        let state = app.state::<AppState>();
+        state.sidecar.ensure_installed()?;
+    }
+
+    let emails: Vec<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        match account {
+            Some(e) => vec![e],
+            None => onedrive::list_accounts(&conn)?
+                .into_iter()
+                .map(|a| a.email)
+                .collect(),
+        }
+    };
+
+    let mut work: Vec<OneDriveAccountWork> = Vec::new();
+    let mut last_err: Option<Error> = None;
+
+    // Phase 1 — gather each account's work off the lock.
+    for email in emails {
+        let token_key = onedrive::account_token_key(&email);
+        let scope = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            onedrive::get_scope(&conn, &email)?
+        };
+
+        let mut items: Vec<OneDriveItem> = Vec::new();
+        let mut new_cursor: Option<String> = None;
+        let mut auth_failed = false;
+
+        match scope.folders.as_deref() {
+            // Folder-scoped: re-enumerate selected folders + reconcile (no cursor).
+            Some(folders) => {
+                match gather_onedrive_folders(app, &token_key, &email, folders).await {
+                    Ok(mut recon) => items.append(&mut recon),
+                    Err(e) => {
+                        if onedrive::is_auth_failure(&e) {
+                            auth_failed = true;
+                        }
+                        last_err = Some(e);
+                    }
+                }
+            }
+            // Whole drive: the Graph delta cursor. No cursor (or a 410 reset) re-baselines via the
+            // no-token delta (every file → Enumerated/Add); otherwise pull the incremental delta.
+            None => {
+                let cursor = {
+                    let state = app.state::<AppState>();
+                    let conn = state.conn()?;
+                    onedrive::get_cursor(&conn, &email)?
+                };
+                let outcome: Result<(Vec<OneDriveItem>, String)> = match &cursor {
+                    None => onedrive::list_delta(&token_key, None)
+                        .await
+                        .map(|(deltas, link)| {
+                            (
+                                deltas
+                                    .into_iter()
+                                    .filter_map(|d| d.file)
+                                    .map(OneDriveItem::Enumerated)
+                                    .collect(),
+                                link,
+                            )
+                        }),
+                    Some(link) => match onedrive::list_delta(&token_key, Some(link)).await {
+                        Ok((deltas, link)) => {
+                            Ok((deltas.into_iter().map(OneDriveItem::Delta).collect(), link))
+                        }
+                        Err(e) if onedrive::is_cursor_expired(&e) => {
+                            onedrive::list_delta(&token_key, None)
+                                .await
+                                .map(|(deltas, link)| {
+                                    (
+                                        deltas
+                                            .into_iter()
+                                            .filter_map(|d| d.file)
+                                            .map(OneDriveItem::Enumerated)
+                                            .collect(),
+                                        link,
+                                    )
+                                })
+                        }
+                        Err(e) => Err(e),
+                    },
+                };
+                match outcome {
+                    Ok((mut its, link)) => {
+                        items.append(&mut its);
+                        new_cursor = Some(link);
+                    }
+                    Err(e) => {
+                        if onedrive::is_auth_failure(&e) {
+                            auth_failed = true;
+                        }
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        work.push(OneDriveAccountWork {
+            email,
+            token_key,
+            items,
+            new_cursor,
+            auth_failed,
+        });
+    }
+
+    let total: usize = work.iter().map(|w| w.items.len()).sum();
+    emit_onedrive_progress(app, onedrive::OneDriveSyncEvent::Counted { total });
+
+    // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
+    let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
+    let mut processed = 0usize;
+    let mut issues: Vec<onedrive::OneDriveSyncIssue> = Vec::new();
+    let mut issues_truncated = false;
+    let mut cancelled = false;
+
+    'accounts: for w in &work {
+        if onedrive_sync_cancelled(app) {
+            cancelled = true;
+            break 'accounts;
+        }
+
+        // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
+        if w.auth_failed {
+            let actions = index_only::react(
+                index_only::ChangeEvent::SourceFailure {
+                    source: format!("onedrive:{}", w.email),
+                },
+                None,
+            );
+            let app2 = app.clone();
+            let _ = tokio::task::spawn_blocking(move || apply_drive_actions(&app2, &actions, None))
+                .await;
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            onedrive::set_state(&conn, &w.email, "error")?;
+            continue;
+        }
+
+        for item in &w.items {
+            if onedrive_sync_cancelled(app) {
+                cancelled = true;
+                break 'accounts;
+            }
+            let (file, source_id, event): (Option<&onedrive::DriveItem>, String, _) = match item {
+                OneDriveItem::Enumerated(it) => {
+                    let sid = onedrive::source_id_for(&w.email, &it.id);
+                    let ev = index_only::ChangeEvent::Add {
+                        source_id: sid.clone(),
+                        modified_at: it.modified_time.clone(),
+                    };
+                    (Some(it), sid, ev)
+                }
+                OneDriveItem::Delta(delta) => {
+                    let sid = onedrive::source_id_for(&w.email, &delta.item_id);
+                    let known = {
+                        let state = app.state::<AppState>();
+                        let conn = state.conn()?;
+                        onedrive::read_item_state(&conn, &sid)?.is_some()
+                    };
+                    match onedrive::map_change(delta, &w.email, known) {
+                        Some(ev) => (delta.file.as_ref(), sid, ev),
+                        None => {
+                            processed += 1;
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+                OneDriveItem::Reconciled {
+                    source_id,
+                    event,
+                    item,
+                } => (item.as_ref(), source_id.clone(), event.clone()),
+            };
+
+            let name = file
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| source_id.clone());
+            let current = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                onedrive::read_item_state(&conn, &source_id)?
+            };
+            let actions = index_only::react(event, current.as_ref());
+            let category = action_category(&actions);
+
+            let needs_body = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    index_only::Action::IngestNew { .. } | index_only::Action::ReEmbed { .. }
+                )
+            });
+            let fetched = if needs_body {
+                let body = match file {
+                    Some(f) => {
+                        let state = app.state::<AppState>();
+                        onedrive::fetch_body(state.inner(), &w.token_key, f).await
+                    }
+                    None => Ok(None),
+                };
+                match body {
+                    Ok(Some(text)) => file.map(|f| f.pointer(source_id.clone(), text)),
+                    Ok(None) => {
+                        processed += 1;
+                        skipped += 1;
+                        record_onedrive_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            "No extractable text (unsupported file type or empty)",
+                        );
+                        emit_onedrive_progress(
+                            app,
+                            onedrive::OneDriveSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        processed += 1;
+                        failed += 1;
+                        record_onedrive_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            &format!("Couldn't fetch from OneDrive: {e}"),
+                        );
+                        last_err = Some(e);
+                        emit_onedrive_progress(
+                            app,
+                            onedrive::OneDriveSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let app2 = app.clone();
+            let apply =
+                tokio::task::spawn_blocking(move || apply_drive_actions(&app2, &actions, fetched))
+                    .await
+                    .map_err(|e| Error::Other(format!("onedrive apply task panicked: {e}")))?;
+            match apply {
+                Ok(()) => match category {
+                    DriveActionKind::Indexed => indexed += 1,
+                    DriveActionKind::Updated => updated += 1,
+                    DriveActionKind::Removed => removed += 1,
+                    DriveActionKind::Other => skipped += 1,
+                },
+                Err(e) => {
+                    failed += 1;
+                    record_onedrive_issue(
+                        &mut issues,
+                        &mut issues_truncated,
+                        &name,
+                        &format!("Indexing failed: {e}"),
+                    );
+                    last_err = Some(e);
+                }
+            }
+            processed += 1;
+            emit_onedrive_progress(
+                app,
+                onedrive::OneDriveSyncEvent::Item {
+                    processed,
+                    total,
+                    name,
+                },
+            );
+            let pause_ms = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                db::indexing_pause_ms(&conn)
+            };
+            if pause_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            }
+        }
+
+        // Persist the pass: advance the whole-drive delta link (if synced), stamp the time, clear
+        // failure state. Auth-failed accounts already `continue`d above.
+        {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            onedrive::finalize_sync(&conn, &w.email, w.new_cursor.as_deref())?;
+        }
+    }
+
+    let report = onedrive::OneDriveSyncReport {
+        indexed,
+        updated,
+        removed,
+        skipped,
+        failed,
+        cancelled,
+        issues,
+        issues_truncated,
+    };
+    emit_onedrive_progress(app, onedrive::OneDriveSyncEvent::Finished { report });
+
+    if !cancelled {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(indexed + updated + removed)
 }
 
 // --- structured preferences (§4.5 — the typed model that replaces the Learning-You blob) ---
