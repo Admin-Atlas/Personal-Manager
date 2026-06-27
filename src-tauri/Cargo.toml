@@ -82,7 +82,7 @@ keyring = { version = "3", features = ["windows-native"] }
 # Windows Hello for the optional, opt-in app-lock (a soft UI gate — see applock.rs).
 # Microsoft-maintained bindings (the same `windows` 0.61 Tauri already resolves, so no
 # duplicate version); windows-future supplies the `IAsyncOperation::get()` we block on.
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
     "Security_Credentials_UI",
     "Win32_Foundation",
     "Win32_System_Com",
