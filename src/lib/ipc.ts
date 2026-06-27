@@ -554,6 +554,9 @@ export const optionalTsneStatus = () => invoke<TsneStatus>("optional_tsne_status
 /** Install the optional t-SNE reducer into the managed venv, then recompute the layout with it. */
 export const installOptionalTsne = () => invoke<void>("install_optional_tsne");
 
+/** Remove the optional t-SNE reducer from the venv (the "delete" action), then recompute with PCA. */
+export const uninstallOptionalTsne = () => invoke<void>("uninstall_optional_tsne");
+
 /** Subscribe to global semantic-layout progress (fires regardless of which view started the job). */
 export const onLayoutProgress = (handler: (e: LayoutProgressEvent) => void): Promise<UnlistenFn> =>
   listen<LayoutProgressEvent>("layout://progress", (e) => handler(e.payload));

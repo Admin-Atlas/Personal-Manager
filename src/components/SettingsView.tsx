@@ -17,6 +17,7 @@ import {
   onTsneInstall,
   openDataFolder,
   optionalTsneStatus,
+  uninstallOptionalTsne,
   refreshPricing,
   setPref,
   startSemanticLayout,
@@ -121,8 +122,13 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     return Number.isFinite(r) ? Math.max(0, Math.min(0.5, r)) : 0;
   });
   const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
+  // Whether to *use* t-SNE when it's installed (vs falling back to PCA). Default true; lives in the
+  // `map` pref alongside nodeCap, so the backend reads it for the layout fingerprint.
+  const [mapTsneEnabled, setMapTsneEnabled] = useState(true);
   const [installingTsne, setInstallingTsne] = useState(false);
   const [tsneInstallFrac, setTsneInstallFrac] = useState(0);
+  const [removingTsne, setRemovingTsne] = useState(false);
+  const [confirmRemoveTsne, setConfirmRemoveTsne] = useState(false);
   // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
   // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
@@ -210,8 +216,9 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       .then((v) => {
         if (!v) return;
         try {
-          const cap = JSON.parse(v)?.nodeCap;
-          if (typeof cap === "number") setMapNodeCap(cap);
+          const pref = JSON.parse(v);
+          if (typeof pref?.nodeCap === "number") setMapNodeCap(pref.nodeCap);
+          if (typeof pref?.tsneEnabled === "boolean") setMapTsneEnabled(pref.tsneEnabled);
         } catch {
           /* ignore a malformed pref */
         }
@@ -249,12 +256,22 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     localStorage.setItem("pm.map.cohesion", String(next)); // shared with the Map's cohesion control
   }
 
-  function changeMapNodeCap(next: number) {
-    setMapNodeCap(next);
-    // The cap is part of the layout fingerprint; recompute in the background so the change takes hold.
-    void setPref("map", JSON.stringify({ nodeCap: next }))
+  // The `map` pref is one blob (`{ nodeCap, tsneEnabled }`), both part of the layout fingerprint —
+  // write it whole (so neither key is lost) and recompute in the background so the change takes hold.
+  function persistMapPref(nodeCap: number, tsneEnabled: boolean) {
+    return setPref("map", JSON.stringify({ nodeCap, tsneEnabled }))
       .then(() => startSemanticLayout())
       .catch(() => {});
+  }
+
+  function changeMapNodeCap(next: number) {
+    setMapNodeCap(next);
+    void persistMapPref(next, mapTsneEnabled);
+  }
+
+  function changeTsneEnabled(next: boolean) {
+    setMapTsneEnabled(next);
+    void persistMapPref(mapNodeCap, next);
   }
 
   function downloadTsne() {
@@ -262,9 +279,27 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     setTsneInstallFrac(0);
     installOptionalTsne()
       .then(() => optionalTsneStatus())
-      .then((s) => setTsneInstalled(s.installed))
+      .then((s) => {
+        setTsneInstalled(s.installed);
+        if (s.installed) {
+          setMapTsneEnabled(true); // a fresh install starts enabled
+          void persistMapPref(mapNodeCap, true);
+        }
+      })
       .catch((e) => setError(String(e)))
       .finally(() => setInstallingTsne(false));
+  }
+
+  function removeTsne() {
+    setRemovingTsne(true);
+    uninstallOptionalTsne()
+      .then(() => optionalTsneStatus())
+      .then((s) => setTsneInstalled(s.installed))
+      .catch((e) => setError(String(e)))
+      .finally(() => {
+        setRemovingTsne(false);
+        setConfirmRemoveTsne(false);
+      });
   }
 
   async function toggleAppLock(next: boolean) {
@@ -739,8 +774,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       value={mapGrouping}
                       onChange={changeMapGrouping}
                       options={[
-                        { value: "semantic", label: "Semantic" },
                         { value: "project", label: "By project" },
+                        { value: "semantic", label: "Semantic" },
                       ]}
                     />
                   </div>
@@ -774,7 +809,31 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     {tsneInstalled === null ? (
                       <span className="text-xs text-ink4">…</span>
                     ) : tsneInstalled ? (
-                      <span className="text-xs text-ink3">Installed</span>
+                      <div className="flex items-center gap-3">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={mapTsneEnabled}
+                          aria-label="Use the enhanced t-SNE layout"
+                          onClick={() => changeTsneEnabled(!mapTsneEnabled)}
+                          className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                            mapTsneEnabled ? "bg-accent" : "bg-surface"
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                              mapTsneEnabled ? "translate-x-4" : "translate-x-0.5"
+                            }`}
+                          />
+                        </button>
+                        <Button
+                          variant="secondary"
+                          onClick={() => setConfirmRemoveTsne(true)}
+                          disabled={removingTsne}
+                        >
+                          {removingTsne ? "Removing…" : "Remove"}
+                        </Button>
+                      </div>
                     ) : (
                       <Button variant="secondary" onClick={downloadTsne} disabled={installingTsne}>
                         {installingTsne ? "Downloading…" : "Download"}
@@ -794,8 +853,22 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     Semantic proximity uses a basic on-device layout by default. Project cohesion
                     gently pulls same-project documents together (Off keeps the layout purely by
                     meaning). The optional t-SNE component (a one-time download) produces tighter
-                    clusters of related documents.
+                    clusters of related documents — once installed you can turn it on or off, or
+                    remove it to free space.
                   </p>
+                  <ConfirmDialog
+                    open={confirmRemoveTsne}
+                    title="Remove the enhanced layout?"
+                    confirmLabel="Remove"
+                    danger
+                    busy={removingTsne}
+                    onConfirm={removeTsne}
+                    onClose={() => setConfirmRemoveTsne(false)}
+                  >
+                    This deletes the optional t-SNE component from PM's document engine. The
+                    semantic Map will go back to the basic (PCA) layout. You can download it again
+                    any time.
+                  </ConfirmDialog>
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">

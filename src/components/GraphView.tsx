@@ -434,8 +434,18 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     if (!wrap) return;
     const onWheel = (e: WheelEvent) => {
       const canvas = canvasRef.current;
-      if (!canvas || !viewRef.current) return;
+      const t = viewRef.current;
+      if (!canvas || !t) return;
       e.preventDefault();
+      // A horizontal-dominant wheel (trackpad side-swipe or Shift+wheel) pans left/right; a vertical
+      // wheel zooms toward the cursor. Scrolling right reveals content to the right.
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        viewRef.current = { ...t, offsetX: t.offsetX - e.deltaX };
+        interactedRef.current = true;
+        setHovered(null);
+        requestAnimationFrame(() => drawRef.current());
+        return;
+      }
       const rect = canvas.getBoundingClientRect();
       const factor = Math.exp(-e.deltaY * 0.0015);
       zoomAt(e.clientX - rect.left, e.clientY - rect.top, factor);
@@ -540,16 +550,31 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
             className="flex rounded-[var(--radius-sm)] border border-border p-0.5 text-xs"
             data-help={toggleHelp}
           >
+            <ModeButton active={layoutMode === "project"} onClick={() => setLayoutMode("project")}>
+              By project
+            </ModeButton>
             <ModeButton
               active={layoutMode === "semantic"}
               onClick={() => setLayoutMode("semantic")}
             >
               Semantic
             </ModeButton>
-            <ModeButton active={layoutMode === "project"} onClick={() => setLayoutMode("project")}>
-              By project
-            </ModeButton>
           </div>
+          {layoutMode === "semantic" && (
+            <label className="flex items-center gap-1.5 text-xs text-ink3" data-help="map-cohesion">
+              <span>Cohesion</span>
+              <select
+                value={String(cohesion)}
+                onChange={(e) => setCohesion(Number(e.target.value))}
+                className="rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 text-xs text-ink2 outline-none transition focus:border-accent"
+              >
+                <option value="0">Off</option>
+                <option value="0.15">Low</option>
+                <option value="0.3">Medium</option>
+                <option value="0.5">High</option>
+              </select>
+            </label>
+          )}
         </div>
         {base && (
           <div className="flex max-w-[50%] flex-wrap justify-end gap-x-3 gap-y-1">
@@ -573,8 +598,6 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
           installing={installingTsne}
           installFrac={installFrac}
           onInstall={installTsne}
-          cohesion={cohesion}
-          onCohesion={setCohesion}
         />
       )}
 
@@ -694,70 +717,49 @@ function NavControls({
   );
 }
 
-/** The strip under the header in semantic mode: status (recompute / install / nudge) on the left, the
- *  project-cohesion control on the right. */
+/** The strip under the header in semantic mode — only shown when there's status to report (a download
+ *  in progress, a recompute, or the not-installed nudge); otherwise it renders nothing. */
 function SemanticBar({
   computing,
   tsneInstalled,
   installing,
   installFrac,
   onInstall,
-  cohesion,
-  onCohesion,
 }: {
   computing: boolean;
   tsneInstalled: boolean | null;
   installing: boolean;
   installFrac: number;
   onInstall: () => void;
-  cohesion: number;
-  onCohesion: (v: number) => void;
 }) {
+  if (!installing && !computing && tsneInstalled !== false) return null;
   return (
-    <div className="flex items-center justify-between gap-4 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
-      <div className="flex min-h-[1.25rem] flex-1 items-center gap-2">
-        {installing ? (
-          <IngestProgress
-            mode="percent"
-            processed={Math.round(installFrac * 100)}
-            total={100}
-            label="Downloading the enhanced (t-SNE) layout"
-            className="w-full max-w-xs"
-          />
-        ) : computing ? (
-          <>
-            <Skeleton className="h-2 w-2" style={{ borderRadius: "9999px" }} />
-            Updating the map by meaning…
-          </>
-        ) : tsneInstalled === false ? (
-          <>
-            <span>Using the basic layout.</span>
-            <button
-              type="button"
-              onClick={onInstall}
-              className="font-medium text-accent hover:underline"
-            >
-              Enable enhanced (t-SNE) →
-            </button>
-          </>
-        ) : null}
-      </div>
-      <label
-        className="flex shrink-0 items-center gap-2 whitespace-nowrap"
-        data-help="map-cohesion"
-      >
-        <span className="text-ink3">Project cohesion</span>
-        <select
-          value={String(cohesion)}
-          onChange={(e) => onCohesion(Number(e.target.value))}
-          className="rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 text-xs text-ink2 outline-none transition focus:border-accent"
-        >
-          <option value="0">Off</option>
-          <option value="0.15">Low</option>
-          <option value="0.3">Medium</option>
-          <option value="0.5">High</option>
-        </select>
-      </label>
+    <div className="flex min-h-[1.75rem] items-center gap-2 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
+      {installing ? (
+        <IngestProgress
+          mode="percent"
+          processed={Math.round(installFrac * 100)}
+          total={100}
+          label="Downloading the enhanced (t-SNE) layout"
+          className="w-full max-w-xs"
+        />
+      ) : computing ? (
+        <>
+          <Skeleton className="h-2 w-2" style={{ borderRadius: "9999px" }} />
+          Updating the map by meaning…
+        </>
+      ) : (
+        <>
+          <span>Using the basic layout.</span>
+          <button
+            type="button"
+            onClick={onInstall}
+            className="font-medium text-accent hover:underline"
+          >
+            Enable enhanced (t-SNE) →
+          </button>
+        </>
+      )}
     </div>
   );
 }

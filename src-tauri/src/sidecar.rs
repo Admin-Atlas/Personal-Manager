@@ -675,6 +675,36 @@ impl SidecarManager {
         Ok(())
     }
 
+    /// Remove the OPTIONAL t-SNE component again (the "delete" action). Drops the marker first — that
+    /// alone disables t-SNE (`optional_tsne_ready` then reports false and the map falls back to PCA) —
+    /// then `pip uninstall`s openTSNE to reclaim space. Only openTSNE is removed: its heavier transitive
+    /// deps (scipy / scikit-learn) are left in place so we can never accidentally break the base venv by
+    /// pulling a package something else relies on; a later re-install is then quick. Idempotent.
+    pub fn uninstall_optional_tsne(&self) -> Result<()> {
+        let _install = self.install.lock().unwrap();
+        // Drop the marker first so the feature is off even if the pip call below fails.
+        let _ = std::fs::remove_file(self.paths.tsne_marker());
+        let py = self.paths.venv_python();
+        if !py.exists() {
+            return Ok(());
+        }
+        let mut pip = Command::new(&py);
+        pip.args([
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "--disable-pip-version-check",
+            "openTSNE",
+        ]);
+        clean_python_env(&mut pip);
+        no_window(&mut pip);
+        // Best-effort: the marker is already gone, so a pip hiccup just leaves the (unused) package on
+        // disk rather than failing the user's "remove".
+        let _ = run_command(&mut pip, "pip uninstall openTSNE");
+        Ok(())
+    }
+
     /// Send one request to the child and read its reply. Spawns the child lazily.
     /// Serialized by the process mutex, so the next stdout line is our reply.
     fn request(&self, method: &str, params: Value) -> Result<Value> {

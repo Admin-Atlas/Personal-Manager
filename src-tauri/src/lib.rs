@@ -562,6 +562,7 @@ pub fn run() {
             layout::prioritise_semantic_layout,
             layout::optional_tsne_status,
             layout::install_optional_tsne,
+            layout::uninstall_optional_tsne,
             commands::open_external_ref,
             commands::open_url,
             commands::get_daily_briefing,

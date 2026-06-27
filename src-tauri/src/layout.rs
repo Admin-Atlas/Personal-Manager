@@ -101,8 +101,10 @@ fn with_job(app: &AppHandle, f: impl FnOnce(&mut LayoutJobState)) {
 /// Everything that, if changed, makes a cached layout stale.
 #[derive(Serialize, Deserialize, PartialEq)]
 struct Fingerprint {
-    /// Whether the optional t-SNE component is installed — flips the reducer, so it invalidates.
-    tsne_available: bool,
+    /// Whether t-SNE is the *effective* reducer (installed AND enabled by the user) — flips the
+    /// reducer, so it invalidates. (Renamed from `tsne_available`; an older stored fingerprint simply
+    /// fails to deserialize and triggers one recompute.)
+    tsne: bool,
     embedder: String,
     dim: usize,
     node_cap: usize,
@@ -273,15 +275,29 @@ fn document_vectors(conn: &Connection) -> Result<Vec<DocVec>> {
     Ok(out)
 }
 
-/// The user-chosen node cap, clamped to the supported range; the default when unset.
-fn read_node_cap(conn: &Connection) -> usize {
+/// The `map` webview-writable pref blob (`{ nodeCap?, tsneEnabled? }`), or `None` if unset/malformed.
+fn read_map_pref(conn: &Connection) -> Option<serde_json::Value> {
     db::get_setting(conn, MAP_PREF_KEY)
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+}
+
+/// The user-chosen node cap, clamped to the supported range; the default when unset.
+fn read_node_cap(conn: &Connection) -> usize {
+    read_map_pref(conn)
         .and_then(|v| v.get("nodeCap").and_then(|n| n.as_u64()))
         .map(|n| (n as usize).clamp(NODE_CAP_MIN, NODE_CAP_MAX))
         .unwrap_or(DEFAULT_NODE_CAP)
+}
+
+/// Whether the user has the enhanced (t-SNE) layout *enabled* — separate from whether it's installed.
+/// Default true, so an existing install keeps using t-SNE; toggling it off uses PCA without
+/// uninstalling. Part of the layout fingerprint via [`Fingerprint::tsne`], so a change recomputes.
+fn read_tsne_enabled(conn: &Connection) -> bool {
+    read_map_pref(conn)
+        .and_then(|v| v.get("tsneEnabled").and_then(|b| b.as_bool()))
+        .unwrap_or(true)
 }
 
 // ---- precompute -----------------------------------------------------------
@@ -337,9 +353,11 @@ async fn run_precompute(app: &AppHandle, force_recompute: bool, ignore_drive: bo
         let dim = db::vec0_dim(&conn)?;
         let embedder = db::selected_embedder(&conn)?.id.to_string();
         let node_cap = read_node_cap(&conn);
+        // t-SNE is the effective reducer only when it's installed AND the user has it enabled.
+        let use_tsne = tsne_available && read_tsne_enabled(&conn);
         let sigs = doc_signatures(&conn)?;
         let fp = Fingerprint {
-            tsne_available,
+            tsne: use_tsne,
             embedder,
             dim,
             node_cap,
@@ -399,7 +417,7 @@ async fn run_precompute(app: &AppHandle, force_recompute: bool, ignore_drive: bo
         return Ok(());
     }
 
-    let requested = if tsne_available { "tsne" } else { "pca" };
+    let requested = if fingerprint.tsne { "tsne" } else { "pca" };
     emit(
         app,
         LayoutProgressEvent::Reducing {
@@ -538,6 +556,26 @@ pub async fn install_optional_tsne(app: AppHandle) -> Result<()> {
     .map_err(|e| Error::Other(format!("t-SNE install task panicked: {e}")))??;
 
     // Now that t-SNE is available, refresh the layout with it (force, and don't defer).
+    let app3 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = precompute_semantic_layout(&app3, true, true).await;
+    });
+    Ok(())
+}
+
+/// Remove the optional t-SNE component (the "delete" action), then recompute the layout with PCA in the
+/// background. Blocking uninstall runs off the async runtime; errors surface to the caller so Settings
+/// can show them.
+#[tauri::command]
+pub async fn uninstall_optional_tsne(app: AppHandle) -> Result<()> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app2.state::<AppState>().sidecar.uninstall_optional_tsne()
+    })
+    .await
+    .map_err(|e| Error::Other(format!("t-SNE uninstall task panicked: {e}")))??;
+
+    // t-SNE is gone (or disabled) — refresh the layout with PCA.
     let app3 = app.clone();
     tauri::async_runtime::spawn(async move {
         let _ = precompute_semantic_layout(&app3, true, true).await;
