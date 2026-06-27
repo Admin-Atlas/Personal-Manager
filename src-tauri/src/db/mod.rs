@@ -36,6 +36,48 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove a key from the `settings` table (a no-op if it isn't present).
+pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
+/// Settings key for the indexing-speed preference: "fast" (default, max throughput) or "gentle"
+/// (paced so a low-end machine stays usable while it indexes in the background).
+pub const INDEXING_SPEED_KEY: &str = "indexing_speed";
+
+/// Pause (ms) inserted after each indexed file in "gentle" mode, so embedding doesn't pin the CPU
+/// continuously. A balance: enough idle for the machine to stay responsive, not so much that a large
+/// index never finishes. "fast" inserts no pause.
+const GENTLE_INDEX_PAUSE_MS: u64 = 250;
+
+/// Embedding batch cap in "gentle" mode: the sidecar embeds at most this many chunks per forward
+/// pass, bounding peak activation memory so indexing on a low-memory machine doesn't spike RAM.
+/// "fast" passes `None` (the embedder's own default batch — max throughput). Small enough to bound
+/// memory, large enough that per-batch overhead stays negligible.
+const GENTLE_EMBED_BATCH: usize = 8;
+
+/// How long indexing should pause between files for the current speed setting (0 unless "gentle").
+/// Cheap to read, so callers re-read it between files — flipping Fast/Gentle then takes effect on
+/// the very next file, even partway through a sync.
+pub fn indexing_pause_ms(conn: &Connection) -> u64 {
+    match get_setting(conn, INDEXING_SPEED_KEY) {
+        Ok(Some(v)) if v == "gentle" => GENTLE_INDEX_PAUSE_MS,
+        _ => 0,
+    }
+}
+
+/// The index-time embedding batch cap for the current speed setting: `Some(GENTLE_EMBED_BATCH)` in
+/// "gentle" mode (bounded memory), `None` otherwise (embedder default). Read alongside
+/// [`indexing_pause_ms`]; the Drive path re-reads it per item, so gentle batching also engages
+/// mid-sync.
+pub fn indexing_embed_batch(conn: &Connection) -> Option<usize> {
+    match get_setting(conn, INDEXING_SPEED_KEY) {
+        Ok(Some(v)) if v == "gentle" => Some(GENTLE_EMBED_BATCH),
+        _ => None,
+    }
+}
+
 /// The `settings` key holding the retrieval-config stamp (spec §21.4). One JSON row capturing
 /// the index-time config that produced this vault's index.
 const RETRIEVAL_STAMP_KEY: &str = "retrieval_config";
@@ -716,6 +758,7 @@ mod tests {
              DROP TABLE entities; \
              ALTER TABLE documents DROP COLUMN entity_id; \
              ALTER TABLE projects  DROP COLUMN entity_id; \
+             ALTER TABLE usage_log DROP COLUMN cost_usd; \
              PRAGMA user_version = 9;",
         )
         .unwrap();
@@ -838,6 +881,7 @@ mod tests {
              ALTER TABLE documents DROP COLUMN stored_summary; \
              ALTER TABLE entities DROP COLUMN confidence; \
              ALTER TABLE entities DROP COLUMN user_confirmed; \
+             ALTER TABLE usage_log DROP COLUMN cost_usd; \
              PRAGMA user_version = 10;",
         )
         .unwrap();

@@ -31,6 +31,13 @@ const IMPORTANCE_OPTIONS: ReadonlyArray<SegOption<string>> = IMPORTANCE_LEVELS.m
   label: level ?? "none",
 }));
 
+// Module-level caches (keyed by document id) so leaving the Review tab and returning doesn't re-run
+// the AI proposals — those cost tokens, and the queue can be hundreds of items deep while a Drive
+// index is running. They survive unmount; `load` restores from them, only proposing for documents
+// not yet cached, prunes entries for docs that have left the queue, and "Re-propose" clears them.
+const proposalCache = new Map<number, MetadataProposal>();
+const editCache = new Map<number, Edit>();
+
 export function ReviewView({ onChanged }: Props) {
   const [queue, setQueue] = useState<Document[]>([]);
   const [proposals, setProposals] = useState<Record<number, MetadataProposal>>({});
@@ -59,20 +66,46 @@ export function ReviewView({ onChanged }: Props) {
       const [q, p] = await Promise.all([reviewQueue(), listProjects()]);
       setQueue(q);
       setProjects(p);
-      // Seed edits from each document's current values until a proposal lands.
-      setEdits(
-        Object.fromEntries(
-          q.map((d) => [d.id, { project: d.project, tags: d.tags, importance: d.importance }]),
-        ),
-      );
-      setProposals({});
-      if (q.length > 0) await runProposals();
+      // Prune cache entries for documents that have left the queue (committed/removed elsewhere).
+      const ids = new Set(q.map((d) => d.id));
+      for (const id of [...proposalCache.keys()]) if (!ids.has(id)) proposalCache.delete(id);
+      for (const id of [...editCache.keys()]) if (!ids.has(id)) editCache.delete(id);
+      // Restore any cached proposals/edits; seed the rest from each document's current values.
+      const restored: Record<number, MetadataProposal> = {};
+      const seededEdits: Record<number, Edit> = {};
+      for (const d of q) {
+        const cached = proposalCache.get(d.id);
+        if (cached) restored[d.id] = cached;
+        seededEdits[d.id] = editCache.get(d.id) ?? {
+          project: d.project,
+          tags: d.tags,
+          importance: d.importance,
+        };
+      }
+      setProposals(restored);
+      setEdits(seededEdits);
+      // Only ask the model for documents we don't already have a proposal for — so peeking at the
+      // tab (or a few new items arriving) never re-runs proposals the model already produced.
+      const missing = q.filter((d) => !proposalCache.has(d.id)).map((d) => d.id);
+      if (missing.length > 0) await runProposals(missing);
     } catch (e) {
       setError(String(e));
     }
   }
 
-  async function runProposals() {
+  // Regenerate from scratch (the explicit "Re-propose" action): clear the cache for the queue so
+  // every row is proposed afresh, discarding prior proposals and hand-edits.
+  function repropose() {
+    for (const d of queue) {
+      proposalCache.delete(d.id);
+      editCache.delete(d.id);
+    }
+    setProposals({});
+    void runProposals(queue.map((d) => d.id));
+  }
+
+  async function runProposals(ids: number[]) {
+    if (ids.length === 0) return;
     const myRun = ++runRef.current;
     setProposing(true);
     setError(null);
@@ -82,18 +115,18 @@ export function ReviewView({ onChanged }: Props) {
         if (runRef.current !== myRun) return; // superseded run or unmounted
         if (event.type !== "proposed") return;
         const { document_id, proposal } = event;
+        proposalCache.set(document_id, proposal);
         setProposals((prev) => ({ ...prev, [document_id]: proposal }));
         // Don't clobber a row the user has already hand-edited while proposals stream.
         if (dirtyRef.current.has(document_id)) return;
-        setEdits((prev) => ({
-          ...prev,
-          [document_id]: {
-            project: proposal.project,
-            tags: proposal.tags,
-            importance: proposal.importance,
-          },
-        }));
-      });
+        const edit = {
+          project: proposal.project,
+          tags: proposal.tags,
+          importance: proposal.importance,
+        };
+        editCache.set(document_id, edit);
+        setEdits((prev) => ({ ...prev, [document_id]: edit }));
+      }, ids);
     } catch (e) {
       if (runRef.current === myRun) setError(String(e));
     } finally {
@@ -103,7 +136,12 @@ export function ReviewView({ onChanged }: Props) {
 
   function updateEdit(id: number, patch: Partial<Edit>) {
     dirtyRef.current.add(id);
-    setEdits((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+    setEdits((prev) => {
+      const next = { ...prev[id], ...patch } as Edit;
+      // Persist hand-edits across tab switches too, so returning doesn't lose them.
+      editCache.set(id, next);
+      return { ...prev, [id]: next };
+    });
   }
 
   function decisionFor(doc: Document): ReviewDecision {
@@ -130,6 +168,10 @@ export function ReviewView({ onChanged }: Props) {
     setError(null);
     try {
       await commitReview(queue.map(decisionFor));
+      for (const d of queue) {
+        proposalCache.delete(d.id);
+        editCache.delete(d.id);
+      }
       setQueue([]);
       setProposals({});
       onChanged();
@@ -166,7 +208,7 @@ export function ReviewView({ onChanged }: Props) {
         <div className="flex items-center gap-2">
           <Button
             variant="tertiary"
-            onClick={runProposals}
+            onClick={repropose}
             disabled={proposing || committing || queue.length === 0}
             data-help="review-repropose"
             title="Re-run the AI proposals"
@@ -284,7 +326,7 @@ function ReviewRow({
         )}
 
         <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-3">
-          <label className="flex items-center gap-2 text-xs text-ink3">
+          <label className="flex items-center gap-2 text-xs text-ink3" data-help="review-project">
             Project
             <Input
               list={PROJECTS_LIST_ID}
@@ -294,7 +336,7 @@ function ReviewRow({
             />
           </label>
 
-          <div className="flex items-center gap-2 text-xs text-ink3">
+          <div className="flex items-center gap-2 text-xs text-ink3" data-help="review-importance">
             Importance
             <ImportancePicker
               value={value.importance}
@@ -303,7 +345,7 @@ function ReviewRow({
           </div>
         </div>
 
-        <div className="mt-3">
+        <div className="mt-3" data-help="review-tags">
           <TagEditor tags={value.tags} onChange={(tags) => onChange({ tags })} />
         </div>
       </Card>

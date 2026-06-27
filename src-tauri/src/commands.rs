@@ -7,8 +7,9 @@
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::sync::atomic::Ordering;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::calendar::{self, CalendarEvent, CalendarInfo, IcsFeedInfo};
 use crate::error::{Error, Result};
@@ -97,6 +98,9 @@ pub struct Settings {
     /// Whether query-time reranking is on (a cross-encoder re-scores search hits for sharper
     /// relevance). Default on; stateless, so toggling it never triggers a Rebuild.
     pub reranking: bool,
+    /// Indexing speed: "fast" (default, max throughput) or "gentle" (paced so a low-end machine
+    /// stays usable while indexing runs in the background).
+    pub indexing_speed: String,
 }
 
 /// Streamed back to the UI over a Tauri channel as the assistant replies.
@@ -160,7 +164,19 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
         help_mode: db::get_setting(&conn, "help_mode")?.as_deref() == Some("true"),
         time_zone: db::get_setting(&conn, TIME_ZONE_KEY)?.unwrap_or_default(),
         reranking: db::reranking_enabled(&conn)?,
+        indexing_speed: db::get_setting(&conn, db::INDEXING_SPEED_KEY)?
+            .unwrap_or_else(|| "fast".into()),
     })
+}
+
+/// Set the indexing-speed preference. "gentle" paces indexing (Drive sync + file import) so a low-end
+/// machine stays usable while it works in the background; "fast" runs at full throughput. Anything
+/// else is treated as "fast".
+#[tauri::command]
+pub fn set_indexing_speed(state: State<'_, AppState>, speed: String) -> Result<()> {
+    let value = if speed == "gentle" { "gentle" } else { "fast" };
+    let conn = state.conn()?;
+    db::set_setting(&conn, db::INDEXING_SPEED_KEY, value)
 }
 
 #[tauri::command]
@@ -2270,17 +2286,446 @@ pub fn disconnect_drive(state: State<'_, AppState>, email: String) -> Result<()>
     Ok(())
 }
 
-/// Sync one Drive account (or every account when `account` is `None`) into the index-only store. The
-/// first sync enumerates My Drive and ingests everything (the slow one — the UI warns); later syncs
-/// apply only the Drive changes feed. Every item is index-only: a pointer + embedding, the body
-/// fetched live. Never holds the DB lock across a network/embed call (rule #4). Streams
-/// `DriveSyncEvent` for the shared progress bar. Returns the number of items touched.
+/// The shared drives one connected account can see (`drives.list`) — for the "add shared drives"
+/// picker. Read-only enumeration over the account's own token; no DB and no sidecar needed.
 #[tauri::command]
-pub async fn sync_drive(
-    app: AppHandle,
-    account: Option<String>,
-    on_event: Channel<drive::DriveSyncEvent>,
-) -> Result<usize> {
+pub async fn list_drive_shared_drives(email: String) -> Result<Vec<drive::SharedDrive>> {
+    drive::list_shared_drives(&drive::account_token_key(&email)).await
+}
+
+/// The immediate subfolders of `parent_id` inside a shared drive — one lazy level of the folder
+/// picker. Pass the shared drive's id as `parent_id` for the top level.
+#[tauri::command]
+pub async fn list_drive_folders(
+    email: String,
+    drive_id: String,
+    parent_id: String,
+) -> Result<Vec<drive::DriveFolder>> {
+    drive::list_folders(&drive::account_token_key(&email), &drive_id, &parent_id).await
+}
+
+/// One account's indexing scope (My Drive on/off + opted-in shared drives and their folders).
+#[tauri::command]
+pub fn get_drive_scope(state: State<'_, AppState>, email: String) -> Result<drive::DriveScope> {
+    let conn = state.conn()?;
+    drive::get_scope(&conn, &email)
+}
+
+/// Persist one account's indexing scope. The UI follows this with a `sync_drive` to apply it (index
+/// newly-in-scope files, soft-remove files that fell out of scope).
+#[tauri::command]
+pub fn set_drive_scope(
+    state: State<'_, AppState>,
+    email: String,
+    scope: drive::DriveScope,
+) -> Result<()> {
+    let conn = state.conn()?;
+    drive::set_scope(&conn, &email, &scope)
+}
+
+/// One unit of sync work for an account, gathered off the lock in phase 1.
+enum DriveItem {
+    /// A My-Drive first-sync file → `Add`.
+    Enumerated(drive::DriveFile),
+    /// A My-Drive changes-feed entry → mapped via `map_change`.
+    Changed(drive::DriveChange),
+    /// A shared-drive reconcile result with its event pre-built: `Add` for a new/reactivating file
+    /// (reducer: unknown→ingest, missing/unreachable→reachable), `Update` for a present healthy file
+    /// (same-hash→noop, changed→re-embed), or `Delete` for a file that vanished from the enumeration.
+    Reconciled {
+        source_id: String,
+        event: index_only::ChangeEvent,
+        file: Option<drive::DriveFile>,
+    },
+}
+
+/// All of one account's gathered work for a sync pass (My Drive + shared drives together).
+struct AccountWork {
+    email: String,
+    token_key: String,
+    items: Vec<DriveItem>,
+    /// The advanced My-Drive delta cursor — set only when My Drive was synced this pass.
+    new_cursor: Option<String>,
+    /// Advanced delta cursors for whole-drive shared selections — `(driveId, newCursor)`, one per
+    /// whole-drive shared drive that synced cleanly this pass. Folder-scoped selections add nothing.
+    shared_new_cursors: Vec<(String, String)>,
+    auth_failed: bool,
+}
+
+/// Gather one opted-in shared drive's work, dispatching on how much of it is in scope:
+/// - **Folder-scoped** (`folders = Some`) → [`gather_shared_folders`] (re-enumerate + reconcile; the
+///   changes feed can't be scoped to folders). No cursor.
+/// - **Whole drive** (`folders = None`) → [`gather_shared_whole`] (the same efficient delta-cursor
+///   path My Drive uses). Returns the advanced `(driveId, cursor)` to persist on a clean pass.
+async fn gather_shared(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    sel: &drive::SharedSelection,
+) -> Result<(Vec<DriveItem>, Option<(String, String)>)> {
+    match sel.folders.as_deref() {
+        Some(folders) => Ok((
+            gather_shared_folders(app, token_key, email, &sel.drive_id, folders).await?,
+            None,
+        )),
+        None => gather_shared_whole(app, token_key, email, &sel.drive_id).await,
+    }
+}
+
+/// Folder-scoped reconcile: enumerate the selected folders live and diff against the currently-healthy
+/// known set. A present file already healthy → `Update` (catches edits); a present file new or
+/// previously missing/unreachable → `Add` (ingests, or reactivates a folder the user removed and
+/// re-added); a known file no longer present → `Delete`. Reads the known set under a brief lock; the
+/// enumeration itself is off the lock.
+async fn gather_shared_folders(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    drive_id: &str,
+    folders: &[String],
+) -> Result<Vec<DriveItem>> {
+    let files = drive::enumerate_shared(token_key, drive_id, Some(folders)).await?;
+    let known: std::collections::HashSet<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        drive::known_shared_source_ids(&conn, email, drive_id)?
+            .into_iter()
+            .collect()
+    };
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut items: Vec<DriveItem> = Vec::with_capacity(files.len());
+    for f in files {
+        let source_id = drive::shared_source_id(email, drive_id, &f.id);
+        present.insert(source_id.clone());
+        let event = if known.contains(&source_id) {
+            index_only::ChangeEvent::Update {
+                source_id: source_id.clone(),
+                modified_at: f.modified_time.clone(),
+                new_content_hash: f.content_hash(),
+            }
+        } else {
+            index_only::ChangeEvent::Add {
+                source_id: source_id.clone(),
+                modified_at: f.modified_time.clone(),
+            }
+        };
+        items.push(DriveItem::Reconciled {
+            source_id,
+            event,
+            file: Some(f),
+        });
+    }
+    for source_id in known {
+        if !present.contains(&source_id) {
+            items.push(DriveItem::Reconciled {
+                source_id: source_id.clone(),
+                event: index_only::ChangeEvent::Delete { source_id },
+                file: None,
+            });
+        }
+    }
+    Ok(items)
+}
+
+/// Whole-drive sync via a **per-drive delta cursor** — the same cheap path My Drive uses, so a large
+/// shared drive isn't fully re-listed every sync. First pass (no stored cursor, or a 410 reset)
+/// enumerates the drive as `Add`s and baselines a fresh start token; later passes pull only the
+/// drive's own changes feed and advance the cursor. Returns the items plus `(driveId, newCursor)` to
+/// persist after the pass commits.
+async fn gather_shared_whole(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    drive_id: &str,
+) -> Result<(Vec<DriveItem>, Option<(String, String)>)> {
+    let cursor = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        drive::get_shared_cursor(&conn, email, drive_id)?
+    };
+
+    // First sync / 410 reset: the whole drive enumerated as Adds + a fresh baseline cursor.
+    async fn baseline(
+        token_key: &str,
+        email: &str,
+        drive_id: &str,
+    ) -> Result<(Vec<DriveItem>, String)> {
+        let files = drive::enumerate_shared(token_key, drive_id, None).await?;
+        let new_cursor = drive::start_page_token(token_key, Some(drive_id)).await?;
+        let items = files
+            .into_iter()
+            .map(|f| {
+                let source_id = drive::shared_source_id(email, drive_id, &f.id);
+                let event = index_only::ChangeEvent::Add {
+                    source_id: source_id.clone(),
+                    modified_at: f.modified_time.clone(),
+                };
+                DriveItem::Reconciled {
+                    source_id,
+                    event,
+                    file: Some(f),
+                }
+            })
+            .collect();
+        Ok((items, new_cursor))
+    }
+
+    let cursor = match cursor {
+        None => {
+            let (items, c) = baseline(token_key, email, drive_id).await?;
+            return Ok((items, Some((drive_id.to_string(), c))));
+        }
+        Some(c) => c,
+    };
+
+    let (changes, new_cursor) = match drive::list_shared_changes(token_key, drive_id, &cursor).await
+    {
+        Ok(v) => v,
+        Err(e) if drive::is_cursor_expired(&e) => {
+            let (items, c) = baseline(token_key, email, drive_id).await?;
+            return Ok((items, Some((drive_id.to_string(), c))));
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut items: Vec<DriveItem> = Vec::with_capacity(changes.len());
+    for change in &changes {
+        let source_id = drive::shared_source_id(email, drive_id, &change.file_id);
+        let known = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            drive::read_item_state(&conn, &source_id)?.is_some()
+        };
+        if let Some(event) = drive::map_shared_change(change, email, drive_id, known) {
+            items.push(DriveItem::Reconciled {
+                source_id,
+                event,
+                file: change.file.clone(),
+            });
+        }
+    }
+    Ok((items, Some((drive_id.to_string(), new_cursor))))
+}
+
+/// Apply `f` to the shared drive-sync snapshot, best-effort (a poisoned lock is skipped). Binding the
+/// lock guard to a named local first sidesteps the `if let` temporary-lifetime pitfall.
+fn with_drive_snap(app: &AppHandle, f: impl FnOnce(&mut crate::DriveSyncState)) {
+    let state = app.state::<AppState>();
+    let guard = state.drive_sync.lock();
+    if let Ok(mut snap) = guard {
+        f(&mut snap);
+    }
+}
+
+/// Update the shared drive-sync snapshot and broadcast a `drive://sync` progress event globally. The
+/// snapshot lets the UI restore an in-flight sync after navigating away; the global event (vs a
+/// per-call Channel) means progress reaches whatever component is mounted, not just the starter.
+fn emit_drive_progress(app: &AppHandle, ev: drive::DriveSyncEvent) {
+    with_drive_snap(app, |snap| match &ev {
+        drive::DriveSyncEvent::Counted { total } => {
+            snap.total = Some(*total);
+            snap.processed = 0;
+        }
+        drive::DriveSyncEvent::Item {
+            processed, total, ..
+        } => {
+            snap.processed = *processed;
+            snap.total = Some(*total);
+        }
+        // Keep the last result in the snapshot too, so a user returning to Settings after the sync
+        // finished still sees the summary (the live event only reaches a mounted listener).
+        drive::DriveSyncEvent::Finished { report } => {
+            snap.last_report = Some(report.clone());
+        }
+    });
+    let _ = app.emit("drive://sync", ev);
+}
+
+/// The currently-running Drive sync snapshot (empty / `running:false` when idle), so the Settings UI
+/// can resume showing progress after the user leaves and returns.
+#[tauri::command]
+pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::DriveSyncState> {
+    state
+        .drive_sync
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|_| Error::Other("drive sync state poisoned".into()))
+}
+
+/// Key in the `settings` table marking a sync that was started but not cleanly finished. Set when a
+/// sync begins and removed when it ends (completed or stopped); a value surviving across a restart
+/// therefore means the app was closed/crashed mid-index, and [`resume_drive_sync`] picks it back up.
+const DRIVE_SYNC_PENDING_KEY: &str = "drive_sync_pending";
+
+/// Cap on how many not-indexed files a report lists (memory-bounded; the count of extras beyond this
+/// is still conveyed via `issues_truncated`).
+const MAX_REPORT_ISSUES: usize = 200;
+
+/// True if the running sync has been asked to stop.
+fn sync_cancelled(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .drive_sync_cancel
+        .load(Ordering::SeqCst)
+}
+
+/// Record a file that couldn't be indexed, up to the cap (after which we just flag truncation).
+fn record_issue(
+    issues: &mut Vec<drive::DriveSyncIssue>,
+    truncated: &mut bool,
+    name: &str,
+    reason: &str,
+) {
+    if issues.len() < MAX_REPORT_ISSUES {
+        issues.push(drive::DriveSyncIssue {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        });
+    } else {
+        *truncated = true;
+    }
+}
+
+/// Sync one Drive account (or every account when `account` is `None`) into the index-only store. See
+/// [`drive_sync_core`] for the behaviour; this is the command the UI's "Sync now" calls.
+#[tauri::command]
+pub async fn sync_drive(app: AppHandle, account: Option<String>) -> Result<usize> {
+    drive_sync_core(&app, account).await
+}
+
+/// Ask the running sync to stop after the current file. Already-indexed files are kept; the rest are
+/// left for the next sync. A no-op when nothing is running (the flag resets at the next sync start).
+#[tauri::command]
+pub fn stop_drive_sync(state: State<'_, AppState>) -> Result<()> {
+    state.drive_sync_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Resume a sync a previous app session started but didn't finish (the app was closed/crashed
+/// mid-index). Called once on launch. Returns whether a resume was kicked off. Already-indexed files
+/// were persisted as they went, so the resumed pass re-checks the source and only does the work that
+/// was left — it never re-embeds what's already there. No marker → nothing to resume.
+#[tauri::command]
+pub fn resume_drive_sync(app: AppHandle) -> Result<bool> {
+    let marker: Option<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, DRIVE_SYNC_PENDING_KEY)?
+    };
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    // Don't stack on a sync the user may already have started this session.
+    let running = app
+        .state::<AppState>()
+        .drive_sync
+        .lock()
+        .map(|s| s.running)
+        .unwrap_or(false);
+    if running {
+        return Ok(false);
+    }
+    let account: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = drive_sync_core(&app2, account).await;
+    });
+    Ok(true)
+}
+
+/// The sync engine behind both [`sync_drive`] and [`resume_drive_sync`], honouring each account's
+/// scope. **My Drive** (on by default) uses the efficient delta cursor — the first sync enumerates
+/// everything (the slow one the UI warns about), later syncs apply only the changes feed. **Shared
+/// drives** the account opted into are re-enumerated and reconciled each pass (whole drive, or just
+/// the selected folders). Every item is index-only: a pointer + embedding, the body fetched live.
+/// Never holds the DB lock across a network/embed call (rule #4).
+///
+/// **Runs detached**: progress is broadcast via the global `drive://sync` event (not a per-call
+/// Channel) and mirrored into [`AppState::drive_sync`], so the sync keeps running — and the UI keeps
+/// reflecting it — even if the user leaves the Settings page.
+///
+/// **Single-flight**: a request arriving while a sync is already running (e.g. the user connected
+/// another account mid-index, or a stray button press) is folded into one follow-up all-accounts
+/// pass rather than starting a second, racy sync — backend-enforced, so the UI can't break it. The
+/// follow-up cheaply re-checks already-synced accounts (delta) and fully indexes any new one.
+///
+/// **Durable**: a crash-resume marker is persisted while running and cleared on a clean exit, so an
+/// interrupted run is resumed on next launch. Already-indexed files survive (each is committed as it
+/// goes), so a stop or crash never loses work. Returns the number of items touched by the last pass.
+async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
+    // Claim the single-flight slot, or fold this request into a follow-up pass if one is running.
+    {
+        let state = app.state::<AppState>();
+        let mut snap = state
+            .drive_sync
+            .lock()
+            .map_err(|_| Error::Other("drive sync state poisoned".into()))?;
+        if snap.running {
+            snap.rerun = true;
+            return Ok(0);
+        }
+        *snap = crate::DriveSyncState {
+            running: true,
+            account: account.clone(),
+            ..Default::default()
+        };
+    }
+    // Fresh stop flag for this run; persist a crash-resume marker (cleared on the clean exit below).
+    {
+        let state = app.state::<AppState>();
+        state.drive_sync_cancel.store(false, Ordering::SeqCst);
+        // Bind the guard to a named local before `if let`, so the `Result` temporary (which borrows
+        // `state`) is dropped before `state` is — otherwise it outlives the borrow (E0597).
+        let conn = state.conn();
+        if let Ok(conn) = conn {
+            let marker = serde_json::to_string(&account).unwrap_or_else(|_| "null".to_string());
+            let _ = db::set_setting(&conn, DRIVE_SYNC_PENDING_KEY, &marker);
+        }
+    }
+
+    let mut pass_account = account;
+    let mut result;
+    loop {
+        result = run_drive_sync(app, pass_account).await;
+        let stopped = sync_cancelled(app);
+        // Check-and-clear `rerun` and clear `running` under one lock, so a request landing exactly as
+        // we finish isn't lost to a race against `running = false`.
+        let again = {
+            let state = app.state::<AppState>();
+            let mut snap = state
+                .drive_sync
+                .lock()
+                .map_err(|_| Error::Other("drive sync state poisoned".into()))?;
+            if snap.rerun && !stopped {
+                snap.rerun = false;
+                snap.processed = 0;
+                snap.total = None;
+                snap.account = None;
+                true
+            } else {
+                snap.running = false;
+                false
+            }
+        };
+        if !again {
+            break;
+        }
+        pass_account = None;
+    }
+
+    // Clean exit (finished or stopped): drop the crash-resume marker so launch doesn't re-run it.
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn();
+        if let Ok(conn) = conn {
+            let _ = db::delete_setting(&conn, DRIVE_SYNC_PENDING_KEY);
+        }
+    }
+    result
+}
+
+/// One sync pass: gather each account's work, then process it. Split out so [`drive_sync_core`] can
+/// run it more than once (the follow-up sweep) and so the wrapper owns the running/marker lifecycle.
+async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usize> {
     // The engine is needed for index-only embedding + binary conversion — ensure it once up front.
     {
         let state = app.state::<AppState>();
@@ -2299,111 +2744,123 @@ pub async fn sync_drive(
         }
     };
 
-    // Phase 1 — gather each account's work off the lock (enumerate, or the changes feed).
-    enum Item {
-        Enumerated(drive::DriveFile),
-        Changed(drive::DriveChange),
-    }
-    struct AccountWork {
-        email: String,
-        token_key: String,
-        items: Vec<Item>,
-        new_cursor: Option<String>,
-        auth_failed: bool,
-    }
-
     let mut work: Vec<AccountWork> = Vec::new();
     let mut last_err: Option<Error> = None;
 
+    // Phase 1 — gather each account's work off the lock: My Drive via its delta cursor, then each
+    // opted-in shared drive via a reconcile. One AccountWork per account carries both.
     for email in emails {
         let token_key = drive::account_token_key(&email);
-        let cursor = {
+        let scope = {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            drive::get_cursor(&conn, &email)?
+            drive::get_scope(&conn, &email)?
         };
 
-        // Helper: a full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
-        let full_relist = |token_key: String| async move {
-            let files = drive::enumerate_drive(&token_key).await?;
-            let cursor = drive::start_page_token(&token_key).await?;
-            Ok::<_, Error>((files, cursor))
-        };
+        let mut items: Vec<DriveItem> = Vec::new();
+        let mut new_cursor: Option<String> = None;
+        let mut shared_new_cursors: Vec<(String, String)> = Vec::new();
+        let mut auth_failed = false;
 
-        if cursor.is_none() {
-            match full_relist(token_key.clone()).await {
-                Ok((files, new_cursor)) => work.push(AccountWork {
-                    email,
-                    token_key,
-                    items: files.into_iter().map(Item::Enumerated).collect(),
-                    new_cursor: Some(new_cursor),
-                    auth_failed: false,
-                }),
+        // --- My Drive (delta cursor) ---
+        if scope.my_drive {
+            let cursor = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                drive::get_cursor(&conn, &email)?
+            };
+            // A full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
+            let full_relist = |token_key: String| async move {
+                let files = drive::enumerate_drive(&token_key).await?;
+                let cursor = drive::start_page_token(&token_key, None).await?;
+                Ok::<_, Error>((files, cursor))
+            };
+            let outcome: Result<(Vec<DriveItem>, String)> = if cursor.is_none() {
+                full_relist(token_key.clone())
+                    .await
+                    .map(|(files, c)| (files.into_iter().map(DriveItem::Enumerated).collect(), c))
+            } else {
+                match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await {
+                    Ok((changes, c)) => {
+                        Ok((changes.into_iter().map(DriveItem::Changed).collect(), c))
+                    }
+                    Err(e) if drive::is_cursor_expired(&e) => {
+                        full_relist(token_key.clone()).await.map(|(files, c)| {
+                            (files.into_iter().map(DriveItem::Enumerated).collect(), c)
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            match outcome {
+                Ok((mut my_items, c)) => {
+                    items.append(&mut my_items);
+                    new_cursor = Some(c);
+                }
                 Err(e) => {
-                    let auth = drive::is_auth_failure(&e);
+                    if drive::is_auth_failure(&e) {
+                        auth_failed = true;
+                    }
                     last_err = Some(e);
-                    work.push(AccountWork {
-                        email,
-                        token_key,
-                        items: Vec::new(),
-                        new_cursor: None,
-                        auth_failed: auth,
-                    });
                 }
             }
-            continue;
         }
 
-        match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await {
-            Ok((changes, new_cursor)) => work.push(AccountWork {
-                email,
-                token_key,
-                items: changes.into_iter().map(Item::Changed).collect(),
-                new_cursor: Some(new_cursor),
-                auth_failed: false,
-            }),
-            Err(e) if drive::is_cursor_expired(&e) => match full_relist(token_key.clone()).await {
-                Ok((files, new_cursor)) => work.push(AccountWork {
-                    email,
-                    token_key,
-                    items: files.into_iter().map(Item::Enumerated).collect(),
-                    new_cursor: Some(new_cursor),
-                    auth_failed: false,
-                }),
-                Err(e2) => {
-                    let auth = drive::is_auth_failure(&e2);
-                    last_err = Some(e2);
-                    work.push(AccountWork {
-                        email,
-                        token_key,
-                        items: Vec::new(),
-                        new_cursor: None,
-                        auth_failed: auth,
-                    });
+        // --- shared drives. Skip if the account already auth-failed (same token). Whole-drive
+        // selections return an advanced cursor to persist; folder-scoped ones return None. ---
+        if !auth_failed {
+            for sel in &scope.shared {
+                match gather_shared(app, &token_key, &email, sel).await {
+                    Ok((mut recon, cursor)) => {
+                        items.append(&mut recon);
+                        if let Some(advanced) = cursor {
+                            shared_new_cursors.push(advanced);
+                        }
+                    }
+                    Err(e) => {
+                        if drive::is_auth_failure(&e) {
+                            auth_failed = true;
+                        }
+                        last_err = Some(e);
+                        if auth_failed {
+                            break;
+                        }
+                    }
                 }
-            },
-            Err(e) => {
-                let auth = drive::is_auth_failure(&e);
-                last_err = Some(e);
-                work.push(AccountWork {
-                    email,
-                    token_key,
-                    items: Vec::new(),
-                    new_cursor: None,
-                    auth_failed: auth,
-                });
             }
         }
+
+        work.push(AccountWork {
+            email,
+            token_key,
+            items,
+            new_cursor,
+            shared_new_cursors,
+            auth_failed,
+        });
     }
 
     let total: usize = work.iter().map(|w| w.items.len()).sum();
-    let _ = on_event.send(drive::DriveSyncEvent::Counted { total });
+    emit_drive_progress(app, drive::DriveSyncEvent::Counted { total });
 
     // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
     let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
     let mut processed = 0usize;
+    // Files we attempted but couldn't index (unsupported/empty, or a fetch error), for the report.
+    let mut issues: Vec<drive::DriveSyncIssue> = Vec::new();
+    let mut issues_truncated = false;
+    // Set if the user pressed Stop. Already-applied items stay committed; we stop early and skip the
+    // interrupted account's cursor advance, so the next sync re-checks it.
+    let mut cancelled = false;
 
-    for w in &work {
+    'accounts: for w in &work {
+        // Stop requested (before this account, or after finishing the previous one)? Halt — keeping
+        // everything indexed so far. The interrupted account's cursor is left unadvanced below.
+        if sync_cancelled(app) {
+            cancelled = true;
+            break 'accounts;
+        }
+
         // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
         if w.auth_failed {
             let actions = index_only::react(
@@ -2422,8 +2879,13 @@ pub async fn sync_drive(
         }
 
         for item in &w.items {
+            // Stop requested mid-account? Halt after the current file — already-indexed files stay.
+            if sync_cancelled(app) {
+                cancelled = true;
+                break 'accounts;
+            }
             let (file, source_id, event): (Option<&drive::DriveFile>, String, _) = match item {
-                Item::Enumerated(file) => {
+                DriveItem::Enumerated(file) => {
                     let sid = drive::source_id_for(&w.email, &file.id);
                     let ev = index_only::ChangeEvent::Add {
                         source_id: sid.clone(),
@@ -2431,7 +2893,7 @@ pub async fn sync_drive(
                     };
                     (Some(file), sid, ev)
                 }
-                Item::Changed(change) => {
+                DriveItem::Changed(change) => {
                     let sid = drive::source_id_for(&w.email, &change.file_id);
                     let known = {
                         let state = app.state::<AppState>();
@@ -2447,6 +2909,12 @@ pub async fn sync_drive(
                         }
                     }
                 }
+                // Shared-drive reconcile: the event (Update/Delete) is already built.
+                DriveItem::Reconciled {
+                    source_id,
+                    event,
+                    file,
+                } => (file.as_ref(), source_id.clone(), event.clone()),
             };
 
             let name = file
@@ -2479,22 +2947,40 @@ pub async fn sync_drive(
                     Ok(None) => {
                         processed += 1;
                         skipped += 1;
-                        let _ = on_event.send(drive::DriveSyncEvent::Item {
-                            processed,
-                            total,
-                            name,
-                        });
+                        record_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            "No extractable text (unsupported file type or empty)",
+                        );
+                        emit_drive_progress(
+                            app,
+                            drive::DriveSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
                         continue;
                     }
                     Err(e) => {
                         processed += 1;
                         failed += 1;
+                        record_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            &format!("Couldn't fetch from Drive: {e}"),
+                        );
                         last_err = Some(e);
-                        let _ = on_event.send(drive::DriveSyncEvent::Item {
-                            processed,
-                            total,
-                            name,
-                        });
+                        emit_drive_progress(
+                            app,
+                            drive::DriveSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
                         continue;
                     }
                 }
@@ -2516,36 +3002,71 @@ pub async fn sync_drive(
                 },
                 Err(e) => {
                     failed += 1;
+                    record_issue(
+                        &mut issues,
+                        &mut issues_truncated,
+                        &name,
+                        &format!("Indexing failed: {e}"),
+                    );
                     last_err = Some(e);
                 }
             }
             processed += 1;
-            let _ = on_event.send(drive::DriveSyncEvent::Item {
-                processed,
-                total,
-                name,
-            });
+            emit_drive_progress(
+                app,
+                drive::DriveSyncEvent::Item {
+                    processed,
+                    total,
+                    name,
+                },
+            );
+            // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously. Re-read
+            // the setting each item (a cheap read, dropped before the await per rule #4) so flipping
+            // Fast/Gentle mid-sync takes effect on the very next file, not only on the next run. Only
+            // items that reached here did real work (the cheap no-op/skip paths `continue` above).
+            let pause_ms = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                db::indexing_pause_ms(&conn)
+            };
+            if pause_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            }
         }
 
-        // Advance the cursor + stamp the time only on a clean pass for this account.
-        if let Some(cursor) = &w.new_cursor {
+        // Persist the pass: advance My Drive's cursor (if synced) + each whole-drive shared cursor,
+        // stamp the time, and clear failure state. Auth-failed accounts already `continue`d above, so
+        // reaching here means the pass was healthy enough to commit its cursors.
+        {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            drive::set_synced(&conn, &w.email, cursor)?;
+            drive::finalize_sync(
+                &conn,
+                &w.email,
+                w.new_cursor.as_deref(),
+                &w.shared_new_cursors,
+            )?;
         }
     }
 
-    let _ = on_event.send(drive::DriveSyncEvent::Finished {
+    let report = drive::DriveSyncReport {
         indexed,
         updated,
         removed,
         skipped,
         failed,
-    });
+        cancelled,
+        issues,
+        issues_truncated,
+    };
+    emit_drive_progress(app, drive::DriveSyncEvent::Finished { report });
 
-    // Surface a failure (auth/expired) even when some items succeeded — the good ones are committed.
-    if let Some(e) = last_err {
-        return Err(e);
+    // A deliberate stop isn't an error. Otherwise surface a failure (auth/expired) even when some
+    // items succeeded — the good ones are already committed.
+    if !cancelled {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
     }
     Ok(indexed + updated + removed)
 }
@@ -2593,9 +3114,13 @@ fn apply_drive_actions(
 ) -> Result<()> {
     let state = app.state::<AppState>();
     let (vault_root, cipher) = state.manifest_io()?;
+    // Gentle mode caps the embedding batch to bound peak memory. `apply_drive_actions` runs once per
+    // item, so reading it here also makes gentle batching engage mid-sync (alongside the pause).
     let gateway = {
         let conn = state.conn()?;
-        state.gateway(&conn)?
+        state
+            .gateway(&conn)?
+            .with_embed_batch(db::indexing_embed_batch(&conn))
     };
     index_only::apply_actions(
         state.inner(),
@@ -2648,6 +3173,25 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
         .ok_or_else(|| Error::Other("This file has no extractable text to show.".into()))
 }
 
+/// Open a URL in the system browser, but ONLY if it's http/https — never a `file:`, app, or custom
+/// scheme, so a stray or injected href can't launch a local handler (the inputs are app constants and
+/// Drive-supplied links, treated as untrusted — rule #6).
+fn open_external_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| Error::Other("That doesn't look like a valid link.".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(Error::Other("Only http(s) links can be opened.".into()));
+    }
+    open::that(parsed.as_str()).map_err(|e| Error::Other(format!("Couldn't open the link: {e}")))
+}
+
+/// Open an arbitrary http(s) URL in the system browser. The webview can't open `target="_blank"`
+/// links itself (no shell/opener plugin), so the frontend's app-wide link handler routes them here.
+#[tauri::command]
+pub fn open_url(url: String) -> Result<()> {
+    open_external_url(&url)
+}
+
 /// Open an index-only document's source in the system browser (its Drive `webViewLink`).
 #[tauri::command]
 pub fn open_external_ref(state: State<'_, AppState>, doc_id: i64) -> Result<()> {
@@ -2660,8 +3204,7 @@ pub fn open_external_ref(state: State<'_, AppState>, doc_id: i64) -> Result<()> 
         )?
     };
     let url = external_ref.ok_or_else(|| Error::Other("This item has no source link.".into()))?;
-    open::that(&url).map_err(|e| Error::Other(format!("Couldn't open the link: {e}")))?;
-    Ok(())
+    open_external_url(&url)
 }
 
 // --- structured preferences (§4.5 — the typed model that replaces the Learning-You blob) ---
@@ -3071,8 +3614,15 @@ fn cached_catalogue(conn: &Connection) -> Result<Vec<openrouter::ModelDetail>> {
 /// so errors are swallowed. `model = None` is allowed (an unreported served model).
 fn log_usage(conn: &Connection, kind: &str, model: Option<&str>, usage: &openrouter::Usage) {
     let _ = conn.execute(
-        "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens) VALUES (?1, ?2, ?3, ?4)",
-        params![model, kind, usage.prompt_tokens, usage.completion_tokens],
+        "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            model,
+            kind,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cost
+        ],
     );
 }
 
@@ -3231,12 +3781,21 @@ fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
     } else {
         ""
     };
+    // Split the token sums by whether the row carried OpenRouter's reported cost, so cost is
+    // computed ROW-ADDITIVELY: real reported spend (`SUM(cost_usd)` over the rows that have it) plus
+    // a tokens × cached-price estimate for ONLY the rows that don't. The earlier all-or-nothing rule
+    // abandoned the whole group's real cost the moment a single pre-feature row (NULL `cost_usd`) was
+    // present — so a model with both old and new calls fell back to the estimate and went blank when
+    // it wasn't in the price cache. Additive costing keeps the known real spend visible regardless.
     let sql = format!(
         "SELECT u.model, \
                 COALESCE(SUM(u.prompt_tokens), 0), \
                 COALESCE(SUM(u.completion_tokens), 0), \
                 COUNT(*), \
-                p.prompt_price, p.completion_price \
+                p.prompt_price, p.completion_price, \
+                SUM(u.cost_usd), COUNT(u.cost_usd), \
+                COALESCE(SUM(CASE WHEN u.cost_usd IS NULL THEN u.prompt_tokens     ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN u.cost_usd IS NULL THEN u.completion_tokens ELSE 0 END), 0) \
          FROM usage_log u LEFT JOIN model_pricing p ON p.model = u.model \
          WHERE u.model IS NOT NULL {window} \
          GROUP BY u.model \
@@ -3247,19 +3806,40 @@ fn spend_rows(conn: &Connection, last_30d: bool) -> Result<Vec<ModelSpend>> {
         .query_map([], |r| {
             let prompt_tokens: i64 = r.get(1)?;
             let completion_tokens: i64 = r.get(2)?;
+            let request_count: i64 = r.get(3)?;
             let prompt_price: Option<f64> = r.get(4)?;
             let completion_price: Option<f64> = r.get(5)?;
+            let reported_cost: Option<f64> = r.get(6)?; // SUM(cost_usd); NULL when no call reported one
+            let reported_count: i64 = r.get(7)?; // calls in this group that reported an actual cost
+            let est_prompt_tokens: i64 = r.get(8)?; // tokens from ONLY the rows lacking a reported cost
+            let est_completion_tokens: i64 = r.get(9)?;
+            // Estimate the unreported rows (tokens × cached price); `None` when that model isn't
+            // priced. Some(0.0) when every row reported an actual cost (nothing left to estimate).
+            let estimate = if request_count - reported_count > 0 {
+                cost::call_cost(
+                    Some(est_prompt_tokens),
+                    Some(est_completion_tokens),
+                    prompt_price,
+                    completion_price,
+                )
+            } else {
+                Some(0.0)
+            };
+            // Real reported spend is always honoured; the estimate only fills in the rows that
+            // lacked a reported cost. "Unknown" (`None`) survives only when NOTHING is known — no
+            // reported cost and the leftover rows are unpriced — never just because of an old row.
+            let cost_usd = match (reported_cost, estimate) {
+                (Some(actual), Some(est)) => Some(actual + est),
+                (Some(actual), None) => Some(actual), // real cost known; unpriced remainder omitted
+                (None, Some(est)) => Some(est),
+                (None, None) => None,
+            };
             Ok(ModelSpend {
                 model: r.get(0)?,
                 prompt_tokens,
                 completion_tokens,
-                request_count: r.get(3)?,
-                cost_usd: cost::call_cost(
-                    Some(prompt_tokens),
-                    Some(completion_tokens),
-                    prompt_price,
-                    completion_price,
-                ),
+                request_count,
+                cost_usd,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3513,6 +4093,15 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn open_external_url_allows_only_http_schemes() {
+        // Rejected before any launch — a stray/injected href can't open a local handler.
+        assert!(open_external_url("file:///etc/passwd").is_err());
+        assert!(open_external_url("javascript:alert(1)").is_err());
+        assert!(open_external_url("not a url").is_err());
+        // The http/https success path is deliberately not exercised (it would launch a browser).
+    }
+
     /// A throwaway encrypted store (also exercises the migration-in-transaction
     /// path in `db::open`).
     fn temp_db() -> (tempfile::TempDir, Connection) {
@@ -3542,5 +4131,56 @@ mod tests {
             1,
             "de-duped"
         );
+    }
+
+    /// Cost is ROW-ADDITIVE: a model's real reported spend always shows, with an estimate filling in
+    /// only the rows that lacked one. The earlier all-or-nothing rule went blank for any model that
+    /// mixed a reported call with an older unreported one and wasn't in the price cache — this pins
+    /// the fix.
+    #[test]
+    fn spend_rows_adds_real_cost_and_estimates_only_unreported_rows() {
+        let (_dir, conn) = temp_db();
+        let priced_now = |model: &str| {
+            conn.execute(
+                "INSERT INTO model_pricing(model, prompt_price, completion_price, fetched_at) \
+                 VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                params![model, 3e-6_f64, 15e-6_f64],
+            )
+            .unwrap();
+        };
+        let log = |model: &str, pt: i64, ct: i64, cost: Option<f64>| {
+            conn.execute(
+                "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
+                 VALUES (?1, 'chat', ?2, ?3, ?4)",
+                params![model, pt, ct, cost],
+            )
+            .unwrap();
+        };
+
+        // Priced model, mixed rows: a reported $0.05 call + an older unreported one (1000/500 tokens).
+        priced_now("vendor/priced");
+        log("vendor/priced", 2000, 1000, Some(0.05));
+        log("vendor/priced", 1000, 500, None);
+
+        // Unpriced model, mixed rows — the regression case: a reported $0.02 call + an unreported one.
+        log("vendor/unpriced", 100, 100, Some(0.02));
+        log("vendor/unpriced", 100, 100, None);
+
+        // Unpriced model, only an old unreported row — genuinely unknown.
+        log("vendor/unknown", 100, 100, None);
+
+        let rows = spend_rows(&conn, false).unwrap();
+        let cost_of = |m: &str| rows.iter().find(|r| r.model == m).unwrap().cost_usd;
+
+        // Reported 0.05 + estimate(1000·3e-6 + 500·15e-6 = 0.0105) = 0.0605.
+        assert!((cost_of("vendor/priced").unwrap() - 0.0605).abs() < 1e-9);
+        // The fix: the real reported cost shows as a floor even though the model isn't priced —
+        // never blank. The unpriced unreported row is omitted (unknown), not understated to $0.
+        assert!((cost_of("vendor/unpriced").unwrap() - 0.02).abs() < 1e-9);
+        // Nothing known at all → still "unknown".
+        assert!(cost_of("vendor/unknown").is_none());
+
+        // And the grand total is the sum of the known rows (0.0605 + 0.02), not blank.
+        assert!((total_cost(&rows).unwrap() - 0.0805).abs() < 1e-9);
     }
 }

@@ -18,8 +18,11 @@ import type {
   Document,
   DraftPreference,
   DriveAccount,
+  DriveFolder,
+  DriveScope,
   DriveStatus,
   DriveSyncEvent,
+  DriveSyncState,
   Entity,
   GoogleCalendar,
   IcsFeedInfo,
@@ -37,6 +40,7 @@ import type {
   ReviewEvent,
   RetrievedChunk,
   Settings,
+  SharedDrive,
   SidecarStatus,
   VaultLockStatus,
   VaultStatus,
@@ -56,6 +60,11 @@ export const getSettings = () => invoke<Settings>("get_settings");
 /** Turn query-time reranking on/off (a cross-encoder re-scores search hits). Stateless — never
  *  triggers a Rebuild; the effect lands on the next query. */
 export const setReranking = (enabled: boolean) => invoke<void>("set_reranking", { enabled });
+
+/** Set the indexing-speed preference: "fast" (max throughput) or "gentle" (paced for low-end
+ *  machines). Applies to the next Drive sync / file import. */
+export const setIndexingSpeed = (speed: "fast" | "gentle") =>
+  invoke<void>("set_indexing_speed", { speed });
 
 /** The vault's search-language choices + current selection for the onboarding picker. */
 export const languageOptions = () => invoke<LanguageOptions>("language_options");
@@ -482,15 +491,42 @@ export const connectDrive = () => invoke<DriveAccount>("connect_drive");
 /** Disconnect one account: forget its token + flag its items unreachable (kept findable). */
 export const disconnectDrive = (email: string) => invoke<void>("disconnect_drive", { email });
 
-/** Sync one account (or all when `email` is omitted), streaming progress. Returns items touched. */
-export function syncDrive(
-  email: string | null,
-  onEvent: (event: DriveSyncEvent) => void,
-): Promise<number> {
-  const channel = new Channel<DriveSyncEvent>();
-  channel.onmessage = onEvent;
-  return invoke<number>("sync_drive", { account: email, onEvent: channel });
-}
+/** Start syncing one account (or all when `email` is null). Runs **detached** in the backend, so it
+ *  keeps going if the user leaves Settings — progress arrives via the global `drive://sync` event
+ *  (subscribe with {@link onDriveSync}). The returned promise resolves with the items-touched count
+ *  when this call's sync finishes; it's fine to ignore it (the events + status drive the UI). */
+export const syncDrive = (email: string | null) => invoke<number>("sync_drive", { account: email });
+
+/** The current background-sync snapshot — used to restore the progress UI on returning to Settings,
+ *  and to show the last finished sync's report. */
+export const driveSyncStatus = () => invoke<DriveSyncState>("drive_sync_status");
+
+/** Ask the running sync to stop after the current file. Already-indexed files are kept. */
+export const stopDriveSync = () => invoke<void>("stop_drive_sync");
+
+/** Resume a sync interrupted by a previous app close/crash mid-index. Called once on launch; resolves
+ *  true if a resume was started. Already-indexed files survive, so it only does the outstanding work. */
+export const resumeDriveSync = () => invoke<boolean>("resume_drive_sync");
+
+/** Subscribe to global Drive sync progress (fires regardless of which view started the sync). */
+export const onDriveSync = (handler: (e: DriveSyncEvent) => void): Promise<UnlistenFn> =>
+  listen<DriveSyncEvent>("drive://sync", (e) => handler(e.payload));
+
+/** The shared drives one account can see (for the "add shared drives" picker). */
+export const listDriveSharedDrives = (email: string) =>
+  invoke<SharedDrive[]>("list_drive_shared_drives", { email });
+
+/** Immediate subfolders of a folder in a shared drive (one lazy picker level). Pass the shared
+ *  drive's id as `parentId` for the top level. */
+export const listDriveFolders = (email: string, driveId: string, parentId: string) =>
+  invoke<DriveFolder[]>("list_drive_folders", { email, driveId, parentId });
+
+/** Read one account's indexing scope (My Drive on/off + opted-in shared drives and folders). */
+export const getDriveScope = (email: string) => invoke<DriveScope>("get_drive_scope", { email });
+
+/** Persist one account's indexing scope; follow with `syncDrive(email)` to apply it. */
+export const setDriveScope = (email: string, scope: DriveScope) =>
+  invoke<void>("set_drive_scope", { email, scope });
 
 /** Fetch an index-only document's full body live from its source (the body is never stored). */
 export const fetchIndexOnlyBody = (docId: number) =>
@@ -498,6 +534,10 @@ export const fetchIndexOnlyBody = (docId: number) =>
 
 /** Open an index-only document's source in the system browser (its Drive link). */
 export const openExternalRef = (docId: number) => invoke<void>("open_external_ref", { docId });
+
+/** Open an arbitrary http(s) URL in the system browser. Used by the app-wide external-link handler
+ *  (the webview can't open `target="_blank"` itself); the backend guards the scheme to http/https. */
+export const openUrl = (url: string) => invoke<void>("open_url", { url });
 
 // --- Personal Assistant: Daily briefing (Step 7, spec §4 P1) ---
 

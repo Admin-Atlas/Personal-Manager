@@ -26,7 +26,8 @@ export interface ThemeState {
   setMode: (m: Mode) => void;
   setAccent: (a: string) => void;
   setDepth: (d: Depth) => void;
-  /** Whether the Teach tab is shown — a Depth-keyed feature reveal the user can override. */
+  /** Whether the **learning tools** — the Review and Teach tabs — are shown. A Depth-keyed reveal
+   *  the user can override, e.g. hide both once the assistant files things well on its own. */
   teachVisible: boolean;
   setTeachVisible: (v: boolean) => void;
 }
@@ -168,8 +169,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.accentBySystem, JSON.stringify(map));
   }
 
-  // The Teach tab is a Depth-keyed feature reveal — hidden for minimalist, shown for
-  // standard/power — until the user makes an explicit choice in Settings, which then wins.
+  // The learning tools (Review + Teach) are a Depth-keyed feature reveal — hidden for minimalist,
+  // shown for standard/power — until the user makes an explicit choice in Settings, which then wins.
+  // Lets a user who's happy with the assistant's filing hide both once they no longer want to curate.
   const teachVisible = teachPref === "auto" ? depth !== "min" : teachPref === "show";
   function setTeachVisible(visible: boolean): void {
     const pref: TeachPref = visible ? "show" : "hide";

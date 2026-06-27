@@ -164,7 +164,29 @@ function ClientSetupGuide() {
         and create a project (or reuse one).
       </li>
       <li>
-        2. Configure the{" "}
+        2. <span className="text-ink2">Enable the API</span> for each service you’ll use —{" "}
+        <a
+          href="https://console.cloud.google.com/apis/library/drive.googleapis.com"
+          target="_blank"
+          rel="noreferrer"
+          className={link}
+        >
+          Google Drive API
+        </a>{" "}
+        and/or{" "}
+        <a
+          href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"
+          target="_blank"
+          rel="noreferrer"
+          className={link}
+        >
+          Google Calendar API
+        </a>{" "}
+        (select your project, then <span className="text-ink2">Enable</span>). Skipping this is what
+        causes the “this API has not been used / is disabled” error.
+      </li>
+      <li>
+        3. Configure the{" "}
         <a
           href="https://console.cloud.google.com/apis/credentials/consent"
           target="_blank"
@@ -173,11 +195,12 @@ function ClientSetupGuide() {
         >
           OAuth consent screen
         </a>{" "}
-        (User type <span className="text-ink2">External</span>) and add your own Google account
-        under <span className="text-ink2">Test users</span>.
+        (User type <span className="text-ink2">External</span>), then under{" "}
+        <span className="text-ink2">Audience → Test users</span> add the exact Google account you’ll
+        sign in with.
       </li>
       <li>
-        3. Under{" "}
+        4. Under{" "}
         <a
           href="https://console.cloud.google.com/apis/credentials"
           target="_blank"
@@ -190,11 +213,27 @@ function ClientSetupGuide() {
         <span className="text-ink2">OAuth client ID</span>, choose application type{" "}
         <span className="text-ink2">Desktop app</span>.
       </li>
-      <li>4. Copy the Client ID + Client secret and paste them below.</li>
+      <li>5. Copy the Client ID + Client secret and paste them below.</li>
+      <li>
+        6. <span className="text-ink2">More than one Google account?</span> You don’t need a new
+        project or new credentials — reuse the same Client ID + secret (it stays saved here, shared
+        by every account). For each extra account, add its email under{" "}
+        <span className="text-ink2">Audience → Test users</span> (step 3), then in PM use{" "}
+        <span className="text-ink2">Add another account</span> and sign in with it. (A separate
+        project is only needed if you’d rather keep accounts fully isolated.)
+      </li>
       <li className="text-ink4">
-        Note: you’ll see an “unverified app” screen — that’s expected for your own client (just
-        continue). If your account uses Advanced Protection, Google blocks this — use a calendar
-        subscription (iCal) instead.
+        If a sign-in fails:{" "}
+        <span className="text-ink2">“…API has not been used… or is disabled” (403)</span> means you
+        skipped step 2 — enable it, then wait ~1 minute.{" "}
+        <span className="text-ink2">“Access blocked… developer-approved testers” (403)</span> means
+        the signed-in account isn’t under <span className="text-ink2">Audience → Test users</span>{" "}
+        (step 3). The “unverified app” screen is expected — continue past it. Test mode signs you
+        out every 7 days; to avoid that you can <span className="text-ink2">Publish app</span>{" "}
+        (Audience → Publish app), which makes your consent screen public — though only your saved
+        client secret can actually use it. <span className="text-ink2">Advanced Protection</span>{" "}
+        accounts block unverified apps from Drive and Calendar entirely; use a different Google
+        account (for Calendar, an iCal subscription works instead).
       </li>
     </ol>
   );

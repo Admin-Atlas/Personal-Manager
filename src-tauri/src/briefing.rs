@@ -204,7 +204,7 @@ pub async fn generate(
     profile: Option<&str>,
 ) -> Result<(String, openrouter::Usage, Option<String>)> {
     let messages = build_messages(snapshot, profile);
-    let c = openrouter::complete(api_key, models, &messages).await?;
+    let c = openrouter::complete(api_key, models, &messages, false).await?;
     Ok((clean(&c.text), c.usage, c.model))
 }
 

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
@@ -38,6 +38,18 @@ interface Summary {
   failed: number;
 }
 
+// Sorting for the document table. The available columns depend on the Depth preset (Ingested only
+// shows on Power), so a header only sorts when it's rendered. `null` = the backend's default order
+// (newest first). Importance is ranked high > medium > low > none rather than sorted alphabetically.
+type SortKey = "title" | "project" | "importance" | "chunks" | "ingested";
+interface DocSort {
+  key: SortKey;
+  dir: "asc" | "desc";
+}
+const IMPORTANCE_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
+// Columns where "biggest first" is the more useful default on first click.
+const SORT_DESC_FIRST = new Set<SortKey>(["importance", "chunks", "ingested"]);
+
 interface Props {
   /** Jump to the Review view (the sorting-review queue). */
   onReviewClick?: () => void;
@@ -63,6 +75,7 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [devTitle, setDevTitle] = useState("");
   const [devBody, setDevBody] = useState("");
   const { showPower } = useDepth();
+  const [sort, setSort] = useState<DocSort | null>(null);
   // Developer mode (issue #78): an in-place chunk inspector. Clicking a document's chunk count
   // (when devMode is on) expands its leaf/parent chunk breakdown, fetched read-only on demand.
   const { devMode } = useDevMode();
@@ -342,6 +355,44 @@ export function DocumentsView({ onReviewClick }: Props) {
 
   const unreviewed = documents.filter((d) => !d.reviewed).length;
 
+  // Click a column header to sort; same header again flips the direction. A new column starts in its
+  // natural direction (descending for importance/chunks/ingested, ascending for title/project).
+  function toggleSort(key: SortKey) {
+    setSort((cur) =>
+      cur?.key === key
+        ? { key, dir: cur.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: SORT_DESC_FIRST.has(key) ? "desc" : "asc" },
+    );
+  }
+
+  const sortedDocuments = useMemo(() => {
+    if (!sort) return documents;
+    const factor = sort.dir === "asc" ? 1 : -1;
+    const rank = (imp: string | null) => (imp ? (IMPORTANCE_RANK[imp] ?? 0) : 0);
+    return [...documents].sort((a, b) => {
+      let c = 0;
+      switch (sort.key) {
+        case "title":
+          c = a.title.localeCompare(b.title);
+          break;
+        case "project":
+          c = a.project.localeCompare(b.project);
+          break;
+        case "importance":
+          c = rank(a.importance) - rank(b.importance);
+          break;
+        case "chunks":
+          c = a.chunk_count - b.chunk_count;
+          break;
+        case "ingested":
+          c = a.ingested_at.localeCompare(b.ingested_at);
+          break;
+      }
+      if (c === 0) c = a.title.localeCompare(b.title); // stable tiebreak
+      return c * factor;
+    });
+  }, [documents, sort]);
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b border-border px-6 py-3">
@@ -560,15 +611,34 @@ export function DocumentsView({ onReviewClick }: Props) {
               <table className="w-full text-left text-sm">
                 <thead className="font-mono text-xs uppercase tracking-wide text-ink3">
                   <tr className="border-b border-border">
-                    <th className="py-2 font-medium">Title</th>
-                    <th className="py-2 font-medium">Project</th>
-                    <th className="py-2 font-medium">Importance</th>
-                    <th className="py-2 text-right font-medium">Chunks</th>
-                    {showPower && <th className="py-2 text-right font-medium">Ingested</th>}
+                    <SortHeader label="Title" sortKey="title" sort={sort} onSort={toggleSort} />
+                    <SortHeader label="Project" sortKey="project" sort={sort} onSort={toggleSort} />
+                    <SortHeader
+                      label="Importance"
+                      sortKey="importance"
+                      sort={sort}
+                      onSort={toggleSort}
+                    />
+                    <SortHeader
+                      label="Chunks"
+                      sortKey="chunks"
+                      sort={sort}
+                      onSort={toggleSort}
+                      align="right"
+                    />
+                    {showPower && (
+                      <SortHeader
+                        label="Ingested"
+                        sortKey="ingested"
+                        sort={sort}
+                        onSort={toggleSort}
+                        align="right"
+                      />
+                    )}
                   </tr>
                 </thead>
                 <tbody>
-                  {documents.map((doc) => (
+                  {sortedDocuments.map((doc) => (
                     <Fragment key={doc.id}>
                       <tr className="border-b border-rule">
                         <td className="py-2 pr-3">
@@ -788,6 +858,38 @@ function SourceBadge({ doc }: { doc: Document }) {
     >
       {label}
     </span>
+  );
+}
+
+/** A clickable column header that sorts the document table and shows the active direction. */
+function SortHeader({
+  label,
+  sortKey,
+  sort,
+  onSort,
+  align,
+}: {
+  label: string;
+  sortKey: SortKey;
+  sort: DocSort | null;
+  onSort: (key: SortKey) => void;
+  align?: "right";
+}) {
+  const active = sort?.key === sortKey;
+  return (
+    <th className={`py-2 font-medium ${align === "right" ? "text-right" : ""}`}>
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className={`inline-flex items-center gap-1 hover:text-ink ${active ? "text-ink2" : ""}`}
+        title={`Sort by ${label.toLowerCase()}`}
+      >
+        {label}
+        <span aria-hidden className="text-[9px] leading-none">
+          {active && sort ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}
+        </span>
+      </button>
+    </th>
   );
 }
 

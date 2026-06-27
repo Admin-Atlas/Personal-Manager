@@ -6,11 +6,12 @@
 // redacted by the backend, so this only lays them out.
 
 import type { DevTablePage } from "../../lib/types";
+import { HScroll } from "../ui";
 
 export function DevTableGrid({ page }: { page: DevTablePage }) {
   if (page.rows.length === 0) return <p className="text-xs text-ink4">No rows.</p>;
   return (
-    <div className="overflow-x-auto">
+    <HScroll>
       <table className="w-full border-collapse text-left font-mono text-xs">
         <thead>
           <tr className="border-b border-border2 text-ink3">
@@ -33,6 +34,6 @@ export function DevTableGrid({ page }: { page: DevTablePage }) {
           ))}
         </tbody>
       </table>
-    </div>
+    </HScroll>
   );
 }

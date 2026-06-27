@@ -39,6 +39,8 @@ import {
   listConversations,
   onVaultAcquired,
   onVaultCurtain,
+  openUrl,
+  resumeDriveSync,
   reviewQueue,
   setHelpMode,
   vaultLockStatus,
@@ -89,10 +91,11 @@ export default function App() {
   const update = useUpdater();
   const { teachVisible } = useTheme();
   const { devMode } = useDevMode();
-  // If the Teach or Dev tab gets hidden (preset change, or the toggle turned off in Settings)
-  // while it's open, fall back to Focus so the user is never stranded on a view with no nav entry.
+  // If the Review/Teach (learning tools) or Dev tab gets hidden — a preset change, or the toggle
+  // turned off in Settings — while it's open, fall back to Focus so the user is never stranded on a
+  // view with no nav entry.
   useEffect(() => {
-    if (view === "teach" && !teachVisible) setView("focus");
+    if ((view === "teach" || view === "review") && !teachVisible) setView("focus");
     if (view === "dev" && !devMode) setView("focus");
   }, [view, teachVisible, devMode]);
   const [appVersion, setAppVersion] = useState<string | null>(null);
@@ -132,6 +135,24 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // External links open in the system browser. The webview can't honour an `<a target="_blank">`
+  // on its own (no shell/opener plugin), so intercept clicks on any such link app-wide and hand the
+  // URL to the OS browser via the backend (which guards to http/https). One handler covers every
+  // link — existing and future — so individual `<a>`s need no special wiring.
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (e.defaultPrevented || e.button !== 0) return;
+      const anchor = (e.target as HTMLElement | null)?.closest?.("a");
+      const href = anchor?.getAttribute("href");
+      if (anchor?.target === "_blank" && href && /^https?:\/\//i.test(href)) {
+        e.preventDefault();
+        void openUrl(href).catch(() => {});
+      }
+    }
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
   }, []);
 
   // Auto-open "What's New" once after the app updates to a version the user
@@ -269,6 +290,13 @@ export default function App() {
   useEffect(() => {
     if (keySet) void refreshReviewCount();
   }, [keySet, view, refreshReviewCount]);
+
+  // Resume a Drive sync interrupted by a previous close/crash mid-index. Runs once the vault is open
+  // (keySet implies an unlocked store), detached in the backend — already-indexed files survive, so
+  // it just finishes the outstanding work. A no-op when there's nothing pending.
+  useEffect(() => {
+    if (keySet) void resumeDriveSync().catch(() => {});
+  }, [keySet]);
 
   async function selectConversation(id: number) {
     setActiveId(id);
@@ -422,7 +450,8 @@ export default function App() {
             </main>
           ) : view === "documents" ? (
             <main className="flex h-full flex-1 flex-col">
-              <DocumentsView onReviewClick={() => setView("review")} />
+              {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
+              <DocumentsView onReviewClick={teachVisible ? () => setView("review") : undefined} />
             </main>
           ) : view === "review" ? (
             <main className="flex h-full flex-1 flex-col">

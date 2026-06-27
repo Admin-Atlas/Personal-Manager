@@ -25,7 +25,7 @@ import type {
   DevTablePage,
   SidecarStatus,
 } from "../lib/types";
-import { Button, Select } from "./ui";
+import { Button, HScroll, Select } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
 import { DevTableGrid } from "./dev/DevTableGrid";
 
@@ -220,7 +220,7 @@ export function DevView() {
                     No candidates — nothing indexed matches this query.
                   </p>
                 ) : (
-                  <div className="mt-2 overflow-x-auto">
+                  <HScroll className="mt-2">
                     <table className="w-full border-collapse text-left text-xs">
                       <thead>
                         <tr className="text-ink4">
@@ -273,7 +273,7 @@ export function DevView() {
                         })}
                       </tbody>
                     </table>
-                  </div>
+                  </HScroll>
                 )}
               </div>
             )}

@@ -19,6 +19,7 @@ import {
   setBackgroundModels,
   setChatAutoSwitch,
   setChatModels,
+  setIndexingSpeed,
   setOpenRouterBackgroundKey,
   setOpenRouterKey,
   setReranking,
@@ -97,6 +98,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [vaultConfirm, setVaultConfirm] = useState("");
   // Query-time reranking toggle (default on; stateless — never triggers a Rebuild).
   const [reranking, setRerankingState] = useState(true);
+  // Indexing speed: "fast" (default) or "gentle" (paced for low-end machines).
+  const [indexingSpeed, setIndexingSpeedState] = useState<"fast" | "gentle">("fast");
   // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
   // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
@@ -145,6 +148,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
           }
         }
         setRerankingState(settings.reranking);
+        setIndexingSpeedState(settings.indexing_speed === "gentle" ? "gentle" : "fast");
       } catch (e) {
         setError(String(e));
       }
@@ -193,6 +197,18 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       await setReranking(next);
     } catch (e) {
       setRerankingState(!next);
+      setError(String(e));
+    }
+  }
+
+  async function changeIndexingSpeed(next: "fast" | "gentle") {
+    setError(null);
+    const prev = indexingSpeed;
+    setIndexingSpeedState(next); // optimistic — revert if the write fails
+    try {
+      await setIndexingSpeed(next);
+    } catch (e) {
+      setIndexingSpeedState(prev);
       setError(String(e));
     }
   }
@@ -603,12 +619,12 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     className="mt-3 flex items-center justify-between gap-3"
                     data-help="settings-teach-tab"
                   >
-                    <span className="text-sm text-ink2">Teach tab</span>
+                    <span className="text-sm text-ink2">Review &amp; Teach tabs</span>
                     <button
                       type="button"
                       role="switch"
                       aria-checked={teachVisible}
-                      aria-label="Show the Teach tab"
+                      aria-label="Show the Review and Teach tabs"
                       onClick={() => setTeachVisible(!teachVisible)}
                       className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
                         teachVisible ? "bg-accent" : "bg-surface"
@@ -789,7 +805,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                         meta={`${fmtUsd(cost.total_30d_usd)} · 30d`}
                       >
                         <p className="pt-2 text-xs text-ink4">
-                          Estimated from the tokens each model call used × OpenRouter&apos;s
+                          Your real per-call cost as reported by OpenRouter where available,
+                          otherwise estimated from the tokens each call used × OpenRouter&apos;s
                           per-token price
                           {cost.pricing_updated_at
                             ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
@@ -816,10 +833,12 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                             is never used for it.
                           </p>
                           <p>
-                            Cost per model = prompt&nbsp;tokens × prompt&nbsp;price +
-                            reply&nbsp;tokens × reply&nbsp;price, summed over that model&apos;s
-                            calls. It&apos;s computed when you open this page, so a later price
-                            change re-prices your history. A model not yet in the price cache shows{" "}
+                            Where OpenRouter reports a call&apos;s actual cost (reflecting any
+                            prompt-cache discount) PM shows that; for older calls without it, cost =
+                            prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
+                            reply&nbsp;price. It&apos;s computed when you open this page, so a later
+                            price change re-prices your history. A model with no reported cost and
+                            not yet in the price cache shows{" "}
                             <span className="font-mono text-ink4">—</span>, never an
                             understated&nbsp;$0.
                           </p>
@@ -937,7 +956,10 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
 
             {tab === "connectors" && (
               <>
-                <ConnectorsSettings />
+                <ConnectorsSettings
+                  indexingSpeed={indexingSpeed}
+                  onChangeIndexingSpeed={(s) => void changeIndexingSpeed(s)}
+                />
               </>
             )}
 

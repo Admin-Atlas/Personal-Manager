@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   forceCenter,
   forceCollide,
@@ -25,9 +25,16 @@ import type { Mode } from "../theme";
  * document is a small node linked to its project's hub, so the grouping is
  * visible at a glance (Step 4b add-on). Hover a document node for its details.
  *
- * The layout is computed once per document set (a few hundred ticks of a d3-force
- * simulation, run synchronously), then rendered as static SVG scaled to fit via a
- * `viewBox` — no animation loop, no resize plumbing.
+ * The layout is computed once per document set (a force simulation run synchronously to
+ * completion), then rendered as static SVG scaled to fit via a `viewBox` — no animation loop,
+ * no resize plumbing. Two efficiency seams matter at scale (a Drive sync can push this past a
+ * thousand nodes):
+ *   1. The expensive part (the force simulation) is keyed on the *document set only*, so a theme
+ *      change re-colours without re-running the layout.
+ *   2. The edges + nodes are a memoised SVG fragment keyed on the coloured layout, so hovering a
+ *      node only re-renders a single overlay highlight — not all N nodes.
+ * Beyond a few thousand nodes the next step is a canvas/WebGL renderer and/or server-side
+ * coordinates (see the `buildPositions` note).
  */
 
 const WIDTH = 960;
@@ -39,6 +46,7 @@ interface GNode extends SimulationNodeDatum {
   label: string;
   project: string;
   radius: number;
+  /** Filled in by `colorize`; empty in the position-only base layout. */
   color: string;
   doc?: Document;
 }
@@ -52,6 +60,15 @@ interface Edge {
   ty: number;
 }
 
+/** Positions only — the costly force-sim output, independent of theme colour. */
+interface BaseLayout {
+  nodes: GNode[];
+  edges: Edge[];
+  viewBox: string;
+  projectNames: string[];
+}
+
+/** A `BaseLayout` with theme colours applied — what the SVG renders. */
 interface Layout {
   nodes: GNode[];
   edges: Edge[];
@@ -75,7 +92,85 @@ export function GraphView() {
       .finally(() => setLoading(false));
   }, []);
 
-  const layout = useMemo<Layout | null>(() => buildLayout(documents, mode), [documents, mode]);
+  // The expensive force layout — recomputed only when the document set changes, NOT on a theme
+  // (mode) toggle, which would otherwise re-run the whole simulation just to swap colours.
+  const base = useMemo(() => buildPositions(documents), [documents]);
+  // Cheap: apply theme colours + build the legend from the already-computed positions.
+  const layout = useMemo<Layout | null>(() => (base ? colorize(base, mode) : null), [base, mode]);
+
+  // Stable so the memoised map body below isn't invalidated by a hover.
+  const onHover = useCallback((doc: Document) => setHovered(doc), []);
+  const onLeave = useCallback(
+    (doc: Document) => setHovered((cur) => (cur?.id === doc.id ? null : cur)),
+    [],
+  );
+
+  // Edges + nodes as one memoised SVG fragment keyed on the layout alone. Because the element
+  // reference is stable across a hover, React skips reconciling all ~1000 nodes when `hovered`
+  // changes — only the overlay highlight + detail card re-render. This is the main win at scale.
+  const mapBody = useMemo(() => {
+    if (!layout) return null;
+    return (
+      <>
+        {layout.edges.map((e, i) => (
+          <line
+            key={i}
+            x1={e.sx}
+            y1={e.sy}
+            x2={e.tx}
+            y2={e.ty}
+            stroke="var(--border)"
+            strokeWidth={0.6}
+          />
+        ))}
+        {layout.nodes.map((n) =>
+          n.kind === "project" ? (
+            <g key={n.id} className="pointer-events-none">
+              <circle
+                cx={n.x}
+                cy={n.y}
+                r={n.radius}
+                fill={n.color}
+                fillOpacity={0.25}
+                stroke={n.color}
+                strokeWidth={1.5}
+              />
+              <text
+                x={n.x}
+                y={(n.y ?? 0) - n.radius - 4}
+                textAnchor="middle"
+                style={{ fontSize: 11, fontWeight: 600, fill: "var(--ink2)" }}
+              >
+                {n.label}
+              </text>
+            </g>
+          ) : (
+            <circle
+              key={n.id}
+              cx={n.x}
+              cy={n.y}
+              r={n.radius}
+              fill={n.color}
+              fillOpacity={0.85}
+              stroke={n.doc && !n.doc.reviewed ? "var(--st-look)" : "var(--bg)"}
+              strokeWidth={n.doc && !n.doc.reviewed ? 1.5 : 1}
+              strokeDasharray={n.doc && !n.doc.reviewed ? "2 2" : undefined}
+              style={{ cursor: "pointer" }}
+              onMouseEnter={() => n.doc && onHover(n.doc)}
+              onMouseLeave={() => n.doc && onLeave(n.doc)}
+            />
+          ),
+        )}
+      </>
+    );
+  }, [layout, onHover, onLeave]);
+
+  // The hovered node's position, looked up once per hover (a single pass — far cheaper than
+  // re-rendering every node) so the highlight can be drawn as one overlay element.
+  const hoveredNode = useMemo(
+    () => (hovered && layout ? (layout.nodes.find((n) => n.doc?.id === hovered.id) ?? null) : null),
+    [hovered, layout],
+  );
 
   return (
     <div className="flex h-full flex-col">
@@ -148,54 +243,18 @@ export function GraphView() {
             className="h-full w-full"
             preserveAspectRatio="xMidYMid meet"
           >
-            {layout.edges.map((e, i) => (
-              <line
-                key={i}
-                x1={e.sx}
-                y1={e.sy}
-                x2={e.tx}
-                y2={e.ty}
-                stroke="var(--border)"
-                strokeWidth={0.6}
+            {mapBody}
+            {hoveredNode && (
+              <circle
+                cx={hoveredNode.x}
+                cy={hoveredNode.y}
+                r={hoveredNode.radius}
+                fill={hoveredNode.color}
+                fillOpacity={1}
+                stroke="var(--ink)"
+                strokeWidth={2}
+                className="pointer-events-none"
               />
-            ))}
-            {layout.nodes.map((n) =>
-              n.kind === "project" ? (
-                <g key={n.id} className="pointer-events-none">
-                  <circle
-                    cx={n.x}
-                    cy={n.y}
-                    r={n.radius}
-                    fill={n.color}
-                    fillOpacity={0.25}
-                    stroke={n.color}
-                    strokeWidth={1.5}
-                  />
-                  <text
-                    x={n.x}
-                    y={(n.y ?? 0) - n.radius - 4}
-                    textAnchor="middle"
-                    style={{ fontSize: 11, fontWeight: 600, fill: "var(--ink2)" }}
-                  >
-                    {n.label}
-                  </text>
-                </g>
-              ) : (
-                <circle
-                  key={n.id}
-                  cx={n.x}
-                  cy={n.y}
-                  r={n.radius}
-                  fill={n.color}
-                  fillOpacity={hovered?.id === n.doc?.id ? 1 : 0.85}
-                  stroke={n.doc && !n.doc.reviewed ? "var(--st-look)" : "var(--bg)"}
-                  strokeWidth={n.doc && !n.doc.reviewed ? 1.5 : hovered?.id === n.doc?.id ? 2 : 1}
-                  strokeDasharray={n.doc && !n.doc.reviewed ? "2 2" : undefined}
-                  style={{ cursor: "pointer" }}
-                  onMouseEnter={() => n.doc && setHovered(n.doc)}
-                  onMouseLeave={() => setHovered((cur) => (cur?.id === n.doc?.id ? null : cur))}
-                />
-              ),
             )}
           </svg>
         )}
@@ -250,12 +309,19 @@ function Row({ label, value, capitalize }: { label: string; value: string; capit
   );
 }
 
-/** Run the force simulation to completion and project it into render-ready data. */
-function buildLayout(documents: Document[], mode: Mode): Layout | null {
+/**
+ * Run the force simulation to completion and project it into render-ready *positions* (no colour).
+ * This is the heavy step; keep it keyed on the document set alone.
+ *
+ * Future: for much larger maps, compute coordinates server-side once and cache them — e.g. a
+ * UMAP/t-SNE projection of the chunk embeddings — and stream just `{id, x, y}` here. That replaces
+ * this synchronous sim with a one-time backend job and makes the map *semantic* (nearby = similar),
+ * but the render path below is what governs draw cost, so it stays as-is.
+ */
+function buildPositions(documents: Document[]): BaseLayout | null {
   if (documents.length === 0) return null;
 
   const projectNames = Array.from(new Set(documents.map((d) => d.project || "Unsorted")));
-  const colorFor = (project: string) => graphColor(projectNames.indexOf(project), mode);
 
   const projectNodes: GNode[] = projectNames.map((name) => ({
     id: `project:${name}`,
@@ -263,7 +329,7 @@ function buildLayout(documents: Document[], mode: Mode): Layout | null {
     label: name,
     project: name,
     radius: 14,
-    color: colorFor(name),
+    color: "",
   }));
   const docNodes: GNode[] = documents.map((d) => ({
     id: `doc:${d.id}`,
@@ -271,7 +337,7 @@ function buildLayout(documents: Document[], mode: Mode): Layout | null {
     label: d.title,
     project: d.project || "Unsorted",
     radius: Math.min(16, 4.5 + Math.sqrt(Math.max(1, d.chunk_count)) * 1.6),
-    color: colorFor(d.project || "Unsorted"),
+    color: "",
     doc: d,
   }));
 
@@ -295,7 +361,11 @@ function buildLayout(documents: Document[], mode: Mode): Layout | null {
     .force("x", forceX(WIDTH / 2).strength(0.05))
     .force("y", forceY(HEIGHT / 2).strength(0.05))
     .stop();
-  for (let i = 0; i < 400; i++) sim.tick();
+  // The sim runs synchronously on the main thread, so cap the work on big maps: the layout is
+  // visually converged well before 400 ticks, and fewer ticks keeps opening a ~1000-node map (a
+  // full Drive sync) responsive instead of freezing the UI.
+  const ticks = nodes.length > 400 ? 250 : 400;
+  for (let i = 0; i < ticks; i++) sim.tick();
 
   const edges: Edge[] = links.map((l) => {
     const s = l.source as GNode;
@@ -312,10 +382,16 @@ function buildLayout(documents: Document[], mode: Mode): Layout | null {
   const w = Math.max(...xs) - minX + pad;
   const h = Math.max(...ys) - minY + pad;
 
+  return { nodes, edges, viewBox: `${minX} ${minY} ${w} ${h}`, projectNames };
+}
+
+/** Apply theme colours to a position-only layout + build the project legend. Cheap (no simulation). */
+function colorize(base: BaseLayout, mode: Mode): Layout {
+  const colorFor = (project: string) => graphColor(base.projectNames.indexOf(project), mode);
   return {
-    nodes,
-    edges,
-    viewBox: `${minX} ${minY} ${w} ${h}`,
-    projects: projectNames.map((name) => ({ name, color: colorFor(name) })),
+    nodes: base.nodes.map((n) => ({ ...n, color: colorFor(n.project) })),
+    edges: base.edges,
+    viewBox: base.viewBox,
+    projects: base.projectNames.map((name) => ({ name, color: colorFor(name) })),
   };
 }

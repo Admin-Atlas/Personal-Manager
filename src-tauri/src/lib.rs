@@ -87,6 +87,27 @@ impl VaultRuntime {
 /// Shared app state. The SQLite connection is guarded by a mutex; commands lock
 /// it only for short synchronous work, never across an `.await`. The sidecar
 /// manages its own interior locking.
+/// A snapshot of the Drive sync that's currently running (if any), shared so the Settings UI can
+/// reflect an in-flight sync no matter which view is mounted. The sync runs detached from the
+/// component that started it — leaving Settings (or starting it, then navigating away) doesn't stop
+/// it; the UI re-reads this on return and follows the `drive://sync` events live.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct DriveSyncState {
+    pub running: bool,
+    pub processed: usize,
+    pub total: Option<usize>,
+    /// The account being synced (email), or `None` for an all-accounts pass.
+    pub account: Option<String>,
+    /// Internal single-flight flag: a sync was requested while one was already running (e.g. the user
+    /// connected another account mid-index). The running pass drains it with one more all-accounts
+    /// sweep so the new account is still picked up. Not exposed to the UI.
+    #[serde(skip)]
+    pub rerun: bool,
+    /// The most recent finished sync's report (counts + the not-indexed list), so a user returning to
+    /// Settings after a sync has completed still sees the result. Cleared when a new sync starts.
+    pub last_report: Option<drive::DriveSyncReport>,
+}
+
 pub struct AppState {
     /// The open store, or `None` when the vault is locked — a passphrase/shareable
     /// vault on a profile that hasn't unlocked it yet. Reach it via [`AppState::conn`],
@@ -107,6 +128,12 @@ pub struct AppState {
     pub instance_id: String,
     /// Cooperative single-writer lock state for the engaged shared vault, if any.
     pub lock_session: Mutex<lock_session::LockSession>,
+    /// Snapshot of the currently-running Drive sync (so the UI can resume showing progress after the
+    /// user navigates away and back). Empty/`running:false` when no sync is in flight.
+    pub drive_sync: Mutex<DriveSyncState>,
+    /// Cooperative stop flag for the running Drive sync. `stop_drive_sync` sets it; the sync loop
+    /// checks it between files and halts, keeping everything indexed so far. Reset at each sync start.
+    pub drive_sync_cancel: AtomicBool,
 }
 
 /// A borrow of the open connection. Derefs to [`Connection`], so call sites read just
@@ -408,6 +435,8 @@ pub fn run() {
                 app_unlocked: AtomicBool::new(false),
                 instance_id: vault::lock::new_instance_id(),
                 lock_session: Mutex::new(lock_session::LockSession::default()),
+                drive_sync: Mutex::new(DriveSyncState::default()),
+                drive_sync_cancel: AtomicBool::new(false),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -437,6 +466,7 @@ pub fn run() {
             commands::has_openrouter_background_key,
             commands::set_openrouter_background_key,
             commands::get_settings,
+            commands::set_indexing_speed,
             commands::set_chat_models,
             commands::set_background_models,
             commands::set_chat_auto_switch,
@@ -514,8 +544,16 @@ pub fn run() {
             commands::list_drive_accounts,
             commands::drive_status,
             commands::sync_drive,
+            commands::drive_sync_status,
+            commands::stop_drive_sync,
+            commands::resume_drive_sync,
+            commands::list_drive_shared_drives,
+            commands::list_drive_folders,
+            commands::get_drive_scope,
+            commands::set_drive_scope,
             commands::fetch_index_only_body,
             commands::open_external_ref,
+            commands::open_url,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::cost_summary,

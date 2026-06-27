@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -52,16 +52,32 @@ fn account_id(email: &str) -> String {
     format!("gdrive:{email}")
 }
 
-/// The stable index-only `source_id` for one Drive file under one account: `gdrive:<email>:<fileId>`.
+/// The stable index-only `source_id` for one **My Drive** file under one account:
+/// `gdrive:<email>:<fileId>`.
 pub fn source_id_for(email: &str, file_id: &str) -> String {
     format!("gdrive:{email}:{file_id}")
 }
 
-/// Recover the account email from a `gdrive:<email>:<fileId>` source id (emails carry no `:`, Drive
-/// fileIds carry no `:`, so the last `:` splits cleanly).
+/// The stable index-only `source_id` for a file in a **shared drive**:
+/// `gdrive:<email>:sd:<driveId>:<fileId>`. The `sd:<driveId>` segment namespaces shared-drive items
+/// so a sync can reconcile one shared drive in isolation (deletion-by-difference) without touching My
+/// Drive or other shared drives — while still living under the account's `gdrive:<email>:%` fan-out.
+pub fn shared_source_id(email: &str, drive_id: &str, file_id: &str) -> String {
+    format!("gdrive:{email}:sd:{drive_id}:{file_id}")
+}
+
+/// The `source_id` prefix that matches every indexed item of one shared drive (for reconcile +
+/// per-drive cleanup): `gdrive:<email>:sd:<driveId>:`.
+fn shared_prefix(email: &str, drive_id: &str) -> String {
+    format!("gdrive:{email}:sd:{drive_id}:")
+}
+
+/// Recover the account email from any Drive source id. Both shapes start `gdrive:<email>:…`, and an
+/// email carries no `:`, so the **first** `:` after the prefix splits the email off cleanly —
+/// covering `gdrive:<email>:<fileId>` and `gdrive:<email>:sd:<driveId>:<fileId>` alike.
 pub fn account_of(source_id: &str) -> Option<String> {
     let rest = source_id.strip_prefix("gdrive:")?;
-    rest.rsplit_once(':').map(|(email, _)| email.to_string())
+    rest.split_once(':').map(|(email, _)| email.to_string())
 }
 
 // --- account registry (connector_sources rows for provider=google service=drive) ----------------
@@ -128,25 +144,82 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<DriveAccount>> {
     Ok(out)
 }
 
-/// The stored delta cursor (Drive changes page token) for an account, if any.
-pub fn get_cursor(conn: &Connection, email: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT cursor FROM connector_sources WHERE id = ?1",
-        params![account_id(email)],
-        |r| r.get(0),
-    )
-    .optional()
-    .map(Option::flatten)
-    .map_err(Error::from)
+// --- delta cursors -------------------------------------------------------------------------------
+//
+// The `connector_sources.cursor` column holds a JSON **map** of changes-feed page tokens, one per
+// independently-tracked corpus: key `"my"` for the personal My Drive, and one key per *whole-drive*
+// shared selection (its driveId). Folder-scoped shared selections have no cursor — the changes feed
+// can't be scoped to folders, so they re-enumerate + reconcile instead (see `gather_shared`). A
+// legacy bare token (pre-shared-drives, when the column held just the My-Drive token) is still read
+// as the `"my"` cursor and upgraded to the map shape on the next clean sync.
+
+/// The cursor-map key for the personal My Drive changes feed (shared selections key on their driveId,
+/// which is never the literal `"my"`).
+const MY_DRIVE_CURSOR_KEY: &str = "my";
+
+type CursorMap = std::collections::BTreeMap<String, String>;
+
+/// Decode the `cursor` column: a JSON object → that map; a non-empty bare string → a legacy My-Drive
+/// token; absent/empty/garbage → an empty map.
+fn decode_cursors(raw: Option<String>) -> CursorMap {
+    match raw {
+        Some(s) if s.trim_start().starts_with('{') => serde_json::from_str(&s).unwrap_or_default(),
+        Some(s) if !s.trim().is_empty() => {
+            let mut m = CursorMap::new();
+            m.insert(MY_DRIVE_CURSOR_KEY.to_string(), s);
+            m
+        }
+        _ => CursorMap::new(),
+    }
 }
 
-/// Record a clean sync: advance the cursor, stamp the time, and clear any failure state.
-pub fn set_synced(conn: &Connection, email: &str, cursor: &str) -> Result<()> {
+/// Read an account's whole cursor map.
+fn read_cursors(conn: &Connection, email: &str) -> Result<CursorMap> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT cursor FROM connector_sources WHERE id = ?1",
+            params![account_id(email)],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)?;
+    Ok(decode_cursors(raw))
+}
+
+/// The stored My-Drive delta cursor for an account, if any.
+pub fn get_cursor(conn: &Connection, email: &str) -> Result<Option<String>> {
+    Ok(read_cursors(conn, email)?.remove(MY_DRIVE_CURSOR_KEY))
+}
+
+/// The stored delta cursor for one whole-drive shared selection (keyed on its driveId), if any.
+pub fn get_shared_cursor(conn: &Connection, email: &str, drive_id: &str) -> Result<Option<String>> {
+    Ok(read_cursors(conn, email)?.remove(drive_id))
+}
+
+/// Record a clean sync: advance the My-Drive cursor (when My Drive synced this pass) and any
+/// whole-drive shared cursors that advanced, stamp the time, and clear any failure state. Cursors for
+/// corpora not touched this pass are left as-is, so a drive that errored mid-pass retries from its
+/// existing token next time.
+pub fn finalize_sync(
+    conn: &Connection,
+    email: &str,
+    my_cursor: Option<&str>,
+    shared_cursors: &[(String, String)],
+) -> Result<()> {
+    let mut cursors = read_cursors(conn, email)?;
+    if let Some(c) = my_cursor {
+        cursors.insert(MY_DRIVE_CURSOR_KEY.to_string(), c.to_string());
+    }
+    for (drive_id, cursor) in shared_cursors {
+        cursors.insert(drive_id.clone(), cursor.clone());
+    }
+    let json = serde_json::to_string(&cursors)
+        .map_err(|e| Error::Other(format!("encode drive cursors: {e}")))?;
     conn.execute(
         "UPDATE connector_sources \
          SET cursor = ?2, last_synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), state = 'ok' \
          WHERE id = ?1",
-        params![account_id(email), cursor],
+        params![account_id(email), json],
     )?;
     Ok(())
 }
@@ -223,6 +296,112 @@ pub fn read_item_state(conn: &Connection, source_id: &str) -> Result<Option<Item
     })
 }
 
+// --- per-account indexing scope (which drives/folders to index) ----------------------------------
+
+/// One shared drive the account opted into, and how much of it to index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedSelection {
+    /// The shared drive's id (its root folder id, too).
+    pub drive_id: String,
+    /// Display name (cached from `drives.list` so the UI/label needs no extra call).
+    pub name: String,
+    /// `None` = the **entire** shared drive; `Some(ids)` = only these folders (recursively). The
+    /// default in the UI is folder-scoped (shared drives are often huge and org-wide).
+    #[serde(default)]
+    pub folders: Option<Vec<String>>,
+}
+
+/// What an account indexes: My Drive (the whole personal drive, the existing default) plus any
+/// opted-in shared drives. Persisted as JSON in `connector_sources.folder_ids` (no migration — the
+/// column already exists and was nullable/unused). A missing/empty value means the default scope
+/// (My Drive on, no shared drives) so every pre-existing account behaves exactly as before.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveScope {
+    /// Index the personal My Drive (delta-cursor sync). Default `true`.
+    #[serde(default = "yes")]
+    pub my_drive: bool,
+    /// Opted-in shared drives (each re-enumerated + reconciled per sync).
+    #[serde(default)]
+    pub shared: Vec<SharedSelection>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for DriveScope {
+    fn default() -> Self {
+        DriveScope {
+            my_drive: true,
+            shared: Vec::new(),
+        }
+    }
+}
+
+/// Read an account's indexing scope (the default scope when none is stored yet).
+pub fn get_scope(conn: &Connection, email: &str) -> Result<DriveScope> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT folder_ids FROM connector_sources WHERE id = ?1",
+            params![account_id(email)],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)?;
+    match raw {
+        Some(s) if !s.trim().is_empty() => {
+            serde_json::from_str(&s).map_err(|e| Error::Other(format!("bad drive scope: {e}")))
+        }
+        _ => Ok(DriveScope::default()),
+    }
+}
+
+/// Persist an account's indexing scope, and **prune stale delta cursors** to match: keep My Drive's
+/// and the cursor of any drive that is still a *whole-drive* selection; drop the rest. A drive that
+/// was removed, or switched to folder-scoped (which uses no cursor), thus loses its cursor — so a
+/// later switch back to whole-drive re-baselines with a fresh enumeration instead of resuming from a
+/// token that predates out-of-scope soft-deletes.
+pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<()> {
+    let json = serde_json::to_string(scope)
+        .map_err(|e| Error::Other(format!("encode drive scope: {e}")))?;
+    let keep: std::collections::HashSet<&str> = scope
+        .shared
+        .iter()
+        .filter(|s| s.folders.is_none())
+        .map(|s| s.drive_id.as_str())
+        .collect();
+    let mut cursors = read_cursors(conn, email)?;
+    cursors.retain(|k, _| k == MY_DRIVE_CURSOR_KEY || keep.contains(k.as_str()));
+    let cursor_json = serde_json::to_string(&cursors)
+        .map_err(|e| Error::Other(format!("encode drive cursors: {e}")))?;
+    conn.execute(
+        "UPDATE connector_sources SET folder_ids = ?2, cursor = ?3 WHERE id = ?1",
+        params![account_id(email), json, cursor_json],
+    )?;
+    Ok(())
+}
+
+/// Every **currently-healthy** (`source_state = 'ok'`) indexed item id belonging to one shared drive
+/// — the set the reconcile diffs the live enumeration against. A present id in this set gets an
+/// `Update` (catches edits, no-ops otherwise); a present id NOT in it gets an `Add` (ingests a new
+/// file, or reactivates one that was previously flagged missing/unreachable — e.g. a folder the user
+/// removed and re-added); an id in this set that is no longer present is a deletion.
+pub fn known_shared_source_ids(
+    conn: &Connection,
+    email: &str,
+    drive_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_id FROM documents \
+         WHERE source_type = 'index_only' AND source_state = 'ok' \
+           AND source_id LIKE ?1 || '%'",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(params![shared_prefix(email, drive_id)], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
 // --- Drive file model + pure parsing/mapping (the unit-tested core) ------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +442,74 @@ pub struct DriveChange {
     pub file_id: String,
     pub removed: bool,
     pub file: Option<DriveFile>,
+}
+
+/// A shared drive the account can see (`drives.list`) — for the "add shared drives" picker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SharedDrive {
+    pub id: String,
+    pub name: String,
+}
+
+/// A folder inside a (shared) drive — one node of the folder picker's lazy tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DriveFolder {
+    pub id: String,
+    pub name: String,
+}
+
+/// Parse a `drives.list` page → its shared drives + the next page token.
+pub fn parse_shared_drives(value: &Value) -> (Vec<SharedDrive>, Option<String>) {
+    let drives = value
+        .get("drives")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    Some(SharedDrive {
+                        id: d.get("id")?.as_str()?.to_string(),
+                        name: d
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Shared drive")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = value
+        .get("nextPageToken")
+        .and_then(Value::as_str)
+        .map(String::from);
+    (drives, next)
+}
+
+/// Parse a `files.list` folder page → its folders + the next page token (only id/name projected).
+pub fn parse_folders(value: &Value) -> (Vec<DriveFolder>, Option<String>) {
+    let folders = value
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    Some(DriveFolder {
+                        id: f.get("id")?.as_str()?.to_string(),
+                        name: f
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Untitled folder")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = value
+        .get("nextPageToken")
+        .and_then(Value::as_str)
+        .map(String::from);
+    (folders, next)
 }
 
 fn parse_file(v: &Value) -> Option<DriveFile> {
@@ -345,12 +592,11 @@ pub fn parse_changes(value: &Value) -> (Vec<DriveChange>, Option<String>, Option
     (changes, next, new_start)
 }
 
-/// Map a Drive change onto a foundation [`ChangeEvent`] — the **pure heart of detection**. `None`
-/// means "skip" (a non-removal change with no file payload — nothing actionable). A rename in Drive
-/// keeps the same fileId (the stable source id), so classification is preserved either way; a
-/// content edit bumps the hash and re-embeds, carrying the new title along.
-pub fn map_change(change: &DriveChange, email: &str, known: bool) -> Option<ChangeEvent> {
-    let source_id = source_id_for(email, &change.file_id);
+/// Map a Drive change onto a foundation [`ChangeEvent`], given the change's already-namespaced source
+/// id — the **pure heart of detection**. `None` means "skip" (a non-removal change with no file
+/// payload — nothing actionable). A rename in Drive keeps the same fileId (the stable source id), so
+/// classification is preserved either way; a content edit bumps the hash and re-embeds.
+fn change_event(source_id: String, change: &DriveChange, known: bool) -> Option<ChangeEvent> {
     if change.removed {
         return Some(ChangeEvent::Delete { source_id });
     }
@@ -366,6 +612,25 @@ pub fn map_change(change: &DriveChange, email: &str, known: bool) -> Option<Chan
         modified_at: file.modified_time.clone(),
         new_content_hash: file.content_hash(),
     })
+}
+
+/// Map a **My Drive** change (the `gdrive:<email>:<fileId>` namespace).
+pub fn map_change(change: &DriveChange, email: &str, known: bool) -> Option<ChangeEvent> {
+    change_event(source_id_for(email, &change.file_id), change, known)
+}
+
+/// Map a **shared-drive** change (the `gdrive:<email>:sd:<driveId>:<fileId>` namespace).
+pub fn map_shared_change(
+    change: &DriveChange,
+    email: &str,
+    drive_id: &str,
+    known: bool,
+) -> Option<ChangeEvent> {
+    change_event(
+        shared_source_id(email, drive_id, &change.file_id),
+        change,
+        known,
+    )
 }
 
 /// How to turn a Drive file's bytes into indexable text, decided purely by its MIME type.
@@ -456,17 +721,189 @@ pub async fn enumerate_drive(token_key: &str) -> Result<Vec<DriveFile>> {
     Ok(out)
 }
 
-/// The delta baseline cursor (`changes.getStartPageToken`).
-pub async fn start_page_token(token_key: &str) -> Result<String> {
-    let v =
-        google::authorized_get(token_key, &format!("{DRIVE_API}/changes/startPageToken")).await?;
+// --- shared drives (Team Drives) — a separate corpus from My Drive ------------------------------
+
+fn shared_drives_url(page: Option<&str>) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/drives"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("pageSize", "100");
+        q.append_pair("fields", "nextPageToken,drives(id,name)");
+        if let Some(t) = page {
+            q.append_pair("pageToken", t);
+        }
+    }
+    Ok(url.to_string())
+}
+
+/// Every shared drive this account can see (`drives.list`) — for the "add shared drives" picker.
+pub async fn list_shared_drives(token_key: &str) -> Result<Vec<SharedDrive>> {
+    let mut out = Vec::new();
+    let mut page: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let v = google::authorized_get(token_key, &shared_drives_url(page.as_deref())?).await?;
+        let (drives, next) = parse_shared_drives(&v);
+        out.extend(drives);
+        match next {
+            Some(t) => page = Some(t),
+            None => return Ok(out),
+        }
+    }
+    Ok(out)
+}
+
+/// A `files.list` URL scoped to one shared drive (`corpora=drive` + the all-drives flags) for an
+/// arbitrary `q`. Shared drives need `supportsAllDrives`/`includeItemsFromAllDrives`; without them the
+/// call silently returns nothing.
+fn shared_files_url(
+    drive_id: &str,
+    q: &str,
+    fields_inner: &str,
+    order_by: &str,
+    page: Option<&str>,
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/files"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("q", q);
+        qp.append_pair("corpora", "drive");
+        qp.append_pair("driveId", drive_id);
+        qp.append_pair("includeItemsFromAllDrives", "true");
+        qp.append_pair("supportsAllDrives", "true");
+        qp.append_pair("spaces", "drive");
+        qp.append_pair("pageSize", "200");
+        if !order_by.is_empty() {
+            qp.append_pair("orderBy", order_by);
+        }
+        qp.append_pair("fields", &format!("nextPageToken,files({fields_inner})"));
+        if let Some(t) = page {
+            qp.append_pair("pageToken", t);
+        }
+    }
+    Ok(url.to_string())
+}
+
+/// The immediate subfolders of `parent_id` within a shared drive — one lazy level of the folder
+/// picker (the drive root's id == the drive id, so the top level passes `parent_id == drive_id`).
+pub async fn list_folders(
+    token_key: &str,
+    drive_id: &str,
+    parent_id: &str,
+) -> Result<Vec<DriveFolder>> {
+    let q = format!(
+        "'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    );
+    let mut out = Vec::new();
+    let mut page: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let url = shared_files_url(drive_id, &q, "id,name", "name", page.as_deref())?;
+        let v = google::authorized_get(token_key, &url).await?;
+        let (folders, next) = parse_folders(&v);
+        out.extend(folders);
+        match next {
+            Some(t) => page = Some(t),
+            None => return Ok(out),
+        }
+    }
+    Ok(out)
+}
+
+/// Enumerate the files of a shared drive to index: the **whole** drive (`folders == None`), or only
+/// the selected folders walked recursively (`Some`). Folders themselves are never indexed — only the
+/// files beneath them. Deduplicates files reachable from more than one selected folder.
+pub async fn enumerate_shared(
+    token_key: &str,
+    drive_id: &str,
+    folders: Option<&[String]>,
+) -> Result<Vec<DriveFile>> {
+    match folders {
+        None => {
+            let mut out = Vec::new();
+            let mut page: Option<String> = None;
+            for _ in 0..MAX_PAGES {
+                let url = shared_files_url(
+                    drive_id,
+                    "trashed = false",
+                    FILE_FIELDS,
+                    "modifiedTime desc",
+                    page.as_deref(),
+                )?;
+                let v = google::authorized_get(token_key, &url).await?;
+                let (files, next) = parse_files(&v);
+                out.extend(files);
+                match next {
+                    Some(t) => page = Some(t),
+                    None => return Ok(out),
+                }
+            }
+            eprintln!("drive: shared whole-drive enumerate hit the page guard");
+            Ok(out)
+        }
+        Some(roots) => {
+            use std::collections::HashSet;
+            let folder_mime = "application/vnd.google-apps.folder";
+            let mut out: Vec<DriveFile> = Vec::new();
+            let mut seen_folders: HashSet<String> = HashSet::new();
+            let mut seen_files: HashSet<String> = HashSet::new();
+            let mut queue: Vec<String> = roots.to_vec();
+            let mut nodes = 0usize;
+            while let Some(folder) = queue.pop() {
+                if !seen_folders.insert(folder.clone()) {
+                    continue; // a folder reachable two ways (nested selections) — walk it once.
+                }
+                nodes += 1;
+                if nodes > MAX_PAGES {
+                    eprintln!(
+                        "drive: shared folder walk hit the node guard at {MAX_PAGES} folders"
+                    );
+                    break;
+                }
+                let q = format!("'{folder}' in parents and trashed = false");
+                let mut page: Option<String> = None;
+                loop {
+                    let url = shared_files_url(drive_id, &q, FILE_FIELDS, "", page.as_deref())?;
+                    let v = google::authorized_get(token_key, &url).await?;
+                    let (children, next) = parse_files(&v);
+                    for child in children {
+                        if child.mime_type == folder_mime {
+                            queue.push(child.id);
+                        } else if seen_files.insert(child.id.clone()) {
+                            out.push(child);
+                        }
+                    }
+                    match next {
+                        Some(t) => page = Some(t),
+                        None => break,
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// The delta baseline cursor (`changes.getStartPageToken`). `drive_id: Some` scopes it to one shared
+/// drive's change feed; `None` is the personal My Drive.
+pub async fn start_page_token(token_key: &str, drive_id: Option<&str>) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/changes/startPageToken"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("supportsAllDrives", "true");
+        if let Some(d) = drive_id {
+            q.append_pair("driveId", d);
+        }
+    }
+    let v = google::authorized_get(token_key, url.as_str()).await?;
     v.get("startPageToken")
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| Error::Other("Drive didn't return a change cursor.".into()))
 }
 
-fn changes_url(page_token: &str) -> Result<String> {
+fn changes_url(page_token: &str, drive_id: Option<&str>) -> Result<String> {
     let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/changes"))
         .map_err(|e| Error::Other(e.to_string()))?;
     {
@@ -475,6 +912,12 @@ fn changes_url(page_token: &str) -> Result<String> {
         q.append_pair("pageSize", "200");
         q.append_pair("includeRemoved", "true");
         q.append_pair("spaces", "drive");
+        // Scope to a shared drive's own change feed (My Drive omits these → its own feed).
+        if let Some(d) = drive_id {
+            q.append_pair("driveId", d);
+            q.append_pair("includeItemsFromAllDrives", "true");
+            q.append_pair("supportsAllDrives", "true");
+        }
         q.append_pair(
             "fields",
             &format!("nextPageToken,newStartPageToken,changes(fileId,removed,file({FILE_FIELDS}))"),
@@ -483,14 +926,15 @@ fn changes_url(page_token: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-/// Pull every change since `cursor`, following pages, and return the changes + the next baseline
-/// cursor (`newStartPageToken`). On an expired cursor Google returns HTTP 410 — surfaced as an error
-/// the caller detects ([`is_cursor_expired`]) to fall back to a full re-list.
-pub async fn list_changes(token_key: &str, cursor: &str) -> Result<(Vec<DriveChange>, String)> {
+async fn list_changes_for(
+    token_key: &str,
+    drive_id: Option<&str>,
+    cursor: &str,
+) -> Result<(Vec<DriveChange>, String)> {
     let mut all = Vec::new();
     let mut page = cursor.to_string();
     for _ in 0..MAX_PAGES {
-        let v = google::authorized_get(token_key, &changes_url(&page)?).await?;
+        let v = google::authorized_get(token_key, &changes_url(&page, drive_id)?).await?;
         let (changes, next, new_start) = parse_changes(&v);
         all.extend(changes);
         match (next, new_start) {
@@ -503,9 +947,26 @@ pub async fn list_changes(token_key: &str, cursor: &str) -> Result<(Vec<DriveCha
     Ok((all, page))
 }
 
+/// Pull every **My Drive** change since `cursor` + the next baseline cursor (`newStartPageToken`). On
+/// an expired cursor Google returns HTTP 410 — surfaced as an error the caller detects
+/// ([`is_cursor_expired`]) to fall back to a full re-list.
+pub async fn list_changes(token_key: &str, cursor: &str) -> Result<(Vec<DriveChange>, String)> {
+    list_changes_for(token_key, None, cursor).await
+}
+
+/// Pull every change since `cursor` for one **shared drive's** own change feed + its next cursor.
+pub async fn list_shared_changes(
+    token_key: &str,
+    drive_id: &str,
+    cursor: &str,
+) -> Result<(Vec<DriveChange>, String)> {
+    list_changes_for(token_key, Some(drive_id), cursor).await
+}
+
 /// Fetch one file's metadata (for body-on-demand, where we hold only the stored pointer).
+/// `supportsAllDrives` so a shared-drive file resolves too (harmless for My Drive files).
 pub async fn fetch_file(token_key: &str, file_id: &str) -> Result<DriveFile> {
-    let url = format!("{DRIVE_API}/files/{file_id}?fields={FILE_FIELDS}");
+    let url = format!("{DRIVE_API}/files/{file_id}?fields={FILE_FIELDS}&supportsAllDrives=true");
     let v = google::authorized_get(token_key, &url).await?;
     parse_file(&v).ok_or_else(|| Error::Other("Drive returned no file for that id.".into()))
 }
@@ -537,18 +998,26 @@ pub async fn fetch_body(
         FetchPlan::Export { mime } => {
             let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/files/{}/export", file.id))
                 .map_err(|e| Error::Other(e.to_string()))?;
-            url.query_pairs_mut().append_pair("mimeType", mime);
+            url.query_pairs_mut()
+                .append_pair("mimeType", mime)
+                .append_pair("supportsAllDrives", "true");
             let bytes =
                 google::authorized_get_bytes(token_key, url.as_str(), MAX_FILE_BYTES).await?;
             Ok(non_empty(&String::from_utf8_lossy(&bytes)))
         }
         FetchPlan::DownloadText => {
-            let url = format!("{DRIVE_API}/files/{}?alt=media", file.id);
+            let url = format!(
+                "{DRIVE_API}/files/{}?alt=media&supportsAllDrives=true",
+                file.id
+            );
             let bytes = google::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await?;
             Ok(non_empty(&String::from_utf8_lossy(&bytes)))
         }
         FetchPlan::DownloadBinary => {
-            let url = format!("{DRIVE_API}/files/{}?alt=media", file.id);
+            let url = format!(
+                "{DRIVE_API}/files/{}?alt=media&supportsAllDrives=true",
+                file.id
+            );
             let bytes = match google::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await {
                 Ok(b) => b,
                 // An over-cap download is a skip (kept findable via its title), not a hard error.
@@ -593,6 +1062,33 @@ fn stage_temp(name: &str, bytes: &[u8]) -> Result<PathBuf> {
 /// Sync progress for the Settings UI. Distinct from `IngestEvent` because a sync also re-embeds and
 /// removes (which carry no freshly-ingested `Document`); the frontend maps `processed`/`total` onto
 /// the shared `IngestProgress` bar.
+/// A file PM tried to index but couldn't, surfaced in the post-sync report so the user knows what was
+/// left out (e.g. an unsupported file type MarkItDown can't read, or a fetch error). Not a fatal
+/// error — the sync carries on; these are just reported.
+#[derive(Clone, Serialize, Default)]
+pub struct DriveSyncIssue {
+    pub name: String,
+    pub reason: String,
+}
+
+/// The outcome of a sync pass: how many items were indexed/updated/removed, the list of files that
+/// couldn't be indexed (capped), and whether the user stopped it early. Shown in Settings after a
+/// sync and stashed in the live snapshot so a user returning after it finished still sees the result.
+#[derive(Clone, Serialize, Default)]
+pub struct DriveSyncReport {
+    pub indexed: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// The user pressed Stop — already-indexed files are kept; the rest were left for next time.
+    pub cancelled: bool,
+    /// Files attempted but not indexed (unsupported/empty, or a fetch error), capped for memory.
+    pub issues: Vec<DriveSyncIssue>,
+    /// True when more files couldn't be indexed than the capped `issues` list holds.
+    pub issues_truncated: bool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DriveSyncEvent {
@@ -604,14 +1100,8 @@ pub enum DriveSyncEvent {
         total: usize,
         name: String,
     },
-    /// The run is done, with a breakdown.
-    Finished {
-        indexed: usize,
-        updated: usize,
-        removed: usize,
-        skipped: usize,
-        failed: usize,
-    },
+    /// The run is done; `report` carries the breakdown + the not-indexed list (+ a `cancelled` flag).
+    Finished { report: DriveSyncReport },
 }
 
 #[cfg(test)]
@@ -638,6 +1128,96 @@ mod tests {
         assert!(sid.starts_with("gdrive:a@b.com:"));
         assert_eq!(account_of(&sid).as_deref(), Some("a@b.com"));
         assert_eq!(account_of("not-a-drive-id"), None);
+    }
+
+    #[test]
+    fn shared_source_ids_namespace_per_drive_and_still_resolve_the_account() {
+        let sid = shared_source_id("a@b.com", "0ADrive", "FILE123");
+        assert_eq!(sid, "gdrive:a@b.com:sd:0ADrive:FILE123");
+        // Lives under the account fan-out (so an auth failure flips it with the rest)…
+        assert!(sid.starts_with("gdrive:a@b.com:"));
+        // …and under its own per-drive prefix (so reconcile can isolate one shared drive).
+        assert!(sid.starts_with(&shared_prefix("a@b.com", "0ADrive")));
+        assert!(!sid.starts_with(&shared_prefix("a@b.com", "0BOther")));
+        // The first-colon split recovers the email from BOTH the My-Drive and shared shapes.
+        assert_eq!(account_of(&sid).as_deref(), Some("a@b.com"));
+        // A My-Drive file is not mistaken for a shared one.
+        assert!(!source_id_for("a@b.com", "FILE123").starts_with(&shared_prefix("a@b.com", "X")));
+    }
+
+    #[test]
+    fn drive_scope_defaults_to_my_drive_only_and_tolerates_partial_json() {
+        // The default (no row value) indexes My Drive and no shared drives.
+        let def = DriveScope::default();
+        assert!(def.my_drive);
+        assert!(def.shared.is_empty());
+        // A stored blob with only `shared` still defaults `my_drive` to true (serde `default = yes`).
+        let parsed: DriveScope =
+            serde_json::from_str(r#"{"shared":[{"drive_id":"0A","name":"Team"}]}"#).unwrap();
+        assert!(parsed.my_drive);
+        assert_eq!(parsed.shared.len(), 1);
+        assert_eq!(parsed.shared[0].drive_id, "0A");
+        assert_eq!(parsed.shared[0].folders, None); // missing → whole drive
+                                                    // Folder-scoped round-trips.
+        let scoped: DriveScope = serde_json::from_str(
+            r#"{"my_drive":false,"shared":[{"drive_id":"0A","name":"Team","folders":["f1","f2"]}]}"#,
+        )
+        .unwrap();
+        assert!(!scoped.my_drive);
+        assert_eq!(
+            scoped.shared[0].folders.as_deref(),
+            Some(&["f1".to_string(), "f2".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn cursor_column_decodes_map_legacy_and_empty() {
+        // The current shape: a JSON object of per-corpus tokens.
+        let m = decode_cursors(Some(r#"{"my":"T1","0ADrive":"T2"}"#.to_string()));
+        assert_eq!(m.get("my").map(String::as_str), Some("T1"));
+        assert_eq!(m.get("0ADrive").map(String::as_str), Some("T2"));
+        // A legacy bare token (pre-shared-drives) reads as the My-Drive cursor and upgrades on write.
+        let legacy = decode_cursors(Some("LEGACYTOKEN".to_string()));
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(
+            legacy.get(MY_DRIVE_CURSOR_KEY).map(String::as_str),
+            Some("LEGACYTOKEN")
+        );
+        // Absent / blank → empty (a first sync).
+        assert!(decode_cursors(None).is_empty());
+        assert!(decode_cursors(Some("   ".to_string())).is_empty());
+    }
+
+    #[test]
+    fn parse_shared_drives_and_folders_read_the_shapes() {
+        let drives = serde_json::json!({
+            "nextPageToken": "P2",
+            "drives": [{"id": "0A", "name": "Team A"}, {"id": "0B"}]
+        });
+        let (parsed, next) = parse_shared_drives(&drives);
+        assert_eq!(next.as_deref(), Some("P2"));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "Team A");
+        assert_eq!(parsed[1].name, "Shared drive"); // name defaulted
+
+        let folders = serde_json::json!({
+            "files": [{"id": "f1", "name": "Reports"}, {"id": "f2", "name": "Archive"}]
+        });
+        let (parsed, next) = parse_folders(&folders);
+        assert!(next.is_none());
+        assert_eq!(
+            parsed,
+            vec![
+                DriveFolder {
+                    id: "f1".into(),
+                    name: "Reports".into()
+                },
+                DriveFolder {
+                    id: "f2".into(),
+                    name: "Archive".into()
+                },
+            ]
+        );
     }
 
     #[test]

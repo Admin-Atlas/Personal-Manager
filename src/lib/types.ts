@@ -37,6 +37,9 @@ export interface Settings {
   /** Whether query-time reranking is on (a cross-encoder re-scores search hits for sharper
    *  relevance). Default on; stateless, so toggling it never triggers a Rebuild. */
   reranking: boolean;
+  /** Indexing speed: "fast" (default, max throughput) or "gentle" (paced so a low-end machine
+   *  stays usable while indexing runs in the background). */
+  indexing_speed: string;
 }
 
 /** One search-language / embedder choice offered at vault creation. */
@@ -391,18 +394,73 @@ export interface DriveStatus {
   accounts: DriveAccount[];
 }
 
+/** A shared drive (Team Drive) an account can see — from `drives.list`, for the "add" picker. */
+export interface SharedDrive {
+  id: string;
+  name: string;
+}
+
+/** A folder inside a (shared) drive — one node of the folder picker's lazy tree. */
+export interface DriveFolder {
+  id: string;
+  name: string;
+}
+
+/** One shared drive an account opted into, and how much of it to index. */
+export interface SharedSelection {
+  drive_id: string;
+  name: string;
+  /** `null` = the entire shared drive; otherwise index only these folders (recursively). */
+  folders: string[] | null;
+}
+
+/** What one account indexes: the personal My Drive plus any opted-in shared drives. Default scope is
+ *  My Drive on, no shared drives — so a freshly-connected account behaves exactly as before. */
+export interface DriveScope {
+  my_drive: boolean;
+  shared: SharedSelection[];
+}
+
+/** A file a Drive sync tried to index but couldn't (e.g. an unsupported type, or a fetch error),
+ *  surfaced in the post-sync report so the user knows what was left out. */
+export interface DriveSyncIssue {
+  name: string;
+  reason: string;
+}
+
+/** The outcome of a Drive sync pass: how many items were indexed/updated/removed, the not-indexed
+ *  list, and whether the user stopped it early. */
+export interface DriveSyncReport {
+  indexed: number;
+  updated: number;
+  removed: number;
+  skipped: number;
+  failed: number;
+  /** The user pressed Stop — already-indexed files are kept; the rest were left for next time. */
+  cancelled: boolean;
+  /** Files attempted but not indexed (capped; see `issues_truncated`). */
+  issues: DriveSyncIssue[];
+  /** True when more files couldn't be indexed than `issues` lists. */
+  issues_truncated: boolean;
+}
+
+/** Snapshot of an in-flight Drive sync, so the UI can resume showing progress after navigating away
+ *  and back. `running` is false when nothing is syncing; `last_report` holds the most recent result
+ *  (so a user returning after it finished still sees the summary). */
+export interface DriveSyncState {
+  running: boolean;
+  processed: number;
+  total: number | null;
+  /** The account (email) being synced, or null for an all-accounts pass. */
+  account: string | null;
+  last_report: DriveSyncReport | null;
+}
+
 /** Streamed progress while a Drive sync runs (mapped onto the shared IngestProgress bar). */
 export type DriveSyncEvent =
   | { type: "counted"; total: number }
   | { type: "item"; processed: number; total: number; name: string }
-  | {
-      type: "finished";
-      indexed: number;
-      updated: number;
-      removed: number;
-      skipped: number;
-      failed: number;
-    };
+  | { type: "finished"; report: DriveSyncReport };
 
 /** A mirrored calendar event (the agenda list). `start` is an ISO datetime, or a
  *  plain date for all-day events. */

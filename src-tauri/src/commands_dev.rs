@@ -211,6 +211,7 @@ const TABLES: &[Table] = &[
             plain("kind"),
             plain("prompt_tokens"),
             plain("completion_tokens"),
+            plain("cost_usd"),
             plain("created_at"),
         ],
     },
@@ -225,6 +226,26 @@ const TABLES: &[Table] = &[
             plain("context_length"),
             plain("intelligence_index"),
             plain("fetched_at"),
+        ],
+    },
+    Table {
+        // Connector accounts (Google Drive today). `folder_ids` is the indexing scope (My Drive +
+        // opted-in shared drives/folders) shown plainly; `cursor` is the delta-sync state — a JSON
+        // map of opaque changes-feed page tokens, shown LENGTH-ONLY (so you can see a cursor is set
+        // and advancing without surfacing the tokens). `last_synced_at` + `state` show sync health.
+        name: "connector_sources",
+        columns: &[
+            plain("id"),
+            plain("provider"),
+            plain("service"),
+            trunc("label", 60),
+            plain("account_email"),
+            plain("mode"),
+            plain("folder_ids"),
+            len("cursor"),
+            plain("last_synced_at"),
+            plain("state"),
+            plain("created_at"),
         ],
     },
 ];
@@ -245,6 +266,7 @@ const COUNT_TABLES: &[&str] = &[
     "conversations",
     "messages",
     "calendar_events",
+    "connector_sources",
     "usage_log",
     "model_pricing",
     "settings",

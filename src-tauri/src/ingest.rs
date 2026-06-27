@@ -117,17 +117,19 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
     // longer matches its index (switched but not yet re-indexed) is sent to the Re-index flow
     // rather than producing wrong-width vectors. Build the gateway so every chunk is sized and
     // embedded with the vault's chosen model.
-    let embedder = {
+    let (embedder, embed_batch) = {
         let conn = state.conn()?;
         let embedder = crate::db::selected_embedder(&conn)?;
         guard_dimension(&conn, &embedder)?;
-        embedder
+        // Resolve the gentle-mode embedding batch cap (the memory lever) once for the run.
+        (embedder, crate::db::indexing_embed_batch(&conn))
     };
     let gateway = ModelGateway::new(
         &state.sidecar,
         embedder.clone(),
         registry::reranker_for(&embedder),
-    );
+    )
+    .with_embed_batch(embed_batch);
 
     // The vault's Markdown dir + cipher for this whole run (they don't change mid-run).
     // Snapshotting up front means we never hold the vault lock across a sidecar call.
@@ -157,6 +159,15 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
             Ok(Outcome::Indexed(document)) => {
                 ingested += 1;
                 let _ = on_event.send(IngestEvent::Done { document });
+                // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously.
+                // Re-read each file (cheap) so flipping Fast/Gentle mid-import takes effect at once.
+                let pause_ms = {
+                    let conn = state.conn()?;
+                    crate::db::indexing_pause_ms(&conn)
+                };
+                if pause_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+                }
             }
             Ok(Outcome::Skipped(reason)) => {
                 skipped += 1;
@@ -300,16 +311,22 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     });
     state.sidecar.ensure_installed()?;
 
-    // Resolve the embedder + its paired reranker before touching the store.
-    let embedder = {
+    // Resolve the embedder + its paired reranker before touching the store, plus the gentle-mode
+    // embedding batch cap — a full rebuild is the heaviest index-time op, so the memory lever matters
+    // most here.
+    let (embedder, embed_batch) = {
         let conn = state.conn()?;
-        crate::db::selected_embedder(&conn)?
+        (
+            crate::db::selected_embedder(&conn)?,
+            crate::db::indexing_embed_batch(&conn),
+        )
     };
     let gateway = ModelGateway::new(
         &state.sidecar,
         embedder.clone(),
         registry::reranker_for(&embedder),
-    );
+    )
+    .with_embed_batch(embed_batch);
 
     // WARMUP-BEFORE-DESTROY: load the embedder — downloading a non-bundled model on first use — and
     // prove it actually emits the expected width *before* clearing the old index. If the user is

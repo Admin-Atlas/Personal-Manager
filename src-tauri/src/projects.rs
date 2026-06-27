@@ -302,7 +302,7 @@ pub async fn propose(
     other_projects: &[String],
 ) -> (ProjectProposal, Option<(openrouter::Usage, Option<String>)>) {
     let messages = build_messages(project, samples, other_projects);
-    match openrouter::complete(api_key, models, &messages).await {
+    match openrouter::complete(api_key, models, &messages, false).await {
         Ok(c) => (parse_proposal(&c.text, project), Some((c.usage, c.model))),
         Err(e) => (
             ProjectProposal::fallback(format!("Proposal request failed: {e}")),

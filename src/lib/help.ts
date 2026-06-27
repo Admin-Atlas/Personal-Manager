@@ -87,8 +87,8 @@ export const HELP: Record<string, HelpEntry> = {
     body: "Type a preference as a plain sentence and PM fills in the fields for you. Check them before saving — nothing is stored until you do.",
   },
   "settings-teach-tab": {
-    title: "Teach tab",
-    body: "Show or hide the Teach tab in the sidebar. It's on for the Standard and Power presets and off for Minimal — but you can override that here. Hiding it only hides the editor; PM still applies the naming rules you've already taught it.",
+    title: "Review & Teach tabs",
+    body: "Show or hide the two 'learning tools' — Review (approve the assistant's filing of new items) and Teach (correct its naming rules and preferences) — together in the sidebar. They're on for the Standard and Power presets and off for Minimal, but you can override that here. Turn them off once the assistant files things well enough on its own that you no longer want to curate; nothing is lost — new items still index and auto-file, and PM keeps applying what you've already taught it. Turn them back on any time.",
   },
 
   // Command palette (Step 5b)
@@ -126,7 +126,19 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "review-row": {
     title: "Reviewing a document",
-    body: "Set the project (start typing to reuse an existing one), pick an importance, and add short tags. The grey line is the AI's reasoning for its suggestion.",
+    body: "Set the project (start typing to reuse an existing one), pick an importance, and add short tags. The grey line is the AI's reasoning for its suggestion. Hover the Project, Importance, and Tags fields for what each one does.",
+  },
+  "review-project": {
+    title: "Project",
+    body: "Which body of work this document belongs to — the bucket it's filed and found under (one document, one project). Start typing to reuse an existing project; a new name creates one. Projects are what the Focus and Map views group by, so consistent names matter more than perfect ones.",
+  },
+  "review-importance": {
+    title: "Importance",
+    body: "How much this document matters to you — NOT how new it is or how often you open it. High: a core reference you'd be set back without; it can surface in Focus and nudge a project toward 'due soon'. Medium: useful, you'll want it sometimes. Low: keep-but-peripheral — it's auto-filed out of the review queue so it never becomes a chore, and stays fully searchable. Rules of thumb for the tricky cases: an active project but an outdated/unused file → Low (the project being live doesn't make the file significant); something you open often but that isn't significant → Medium is fine; something you rarely touch but would be stuck without → High. When unsure, Medium is the safe middle — you can change it anytime.",
+  },
+  "review-tags": {
+    title: "Tags",
+    body: "Short, free-form labels for finding and grouping documents later — topics, people, or types like 'invoice', 'tax', 'spec', 'meeting'. They're extra handles for search and don't change a document's project or importance. Keep them lowercase and short; press Enter or comma to add, × to remove. A document can have many; none is fine too.",
   },
 
   // Chat
@@ -159,6 +171,10 @@ export const HELP: Record<string, HelpEntry> = {
   "settings-background-models": {
     title: "Background model",
     body: "Which model does PM's behind-the-scenes work — the sorting proposals in Review and the Learning You profile. It can differ from your chat model; free models work well here. Chain several with auto-switch so background work keeps going when a free model's daily cap is reached.",
+  },
+  "settings-indexing-speed": {
+    title: "Indexing speed",
+    body: "How hard PM works your machine when it indexes documents (a Drive sync, or files you add). Fast indexes at full speed, using as much CPU and memory as it needs. Gentle paces the work — it pauses briefly between files and embeds in smaller batches — so it uses less CPU and less memory and your computer stays usable while a big index runs in the background. It only changes how fast indexing goes, never what gets indexed, and a change applies right away — even partway through a sync.",
   },
   "settings-learning": {
     title: "Learning You",
@@ -211,6 +227,14 @@ export const HELP: Record<string, HelpEntry> = {
   "settings-drive-firstsync": {
     title: "First sync",
     body: "The first sync walks your whole Drive and indexes every file it can read, so it can take a while and use bandwidth on a large Drive. After that, syncing only fetches what changed since last time. Files deleted in Drive are kept findable but marked 'source missing' — never silently dropped.",
+  },
+  "settings-drive-shared": {
+    title: "Shared drives & scope",
+    body: "Choose what each account indexes. Your personal My Drive is indexed whole by default. Shared drives (Team Drives) are opt-in and folder-scoped by default — pick the folders you want (everything inside is indexed) or switch to the entire drive. Saving re-syncs: newly-in-scope files get indexed, and files that fall out of scope are kept findable but marked 'source missing'. Still index-only — the files stay in Drive.",
+  },
+  "settings-drive-report": {
+    title: "Sync results",
+    body: "A summary of the last sync: how many files were indexed, updated, or removed, plus any that couldn't be indexed and why (an unsupported file type, or a fetch error). Files that couldn't be read are simply skipped — nothing is lost, and they don't block the rest. Indexed files become searchable and show up in Documents. If you stopped the sync early, everything indexed so far is kept; sync again to finish the rest.",
   },
   "settings-data": {
     title: "Data",
