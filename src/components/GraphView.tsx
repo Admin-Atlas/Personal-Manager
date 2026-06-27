@@ -8,6 +8,7 @@ import {
   installOptionalTsne,
   listDocuments,
   onLayoutProgress,
+  onTsneInstall,
   optionalTsneStatus,
   prioritiseSemanticLayout,
   semanticLayout,
@@ -20,6 +21,7 @@ import {
   type Bounds,
   type PositionedNode,
 } from "../lib/mapLayout";
+import { IngestProgress } from "./IngestProgress";
 import { Skeleton } from "./ui";
 import type { Document, SemanticLayout } from "../lib/types";
 import { graphColor, useTheme, useDepth } from "../theme";
@@ -31,16 +33,24 @@ import { graphColor, useTheme, useDepth } from "../theme";
  *     projection of their embeddings computed in the background (see `src/lib/layout.rs`); no edges.
  *
  * Rendering is on a single `<canvas>` (one draw call per frame, d3-quadtree hit-testing) so thousands
- * of nodes — index-only Drive files inflate the count — stay smooth. Hover a node for its details;
- * click one to open its project's focused view. Colour is applied in the draw call, so a theme toggle
- * is a redraw, not a relayout.
+ * of nodes — index-only Drive files inflate the count — stay smooth. The view is navigable: scroll to
+ * zoom, drag to pan, double-click (or the Fit button) to reset. Hover a node for its details; click one
+ * (without dragging) to open its project's focused view. Colour is applied in the draw call, so a theme
+ * toggle is a redraw, not a relayout.
  */
 
 type LayoutMode = "project" | "semantic";
 const MODE_KEY = "pm.map.layoutMode";
+const COHESION_KEY = "pm.map.cohesion";
 
 function initialMode(): LayoutMode {
   return localStorage.getItem(MODE_KEY) === "semantic" ? "semantic" : "project";
+}
+
+/** Project-cohesion weight (0 = pure meaning, the default; ≤0.5). Per-device, like the mode pref. */
+function initialCohesion(): number {
+  const raw = Number(localStorage.getItem(COHESION_KEY));
+  return Number.isFinite(raw) ? Math.max(0, Math.min(0.5, raw)) : 0;
 }
 
 /** Themed values the canvas needs as concrete strings (canvas can't read CSS `var(--…)`). */
@@ -93,14 +103,31 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   const [loading, setLoading] = useState(true);
 
   const [layoutMode, setLayoutMode] = useState<LayoutMode>(initialMode);
+  const [cohesion, setCohesion] = useState<number>(initialCohesion);
   const [semantic, setSemantic] = useState<SemanticLayout | null>(null);
   const [computing, setComputing] = useState(false);
   const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
   const [installingTsne, setInstallingTsne] = useState(false);
+  const [installFrac, setInstallFrac] = useState(0);
+  const [grabbing, setGrabbing] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
-  const transformRef = useRef<Transform | null>(null);
+  // The live world→screen transform (pan/zoom mutate it in place; draw + hit-testing read it).
+  const viewRef = useRef<Transform | null>(null);
+  // The most recent fit transform, for clamping zoom and resetting the view.
+  const fitRef = useRef<Transform | null>(null);
+  // Recompute the fit on the next draw (a fresh layout, or a reset).
+  const needFitRef = useRef(true);
+  // The user has panned/zoomed, so a resize keeps their view instead of refitting.
+  const interactedRef = useRef(false);
+  const dragRef = useRef<{
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastY: number;
+    moved: boolean;
+  } | null>(null);
 
   useEffect(() => {
     listDocuments()
@@ -115,10 +142,29 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       .catch(() => setTsneInstalled(false));
   }, []);
 
-  // Persist the chosen arrangement (per-device, like the theme/depth prefs).
+  // Persist the chosen arrangement + cohesion (per-device, like the theme/depth prefs).
   useEffect(() => {
     localStorage.setItem(MODE_KEY, layoutMode);
   }, [layoutMode]);
+  useEffect(() => {
+    localStorage.setItem(COHESION_KEY, String(cohesion));
+  }, [cohesion]);
+
+  // Follow the optional-t-SNE download's progress (it can be triggered here or from Settings).
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    void onTsneInstall((e) => {
+      if (!cancelled) setInstallFrac(e.fraction);
+    }).then((u) => {
+      unlisten = u;
+      if (cancelled) u();
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   // Semantic mode: fetch the cached coords, ask the backend to prioritise a recompute if stale, and
   // follow the global progress event so the map refreshes when a new layout lands.
@@ -158,7 +204,8 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   }, [layoutMode]);
 
   // The render layout. Project mode runs the (worker-backed, cached) force layout; semantic mode joins
-  // the backend coords to the documents. A stale async result can't overwrite a newer one.
+  // the backend coords to the documents (optionally blended toward project centroids by `cohesion`).
+  // A stale async result can't overwrite a newer one.
   useEffect(() => {
     let cancelled = false;
     if (layoutMode === "project") {
@@ -171,12 +218,19 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     } else {
       // Don't render a pile of centroids before any coords exist — show the preparing state instead.
       const coords = semantic?.coords ?? [];
-      setBase(coords.length > 0 ? buildSemanticLayout(documents, coords) : null);
+      setBase(coords.length > 0 ? buildSemanticLayout(documents, coords, cohesion) : null);
     }
     return () => {
       cancelled = true;
     };
-  }, [documents, layoutMode, semantic]);
+  }, [documents, layoutMode, semantic, cohesion]);
+
+  // A new layout (or mode/cohesion change) refits the view; the user's pan/zoom only applies within a
+  // given layout.
+  useEffect(() => {
+    needFitRef.current = true;
+    interactedRef.current = false;
+  }, [base]);
 
   const projectIndex = useMemo(() => {
     const m = new Map<string, number>();
@@ -221,8 +275,14 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
 
-    const t = fitTransform(base.bounds, cssW, cssH);
-    transformRef.current = t;
+    // Fit on a fresh layout / reset; otherwise keep the user's pan & zoom.
+    if (needFitRef.current || !viewRef.current) {
+      const fit = fitTransform(base.bounds, cssW, cssH);
+      fitRef.current = fit;
+      viewRef.current = fit;
+      needFitRef.current = false;
+    }
+    const t = viewRef.current;
     const sx = (x: number) => x * t.scale + t.offsetX;
     const sy = (y: number) => y * t.scale + t.offsetY;
     const colors = readThemeColors();
@@ -300,7 +360,11 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return;
-    const ro = new ResizeObserver(() => requestAnimationFrame(draw));
+    const ro = new ResizeObserver(() => {
+      // Keep the user's framing if they've navigated; otherwise refit to the new size.
+      if (!interactedRef.current) needFitRef.current = true;
+      requestAnimationFrame(draw);
+    });
     ro.observe(wrap);
     return () => ro.disconnect();
   }, [draw]);
@@ -309,21 +373,127 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   const nodeAt = useCallback(
     (clientX: number, clientY: number): PositionedNode | null => {
       const canvas = canvasRef.current;
-      const t = transformRef.current;
+      const t = viewRef.current;
       if (!canvas || !t || !docQuadtree) return null;
       const rect = canvas.getBoundingClientRect();
       const wx = (clientX - rect.left - t.offsetX) / t.scale;
       const wy = (clientY - rect.top - t.offsetY) / t.scale;
-      const hit = docQuadtree.find(wx, wy, 18);
+      // Allow a constant ~6 screen-px slop on top of the node's world radius, so nodes stay easy to
+      // hit when zoomed out (where a node covers few pixels).
+      const tol = 6 / t.scale;
+      const hit = docQuadtree.find(wx, wy, 16 + tol + 2);
       if (!hit) return null;
       const d = Math.hypot(hit.x - wx, hit.y - wy);
-      return d <= hit.radius + 2 ? hit : null;
+      return d <= hit.radius + tol ? hit : null;
     },
     [docQuadtree],
   );
 
+  // Keep the latest callbacks reachable from the once-attached native/window listeners.
+  const drawRef = useRef(draw);
+  const nodeAtRef = useRef(nodeAt);
+  const onOpenRef = useRef(onOpenProject);
+  useEffect(() => {
+    drawRef.current = draw;
+    nodeAtRef.current = nodeAt;
+    onOpenRef.current = onOpenProject;
+  });
+
+  /** Zoom about a point (screen px), clamped so the whole map is never smaller than half the fit. */
+  const zoomAt = useCallback((px: number, py: number, factor: number) => {
+    const t = viewRef.current;
+    if (!t) return;
+    const fitScale = fitRef.current?.scale ?? t.scale;
+    const wx = (px - t.offsetX) / t.scale;
+    const wy = (py - t.offsetY) / t.scale;
+    const scale = Math.min(fitScale * 16, Math.max(fitScale * 0.5, t.scale * factor));
+    viewRef.current = { scale, offsetX: px - wx * scale, offsetY: py - wy * scale };
+    interactedRef.current = true;
+    setHovered(null);
+    requestAnimationFrame(() => drawRef.current());
+  }, []);
+
+  const zoomButton = useCallback(
+    (factor: number) => {
+      const wrap = wrapRef.current;
+      if (!wrap) return;
+      zoomAt(wrap.clientWidth / 2, wrap.clientHeight / 2, factor);
+    },
+    [zoomAt],
+  );
+
+  const resetView = useCallback(() => {
+    needFitRef.current = true;
+    interactedRef.current = false;
+    requestAnimationFrame(() => drawRef.current());
+  }, []);
+
+  // Native, non-passive wheel listener (React's onWheel is passive, so it can't preventDefault).
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const onWheel = (e: WheelEvent) => {
+      const canvas = canvasRef.current;
+      if (!canvas || !viewRef.current) return;
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const factor = Math.exp(-e.deltaY * 0.0015);
+      zoomAt(e.clientX - rect.left, e.clientY - rect.top, factor);
+    };
+    wrap.addEventListener("wheel", onWheel, { passive: false });
+    return () => wrap.removeEventListener("wheel", onWheel);
+  }, [zoomAt]);
+
+  // Pan with a window-level drag (so it keeps tracking outside the canvas), and treat a press that
+  // didn't move as a click that opens the project under it.
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const drag = dragRef.current;
+      const t = viewRef.current;
+      if (!drag || !t) return;
+      const dx = e.clientX - drag.lastX;
+      const dy = e.clientY - drag.lastY;
+      drag.lastX = e.clientX;
+      drag.lastY = e.clientY;
+      if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) > 3) drag.moved = true;
+      viewRef.current = { ...t, offsetX: t.offsetX + dx, offsetY: t.offsetY + dy };
+      interactedRef.current = true;
+      setHovered(null);
+      requestAnimationFrame(() => drawRef.current());
+    };
+    const onUp = (e: MouseEvent) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      dragRef.current = null;
+      setGrabbing(false);
+      if (!drag.moved) {
+        const hit = nodeAtRef.current(e.clientX, e.clientY);
+        if (hit?.doc && onOpenRef.current) onOpenRef.current(hit.doc.project);
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const onCanvasMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    dragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      moved: false,
+    };
+    setGrabbing(true);
+  }, []);
+
   const onMouseMove = useCallback(
     (e: React.MouseEvent) => {
+      if (dragRef.current) return; // panning — no hover
       const hit = nodeAt(e.clientX, e.clientY);
       const doc = hit?.doc ?? null;
       setHovered((cur) => (cur?.id === doc?.id ? cur : doc));
@@ -331,16 +501,10 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     [nodeAt],
   );
   const onMouseLeave = useCallback(() => setHovered(null), []);
-  const onClick = useCallback(
-    (e: React.MouseEvent) => {
-      const hit = nodeAt(e.clientX, e.clientY);
-      if (hit?.doc && onOpenProject) onOpenProject(hit.doc.project);
-    },
-    [nodeAt, onOpenProject],
-  );
 
   const installTsne = useCallback(() => {
     setInstallingTsne(true);
+    setInstallFrac(0);
     installOptionalTsne()
       .then(() => optionalTsneStatus())
       .then((s) => setTsneInstalled(s.installed))
@@ -352,12 +516,13 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   const subtitle =
     layoutMode === "semantic"
       ? placed > 0 && placed < documents.length
-        ? `showing the top ${placed} of ${documents.length} documents by meaning · click to open a project`
-        : `${documents.length} document${documents.length === 1 ? "" : "s"} by meaning · click to open a project`
-      : `${documents.length} document${documents.length === 1 ? "" : "s"} across ${legend.length} project${legend.length === 1 ? "" : "s"} · hover for details, click to open`;
+        ? `showing the top ${placed} of ${documents.length} documents by meaning · scroll to zoom, drag to pan`
+        : `${documents.length} document${documents.length === 1 ? "" : "s"} by meaning · scroll to zoom, drag to pan`
+      : `${documents.length} document${documents.length === 1 ? "" : "s"} across ${legend.length} project${legend.length === 1 ? "" : "s"} · scroll to zoom, drag to pan, click to open`;
 
   // The toggle's help differs by whether t-SNE is installed (explain what it is vs that it's running).
   const toggleHelp = tsneInstalled ? "map-layout-toggle-tsne" : "map-layout-toggle";
+  const cursor = grabbing ? "grabbing" : hovered ? "pointer" : "grab";
 
   return (
     <div className="flex h-full flex-col">
@@ -406,7 +571,10 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
           computing={computing}
           tsneInstalled={tsneInstalled}
           installing={installingTsne}
+          installFrac={installFrac}
           onInstall={installTsne}
+          cohesion={cohesion}
+          onCohesion={setCohesion}
         />
       )}
 
@@ -441,14 +609,22 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
             <span>Preparing the semantic map…</span>
           </div>
         ) : (
-          <canvas
-            ref={canvasRef}
-            className="h-full w-full"
-            style={{ cursor: hovered ? "pointer" : "default" }}
-            onMouseMove={onMouseMove}
-            onMouseLeave={onMouseLeave}
-            onClick={onClick}
-          />
+          <>
+            <canvas
+              ref={canvasRef}
+              className="h-full w-full"
+              style={{ cursor }}
+              onMouseDown={onCanvasMouseDown}
+              onMouseMove={onMouseMove}
+              onMouseLeave={onMouseLeave}
+              onDoubleClick={resetView}
+            />
+            <NavControls
+              onZoomIn={() => zoomButton(1.3)}
+              onZoomOut={() => zoomButton(1 / 1.3)}
+              onReset={resetView}
+            />
+          </>
         )}
 
         {hovered && <DetailCard doc={hovered} />}
@@ -479,49 +655,111 @@ function ModeButton({
   );
 }
 
-/** The strip under the header in semantic mode: a recompute indicator, or the optional-t-SNE nudge. */
+/** Zoom + fit controls, bottom-right over the canvas. */
+function NavControls({
+  onZoomIn,
+  onZoomOut,
+  onReset,
+}: {
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onReset: () => void;
+}) {
+  const btn =
+    "flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] border border-border bg-surface/85 text-ink2 backdrop-blur transition hover:text-ink hover:border-border2";
+  return (
+    <div className="absolute bottom-4 right-4 z-10 flex flex-col gap-1.5" data-help="map-navigate">
+      <button type="button" className={btn} onClick={onZoomIn} aria-label="Zoom in" title="Zoom in">
+        +
+      </button>
+      <button
+        type="button"
+        className={btn}
+        onClick={onZoomOut}
+        aria-label="Zoom out"
+        title="Zoom out"
+      >
+        −
+      </button>
+      <button
+        type="button"
+        className={btn}
+        onClick={onReset}
+        aria-label="Fit to view"
+        title="Fit to view"
+      >
+        ⤢
+      </button>
+    </div>
+  );
+}
+
+/** The strip under the header in semantic mode: status (recompute / install / nudge) on the left, the
+ *  project-cohesion control on the right. */
 function SemanticBar({
   computing,
   tsneInstalled,
   installing,
+  installFrac,
   onInstall,
+  cohesion,
+  onCohesion,
 }: {
   computing: boolean;
   tsneInstalled: boolean | null;
   installing: boolean;
+  installFrac: number;
   onInstall: () => void;
+  cohesion: number;
+  onCohesion: (v: number) => void;
 }) {
-  if (computing) {
-    return (
-      <div className="flex items-center gap-2 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
-        <Skeleton className="h-2 w-2" style={{ borderRadius: "9999px" }} />
-        Updating the map by meaning…
+  return (
+    <div className="flex items-center justify-between gap-4 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
+      <div className="flex min-h-[1.25rem] flex-1 items-center gap-2">
+        {installing ? (
+          <IngestProgress
+            mode="percent"
+            processed={Math.round(installFrac * 100)}
+            total={100}
+            label="Downloading the enhanced (t-SNE) layout"
+            className="w-full max-w-xs"
+          />
+        ) : computing ? (
+          <>
+            <Skeleton className="h-2 w-2" style={{ borderRadius: "9999px" }} />
+            Updating the map by meaning…
+          </>
+        ) : tsneInstalled === false ? (
+          <>
+            <span>Using the basic layout.</span>
+            <button
+              type="button"
+              onClick={onInstall}
+              className="font-medium text-accent hover:underline"
+            >
+              Enable enhanced (t-SNE) →
+            </button>
+          </>
+        ) : null}
       </div>
-    );
-  }
-  if (installing) {
-    return (
-      <div className="flex items-center gap-2 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
-        <Skeleton className="h-2 w-2" style={{ borderRadius: "9999px" }} />
-        Downloading the enhanced (t-SNE) layout…
-      </div>
-    );
-  }
-  if (tsneInstalled === false) {
-    return (
-      <div className="flex items-center gap-2 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
-        <span>Using the basic layout.</span>
-        <button
-          type="button"
-          onClick={onInstall}
-          className="font-medium text-accent hover:underline"
+      <label
+        className="flex shrink-0 items-center gap-2 whitespace-nowrap"
+        data-help="map-cohesion"
+      >
+        <span className="text-ink3">Project cohesion</span>
+        <select
+          value={String(cohesion)}
+          onChange={(e) => onCohesion(Number(e.target.value))}
+          className="rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 text-xs text-ink2 outline-none transition focus:border-accent"
         >
-          Enable enhanced (t-SNE) →
-        </button>
-      </div>
-    );
-  }
-  return null;
+          <option value="0">Off</option>
+          <option value="0.15">Low</option>
+          <option value="0.3">Medium</option>
+          <option value="0.5">High</option>
+        </select>
+      </label>
+    </div>
+  );
 }
 
 /** A node-cluster shimmer that mirrors the map's shape, so a load reads as "your map is coming". */

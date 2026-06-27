@@ -217,12 +217,23 @@ export function getProjectLayout(documents: Document[]): Promise<BaseLayout> | n
  * but documents are still coloured by project for the legend. A document with no coordinate yet (added
  * since the last compute, or beyond the node cap) is parked at its project's centroid and marked
  * transient, so it still appears — grouped — and snaps into place when the next recompute lands.
+ *
+ * `cohesion` (0 = off, the default) optionally nudges each document a fraction of the way toward its
+ * project's centre of mass, so same-project documents read as looser clusters without abandoning the
+ * meaning-driven layout. It's a render-time blend over the cached pure coords — instant, with no
+ * recompute and no effect on the cache — so the default layout stays a faithful "by meaning" view.
+ *
+ * NOTE: this assumes one project per document (the current data model). If documents ever belong to
+ * multiple projects, "the project centroid" becomes ambiguous (the same objection that excludes tags
+ * from cohesion) and this blend needs rethinking — see the Stage-4 backlog card / issue #97.
  */
 export function buildSemanticLayout(
   documents: Document[],
   coords: SemanticCoord[],
+  cohesion = 0,
 ): BaseLayout | null {
   if (documents.length === 0) return null;
+  const pull = Math.max(0, Math.min(0.5, cohesion));
 
   const projectNames = Array.from(new Set(documents.map((d) => d.project || "Unsorted")));
   const coordById = new Map(coords.map((c) => [c.id, c]));
@@ -253,7 +264,13 @@ export function buildSemanticLayout(
   const nodes: PositionedNode[] = documents.map((d) => {
     const proj = d.project || "Unsorted";
     const c = coordById.get(d.id);
-    const p = c ?? centroidFor(proj);
+    // No coord yet → park (faded) at the project centroid. Otherwise sit at the meaning-driven coord,
+    // optionally blended a fraction (`pull`) toward that centroid when cohesion is on.
+    let p = c ?? centroidFor(proj);
+    if (c && pull > 0) {
+      const cen = centroidFor(proj);
+      p = { x: c.x + (cen.x - c.x) * pull, y: c.y + (cen.y - c.y) * pull };
+    }
     return {
       id: `doc:${d.id}`,
       kind: "doc",

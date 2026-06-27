@@ -44,6 +44,7 @@ import type {
   Settings,
   SharedDrive,
   SidecarStatus,
+  TsneInstallEvent,
   TsneStatus,
   VaultLockStatus,
   VaultStatus,
@@ -556,6 +557,10 @@ export const installOptionalTsne = () => invoke<void>("install_optional_tsne");
 /** Subscribe to global semantic-layout progress (fires regardless of which view started the job). */
 export const onLayoutProgress = (handler: (e: LayoutProgressEvent) => void): Promise<UnlistenFn> =>
   listen<LayoutProgressEvent>("layout://progress", (e) => handler(e.payload));
+
+/** Subscribe to the optional t-SNE download's progress (fires from whichever view triggered it). */
+export const onTsneInstall = (handler: (e: TsneInstallEvent) => void): Promise<UnlistenFn> =>
+  listen<TsneInstallEvent>("tsne://install", (e) => handler(e.payload));
 
 /** Open an index-only document's source in the system browser (its Drive link). */
 export const openExternalRef = (docId: number) => invoke<void>("open_external_ref", { docId });

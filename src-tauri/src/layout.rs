@@ -79,6 +79,13 @@ fn emit(app: &AppHandle, ev: LayoutProgressEvent) {
     let _ = app.emit("layout://progress", ev);
 }
 
+/// Progress for the optional t-SNE component download (broadcast on `tsne://install`). The download
+/// has no file count, so `fraction` (0.0..=1.0, monotonic) is rendered as a percentage bar.
+#[derive(Clone, Serialize)]
+pub struct TsneInstallEvent {
+    fraction: f32,
+}
+
 /// Mutate the shared job snapshot, best-effort. Binds the lock guard to a named local first to
 /// sidestep the `if let` temporary-lifetime pitfall (same pattern as `with_drive_snap`).
 fn with_job(app: &AppHandle, f: impl FnOnce(&mut LayoutJobState)) {
@@ -520,7 +527,12 @@ pub fn optional_tsne_status(state: State<'_, AppState>) -> Result<TsneStatus> {
 pub async fn install_optional_tsne(app: AppHandle) -> Result<()> {
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        app2.state::<AppState>().sidecar.install_optional_tsne()
+        let progress_app = app2.clone();
+        app2.state::<AppState>()
+            .sidecar
+            .install_optional_tsne(move |fraction| {
+                let _ = progress_app.emit("tsne://install", TsneInstallEvent { fraction });
+            })
     })
     .await
     .map_err(|e| Error::Other(format!("t-SNE install task panicked: {e}")))??;

@@ -482,6 +482,12 @@ export interface TsneStatus {
   installed: boolean;
 }
 
+/** Progress for the optional t-SNE component download (0..1, monotonic). Rendered as a percentage —
+ *  a download has no file count — tiered by Depth (bar at minimal, bar + % at standard and power). */
+export interface TsneInstallEvent {
+  fraction: number;
+}
+
 /** Global progress for the semantic-layout precompute (fires regardless of which view started it). */
 export type LayoutProgressEvent =
   | { state: "preparing" }

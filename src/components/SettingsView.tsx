@@ -14,6 +14,7 @@ import {
   hasOpenRouterKey,
   installOptionalTsne,
   languageOptions,
+  onTsneInstall,
   openDataFolder,
   optionalTsneStatus,
   refreshPricing,
@@ -35,6 +36,7 @@ import { useHelp } from "../lib/help";
 import { ConnectorsSettings } from "./ConnectorsSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
+import { IngestProgress } from "./IngestProgress";
 import { RebuildProgress } from "./RebuildProgress";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
@@ -112,8 +114,15 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     localStorage.getItem("pm.map.layoutMode") === "semantic" ? "semantic" : "project",
   );
   const [mapNodeCap, setMapNodeCap] = useState(1000);
+  // Project cohesion (0 = pure meaning, the default; ≤0.5) — a render-time blend, so it lives in
+  // localStorage like the grouping pref, not in the backend layout fingerprint.
+  const [mapCohesion, setMapCohesion] = useState<number>(() => {
+    const r = Number(localStorage.getItem("pm.map.cohesion"));
+    return Number.isFinite(r) ? Math.max(0, Math.min(0.5, r)) : 0;
+  });
   const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
   const [installingTsne, setInstallingTsne] = useState(false);
+  const [tsneInstallFrac, setTsneInstallFrac] = useState(0);
   // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
   // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
@@ -213,9 +222,31 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       .catch(() => setTsneInstalled(false));
   }, [onboarding]);
 
+  // Follow the optional-t-SNE download's progress so the row shows a real percentage bar.
+  useEffect(() => {
+    if (onboarding) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void onTsneInstall((e) => {
+      if (!cancelled) setTsneInstallFrac(e.fraction);
+    }).then((u) => {
+      unlisten = u;
+      if (cancelled) u();
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [onboarding]);
+
   function changeMapGrouping(next: "semantic" | "project") {
     setMapGrouping(next);
     localStorage.setItem("pm.map.layoutMode", next); // shared with the Map header toggle
+  }
+
+  function changeMapCohesion(next: number) {
+    setMapCohesion(next);
+    localStorage.setItem("pm.map.cohesion", String(next)); // shared with the Map's cohesion control
   }
 
   function changeMapNodeCap(next: number) {
@@ -228,6 +259,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
 
   function downloadTsne() {
     setInstallingTsne(true);
+    setTsneInstallFrac(0);
     installOptionalTsne()
       .then(() => optionalTsneStatus())
       .then((s) => setTsneInstalled(s.installed))
@@ -713,6 +745,18 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     />
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-sm text-ink2">Project cohesion</span>
+                    <Select
+                      value={String(mapCohesion)}
+                      onChange={(e) => changeMapCohesion(Number(e.target.value))}
+                    >
+                      <option value="0">Off</option>
+                      <option value="0.15">Low</option>
+                      <option value="0.3">Medium</option>
+                      <option value="0.5">High</option>
+                    </Select>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-sm text-ink2">Maximum nodes</span>
                     <Select
                       value={String(mapNodeCap)}
@@ -737,9 +781,20 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       </Button>
                     )}
                   </div>
+                  {installingTsne && (
+                    <IngestProgress
+                      mode="percent"
+                      processed={Math.round(tsneInstallFrac * 100)}
+                      total={100}
+                      label="Downloading the enhanced (t-SNE) layout"
+                      className="mt-2"
+                    />
+                  )}
                   <p className="mt-2 text-xs text-ink4">
-                    Semantic proximity uses a basic on-device layout by default. The optional t-SNE
-                    component (a one-time download) produces tighter clusters of related documents.
+                    Semantic proximity uses a basic on-device layout by default. Project cohesion
+                    gently pulls same-project documents together (Off keeps the layout purely by
+                    meaning). The optional t-SNE component (a one-time download) produces tighter
+                    clusters of related documents.
                   </p>
                 </div>
 
