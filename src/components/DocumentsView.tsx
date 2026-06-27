@@ -18,6 +18,7 @@ import {
 } from "../lib/ipc";
 import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
+import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { useDepth } from "../theme";
 import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
@@ -46,9 +47,6 @@ interface DocSort {
   key: SortKey;
   dir: "asc" | "desc";
 }
-// Archive sits below everything — below an untriaged (null → 0) document too — so deliberately
-// shelved files sink to the bottom when sorting by importance.
-const IMPORTANCE_RANK: Record<string, number> = { high: 3, medium: 2, low: 1, archive: -1 };
 // Columns where "biggest first" is the more useful default on first click.
 const SORT_DESC_FIRST = new Set<SortKey>(["importance", "chunks", "ingested"]);
 
@@ -370,7 +368,6 @@ export function DocumentsView({ onReviewClick }: Props) {
   const sortedDocuments = useMemo(() => {
     if (!sort) return documents;
     const factor = sort.dir === "asc" ? 1 : -1;
-    const rank = (imp: string | null) => (imp ? (IMPORTANCE_RANK[imp] ?? 0) : 0);
     return [...documents].sort((a, b) => {
       let c = 0;
       switch (sort.key) {
@@ -381,7 +378,7 @@ export function DocumentsView({ onReviewClick }: Props) {
           c = a.project.localeCompare(b.project);
           break;
         case "importance":
-          c = rank(a.importance) - rank(b.importance);
+          c = rankImportance(a.importance) - rankImportance(b.importance);
           break;
         case "chunks":
           c = a.chunk_count - b.chunk_count;
@@ -509,63 +506,75 @@ export function DocumentsView({ onReviewClick }: Props) {
               `showHarness` above (issue #78). */}
           {showHarness && (
             <Card className="mt-4 p-3">
-              <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
-                Dev — add an indexed-only item
-              </p>
-              <div className="flex flex-col gap-2">
-                <input
-                  value={devTitle}
-                  onChange={(e) => setDevTitle(e.target.value)}
-                  placeholder="Title"
-                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
-                />
-                <textarea
-                  value={devBody}
-                  onChange={(e) => setDevBody(e.target.value)}
-                  placeholder="Body — embedded + summarised, never stored (the index-only pointer)"
-                  rows={3}
-                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
-                />
-                <div className="flex justify-end">
-                  <Button
-                    onClick={devAddPointer}
-                    disabled={busy || !devTitle.trim() || !devBody.trim()}
-                  >
-                    Register indexed-only
-                  </Button>
+              <Collapsible
+                defaultOpen={false}
+                title={
+                  <span className="font-mono text-xs uppercase tracking-wide text-ink3">
+                    Dev — add an indexed-only item
+                  </span>
+                }
+              >
+                <div className="flex flex-col gap-2 pt-2">
+                  <input
+                    value={devTitle}
+                    onChange={(e) => setDevTitle(e.target.value)}
+                    placeholder="Title"
+                    className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
+                  />
+                  <textarea
+                    value={devBody}
+                    onChange={(e) => setDevBody(e.target.value)}
+                    placeholder="Body — embedded + summarised, never stored (the index-only pointer)"
+                    rows={3}
+                    className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
+                  />
+                  <div className="flex justify-end">
+                    <Button
+                      onClick={devAddPointer}
+                      disabled={busy || !devTitle.trim() || !devBody.trim()}
+                    >
+                      Register indexed-only
+                    </Button>
+                  </div>
                 </div>
-              </div>
+              </Collapsible>
             </Card>
           )}
 
           {showHarness && documents.some((d) => d.source_type === "index_only" && d.source_id) && (
             <Card className="mt-4 p-3">
-              <p className="mb-2 font-mono text-xs uppercase tracking-wide text-ink3">
-                Dev — simulate a source change (observe-and-react)
-              </p>
-              <ul className="flex flex-col gap-1.5">
-                {documents
-                  .filter((d) => d.source_type === "index_only" && d.source_id)
-                  .map((d) => (
-                    <li key={d.id} className="flex items-center justify-between gap-2 text-sm">
-                      <span className="truncate text-ink2" title={d.title}>
-                        {d.title}
-                      </span>
-                      <span className="flex shrink-0 gap-1 font-mono text-xs">
-                        {(["update", "delete", "rename", "source_failure"] as const).map((k) => (
-                          <button
-                            key={k}
-                            onClick={() => devFire(k, d.source_id!)}
-                            disabled={busy}
-                            className="rounded border border-border px-1.5 py-0.5 text-ink3 hover:text-ink disabled:opacity-50"
-                          >
-                            {k === "source_failure" ? "fail" : k}
-                          </button>
-                        ))}
-                      </span>
-                    </li>
-                  ))}
-              </ul>
+              <Collapsible
+                defaultOpen={false}
+                title={
+                  <span className="font-mono text-xs uppercase tracking-wide text-ink3">
+                    Dev — simulate a source change (observe-and-react)
+                  </span>
+                }
+              >
+                <ul className="flex flex-col gap-1.5 pt-2">
+                  {documents
+                    .filter((d) => d.source_type === "index_only" && d.source_id)
+                    .map((d) => (
+                      <li key={d.id} className="flex items-center justify-between gap-2 text-sm">
+                        <span className="truncate text-ink2" title={d.title}>
+                          {d.title}
+                        </span>
+                        <span className="flex shrink-0 gap-1 font-mono text-xs">
+                          {(["update", "delete", "rename", "source_failure"] as const).map((k) => (
+                            <button
+                              key={k}
+                              onClick={() => devFire(k, d.source_id!)}
+                              disabled={busy}
+                              className="rounded border border-border px-1.5 py-0.5 text-ink3 hover:text-ink disabled:opacity-50"
+                            >
+                              {k === "source_failure" ? "fail" : k}
+                            </button>
+                          ))}
+                        </span>
+                      </li>
+                    ))}
+                </ul>
+              </Collapsible>
             </Card>
           )}
 

@@ -9,6 +9,7 @@ import { useDepth } from "../theme";
 import { Button, Card, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { TagEditor } from "./TagEditor";
+import { rankImportance } from "../lib/importance";
 
 interface Props {
   /** Called after the queue changes so the parent can refresh the sidebar badge. */
@@ -183,6 +184,11 @@ export function ReviewView({ onChanged }: Props) {
       const imp = edits[d.id]?.importance ?? d.importance;
       (imp === "low" ? autofiled : needsReview).push(d);
     }
+    // Sort the active queue by importance, high → low, so the AI's most-important picks rise to the
+    // top — and re-order live as proposals stream in (this memo keys on `edits`, which proposals
+    // update). Untriaged sits above archive; title breaks ties for a stable order.
+    const eff = (d: Document) => rankImportance(edits[d.id]?.importance ?? d.importance);
+    needsReview.sort((a, b) => eff(b) - eff(a) || a.title.localeCompare(b.title));
     return { needsReview, autofiled };
   }, [queue, edits]);
 
