@@ -734,9 +734,9 @@ mod tests {
         // tables back down to a v9-shaped store, seed it with documents carrying name variants,
         // then re-run migrations so the real backfill processes them. Because `migrations::run`
         // re-applies EVERY step from the reset `user_version` forward, every later step must be
-        // reverted too — otherwise v11's/v12's ADD COLUMNs and v13's CREATE TABLE would collide with
-        // schema still on disk. `preferences` (v13) is dropped FIRST: it FKs `entities`, so it must
-        // go before the entity tables it references.
+        // reverted too — otherwise v11's/v12's ADD COLUMNs and v13's/v19's CREATE TABLEs would collide
+        // with schema still on disk. Drop order respects FKs: `preferences` (v13) drops before the
+        // `entities` it references, and `shared_drive_access` (v19) before its `connector_sources`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v10.sqlite");
         let conn = open(&path, KEY).unwrap();
@@ -749,6 +749,7 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN uid; \
              ALTER TABLE calendar_events DROP COLUMN entity_id; \
              DROP TABLE doc_layout; \
+             DROP TABLE shared_drive_access; \
              DROP TABLE connector_sources; \
              DROP TABLE preferences; \
              DROP INDEX idx_documents_source_id; \
@@ -867,9 +868,10 @@ mod tests {
         // Tear the store back down to a v10-shaped store, seed a document the way v10 wrote them (no
         // source_* columns), then re-run migrations so the real v11 step processes a pre-existing
         // row. Every migration ABOVE v10 must be reverted — v11's source_* columns, v12's
-        // `entities.confidence`/`user_confirmed`, AND v13's `preferences` table — otherwise their
-        // re-run ADD COLUMNs / CREATE TABLE collide with schema still on disk from the initial
-        // `open`. `preferences` is dropped first (it FKs `entities`).
+        // `entities.confidence`/`user_confirmed`, v13's `preferences` table, AND v19's
+        // `shared_drive_access` — otherwise their re-run ADD COLUMNs / CREATE TABLEs collide with
+        // schema still on disk from the initial `open`. FK order: `preferences` drops before
+        // `entities`, and `shared_drive_access` before `connector_sources`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v11.sqlite");
         let conn = open(&path, KEY).unwrap();
@@ -882,6 +884,7 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN uid; \
              ALTER TABLE calendar_events DROP COLUMN entity_id; \
              DROP TABLE doc_layout; \
+             DROP TABLE shared_drive_access; \
              DROP TABLE connector_sources; \
              DROP TABLE preferences; \
              DROP INDEX idx_documents_source_id; \
