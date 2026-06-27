@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useDepth } from "../theme";
 import { driveStatus, oneDriveStatus } from "../lib/ipc";
 import { Collapsible, SegmentedControl } from "./ui";
-import { GoogleCalendarConnection } from "./GoogleCalendarConnection";
+import { CalendarConnection } from "./CalendarConnection";
 import { GoogleDriveConnection } from "./GoogleDriveConnection";
 import { OneDriveConnection } from "./OneDriveConnection";
 import { GoogleCredentialBlock } from "./GoogleCredentialBlock";
@@ -97,7 +97,7 @@ function GoogleProvider() {
       <GoogleCredentialBlock configured={configured} onChange={onClientChange} />
       {configured && <GoogleMultiAccountHelp />}
       <Divider />
-      <GoogleCalendarConnection refreshSignal={signal} />
+      <CalendarConnection provider="google" refreshSignal={signal} />
       <Divider />
       <GoogleDriveConnection refreshSignal={signal} />
       <Divider />
@@ -136,13 +136,14 @@ function MicrosoftProvider() {
   return (
     <ConnectorGroup
       title="Microsoft"
-      blurb="One sign-in powers OneDrive (Outlook later). It’s a public app registration — just a client ID, no secret."
+      blurb="One sign-in powers OneDrive and Outlook Calendar (Mail later). It’s a public app registration — just a client ID, no secret."
     >
       <MicrosoftCredentialBlock configured={configured} onChange={onClientChange} />
       <Divider />
       <OneDriveConnection refreshSignal={signal} />
       <Divider />
-      <ComingSoonRow name="Outlook Calendar" detail="Microsoft — coming later." />
+      <CalendarConnection provider="microsoft" refreshSignal={signal} />
+      <Divider />
       <ComingSoonRow name="Outlook Mail" detail="Microsoft — coming later." />
     </ConnectorGroup>
   );
@@ -154,13 +155,11 @@ function AppleProvider() {
   return (
     <ConnectorGroup
       title="Apple"
-      blurb="iCloud connectors are coming later. For an Apple calendar today, add it as a subscription below — no sign-in needed."
+      blurb="Apple has no desktop sign-in, so add an Apple/iCloud calendar by its public link — no account needed. iCloud Drive is coming later."
     >
+      <IcsFeedSubscription provider="apple" />
+      <Divider />
       <ComingSoonRow name="iCloud Drive" detail="Apple — coming later." />
-      <ComingSoonRow
-        name="Apple Calendar"
-        detail="Apple — coming later (use a calendar subscription below for now)."
-      />
     </ConnectorGroup>
   );
 }
@@ -172,7 +171,7 @@ function CalendarSubscriptions() {
   return (
     <ConnectorGroup
       title="Calendar subscriptions"
-      blurb="Add any calendar — Google, Outlook, Apple, or any iCal/ICS link — by its private URL. No sign-in and no provider account, even under Advanced Protection. Read-only: it powers your agenda, schedule questions in chat, and the “Due soon” status."
+      blurb="Add any other calendar by its private iCal/ICS link — no sign-in, even under Advanced Protection. (Google and Outlook can sign in above; Apple has its own section.) Read-only: it powers your agenda, schedule questions in chat, and the “Due soon” status."
     >
       <IcsFeedSubscription />
     </ConnectorGroup>
@@ -234,9 +233,8 @@ function GoogleMultiAccountHelp() {
         </p>
         <p>
           <span className="text-ink2">2. Add it in PM.</span> Use{" "}
-          <span className="text-ink2">Add another account</span> on Drive below — Google shows its
-          account chooser, so pick the <em>different</em> account. (Calendar connects one Google
-          account for now; multiple-calendar accounts are coming.)
+          <span className="text-ink2">Add another account</span> on Calendar or Drive below — Google
+          shows its account chooser, so pick the <em>different</em> account. Each is independent.
         </p>
         <p className="text-ink4">
           Prefer to keep accounts fully separate? You can instead make a second Google Cloud project

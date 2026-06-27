@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.30.0-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "Multi-calendar is here. You can now connect several Google Calendar accounts — each shows under Google with its own list of calendars to sync.",
+      "Outlook / Microsoft 365 calendars now connect with a read-only sign-in, right under Microsoft — pick which calendars to sync, just like Google.",
+      "Apple iCloud calendars have their own spot under Apple — add one by its public iCal link (no Apple sign-in needed).",
+      "Everything you connect — Google, Outlook, Apple, and any iCal link — flows into one read-only calendar that powers your agenda, “what's on tomorrow” in chat, and the “Due soon” status. Read-only for now; nothing is written back to any provider.",
+    ],
+  },
+  {
     version: "2.29.0-alpha",
     date: "2026-06-27",
     highlights: [
