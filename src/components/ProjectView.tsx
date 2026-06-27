@@ -1,14 +1,31 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Composer } from "./Composer";
-import { createConversation, getMessages, listDocuments } from "../lib/ipc";
+import {
+  createConversation,
+  getMessages,
+  listDocuments,
+  listProjects,
+  setDocumentMetadata,
+} from "../lib/ipc";
 import { useChatStream } from "../lib/useChatStream";
 import type { Document } from "../lib/types";
-import { Button } from "./ui";
-import { useDepth } from "../theme";
+import { Button, Input } from "./ui";
+import { ImportancePicker } from "./ImportancePicker";
+import { TagEditor } from "./TagEditor";
+import { rankImportance } from "../lib/importance";
+import { useDepth, useTheme } from "../theme";
+
+const PROJECT_LIST_ID = "focus-projects";
+
+type FileSortKey = "name" | "importance";
+interface FileSort {
+  key: FileSortKey;
+  dir: "asc" | "desc";
+}
 
 interface Props {
   project: string;
@@ -32,7 +49,35 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
   /** The file the palette jumped to — flashed briefly, then cleared. */
   const [flashId, setFlashId] = useState<number | null>(null);
   const filesRef = useRef<HTMLUListElement>(null);
-  const { showMeta } = useDepth();
+  const { showMeta, showPower } = useDepth();
+  // The focus-panel triage controls are the same learning tool as the Review/Teach tabs, so they
+  // ride the same Settings switch: when the user trusts the AI's filing and hides those tabs, these
+  // hide too (the panel falls back to the read-only display below).
+  const { teachVisible } = useTheme();
+  // Existing project names for the power-depth project datalist (re-file autocomplete).
+  const [projectNames, setProjectNames] = useState<string[]>([]);
+  // How the Files panel is ordered. Name A→Z by default; clicking a key again reverses it.
+  const [sort, setSort] = useState<FileSort>({ key: "name", dir: "asc" });
+
+  function toggleSort(key: FileSortKey) {
+    setSort((cur) =>
+      cur.key === key
+        ? { key, dir: cur.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "importance" ? "desc" : "asc" },
+    );
+  }
+
+  const sortedDocs = useMemo(() => {
+    const factor = sort.dir === "asc" ? 1 : -1;
+    return [...documents].sort((a, b) => {
+      const c =
+        sort.key === "importance"
+          ? rankImportance(a.importance) - rankImportance(b.importance) ||
+            a.title.localeCompare(b.title)
+          : a.title.localeCompare(b.title);
+      return c * factor;
+    });
+  }, [documents, sort]);
 
   useEffect(() => {
     // Reset chat when switching projects (also abandons any in-flight reply).
@@ -56,6 +101,36 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
     const clear = setTimeout(() => setFlashId(null), 2500);
     return () => clearTimeout(clear);
   }, [focusDocId, documents]);
+
+  // Project names for the power-depth re-file datalist; only needed while the triage controls show.
+  useEffect(() => {
+    if (!teachVisible || !showPower) return;
+    listProjects()
+      .then(setProjectNames)
+      .catch(() => {});
+  }, [teachVisible, showPower]);
+
+  /** Persist a metadata change for one document (importance / tags / project) and reflect it
+   *  locally. A metadata edit only rewrites front-matter — no re-embed. If a power-user re-files a
+   *  document to a different project, it leaves this project's panel. */
+  async function saveMeta(
+    doc: Document,
+    patch: Partial<Pick<Document, "project" | "tags" | "importance">>,
+  ) {
+    const nextProject = patch.project ?? doc.project;
+    const nextTags = patch.tags ?? doc.tags;
+    const nextImportance = patch.importance !== undefined ? patch.importance : doc.importance;
+    try {
+      const updated = await setDocumentMetadata(doc.id, nextProject, nextTags, nextImportance);
+      setDocuments((docs) =>
+        updated.project !== project
+          ? docs.filter((d) => d.id !== updated.id)
+          : docs.map((d) => (d.id === updated.id ? updated : d)),
+      );
+    } catch (e) {
+      chat.setError(String(e));
+    }
+  }
 
   async function handleSend(text: string) {
     let id = convId;
@@ -117,14 +192,32 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
           className="w-80 shrink-0 overflow-y-auto border-l border-border bg-panel"
           data-help="project-files"
         >
-          <p className="px-4 pb-1 pt-3 font-mono text-xs uppercase tracking-wide text-ink4">
-            Files
-          </p>
+          <div className="flex items-center justify-between gap-2 px-4 pb-1 pt-3">
+            <span className="font-mono text-xs uppercase tracking-wide text-ink4">Files</span>
+            {documents.length > 1 && (
+              <div className="flex items-center gap-2 text-[10px] text-ink4">
+                <FileSortButton label="Name" sortKey="name" sort={sort} onSort={toggleSort} />
+                <FileSortButton
+                  label="Importance"
+                  sortKey="importance"
+                  sort={sort}
+                  onSort={toggleSort}
+                />
+              </div>
+            )}
+          </div>
+          {teachVisible && showPower && (
+            <datalist id={PROJECT_LIST_ID}>
+              {projectNames.map((name) => (
+                <option key={name} value={name} />
+              ))}
+            </datalist>
+          )}
           {documents.length === 0 ? (
             <p className="px-4 py-2 text-xs text-ink4">No documents in this project.</p>
           ) : (
             <ul ref={filesRef} className="flex flex-col gap-0.5 px-2 pb-4">
-              {documents.map((d) => (
+              {sortedDocs.map((d) => (
                 <li
                   key={d.id}
                   data-doc-id={d.id}
@@ -137,13 +230,42 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
                   <div className="truncate font-head text-sm text-ink2" title={d.title}>
                     {d.title}
                   </div>
-                  {showMeta && (
-                    <div className="flex gap-2 font-mono text-xs text-ink4">
-                      {d.importance && <span className="capitalize">{d.importance}</span>}
-                      <span>
-                        {d.chunk_count} chunk{d.chunk_count === 1 ? "" : "s"}
-                      </span>
+                  {teachVisible ? (
+                    // Manual triage, same controls as the Review tab. Everyone gets the importance
+                    // toggle; power depth also gets project (re-file) + tags, like a Review row.
+                    <div className="mt-1.5 flex flex-col gap-1.5">
+                      {showPower && (
+                        <label className="flex items-center gap-1.5 text-xs text-ink4">
+                          <span className="shrink-0">Project</span>
+                          <Input
+                            key={d.project}
+                            list={PROJECT_LIST_ID}
+                            defaultValue={d.project}
+                            onBlur={(e) => {
+                              const v = e.target.value.trim();
+                              if (v && v !== d.project) void saveMeta(d, { project: v });
+                            }}
+                            className="h-6 w-full text-xs"
+                          />
+                        </label>
+                      )}
+                      <ImportancePicker
+                        value={d.importance}
+                        onChange={(importance) => void saveMeta(d, { importance })}
+                      />
+                      {showPower && (
+                        <TagEditor tags={d.tags} onChange={(tags) => void saveMeta(d, { tags })} />
+                      )}
                     </div>
+                  ) : (
+                    showMeta && (
+                      <div className="flex gap-2 font-mono text-xs text-ink4">
+                        {d.importance && <span className="capitalize">{d.importance}</span>}
+                        <span>
+                          {d.chunk_count} chunk{d.chunk_count === 1 ? "" : "s"}
+                        </span>
+                      </div>
+                    )
                   )}
                 </li>
               ))}
@@ -152,5 +274,34 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
         </aside>
       </div>
     </div>
+  );
+}
+
+/** A compact sort toggle for the Files panel header: click to sort by this key, click again to
+ *  reverse. Shows the active direction (▲/▼) or an idle hint (↕). */
+function FileSortButton({
+  label,
+  sortKey,
+  sort,
+  onSort,
+}: {
+  label: string;
+  sortKey: FileSortKey;
+  sort: FileSort;
+  onSort: (key: FileSortKey) => void;
+}) {
+  const active = sort.key === sortKey;
+  return (
+    <button
+      type="button"
+      onClick={() => onSort(sortKey)}
+      title={`Sort by ${label.toLowerCase()}`}
+      className={`inline-flex items-center gap-0.5 hover:text-ink2 ${active ? "text-ink2" : ""}`}
+    >
+      {label}
+      <span aria-hidden className="text-[8px] leading-none">
+        {active ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}
+      </span>
+    </button>
   );
 }

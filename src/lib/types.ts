@@ -184,8 +184,9 @@ export type ChatEvent =
   | { type: "done"; message_id: number; content: string; citations: Citation[] }
   | { type: "error"; message: string };
 
-/** Ranked importance of a document (or unset). */
-export type Importance = "high" | "medium" | "low" | null;
+/** Ranked importance of a document. `archive` is an explicit "shelved" level (hidden from the Map,
+ *  sunk to the bottom of lists, still searchable); `null` is untriaged / unset — a distinct state. */
+export type Importance = "high" | "medium" | "low" | "archive" | null;
 
 export interface Document {
   id: number;

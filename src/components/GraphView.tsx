@@ -152,7 +152,9 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
 
   useEffect(() => {
     listDocuments()
-      .then(setDocuments)
+      // Archived documents are deliberately shelved — keep them off the Map (both arrangements),
+      // while they stay fully searchable and listed elsewhere. Untriaged docs still appear.
+      .then((docs) => setDocuments(docs.filter((d) => d.importance !== "archive")))
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, []);

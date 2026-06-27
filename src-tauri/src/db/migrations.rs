@@ -439,6 +439,27 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (document_id, method)
     );
     "#,
+    // v17: add 'archive' as a distinct importance level. Until now `documents.importance` was
+    // `high|medium|low|NULL`, where NULL doubled as both "not yet triaged" and "none". 'archive' is
+    // a fourth, EXPLICIT level — a document the user deliberately shelved: hidden from the Map,
+    // sunk to the bottom of importance-sorted lists, but still fully searchable (incl. exact
+    // keyword). It is deliberately SEPARATE from NULL so a brand-new, un-reviewed document (NULL)
+    // still appears on the Map; only a deliberate Archive choice hides it.
+    //
+    // The only change is relaxing the column CHECK to admit 'archive'. SQLite can't ALTER a column
+    // CHECK in place, and a full table rebuild would mean recreating `documents` (20+ columns) and
+    // its three FK children (chunks, corrections, doc_layout) + every index — high-risk for a
+    // one-token change. Instead we use the SQLite-documented `writable_schema` text-patch: it edits
+    // the stored CREATE TABLE text only, moves no data, and touches nothing else. We surgically
+    // replace the value list, which appears exactly once (in this CHECK) and only on `documents`.
+    // The schema cookie is then bumped (see `run`) so this connection reparses the new constraint.
+    r#"
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master
+       SET sql = replace(sql, '''high'',''medium'',''low''', '''high'',''medium'',''low'',''archive''')
+     WHERE type = 'table' AND name = 'documents';
+    PRAGMA writable_schema = OFF;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -454,6 +475,17 @@ pub fn run(conn: &Connection) -> Result<()> {
         tx.pragma_update(None, "user_version", (version + 1) as i64)?;
         tx.commit()?;
         version += 1;
+    }
+    // A `writable_schema` text-patch (v17's importance-CHECK relaxation) edits the stored schema
+    // without bumping the schema cookie, so this connection would keep compiling the OLD constraint
+    // into prepared statements. If any migration ran, bump the cookie once to force a reparse so the
+    // relaxed CHECK takes effect immediately (harmless when no writable_schema edit was involved).
+    if version as i64 != current {
+        let cookie: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+        conn.execute_batch(&format!(
+            "PRAGMA writable_schema=ON; PRAGMA schema_version={}; PRAGMA writable_schema=OFF;",
+            cookie + 1
+        ))?;
     }
     Ok(())
 }
@@ -477,9 +509,9 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 16,
+            version, 17,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
-             semantic-map doc_layout is v16)"
+             semantic-map doc_layout is v16; importance 'archive' level is v17)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -499,5 +531,40 @@ mod tests {
         assert_eq!(mode, "index_only");
         assert_eq!(state, "ok");
         assert_eq!(cursor, None);
+    }
+
+    /// v17 relaxed the `documents.importance` CHECK: 'archive' is now a valid level (and the
+    /// writable_schema patch took effect on this connection — the reparse in `run` worked), while
+    /// `high|medium|low|NULL` and a genuinely bad value still behave as before.
+    #[test]
+    fn importance_archive_level_allowed() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        let insert = |path: &str, imp: Option<&str>| {
+            conn.execute(
+                "INSERT INTO documents(vault_path, content_hash, importance) VALUES (?1, ?2, ?3)",
+                rusqlite::params![path, path, imp],
+            )
+        };
+        // The four valid levels plus untriaged NULL all insert.
+        for (i, imp) in [
+            Some("high"),
+            Some("medium"),
+            Some("low"),
+            Some("archive"),
+            None,
+        ]
+        .iter()
+        .enumerate()
+        {
+            insert(&format!("v{i}"), *imp).unwrap_or_else(|e| panic!("{imp:?} should insert: {e}"));
+        }
+        // An out-of-set value is still rejected by the relaxed CHECK.
+        assert!(
+            insert("bad", Some("urgent")).is_err(),
+            "an unknown importance must still violate the CHECK"
+        );
     }
 }
