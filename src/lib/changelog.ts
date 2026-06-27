@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.22.1-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "Behind the scenes: routine maintenance updates to a few bundled dependencies, keeping things current. No change to the app itself.",
+    ],
+  },
+  {
     version: "2.22.0-alpha",
     date: "2026-06-27",
     highlights: [
