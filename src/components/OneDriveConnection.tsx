@@ -14,21 +14,24 @@ import {
 import type { OneDriveAccount, OneDriveStatus, OneDriveSyncReport } from "../lib/types";
 import { Button, Collapsible, ConfirmDialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
-import { MicrosoftCredentialBlock } from "./MicrosoftCredentialBlock";
 import { OneDriveFolders } from "./OneDriveFolders";
 
 /**
  * **Microsoft OneDrive** (read-only, index-only) — the second cloud-API connector (board card 4B), a
- * mirror of {@link "./GoogleDriveConnection"}. Reuses the shared {@link MicrosoftCredentialBlock} for
- * the BYO Microsoft client, then connects one or more OneDrive accounts. Each connected account is
- * **independent** — its own sign-in, sync, and indexed items.
+ * mirror of {@link "./GoogleDriveConnection"}, under the Connectors tab's Microsoft group. The shared
+ * BYO Microsoft client is set up once at the provider level (see {@link "./ConnectorsSettings"}); this
+ * component connects one or more OneDrive accounts once that client is configured. Each connected
+ * account is **independent** — its own sign-in, sync, and indexed items.
+ *
+ * `refreshSignal` is bumped by the parent Microsoft group when the shared client is saved/cleared, so
+ * this view refetches its status.
  *
  * Every file is **index-only**: PM stores a searchable pointer + a short summary, never the bytes; the
  * full file stays in OneDrive and is fetched on demand. The first sync walks the whole drive (the
  * banner warns it can be slow); later syncs apply only what changed (the Graph delta query). Expand an
  * account to index just the folders you choose.
  */
-export function OneDriveConnection() {
+export function OneDriveConnection({ refreshSignal = 0 }: { refreshSignal?: number }) {
   const [status, setStatus] = useState<OneDriveStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -52,9 +55,10 @@ export function OneDriveConnection() {
     }
   }, []);
 
+  // Refetch on mount, and whenever the parent Microsoft group reports the shared client changed.
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, refreshSignal]);
 
   useEffect(() => {
     syncingRef.current = progress != null;
@@ -159,9 +163,10 @@ export function OneDriveConnection() {
       </p>
 
       {!configured ? (
-        <div className="mt-2">
-          <MicrosoftCredentialBlock configured={false} onChange={refresh} />
-        </div>
+        <p className="mt-2 text-xs text-ink4">
+          Set up <span className="text-ink2">Microsoft sign-in</span> above to connect a OneDrive
+          account.
+        </p>
       ) : (
         <>
           <div
@@ -196,6 +201,14 @@ export function OneDriveConnection() {
                 </li>
               ))}
             </ul>
+          )}
+
+          {accounts.length === 0 && (
+            <p className="mt-3 text-xs text-ink4">
+              You’ll be asked which Microsoft account to use — connect your <strong>main</strong>{" "}
+              one first; it heads the list. You can add more accounts afterwards, and each is
+              indexed independently.
+            </p>
           )}
 
           <div className="mt-3">

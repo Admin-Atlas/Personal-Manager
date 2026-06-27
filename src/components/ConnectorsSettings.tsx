@@ -1,29 +1,32 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useDepth } from "../theme";
+import { driveStatus, oneDriveStatus } from "../lib/ipc";
 import { Collapsible, SegmentedControl } from "./ui";
 import { GoogleCalendarConnection } from "./GoogleCalendarConnection";
 import { GoogleDriveConnection } from "./GoogleDriveConnection";
 import { OneDriveConnection } from "./OneDriveConnection";
+import { GoogleCredentialBlock } from "./GoogleCredentialBlock";
+import { MicrosoftCredentialBlock } from "./MicrosoftCredentialBlock";
 import { IcsFeedSubscription } from "./IcsFeedSubscription";
 
 /**
- * The **Connectors** hub (Stage 3, §8.1) — where external accounts are connected so the
- * Archivist can index them, and where the read-only calendar now lives (the standalone Calendar
- * tab was folded in here).
+ * The **Connectors** hub (Stage 3, §8.1) — where external accounts are connected so the Archivist
+ * can index them, and where the read-only calendar lives.
  *
- * Grouped **by service** (Calendar / Drive / Email), each listing its provider connections
- * (Google available now; Apple / Microsoft coming-soon). A provider's BYO-OAuth client is
- * provider-level and shared across its services — it's set up inside the first Google service you
- * connect (see {@link GoogleCredentialBlock}) and reused everywhere. Every connection is
- * **independently opt-in and removable** — subscribe to a calendar URL only, connect Drive only,
- * or set up the OAuth client and connect nothing yet; nothing cascades or auto-enables.
+ * Grouped **by provider** (Google / Microsoft / Apple). A provider's BYO-OAuth client is
+ * provider-level — one client powers all of that provider's services (Google: Calendar + Drive +
+ * future Gmail; Microsoft: OneDrive + future Outlook) — so it's set up **once at the top of the
+ * provider group** (see {@link GoogleProvider} / {@link MicrosoftProvider}), with the multi-account
+ * guidance right beside it. Previously the shared client + that guidance were buried inside whichever
+ * service you happened to open first (so e.g. a Calendar-first user never saw the Drive-only
+ * "Add another account" flow); grouping by provider gives them one obvious home.
  *
- * Calendar (Google OAuth + the zero-auth iCal subscription) and Drive (Google Drive, index-only)
- * are live; Microsoft, Apple, and Email show as coming-soon placeholders that drop into their
- * service sections as later cards land — no change to the surrounding structure.
+ * Calendar subscriptions (zero-auth iCal) are provider-agnostic, so they get their own section at the
+ * bottom. Every connection is **independently opt-in and removable** — set up a provider's client and
+ * connect nothing, subscribe to a calendar URL only, connect Drive only; nothing cascades.
  */
 export function ConnectorsSettings({
   indexingSpeed,
@@ -36,54 +39,203 @@ export function ConnectorsSettings({
     <div className="mt-5 border-t border-border pt-4" data-help="settings-connectors">
       <label className="block text-sm font-medium text-ink2">Connectors</label>
       <p className="mt-1 text-xs text-ink4">
-        Connect external accounts so PM can find and use what’s in them, grouped by what they do.
-        Every connection is independently opt-in and removable — nothing cascades. Credentials and
-        tokens live only in your keychain.
+        Connect external accounts so PM can find and use what’s in them, grouped by provider. Set up
+        a provider’s sign-in once and it’s shared across that provider’s services. Every connection
+        is independently opt-in and removable — nothing cascades. Credentials and tokens live only
+        in your keychain.
       </p>
 
       <IndexingSpeedControl value={indexingSpeed} onChange={onChangeIndexingSpeed} />
 
-      <ServiceSection
-        title="Calendar"
-        blurb="Mirror your agenda (read-only) for the focus view, chat, and the “Due soon” status."
-      >
-        <GoogleCalendarConnection />
-        <Divider />
-        <IcsFeedSubscription />
-        <Divider />
-        <ComingSoonRow name="Apple Calendar" />
-        <ComingSoonRow name="Outlook Calendar" />
-      </ServiceSection>
-
-      <ServiceSection
-        title="Drive"
-        blurb="Index your cloud files so PM can find them and ground answers in their contents."
-      >
-        <GoogleDriveConnection />
-        <Divider />
-        <OneDriveConnection />
-        <Divider />
-        <ComingSoonRow name="iCloud Drive" detail="Apple — coming later." />
-      </ServiceSection>
-
-      <ServiceSection
-        title="Email"
-        blurb="Index your mail so PM can search it and reference it in chat."
-      >
-        <ComingSoonRow name="Gmail" />
-        <ComingSoonRow name="Outlook mail" />
-      </ServiceSection>
+      <GoogleProvider />
+      <MicrosoftProvider />
+      <AppleProvider />
+      <CalendarSubscriptions />
     </div>
   );
 }
 
 /**
- * A capability group (Calendar / Drive / Email) holding one or more provider connections. These
- * sections get large (multi-account Drive, calendar feeds), so each is **collapsible**: it opens by
- * default for Standard/Power density and starts **collapsed at Minimal** (so the tab stays scannable),
- * and can always be toggled either way. The disclosure state is per-section local UI.
+ * The **Google** provider group: the one BYO Google client (shared by Calendar, Drive, future Gmail)
+ * set up once at the top, the "more than one account?" guidance beside it, then each Google service.
+ *
+ * The shared client is **provider-level** (`google::has_client()` — a single global flag), so this
+ * group owns the `configured` flag (read from `drive_status`, which carries that flag) and renders
+ * {@link GoogleCredentialBlock} once. Saving/clearing it bumps `signal`, which the child services
+ * watch (via their `refreshSignal` prop) to refetch — so their connect buttons / account lists track
+ * the new client state without each embedding its own copy of the setup block.
  */
-function ServiceSection({
+function GoogleProvider() {
+  const [configured, setConfigured] = useState(false);
+  const [signal, setSignal] = useState(0);
+
+  const refreshConfigured = useCallback(async () => {
+    try {
+      // drive_status carries the provider-level `google::has_client()` flag; reading it here avoids a
+      // dedicated command while keeping the shared sign-in block's source of truth in one place.
+      const s = await driveStatus();
+      setConfigured(s.oauth_client_configured);
+    } catch {
+      // The child connectors surface their own errors; a failed flag read just leaves setup showing.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshConfigured();
+  }, [refreshConfigured]);
+
+  const onClientChange = useCallback(async () => {
+    await refreshConfigured();
+    setSignal((n) => n + 1);
+  }, [refreshConfigured]);
+
+  return (
+    <ConnectorGroup
+      title="Google"
+      blurb="One sign-in powers Calendar and Drive (Gmail later). Set it up once below; each calendar and account stays independently opt-in."
+    >
+      <GoogleCredentialBlock configured={configured} onChange={onClientChange} />
+      {configured && <GoogleMultiAccountHelp />}
+      <Divider />
+      <GoogleCalendarConnection refreshSignal={signal} />
+      <Divider />
+      <GoogleDriveConnection refreshSignal={signal} />
+      <Divider />
+      <ComingSoonRow name="Gmail" />
+    </ConnectorGroup>
+  );
+}
+
+/**
+ * The **Microsoft** provider group — mirrors {@link GoogleProvider}. The shared Microsoft client is a
+ * public client (just a client ID, no secret); reads the provider-level `configured` flag from
+ * `onedrive_status` and lifts {@link MicrosoftCredentialBlock} above OneDrive.
+ */
+function MicrosoftProvider() {
+  const [configured, setConfigured] = useState(false);
+  const [signal, setSignal] = useState(0);
+
+  const refreshConfigured = useCallback(async () => {
+    try {
+      const s = await oneDriveStatus();
+      setConfigured(s.oauth_client_configured);
+    } catch {
+      // OneDrive surfaces its own errors; a failed flag read just leaves setup showing.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshConfigured();
+  }, [refreshConfigured]);
+
+  const onClientChange = useCallback(async () => {
+    await refreshConfigured();
+    setSignal((n) => n + 1);
+  }, [refreshConfigured]);
+
+  return (
+    <ConnectorGroup
+      title="Microsoft"
+      blurb="One sign-in powers OneDrive (Outlook later). It’s a public app registration — just a client ID, no secret."
+    >
+      <MicrosoftCredentialBlock configured={configured} onChange={onClientChange} />
+      <Divider />
+      <OneDriveConnection refreshSignal={signal} />
+      <Divider />
+      <ComingSoonRow name="Outlook Calendar" detail="Microsoft — coming later." />
+      <ComingSoonRow name="Outlook Mail" detail="Microsoft — coming later." />
+    </ConnectorGroup>
+  );
+}
+
+/** The **Apple** provider group — placeholders only for now. Apple/iCloud connectors land later;
+ *  meanwhile an Apple (or any) calendar can be added below as a no-sign-in subscription. */
+function AppleProvider() {
+  return (
+    <ConnectorGroup
+      title="Apple"
+      blurb="iCloud connectors are coming later. For an Apple calendar today, add it as a subscription below — no sign-in needed."
+    >
+      <ComingSoonRow name="iCloud Drive" detail="Apple — coming later." />
+      <ComingSoonRow
+        name="Apple Calendar"
+        detail="Apple — coming later (use a calendar subscription below for now)."
+      />
+    </ConnectorGroup>
+  );
+}
+
+/** The provider-agnostic **calendar subscriptions** (iCal) section — no sign-in, no provider account,
+ *  works even under Advanced Protection. Kept separate from the provider groups because it belongs to
+ *  no one provider. */
+function CalendarSubscriptions() {
+  return (
+    <ConnectorGroup
+      title="Calendar subscriptions"
+      blurb="Add any calendar by its private iCal URL — no sign-in and no provider account, even under Advanced Protection. Read-only: it powers your agenda, schedule questions in chat, and the “Due soon” status."
+    >
+      <IcsFeedSubscription />
+    </ConnectorGroup>
+  );
+}
+
+/**
+ * The provider-level "more than one Google account?" guidance — the discoverability fix. It lives at
+ * the top of the Google group (not buried inside Drive), so a user looking to connect a second Google
+ * account finds it whatever service they came for. Reuses the same facts as the BYO-client setup
+ * guide: reuse the one project, add each account as a Test user, then the account chooser does the
+ * rest (PM now forces it — see `google::build_auth_url`).
+ */
+function GoogleMultiAccountHelp() {
+  const link = "text-accent-text underline hover:brightness-110";
+  return (
+    <Collapsible
+      className="mt-2"
+      defaultOpen={false}
+      title={<span className="text-xs text-ink3">Using more than one Google account?</span>}
+    >
+      <div
+        className="mt-1.5 space-y-1.5 rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink3"
+        data-help="connectors-google-multiaccount"
+      >
+        <p>
+          You don’t need a new project or new credentials — every account reuses the one Client ID +
+          secret you saved above.
+        </p>
+        <p>
+          1. If your OAuth app is still in <span className="text-ink2">Testing</span> mode, add each
+          account’s email under{" "}
+          <a
+            href="https://console.cloud.google.com/apis/credentials/consent"
+            target="_blank"
+            rel="noreferrer"
+            className={link}
+          >
+            Audience → Test users
+          </a>{" "}
+          in the Google Cloud Console (a published app skips this).
+        </p>
+        <p>
+          2. Use <span className="text-ink2">Add another account</span> on Drive below — Google
+          shows its account chooser, so pick the <em>different</em> account. (Calendar connects one
+          Google account for now; multiple-calendar accounts are coming.)
+        </p>
+        <p className="text-ink4">
+          Prefer to keep accounts fully separate? You can instead make a second Google Cloud project
+          with its own credentials — but for most people reusing the one project is simpler.
+        </p>
+      </div>
+    </Collapsible>
+  );
+}
+
+/**
+ * A connector group (Google / Microsoft / Apple / Calendar subscriptions) holding a provider's shared
+ * sign-in and its services. These get large (multi-account Drive, calendar feeds), so each is
+ * **collapsible**: open by default for Standard/Power density, **collapsed at Minimal** (so the tab
+ * stays scannable), always toggleable. The disclosure state is per-group local UI.
+ */
+function ConnectorGroup({
   title,
   blurb,
   children,

@@ -214,7 +214,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-connectors": {
     title: "Connectors",
-    body: "Connect external accounts so PM can find and use what's in them, grouped by what they do — Calendar, Drive, and email. Each provider keeps its own sign-in; every connection is independently opt-in and removable, and nothing cascades or auto-enables. Credentials and tokens live only in your keychain.",
+    body: "Connect external accounts so PM can find and use what's in them, grouped by provider — Google, Microsoft, Apple. A provider's sign-in is set up once at the top of its group and shared across all of that provider's services (Google: Calendar + Drive; Microsoft: OneDrive). Calendar subscriptions (iCal) need no sign-in and sit in their own section. Every connection is independently opt-in and removable, and nothing cascades or auto-enables. Credentials and tokens live only in your keychain.",
+  },
+  "connectors-google-multiaccount": {
+    title: "More than one Google account",
+    body: "How to connect a second (or third) Google account. You don't need a new Google Cloud project or new credentials — every account reuses the one client you saved. If your OAuth app is still in 'Testing' mode, add each account's email under Audience → Test users in the Google Cloud Console first; a published app skips that. Then use 'Add another account' on Drive and pick the different account from Google's chooser. A separate project is only needed if you'd rather keep accounts fully isolated.",
   },
   "connectors-google-client": {
     title: "Google sign-in (one-time setup)",

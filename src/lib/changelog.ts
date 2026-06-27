@@ -19,6 +19,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.27.0-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "Connecting a second Google (or Microsoft) account now works properly: when you click “Add another account”, the sign-in always shows the account chooser, so you can pick a different account instead of it silently re-using the one you're already signed in with.",
+      "The Connectors tab is now grouped by provider — Google, Microsoft, Apple — instead of by Calendar / Drive / Email. Each provider's sign-in is set up once at the top of its group and shared across all of that provider's services (Google: Calendar + Drive; Microsoft: OneDrive), so a calendar-only user no longer has to hunt around the Drive section to find it.",
+      "New “Using more than one Google account?” help sits right under the Google sign-in: reuse the one project, add each account under Test users, then pick it from the chooser — no second project needed.",
+      "When you connect your first Google or Microsoft account, a short note reminds you that the account you connect first heads the list, so you can connect your main one first.",
+      "Calendar subscriptions (iCal, no sign-in) now have their own clearly-labelled section, since they don't belong to any one provider.",
+    ],
+  },
+  {
     version: "2.26.0-alpha",
     date: "2026-06-27",
     highlights: [

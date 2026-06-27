@@ -328,7 +328,10 @@ fn random_token(n: usize) -> Result<String> {
 }
 
 /// Build Google's consent URL. `access_type=offline` + `prompt=consent` guarantee a
-/// refresh token so PM can stay connected. Pure, so it's unit-tested.
+/// refresh token so PM can stay connected. `select_account` forces Google's account chooser every
+/// time, so connecting a *second* account actually works — without it, Google silently reuses the
+/// browser's signed-in session and re-grants the same account, which is why "Add another account"
+/// could only ever re-link the first one. Pure, so it's unit-tested.
 pub fn build_auth_url(
     client_id: &str,
     redirect_uri: &str,
@@ -347,7 +350,7 @@ pub fn build_auth_url(
             ("code_challenge_method", "S256"),
             ("state", state),
             ("access_type", "offline"),
-            ("prompt", "consent"),
+            ("prompt", "select_account consent"),
             ("include_granted_scopes", "true"),
         ],
     )
@@ -551,7 +554,10 @@ mod tests {
         assert!(url.starts_with(AUTH_ENDPOINT));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("access_type=offline"));
-        assert!(url.contains("prompt=consent"));
+        // The account chooser is forced (space-joined prompt values url-encode the space as `+`),
+        // so a second Google account can actually be connected instead of silently re-linking the
+        // browser's current session.
+        assert!(url.contains("prompt=select_account+consent"));
         assert!(url.contains("calendar.readonly"));
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A54321"));
         assert!(url.contains("state=state-abc"));
