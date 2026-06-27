@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getDriveScope, listDriveFolders, listDriveSharedDrives, setDriveScope } from "../lib/ipc";
 import type { DriveFolder, DriveScope, SharedDrive, SharedSelection } from "../lib/types";
-import { Button, SegmentedControl } from "./ui";
+import { SegmentedControl } from "./ui";
 
 /** Sentinel `driveId` the folder picker passes to walk the **personal** My Drive (matches the
  *  backend's `MY_DRIVE_ROOT`); it's also My Drive's root-folder alias, so it doubles as the top-level
@@ -15,25 +15,21 @@ const MY_DRIVE_ROOT = "root";
  * Per-account **shared-drives** manager (Connectors → Drive). My Drive (personal) is indexed whole by
  * default; shared drives (Team Drives) are **opt-in and folder-scoped by default** — they're often
  * huge and org-wide, so picking folders is the safer default, with an "entire drive" escape hatch.
- * Everything stays index-only (a pointer + summary, never the bytes). **Save** only persists the
- * scope; the account's single **Sync now** then applies it (indexes newly-in-scope files, soft-removes
- * — kept findable, flagged source-missing — those that fell out of scope), so there's one sync action
- * for the whole account rather than a separate one per shared drive.
+ * Everything stays index-only (a pointer + summary, never the bytes). Scope changes **save
+ * automatically** (no Save button); the account's single **Sync now** then applies them (indexes
+ * newly-in-scope files, soft-removes — kept findable, flagged source-missing — those that fell out of
+ * scope), so there's one sync action for the whole account rather than a separate one per shared drive.
  */
-export function SharedDrivesManager({
-  email,
-  busy,
-  onSaved,
-}: {
-  email: string;
-  busy: boolean;
-  onSaved: () => void;
-}) {
+export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved: () => void }) {
   const [scope, setScope] = useState<DriveScope | null>(null);
   const [drives, setDrives] = useState<SharedDrive[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Serialize auto-saves (see `commit`): writes go out in click order, and only the latest one drives
+  // the "Saving…/Saved" flag so a burst of folder toggles can't land out of order or get stuck.
+  const saveSeq = useRef(0);
+  const saveChain = useRef<Promise<void>>(Promise.resolve());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -69,21 +65,43 @@ export function SharedDrivesManager({
   const selectionFor = (driveId: string): SharedSelection | undefined =>
     scope.shared.find((s) => s.drive_id === driveId);
 
-  const setMyDrive = (on: boolean) => setScope({ ...scope, my_drive: on });
+  // Persist on every change — there's no Save button. Optimistically updates local state, then writes
+  // through the serialized chain. Scope only takes effect on the next "Sync now"; saving never syncs.
+  const commit = (next: DriveScope) => {
+    setScope(next);
+    setError(null);
+    setSaving(true);
+    const seq = ++saveSeq.current;
+    saveChain.current = saveChain.current
+      .catch(() => {})
+      .then(() => setDriveScope(email, next))
+      .then(() => {
+        if (seq !== saveSeq.current) return; // a newer save is in flight; let it own the UI
+        setSaving(false);
+        onSaved();
+      })
+      .catch((e) => {
+        if (seq !== saveSeq.current) return;
+        setSaving(false);
+        setError(String(e));
+      });
+  };
+
+  const setMyDrive = (on: boolean) => commit({ ...scope, my_drive: on });
 
   const myWhole = scope.my_drive_folders == null;
 
   const setMyDriveWhole = (whole: boolean) =>
-    setScope({ ...scope, my_drive_folders: whole ? null : [] });
+    commit({ ...scope, my_drive_folders: whole ? null : [] });
 
   const toggleMyFolder = (folderId: string, checked: boolean) => {
     const cur = scope.my_drive_folders ?? [];
     const next = checked ? [...new Set([...cur, folderId])] : cur.filter((f) => f !== folderId);
-    setScope({ ...scope, my_drive_folders: next });
+    commit({ ...scope, my_drive_folders: next });
   };
 
   const toggleDrive = (drive: SharedDrive, included: boolean) =>
-    setScope({
+    commit({
       ...scope,
       shared: included
         ? [...scope.shared, { drive_id: drive.id, name: drive.name, folders: [] }]
@@ -91,7 +109,7 @@ export function SharedDrivesManager({
     });
 
   const setWhole = (driveId: string, whole: boolean) =>
-    setScope({
+    commit({
       ...scope,
       shared: scope.shared.map((s) =>
         s.drive_id === driveId ? { ...s, folders: whole ? null : [] } : s,
@@ -99,7 +117,7 @@ export function SharedDrivesManager({
     });
 
   const toggleFolder = (driveId: string, folderId: string, checked: boolean) =>
-    setScope({
+    commit({
       ...scope,
       shared: scope.shared.map((s) => {
         if (s.drive_id !== driveId) return s;
@@ -108,19 +126,6 @@ export function SharedDrivesManager({
         return { ...s, folders: next };
       }),
     });
-
-  const save = async () => {
-    setSaving(true);
-    setError(null);
-    try {
-      await setDriveScope(email, scope);
-      onSaved();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
 
   return (
     <div className="mt-2 space-y-3" data-help="settings-drive-shared">
@@ -211,14 +216,10 @@ export function SharedDrivesManager({
 
       {error && <p className="text-xs text-st-due">{error}</p>}
 
-      <div className="flex items-center gap-2">
-        <Button onClick={save} disabled={busy || saving} className="px-2 py-1 text-xs">
-          {saving ? "Saving…" : "Save"}
-        </Button>
-        <span className="text-[11px] text-ink4">
-          Saved here, then indexed when you <span className="text-ink3">Sync now</span> above.
-        </span>
-      </div>
+      <p className="text-[11px] text-ink4">
+        {saving ? "Saving…" : "Changes saved"} — applied next time you{" "}
+        <span className="text-ink3">Sync now</span> above.
+      </p>
     </div>
   );
 }

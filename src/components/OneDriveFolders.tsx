@@ -1,35 +1,31 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getOneDriveScope, listOneDriveFolders, setOneDriveScope } from "../lib/ipc";
 import type { OneDriveFolder, OneDriveScope } from "../lib/types";
-import { Button, SegmentedControl } from "./ui";
+import { SegmentedControl } from "./ui";
 
 /**
  * Per-account OneDrive **scope** manager (Connectors → Drive). The personal OneDrive is indexed whole
  * by default (the efficient delta cursor); switch to "Choose folders" to index only the folders you
  * pick (everything inside, recursively — re-enumerated each sync). Everything stays index-only (a
- * pointer + summary, never the bytes). **Save** only persists the scope; the account's **Sync now**
- * then applies it (indexes newly-in-scope files, soft-removes — kept findable, flagged source-missing
- * — those that fell out of scope).
+ * pointer + summary, never the bytes). Scope changes **save automatically** (no Save button); the
+ * account's **Sync now** then applies them (indexes newly-in-scope files, soft-removes — kept
+ * findable, flagged source-missing — those that fell out of scope).
  *
  * The Drive sibling ({@link "./DriveSharedDrives"}) also lists shared drives; OneDrive has just the
  * one personal drive, so this is only the My-Drive-style whole/folders choice.
  */
-export function OneDriveFolders({
-  email,
-  busy,
-  onSaved,
-}: {
-  email: string;
-  busy: boolean;
-  onSaved: () => void;
-}) {
+export function OneDriveFolders({ email, onSaved }: { email: string; onSaved: () => void }) {
   const [scope, setScope] = useState<OneDriveScope | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Serialize auto-saves (see `commit`): writes go out in click order, and only the latest one drives
+  // the "Saving…/Saved" flag so a burst of folder toggles can't land out of order or get stuck.
+  const saveSeq = useRef(0);
+  const saveChain = useRef<Promise<void>>(Promise.resolve());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -62,25 +58,34 @@ export function OneDriveFolders({
 
   const whole = scope.folders == null;
 
-  const setWhole = (w: boolean) => setScope({ folders: w ? null : [] });
+  // Persist on every change — there's no Save button. Optimistically updates local state, then writes
+  // through the serialized chain. Scope only takes effect on the next "Sync now"; saving never syncs.
+  const commit = (next: OneDriveScope) => {
+    setScope(next);
+    setError(null);
+    setSaving(true);
+    const seq = ++saveSeq.current;
+    saveChain.current = saveChain.current
+      .catch(() => {})
+      .then(() => setOneDriveScope(email, next))
+      .then(() => {
+        if (seq !== saveSeq.current) return; // a newer save is in flight; let it own the UI
+        setSaving(false);
+        onSaved();
+      })
+      .catch((e) => {
+        if (seq !== saveSeq.current) return;
+        setSaving(false);
+        setError(String(e));
+      });
+  };
+
+  const setWhole = (w: boolean) => commit({ folders: w ? null : [] });
 
   const toggleFolder = (folderId: string, checked: boolean) => {
     const cur = scope.folders ?? [];
     const next = checked ? [...new Set([...cur, folderId])] : cur.filter((f) => f !== folderId);
-    setScope({ folders: next });
-  };
-
-  const save = async () => {
-    setSaving(true);
-    setError(null);
-    try {
-      await setOneDriveScope(email, scope);
-      onSaved();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
-    }
+    commit({ folders: next });
   };
 
   return (
@@ -99,14 +104,10 @@ export function OneDriveFolders({
 
       {error && <p className="text-xs text-st-due">{error}</p>}
 
-      <div className="flex items-center gap-2">
-        <Button onClick={save} disabled={busy || saving} className="px-2 py-1 text-xs">
-          {saving ? "Saving…" : "Save"}
-        </Button>
-        <span className="text-[11px] text-ink4">
-          Saved here, then indexed when you <span className="text-ink3">Sync now</span> above.
-        </span>
-      </div>
+      <p className="text-[11px] text-ink4">
+        {saving ? "Saving…" : "Changes saved"} — applied next time you{" "}
+        <span className="text-ink3">Sync now</span> above.
+      </p>
     </div>
   );
 }

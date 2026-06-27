@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.31.0-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "Connecting a Google Drive or OneDrive account no longer starts indexing straight away. The account now lands ready-but-unsynced with its scope chooser already open, so you can pick what to index first — your whole drive, just certain folders, or (for Google) which shared drives — and then press “Sync now” to start. Nothing is fetched until you do.",
+      "Choosing what to sync now saves as you go — the Save button is gone. Tick My Drive, switch a drive to “Choose folders”, or add a shared drive and it's stored immediately; it takes effect the next time you press “Sync now”.",
+    ],
+  },
+  {
     version: "2.30.0-alpha",
     date: "2026-06-27",
     highlights: [
