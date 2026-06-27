@@ -278,7 +278,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Graph
   "graph-canvas": {
     title: "Document map",
-    body: "Each large labelled node is a project; the smaller nodes linked to it are its documents. Bigger document nodes have more content. Hover a document to see its full details.",
+    body: "Each large labelled node is a project hub; the smaller nodes linked to it are its documents. A node's size is how much content it holds (its number of chunks), and its colour is its project — matching the legend. A dashed ring means a document is still awaiting review, or is index-only (it lives in a connected source like Drive, not stored on this device). Hover a document for its details, or click it to open its project.",
   },
 
   // Focus view & projects (Step 5)
