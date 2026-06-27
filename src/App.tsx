@@ -10,6 +10,7 @@ import { DevView } from "./components/DevView";
 import { DocumentsView } from "./components/DocumentsView";
 import { FocusView } from "./components/FocusView";
 import { GraphView } from "./components/GraphView";
+import { warmMapLayout } from "./lib/mapLayout";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { LockScreen } from "./components/LockScreen";
 import { PinboardView } from "./components/PinboardView";
@@ -298,6 +299,12 @@ export default function App() {
     if (keySet) void resumeDriveSync().catch(() => {});
   }, [keySet]);
 
+  // Pre-compute the Map's force layout in the background after unlock, at idle priority and off the
+  // main thread (a worker), so opening the Map tab is instant and never stutters the app at launch.
+  useEffect(() => {
+    if (keySet) warmMapLayout();
+  }, [keySet]);
+
   async function selectConversation(id: number) {
     setActiveId(id);
     chat.clearTransient(); // drop any in-flight stream's UI from the conversation we're leaving
@@ -463,7 +470,7 @@ export default function App() {
             </main>
           ) : view === "graph" ? (
             <main className="flex h-full flex-1 flex-col">
-              <GraphView />
+              <GraphView onOpenProject={openProject} />
             </main>
           ) : view === "pinboard" ? (
             <main className="flex h-full flex-1 flex-col">
