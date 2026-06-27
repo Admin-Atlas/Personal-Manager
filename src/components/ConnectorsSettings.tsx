@@ -6,6 +6,7 @@ import { useDepth } from "../theme";
 import { Collapsible, SegmentedControl } from "./ui";
 import { GoogleCalendarConnection } from "./GoogleCalendarConnection";
 import { GoogleDriveConnection } from "./GoogleDriveConnection";
+import { OneDriveConnection } from "./OneDriveConnection";
 import { IcsFeedSubscription } from "./IcsFeedSubscription";
 
 /**
@@ -60,7 +61,8 @@ export function ConnectorsSettings({
       >
         <GoogleDriveConnection />
         <Divider />
-        <ComingSoonRow name="OneDrive" detail="Microsoft — the connector after Drive." />
+        <OneDriveConnection />
+        <Divider />
         <ComingSoonRow name="iCloud Drive" detail="Apple — coming later." />
       </ServiceSection>
 

@@ -144,6 +144,46 @@ pub fn migrate_legacy_google_token() -> Result<()> {
     Ok(())
 }
 
+// --- Microsoft OAuth (board card 4B — OneDrive) ---
+//
+// The user's BYO Microsoft Entra "Mobile & desktop" app registration. Microsoft desktop apps are
+// PUBLIC clients: PKCE auth-code with NO client secret, so only a client id is stored (there is no
+// secret to ship — rule #1 holds for free). Each connected OneDrive account gets its own token blob
+// under `MICROSOFT_TOKEN_ONEDRIVE_PREFIX + <email>`, mirroring the per-account Drive tokens, so
+// connecting or disconnecting one account never disturbs another.
+const MICROSOFT_CLIENT_ID: &str = "microsoft_oauth_client_id";
+pub const MICROSOFT_TOKEN_ONEDRIVE_PREFIX: &str = "microsoft_oauth_token_onedrive::";
+
+pub fn get_microsoft_client_id() -> Result<Option<String>> {
+    get(MICROSOFT_CLIENT_ID)
+}
+
+/// Store the user's BYO Microsoft client id (public client — there is no secret).
+pub fn set_microsoft_client(client_id: &str) -> Result<()> {
+    set(MICROSOFT_CLIENT_ID, client_id)
+}
+
+/// Forget the Microsoft client id (used when the user clears the connector).
+pub fn clear_microsoft_client() -> Result<()> {
+    delete(MICROSOFT_CLIENT_ID)
+}
+
+/// Read a per-account Microsoft OAuth token blob by its keychain key.
+pub fn get_microsoft_token_for(key: &str) -> Result<Option<Secret>> {
+    Ok(get(key)?.map(Secret::from))
+}
+
+/// Store a per-account Microsoft OAuth token blob under its keychain key.
+pub fn set_microsoft_token_for(key: &str, value: &str) -> Result<()> {
+    set(key, value)
+}
+
+/// Forget a per-account Microsoft OAuth token (disconnect that account). Absent is success, so
+/// disconnect is idempotent.
+pub fn clear_microsoft_token_for(key: &str) -> Result<()> {
+    delete(key)
+}
+
 pub fn get_ics_feeds() -> Result<Option<Secret>> {
     Ok(get(CALENDAR_ICS_FEEDS)?.map(Secret::from))
 }

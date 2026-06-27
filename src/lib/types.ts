@@ -466,6 +466,77 @@ export type DriveSyncEvent =
   | { type: "item"; processed: number; total: number; name: string }
   | { type: "finished"; report: DriveSyncReport };
 
+// --- Personal Assistant: Microsoft OneDrive connector (board card 4B, spec §8.1) ---
+// A near-mirror of the Google Drive types above. One personal drive per account (no shared drives),
+// indexed whole (delta cursor) or folder-scoped.
+
+/** A connected Microsoft OneDrive account (Connectors → Drive). Each is independent — its own token,
+ *  sync cursor, and indexed items. */
+export interface OneDriveAccount {
+  id: string;
+  email: string;
+  label: string;
+  last_synced_at: string | null;
+  state: "ok" | "unreachable" | "error";
+  /** How many index-only documents this account currently has. */
+  indexed: number;
+}
+
+/** The OneDrive connector's state for Settings. */
+export interface OneDriveStatus {
+  /** The BYO Microsoft client id is configured (provider-level). */
+  oauth_client_configured: boolean;
+  accounts: OneDriveAccount[];
+}
+
+/** A folder inside the drive — one node of the OneDrive folder picker's lazy tree. */
+export interface OneDriveFolder {
+  id: string;
+  name: string;
+}
+
+/** What one account indexes: the whole personal OneDrive, or the chosen folders. Default scope is the
+ *  whole drive — so a freshly-connected account indexes everything. */
+export interface OneDriveScope {
+  /** `null` = the entire OneDrive (delta-cursor sync); otherwise index only these folders
+   *  (recursively, re-enumerated each sync). */
+  folders: string[] | null;
+}
+
+/** A file a OneDrive sync tried to index but couldn't, surfaced in the post-sync report. */
+export interface OneDriveSyncIssue {
+  name: string;
+  reason: string;
+}
+
+/** The outcome of a OneDrive sync pass. */
+export interface OneDriveSyncReport {
+  indexed: number;
+  updated: number;
+  removed: number;
+  skipped: number;
+  failed: number;
+  cancelled: boolean;
+  issues: OneDriveSyncIssue[];
+  issues_truncated: boolean;
+}
+
+/** Snapshot of an in-flight OneDrive sync, so the UI can resume showing progress after navigating
+ *  away and back. */
+export interface OneDriveSyncState {
+  running: boolean;
+  processed: number;
+  total: number | null;
+  account: string | null;
+  last_report: OneDriveSyncReport | null;
+}
+
+/** Streamed progress while a OneDrive sync runs (mapped onto the shared IngestProgress bar). */
+export type OneDriveSyncEvent =
+  | { type: "counted"; total: number }
+  | { type: "item"; processed: number; total: number; name: string }
+  | { type: "finished"; report: OneDriveSyncReport };
+
 /** One document's 2-D position on the semantic memory map (coords are in [0,1]²). */
 export interface SemanticCoord {
   id: number;

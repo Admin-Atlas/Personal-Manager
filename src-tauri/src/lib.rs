@@ -19,7 +19,9 @@ mod index_only;
 mod ingest;
 mod layout;
 mod lock_session;
+mod microsoft;
 mod model_gateway;
+mod onedrive;
 mod openrouter;
 mod paths;
 mod preferences;
@@ -110,6 +112,23 @@ pub struct DriveSyncState {
     pub last_report: Option<drive::DriveSyncReport>,
 }
 
+/// A snapshot of the OneDrive sync that's currently running (if any) — the Microsoft sibling of
+/// [`DriveSyncState`]. Kept as its own field/channel so the two connectors run and report
+/// independently.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct OneDriveSyncState {
+    pub running: bool,
+    pub processed: usize,
+    pub total: Option<usize>,
+    /// The account being synced (email), or `None` for an all-accounts pass.
+    pub account: Option<String>,
+    /// Internal single-flight flag (a sync requested while one was running). Not exposed to the UI.
+    #[serde(skip)]
+    pub rerun: bool,
+    /// The most recent finished sync's report, so a user returning after a sync still sees the result.
+    pub last_report: Option<onedrive::OneDriveSyncReport>,
+}
+
 pub struct AppState {
     /// The open store, or `None` when the vault is locked — a passphrase/shareable
     /// vault on a profile that hasn't unlocked it yet. Reach it via [`AppState::conn`],
@@ -136,6 +155,10 @@ pub struct AppState {
     /// Cooperative stop flag for the running Drive sync. `stop_drive_sync` sets it; the sync loop
     /// checks it between files and halts, keeping everything indexed so far. Reset at each sync start.
     pub drive_sync_cancel: AtomicBool,
+    /// Snapshot of the currently-running OneDrive sync (the Microsoft sibling of `drive_sync`).
+    pub onedrive_sync: Mutex<OneDriveSyncState>,
+    /// Cooperative stop flag for the running OneDrive sync (the sibling of `drive_sync_cancel`).
+    pub onedrive_sync_cancel: AtomicBool,
     /// Snapshot of the semantic-map layout precompute (single-flight; running/method/last-error), so
     /// the Map can show progress and a second request folds into the running one. See `layout`.
     pub layout_job: Mutex<layout::LayoutJobState>,
@@ -442,6 +465,8 @@ pub fn run() {
                 lock_session: Mutex::new(lock_session::LockSession::default()),
                 drive_sync: Mutex::new(DriveSyncState::default()),
                 drive_sync_cancel: AtomicBool::new(false),
+                onedrive_sync: Mutex::new(OneDriveSyncState::default()),
+                onedrive_sync_cancel: AtomicBool::new(false),
                 layout_job: Mutex::new(layout::LayoutJobState::default()),
             });
 
@@ -557,6 +582,19 @@ pub fn run() {
             commands::list_drive_folders,
             commands::get_drive_scope,
             commands::set_drive_scope,
+            commands::onedrive_status,
+            commands::list_onedrive_accounts,
+            commands::set_microsoft_client,
+            commands::clear_microsoft_client,
+            commands::connect_onedrive,
+            commands::disconnect_onedrive,
+            commands::sync_onedrive,
+            commands::onedrive_sync_status,
+            commands::stop_onedrive_sync,
+            commands::resume_onedrive_sync,
+            commands::list_onedrive_folders,
+            commands::get_onedrive_scope,
+            commands::set_onedrive_scope,
             commands::fetch_index_only_body,
             layout::semantic_layout,
             layout::start_semantic_layout,

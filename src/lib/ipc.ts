@@ -33,6 +33,12 @@ import type {
   Message,
   ModelInfo,
   ModelRecommendations,
+  OneDriveAccount,
+  OneDriveFolder,
+  OneDriveScope,
+  OneDriveStatus,
+  OneDriveSyncEvent,
+  OneDriveSyncState,
   Preference,
   ProjectOverview,
   ProjectProposalEvent,
@@ -532,6 +538,57 @@ export const getDriveScope = (email: string) => invoke<DriveScope>("get_drive_sc
 /** Persist one account's indexing scope; follow with `syncDrive(email)` to apply it. */
 export const setDriveScope = (email: string, scope: DriveScope) =>
   invoke<void>("set_drive_scope", { email, scope });
+
+// --- Microsoft OneDrive (index-only connector, board card 4B) ---
+
+/** Save the user's BYO Microsoft client id (public client — no secret; keychain only). */
+export const setMicrosoftClient = (clientId: string) =>
+  invoke<void>("set_microsoft_client", { clientId });
+
+/** Clear the Microsoft client id and sign out every OneDrive account (kept findable). */
+export const clearMicrosoftClient = () => invoke<void>("clear_microsoft_client");
+
+/** The OneDrive connector's state: whether the Microsoft client is set up + connected accounts. */
+export const oneDriveStatus = () => invoke<OneDriveStatus>("onedrive_status");
+
+/** The connected OneDrive accounts (each independent). */
+export const listOneDriveAccounts = () => invoke<OneDriveAccount[]>("list_onedrive_accounts");
+
+/** Connect a Microsoft OneDrive account — opens the browser; resolves with the connected account. */
+export const connectOneDrive = () => invoke<OneDriveAccount>("connect_onedrive");
+
+/** Disconnect one account: forget its token + flag its items unreachable (kept findable). */
+export const disconnectOneDrive = (email: string) => invoke<void>("disconnect_onedrive", { email });
+
+/** Start syncing one account (or all when `email` is null). Detached in the backend — progress
+ *  arrives via the global `onedrive://sync` event (subscribe with {@link onOneDriveSync}). */
+export const syncOneDrive = (email: string | null) =>
+  invoke<number>("sync_onedrive", { account: email });
+
+/** The current background-sync snapshot — used to restore the progress UI on returning to Settings. */
+export const oneDriveSyncStatus = () => invoke<OneDriveSyncState>("onedrive_sync_status");
+
+/** Ask the running sync to stop after the current file. Already-indexed files are kept. */
+export const stopOneDriveSync = () => invoke<void>("stop_onedrive_sync");
+
+/** Resume a sync interrupted by a previous app close/crash mid-index. Called once on launch. */
+export const resumeOneDriveSync = () => invoke<boolean>("resume_onedrive_sync");
+
+/** Subscribe to global OneDrive sync progress (fires regardless of which view started the sync). */
+export const onOneDriveSync = (handler: (e: OneDriveSyncEvent) => void): Promise<UnlistenFn> =>
+  listen<OneDriveSyncEvent>("onedrive://sync", (e) => handler(e.payload));
+
+/** Immediate subfolders of a folder (one lazy picker level); pass `null` for the drive root. */
+export const listOneDriveFolders = (email: string, parentId: string | null) =>
+  invoke<OneDriveFolder[]>("list_onedrive_folders", { email, parentId });
+
+/** Read one account's indexing scope (whole drive, or the chosen folders). */
+export const getOneDriveScope = (email: string) =>
+  invoke<OneDriveScope>("get_onedrive_scope", { email });
+
+/** Persist one account's indexing scope; follow with `syncOneDrive(email)` to apply it. */
+export const setOneDriveScope = (email: string, scope: OneDriveScope) =>
+  invoke<void>("set_onedrive_scope", { email, scope });
 
 /** Fetch an index-only document's full body live from its source (the body is never stored). */
 export const fetchIndexOnlyBody = (docId: number) =>
