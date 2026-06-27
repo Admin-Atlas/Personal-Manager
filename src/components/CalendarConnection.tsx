@@ -15,6 +15,7 @@ import type { Calendar, CalendarAccount, CalendarOverview } from "../lib/types";
 import { useDevMode } from "../lib/capabilities";
 import { Button, ConfirmDialog, Skeleton } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
+import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
 
 /** The two read-only OAuth calendar providers. Apple has no desktop OAuth, so it stays a subscription
  *  (see {@link "./IcsFeedSubscription"}). */
@@ -113,13 +114,19 @@ export function CalendarConnection({
       .filter((c) => c.source_id === sourceId)
       .sort((a, b) => Number(b.is_primary) - Number(a.is_primary) || a.name.localeCompare(b.name));
 
+  // Post-connect: refresh the account list, kick a first sync, and report the count. Shared by the
+  // normal connect and the own-project (Advanced-Protection) connect path below.
+  const afterConnect = async () => {
+    await refresh();
+    const n = await syncCalendar().catch(() => 0);
+    setNote(`Connected. Synced ${n} event${n === 1 ? "" : "s"}.`);
+    await refresh();
+  };
+
   const connect = () =>
     run("connect", async () => {
       await meta.connect();
-      await refresh();
-      const n = await syncCalendar().catch(() => 0);
-      setNote(`Connected. Synced ${n} event${n === 1 ? "" : "s"}.`);
-      await refresh();
+      await afterConnect();
     });
 
   const disconnect = (email: string) =>
@@ -231,6 +238,13 @@ export function CalendarConnection({
                   ? `Connect ${meta.label}`
                   : "Add another account"}
             </Button>
+            {provider === "google" && (
+              <GoogleOwnProjectConnect
+                service="calendar"
+                disabled={busy != null}
+                onConnected={afterConnect}
+              />
+            )}
           </div>
         </>
       )}

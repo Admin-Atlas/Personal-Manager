@@ -2071,8 +2071,22 @@ pub fn set_calendar_selected(
 /// The core connect flow, shared by the new per-account command and the back-compat `connect_google`:
 /// run consent, learn the account from its primary calendar (id == email), store the token under that
 /// account's key, and register the account + its calendars (all selected by default).
-async fn do_connect_google_calendar(app: &AppHandle) -> Result<calendar::CalendarAccount> {
-    let token = google::run_consent(google::CALENDAR_SCOPE, "Google Calendar").await?;
+async fn do_connect_google_calendar(
+    app: &AppHandle,
+    own: Option<(String, String)>,
+) -> Result<calendar::CalendarAccount> {
+    let token = match &own {
+        Some((id, secret)) => {
+            google::run_consent_with_client(
+                google::CALENDAR_SCOPE,
+                "Google Calendar",
+                id.clone(),
+                secret.clone(),
+            )
+            .await?
+        }
+        None => google::run_consent(google::CALENDAR_SCOPE, "Google Calendar").await?,
+    };
     let raw = calendar::fetch_calendar_list_with_token(&token).await?;
     let email = raw
         .iter()
@@ -2082,6 +2096,9 @@ async fn do_connect_google_calendar(app: &AppHandle) -> Result<calendar::Calenda
             Error::Other("Google didn't return a primary calendar to identify the account.".into())
         })?;
     let account = calendar::google_account_id(&email);
+    if let Some((id, secret)) = &own {
+        secrets::set_google_client_for_account(&email, id, secret)?;
+    }
     google::save_token(&google_calendar_token_key(&email), &token)?;
     let state = app.state::<AppState>();
     let conn = state.conn()?;
@@ -2094,10 +2111,15 @@ async fn do_connect_google_calendar(app: &AppHandle) -> Result<calendar::Calenda
         .ok_or_else(|| Error::Other("the account registration could not be read back".into()))
 }
 
-/// Connect a Google Calendar account (multi-account).
+/// Connect a Google Calendar account (multi-account). Optionally signs in with the account's OWN
+/// Cloud project (`client_id`/`client_secret`) — the Advanced-Protection path, mirroring `connect_drive`.
 #[tauri::command]
-pub async fn connect_google_calendar_account(app: AppHandle) -> Result<calendar::CalendarAccount> {
-    do_connect_google_calendar(&app).await
+pub async fn connect_google_calendar_account(
+    app: AppHandle,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<calendar::CalendarAccount> {
+    do_connect_google_calendar(&app, own_client(client_id, client_secret)?).await
 }
 
 /// Disconnect one Google Calendar account: drop its registry source (cascading its calendars +
@@ -2429,13 +2451,55 @@ pub fn list_drive_accounts(state: State<'_, AppState>) -> Result<Vec<drive::Driv
     drive::list_accounts(&conn)
 }
 
+/// Normalize the optional per-account client (id + secret) passed at connect time into
+/// `Some((id, secret))` only when BOTH are non-empty; blank means "use the shared client". Lets an
+/// Advanced-Protection account sign in with its own Cloud project (see
+/// [`secrets::set_google_client_for_account`]). Errors if exactly one of the two is supplied.
+fn own_client(
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<Option<(String, String)>> {
+    let id = client_id.unwrap_or_default().trim().to_string();
+    let secret = client_secret.unwrap_or_default().trim().to_string();
+    match (id.is_empty(), secret.is_empty()) {
+        (true, true) => Ok(None),
+        (false, false) => Ok(Some((id, secret))),
+        _ => Err(Error::Other(
+            "Enter both the account's Client ID and Client secret, or leave both blank to use the \
+             shared client."
+                .into(),
+        )),
+    }
+}
+
 /// Connect a Google Drive account (read-only): run the consent flow, learn which account it granted
 /// (Drive `about`), store that account's token under its own keychain key, and register it. Returns
-/// the connected account. The shared BYO Google client must already be configured.
+/// the connected account. Normally uses the shared BYO Google client; if `client_id`/`client_secret`
+/// are supplied, this account signs in with its OWN Cloud project (the Advanced-Protection path) and
+/// that client is remembered for the account so later token refreshes reuse it.
 #[tauri::command]
-pub async fn connect_drive(app: AppHandle) -> Result<drive::DriveAccount> {
-    let token = google::run_consent(google::DRIVE_SCOPE, "Google Drive").await?;
+pub async fn connect_drive(
+    app: AppHandle,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<drive::DriveAccount> {
+    let own = own_client(client_id, client_secret)?;
+    let token = match &own {
+        Some((id, secret)) => {
+            google::run_consent_with_client(
+                google::DRIVE_SCOPE,
+                "Google Drive",
+                id.clone(),
+                secret.clone(),
+            )
+            .await?
+        }
+        None => google::run_consent(google::DRIVE_SCOPE, "Google Drive").await?,
+    };
     let (email, name) = drive::about_user(&token).await?;
+    if let Some((id, secret)) = &own {
+        secrets::set_google_client_for_account(&email, id, secret)?;
+    }
     google::save_token(&drive::account_token_key(&email), &token)?;
     let state = app.state::<AppState>();
     let conn = state.conn()?;

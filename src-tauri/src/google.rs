@@ -63,6 +63,22 @@ fn client_creds() -> Result<(String, Secret)> {
     Ok((id, secret))
 }
 
+/// The OAuth client to use for the account behind a token key — its OWN client if one is stored
+/// (an Advanced-Protection account on its own Cloud project), else the shared client. The account
+/// email is the suffix after `::` in the token key (`google_oauth_token_drive::<email>` etc.); the
+/// legacy fixed calendar key has no suffix, so it resolves to the shared client.
+fn client_creds_for_key(token_key: &str) -> Result<(String, Secret)> {
+    if let Some((_, email)) = token_key.rsplit_once("::") {
+        if let (Some(id), Some(secret)) = (
+            secrets::get_google_client_id_for_account(email)?,
+            secrets::get_google_client_secret_for_account(email)?,
+        ) {
+            return Ok((id, secret));
+        }
+    }
+    client_creds()
+}
+
 fn http() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -77,7 +93,31 @@ fn http() -> Result<reqwest::Client> {
 /// the caller's job. `success_label` names the connected product on the browser success page.
 /// Errors (no client configured, browser failed, cancelled, timeout) surface to the UI.
 pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
-    let (client_id, client_secret) = client_creds()?;
+    run_consent_inner(scope, success_label, client_creds()?).await
+}
+
+/// As [`run_consent`], but using an account's OWN client (id + secret) supplied explicitly — the path
+/// for connecting an Advanced-Protection account whose Cloud project isn't the shared one. The caller
+/// persists the per-account client (keyed by the email it learns) so later refreshes reuse it.
+pub async fn run_consent_with_client(
+    scope: &str,
+    success_label: &str,
+    client_id: String,
+    client_secret: String,
+) -> Result<Token> {
+    run_consent_inner(
+        scope,
+        success_label,
+        (client_id, Secret::from(client_secret)),
+    )
+    .await
+}
+
+async fn run_consent_inner(
+    scope: &str,
+    success_label: &str,
+    (client_id, client_secret): (String, Secret),
+) -> Result<Token> {
     let (verifier, challenge) = pkce()?;
     let state = random_token(16)?;
 
@@ -156,7 +196,7 @@ pub async fn get_json_with_token(token: &Token, url: &str) -> Result<serde_json:
 /// 401-retry-after-refresh (the backstop for a token revoked or expired early). Returns the raw
 /// response so the caller can decode it as JSON or bytes.
 async fn authorized_send(token_key: &str, url: &str) -> Result<reqwest::Response> {
-    let (client_id, client_secret) = client_creds()?;
+    let (client_id, client_secret) = client_creds_for_key(token_key)?;
     let mut token = load_token(token_key)?;
 
     if token.expiry <= now_unix() + 60 {
