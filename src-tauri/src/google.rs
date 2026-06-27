@@ -123,12 +123,6 @@ pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
     Ok(token)
 }
 
-/// Connect Google Calendar (read-only): run consent and store the token under the calendar key.
-pub async fn connect() -> Result<()> {
-    let token = run_consent(CALENDAR_SCOPE, "Google Calendar").await?;
-    save_token(CALENDAR_TOKEN_KEY, &token)
-}
-
 /// GET a Google API URL as JSON, authorised with the token under `token_key`. Refreshes the
 /// access token first if it's near expiry, and retries once after a refresh on 401. Never
 /// touches the DB, so callers hold no lock across it (rule #4).

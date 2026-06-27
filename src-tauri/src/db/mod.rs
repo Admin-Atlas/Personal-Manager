@@ -742,7 +742,13 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE doc_layout; \
+            "DROP INDEX idx_calendar_events_uid; \
+             DROP INDEX idx_calendar_events_entity; \
+             DROP INDEX idx_calendar_events_calendar; \
+             DROP TABLE calendars; \
+             ALTER TABLE calendar_events DROP COLUMN uid; \
+             ALTER TABLE calendar_events DROP COLUMN entity_id; \
+             DROP TABLE doc_layout; \
              DROP TABLE connector_sources; \
              DROP TABLE preferences; \
              DROP INDEX idx_documents_source_id; \
@@ -869,7 +875,13 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE doc_layout; \
+            "DROP INDEX idx_calendar_events_uid; \
+             DROP INDEX idx_calendar_events_entity; \
+             DROP INDEX idx_calendar_events_calendar; \
+             DROP TABLE calendars; \
+             ALTER TABLE calendar_events DROP COLUMN uid; \
+             ALTER TABLE calendar_events DROP COLUMN entity_id; \
+             DROP TABLE doc_layout; \
              DROP TABLE connector_sources; \
              DROP TABLE preferences; \
              DROP INDEX idx_documents_source_id; \

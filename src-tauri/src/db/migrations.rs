@@ -460,6 +460,54 @@ const MIGRATIONS: &[&str] = &[
      WHERE type = 'table' AND name = 'documents';
     PRAGMA writable_schema = OFF;
     "#,
+    // v18: the multi-provider calendar foundation (Stage 3, board cards 6A/6B). The v6 mirror was
+    // single-Google-account and flat: events keyed by an overloaded `calendar_id` string (a Google
+    // calendar id OR an `ics:<hex>` feed id), with no account model, no calendar registry, no stored
+    // iCal UID, and no slot to ever link an event to a PM entity. This card builds the clean
+    // three-level relational model — **account → calendar → event** — that Google (now multi-account),
+    // Outlook (Microsoft Graph OAuth), and Apple/any iCal subscription all flow into, and that the
+    // later unified calendar VIEW (card 6B) renders.
+    //
+    //   * `connector_sources` (v14) is REUSED as the account/subscription layer (one row per Google
+    //     account `gcal:<email>`, Outlook account `outlook:<email>`, or iCal subscription `ical:<hex>`,
+    //     all `service='calendar'`) — holding the uniform per-source `last_synced_at` + reachability
+    //     `state`. Read-only with a small rolling window uses delete-then-reinsert per calendar, so
+    //     `cursor` stays NULL (no delta tokens).
+    //   * `calendars` (NEW) is one row per individual calendar within a source — a Google/Outlook
+    //     account has many; an iCal subscription is exactly one. `selected` replaces the old
+    //     `settings.google_calendar_ids` blob; `color` is the per-source colour the 6B view will use.
+    //     `source_id` cascades, so dropping an account drops its calendars (the app also deletes their
+    //     mirrored events explicitly — belt-and-braces, independent of the foreign_keys pragma).
+    //   * `calendar_events` (the DERIVED mirror) is EXTENDED in place — additive ALTER, never a
+    //     destructive rebuild (rule #3): it's reconstructable on the next sync, and `uid` simply
+    //     backfills then. `uid` is the iCal UID — the durable identifier that survives edits and
+    //     round-trips across Google/Outlook/Apple, the anchor the Stage-4 "Calendar ↔ PM
+    //     correspondence" card needs. `entity_id` is that correspondence SLOT: nullable, **written by
+    //     nobody this stage**, so the Stage-4 card ships with zero schema change. `calendar_events.
+    //     calendar_id` now logically references `calendars.id` (an app-maintained relation, exactly as
+    //     the old `remove_feed` already cleaned events by `calendar_id`). All additive — an existing
+    //     store gains the `calendars` table + two nullable event columns, no backfill; the next sync
+    //     repopulates the mirror under the new account→calendar ids (rule #3). Vectors are untouched.
+    r#"
+    CREATE TABLE calendars (
+        id          TEXT PRIMARY KEY,    -- 'gcal:<email>:<calId>' | 'outlook:<email>:<calId>' | 'ical:<hex>'
+        source_id   TEXT NOT NULL REFERENCES connector_sources(id) ON DELETE CASCADE,
+        provider    TEXT NOT NULL,       -- 'google' | 'microsoft' | 'apple' | 'other' (denorm for grouping/colour)
+        remote_id   TEXT,                -- the provider's own calendar id; NULL for a single-calendar ICS subscription
+        name        TEXT NOT NULL DEFAULT '(calendar)',
+        color       TEXT,                -- per-source colour the unified view (6B) uses; nullable
+        selected    INTEGER NOT NULL DEFAULT 1,  -- sync/show this calendar? (replaces settings.google_calendar_ids)
+        is_primary  INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_calendars_source ON calendars(source_id);
+
+    ALTER TABLE calendar_events ADD COLUMN uid       TEXT;                        -- iCal UID: the durable cross-provider anchor (Stage-4 seam)
+    ALTER TABLE calendar_events ADD COLUMN entity_id INTEGER REFERENCES entities(id);  -- correspondence slot; WRITTEN BY NOBODY this stage
+    CREATE INDEX idx_calendar_events_uid      ON calendar_events(uid);
+    CREATE INDEX idx_calendar_events_entity   ON calendar_events(entity_id);
+    CREATE INDEX idx_calendar_events_calendar ON calendar_events(calendar_id);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -509,9 +557,10 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 17,
+            version, 18,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
-             semantic-map doc_layout is v16; importance 'archive' level is v17)"
+             semantic-map doc_layout is v16; importance 'archive' level is v17; \
+             multi-provider calendar foundation is v18)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -531,6 +580,73 @@ mod tests {
         assert_eq!(mode, "index_only");
         assert_eq!(state, "ok");
         assert_eq!(cursor, None);
+    }
+
+    /// v18 lands the multi-provider calendar foundation: the `calendars` registry (cascading from a
+    /// `connector_sources` account row), the two new `calendar_events` columns (`uid` + the
+    /// write-nobody-yet `entity_id` correspondence slot), and their indexes — the clean
+    /// account → calendar → event spine Google/Outlook/Apple all flow into.
+    #[test]
+    fn calendar_foundation_lands_with_registry_and_event_columns() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        // The pragma the cascade below relies on (db::open should set it; assert so a regression here
+        // surfaces as a clear failure rather than a silently-orphaned calendar row).
+        let fk_on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            fk_on, 1,
+            "foreign_keys must be ON for the source→calendar cascade"
+        );
+
+        // An account source + one of its calendars + a mirrored event with the new columns all insert.
+        conn.execute(
+            "INSERT INTO connector_sources(id, provider, service, label, account_email) \
+             VALUES ('gcal:a@b.com', 'google', 'calendar', 'a@b.com', 'a@b.com')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendars(id, source_id, provider, remote_id, name, is_primary) \
+             VALUES ('gcal:a@b.com:a@b.com', 'gcal:a@b.com', 'google', 'a@b.com', 'a@b.com', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events(id, calendar_id, summary, start, uid) \
+             VALUES ('gcal:a@b.com:a@b.com:evt1', 'gcal:a@b.com:a@b.com', 'Standup', \
+                     '2026-06-27T09:00:00Z', 'ABC-UID@google.com')",
+            [],
+        )
+        .unwrap();
+        // `selected` defaults to 1, `entity_id` to NULL (nobody writes it this stage).
+        let (selected, uid, entity_id): (i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT c.selected, e.uid, e.entity_id FROM calendars c \
+                 JOIN calendar_events e ON e.calendar_id = c.id WHERE c.id = 'gcal:a@b.com:a@b.com'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(selected, 1);
+        assert_eq!(uid.as_deref(), Some("ABC-UID@google.com"));
+        assert_eq!(entity_id, None);
+
+        // Dropping the account cascades its calendars (source_id REFERENCES … ON DELETE CASCADE).
+        conn.execute(
+            "DELETE FROM connector_sources WHERE id = 'gcal:a@b.com'",
+            [],
+        )
+        .unwrap();
+        let calendars: i64 = conn
+            .query_row("SELECT count(*) FROM calendars", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            calendars, 0,
+            "calendars cascade when their source is deleted"
+        );
     }
 
     /// v17 relaxed the `documents.importance` CHECK: 'archive' is now a valid level (and the

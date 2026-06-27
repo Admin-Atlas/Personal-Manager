@@ -289,6 +289,7 @@ mod tests {
             end: None,
             all_day: false,
             html_link: None,
+            uid: None,
         }
     }
 

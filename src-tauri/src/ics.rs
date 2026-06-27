@@ -253,6 +253,8 @@ fn make_event(
         end,
         all_day,
         html_link: None,
+        // The iCal UID is the durable cross-provider anchor; an empty UID stores as None.
+        uid: (!uid.is_empty()).then(|| uid.to_string()),
     }
 }
 
