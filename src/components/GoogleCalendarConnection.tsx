@@ -114,6 +114,9 @@ export function GoogleCalendarConnection() {
 
   const configured = status?.oauth_client_configured ?? false;
   const connected = status?.oauth_connected ?? false;
+  // A connected account can still fail because the Calendar API isn't enabled in the user's Cloud
+  // project — surface that as an actionable enable-link rather than a raw 403 wall of text.
+  const apiDisabled = calendarApiDisabled(error);
 
   return (
     <div data-help="settings-calendar">
@@ -198,14 +201,37 @@ export function GoogleCalendarConnection() {
       )}
 
       {note && <p className="mt-2 text-xs text-st-quick">{note}</p>}
-      {error && (
-        <p
-          className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
-          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-        >
-          {error}
-        </p>
-      )}
+      {error &&
+        (apiDisabled ? (
+          <div
+            className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
+            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+          >
+            <p>
+              Your Google account is connected, but the{" "}
+              <span className="font-medium">Google Calendar API</span> isn&apos;t enabled in your
+              Google Cloud project yet.
+            </p>
+            <p className="mt-1">
+              <a
+                href={apiDisabled.enableUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent-text underline hover:brightness-110"
+              >
+                Enable the Google Calendar API
+              </a>{" "}
+              (with your project selected), give it a minute to take effect, then Sync again.
+            </p>
+          </div>
+        ) : (
+          <p
+            className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
+            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+          >
+            {error}
+          </p>
+        ))}
 
       {devMode && status && (
         <DevPanel
@@ -255,6 +281,19 @@ export function GoogleCalendarConnection() {
       </ConfirmDialog>
     </div>
   );
+}
+
+/** Recognise Google's "the Calendar API isn't enabled for your Cloud project" 403 — distinct from a
+ *  sign-in problem — and pull the project-specific enable URL out of the message (Google includes a
+ *  console link). Falls back to the generic API-library page if the URL isn't in the (truncated)
+ *  text. Returns null for any other error, so those still show verbatim. */
+function calendarApiDisabled(error: string | null): { enableUrl: string } | null {
+  if (!error) return null;
+  if (!/has not been used in project|accessNotConfigured/i.test(error)) return null;
+  const url = error.match(/https?:\/\/[^\s"']+/)?.[0];
+  return {
+    enableUrl: url ?? "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com",
+  };
 }
 
 function formatWhen(iso: string): string {
