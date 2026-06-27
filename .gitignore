@@ -63,3 +63,13 @@ PUBLISH.md
 # Docs are excluded from the repo move; they'll be re-added to the new repo
 # after the code is moved. Kept on disk locally, just untracked here.
 /docs
+
+# --- design-sync (claude.ai/design) ---
+# Staged converter scripts, regenerated build output, machine state, and fan-out
+# scratch. The durable inputs under .design-sync/ (config.json, NOTES.md,
+# conventions.md, previews/, overrides/) ARE committed.
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules

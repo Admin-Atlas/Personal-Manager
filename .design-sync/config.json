@@ -1,0 +1,38 @@
+{
+  "pkg": "pm",
+  "globalName": "PMDesignSystem",
+  "shape": "package",
+  "projectId": "4965e52e-a194-423b-a3ca-046509b077d0",
+  "buildCmd": "tsc && npx vite build --base=./",
+  "entry": "./src/components/ui/index.ts",
+  "srcDir": "src",
+  "tsconfig": "tsconfig.json",
+  "componentSrcMap": {
+    "Button": "src/components/ui/Button.tsx",
+    "Input": "src/components/ui/Input.tsx",
+    "Textarea": "src/components/ui/Textarea.tsx",
+    "Select": "src/components/ui/Select.tsx",
+    "SegmentedControl": "src/components/ui/SegmentedControl.tsx",
+    "Card": "src/components/ui/Card.tsx",
+    "Collapsible": "src/components/ui/Collapsible.tsx",
+    "ListRow": "src/components/ui/ListRow.tsx",
+    "StatusBadge": "src/components/ui/StatusBadge.tsx",
+    "Modal": "src/components/ui/Modal.tsx",
+    "ConfirmDialog": "src/components/ui/ConfirmDialog.tsx",
+    "NavItem": "src/components/ui/NavItem.tsx",
+    "Progress": "src/components/ui/Progress.tsx",
+    "HScroll": "src/components/ui/HScroll.tsx",
+    "Skeleton": "src/components/ui/Skeleton.tsx",
+    "TitleBar": "src/components/ui/TitleBar.tsx",
+    "cn": null
+  },
+  "extraEntries": ["./src/theme/index.ts", "./.design-sync/preview-provider.tsx"],
+  "provider": { "component": "PreviewSurface" },
+  "cssEntry": "dist/assets/index-D92XgbsW.css",
+  "guidelinesGlob": ["design-system-docs/DESIGN_TOKENS.md"],
+  "readmeHeader": ".design-sync/conventions.md",
+  "overrides": {
+    "Modal": { "cardMode": "single", "viewport": "600x420" },
+    "ConfirmDialog": { "cardMode": "single", "viewport": "600x420" }
+  }
+}

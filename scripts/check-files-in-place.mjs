@@ -76,6 +76,7 @@ for (const f of tracked) {
 // new legitimate root file? Add it here in the same PR; that is the point.
 const ALLOWED_ROOT = new Set([
   ".claude",
+  ".design-sync", // /design-sync skill inputs (claude.ai/design); build output is git-ignored
   ".github",
   ".gitignore",
   ".gitleaks.toml",

@@ -29,6 +29,12 @@ export default tseslint.config(
       "src-tauri/python",
       "design-system-docs",
       "node_modules",
+      // design-sync (claude.ai/design) build output & staged converter scripts —
+      // regenerated, vendored, git-ignored. The hand-authored .design-sync/previews/
+      // and preview-provider.tsx are NOT ignored (they're first-party and linted).
+      "ds-bundle",
+      ".ds-sync",
+      ".design-sync/.cache",
     ],
   },
   js.configs.recommended,
