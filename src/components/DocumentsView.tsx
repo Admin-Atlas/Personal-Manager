@@ -40,13 +40,15 @@ interface Summary {
 
 // Sorting for the document table. The available columns depend on the Depth preset (Ingested only
 // shows on Power), so a header only sorts when it's rendered. `null` = the backend's default order
-// (newest first). Importance is ranked high > medium > low > none rather than sorted alphabetically.
+// (newest first). Importance is ranked high > medium > low > none > archive rather than alphabetically.
 type SortKey = "title" | "project" | "importance" | "chunks" | "ingested";
 interface DocSort {
   key: SortKey;
   dir: "asc" | "desc";
 }
-const IMPORTANCE_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
+// Archive sits below everything — below an untriaged (null → 0) document too — so deliberately
+// shelved files sink to the bottom when sorting by importance.
+const IMPORTANCE_RANK: Record<string, number> = { high: 3, medium: 2, low: 1, archive: -1 };
 // Columns where "biggest first" is the more useful default on first click.
 const SORT_DESC_FIRST = new Set<SortKey>(["importance", "chunks", "ingested"]);
 

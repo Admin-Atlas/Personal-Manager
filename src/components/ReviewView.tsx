@@ -6,7 +6,9 @@ import { commitReview, listProjects, proposeMetadata, reviewQueue } from "../lib
 import type { Document, Importance, MetadataProposal, ReviewDecision } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
-import { Button, Card, Input, SegmentedControl, type SegOption } from "./ui";
+import { Button, Card, Input } from "./ui";
+import { ImportancePicker } from "./ImportancePicker";
+import { TagEditor } from "./TagEditor";
 
 interface Props {
   /** Called after the queue changes so the parent can refresh the sidebar badge. */
@@ -20,16 +22,6 @@ interface Edit {
 }
 
 const PROJECTS_LIST_ID = "review-projects";
-const IMPORTANCE_LEVELS: Importance[] = ["high", "medium", "low", null];
-
-// SegmentedControl is keyed by string; encode the nullable Importance as a stable key.
-const IMPORTANCE_KEY = (imp: Importance): string => imp ?? "none";
-const IMPORTANCE_FROM_KEY = (key: string): Importance =>
-  key === "none" ? null : (key as Importance);
-const IMPORTANCE_OPTIONS: ReadonlyArray<SegOption<string>> = IMPORTANCE_LEVELS.map((level) => ({
-  value: IMPORTANCE_KEY(level),
-  label: level ?? "none",
-}));
 
 // Module-level caches (keyed by document id) so leaving the Review tab and returning doesn't re-run
 // the AI proposals — those cost tokens, and the queue can be hundreds of items deep while a Drive
@@ -350,67 +342,5 @@ function ReviewRow({
         </div>
       </Card>
     </li>
-  );
-}
-
-function ImportancePicker({
-  value,
-  onChange,
-}: {
-  value: Importance;
-  onChange: (value: Importance) => void;
-}) {
-  return (
-    <SegmentedControl
-      options={IMPORTANCE_OPTIONS}
-      value={IMPORTANCE_KEY(value)}
-      onChange={(key) => onChange(IMPORTANCE_FROM_KEY(key))}
-      className="capitalize"
-    />
-  );
-}
-
-function TagEditor({ tags, onChange }: { tags: string[]; onChange: (tags: string[]) => void }) {
-  const [draft, setDraft] = useState("");
-
-  function add() {
-    // Commas aren't allowed in tags (the vault serializes them comma-separated).
-    const tag = draft.replace(/,/g, "").trim().toLowerCase();
-    setDraft("");
-    if (tag && !tags.includes(tag)) onChange([...tags, tag]);
-  }
-
-  return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      {tags.map((tag) => (
-        <span
-          key={tag}
-          className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] bg-accent-soft px-2 py-0.5 text-xs text-accent-text"
-        >
-          {tag}
-          <button
-            onClick={() => onChange(tags.filter((t) => t !== tag))}
-            className="text-ink4 hover:text-ink"
-            title="Remove tag"
-            aria-label={`Remove tag ${tag}`}
-          >
-            ×
-          </button>
-        </span>
-      ))}
-      <input
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === ",") {
-            e.preventDefault();
-            add();
-          }
-        }}
-        onBlur={add}
-        placeholder="add tag…"
-        className="w-24 bg-transparent px-1 py-0.5 text-xs text-ink2 outline-none placeholder:text-ink4"
-      />
-    </div>
   );
 }

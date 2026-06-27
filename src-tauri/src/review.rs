@@ -182,11 +182,12 @@ fn parse_proposal(raw: &str) -> Proposal {
     }
 }
 
-/// Keep only a valid importance level; anything else (incl. `null`) → `None`.
+/// Keep only a valid importance level; anything else (incl. `null`) → `None`. `archive` is a valid
+/// explicit level (a deliberately shelved document), distinct from `None`/untriaged.
 pub fn normalize_importance(value: Option<String>) -> Option<String> {
     value
         .map(|s| s.trim().to_lowercase())
-        .filter(|s| matches!(s.as_str(), "high" | "medium" | "low"))
+        .filter(|s| matches!(s.as_str(), "high" | "medium" | "low" | "archive"))
 }
 
 /// The substring from the first `{` to the last `}` — strips code fences / prose.
