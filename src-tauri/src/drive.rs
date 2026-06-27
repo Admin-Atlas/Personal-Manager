@@ -12,9 +12,16 @@
 //! hash), never the bytes — the body is fetched live on demand.
 //!
 //! **Multi-account.** Each connected Google account is its own [`connector_sources`] row (id
-//! `gdrive:<email>`), its own keychain token (`account_token_key`), and namespaces its item ids
-//! `gdrive:<email>:<fileId>` — so the foundation's `source_id LIKE 'gdrive:<email>:%'` fan-out flips a
-//! single account to `unreachable` on an auth failure without touching the others.
+//! `gdrive:<email>`), its own keychain token (`account_token_key`), and namespaces its **My Drive**
+//! item ids `gdrive:<email>:<fileId>` — so the foundation's `source_id LIKE 'gdrive:<email>:%'` fan-out
+//! flips a single account to `unreachable` on an auth failure without touching the others.
+//!
+//! **Shared (Team) drives are de-duplicated across accounts** (v19). Their files are the same whoever
+//! reaches them, so they're indexed ONCE under an account-independent id `gdrive:sd:<driveId>:<fileId>`
+//! by whichever account syncs the drive first (its "owner"). The `shared_drive_access` relation records
+//! which accounts can reach each drive and which one owns it; other accounts with access don't
+//! re-index it (the scope UI greys those out), and a drive's items only go `unreachable` once NO
+//! connected account can reach it.
 
 use std::path::PathBuf;
 
@@ -65,26 +72,40 @@ pub fn source_id_for(email: &str, file_id: &str) -> String {
     format!("gdrive:{email}:{file_id}")
 }
 
-/// The stable index-only `source_id` for a file in a **shared drive**:
-/// `gdrive:<email>:sd:<driveId>:<fileId>`. The `sd:<driveId>` segment namespaces shared-drive items
-/// so a sync can reconcile one shared drive in isolation (deletion-by-difference) without touching My
-/// Drive or other shared drives — while still living under the account's `gdrive:<email>:%` fan-out.
-pub fn shared_source_id(email: &str, drive_id: &str, file_id: &str) -> String {
-    format!("gdrive:{email}:sd:{drive_id}:{file_id}")
+/// The stable index-only `source_id` for a file in a **shared drive**: `gdrive:sd:<driveId>:<fileId>`.
+/// **Account-independent** (no email) — a shared drive's files are the same whichever account reaches
+/// them (Drive file ids are globally stable), so PM indexes them ONCE under this namespace rather than
+/// once per account (board card 4A dedup, v19). Which account owns/reconciles the drive lives in the
+/// `shared_drive_access` relation. The `sd:<driveId>` segment still isolates one drive for reconcile.
+pub fn shared_source_id(drive_id: &str, file_id: &str) -> String {
+    format!("gdrive:sd:{drive_id}:{file_id}")
 }
 
 /// The `source_id` prefix that matches every indexed item of one shared drive (for reconcile +
-/// per-drive cleanup): `gdrive:<email>:sd:<driveId>:`.
-fn shared_prefix(email: &str, drive_id: &str) -> String {
-    format!("gdrive:{email}:sd:{drive_id}:")
+/// per-drive cleanup): `gdrive:sd:<driveId>:`.
+fn shared_prefix(drive_id: &str) -> String {
+    format!("gdrive:sd:{drive_id}:")
 }
 
-/// Recover the account email from any Drive source id. Both shapes start `gdrive:<email>:…`, and an
-/// email carries no `:`, so the **first** `:` after the prefix splits the email off cleanly —
-/// covering `gdrive:<email>:<fileId>` and `gdrive:<email>:sd:<driveId>:<fileId>` alike.
+/// Recover the account email from a **My Drive** source id (`gdrive:<email>:<fileId>`). Shared-drive
+/// ids are account-independent (`gdrive:sd:<driveId>:<fileId>`), so they have no owning account here —
+/// [`token_key_for_source`] resolves an account that can reach them instead. An email carries no `:`,
+/// so the first `:` after the prefix splits it off.
 pub fn account_of(source_id: &str) -> Option<String> {
     let rest = source_id.strip_prefix("gdrive:")?;
+    if rest.starts_with("sd:") {
+        return None; // a shared-drive id — no single owning account in the id itself
+    }
     rest.split_once(':').map(|(email, _)| email.to_string())
+}
+
+/// The shared drive id embedded in a shared-drive source id (`gdrive:sd:<driveId>:<fileId>`), or None
+/// for a My Drive / non-Drive id.
+pub fn shared_drive_of(source_id: &str) -> Option<String> {
+    source_id
+        .strip_prefix("gdrive:sd:")?
+        .split_once(':')
+        .map(|(drive_id, _)| drive_id.to_string())
 }
 
 // --- account registry (connector_sources rows for provider=google service=drive) ----------------
@@ -131,10 +152,17 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<DriveAccount>> {
     let mut out = Vec::with_capacity(rows.len());
     for (id, email, label, last_synced_at, state) in rows {
         let email = email.unwrap_or_default();
+        // This account's My Drive items, plus the shared-drive items of any drive it OWNS (shared
+        // drives are account-independent and indexed once by their owner — a non-owner counts only
+        // its own My Drive).
         let indexed: i64 = conn
             .query_row(
-                "SELECT count(*) FROM documents \
-                 WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%'",
+                "SELECT count(*) FROM documents d \
+                 WHERE d.source_type = 'index_only' AND ( \
+                     d.source_id LIKE ?1 || ':%' \
+                     OR EXISTS (SELECT 1 FROM shared_drive_access a \
+                                WHERE a.account_id = ?1 AND a.is_owner = 1 \
+                                  AND d.source_id LIKE 'gdrive:sd:' || a.drive_id || ':%') )",
                 params![account_id(&email)],
                 |r| r.get(0),
             )
@@ -242,18 +270,136 @@ pub fn set_state(conn: &Connection, email: &str, state: &str) -> Result<()> {
 
 /// Disconnect one account: soft-flag its items `unreachable` (kept findable), drop the registry row,
 /// and forget its token. Never hard-deletes the indexed documents.
+///
+/// **My Drive** items (`gdrive:<email>:%`) belong to this account, so they're flagged outright.
+/// **Shared-drive** items are account-independent and may still be reachable by another connected
+/// account — so they're only flagged once NO remaining account can reach the drive. The registry row
+/// is dropped *between* the two so the cascade clears this account's `shared_drive_access` rows first
+/// (leaving any still-reachable drive owner-less, to be re-claimed on another account's next sync).
 pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
+    let account = account_id(email);
     conn.execute(
         "UPDATE documents SET source_state = 'unreachable' \
          WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%'",
-        params![account_id(email)],
+        params![account],
     )?;
+    // Shared drives this account could reach — captured before the cascade removes its access rows.
+    let drives: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT drive_id FROM shared_drive_access WHERE account_id = ?1")?;
+        let rows: Vec<String> = stmt
+            .query_map(params![account], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
     conn.execute(
         "DELETE FROM connector_sources WHERE id = ?1",
-        params![account_id(email)],
+        params![account],
     )?;
+    for drive_id in drives {
+        soft_flag_orphaned_shared_drive(conn, &drive_id)?;
+    }
     secrets::clear_google_token_for(&account_token_key(email)).ok();
     Ok(())
+}
+
+/// If NO connected account can still reach shared drive `drive_id`, soft-flag its items `unreachable`
+/// (kept findable, never deleted). A no-op while any account retains access — that account (re)claims
+/// ownership and keeps the drive indexed.
+fn soft_flag_orphaned_shared_drive(conn: &Connection, drive_id: &str) -> Result<()> {
+    let still_reachable: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM shared_drive_access WHERE drive_id = ?1)",
+        params![drive_id],
+        |r| r.get(0),
+    )?;
+    if !still_reachable {
+        conn.execute(
+            "UPDATE documents SET source_state = 'unreachable' \
+             WHERE source_type = 'index_only' AND source_id LIKE ?1 || '%'",
+            params![shared_prefix(drive_id)],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record that `email` can reach shared drive `drive_id` (caching `name` for the UI), and decide
+/// whether THIS account should index it. The first account to sync a drive claims ownership and
+/// indexes it; later accounts with access don't re-index (the scope UI greys those out). Returns true
+/// iff this account owns the drive — i.e. the caller should gather + reconcile it this pass.
+pub fn claim_or_skip_shared_drive(
+    conn: &Connection,
+    email: &str,
+    drive_id: &str,
+    name: &str,
+) -> Result<bool> {
+    let account = account_id(email);
+    conn.execute(
+        "INSERT INTO shared_drive_access(drive_id, account_id, name) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(drive_id, account_id) DO UPDATE SET name = excluded.name",
+        params![drive_id, account, name],
+    )?;
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT account_id FROM shared_drive_access WHERE drive_id = ?1 AND is_owner = 1",
+            params![drive_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match owner {
+        Some(o) if o == account => Ok(true),
+        Some(_) => Ok(false), // already owned + indexed by another account
+        None => {
+            conn.execute(
+                "UPDATE shared_drive_access SET is_owner = 1 \
+                 WHERE drive_id = ?1 AND account_id = ?2",
+                params![drive_id, account],
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+/// Shared drives already owned (indexed) by a DIFFERENT account → `driveId → owner email`. The scope
+/// picker greys these out for `email` with a "synced by <owner>" note instead of re-indexing them.
+pub fn shared_drive_owners_elsewhere(
+    conn: &Connection,
+    email: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let me = account_id(email);
+    let mut stmt = conn.prepare(
+        "SELECT drive_id, account_id FROM shared_drive_access WHERE is_owner = 1 AND account_id != ?1",
+    )?;
+    let rows = stmt.query_map(params![me], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (drive_id, owner_account) = row?;
+        let owner_email = owner_account
+            .strip_prefix("gdrive:")
+            .unwrap_or(&owner_account)
+            .to_string();
+        map.insert(drive_id, owner_email);
+    }
+    Ok(map)
+}
+
+/// The token key of an account that can reach the source behind `source_id`, for an on-demand body
+/// fetch. A **My Drive** id names its account directly. A **shared-drive** id is account-independent,
+/// so this resolves an account with access (preferring the owner) from `shared_drive_access`.
+pub fn token_key_for_source(conn: &Connection, source_id: &str) -> Result<Option<String>> {
+    if let Some(drive_id) = shared_drive_of(source_id) {
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT account_id FROM shared_drive_access WHERE drive_id = ?1 \
+                 ORDER BY is_owner DESC LIMIT 1",
+                params![drive_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        return Ok(owner.and_then(|a| a.strip_prefix("gdrive:").map(account_token_key)));
+    }
+    Ok(account_of(source_id).map(|email| account_token_key(&email)))
 }
 
 /// Forget every Drive account — used when the shared Google client credentials are cleared (they all
@@ -403,6 +549,30 @@ pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<(
         "UPDATE connector_sources SET folder_ids = ?2, cursor = ?3 WHERE id = ?1",
         params![account_id(email), json, cursor_json],
     )?;
+    // Reconcile shared-drive access to the new scope: this account keeps access only to the shared
+    // drives still in scope. Any it dropped is released — freeing its ownership for another account to
+    // re-claim on that account's next sync, and soft-flagging the drive's items if no account can
+    // reach it any more (the same orphan rule as disconnect).
+    let keep: std::collections::HashSet<&str> =
+        scope.shared.iter().map(|s| s.drive_id.as_str()).collect();
+    let had: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT drive_id FROM shared_drive_access WHERE account_id = ?1")?;
+        let rows: Vec<String> = stmt
+            .query_map(params![account_id(email)], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
+    for drive_id in had {
+        if keep.contains(drive_id.as_str()) {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM shared_drive_access WHERE drive_id = ?1 AND account_id = ?2",
+            params![drive_id, account_id(email)],
+        )?;
+        soft_flag_orphaned_shared_drive(conn, &drive_id)?;
+    }
     Ok(())
 }
 
@@ -411,18 +581,14 @@ pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<(
 /// `Update` (catches edits, no-ops otherwise); a present id NOT in it gets an `Add` (ingests a new
 /// file, or reactivates one that was previously flagged missing/unreachable — e.g. a folder the user
 /// removed and re-added); an id in this set that is no longer present is a deletion.
-pub fn known_shared_source_ids(
-    conn: &Connection,
-    email: &str,
-    drive_id: &str,
-) -> Result<Vec<String>> {
+pub fn known_shared_source_ids(conn: &Connection, drive_id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT source_id FROM documents \
          WHERE source_type = 'index_only' AND source_state = 'ok' \
            AND source_id LIKE ?1 || '%'",
     )?;
     let rows: Vec<String> = stmt
-        .query_map(params![shared_prefix(email, drive_id)], |r| r.get(0))?
+        .query_map(params![shared_prefix(drive_id)], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     Ok(rows)
 }
@@ -661,18 +827,9 @@ pub fn map_change(change: &DriveChange, email: &str, known: bool) -> Option<Chan
     change_event(source_id_for(email, &change.file_id), change, known)
 }
 
-/// Map a **shared-drive** change (the `gdrive:<email>:sd:<driveId>:<fileId>` namespace).
-pub fn map_shared_change(
-    change: &DriveChange,
-    email: &str,
-    drive_id: &str,
-    known: bool,
-) -> Option<ChangeEvent> {
-    change_event(
-        shared_source_id(email, drive_id, &change.file_id),
-        change,
-        known,
-    )
+/// Map a **shared-drive** change (the account-independent `gdrive:sd:<driveId>:<fileId>` namespace).
+pub fn map_shared_change(change: &DriveChange, drive_id: &str, known: bool) -> Option<ChangeEvent> {
+    change_event(shared_source_id(drive_id, &change.file_id), change, known)
 }
 
 /// How to turn a Drive file's bytes into indexable text, decided purely by its MIME type.
@@ -1219,18 +1376,22 @@ mod tests {
     }
 
     #[test]
-    fn shared_source_ids_namespace_per_drive_and_still_resolve_the_account() {
-        let sid = shared_source_id("a@b.com", "0ADrive", "FILE123");
-        assert_eq!(sid, "gdrive:a@b.com:sd:0ADrive:FILE123");
-        // Lives under the account fan-out (so an auth failure flips it with the rest)…
-        assert!(sid.starts_with("gdrive:a@b.com:"));
-        // …and under its own per-drive prefix (so reconcile can isolate one shared drive).
-        assert!(sid.starts_with(&shared_prefix("a@b.com", "0ADrive")));
-        assert!(!sid.starts_with(&shared_prefix("a@b.com", "0BOther")));
-        // The first-colon split recovers the email from BOTH the My-Drive and shared shapes.
-        assert_eq!(account_of(&sid).as_deref(), Some("a@b.com"));
-        // A My-Drive file is not mistaken for a shared one.
-        assert!(!source_id_for("a@b.com", "FILE123").starts_with(&shared_prefix("a@b.com", "X")));
+    fn shared_source_ids_are_account_independent_and_namespace_per_drive() {
+        // Shared-drive ids carry NO account (dedup, v19) — the same id whoever reaches the drive.
+        let sid = shared_source_id("0ADrive", "FILE123");
+        assert_eq!(sid, "gdrive:sd:0ADrive:FILE123");
+        // Under its own per-drive prefix (so reconcile can isolate one shared drive)…
+        assert!(sid.starts_with(&shared_prefix("0ADrive")));
+        assert!(!sid.starts_with(&shared_prefix("0BOther")));
+        // …with no owning account in the id itself (resolved via shared_drive_access instead)…
+        assert_eq!(account_of(&sid), None);
+        // …and the drive id is recoverable for access lookups.
+        assert_eq!(shared_drive_of(&sid).as_deref(), Some("0ADrive"));
+        assert_eq!(shared_drive_of("gdrive:a@b.com:FILE123"), None);
+        // A My-Drive id still resolves to its account and isn't mistaken for a shared one.
+        let my = source_id_for("a@b.com", "FILE123");
+        assert_eq!(account_of(&my).as_deref(), Some("a@b.com"));
+        assert!(!my.starts_with(&shared_prefix("0ADrive")));
     }
 
     #[test]

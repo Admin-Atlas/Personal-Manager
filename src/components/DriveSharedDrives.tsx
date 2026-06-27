@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getDriveScope, listDriveFolders, listDriveSharedDrives, setDriveScope } from "../lib/ipc";
+import {
+  driveSharedOwners,
+  getDriveScope,
+  listDriveFolders,
+  listDriveSharedDrives,
+  setDriveScope,
+} from "../lib/ipc";
 import type { DriveFolder, DriveScope, SharedDrive, SharedSelection } from "../lib/types";
 import { SegmentedControl } from "./ui";
 
@@ -23,6 +29,9 @@ const MY_DRIVE_ROOT = "root";
 export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved: () => void }) {
   const [scope, setScope] = useState<DriveScope | null>(null);
   const [drives, setDrives] = useState<SharedDrive[] | null>(null);
+  // Shared drives already indexed by another connected account → owner email. Those rows are greyed
+  // out: shared drives are de-duplicated, so only their owner indexes them (this account just shares).
+  const [owners, setOwners] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -35,9 +44,14 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
     setLoading(true);
     setError(null);
     try {
-      const [sc, dr] = await Promise.all([getDriveScope(email), listDriveSharedDrives(email)]);
+      const [sc, dr, ow] = await Promise.all([
+        getDriveScope(email),
+        listDriveSharedDrives(email),
+        driveSharedOwners(email),
+      ]);
       setScope(sc);
       setDrives(dr);
+      setOwners(ow);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -177,6 +191,23 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
             {drives?.map((d) => {
               const sel = selectionFor(d.id);
               const whole = sel != null && sel.folders == null;
+              // Already indexed by another connected account → greyed out (de-duplicated: only the
+              // owner indexes a shared drive; this account would index the very same files).
+              const ownedBy = owners[d.id];
+              if (ownedBy) {
+                return (
+                  <li key={d.id} className="py-2 first:pt-0 last:pb-0 opacity-60">
+                    <div className="flex items-center gap-2 text-xs">
+                      <input type="checkbox" checked disabled className="cursor-not-allowed" />
+                      <span className="truncate text-ink3">{d.name}</span>
+                    </div>
+                    <p className="mt-0.5 pl-5 text-[11px] text-ink4">
+                      Already synced by <span className="text-ink3">{ownedBy}</span> — shared drives
+                      are indexed once across your accounts.
+                    </p>
+                  </li>
+                );
+              }
               return (
                 <li key={d.id} className="py-2 first:pt-0 last:pb-0">
                   <label className="flex items-center gap-2 text-xs">

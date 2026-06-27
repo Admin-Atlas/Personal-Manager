@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.33.0-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "Shared (Team) drives are now indexed just once across your Google accounts. If two connected accounts can both see the same shared drive, PM no longer indexes it twice — whichever account syncs it first “owns” it, and that drive shows up greyed out (“Already synced by …”) when you expand your other accounts. Disconnect the owning account and another account with access automatically takes it over on its next sync; a shared drive's files only become “source unreachable” once no connected account can reach it.",
+      "Upgrade note: your existing shared-drive items are rebuilt under the new shared index on the next sync (they're index-only pointers and summaries, so nothing real is lost). Press “Sync now” to refresh them.",
+    ],
+  },
+  {
     version: "2.31.0-alpha",
     date: "2026-06-27",
     highlights: [

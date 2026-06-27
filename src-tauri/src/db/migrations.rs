@@ -508,6 +508,48 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_calendar_events_entity   ON calendar_events(entity_id);
     CREATE INDEX idx_calendar_events_calendar ON calendar_events(calendar_id);
     "#,
+    // v19: shared-drive deduplication across Google accounts (board card 4A follow-up).
+    //
+    // Shared (Team) drives were indexed PER ACCOUNT — source_id `gdrive:<email>:sd:<driveId>:<fileId>`
+    // — so the same Team Drive reachable from two connected accounts was indexed twice. Drive file ids
+    // are globally stable, so a shared drive's files now live ACCOUNT-INDEPENDENTLY under
+    // `gdrive:sd:<driveId>:<fileId>` and are indexed once: by whichever account syncs the drive first
+    // (its "owner"); other accounts with access don't re-index it (the scope UI greys those out).
+    //
+    // `shared_drive_access` is the access relation — one row per (drive, account) recording who can
+    // reach each shared drive, and which one owns its index. `account_id` FKs the registry with
+    // ON DELETE CASCADE, so disconnecting an account drops its access rows (the connector then
+    // soft-flags any drive no remaining account can reach).
+    //
+    // Rebuild on next sync: drop the existing per-account shared-drive documents (+ their chunks / fts
+    // / vec rows) so the next sync re-creates them once under the new namespace — they're index-only
+    // (pointers + summaries, never file bytes) and a first sync re-enumerates anyway, so nothing real
+    // is lost. Clearing every Drive account's delta cursor forces that re-baseline (My Drive
+    // re-enumerates too, reconciling its unchanged items as no-op Updates — no duplicates).
+    r#"
+    CREATE TABLE shared_drive_access (
+        drive_id   TEXT NOT NULL,
+        account_id TEXT NOT NULL REFERENCES connector_sources(id) ON DELETE CASCADE,
+        is_owner   INTEGER NOT NULL DEFAULT 0,   -- the one account whose sync indexes + reconciles this drive
+        name       TEXT,                          -- cached drive display name (for the "synced by X" UI)
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (drive_id, account_id)
+    );
+    CREATE INDEX idx_shared_drive_access_drive   ON shared_drive_access(drive_id);
+    CREATE INDEX idx_shared_drive_access_account ON shared_drive_access(account_id);
+
+    DELETE FROM chunk_vec  WHERE rowid IN (
+        SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id
+        WHERE d.source_type = 'index_only' AND d.source_id LIKE 'gdrive:%:sd:%');
+    DELETE FROM chunks_fts WHERE rowid IN (
+        SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id
+        WHERE d.source_type = 'index_only' AND d.source_id LIKE 'gdrive:%:sd:%');
+    DELETE FROM chunks WHERE document_id IN (
+        SELECT id FROM documents WHERE source_type = 'index_only' AND source_id LIKE 'gdrive:%:sd:%');
+    DELETE FROM documents WHERE source_type = 'index_only' AND source_id LIKE 'gdrive:%:sd:%';
+
+    UPDATE connector_sources SET cursor = NULL WHERE provider = 'google' AND service = 'drive';
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -557,10 +599,10 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 18,
+            version, 19,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
-             multi-provider calendar foundation is v18)"
+             multi-provider calendar foundation is v18; shared-drive access relation is v19)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
