@@ -168,12 +168,12 @@ export function SharedDrivesManager({
         {drives && drives.length === 0 ? (
           <p className="mt-1 text-xs text-ink4">No shared drives are available on this account.</p>
         ) : (
-          <ul className="mt-2 space-y-2">
+          <ul className="mt-2 divide-y divide-rule">
             {drives?.map((d) => {
               const sel = selectionFor(d.id);
               const whole = sel != null && sel.folders == null;
               return (
-                <li key={d.id} className="rounded-[var(--radius)] border border-border p-2">
+                <li key={d.id} className="py-2 first:pt-0 last:pb-0">
                   <label className="flex items-center gap-2 text-xs">
                     <input
                       type="checkbox"
@@ -237,7 +237,7 @@ function FolderPicker({
   onToggle: (folderId: string, checked: boolean) => void;
 }) {
   return (
-    <div className="mt-2 max-h-56 overflow-auto rounded-[var(--radius)] border border-border p-1">
+    <div className="mt-2 max-h-56 overflow-auto rounded-[var(--radius)] bg-surface p-1">
       <FolderChildren
         email={email}
         driveId={driveId}

@@ -122,7 +122,7 @@ function FolderPicker({
   onToggle: (folderId: string, checked: boolean) => void;
 }) {
   return (
-    <div className="mt-1 max-h-56 overflow-auto rounded-[var(--radius)] border border-border p-1">
+    <div className="mt-1 max-h-56 overflow-auto rounded-[var(--radius)] bg-surface p-1">
       <FolderChildren
         email={email}
         parentId={null}

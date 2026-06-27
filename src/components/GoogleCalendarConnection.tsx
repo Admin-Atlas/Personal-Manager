@@ -119,6 +119,9 @@ export function GoogleCalendarConnection({ refreshSignal = 0 }: { refreshSignal?
   // A connected account can still fail because the Calendar API isn't enabled in the user's Cloud
   // project — surface that as an actionable enable-link rather than a raw 403 wall of text.
   const apiDisabled = calendarApiDisabled(error);
+  // The signed-in Google account, so people with several accounts can tell which one this is. No
+  // extra call needed: Google sets the **primary** calendar's id to the account's email address.
+  const linkedEmail = calendars?.find((c) => c.primary)?.id ?? null;
 
   return (
     <div data-help="settings-calendar">
@@ -162,6 +165,14 @@ export function GoogleCalendarConnection({ refreshSignal = 0 }: { refreshSignal?
               Disconnect
             </Button>
           </div>
+          <p className="text-xs text-ink4">
+            {linkedEmail && (
+              <>
+                Signed in as <span className="text-ink2">{linkedEmail}</span>.{" "}
+              </>
+            )}
+            Choose which calendars to sync:
+          </p>
           {calendars == null ? (
             <div className="flex flex-col gap-1.5 py-1">
               {Array.from({ length: 3 }).map((_, i) => (

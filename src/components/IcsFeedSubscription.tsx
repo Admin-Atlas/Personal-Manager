@@ -91,9 +91,10 @@ export function IcsFeedSubscription() {
         </span>
       </div>
       <p className="mt-1 text-xs text-ink4">
-        Paste a calendar’s private “secret address in iCal format”. No OAuth — works even with
-        Advanced Protection. Read-only; powers your agenda, schedule questions in chat, and the “Due
-        soon” status when an event names a project.
+        Paste a calendar’s private iCal/ICS link — from <span className="text-ink2">Google</span>,{" "}
+        <span className="text-ink2">Outlook</span>, <span className="text-ink2">Apple</span>, or any
+        provider. No OAuth — works even with Advanced Protection. Read-only; powers your agenda,
+        schedule questions in chat, and the “Due soon” status when an event names a project.
       </p>
       <button
         onClick={() => setShowGuide((s) => !s)}
@@ -136,7 +137,7 @@ export function IcsFeedSubscription() {
           autoComplete="off"
           value={feedUrl}
           onChange={(e) => setFeedUrl(e.target.value)}
-          placeholder="https://calendar.google.com/calendar/ical/…/basic.ics"
+          placeholder="Paste the calendar’s iCal/ICS URL (https://…)"
         />
         <Button
           onClick={addFeed}
@@ -193,32 +194,97 @@ export function IcsFeedSubscription() {
   );
 }
 
-/** How to find a Google Calendar's private iCal address. */
+/** How to find a calendar's private iCal/ICS address across the common providers. One borderless
+ *  panel (no nested box) with a short section per provider. */
 function FeedGuide() {
+  const link = "text-accent-text underline hover:brightness-110";
   return (
-    <ol className="mt-2 space-y-1 rounded-[var(--radius)] border border-border bg-surface px-3 py-2 text-xs text-ink3">
-      <li>
-        1. Open{" "}
-        <a
-          href="https://calendar.google.com/"
-          target="_blank"
-          rel="noreferrer"
-          className="text-accent-text underline hover:brightness-110"
-        >
-          Google Calendar
-        </a>{" "}
-        on the web.
-      </li>
-      <li>
-        2. Hover the calendar in the left list → ⋮ →{" "}
-        <span className="text-ink2">Settings and sharing</span>.
-      </li>
-      <li>
-        3. Scroll to <span className="text-ink2">Integrate calendar</span> → copy the{" "}
-        <span className="text-ink2">Secret address in iCal format</span>.
-      </li>
-      <li>4. Paste it below. (Keep it private — anyone with the link can read that calendar.)</li>
-    </ol>
+    <div className="mt-2 space-y-2.5 rounded-[var(--radius)] bg-surface px-3 py-2 text-xs text-ink3">
+      <p className="text-ink4">
+        Find the calendar’s private link below, then paste it in. Keep it private — anyone with the
+        link can read that calendar.
+      </p>
+
+      <div>
+        <div className="font-medium text-ink2">Google Calendar</div>
+        <ol className="mt-1 space-y-0.5">
+          <li>
+            1. Open{" "}
+            <a
+              href="https://calendar.google.com/"
+              target="_blank"
+              rel="noreferrer"
+              className={link}
+            >
+              Google Calendar
+            </a>{" "}
+            on the web.
+          </li>
+          <li>
+            2. Hover the calendar in the left list → ⋮ →{" "}
+            <span className="text-ink2">Settings and sharing</span>.
+          </li>
+          <li>
+            3. Under <span className="text-ink2">Integrate calendar</span>, copy the{" "}
+            <span className="text-ink2">Secret address in iCal format</span>.
+          </li>
+        </ol>
+      </div>
+
+      <div>
+        <div className="font-medium text-ink2">Outlook (outlook.com / Microsoft 365)</div>
+        <ol className="mt-1 space-y-0.5">
+          <li>
+            1. Open{" "}
+            <a
+              href="https://outlook.office.com/calendar/"
+              target="_blank"
+              rel="noreferrer"
+              className={link}
+            >
+              Outlook Calendar
+            </a>{" "}
+            on the web → <span className="text-ink2">Settings</span> (gear) →{" "}
+            <span className="text-ink2">Calendar → Shared calendars</span>.
+          </li>
+          <li>
+            2. Under <span className="text-ink2">Publish a calendar</span>, pick the calendar and{" "}
+            <span className="text-ink2">Can view all details</span>, then{" "}
+            <span className="text-ink2">Publish</span>.
+          </li>
+          <li>
+            3. Copy the <span className="text-ink2">ICS</span> link (not the HTML one).
+          </li>
+        </ol>
+      </div>
+
+      <div>
+        <div className="font-medium text-ink2">Apple iCloud</div>
+        <ol className="mt-1 space-y-0.5">
+          <li>
+            1. Open{" "}
+            <a
+              href="https://www.icloud.com/calendar/"
+              target="_blank"
+              rel="noreferrer"
+              className={link}
+            >
+              iCloud Calendar
+            </a>{" "}
+            on the web (or the Calendar app on Mac).
+          </li>
+          <li>
+            2. Click the share icon next to the calendar → turn on{" "}
+            <span className="text-ink2">Public Calendar</span>.
+          </li>
+          <li>
+            3. <span className="text-ink2">Copy Link</span>. If it starts with{" "}
+            <span className="font-mono text-[11px] text-ink2">webcal://</span>, change it to{" "}
+            <span className="font-mono text-[11px] text-ink2">https://</span>.
+          </li>
+        </ol>
+      </div>
+    </div>
   );
 }
 
