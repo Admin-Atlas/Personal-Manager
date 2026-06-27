@@ -23,6 +23,7 @@ mod microsoft;
 mod model_gateway;
 mod onedrive;
 mod openrouter;
+mod outlook_calendar;
 mod paths;
 mod preferences;
 mod projects;
@@ -559,6 +560,12 @@ pub fn run() {
             commands::set_project_metadata,
             commands::propose_project_metadata,
             commands::calendar_status,
+            commands::calendar_overview,
+            commands::set_calendar_selected,
+            commands::connect_google_calendar_account,
+            commands::disconnect_google_calendar_account,
+            commands::connect_outlook_calendar,
+            commands::disconnect_outlook_calendar,
             commands::list_ics_feeds,
             commands::add_ics_feed,
             commands::remove_ics_feed,

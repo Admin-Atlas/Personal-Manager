@@ -21,7 +21,8 @@ use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
     applock, briefing, clock, cost, db, drive, entities, index_only, lock_session, microsoft,
-    onedrive, openrouter, paths, preferences, recommend, secrets, vault, AppState, VaultRuntime,
+    onedrive, openrouter, outlook_calendar, paths, preferences, recommend, secrets, vault,
+    AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -2011,40 +2012,177 @@ pub async fn propose_project_metadata(
     Ok(())
 }
 
-// --- personal assistant: calendar (Step 6) ---
+// --- personal assistant: calendar (multi-provider, read-only — cards 6A/6B) ---
+//
+// The calendar surface is multi-PROVIDER and multi-ACCOUNT: Google (OAuth, per-account), Outlook
+// (Microsoft Graph OAuth, per-account), and Apple/any iCal subscription all flow into one normalised
+// account → calendar → event model (see `crate::calendar`). The new `calendar_overview`,
+// per-provider connect/disconnect, and `set_calendar_selected` commands drive it; the older
+// single-account commands further down are thin back-compat wrappers over the same model, kept
+// working until the Settings UI is rewired (PR2).
 
-/// The calendar connector's state, for the Settings panel. Covers both paths: the
-/// simple .ics feeds and the advanced Google OAuth sign-in.
+/// The per-account Google Calendar keychain token key (`google_oauth_token_calendar::<email>`).
+fn google_calendar_token_key(email: &str) -> String {
+    format!("{}{}", secrets::GOOGLE_TOKEN_CALENDAR_PREFIX, email)
+}
+
+/// Everything the Connectors → Calendar UI needs in one read: which provider clients are configured,
+/// every connected account/subscription, and every registered calendar (with its selection).
 #[derive(Serialize)]
-pub struct CalendarStatus {
-    /// How many .ics feeds are subscribed (the no-OAuth path).
-    pub ics_feeds: usize,
-    /// The user has pasted a Google client id + secret.
-    pub oauth_client_configured: bool,
-    /// A Google OAuth token is stored (sign-in completed).
-    pub oauth_connected: bool,
-    /// How many Google calendars are selected to sync.
-    pub calendars_selected: usize,
-    /// ISO timestamp of the last successful sync, if any.
+pub struct CalendarOverview {
+    pub google_client_configured: bool,
+    pub microsoft_client_configured: bool,
+    pub accounts: Vec<calendar::CalendarAccount>,
+    pub calendars: Vec<calendar::Calendar>,
     pub last_sync: Option<String>,
-    /// How far ahead PM mirrors events (and the agenda horizon), in days.
     pub window_days: i64,
 }
 
+/// The unified calendar state across every provider. Runs the one-time legacy Google migration first
+/// so an upgrading single-account user appears in the new model.
 #[tauri::command]
-pub fn calendar_status(state: State<'_, AppState>) -> Result<CalendarStatus> {
+pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
+    let _ = migrate_legacy_google_calendar(&app).await;
+    let state = app.state::<AppState>();
     let conn = state.conn()?;
-    Ok(CalendarStatus {
-        ics_feeds: calendar::load_feeds()?.len(),
-        oauth_client_configured: google::has_client()?,
-        oauth_connected: google::is_connected_for(google::CALENDAR_TOKEN_KEY)?,
-        calendars_selected: calendar::selected_calendar_ids(&conn)?.len(),
+    Ok(CalendarOverview {
+        google_client_configured: google::has_client()?,
+        microsoft_client_configured: microsoft::has_client()?,
+        accounts: calendar::list_sources(&conn, None)?,
+        calendars: calendar::list_calendars(&conn)?,
         last_sync: calendar::last_sync(&conn)?,
         window_days: calendar::AGENDA_DAYS,
     })
 }
 
-// .ics feeds — the no-OAuth path (works under Advanced Protection).
+/// Tick/untick one calendar (by its `calendars.id`) for syncing.
+#[tauri::command]
+pub fn set_calendar_selected(
+    state: State<'_, AppState>,
+    calendar_id: String,
+    selected: bool,
+) -> Result<()> {
+    let conn = state.conn()?;
+    calendar::set_calendar_selected(&conn, &calendar_id, selected)
+}
+
+// --- Google Calendar (OAuth, per-account) ---
+
+/// The core connect flow, shared by the new per-account command and the back-compat `connect_google`:
+/// run consent, learn the account from its primary calendar (id == email), store the token under that
+/// account's key, and register the account + its calendars (all selected by default).
+async fn do_connect_google_calendar(app: &AppHandle) -> Result<calendar::CalendarAccount> {
+    let token = google::run_consent(google::CALENDAR_SCOPE, "Google Calendar").await?;
+    let raw = calendar::fetch_calendar_list_with_token(&token).await?;
+    let email = raw
+        .iter()
+        .find(|c| c.primary)
+        .map(|c| c.id.clone())
+        .ok_or_else(|| {
+            Error::Other("Google didn't return a primary calendar to identify the account.".into())
+        })?;
+    let account = calendar::google_account_id(&email);
+    google::save_token(&google_calendar_token_key(&email), &token)?;
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
+    let inputs: Vec<_> = raw.iter().map(|c| c.to_input()).collect();
+    calendar::register_calendars(&conn, &account, "google", &inputs, |_| true)?;
+    calendar::list_sources(&conn, Some("google"))?
+        .into_iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| Error::Other("the account registration could not be read back".into()))
+}
+
+/// Connect a Google Calendar account (multi-account).
+#[tauri::command]
+pub async fn connect_google_calendar_account(app: AppHandle) -> Result<calendar::CalendarAccount> {
+    do_connect_google_calendar(&app).await
+}
+
+/// Disconnect one Google Calendar account: drop its registry source (cascading its calendars +
+/// mirrored events) and forget its token.
+#[tauri::command]
+pub fn disconnect_google_calendar_account(state: State<'_, AppState>, email: String) -> Result<()> {
+    let conn = state.conn()?;
+    calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
+    secrets::clear_google_token_for(&google_calendar_token_key(&email)).ok();
+    Ok(())
+}
+
+/// One-time, online: lift an existing single-account Google Calendar connection (the legacy fixed
+/// keychain token + the old `google_calendar_ids` selection) into the new multi-account model. Learns
+/// the account email from its primary calendar, re-keys the token to its per-account key, registers
+/// the `gcal:<email>` source + calendars (preserving the old selection), and deletes the legacy key.
+/// Idempotent + best-effort: a no-op once migrated, with no legacy token, or if the fetch fails (it
+/// retries next time). Never holds the DB lock across the fetch (rule #4).
+async fn migrate_legacy_google_calendar(app: &AppHandle) -> Result<()> {
+    if secrets::get_google_token_for(secrets::GOOGLE_TOKEN_CALENDAR)?.is_none() {
+        return Ok(());
+    }
+    // A Google calendar account already registered? Drop the redundant legacy key and stop.
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        if !calendar::list_sources(&conn, Some("google"))?.is_empty() {
+            secrets::clear_google_token_for(secrets::GOOGLE_TOKEN_CALENDAR).ok();
+            return Ok(());
+        }
+    }
+    let raw = calendar::fetch_calendar_list(secrets::GOOGLE_TOKEN_CALENDAR).await?;
+    let Some(email) = raw.iter().find(|c| c.primary).map(|c| c.id.clone()) else {
+        return Ok(()); // can't identify the account yet; try again next time
+    };
+    let account = calendar::google_account_id(&email);
+    if let Some(blob) = secrets::get_google_token_for(secrets::GOOGLE_TOKEN_CALENDAR)? {
+        secrets::set_google_token_for(&google_calendar_token_key(&email), blob.expose())?;
+    }
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let old_selection = calendar::selected_calendar_ids(&conn)?; // legacy remote ids
+        calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
+        let inputs: Vec<_> = raw.iter().map(|c| c.to_input()).collect();
+        calendar::register_calendars(&conn, &account, "google", &inputs, |it| {
+            old_selection.iter().any(|id| id == &it.remote_id)
+        })?;
+    }
+    secrets::clear_google_token_for(secrets::GOOGLE_TOKEN_CALENDAR).ok();
+    Ok(())
+}
+
+// --- Outlook Calendar (Microsoft Graph OAuth, per-account) ---
+
+/// Connect an Outlook / Microsoft 365 calendar account: consent (Graph `Calendars.Read`), learn the
+/// account via `/me`, store the token, and register the account + its calendars (all selected).
+#[tauri::command]
+pub async fn connect_outlook_calendar(app: AppHandle) -> Result<calendar::CalendarAccount> {
+    let token = microsoft::run_consent(microsoft::CALENDAR_SCOPE, "Outlook Calendar").await?;
+    let (email, name) = outlook_calendar::me_account(&token).await?;
+    let token_key = outlook_calendar::account_token_key(&email);
+    microsoft::save_token(&token_key, &token)?;
+    let raw = outlook_calendar::list_calendars(&token_key).await?;
+    let account = outlook_calendar::account_id(&email);
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    calendar::upsert_source(&conn, &account, "microsoft", Some(&email), &name)?;
+    calendar::register_calendars(&conn, &account, "microsoft", &raw, |_| true)?;
+    calendar::list_sources(&conn, Some("microsoft"))?
+        .into_iter()
+        .find(|a| a.id == account)
+        .ok_or_else(|| Error::Other("the account registration could not be read back".into()))
+}
+
+/// Disconnect one Outlook calendar account.
+#[tauri::command]
+pub fn disconnect_outlook_calendar(state: State<'_, AppState>, email: String) -> Result<()> {
+    let conn = state.conn()?;
+    calendar::remove_source(&conn, &outlook_calendar::account_id(&email))?;
+    secrets::clear_microsoft_token_for(&outlook_calendar::account_token_key(&email)).ok();
+    Ok(())
+}
+
+// --- iCal subscriptions — the no-OAuth path (works under Advanced Protection) ---
 
 /// Subscribed feeds without their secret URLs, for Settings.
 #[tauri::command]
@@ -2052,36 +2190,36 @@ pub fn list_ics_feeds() -> Result<Vec<IcsFeedInfo>> {
     calendar::feed_infos()
 }
 
-/// Add an .ics feed and sync it immediately so its events appear. If it can't be
-/// fetched/parsed, it's rolled back so a broken feed isn't left behind.
+/// Add an iCal subscription and sync it immediately. `provider` tags it (`apple`/`outlook`/`other`,
+/// defaulting to `other` when omitted). Persists nothing until the feed fetches cleanly, so a broken
+/// URL leaves nothing behind.
 #[tauri::command]
-pub async fn add_ics_feed(app: AppHandle, label: String, url: String) -> Result<()> {
-    let feed = calendar::add_feed(&label, &url)?;
-    // Resolve the user's zone (for floating/all-day ICS times) under a short lock,
-    // then drop it before the network sync (rule #4).
+pub async fn add_ics_feed(
+    app: AppHandle,
+    label: String,
+    url: String,
+    provider: Option<String>,
+) -> Result<()> {
+    let provider = provider.unwrap_or_else(|| "other".to_string());
+    let feed = calendar::build_feed(&label, &url, &provider)?;
+    // Resolve the user's zone (for floating/all-day ICS times) under a short lock, then drop it
+    // before the network sync (rule #4).
     let tz = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         resolve_zone(&conn)
     };
-    match calendar::sync_feed(&feed, tz).await {
-        Ok(events) => {
-            let state = app.state::<AppState>();
-            let conn = state.conn()?;
-            calendar::replace_events(&conn, &feed.id, &events)?;
-            calendar::set_last_sync(&conn)?;
-            Ok(())
-        }
-        Err(e) => {
-            let state = app.state::<AppState>();
-            let conn = state.conn()?;
-            let _ = calendar::remove_feed(&conn, &feed.id);
-            Err(e)
-        }
-    }
+    let events = calendar::sync_feed(&feed, tz).await?;
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    calendar::save_new_feed(&feed)?;
+    calendar::register_feed_source(&conn, &feed)?;
+    calendar::replace_events(&conn, &feed.id, &events)?;
+    calendar::set_last_sync(&conn)?;
+    Ok(())
 }
 
-/// Remove a feed and its mirrored events.
+/// Remove a feed, its registry rows, and its mirrored events.
 #[tauri::command]
 pub fn remove_ics_feed(state: State<'_, AppState>, id: String) -> Result<()> {
     let conn = state.conn()?;
@@ -2101,75 +2239,110 @@ pub fn set_google_client(client_id: String, client_secret: String) -> Result<()>
     secrets::set_google_client(id, secret)
 }
 
-/// Forget the client credentials (also disconnects + clears the mirror, since the
-/// token belongs to that client).
+/// Forget the Google client credentials. The client is shared by every Google service, so this
+/// invalidates them all: drop each Calendar account + every Drive account and the events/items they
+/// mirror (ICS/Outlook events, which don't depend on this client, are kept).
 #[tauri::command]
 pub fn clear_google_client(state: State<'_, AppState>) -> Result<()> {
-    // The provider client is shared by every Google service, so forgetting it invalidates them
-    // all: drop each service's token (calendar + every Drive account) and clear what each mirrors.
-    secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok();
     let conn = state.conn()?;
+    for acc in calendar::list_sources(&conn, Some("google"))? {
+        calendar::remove_source(&conn, &acc.id)?;
+        if let Some(email) = acc.email {
+            secrets::clear_google_token_for(&google_calendar_token_key(&email)).ok();
+        }
+    }
+    secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
     drive::forget_all_accounts(&conn).ok();
     secrets::clear_google_client()?;
-    calendar::clear_all_events(&conn)
+    // Drop events for the now-removed Google calendars; selected ICS/Outlook events are kept.
+    let active: Vec<String> = calendar::selected_calendars(&conn)?
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    calendar::prune_unselected(&conn, &active)
 }
 
-/// Run the OAuth consent flow (opens the system browser; resolves once the user
-/// signs in or it times out).
-#[tauri::command]
-pub async fn connect_google() -> Result<()> {
-    google::connect().await
-}
+// --- shared sync over every provider ---
 
-/// Sign out: forget the token and clear the mirrored events. Client credentials stay
-/// so the user can reconnect without re-entering them.
-#[tauri::command]
-pub fn disconnect_google(state: State<'_, AppState>) -> Result<()> {
-    secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY)?;
-    let conn = state.conn()?;
-    calendar::clear_all_events(&conn)
-}
-
-/// The user's calendars, with PM's current selection applied (for the picker).
-#[tauri::command]
-pub async fn list_google_calendars(app: AppHandle) -> Result<Vec<CalendarInfo>> {
-    let raw = calendar::fetch_calendar_list().await?;
+/// Pull events from a single selected calendar (provider-dispatched) and write them to the mirror.
+/// Returns the event count. Never holds the DB lock across the fetch (rule #4).
+async fn sync_one_calendar(
+    app: &AppHandle,
+    cal: &calendar::Calendar,
+    feed_by_id: &std::collections::HashMap<String, calendar::IcsFeed>,
+    time_min: &str,
+    time_max: &str,
+    tz: chrono_tz::Tz,
+) -> Result<usize> {
+    let events = match cal.provider.as_str() {
+        "google" => {
+            let email = calendar::account_email_of(&cal.source_id).ok_or_else(|| {
+                Error::Other(format!("bad calendar source id: {}", cal.source_id))
+            })?;
+            let remote = cal.remote_id.as_deref().unwrap_or(&cal.id);
+            calendar::fetch_events(
+                &google_calendar_token_key(&email),
+                &cal.id,
+                remote,
+                time_min,
+                time_max,
+            )
+            .await?
+        }
+        "microsoft" => {
+            let email = calendar::account_email_of(&cal.source_id).ok_or_else(|| {
+                Error::Other(format!("bad calendar source id: {}", cal.source_id))
+            })?;
+            let remote = cal.remote_id.as_deref().unwrap_or(&cal.id);
+            outlook_calendar::fetch_events(
+                &outlook_calendar::account_token_key(&email),
+                &cal.id,
+                remote,
+                time_min,
+                time_max,
+            )
+            .await?
+        }
+        // Any other provider is an iCal subscription (its source id is the feed id).
+        _ => {
+            let feed = feed_by_id.get(&cal.source_id).ok_or_else(|| {
+                Error::Other(format!(
+                    "calendar subscription {} has no stored URL",
+                    cal.source_id
+                ))
+            })?;
+            calendar::sync_feed(feed, tz).await?
+        }
+    };
+    let n = events.len();
     let state = app.state::<AppState>();
     let conn = state.conn()?;
-    let selected = calendar::selected_calendar_ids(&conn)?;
-    Ok(calendar::to_calendar_infos(raw, &selected))
+    calendar::replace_events(&conn, &cal.id, &events)?;
+    Ok(n)
 }
 
-/// Choose which calendars to sync.
-#[tauri::command]
-pub fn set_google_calendar_ids(state: State<'_, AppState>, ids: Vec<String>) -> Result<()> {
-    let conn = state.conn()?;
-    calendar::set_selected_calendar_ids(&conn, &ids)
-}
-
-/// Pull events from both sources (subscribed .ics feeds + selected Google calendars)
-/// into the local mirror. Returns the number of events synced. Best-effort per source
-/// and never holds the DB lock across a fetch (rule #4); surfaces an error only if
-/// every source failed (so a transient miss keeps the last-good events).
+/// Pull events from every selected calendar (all providers + ICS subscriptions) into the mirror.
+/// Returns the total events synced. Best-effort per source and never holds the DB lock across a fetch
+/// (rule #4); a source whose every calendar failed flips to `unreachable` while the rest keep their
+/// last-good events. Surfaces an error only if at least one source failed (the successes are committed).
 #[tauri::command]
 pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
-    let (oauth_ids, feeds, time_min, time_max, tz) = {
+    let _ = migrate_legacy_google_calendar(&app).await;
+
+    // Phase 1 (brief lock): snapshot what to sync.
+    let (calendars, feeds, (time_min, time_max), tz) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let oauth_ids = if google::is_connected_for(google::CALENDAR_TOKEN_KEY)? {
-            calendar::selected_calendar_ids(&conn)?
-        } else {
-            Vec::new()
-        };
-        let feeds = calendar::load_feeds()?;
-        let (min, max) = calendar::time_window(&conn)?;
-        (oauth_ids, feeds, min, max, resolve_zone(&conn))
+        (
+            calendar::selected_calendars(&conn)?,
+            calendar::load_feeds()?,
+            calendar::time_window(&conn)?,
+            resolve_zone(&conn),
+        )
     };
 
-    // Every calendar/feed we intend to keep events for — anything else is pruned.
-    let mut active: Vec<String> = oauth_ids.clone();
-    active.extend(feeds.iter().map(|f| f.id.clone()));
-
+    // The set of calendar ids we intend to keep events for — anything else is pruned.
+    let active: Vec<String> = calendars.iter().map(|c| c.id.clone()).collect();
     if active.is_empty() {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -2178,47 +2351,46 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         return Ok(0);
     }
 
+    let feed_by_id: std::collections::HashMap<String, calendar::IcsFeed> =
+        feeds.into_iter().map(|f| (f.id.clone(), f)).collect();
+
     let mut total = 0usize;
+    let mut ok_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_err: Option<Error> = None;
 
-    for id in &oauth_ids {
-        match calendar::fetch_events(id, &time_min, &time_max).await {
-            Ok(events) => {
-                let state = app.state::<AppState>();
-                let conn = state.conn()?;
-                calendar::replace_events(&conn, id, &events)?;
-                total += events.len();
+    for cal in &calendars {
+        match sync_one_calendar(&app, cal, &feed_by_id, &time_min, &time_max, tz).await {
+            Ok(n) => {
+                total += n;
+                ok_sources.insert(cal.source_id.clone());
             }
-            Err(e) => last_err = Some(e),
-        }
-    }
-    for feed in &feeds {
-        match calendar::sync_feed(feed, tz).await {
-            Ok(events) => {
-                let state = app.state::<AppState>();
-                let conn = state.conn()?;
-                calendar::replace_events(&conn, &feed.id, &events)?;
-                total += events.len();
+            Err(e) => {
+                failed_sources.insert(cal.source_id.clone());
+                last_err = Some(e);
             }
-            Err(e) => last_err = Some(e),
         }
     }
 
     {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        // Reconcile deselected calendars. A source that failed *this* round keeps
-        // its last-good events (standard cache behaviour) rather than being blanked.
+        // Reconcile deselected/removed calendars. A source that failed *this* round keeps its
+        // last-good events (standard cache behaviour) rather than being blanked.
         calendar::prune_unselected(&conn, &active)?;
-        // Only record a clean sync when every selected source refreshed — a partial
-        // failure must not hide behind a fresh "last synced" timestamp.
+        for acc in calendar::list_sources(&conn, None)? {
+            if ok_sources.contains(&acc.id) {
+                calendar::set_source_synced(&conn, &acc.id)?;
+            } else if failed_sources.contains(&acc.id) {
+                calendar::set_source_state(&conn, &acc.id, "unreachable")?;
+            }
+        }
+        // Only stamp a clean global sync when every selected source refreshed.
         if last_err.is_none() {
             calendar::set_last_sync(&conn)?;
         }
     }
 
-    // Surface any source failure (auth/expired, or a bad feed URL) even when other
-    // sources succeeded; the successful ones are already committed above.
     if let Some(e) = last_err {
         return Err(e);
     }
@@ -2230,6 +2402,95 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
 pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
     let conn = state.conn()?;
     calendar::list_upcoming(&conn, calendar::AGENDA_DAYS)
+}
+
+// --- back-compat: the single-account Google calendar commands (over the new model) ---
+//
+// The current Settings UI still calls these; they're thin wrappers retired when the UI is rewired
+// (PR2). `CalendarStatus` keeps its old shape so the existing component compiles unchanged.
+
+/// The calendar connector's state, for the legacy Settings panel.
+#[derive(Serialize)]
+pub struct CalendarStatus {
+    pub ics_feeds: usize,
+    pub oauth_client_configured: bool,
+    pub oauth_connected: bool,
+    pub calendars_selected: usize,
+    pub last_sync: Option<String>,
+    pub window_days: i64,
+}
+
+#[tauri::command]
+pub fn calendar_status(state: State<'_, AppState>) -> Result<CalendarStatus> {
+    let conn = state.conn()?;
+    let google_accounts = calendar::list_sources(&conn, Some("google"))?;
+    let calendars_selected = calendar::list_calendars(&conn)?
+        .into_iter()
+        .filter(|c| c.provider == "google" && c.selected)
+        .count();
+    Ok(CalendarStatus {
+        ics_feeds: calendar::load_feeds()?.len(),
+        oauth_client_configured: google::has_client()?,
+        // "Connected" if any Google account is registered, or a not-yet-migrated legacy token exists.
+        oauth_connected: !google_accounts.is_empty()
+            || google::is_connected_for(google::CALENDAR_TOKEN_KEY)?,
+        calendars_selected,
+        last_sync: calendar::last_sync(&conn)?,
+        window_days: calendar::AGENDA_DAYS,
+    })
+}
+
+/// Back-compat: connect one Google Calendar account into the new model.
+#[tauri::command]
+pub async fn connect_google(app: AppHandle) -> Result<()> {
+    do_connect_google_calendar(&app).await.map(|_| ())
+}
+
+/// Back-compat: disconnect every Google Calendar account (+ any leftover legacy token/events).
+#[tauri::command]
+pub fn disconnect_google(state: State<'_, AppState>) -> Result<()> {
+    let conn = state.conn()?;
+    for acc in calendar::list_sources(&conn, Some("google"))? {
+        calendar::remove_source(&conn, &acc.id)?;
+        if let Some(email) = acc.email {
+            secrets::clear_google_token_for(&google_calendar_token_key(&email)).ok();
+        }
+    }
+    secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok();
+    // Drop leftover events for calendars no longer present/selected (incl. pre-migration Google rows).
+    let active: Vec<String> = calendar::selected_calendars(&conn)?
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    calendar::prune_unselected(&conn, &active)
+}
+
+/// Back-compat: the connected Google account's calendars (id == the provider's own id, so the legacy
+/// "primary id == account email" mapping holds).
+#[tauri::command]
+pub async fn list_google_calendars(app: AppHandle) -> Result<Vec<CalendarInfo>> {
+    let _ = migrate_legacy_google_calendar(&app).await;
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    calendar::calendar_infos_for_provider(&conn, "google")
+}
+
+/// Back-compat: choose which Google calendars sync, by their provider calendar ids (`remote_id`).
+#[tauri::command]
+pub fn set_google_calendar_ids(state: State<'_, AppState>, ids: Vec<String>) -> Result<()> {
+    let conn = state.conn()?;
+    for cal in calendar::list_calendars(&conn)?
+        .into_iter()
+        .filter(|c| c.provider == "google")
+    {
+        let on = cal
+            .remote_id
+            .as_deref()
+            .is_some_and(|r| ids.iter().any(|id| id == r));
+        calendar::set_calendar_selected(&conn, &cal.id, on)?;
+    }
+    // Keep the legacy selection setting consistent (read by the migration on a fresh device).
+    calendar::set_selected_calendar_ids(&conn, &ids)
 }
 
 // --- Google Drive (index-only connector, board card 4A) ---

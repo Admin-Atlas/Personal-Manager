@@ -34,6 +34,10 @@ pub const GRAPH_API: &str = "https://graph.microsoft.com/v1.0";
 /// expects. `Files.Read` covers reading file metadata AND content (index-only needs each body to
 /// embed it).
 pub const ONEDRIVE_SCOPE: &str = "Files.Read offline_access User.Read";
+/// Read-only Outlook/Microsoft 365 calendar scope (card 6A) + `offline_access` (refresh token) +
+/// `User.Read` (to learn which account the token grants, via `/me`). `Calendars.Read` reads events
+/// from every calendar the account owns or is shared on; PM never writes (spec non-goal #4).
+pub const CALENDAR_SCOPE: &str = "Calendars.Read offline_access User.Read";
 /// How long to wait for the browser consent redirect before giving up.
 const REDIRECT_TIMEOUT_SECS: u64 = 180;
 

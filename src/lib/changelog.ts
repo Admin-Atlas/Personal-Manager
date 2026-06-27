@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.29.0-alpha",
+    date: "2026-06-27",
+    highlights: [
+      "Groundwork for multi-calendar support: behind the scenes, your calendar now records each connected account and individual calendar in a cleaner structure — the foundation for bringing several Google accounts, Outlook (Microsoft 365), and Apple calendars together in one place. How you use it doesn't change yet; the new controls arrive next.",
+      "Each event now keeps its stable calendar ID, so a future release can link an event to the project or deadline it belongs to.",
+      "Your existing Google Calendar connection carries over automatically — no need to reconnect.",
+    ],
+  },
+  {
     version: "2.28.0-alpha",
     date: "2026-06-27",
     highlights: [

@@ -37,6 +37,12 @@ const GOOGLE_TOKEN: &str = "google_oauth_token";
 /// fixed key; a Drive account's key is `GOOGLE_TOKEN_DRIVE_PREFIX + <account-email>`.
 pub const GOOGLE_TOKEN_CALENDAR: &str = "google_oauth_token_calendar";
 pub const GOOGLE_TOKEN_DRIVE_PREFIX: &str = "google_oauth_token_drive::";
+/// Per-ACCOUNT Google Calendar token key prefix (`<prefix><email>`) — Calendar went multi-account
+/// (cards 6A/6B) like Drive, so each connected Google account gets its own token. The fixed
+/// `GOOGLE_TOKEN_CALENDAR` above is now LEGACY: an existing single-account connection is re-keyed to
+/// `<prefix><that-account-email>` lazily on the first calendar overview/sync (the email is learned
+/// from the account's primary calendar), then never written again.
+pub const GOOGLE_TOKEN_CALENDAR_PREFIX: &str = "google_oauth_token_calendar::";
 /// Subscribed .ics feed URLs (the no-OAuth calendar path). These are secret bearer
 /// links, so the whole JSON list lives in the keychain, not the DB.
 const CALENDAR_ICS_FEEDS: &str = "calendar_ics_feeds";
@@ -153,6 +159,10 @@ pub fn migrate_legacy_google_token() -> Result<()> {
 // connecting or disconnecting one account never disturbs another.
 const MICROSOFT_CLIENT_ID: &str = "microsoft_oauth_client_id";
 pub const MICROSOFT_TOKEN_ONEDRIVE_PREFIX: &str = "microsoft_oauth_token_onedrive::";
+/// Per-account Microsoft (Outlook) Calendar token key prefix (`<prefix><email>`) — the Graph
+/// `Calendars.Read` OAuth path (card 6A). Mirrors the OneDrive prefix: the same provider-level client
+/// id (shared with OneDrive — no new client setup), one token blob per connected account.
+pub const MICROSOFT_TOKEN_CALENDAR_PREFIX: &str = "microsoft_oauth_token_calendar::";
 
 pub fn get_microsoft_client_id() -> Result<Option<String>> {
     get(MICROSOFT_CLIENT_ID)
