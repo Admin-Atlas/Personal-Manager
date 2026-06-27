@@ -17,7 +17,6 @@ import {
   onTsneInstall,
   openDataFolder,
   optionalTsneStatus,
-  uninstallOptionalTsne,
   refreshPricing,
   setPref,
   startSemanticLayout,
@@ -39,6 +38,7 @@ import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
 import { IngestProgress } from "./IngestProgress";
 import { RebuildProgress } from "./RebuildProgress";
+import { StorageSettings } from "./StorageSettings";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
@@ -54,7 +54,7 @@ interface Props {
 }
 
 /** The non-onboarding Settings tabs (left rail). Onboarding stays a single untabbed scroll. */
-type SettingsTab = "general" | "ai" | "search" | "connectors" | "data" | "developer";
+type SettingsTab = "general" | "ai" | "search" | "connectors" | "data" | "storage" | "developer";
 
 const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },
@@ -62,6 +62,7 @@ const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: "search", label: "Search" },
   { id: "connectors", label: "Connectors" },
   { id: "data", label: "Data & Security" },
+  { id: "storage", label: "Storage" },
   { id: "developer", label: "Developer" },
 ];
 
@@ -127,8 +128,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [mapTsneEnabled, setMapTsneEnabled] = useState(true);
   const [installingTsne, setInstallingTsne] = useState(false);
   const [tsneInstallFrac, setTsneInstallFrac] = useState(0);
-  const [removingTsne, setRemovingTsne] = useState(false);
-  const [confirmRemoveTsne, setConfirmRemoveTsne] = useState(false);
   // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
   // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
@@ -288,18 +287,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       })
       .catch((e) => setError(String(e)))
       .finally(() => setInstallingTsne(false));
-  }
-
-  function removeTsne() {
-    setRemovingTsne(true);
-    uninstallOptionalTsne()
-      .then(() => optionalTsneStatus())
-      .then((s) => setTsneInstalled(s.installed))
-      .catch((e) => setError(String(e)))
-      .finally(() => {
-        setRemovingTsne(false);
-        setConfirmRemoveTsne(false);
-      });
   }
 
   async function toggleAppLock(next: boolean) {
@@ -809,31 +796,22 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     {tsneInstalled === null ? (
                       <span className="text-xs text-ink4">…</span>
                     ) : tsneInstalled ? (
-                      <div className="flex items-center gap-3">
-                        <button
-                          type="button"
-                          role="switch"
-                          aria-checked={mapTsneEnabled}
-                          aria-label="Use the enhanced t-SNE layout"
-                          onClick={() => changeTsneEnabled(!mapTsneEnabled)}
-                          className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                            mapTsneEnabled ? "bg-accent" : "bg-surface"
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={mapTsneEnabled}
+                        aria-label="Use the enhanced t-SNE layout"
+                        onClick={() => changeTsneEnabled(!mapTsneEnabled)}
+                        className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                          mapTsneEnabled ? "bg-accent" : "bg-surface"
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                            mapTsneEnabled ? "translate-x-4" : "translate-x-0.5"
                           }`}
-                        >
-                          <span
-                            className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                              mapTsneEnabled ? "translate-x-4" : "translate-x-0.5"
-                            }`}
-                          />
-                        </button>
-                        <Button
-                          variant="secondary"
-                          onClick={() => setConfirmRemoveTsne(true)}
-                          disabled={removingTsne}
-                        >
-                          {removingTsne ? "Removing…" : "Remove"}
-                        </Button>
-                      </div>
+                        />
+                      </button>
                     ) : (
                       <Button variant="secondary" onClick={downloadTsne} disabled={installingTsne}>
                         {installingTsne ? "Downloading…" : "Download"}
@@ -853,22 +831,9 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     Semantic proximity uses a basic on-device layout by default. Project cohesion
                     gently pulls same-project documents together (Off keeps the layout purely by
                     meaning). The optional t-SNE component (a one-time download) produces tighter
-                    clusters of related documents — once installed you can turn it on or off, or
-                    remove it to free space.
+                    clusters of related documents — turn it on or off here, or remove it to free
+                    space under Settings → Storage.
                   </p>
-                  <ConfirmDialog
-                    open={confirmRemoveTsne}
-                    title="Remove the enhanced layout?"
-                    confirmLabel="Remove"
-                    danger
-                    busy={removingTsne}
-                    onConfirm={removeTsne}
-                    onClose={() => setConfirmRemoveTsne(false)}
-                  >
-                    This deletes the optional t-SNE component from PM's document engine. The
-                    semantic Map will go back to the basic (PCA) layout. You can download it again
-                    any time.
-                  </ConfirmDialog>
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">
@@ -1290,6 +1255,10 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                   </Collapsible>
                 </div>
               </>
+            )}
+
+            {tab === "storage" && (
+              <StorageSettings onNavigate={(t) => selectTab(t as SettingsTab)} />
             )}
 
             {tab === "developer" && (

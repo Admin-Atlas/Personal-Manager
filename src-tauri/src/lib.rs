@@ -7,6 +7,7 @@ mod calendar;
 mod clock;
 mod commands;
 mod commands_dev;
+mod components;
 mod cost;
 mod db;
 mod drive;
@@ -563,6 +564,8 @@ pub fn run() {
             layout::optional_tsne_status,
             layout::install_optional_tsne,
             layout::uninstall_optional_tsne,
+            components::list_storage_components,
+            components::remove_storage_component,
             commands::open_external_ref,
             commands::open_url,
             commands::get_daily_briefing,

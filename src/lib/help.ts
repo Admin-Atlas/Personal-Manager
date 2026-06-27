@@ -184,6 +184,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Appearance",
     body: "Switch the visual System (Editorial / Slate / Terminal), Light or Dark mode, the accent colour, and Depth (how much detail is shown). Changes apply instantly and are remembered on this device.",
   },
+  "settings-storage": {
+    title: "On-device components",
+    body: "Everything PM has downloaded to this device, with sizes. The document engine and the active search model are always needed. The enhanced map layout (t-SNE) and the speech model can be removed to free space — they re-download when you need them again. The heavy shared libraries (scikit-learn, scipy) can only be removed once nothing still uses them: a greyed Remove button shows a pill pointing to what to remove first. numpy is never offered because the search model shares it.",
+  },
   "settings-memory-map": {
     title: "Memory map",
     body: "Settings for the Map tab. Default grouping picks how the Map opens — Semantic proximity (similar documents sit together) or By project (each project a hub with its documents around it). Project cohesion (Off by default) gently pulls same-project documents together in the semantic view without abandoning the meaning-driven layout. Maximum nodes caps how many documents are individually plotted; above it, the rest are gathered at their project's spot — raise it for a fuller picture, lower it on a slower machine. Enhanced layout (t-SNE) is a one-time, on-device download that gives the semantic view tighter, clearer clusters than the built-in basic layout; once installed you can switch it on or off, or remove it to free space.",
@@ -299,6 +303,10 @@ export const HELP: Record<string, HelpEntry> = {
   "map-navigate": {
     title: "Move around the map",
     body: "Zoom in or out, or fit the whole map back into view. You can also scroll to zoom (scroll sideways to pan left/right), drag anywhere to pan, and double-click to reset the framing.",
+  },
+  "map-labels": {
+    title: "Show file names",
+    body: "Write each document's file name inside its node, so you can tell nodes apart without hovering. The text is sized to the node — small when you're zoomed out, larger as you zoom in — and a long name is shortened to fit, showing the start; zoom into a bigger node to read more of it. Off by default to keep a busy map uncluttered; your choice is remembered on this device.",
   },
 
   // Focus view & projects (Step 5)
