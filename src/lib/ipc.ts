@@ -540,6 +540,11 @@ export const onDriveSync = (handler: (e: DriveSyncEvent) => void): Promise<Unlis
 export const listDriveSharedDrives = (email: string) =>
   invoke<SharedDrive[]>("list_drive_shared_drives", { email });
 
+/** Shared drives already indexed by a DIFFERENT connected account → `{ [driveId]: ownerEmail }`. The
+ *  scope picker greys those out (shared drives are de-duplicated — only the owner indexes a drive). */
+export const driveSharedOwners = (email: string) =>
+  invoke<Record<string, string>>("drive_shared_owners", { email });
+
 /** Immediate subfolders of a folder in a shared drive (one lazy picker level). Pass the shared
  *  drive's id as `parentId` for the top level. */
 export const listDriveFolders = (email: string, driveId: string, parentId: string) =>

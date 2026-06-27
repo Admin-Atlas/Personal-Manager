@@ -2530,6 +2530,18 @@ pub async fn list_drive_shared_drives(email: String) -> Result<Vec<drive::Shared
     drive::list_shared_drives(&drive::account_token_key(&email)).await
 }
 
+/// Shared drives already indexed by a DIFFERENT connected account → `driveId → owner email`. The
+/// scope picker greys those out ("synced by <owner>") since shared drives are de-duplicated — only the
+/// owner indexes a drive, so the user needn't (and can't usefully) re-index it under this account.
+#[tauri::command]
+pub fn drive_shared_owners(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<std::collections::HashMap<String, String>> {
+    let conn = state.conn()?;
+    drive::shared_drive_owners_elsewhere(&conn, &email)
+}
+
 /// The immediate subfolders of `parent_id` inside a shared drive — one lazy level of the folder
 /// picker. Pass the shared drive's id as `parent_id` for the top level.
 #[tauri::command]
@@ -2602,7 +2614,7 @@ async fn gather_shared(
 ) -> Result<(Vec<DriveItem>, Option<(String, String)>)> {
     match sel.folders.as_deref() {
         Some(folders) => Ok((
-            gather_shared_folders(app, token_key, email, &sel.drive_id, folders).await?,
+            gather_shared_folders(app, token_key, &sel.drive_id, folders).await?,
             None,
         )),
         None => gather_shared_whole(app, token_key, email, &sel.drive_id).await,
@@ -2617,7 +2629,6 @@ async fn gather_shared(
 async fn gather_shared_folders(
     app: &AppHandle,
     token_key: &str,
-    email: &str,
     drive_id: &str,
     folders: &[String],
 ) -> Result<Vec<DriveItem>> {
@@ -2625,12 +2636,12 @@ async fn gather_shared_folders(
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        drive::known_shared_source_ids(&conn, email, drive_id)?
+        drive::known_shared_source_ids(&conn, drive_id)?
             .into_iter()
             .collect()
     };
     Ok(reconcile_enumeration(files, known, |file_id| {
-        drive::shared_source_id(email, drive_id, file_id)
+        drive::shared_source_id(drive_id, file_id)
     }))
 }
 
@@ -2720,17 +2731,13 @@ async fn gather_shared_whole(
     };
 
     // First sync / 410 reset: the whole drive enumerated as Adds + a fresh baseline cursor.
-    async fn baseline(
-        token_key: &str,
-        email: &str,
-        drive_id: &str,
-    ) -> Result<(Vec<DriveItem>, String)> {
+    async fn baseline(token_key: &str, drive_id: &str) -> Result<(Vec<DriveItem>, String)> {
         let files = drive::enumerate_shared(token_key, drive_id, None).await?;
         let new_cursor = drive::start_page_token(token_key, Some(drive_id)).await?;
         let items = files
             .into_iter()
             .map(|f| {
-                let source_id = drive::shared_source_id(email, drive_id, &f.id);
+                let source_id = drive::shared_source_id(drive_id, &f.id);
                 let event = index_only::ChangeEvent::Add {
                     source_id: source_id.clone(),
                     modified_at: f.modified_time.clone(),
@@ -2747,7 +2754,7 @@ async fn gather_shared_whole(
 
     let cursor = match cursor {
         None => {
-            let (items, c) = baseline(token_key, email, drive_id).await?;
+            let (items, c) = baseline(token_key, drive_id).await?;
             return Ok((items, Some((drive_id.to_string(), c))));
         }
         Some(c) => c,
@@ -2757,7 +2764,7 @@ async fn gather_shared_whole(
     {
         Ok(v) => v,
         Err(e) if drive::is_cursor_expired(&e) => {
-            let (items, c) = baseline(token_key, email, drive_id).await?;
+            let (items, c) = baseline(token_key, drive_id).await?;
             return Ok((items, Some((drive_id.to_string(), c))));
         }
         Err(e) => return Err(e),
@@ -2765,13 +2772,13 @@ async fn gather_shared_whole(
 
     let mut items: Vec<DriveItem> = Vec::with_capacity(changes.len());
     for change in &changes {
-        let source_id = drive::shared_source_id(email, drive_id, &change.file_id);
+        let source_id = drive::shared_source_id(drive_id, &change.file_id);
         let known = {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
             drive::read_item_state(&conn, &source_id)?.is_some()
         };
-        if let Some(event) = drive::map_shared_change(change, email, drive_id, known) {
+        if let Some(event) = drive::map_shared_change(change, drive_id, known) {
             items.push(DriveItem::Reconciled {
                 source_id,
                 event,
@@ -3098,10 +3105,21 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
             }
         }
 
-        // --- shared drives. Skip if the account already auth-failed (same token). Whole-drive
-        // selections return an advanced cursor to persist; folder-scoped ones return None. ---
+        // --- shared drives. Skip if the account already auth-failed (same token). Shared drives are
+        // de-duplicated across accounts: `claim_or_skip_shared_drive` records this account's access and
+        // tells us whether it OWNS the drive (the first account to sync it does). A drive owned by
+        // another account is skipped here — that owner already indexes it (the scope UI greys it out).
+        // Whole-drive selections return an advanced cursor to persist; folder-scoped ones return None. ---
         if !auth_failed {
             for sel in &scope.shared {
+                let owns = {
+                    let state = app.state::<AppState>();
+                    let conn = state.conn()?;
+                    drive::claim_or_skip_shared_drive(&conn, &email, &sel.drive_id, &sel.name)?
+                };
+                if !owns {
+                    continue;
+                }
                 match gather_shared(app, &token_key, &email, sel).await {
                     Ok((mut recon, cursor)) => {
                         items.append(&mut recon);
@@ -3459,8 +3477,14 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
         .map(|(_, id)| id.to_string())
         .ok_or_else(|| Error::Other("Malformed source id.".into()))?;
     let no_text = || Error::Other("This file has no extractable text to show.".into());
-    if let Some(email) = drive::account_of(&source_id) {
-        let token_key = drive::account_token_key(&email);
+    // Drive: a My Drive id names its account directly; a shared-drive id is account-independent, so
+    // resolve an account that can reach it (owner first) from the access table. Read off the lock
+    // before the fetch (rule #4).
+    let drive_token_key = {
+        let conn = state.conn()?;
+        drive::token_key_for_source(&conn, &source_id)?
+    };
+    if let Some(token_key) = drive_token_key {
         let file = drive::fetch_file(&token_key, &item_id).await?;
         drive::fetch_body(state.inner(), &token_key, &file)
             .await?
