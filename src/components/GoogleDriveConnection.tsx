@@ -153,10 +153,11 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
 
   const connect = () =>
     run("connect", async () => {
-      const account = await connectDrive();
+      await connectDrive();
       await refresh();
-      // Kick off the (slow) first sync in the background — the banner above sets the expectation.
-      sync(account.email);
+      // No auto-sync: the account lands "not synced yet" so you can choose its scope first (whole
+      // My Drive vs specific folders, plus any shared drives) and then start indexing yourself with
+      // "Sync now". The post-connect banner below points at that next step.
     });
 
   const disconnect = (email: string) =>
@@ -176,6 +177,9 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
   const firstSync =
     syncing &&
     (syncingAccount ? !syncingAccount.last_synced_at : accounts.some((a) => !a.last_synced_at));
+  // A reachable account that's connected but never indexed — its scope chooser auto-expands and the
+  // banner below nudges the user to pick a scope and press "Sync now" (we no longer auto-sync on connect).
+  const needsFirstSync = !syncing && accounts.some((a) => a.state === "ok" && !a.last_synced_at);
 
   return (
     <div data-help="settings-drive">
@@ -211,10 +215,10 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
                   {a.state === "ok" && (
                     <Collapsible
                       className="mt-2"
-                      defaultOpen={false}
+                      defaultOpen={!a.last_synced_at}
                       title={<span className="text-xs text-ink3">Shared drives & scope</span>}
                     >
-                      <SharedDrivesManager email={a.email} busy={anyBusy} onSaved={refresh} />
+                      <SharedDrivesManager email={a.email} onSaved={refresh} />
                     </Collapsible>
                   )}
                 </li>
@@ -228,6 +232,21 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
               first; it heads the list. You can add more accounts afterwards, and each is indexed
               independently.
             </p>
+          )}
+
+          {needsFirstSync && (
+            <div
+              className="mt-3 rounded-[var(--radius)] px-3 py-2 text-xs text-ink3"
+              style={{ background: "color-mix(in oklab, var(--st-look) 14%, transparent)" }}
+              data-help="settings-drive-firstsync"
+            >
+              <span className="text-ink2">Choose what to index first.</span> Each account indexes
+              your whole <strong>My Drive</strong> by default — expand{" "}
+              <span className="text-ink3">Shared drives &amp; scope</span> to limit it to folders or
+              add shared drives. When you’re ready, press{" "}
+              <span className="text-ink2">Sync now</span> to start indexing — the first sync can
+              take a while; later syncs only fetch what changed.
+            </div>
           )}
 
           {syncing && progress && (
