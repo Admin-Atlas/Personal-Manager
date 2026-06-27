@@ -705,6 +705,37 @@ impl SidecarManager {
         Ok(())
     }
 
+    /// `pip uninstall -y` the given packages from the managed venv — the Storage manager's guarded
+    /// teardown of the optional t-SNE libraries (scikit-learn / scipy / their small siblings). The
+    /// caller MUST enforce the dependency cascade (see `components.rs`); this only adds a final
+    /// backstop that **refuses to ever remove `numpy`** (shared with the embedder). Blocking;
+    /// serialised by the install lock. Idempotent — pip skips a package that isn't installed.
+    pub fn pip_uninstall(&self, packages: &[&str]) -> Result<()> {
+        if packages.iter().any(|p| p.eq_ignore_ascii_case("numpy")) {
+            return Err(Error::Other(
+                "refusing to remove numpy (it's shared with the search model)".into(),
+            ));
+        }
+        let py = self.paths.venv_python();
+        if !py.exists() {
+            return Ok(());
+        }
+        let _install = self.install.lock().unwrap();
+        let mut pip = Command::new(&py);
+        pip.args([
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "--disable-pip-version-check",
+        ]);
+        pip.args(packages);
+        clean_python_env(&mut pip);
+        no_window(&mut pip);
+        run_command(&mut pip, "pip uninstall")?;
+        Ok(())
+    }
+
     /// Send one request to the child and read its reply. Spawns the child lazily.
     /// Serialized by the process mutex, so the next stdout line is our reply.
     fn request(&self, method: &str, params: Value) -> Result<Value> {

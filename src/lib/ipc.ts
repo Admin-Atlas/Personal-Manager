@@ -44,6 +44,7 @@ import type {
   Settings,
   SharedDrive,
   SidecarStatus,
+  StorageReport,
   TsneInstallEvent,
   TsneStatus,
   VaultLockStatus,
@@ -556,6 +557,13 @@ export const installOptionalTsne = () => invoke<void>("install_optional_tsne");
 
 /** Remove the optional t-SNE reducer from the venv (the "delete" action), then recompute with PCA. */
 export const uninstallOptionalTsne = () => invoke<void>("uninstall_optional_tsne");
+
+/** Inventory the large on-device components (venv, t-SNE libraries, speech model, search model). */
+export const listStorageComponents = () => invoke<StorageReport>("list_storage_components");
+
+/** Remove an on-device component, enforced by the dependency cascade server-side. */
+export const removeStorageComponent = (id: string) =>
+  invoke<void>("remove_storage_component", { id });
 
 /** Subscribe to global semantic-layout progress (fires regardless of which view started the job). */
 export const onLayoutProgress = (handler: (e: LayoutProgressEvent) => void): Promise<UnlistenFn> =>

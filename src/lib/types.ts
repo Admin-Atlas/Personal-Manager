@@ -488,6 +488,39 @@ export interface TsneInstallEvent {
   fraction: number;
 }
 
+/** One on-device component in the Storage manager (the venv, the t-SNE libraries, the speech model,
+ *  the active search model). `status` drives the action: removable now, blocked behind a dependent,
+ *  required, or in-use (managed elsewhere). */
+export type StorageStatus = "required" | "in_use" | "removable" | "blocked";
+export interface StorageBlocker {
+  label: string;
+  /** The component id to scroll to (remove that one first). */
+  anchor: string;
+}
+export interface StorageManage {
+  label: string;
+  /** The Settings tab to jump to (e.g. "search" for the embedder, "general" for the map toggle). */
+  tab: string;
+}
+export interface StorageComponent {
+  id: string;
+  label: string;
+  detail: string;
+  size_bytes: number;
+  /** The size is an estimate, not a real on-disk measurement (the embedder's shared cache). */
+  approximate: boolean;
+  /** Indented under the component above it (the t-SNE libraries under the enhanced layout). */
+  child: boolean;
+  status: StorageStatus;
+  blockers: StorageBlocker[];
+  manage: StorageManage | null;
+  note: string | null;
+}
+export interface StorageReport {
+  total_bytes: number;
+  components: StorageComponent[];
+}
+
 /** Global progress for the semantic-layout precompute (fires regardless of which view started it). */
 export type LayoutProgressEvent =
   | { state: "preparing" }
