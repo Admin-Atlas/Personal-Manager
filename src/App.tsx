@@ -44,6 +44,7 @@ import {
   resumeDriveSync,
   reviewQueue,
   setHelpMode,
+  startSemanticLayout,
   vaultLockStatus,
   vaultStatus,
 } from "./lib/ipc";
@@ -299,10 +300,14 @@ export default function App() {
     if (keySet) void resumeDriveSync().catch(() => {});
   }, [keySet]);
 
-  // Pre-compute the Map's force layout in the background after unlock, at idle priority and off the
-  // main thread (a worker), so opening the Map tab is instant and never stutters the app at launch.
+  // Pre-compute the Map's layouts in the background after unlock, at idle priority: the by-project
+  // force layout off the main thread (a worker), and the semantic layout in the backend (which defers
+  // to an active Drive sync). Both prime caches so opening the Map is instant and never stutters launch.
   useEffect(() => {
-    if (keySet) warmMapLayout();
+    if (keySet) {
+      warmMapLayout();
+      void startSemanticLayout().catch(() => {});
+    }
   }, [keySet]);
 
   async function selectConversation(id: number) {

@@ -85,5 +85,44 @@ class CountTokensTest(unittest.TestCase):
         self.assertNotEqual(counts[0], max(counts))
 
 
+class ReduceTest(unittest.TestCase):
+    """The 2-D reducer for the semantic memory map. The PCA path (the bundled default) needs only
+    numpy, so these run wherever numpy is present and skip otherwise (CI is model-free)."""
+
+    def test_empty_and_tiny_inputs(self):
+        # No numpy needed for the degenerate guards.
+        self.assertEqual(S.do_reduce({"vectors": []}), {"coords": [], "method": "none"})
+        out = S.do_reduce({"vectors": [[1.0, 2.0], [3.0, 4.0]], "method": "pca"})
+        self.assertEqual(out["method"], "trivial")  # n <= 3 short-circuits before any reducer
+        self.assertEqual(len(out["coords"]), 2)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy") is not None,
+        "numpy not installed (the PCA reducer is a local-only check)",
+    )
+    def test_pca_projects_into_unit_square(self):
+        # Two clusters in 4-d → PCA to 2-d. One point per row; coords must be scaled into [0,1]^2.
+        vectors = [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.1, 0.0],
+            [0.0, 0.1, 0.0, 0.1],
+            [9.0, 9.0, 9.0, 9.0],
+            [9.1, 9.0, 9.1, 9.0],
+            [9.0, 9.1, 9.0, 9.1],
+        ]
+        out = S.do_reduce({"vectors": vectors, "method": "pca"})
+        self.assertEqual(out["method"], "pca")
+        self.assertEqual(len(out["coords"]), len(vectors))
+        for x, y in out["coords"]:
+            self.assertGreaterEqual(x, 0.0)
+            self.assertLessEqual(x, 1.0)
+            self.assertGreaterEqual(y, 0.0)
+            self.assertLessEqual(y, 1.0)
+        # An unknown/absent t-SNE install falls back to PCA, never an empty map.
+        fallback = S.do_reduce({"vectors": vectors, "method": "tsne"})
+        self.assertEqual(len(fallback["coords"]), len(vectors))
+        self.assertIn(fallback["method"], ("tsne", "pca"))
+
+
 if __name__ == "__main__":
     unittest.main()

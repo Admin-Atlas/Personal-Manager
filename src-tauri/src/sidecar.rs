@@ -18,7 +18,7 @@
 //! these methods off the async runtime (see `tokio::task::spawn_blocking` in the
 //! ingest command) — they block. Never hold the DB lock across a sidecar call.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +70,12 @@ const MAX_SIDECAR_LINE: usize = 64 * 1024 * 1024;
 /// to a failed call instead of an infinite loop.
 const MAX_SKIP_LINES: usize = 1024;
 
+/// The OPTIONAL t-SNE reducer for the semantic memory map, pinned. **Not** in `requirements.txt` —
+/// the base venv stays lean; the user installs it on demand from Settings (see
+/// [`SidecarManager::install_optional_tsne`]). openTSNE pulls scikit-learn + scipy (numpy is already
+/// present via fastembed) and ships a binary wheel for our pinned Python, so there's no compile step.
+const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
+
 /// Where the sidecar script and its requirements live, and where the venv goes.
 pub struct SidecarPaths {
     /// Directory containing `pm_sidecar.py` + `requirements.txt`.
@@ -114,6 +120,13 @@ impl SidecarPaths {
 
     fn ready_marker(&self) -> PathBuf {
         self.venv_dir.join(".pm-ready")
+    }
+
+    /// Marker that the OPTIONAL t-SNE component is installed in this venv. Separate from
+    /// `.pm-ready` so the base requirements hash is untouched and an existing user never re-installs
+    /// the base venv just because t-SNE became available. Holds the pin, so a future bump re-installs.
+    fn tsne_marker(&self) -> PathBuf {
+        self.venv_dir.join(".pm-tsne")
     }
 
     /// Where the speech model's weights are cached — a sibling of the venv under
@@ -567,6 +580,131 @@ impl SidecarManager {
         Ok(result["text"].as_str().unwrap_or_default().to_string())
     }
 
+    /// Project per-document vectors to 2-D for the semantic memory map. `method` is `"pca"` (the
+    /// numpy-only default) or `"tsne"` (only requested when the optional component is installed; the
+    /// sidecar falls back to PCA if it isn't, so this always returns a usable layout). Returns the
+    /// coordinates (already scaled into `[0,1]²`) and the method actually used. Blocking — run off the
+    /// async runtime and never while holding the DB lock, like every other sidecar call.
+    pub fn reduce(&self, vectors: &[Vec<f32>], method: &str) -> Result<(Vec<[f32; 2]>, String)> {
+        if vectors.is_empty() {
+            return Ok((Vec::new(), "none".to_string()));
+        }
+        let result = self.request("reduce", json!({ "vectors": vectors, "method": method }))?;
+        let used = result["method"].as_str().unwrap_or("pca").to_string();
+        let coords = result["coords"]
+            .as_array()
+            .ok_or_else(|| Error::Other("sidecar reduce returned no coords".into()))?
+            .iter()
+            .map(|row| {
+                let point = row.as_array().ok_or_else(|| {
+                    Error::Other("sidecar reduce returned a malformed point".into())
+                })?;
+                // Reject a non-finite coordinate rather than placing a node at infinity.
+                let at = |i: usize| {
+                    point
+                        .get(i)
+                        .and_then(|n| n.as_f64())
+                        .filter(|f| f.is_finite())
+                        .map(|f| f as f32)
+                        .ok_or_else(|| {
+                            Error::Other("sidecar reduce returned a non-finite coordinate".into())
+                        })
+                };
+                Ok([at(0)?, at(1)?])
+            })
+            .collect::<Result<Vec<[f32; 2]>>>()?;
+        Ok((coords, used))
+    }
+
+    /// Whether the OPTIONAL t-SNE reducer is installed in this venv at the pinned version. Cheap (a
+    /// marker read) so it can be polled on every layout request to decide PCA-vs-t-SNE.
+    pub fn optional_tsne_ready(&self) -> bool {
+        self.paths.venv_python().exists()
+            && std::fs::read_to_string(self.paths.tsne_marker())
+                .map(|s| s.trim() == OPTIONAL_TSNE_PIN)
+                .unwrap_or(false)
+    }
+
+    /// Install the OPTIONAL t-SNE reducer (openTSNE) into the managed venv on demand. The base venv
+    /// must exist first, so this provisions it if needed, then `pip install`s the pin and stamps the
+    /// t-SNE marker. Blocking and slow (a download); serialised by the install lock. Idempotent — a
+    /// no-op once the marker is current.
+    ///
+    /// `on_progress` is called with a monotonic `0.0..=1.0` fraction as the install advances (derived
+    /// from pip's `Collecting/Downloading/Installing` markers — see [`pip_phase_fraction`]), so the
+    /// Map and Settings can show a real progress bar instead of an indeterminate spinner. The download
+    /// has no file-count, so the UI renders this as a percentage.
+    pub fn install_optional_tsne(&self, mut on_progress: impl FnMut(f32)) -> Result<()> {
+        on_progress(0.03);
+        // openTSNE goes into the base venv, which must exist with its requirements first.
+        self.ensure_installed()?;
+        on_progress(0.10);
+
+        let _install = self.install.lock().unwrap();
+        if self.optional_tsne_ready() {
+            on_progress(1.0);
+            return Ok(());
+        }
+
+        let py = self.paths.venv_python();
+        // `--progress-bar off` so pip emits clean newline-terminated phase lines (no carriage-return
+        // byte bar) we can parse; the side-thread stderr drain in run_pip_streaming avoids a deadlock.
+        let mut downloads = 0u32;
+        let mut last = 0.10f32;
+        run_pip_streaming(
+            &py,
+            &[
+                "install",
+                "--disable-pip-version-check",
+                "--progress-bar",
+                "off",
+                OPTIONAL_TSNE_PIN,
+            ],
+            |line| {
+                if let Some(f) = pip_phase_fraction(line, &mut downloads) {
+                    if f > last {
+                        last = f;
+                        on_progress(f);
+                    }
+                }
+            },
+        )?;
+
+        std::fs::write(self.paths.tsne_marker(), OPTIONAL_TSNE_PIN)?;
+        on_progress(1.0);
+        Ok(())
+    }
+
+    /// Remove the OPTIONAL t-SNE component again (the "delete" action). Drops the marker first — that
+    /// alone disables t-SNE (`optional_tsne_ready` then reports false and the map falls back to PCA) —
+    /// then `pip uninstall`s openTSNE to reclaim space. Only openTSNE is removed: its heavier transitive
+    /// deps (scipy / scikit-learn) are left in place so we can never accidentally break the base venv by
+    /// pulling a package something else relies on; a later re-install is then quick. Idempotent.
+    pub fn uninstall_optional_tsne(&self) -> Result<()> {
+        let _install = self.install.lock().unwrap();
+        // Drop the marker first so the feature is off even if the pip call below fails.
+        let _ = std::fs::remove_file(self.paths.tsne_marker());
+        let py = self.paths.venv_python();
+        if !py.exists() {
+            return Ok(());
+        }
+        let mut pip = Command::new(&py);
+        pip.args([
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "--disable-pip-version-check",
+            "openTSNE",
+        ]);
+        clean_python_env(&mut pip);
+        no_window(&mut pip);
+        // Best-effort: the marker is already gone, so a pip hiccup just leaves the (unused) package on
+        // disk rather than failing the user's "remove".
+        let _ = run_command(&mut pip, "pip uninstall openTSNE");
+        Ok(())
+    }
+
     /// Send one request to the child and read its reply. Spawns the child lazily.
     /// Serialized by the process mutex, so the next stdout line is our reply.
     fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -993,6 +1131,84 @@ fn preflight_interpreter(py: &Path) -> std::result::Result<(), ProvisionError> {
     Ok(())
 }
 
+/// Run `python -m pip <pip_args>` in the venv, streaming stdout line-by-line to `on_line` so the
+/// caller can turn pip's phase markers into progress. stderr is drained on a side thread (a full
+/// stderr pipe could otherwise block our stdout reads) and surfaced in the error on failure.
+fn run_pip_streaming(py: &Path, pip_args: &[&str], mut on_line: impl FnMut(&str)) -> Result<()> {
+    let mut cmd = Command::new(py);
+    cmd.arg("-m").arg("pip").args(pip_args);
+    clean_python_env(&mut cmd);
+    no_window(&mut cmd);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::Other(format!("could not start pip install: {e}")))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let err_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut s);
+        s
+    });
+
+    for line in BufReader::new(stdout).lines() {
+        match line {
+            Ok(l) => on_line(&l),
+            Err(_) => break,
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| Error::Other(format!("pip install did not exit cleanly: {e}")))?;
+    let stderr_text = err_thread.join().unwrap_or_default();
+    if !status.success() {
+        let detail = stderr_text.trim();
+        return Err(Error::Other(format!(
+            "pip install failed:\n{}",
+            if detail.is_empty() {
+                "(no output)"
+            } else {
+                detail
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// Map one line of pip's (`--progress-bar off`) stdout to a coarse, monotonic install fraction. Pure
+/// (unit-tested). `downloads` accumulates real wheel downloads — `.metadata` fetches are skipped — so
+/// the bar advances across packages. The caller keeps the running maximum, so a slightly miscounted
+/// line can never make the bar jump backwards; the final 1.0 is emitted only once the marker is
+/// stamped. This is phase-derived, not byte-exact (pip doesn't expose clean byte totals), but it is
+/// honest: it only reaches completion when the install actually finishes.
+fn pip_phase_fraction(line: &str, downloads: &mut u32) -> Option<f32> {
+    let l = line.trim();
+    if l.starts_with("Collecting ") || l.starts_with("Obtaining ") {
+        return Some(0.16);
+    }
+    if (l.starts_with("Downloading ") || l.starts_with("Using cached ")) && !l.contains(".metadata")
+    {
+        *downloads += 1;
+        // openTSNE pulls roughly scikit-learn, scipy, joblib, threadpoolctl, openTSNE (+ numpy if it
+        // isn't already cached). An estimate is fine — the running max keeps it monotonic regardless.
+        const EST_PACKAGES: f32 = 6.0;
+        let frac = (*downloads as f32 / EST_PACKAGES).min(1.0);
+        return Some(0.28 + 0.50 * frac); // ramp 0.28 -> 0.78 across the downloads
+    }
+    if l.starts_with("Installing collected packages") {
+        return Some(0.86);
+    }
+    if l.starts_with("Successfully installed") {
+        return Some(0.96);
+    }
+    None
+}
+
 fn run_command(command: &mut Command, what: &str) -> Result<()> {
     let output = command
         .output()
@@ -1187,6 +1403,89 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v["kind"], "packaging_bug");
+    }
+
+    #[test]
+    fn pip_phase_fraction_is_monotonic_across_a_real_install() {
+        // Walk a representative pip transcript and assert the derived fraction never goes backwards
+        // and lands in the expected phase bands. (A free fn, not a capturing closure, so we can also
+        // read `downloads` directly between steps.)
+        fn band(f: f32, lo: f32, hi: f32, last: &mut f32, line: &str) {
+            assert!(
+                f + 1e-6 >= *last,
+                "fraction regressed at {line:?}: {f} < {last}"
+            );
+            assert!(
+                f >= lo && f <= hi,
+                "fraction {f} for {line:?} not in [{lo},{hi}]"
+            );
+            *last = f;
+        }
+        let mut downloads = 0u32;
+        let mut last = 0.10f32;
+
+        let l = "Collecting openTSNE==1.0.4";
+        band(
+            pip_phase_fraction(l, &mut downloads).unwrap(),
+            0.15,
+            0.20,
+            &mut last,
+            l,
+        );
+
+        // A `.metadata` fetch must NOT count as a package download.
+        let before = downloads;
+        assert_eq!(
+            pip_phase_fraction(
+                "  Downloading openTSNE-1.0.4.whl.metadata (5 kB)",
+                &mut downloads
+            ),
+            None
+        );
+        assert_eq!(
+            downloads, before,
+            "metadata fetch must not advance the download count"
+        );
+
+        let l = "  Downloading scipy-1.14.0-cp314-win_amd64.whl (44 MB)";
+        band(
+            pip_phase_fraction(l, &mut downloads).unwrap(),
+            0.30,
+            0.40,
+            &mut last,
+            l,
+        );
+        let l = "  Downloading scikit_learn-1.5.0-cp314-win_amd64.whl (11 MB)";
+        band(
+            pip_phase_fraction(l, &mut downloads).unwrap(),
+            0.35,
+            0.50,
+            &mut last,
+            l,
+        );
+        let l =
+            "Installing collected packages: threadpoolctl, scipy, joblib, scikit-learn, openTSNE";
+        band(
+            pip_phase_fraction(l, &mut downloads).unwrap(),
+            0.85,
+            0.87,
+            &mut last,
+            l,
+        );
+        let l = "Successfully installed openTSNE-1.0.4 scipy-1.14.0";
+        band(
+            pip_phase_fraction(l, &mut downloads).unwrap(),
+            0.95,
+            0.97,
+            &mut last,
+            l,
+        );
+
+        // Unrelated chatter is ignored.
+        assert_eq!(
+            pip_phase_fraction("WARNING: something cosmetic", &mut downloads),
+            None
+        );
     }
 
     #[test]

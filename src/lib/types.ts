@@ -462,6 +462,40 @@ export type DriveSyncEvent =
   | { type: "item"; processed: number; total: number; name: string }
   | { type: "finished"; report: DriveSyncReport };
 
+/** One document's 2-D position on the semantic memory map (coords are in [0,1]²). */
+export interface SemanticCoord {
+  id: number;
+  x: number;
+  y: number;
+}
+
+/** The cached semantic layout: which reducer produced it (`pca`|`tsne`|`none`), the coordinates, and
+ *  whether a recompute is currently in flight. */
+export interface SemanticLayout {
+  method: string;
+  coords: SemanticCoord[];
+  computing: boolean;
+}
+
+/** Whether the optional t-SNE reducer (an on-demand download) is installed. */
+export interface TsneStatus {
+  installed: boolean;
+}
+
+/** Progress for the optional t-SNE component download (0..1, monotonic). Rendered as a percentage —
+ *  a download has no file count — tiered by Depth (bar at minimal, bar + % at standard and power). */
+export interface TsneInstallEvent {
+  fraction: number;
+}
+
+/** Global progress for the semantic-layout precompute (fires regardless of which view started it). */
+export type LayoutProgressEvent =
+  | { state: "preparing" }
+  | { state: "reducing"; count: number; method: string }
+  | { state: "deferred" }
+  | { state: "done"; method: string }
+  | { state: "error"; message: string };
+
 /** A mirrored calendar event (the agenda list). `start` is an ISO datetime, or a
  *  plain date for all-day events. */
 export interface CalendarEvent {

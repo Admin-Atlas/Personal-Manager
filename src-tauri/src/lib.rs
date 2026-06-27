@@ -16,6 +16,7 @@ mod google;
 mod ics;
 mod index_only;
 mod ingest;
+mod layout;
 mod lock_session;
 mod model_gateway;
 mod openrouter;
@@ -134,6 +135,9 @@ pub struct AppState {
     /// Cooperative stop flag for the running Drive sync. `stop_drive_sync` sets it; the sync loop
     /// checks it between files and halts, keeping everything indexed so far. Reset at each sync start.
     pub drive_sync_cancel: AtomicBool,
+    /// Snapshot of the semantic-map layout precompute (single-flight; running/method/last-error), so
+    /// the Map can show progress and a second request folds into the running one. See `layout`.
+    pub layout_job: Mutex<layout::LayoutJobState>,
 }
 
 /// A borrow of the open connection. Derefs to [`Connection`], so call sites read just
@@ -437,6 +441,7 @@ pub fn run() {
                 lock_session: Mutex::new(lock_session::LockSession::default()),
                 drive_sync: Mutex::new(DriveSyncState::default()),
                 drive_sync_cancel: AtomicBool::new(false),
+                layout_job: Mutex::new(layout::LayoutJobState::default()),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -552,6 +557,12 @@ pub fn run() {
             commands::get_drive_scope,
             commands::set_drive_scope,
             commands::fetch_index_only_body,
+            layout::semantic_layout,
+            layout::start_semantic_layout,
+            layout::prioritise_semantic_layout,
+            layout::optional_tsne_status,
+            layout::install_optional_tsne,
+            layout::uninstall_optional_tsne,
             commands::open_external_ref,
             commands::open_url,
             commands::get_daily_briefing,

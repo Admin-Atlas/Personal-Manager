@@ -424,6 +424,21 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE usage_log ADD COLUMN cost_usd REAL;
     "#,
+    // v16: cached 2-D coordinates for the semantic memory map (one row per document for the current
+    // layout). Fully regenerable from `chunk_vec` — the layout module drops + rebuilds these on a
+    // fingerprint mismatch (embedder/dim/node-cap/doc-set change), and the cache only spares
+    // re-reading + averaging every leaf-chunk vector on each Map open. `method` records which reducer
+    // produced the coords (`pca` | `tsne`) for display. Additive, no backfill — an existing store
+    // just gains an empty table (rule #3); vectors and every existing query are untouched.
+    r#"
+    CREATE TABLE doc_layout (
+        document_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        method       TEXT NOT NULL,            -- 'pca' | 'tsne' (the reducer actually used)
+        x            REAL NOT NULL,
+        y            REAL NOT NULL,
+        PRIMARY KEY (document_id, method)
+    );
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -462,8 +477,9 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 15,
-            "migration count pin (connector registry is v14; usage cost_usd is v15)"
+            version, 16,
+            "migration count pin (connector registry is v14; usage cost_usd is v15; \
+             semantic-map doc_layout is v16)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

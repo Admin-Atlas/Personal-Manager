@@ -184,6 +184,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Appearance",
     body: "Switch the visual System (Editorial / Slate / Terminal), Light or Dark mode, the accent colour, and Depth (how much detail is shown). Changes apply instantly and are remembered on this device.",
   },
+  "settings-memory-map": {
+    title: "Memory map",
+    body: "Settings for the Map tab. Default grouping picks how the Map opens — Semantic proximity (similar documents sit together) or By project (each project a hub with its documents around it). Project cohesion (Off by default) gently pulls same-project documents together in the semantic view without abandoning the meaning-driven layout. Maximum nodes caps how many documents are individually plotted; above it, the rest are gathered at their project's spot — raise it for a fuller picture, lower it on a slower machine. Enhanced layout (t-SNE) is a one-time, on-device download that gives the semantic view tighter, clearer clusters than the built-in basic layout; once installed you can switch it on or off, or remove it to free space.",
+  },
   "settings-timezone": {
     title: "Time zone",
     body: "The zone PM reasons about dates in — which day is 'today', when something is 'due soon', and the times in your calendar agenda and briefing. Auto follows this device; switch to Manual to pin a specific zone (useful when you travel and don't want the boundaries to shift).",
@@ -278,7 +282,23 @@ export const HELP: Record<string, HelpEntry> = {
   // Graph
   "graph-canvas": {
     title: "Document map",
-    body: "Each large labelled node is a project hub; the smaller nodes linked to it are its documents. A node's size is how much content it holds (its number of chunks), and its colour is its project — matching the legend. A dashed ring means a document is still awaiting review, or is index-only (it lives in a connected source like Drive, not stored on this device). Hover a document for its details, or click it to open its project.",
+    body: "Each node is a document — its size is how much content it holds (its number of chunks) and its colour is its project, matching the legend. A dashed ring means a document is still awaiting review, or is index-only (it lives in a connected source like Drive rather than on this device). There are two arrangements: in By project (the default), each project becomes a hub with its documents gathered around it and linked to it, so you see how your library is organised; in Semantic proximity, documents that sit close together are about similar things — their position comes from their meaning, not their project. Scroll to zoom (or sideways to pan left/right), drag to pan, and double-click (or the Fit button) to reset the view. Hover a node for its details, or click it to open its project.",
+  },
+  "map-layout-toggle": {
+    title: "How the map is arranged",
+    body: "Switch how documents are laid out. By project (the default) groups documents by where you've filed them: each project is a hub with its documents gathered around it and linked to it, so the map shows how your library is organised. Semantic proximity instead places documents so that similar ones sit close together, worked out from their meaning (a basic layout, computed on your device) — here projects only colour the nodes, they don't decide where a node goes. An optional enhanced layout — t-SNE, which finds tighter, clearer clusters of related documents — can be downloaded from the bar below the header (or Settings → Memory map); it's a one-time download that then runs fully on your device.",
+  },
+  "map-layout-toggle-tsne": {
+    title: "How the map is arranged",
+    body: "Switch how documents are laid out. By project (the default) groups documents by where you've filed them: each project is a hub with its documents gathered around it and linked to it, so the map shows how your library is organised. Semantic proximity places similar documents close together — it's using t-SNE, the enhanced layout you installed, which arranges documents by learned neighbourhoods so related ones form tighter, clearer clusters (projects only colour the nodes here). You can turn t-SNE off, or remove it, in Settings → Memory map. The semantic layout is computed in the background and cached, so the first run after big changes can take a moment.",
+  },
+  "map-cohesion": {
+    title: "Project cohesion",
+    body: "How strongly the semantic layout pulls documents in the same project together. Off (the default) lays everything out purely by meaning. Low, Medium, or High nudge same-project documents a little closer, so each project reads as a looser cluster while meaning still drives the overall shape — a middle ground between Semantic proximity and By project. It applies instantly and changes nothing about how the layout is computed or stored.",
+  },
+  "map-navigate": {
+    title: "Move around the map",
+    body: "Zoom in or out, or fit the whole map back into view. You can also scroll to zoom (scroll sideways to pan left/right), drag anywhere to pan, and double-click to reset the framing.",
   },
 
   // Focus view & projects (Step 5)

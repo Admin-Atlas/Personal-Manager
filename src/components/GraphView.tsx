@@ -3,36 +3,57 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { quadtree, type Quadtree } from "d3-quadtree";
-import { listDocuments } from "../lib/ipc";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import {
+  installOptionalTsne,
+  listDocuments,
+  onLayoutProgress,
+  onTsneInstall,
+  optionalTsneStatus,
+  prioritiseSemanticLayout,
+  semanticLayout,
+} from "../lib/ipc";
 import { formatDate } from "../lib/format";
 import {
+  buildSemanticLayout,
   getProjectLayout,
   type BaseLayout,
   type Bounds,
   type PositionedNode,
 } from "../lib/mapLayout";
+import { IngestProgress } from "./IngestProgress";
 import { Skeleton } from "./ui";
-import type { Document } from "../lib/types";
+import type { Document, SemanticLayout } from "../lib/types";
 import { graphColor, useTheme, useDepth } from "../theme";
 
 /**
- * A map of the store: every project is a hub node, and each document is a small node linked to its
- * project's hub, so the grouping is visible at a glance. Hover a document node for its details; click
- * one to open its project's focused view.
+ * A map of the store, in one of two arrangements the user switches between:
+ *   - **By project** — every project is a hub, each document a node linked to it (the d3-force layout).
+ *   - **Semantic proximity** — documents laid out by meaning (nearby = similar), from a UMAP/t-SNE-style
+ *     projection of their embeddings computed in the background (see `src/lib/layout.rs`); no edges.
  *
- * Rendering is on a single `<canvas>` rather than per-node SVG, so a vault with thousands of nodes (a
- * full Drive sync inflates the count with index-only files) stays smooth: one draw call per frame, and
- * hover/click hit-testing via a d3-quadtree (O(log n)) instead of N DOM listeners. The heavy force
- * layout runs off the main thread on a worker and is pre-warmed at launch (see `src/lib/mapLayout.ts`),
- * so opening the Map doesn't stutter the app. Two efficiency seams carry over: the layout is keyed on
- * the document set only (a theme change re-colours without re-running it), and colour is applied in the
- * draw call (a theme toggle is a redraw, not a recompute).
+ * Rendering is on a single `<canvas>` (one draw call per frame, d3-quadtree hit-testing) so thousands
+ * of nodes — index-only Drive files inflate the count — stay smooth. The view is navigable: scroll to
+ * zoom, drag to pan, double-click (or the Fit button) to reset. Hover a node for its details; click one
+ * (without dragging) to open its project's focused view. Colour is applied in the draw call, so a theme
+ * toggle is a redraw, not a relayout.
  */
 
-/**
- * Themed values the canvas needs as concrete strings, resolved from the document root. Canvas can't
- * read CSS `var(--…)` directly (unlike the old SVG), so we resolve the colours and the UI font here.
- */
+type LayoutMode = "project" | "semantic";
+const MODE_KEY = "pm.map.layoutMode";
+const COHESION_KEY = "pm.map.cohesion";
+
+function initialMode(): LayoutMode {
+  return localStorage.getItem(MODE_KEY) === "semantic" ? "semantic" : "project";
+}
+
+/** Project-cohesion weight (0 = pure meaning, the default; ≤0.5). Per-device, like the mode pref. */
+function initialCohesion(): number {
+  const raw = Number(localStorage.getItem(COHESION_KEY));
+  return Number.isFinite(raw) ? Math.max(0, Math.min(0.5, raw)) : 0;
+}
+
+/** Themed values the canvas needs as concrete strings (canvas can't read CSS `var(--…)`). */
 interface ThemeColors {
   border: string;
   bg: string;
@@ -79,13 +100,34 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   const [base, setBase] = useState<BaseLayout | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<Document | null>(null);
-  // Distinguish "still loading" from "genuinely empty": without this the view would flash
-  // "No documents yet" on every open (documents starts []), before the fetch lands.
   const [loading, setLoading] = useState(true);
+
+  const [layoutMode, setLayoutMode] = useState<LayoutMode>(initialMode);
+  const [cohesion, setCohesion] = useState<number>(initialCohesion);
+  const [semantic, setSemantic] = useState<SemanticLayout | null>(null);
+  const [computing, setComputing] = useState(false);
+  const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
+  const [installingTsne, setInstallingTsne] = useState(false);
+  const [installFrac, setInstallFrac] = useState(0);
+  const [grabbing, setGrabbing] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
-  const transformRef = useRef<Transform | null>(null);
+  // The live world→screen transform (pan/zoom mutate it in place; draw + hit-testing read it).
+  const viewRef = useRef<Transform | null>(null);
+  // The most recent fit transform, for clamping zoom and resetting the view.
+  const fitRef = useRef<Transform | null>(null);
+  // Recompute the fit on the next draw (a fresh layout, or a reset).
+  const needFitRef = useRef(true);
+  // The user has panned/zoomed, so a resize keeps their view instead of refitting.
+  const interactedRef = useRef(false);
+  const dragRef = useRef<{
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastY: number;
+    moved: boolean;
+  } | null>(null);
 
   useEffect(() => {
     listDocuments()
@@ -94,22 +136,102 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       .finally(() => setLoading(false));
   }, []);
 
-  // The layout is async (the force sim runs on a worker, pre-warmed at launch). A cache hit on the
-  // same document set resolves immediately. Guard against a stale set landing after a newer one.
+  useEffect(() => {
+    optionalTsneStatus()
+      .then((s) => setTsneInstalled(s.installed))
+      .catch(() => setTsneInstalled(false));
+  }, []);
+
+  // Persist the chosen arrangement + cohesion (per-device, like the theme/depth prefs).
+  useEffect(() => {
+    localStorage.setItem(MODE_KEY, layoutMode);
+  }, [layoutMode]);
+  useEffect(() => {
+    localStorage.setItem(COHESION_KEY, String(cohesion));
+  }, [cohesion]);
+
+  // Follow the optional-t-SNE download's progress (it can be triggered here or from Settings).
   useEffect(() => {
     let cancelled = false;
-    const job = getProjectLayout(documents);
-    if (!job) {
-      setBase(null);
-      return;
+    let unlisten: UnlistenFn | undefined;
+    void onTsneInstall((e) => {
+      if (!cancelled) setInstallFrac(e.fraction);
+    }).then((u) => {
+      unlisten = u;
+      if (cancelled) u();
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Semantic mode: fetch the cached coords, ask the backend to prioritise a recompute if stale, and
+  // follow the global progress event so the map refreshes when a new layout lands.
+  useEffect(() => {
+    if (layoutMode !== "semantic") return;
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    const load = () =>
+      semanticLayout()
+        .then((d) => {
+          if (!cancelled) {
+            setSemantic(d);
+            setComputing(d.computing);
+          }
+        })
+        .catch(() => {});
+    void load();
+    void prioritiseSemanticLayout().catch(() => {});
+    void onLayoutProgress((e) => {
+      if (cancelled) return;
+      if (e.state === "done") {
+        setComputing(false);
+        void load();
+      } else if (e.state === "preparing" || e.state === "reducing") {
+        setComputing(true);
+      } else {
+        setComputing(false); // deferred / error
+      }
+    }).then((u) => {
+      unlisten = u;
+      if (cancelled) u();
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [layoutMode]);
+
+  // The render layout. Project mode runs the (worker-backed, cached) force layout; semantic mode joins
+  // the backend coords to the documents (optionally blended toward project centroids by `cohesion`).
+  // A stale async result can't overwrite a newer one.
+  useEffect(() => {
+    let cancelled = false;
+    if (layoutMode === "project") {
+      const job = getProjectLayout(documents);
+      if (!job) {
+        setBase(null);
+        return;
+      }
+      job.then((b) => !cancelled && setBase(b)).catch(() => !cancelled && setBase(null));
+    } else {
+      // Don't render a pile of centroids before any coords exist — show the preparing state instead.
+      const coords = semantic?.coords ?? [];
+      setBase(coords.length > 0 ? buildSemanticLayout(documents, coords, cohesion) : null);
     }
-    job.then((b) => !cancelled && setBase(b)).catch(() => !cancelled && setBase(null));
     return () => {
       cancelled = true;
     };
-  }, [documents]);
+  }, [documents, layoutMode, semantic, cohesion]);
 
-  // Project → palette index, for colouring nodes + the legend. Keyed on the layout only.
+  // A new layout (or mode/cohesion change) refits the view; the user's pan/zoom only applies within a
+  // given layout.
+  useEffect(() => {
+    needFitRef.current = true;
+    interactedRef.current = false;
+  }, [base]);
+
   const projectIndex = useMemo(() => {
     const m = new Map<string, number>();
     base?.projectNames.forEach((name, i) => m.set(name, i));
@@ -119,14 +241,11 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     (project: string) => graphColor(projectIndex.get(project) ?? 0, mode),
     [projectIndex, mode],
   );
-
   const legend = useMemo(
     () => base?.projectNames.map((name) => ({ name, color: colorFor(name) })) ?? [],
     [base, colorFor],
   );
 
-  // Hit-testing index over the document nodes (project hubs aren't interactive), in world coords so
-  // it survives resize/zoom. O(log n) lookup is the scale win that keeps thousands of nodes smooth.
   const docQuadtree = useMemo<Quadtree<PositionedNode> | null>(() => {
     if (!base) return null;
     const docs = base.nodes.filter((n) => n.kind === "doc");
@@ -149,7 +268,6 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     const cssH = wrap.clientHeight;
     if (cssW === 0 || cssH === 0) return;
 
-    // Size the backing store for crisp nodes on HiDPI; draw in CSS pixels.
     if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
       canvas.width = Math.round(cssW * dpr);
       canvas.height = Math.round(cssH * dpr);
@@ -157,25 +275,32 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
 
-    const t = fitTransform(base.bounds, cssW, cssH);
-    transformRef.current = t;
+    // Fit on a fresh layout / reset; otherwise keep the user's pan & zoom.
+    if (needFitRef.current || !viewRef.current) {
+      const fit = fitTransform(base.bounds, cssW, cssH);
+      fitRef.current = fit;
+      viewRef.current = fit;
+      needFitRef.current = false;
+    }
+    const t = viewRef.current;
     const sx = (x: number) => x * t.scale + t.offsetX;
     const sy = (y: number) => y * t.scale + t.offsetY;
     const colors = readThemeColors();
 
-    // Edges (one path, single stroke). Node radii scale with the fit (size = content volume, a real
-    // signal); stroke/edge widths stay fixed in screen pixels so they read as crisp chrome at any zoom.
-    ctx.strokeStyle = colors.border;
-    ctx.lineWidth = 0.75;
-    ctx.beginPath();
-    for (const e of base.edges) {
-      ctx.moveTo(sx(e.sx), sy(e.sy));
-      ctx.lineTo(sx(e.tx), sy(e.ty));
+    // Edges (project mode only; one path, single stroke). Node radii scale with the fit (size =
+    // content volume, a real signal); stroke/edge widths stay fixed in screen pixels as crisp chrome.
+    if (base.edges.length > 0) {
+      ctx.strokeStyle = colors.border;
+      ctx.lineWidth = 0.75;
+      ctx.beginPath();
+      for (const e of base.edges) {
+        ctx.moveTo(sx(e.sx), sy(e.sy));
+        ctx.lineTo(sx(e.tx), sy(e.ty));
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
     }
-    ctx.stroke();
-    ctx.setLineDash([]);
 
-    // Nodes.
     for (const n of base.nodes) {
       const color = colorFor(n.project);
       const r = n.radius * t.scale;
@@ -196,7 +321,8 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
         ctx.fillText(n.label, sx(n.x), sy(n.y) - r - 4);
       } else {
         const dashed = isDashed(n.doc);
-        ctx.globalAlpha = 0.85;
+        // Transient (not-yet-projected) semantic nodes sit at a project centroid; draw them faded.
+        ctx.globalAlpha = n.transient ? 0.32 : 0.85;
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.arc(sx(n.x), sy(n.y), r, 0, Math.PI * 2);
@@ -210,7 +336,6 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       }
     }
 
-    // Hovered node redrawn last, fully opaque with an --ink halo (the old SVG overlay, now a draw call).
     if (hovered) {
       const n = base.nodes.find((x) => x.doc?.id === hovered.id);
       if (n) {
@@ -227,17 +352,19 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     }
   }, [base, colorFor, hovered]);
 
-  // Redraw on layout / theme / hover change, batched into a frame.
   useEffect(() => {
     const id = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(id);
   }, [draw]);
 
-  // Redraw on resize (the canvas, unlike the old SVG viewBox, doesn't rescale itself).
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return;
-    const ro = new ResizeObserver(() => requestAnimationFrame(draw));
+    const ro = new ResizeObserver(() => {
+      // Keep the user's framing if they've navigated; otherwise refit to the new size.
+      if (!interactedRef.current) needFitRef.current = true;
+      requestAnimationFrame(draw);
+    });
     ro.observe(wrap);
     return () => ro.disconnect();
   }, [draw]);
@@ -246,21 +373,137 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   const nodeAt = useCallback(
     (clientX: number, clientY: number): PositionedNode | null => {
       const canvas = canvasRef.current;
-      const t = transformRef.current;
+      const t = viewRef.current;
       if (!canvas || !t || !docQuadtree) return null;
       const rect = canvas.getBoundingClientRect();
       const wx = (clientX - rect.left - t.offsetX) / t.scale;
       const wy = (clientY - rect.top - t.offsetY) / t.scale;
-      const hit = docQuadtree.find(wx, wy, 18);
+      // Allow a constant ~6 screen-px slop on top of the node's world radius, so nodes stay easy to
+      // hit when zoomed out (where a node covers few pixels).
+      const tol = 6 / t.scale;
+      const hit = docQuadtree.find(wx, wy, 16 + tol + 2);
       if (!hit) return null;
       const d = Math.hypot(hit.x - wx, hit.y - wy);
-      return d <= hit.radius + 2 ? hit : null;
+      return d <= hit.radius + tol ? hit : null;
     },
     [docQuadtree],
   );
 
+  // Keep the latest callbacks reachable from the once-attached native/window listeners.
+  const drawRef = useRef(draw);
+  const nodeAtRef = useRef(nodeAt);
+  const onOpenRef = useRef(onOpenProject);
+  useEffect(() => {
+    drawRef.current = draw;
+    nodeAtRef.current = nodeAt;
+    onOpenRef.current = onOpenProject;
+  });
+
+  /** Zoom about a point (screen px), clamped so the whole map is never smaller than half the fit. */
+  const zoomAt = useCallback((px: number, py: number, factor: number) => {
+    const t = viewRef.current;
+    if (!t) return;
+    const fitScale = fitRef.current?.scale ?? t.scale;
+    const wx = (px - t.offsetX) / t.scale;
+    const wy = (py - t.offsetY) / t.scale;
+    const scale = Math.min(fitScale * 16, Math.max(fitScale * 0.5, t.scale * factor));
+    viewRef.current = { scale, offsetX: px - wx * scale, offsetY: py - wy * scale };
+    interactedRef.current = true;
+    setHovered(null);
+    requestAnimationFrame(() => drawRef.current());
+  }, []);
+
+  const zoomButton = useCallback(
+    (factor: number) => {
+      const wrap = wrapRef.current;
+      if (!wrap) return;
+      zoomAt(wrap.clientWidth / 2, wrap.clientHeight / 2, factor);
+    },
+    [zoomAt],
+  );
+
+  const resetView = useCallback(() => {
+    needFitRef.current = true;
+    interactedRef.current = false;
+    requestAnimationFrame(() => drawRef.current());
+  }, []);
+
+  // Native, non-passive wheel listener (React's onWheel is passive, so it can't preventDefault).
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const onWheel = (e: WheelEvent) => {
+      const canvas = canvasRef.current;
+      const t = viewRef.current;
+      if (!canvas || !t) return;
+      e.preventDefault();
+      // A horizontal-dominant wheel (trackpad side-swipe or Shift+wheel) pans left/right; a vertical
+      // wheel zooms toward the cursor. Scrolling right reveals content to the right.
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        viewRef.current = { ...t, offsetX: t.offsetX - e.deltaX };
+        interactedRef.current = true;
+        setHovered(null);
+        requestAnimationFrame(() => drawRef.current());
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const factor = Math.exp(-e.deltaY * 0.0015);
+      zoomAt(e.clientX - rect.left, e.clientY - rect.top, factor);
+    };
+    wrap.addEventListener("wheel", onWheel, { passive: false });
+    return () => wrap.removeEventListener("wheel", onWheel);
+  }, [zoomAt]);
+
+  // Pan with a window-level drag (so it keeps tracking outside the canvas), and treat a press that
+  // didn't move as a click that opens the project under it.
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const drag = dragRef.current;
+      const t = viewRef.current;
+      if (!drag || !t) return;
+      const dx = e.clientX - drag.lastX;
+      const dy = e.clientY - drag.lastY;
+      drag.lastX = e.clientX;
+      drag.lastY = e.clientY;
+      if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) > 3) drag.moved = true;
+      viewRef.current = { ...t, offsetX: t.offsetX + dx, offsetY: t.offsetY + dy };
+      interactedRef.current = true;
+      setHovered(null);
+      requestAnimationFrame(() => drawRef.current());
+    };
+    const onUp = (e: MouseEvent) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      dragRef.current = null;
+      setGrabbing(false);
+      if (!drag.moved) {
+        const hit = nodeAtRef.current(e.clientX, e.clientY);
+        if (hit?.doc && onOpenRef.current) onOpenRef.current(hit.doc.project);
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const onCanvasMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    dragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      moved: false,
+    };
+    setGrabbing(true);
+  }, []);
+
   const onMouseMove = useCallback(
     (e: React.MouseEvent) => {
+      if (dragRef.current) return; // panning — no hover
       const hit = nodeAt(e.clientX, e.clientY);
       const doc = hit?.doc ?? null;
       setHovered((cur) => (cur?.id === doc?.id ? cur : doc));
@@ -268,31 +511,73 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     [nodeAt],
   );
   const onMouseLeave = useCallback(() => setHovered(null), []);
-  const onClick = useCallback(
-    (e: React.MouseEvent) => {
-      const hit = nodeAt(e.clientX, e.clientY);
-      if (hit?.doc && onOpenProject) onOpenProject(hit.doc.project);
-    },
-    [nodeAt, onOpenProject],
-  );
+
+  const installTsne = useCallback(() => {
+    setInstallingTsne(true);
+    setInstallFrac(0);
+    installOptionalTsne()
+      .then(() => optionalTsneStatus())
+      .then((s) => setTsneInstalled(s.installed))
+      .catch((e) => setError(String(e)))
+      .finally(() => setInstallingTsne(false));
+  }, []);
+
+  const placed = semantic?.coords.length ?? 0;
+  const subtitle =
+    layoutMode === "semantic"
+      ? placed > 0 && placed < documents.length
+        ? `showing the top ${placed} of ${documents.length} documents by meaning · scroll to zoom, drag to pan`
+        : `${documents.length} document${documents.length === 1 ? "" : "s"} by meaning · scroll to zoom, drag to pan`
+      : `${documents.length} document${documents.length === 1 ? "" : "s"} across ${legend.length} project${legend.length === 1 ? "" : "s"} · scroll to zoom, drag to pan, click to open`;
+
+  // The toggle's help differs by whether t-SNE is installed (explain what it is vs that it's running).
+  const toggleHelp = tsneInstalled ? "map-layout-toggle-tsne" : "map-layout-toggle";
+  const cursor = grabbing ? "grabbing" : hovered ? "pointer" : "grab";
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between border-b border-border px-6 py-3">
-        <div data-help="nav-graph">
-          <h1 className="text-sm font-semibold font-head text-ink">Map</h1>
-          {loading ? (
-            <Skeleton className="mt-1 h-3 w-56" />
-          ) : (
-            <p className="text-xs text-ink3">
-              {documents.length} document{documents.length === 1 ? "" : "s"} across {legend.length}{" "}
-              project{legend.length === 1 ? "" : "s"} · hover a node for details, click to open its
-              project
-            </p>
+      <header className="flex items-center justify-between gap-4 border-b border-border px-6 py-3">
+        <div className="flex items-center gap-4">
+          <div data-help="nav-graph">
+            <h1 className="text-sm font-semibold font-head text-ink">Map</h1>
+            {loading ? (
+              <Skeleton className="mt-1 h-3 w-56" />
+            ) : (
+              <p className="text-xs text-ink3">{subtitle}</p>
+            )}
+          </div>
+          <div
+            className="flex rounded-[var(--radius-sm)] border border-border p-0.5 text-xs"
+            data-help={toggleHelp}
+          >
+            <ModeButton active={layoutMode === "project"} onClick={() => setLayoutMode("project")}>
+              By project
+            </ModeButton>
+            <ModeButton
+              active={layoutMode === "semantic"}
+              onClick={() => setLayoutMode("semantic")}
+            >
+              Semantic
+            </ModeButton>
+          </div>
+          {layoutMode === "semantic" && (
+            <label className="flex items-center gap-1.5 text-xs text-ink3" data-help="map-cohesion">
+              <span>Cohesion</span>
+              <select
+                value={String(cohesion)}
+                onChange={(e) => setCohesion(Number(e.target.value))}
+                className="rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 text-xs text-ink2 outline-none transition focus:border-accent"
+              >
+                <option value="0">Off</option>
+                <option value="0.15">Low</option>
+                <option value="0.3">Medium</option>
+                <option value="0.5">High</option>
+              </select>
+            </label>
           )}
         </div>
         {base && (
-          <div className="flex max-w-[60%] flex-wrap justify-end gap-x-3 gap-y-1">
+          <div className="flex max-w-[50%] flex-wrap justify-end gap-x-3 gap-y-1">
             {legend.map((p) => (
               <span key={p.name} className="inline-flex items-center gap-1.5 text-xs text-ink2">
                 <span
@@ -305,6 +590,16 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
           </div>
         )}
       </header>
+
+      {layoutMode === "semantic" && (
+        <SemanticBar
+          computing={computing}
+          tsneInstalled={tsneInstalled}
+          installing={installingTsne}
+          installFrac={installFrac}
+          onInstall={installTsne}
+        />
+      )}
 
       <div className="relative flex-1 overflow-hidden" data-help="graph-canvas" ref={wrapRef}>
         {error && (
@@ -321,38 +616,169 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
         )}
 
         {loading ? (
-          // A node-cluster shimmer that mirrors the map's shape, so the load reads as
-          // "your map is coming" rather than "you have nothing".
-          <div className="flex h-full items-center justify-center">
-            <div className="flex flex-col items-center gap-8" aria-hidden>
-              <div className="flex items-end gap-10">
-                <Skeleton className="h-9 w-9" style={{ borderRadius: "9999px" }} />
-                <Skeleton className="h-16 w-16" style={{ borderRadius: "9999px" }} />
-                <Skeleton className="h-11 w-11" style={{ borderRadius: "9999px" }} />
-              </div>
-              <div className="flex items-center gap-12">
-                <Skeleton className="h-7 w-7" style={{ borderRadius: "9999px" }} />
-                <Skeleton className="h-14 w-14" style={{ borderRadius: "9999px" }} />
-                <Skeleton className="h-8 w-8" style={{ borderRadius: "9999px" }} />
-              </div>
-            </div>
-          </div>
-        ) : !base ? (
+          <MapSkeleton />
+        ) : documents.length === 0 ? (
           <div className="flex h-full items-center justify-center text-sm text-ink4">
             No documents yet. Ingest some in the Documents view and they'll appear here.
           </div>
+        ) : !base ? (
+          // Semantic mode with no coords yet: the background job is preparing the first layout.
+          <div className="flex h-full flex-col items-center justify-center gap-5 text-sm text-ink4">
+            <div className="flex items-end gap-8" aria-hidden>
+              <Skeleton className="h-8 w-8" style={{ borderRadius: "9999px" }} />
+              <Skeleton className="h-12 w-12" style={{ borderRadius: "9999px" }} />
+              <Skeleton className="h-9 w-9" style={{ borderRadius: "9999px" }} />
+            </div>
+            <span>Preparing the semantic map…</span>
+          </div>
         ) : (
-          <canvas
-            ref={canvasRef}
-            className="h-full w-full"
-            style={{ cursor: hovered ? "pointer" : "default" }}
-            onMouseMove={onMouseMove}
-            onMouseLeave={onMouseLeave}
-            onClick={onClick}
-          />
+          <>
+            <canvas
+              ref={canvasRef}
+              className="h-full w-full"
+              style={{ cursor }}
+              onMouseDown={onCanvasMouseDown}
+              onMouseMove={onMouseMove}
+              onMouseLeave={onMouseLeave}
+              onDoubleClick={resetView}
+            />
+            <NavControls
+              onZoomIn={() => zoomButton(1.3)}
+              onZoomOut={() => zoomButton(1 / 1.3)}
+              onReset={resetView}
+            />
+          </>
         )}
 
         {hovered && <DetailCard doc={hovered} />}
+      </div>
+    </div>
+  );
+}
+
+function ModeButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-[calc(var(--radius-sm)-2px)] px-2.5 py-1 transition-colors ${
+        active ? "bg-accent text-accent-ink" : "text-ink3 hover:text-ink"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Zoom + fit controls, bottom-right over the canvas. */
+function NavControls({
+  onZoomIn,
+  onZoomOut,
+  onReset,
+}: {
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onReset: () => void;
+}) {
+  const btn =
+    "flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] border border-border bg-surface/85 text-ink2 backdrop-blur transition hover:text-ink hover:border-border2";
+  return (
+    <div className="absolute bottom-4 right-4 z-10 flex flex-col gap-1.5" data-help="map-navigate">
+      <button type="button" className={btn} onClick={onZoomIn} aria-label="Zoom in" title="Zoom in">
+        +
+      </button>
+      <button
+        type="button"
+        className={btn}
+        onClick={onZoomOut}
+        aria-label="Zoom out"
+        title="Zoom out"
+      >
+        −
+      </button>
+      <button
+        type="button"
+        className={btn}
+        onClick={onReset}
+        aria-label="Fit to view"
+        title="Fit to view"
+      >
+        ⤢
+      </button>
+    </div>
+  );
+}
+
+/** The strip under the header in semantic mode — only shown when there's status to report (a download
+ *  in progress, a recompute, or the not-installed nudge); otherwise it renders nothing. */
+function SemanticBar({
+  computing,
+  tsneInstalled,
+  installing,
+  installFrac,
+  onInstall,
+}: {
+  computing: boolean;
+  tsneInstalled: boolean | null;
+  installing: boolean;
+  installFrac: number;
+  onInstall: () => void;
+}) {
+  if (!installing && !computing && tsneInstalled !== false) return null;
+  return (
+    <div className="flex min-h-[1.75rem] items-center gap-2 border-b border-border bg-panel px-6 py-1.5 text-xs text-ink3">
+      {installing ? (
+        <IngestProgress
+          mode="percent"
+          processed={Math.round(installFrac * 100)}
+          total={100}
+          label="Downloading the enhanced (t-SNE) layout"
+          className="w-full max-w-xs"
+        />
+      ) : computing ? (
+        <>
+          <Skeleton className="h-2 w-2" style={{ borderRadius: "9999px" }} />
+          Updating the map by meaning…
+        </>
+      ) : (
+        <>
+          <span>Using the basic layout.</span>
+          <button
+            type="button"
+            onClick={onInstall}
+            className="font-medium text-accent hover:underline"
+          >
+            Enable enhanced (t-SNE) →
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** A node-cluster shimmer that mirrors the map's shape, so a load reads as "your map is coming". */
+function MapSkeleton() {
+  return (
+    <div className="flex h-full items-center justify-center">
+      <div className="flex flex-col items-center gap-8" aria-hidden>
+        <div className="flex items-end gap-10">
+          <Skeleton className="h-9 w-9" style={{ borderRadius: "9999px" }} />
+          <Skeleton className="h-16 w-16" style={{ borderRadius: "9999px" }} />
+          <Skeleton className="h-11 w-11" style={{ borderRadius: "9999px" }} />
+        </div>
+        <div className="flex items-center gap-12">
+          <Skeleton className="h-7 w-7" style={{ borderRadius: "9999px" }} />
+          <Skeleton className="h-14 w-14" style={{ borderRadius: "9999px" }} />
+          <Skeleton className="h-8 w-8" style={{ borderRadius: "9999px" }} />
+        </div>
       </div>
     </div>
   );
