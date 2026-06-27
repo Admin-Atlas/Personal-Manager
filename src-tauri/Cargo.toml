@@ -33,7 +33,7 @@ zeroize = "1"
 tempfile = "3"
 # Bundle the data folder (store snapshot + Markdown vault) into one .zip for the
 # "Export all data" button. default-features off keeps it to deflate (no bzip2/zstd/aes).
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Encrypted store (SQLCipher / AES-256) + vectors (sqlite-vec) + keyword (FTS5),
 # all in one bundled, vendored connection — no system SQLite needed.
