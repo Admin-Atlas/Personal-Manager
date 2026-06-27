@@ -360,28 +360,6 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       }
     }
 
-    // File-name labels under each document node (opt-in). The text is world-scaled — tiny when zoomed
-    // out, larger as you zoom in (no fixed screen size) — and truncated to the node's width, so a long
-    // name reads in full only once you zoom into it. We skip nodes that are off-screen or too small to
-    // read, which both declutters the map and bounds the per-frame cost on a big library.
-    if (showLabels) {
-      ctx.fillStyle = colors.ink2;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
-      const fontPx = 10 * t.scale;
-      ctx.font = `500 ${fontPx}px ${colors.uiFont}`;
-      for (const n of base.nodes) {
-        if (n.kind !== "doc") continue;
-        const r = n.radius * t.scale;
-        if (r < 4) continue; // unreadable when zoomed out — skip
-        const cx = sx(n.x);
-        const cy = sy(n.y);
-        if (cx < -60 || cx > cssW + 60 || cy < -20 || cy > cssH + fontPx + 20) continue;
-        const text = fitLabel(ctx, n.label, r * 2);
-        if (text) ctx.fillText(text, cx, cy + r + 1);
-      }
-    }
-
     if (hovered) {
       const n = base.nodes.find((x) => x.doc?.id === hovered.id);
       if (n) {
@@ -394,6 +372,36 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
         ctx.lineWidth = 2;
         ctx.setLineDash([]);
         ctx.stroke();
+      }
+    }
+
+    // File-name labels centred inside each document node (opt-in). Sized relative to the node — so a
+    // readable ~10–15 characters fit and the text always sits within the circle (it scales with the
+    // node as you zoom, never a fixed screen size) — and truncated to the node's width, so a long name
+    // shows a prefix; zoom into a bigger node to read more. A contrasting halo keeps it legible on any
+    // node colour; nodes that are off-screen or too small to read are skipped, bounding the per-frame
+    // cost on a large library.
+    if (showLabels) {
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.lineJoin = "round";
+      ctx.setLineDash([]);
+      for (const n of base.nodes) {
+        if (n.kind !== "doc") continue;
+        const r = n.radius * t.scale;
+        if (r < 12) continue; // too small to read — skip (also bounds how many labels we draw)
+        const cx = sx(n.x);
+        const cy = sy(n.y);
+        if (cx < -r || cx > cssW + r || cy < -r || cy > cssH + r) continue;
+        const fontPx = r * 0.25;
+        ctx.font = `500 ${fontPx}px ${colors.uiFont}`;
+        const text = fitLabel(ctx, n.label, r * 1.8);
+        if (!text) continue;
+        ctx.lineWidth = Math.max(1.5, fontPx * 0.14);
+        ctx.strokeStyle = colors.bg;
+        ctx.strokeText(text, cx, cy);
+        ctx.fillStyle = colors.ink;
+        ctx.fillText(text, cx, cy);
       }
     }
   }, [base, colorFor, hovered, showLabels]);
