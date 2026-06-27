@@ -241,7 +241,8 @@ pub fn set_state(conn: &Connection, email: &str, state: &str) -> Result<()> {
 }
 
 /// Disconnect one account: soft-flag its items `unreachable` (kept findable), drop the registry row,
-/// and forget its token. Never hard-deletes the indexed documents.
+/// and forget its token plus any per-account (Advanced-Protection) client. Never hard-deletes the
+/// indexed documents.
 pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
     conn.execute(
         "UPDATE documents SET source_state = 'unreachable' \
@@ -253,6 +254,9 @@ pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
         params![account_id(email)],
     )?;
     secrets::clear_google_token_for(&account_token_key(email)).ok();
+    // Forget the account's own Cloud-project client too, so reconnecting later with the shared
+    // client isn't silently overridden by stale per-account creds (see `client_creds_for_key`).
+    secrets::clear_google_client_for_account(email).ok();
     Ok(())
 }
 

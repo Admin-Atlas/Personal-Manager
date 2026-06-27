@@ -2123,12 +2123,13 @@ pub async fn connect_google_calendar_account(
 }
 
 /// Disconnect one Google Calendar account: drop its registry source (cascading its calendars +
-/// mirrored events) and forget its token.
+/// mirrored events) and forget its token plus any per-account (Advanced-Protection) client.
 #[tauri::command]
 pub fn disconnect_google_calendar_account(state: State<'_, AppState>, email: String) -> Result<()> {
     let conn = state.conn()?;
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
     secrets::clear_google_token_for(&google_calendar_token_key(&email)).ok();
+    secrets::clear_google_client_for_account(&email).ok();
     Ok(())
 }
 

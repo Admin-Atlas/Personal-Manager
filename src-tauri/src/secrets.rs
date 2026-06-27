@@ -136,12 +136,6 @@ pub fn get_google_client_secret_for_account(email: &str) -> Result<Option<Secret
     Ok(get(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"))?.map(Secret::from))
 }
 
-/// True once a per-account client (both id + secret) is stored for `email`.
-pub fn has_google_client_for_account(email: &str) -> Result<bool> {
-    Ok(get(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"))?.is_some()
-        && get(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"))?.is_some())
-}
-
 /// Store an account's own client credentials together (overwrites — reconnecting re-sets the same).
 pub fn set_google_client_for_account(
     email: &str,
