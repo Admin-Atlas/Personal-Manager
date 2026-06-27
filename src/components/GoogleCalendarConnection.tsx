@@ -14,19 +14,20 @@ import type { CalendarStatus, GoogleCalendar } from "../lib/types";
 import { useDevMode } from "../lib/capabilities";
 import { Button, ConfirmDialog, Skeleton } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
-import { GoogleCredentialBlock } from "./GoogleCredentialBlock";
 
 /**
- * **Google Calendar** (read-only OAuth) — the per-service connection under the Connectors tab's
- * Calendar section. Moved verbatim from the old standalone Calendar settings tab; the backend
- * (`connect_google` / `sync_calendar` / the `calendar_events` mirror) is unchanged.
+ * **Google Calendar** (read-only OAuth) — the calendar connection under the Connectors tab's Google
+ * group. The shared, provider-level BYO Google client is set up once at the group level (see
+ * {@link "./ConnectorsSettings"}); this component offers Connect → browser, a calendar picker, Sync,
+ * and Disconnect once that client is configured. Once the user signs in, PM mirrors the selected
+ * calendars and uses them for the agenda, schedule questions in chat, and the focus view's "Due
+ * soon" status.
  *
- * It reuses the shared, provider-level {@link GoogleCredentialBlock} (the one BYO Google client)
- * for sign-in setup, then offers Connect → browser, a calendar picker, Sync, and Disconnect. Once
- * the user signs in, PM mirrors the selected calendars and uses them for the agenda, schedule
- * questions in chat, and the focus view's "Due soon" status.
+ * `refreshSignal` is bumped by the parent Google group when the shared client is saved/cleared, so
+ * this view refetches its status. (Single Google account today; multi-account Calendar is a planned
+ * follow-up.)
  */
-export function GoogleCalendarConnection() {
+export function GoogleCalendarConnection({ refreshSignal = 0 }: { refreshSignal?: number }) {
   const { devMode } = useDevMode();
   const [status, setStatus] = useState<CalendarStatus | null>(null);
   const [calendars, setCalendars] = useState<GoogleCalendar[] | null>(null);
@@ -51,9 +52,10 @@ export function GoogleCalendarConnection() {
     }
   }, []);
 
+  // Refetch on mount, and whenever the parent Google group reports the shared client changed.
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, refreshSignal]);
 
   useEffect(() => {
     if (status?.oauth_connected) void loadCalendars();
@@ -126,10 +128,10 @@ export function GoogleCalendarConnection() {
         chat, and the “Due soon” status when an event names a project.
       </p>
 
-      {!connected && (
-        <div className="mt-2">
-          <GoogleCredentialBlock configured={configured} onChange={refresh} />
-        </div>
+      {!configured && (
+        <p className="mt-2 text-xs text-ink4">
+          Set up <span className="text-ink2">Google sign-in</span> above to connect your calendar.
+        </p>
       )}
 
       {configured && !connected && (

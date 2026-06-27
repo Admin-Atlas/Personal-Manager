@@ -14,20 +14,23 @@ import {
 import type { DriveAccount, DriveStatus, DriveSyncReport } from "../lib/types";
 import { Button, Collapsible, ConfirmDialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
-import { GoogleCredentialBlock } from "./GoogleCredentialBlock";
 import { SharedDrivesManager } from "./DriveSharedDrives";
 
 /**
  * **Google Drive** (read-only, index-only) — the first cloud-API connector (board card 4A), under
- * the Connectors tab's Drive section. Reuses the shared {@link GoogleCredentialBlock} for the BYO
- * Google client, then connects one or more Drive accounts. Each connected account is **independent**
- * — its own sign-in, sync, and indexed items.
+ * the Connectors tab's Google group. The shared BYO Google client + the multi-account guidance live
+ * once at the provider level (see {@link "./ConnectorsSettings"}); this component just connects one
+ * or more Drive accounts once that client is configured. Each connected account is **independent** —
+ * its own sign-in, sync, and indexed items.
+ *
+ * `refreshSignal` is bumped by the parent Google group when the shared client is saved/cleared, so
+ * this view refetches its status (and its connect button / account list reflects the new state).
  *
  * Every file is **index-only**: PM stores a searchable pointer + a short summary, never the bytes;
  * the full file stays in Drive and is fetched on demand. The first sync walks the whole Drive (the
  * banner warns it can be slow); later syncs apply only what changed.
  */
-export function GoogleDriveConnection() {
+export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: number }) {
   const [status, setStatus] = useState<DriveStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -52,9 +55,10 @@ export function GoogleDriveConnection() {
     }
   }, []);
 
+  // Refetch on mount, and whenever the parent Google group reports the shared client changed.
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, refreshSignal]);
 
   // Mirror "is a sync on screen" into a ref for callbacks that outlive their render (see `sync`).
   useEffect(() => {
@@ -168,9 +172,9 @@ export function GoogleDriveConnection() {
       </p>
 
       {!configured ? (
-        <div className="mt-2">
-          <GoogleCredentialBlock configured={false} onChange={refresh} />
-        </div>
+        <p className="mt-2 text-xs text-ink4">
+          Set up <span className="text-ink2">Google sign-in</span> above to connect a Drive account.
+        </p>
       ) : (
         <>
           <div
@@ -205,6 +209,14 @@ export function GoogleDriveConnection() {
                 </li>
               ))}
             </ul>
+          )}
+
+          {accounts.length === 0 && (
+            <p className="mt-3 text-xs text-ink4">
+              You’ll be asked which Google account to use — connect your <strong>main</strong> one
+              first; it heads the list. You can add more accounts afterwards, and each is indexed
+              independently.
+            </p>
           )}
 
           <div className="mt-3">
