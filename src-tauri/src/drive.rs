@@ -36,6 +36,13 @@ const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_PAGES: usize = 1000;
 /// The field projection for a Drive file — kept tight (only what the connector needs).
 const FILE_FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum,trashed,webViewLink";
+/// Drive's folder MIME type (folders are containers we walk, never files we index).
+const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+
+/// My Drive's root-folder alias. Doubles as the sentinel `drive_id` the folder picker / enumeration
+/// pass to mean "the personal drive" rather than a shared drive's id (`'root' in parents` lists
+/// My Drive's top level; shared-drive ids never equal the literal `"root"`).
+pub const MY_DRIVE_ROOT: &str = "root";
 
 const PROVIDER: &str = "google";
 const SERVICE: &str = "drive";
@@ -317,9 +324,15 @@ pub struct SharedSelection {
 /// (My Drive on, no shared drives) so every pre-existing account behaves exactly as before.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriveScope {
-    /// Index the personal My Drive (delta-cursor sync). Default `true`.
+    /// Index the personal My Drive. Default `true`.
     #[serde(default = "yes")]
     pub my_drive: bool,
+    /// How much of My Drive to index: `None` = the **entire** personal drive (the default —
+    /// delta-cursor sync); `Some(ids)` = only these folders (recursively, re-enumerated + reconciled
+    /// each sync, no cursor — the changes feed can't be folder-scoped). Absent in older stored scopes,
+    /// so it defaults to whole-drive and every pre-existing account behaves exactly as before.
+    #[serde(default)]
+    pub my_drive_folders: Option<Vec<String>>,
     /// Opted-in shared drives (each re-enumerated + reconciled per sync).
     #[serde(default)]
     pub shared: Vec<SharedSelection>,
@@ -333,6 +346,7 @@ impl Default for DriveScope {
     fn default() -> Self {
         DriveScope {
             my_drive: true,
+            my_drive_folders: None,
             shared: Vec::new(),
         }
     }
@@ -356,11 +370,12 @@ pub fn get_scope(conn: &Connection, email: &str) -> Result<DriveScope> {
     }
 }
 
-/// Persist an account's indexing scope, and **prune stale delta cursors** to match: keep My Drive's
-/// and the cursor of any drive that is still a *whole-drive* selection; drop the rest. A drive that
-/// was removed, or switched to folder-scoped (which uses no cursor), thus loses its cursor — so a
-/// later switch back to whole-drive re-baselines with a fresh enumeration instead of resuming from a
-/// token that predates out-of-scope soft-deletes.
+/// Persist an account's indexing scope, and **prune stale delta cursors** to match: keep the cursor
+/// of any corpus that is still a *whole-drive* selection — My Drive (when on and not folder-scoped)
+/// and each whole-drive shared selection — and drop the rest. A corpus that was removed, or switched
+/// to folder-scoped (which uses no cursor), thus loses its cursor — so a later switch back to
+/// whole-drive re-baselines with a fresh enumeration instead of resuming from a token that predates
+/// out-of-scope soft-deletes.
 pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<()> {
     let json = serde_json::to_string(scope)
         .map_err(|e| Error::Other(format!("encode drive scope: {e}")))?;
@@ -370,8 +385,18 @@ pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<(
         .filter(|s| s.folders.is_none())
         .map(|s| s.drive_id.as_str())
         .collect();
+    // Keep My Drive's cursor only while it stays a *whole-drive* selection; switching it to
+    // folder-scoped (which uses no cursor) drops it, so a later switch back re-baselines with a fresh
+    // enumeration instead of resuming from a token that predates out-of-scope soft-deletes.
+    let keep_my = scope.my_drive && scope.my_drive_folders.is_none();
     let mut cursors = read_cursors(conn, email)?;
-    cursors.retain(|k, _| k == MY_DRIVE_CURSOR_KEY || keep.contains(k.as_str()));
+    cursors.retain(|k, _| {
+        if k == MY_DRIVE_CURSOR_KEY {
+            keep_my
+        } else {
+            keep.contains(k.as_str())
+        }
+    });
     let cursor_json = serde_json::to_string(&cursors)
         .map_err(|e| Error::Other(format!("encode drive cursors: {e}")))?;
     conn.execute(
@@ -398,6 +423,23 @@ pub fn known_shared_source_ids(
     )?;
     let rows: Vec<String> = stmt
         .query_map(params![shared_prefix(email, drive_id)], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Every currently-healthy indexed **My Drive** item id for one account — the set the folder-scoped
+/// reconcile diffs against (same role as [`known_shared_source_ids`]). My Drive items are
+/// `gdrive:<email>:<fileId>`; the `NOT LIKE …:sd:%` excludes shared-drive items, which share the
+/// account prefix but are reconciled per shared drive on their own.
+pub fn known_my_drive_source_ids(conn: &Connection, email: &str) -> Result<Vec<String>> {
+    let prefix = format!("{}:", account_id(email));
+    let mut stmt = conn.prepare(
+        "SELECT source_id FROM documents \
+         WHERE source_type = 'index_only' AND source_state = 'ok' \
+           AND source_id LIKE ?1 || '%' AND source_id NOT LIKE ?1 || 'sd:%'",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(params![prefix], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     Ok(rows)
 }
@@ -702,6 +744,25 @@ fn files_url(page: Option<&str>) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// A personal-corpus (My Drive) `files.list` URL for an arbitrary `q` — the My-Drive counterpart to
+/// `shared_files_url` (no `corpora`/`driveId`, so it stays on the personal drive). Used by the My-Drive
+/// folder walk and folder picker.
+fn my_files_url(q: &str, page: Option<&str>) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/files"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("q", q);
+        qp.append_pair("pageSize", "200");
+        qp.append_pair("spaces", "drive");
+        qp.append_pair("fields", &format!("nextPageToken,files({FILE_FIELDS})"));
+        if let Some(t) = page {
+            qp.append_pair("pageToken", t);
+        }
+    }
+    Ok(url.to_string())
+}
+
 /// Enumerate every non-trashed file in My Drive (paginated) — the first-sync baseline.
 pub async fn enumerate_drive(token_key: &str) -> Result<Vec<DriveFile>> {
     let mut out = Vec::new();
@@ -785,27 +846,36 @@ fn shared_files_url(
     Ok(url.to_string())
 }
 
-/// The immediate subfolders of `parent_id` within a shared drive — one lazy level of the folder
-/// picker (the drive root's id == the drive id, so the top level passes `parent_id == drive_id`).
+/// The immediate subfolders of `parent_id` — one lazy level of the folder picker. `drive_id` selects
+/// the corpus: the `MY_DRIVE_ROOT` sentinel walks the **personal** My Drive (its top level passes
+/// `parent_id == MY_DRIVE_ROOT`); any other id is a **shared** drive (whose root id equals the drive
+/// id, so the top level passes `parent_id == drive_id`).
 pub async fn list_folders(
     token_key: &str,
     drive_id: &str,
     parent_id: &str,
 ) -> Result<Vec<DriveFolder>> {
-    let q = format!(
-        "'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    );
+    let my_drive = drive_id == MY_DRIVE_ROOT;
+    let q = format!("'{parent_id}' in parents and mimeType = '{FOLDER_MIME}' and trashed = false");
     let mut out = Vec::new();
     let mut page: Option<String> = None;
     for _ in 0..MAX_PAGES {
-        let url = shared_files_url(drive_id, &q, "id,name", "name", page.as_deref())?;
+        let url = if my_drive {
+            my_files_url(&q, page.as_deref())?
+        } else {
+            shared_files_url(drive_id, &q, "id,name", "name", page.as_deref())?
+        };
         let v = google::authorized_get(token_key, &url).await?;
         let (folders, next) = parse_folders(&v);
         out.extend(folders);
-        match next {
-            Some(t) => page = Some(t),
-            None => return Ok(out),
+        if next.is_none() {
+            break;
         }
+        page = next;
+    }
+    // The personal corpus isn't server-sorted by name (no `orderBy`); sort for a stable picker.
+    if my_drive {
+        out.sort_by_key(|a| a.name.to_lowercase());
     }
     Ok(out)
 }
@@ -842,46 +912,64 @@ pub async fn enumerate_shared(
             Ok(out)
         }
         Some(roots) => {
-            use std::collections::HashSet;
-            let folder_mime = "application/vnd.google-apps.folder";
-            let mut out: Vec<DriveFile> = Vec::new();
-            let mut seen_folders: HashSet<String> = HashSet::new();
-            let mut seen_files: HashSet<String> = HashSet::new();
-            let mut queue: Vec<String> = roots.to_vec();
-            let mut nodes = 0usize;
-            while let Some(folder) = queue.pop() {
-                if !seen_folders.insert(folder.clone()) {
-                    continue; // a folder reachable two ways (nested selections) — walk it once.
-                }
-                nodes += 1;
-                if nodes > MAX_PAGES {
-                    eprintln!(
-                        "drive: shared folder walk hit the node guard at {MAX_PAGES} folders"
-                    );
-                    break;
-                }
-                let q = format!("'{folder}' in parents and trashed = false");
-                let mut page: Option<String> = None;
-                loop {
-                    let url = shared_files_url(drive_id, &q, FILE_FIELDS, "", page.as_deref())?;
-                    let v = google::authorized_get(token_key, &url).await?;
-                    let (children, next) = parse_files(&v);
-                    for child in children {
-                        if child.mime_type == folder_mime {
-                            queue.push(child.id);
-                        } else if seen_files.insert(child.id.clone()) {
-                            out.push(child);
-                        }
-                    }
-                    match next {
-                        Some(t) => page = Some(t),
-                        None => break,
-                    }
-                }
-            }
-            Ok(out)
+            walk_folders(token_key, roots, |q, page| {
+                shared_files_url(drive_id, q, FILE_FIELDS, "", page)
+            })
+            .await
         }
     }
+}
+
+/// Walk a set of root folders (recursively, breadth via a queue), collecting the non-folder files
+/// beneath them — deduped, and each folder walked once even if reachable from two selections. The
+/// `url_for(q, page)` closure builds each `files.list` page URL, so My Drive (`my_files_url`) and
+/// shared drives (`shared_files_url`) share one walk. Folders themselves are never returned.
+async fn walk_folders(
+    token_key: &str,
+    roots: &[String],
+    url_for: impl Fn(&str, Option<&str>) -> Result<String>,
+) -> Result<Vec<DriveFile>> {
+    use std::collections::HashSet;
+    let mut out: Vec<DriveFile> = Vec::new();
+    let mut seen_folders: HashSet<String> = HashSet::new();
+    let mut seen_files: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = roots.to_vec();
+    let mut nodes = 0usize;
+    while let Some(folder) = queue.pop() {
+        if !seen_folders.insert(folder.clone()) {
+            continue; // a folder reachable two ways (nested selections) — walk it once.
+        }
+        nodes += 1;
+        if nodes > MAX_PAGES {
+            eprintln!("drive: folder walk hit the node guard at {MAX_PAGES} folders");
+            break;
+        }
+        let q = format!("'{folder}' in parents and trashed = false");
+        let mut page: Option<String> = None;
+        loop {
+            let url = url_for(&q, page.as_deref())?;
+            let v = google::authorized_get(token_key, &url).await?;
+            let (children, next) = parse_files(&v);
+            for child in children {
+                if child.mime_type == FOLDER_MIME {
+                    queue.push(child.id);
+                } else if seen_files.insert(child.id.clone()) {
+                    out.push(child);
+                }
+            }
+            match next {
+                Some(t) => page = Some(t),
+                None => break,
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Enumerate the files under the selected **My Drive** folders (recursively, deduped) — the personal
+/// counterpart to `enumerate_shared`'s folder branch, for folder-scoped My Drive.
+pub async fn enumerate_my_folders(token_key: &str, folders: &[String]) -> Result<Vec<DriveFile>> {
+    walk_folders(token_key, folders, my_files_url).await
 }
 
 /// The delta baseline cursor (`changes.getStartPageToken`). `drive_id: Some` scopes it to one shared

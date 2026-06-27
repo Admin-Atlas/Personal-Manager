@@ -2392,10 +2392,48 @@ async fn gather_shared_folders(
             .into_iter()
             .collect()
     };
+    Ok(reconcile_enumeration(files, known, |file_id| {
+        drive::shared_source_id(email, drive_id, file_id)
+    }))
+}
+
+/// Folder-scoped reconcile for **My Drive**: the personal counterpart to [`gather_shared_folders`].
+/// Enumerates the selected My-Drive folders live and diffs against the account's currently-healthy
+/// My-Drive items (shared-drive items excluded — they reconcile on their own). Same event semantics:
+/// present+known → `Update`, present+new/missing → `Add`, known-but-absent → `Delete`. No cursor.
+async fn gather_my_drive_folders(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    folders: &[String],
+) -> Result<Vec<DriveItem>> {
+    let files = drive::enumerate_my_folders(token_key, folders).await?;
+    let known: std::collections::HashSet<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        drive::known_my_drive_source_ids(&conn, email)?
+            .into_iter()
+            .collect()
+    };
+    Ok(reconcile_enumeration(files, known, |file_id| {
+        drive::source_id_for(email, file_id)
+    }))
+}
+
+/// Diff a live folder-scoped enumeration against the known-healthy set → reconcile events. A present
+/// file already known → `Update` (catches edits, no-ops otherwise); a present file new or previously
+/// missing/unreachable → `Add` (ingests, or reactivates a folder removed then re-added); a known file
+/// no longer present → `Delete`. `source_id_of` maps a Drive file id to its namespaced source id, so
+/// My Drive and shared drives share this core.
+fn reconcile_enumeration(
+    files: Vec<drive::DriveFile>,
+    known: std::collections::HashSet<String>,
+    source_id_of: impl Fn(&str) -> String,
+) -> Vec<DriveItem> {
     let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut items: Vec<DriveItem> = Vec::with_capacity(files.len());
     for f in files {
-        let source_id = drive::shared_source_id(email, drive_id, &f.id);
+        let source_id = source_id_of(&f.id);
         present.insert(source_id.clone());
         let event = if known.contains(&source_id) {
             index_only::ChangeEvent::Update {
@@ -2424,7 +2462,7 @@ async fn gather_shared_folders(
             });
         }
     }
-    Ok(items)
+    items
 }
 
 /// Whole-drive sync via a **per-drive delta cursor** — the same cheap path My Drive uses, so a large
@@ -2762,46 +2800,63 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
         let mut shared_new_cursors: Vec<(String, String)> = Vec::new();
         let mut auth_failed = false;
 
-        // --- My Drive (delta cursor) ---
+        // --- My Drive. Whole-drive uses the cheap delta cursor; folder-scoped re-enumerates +
+        // reconciles (like a folder-scoped shared drive), advancing no cursor. ---
         if scope.my_drive {
-            let cursor = {
-                let state = app.state::<AppState>();
-                let conn = state.conn()?;
-                drive::get_cursor(&conn, &email)?
-            };
-            // A full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
-            let full_relist = |token_key: String| async move {
-                let files = drive::enumerate_drive(&token_key).await?;
-                let cursor = drive::start_page_token(&token_key, None).await?;
-                Ok::<_, Error>((files, cursor))
-            };
-            let outcome: Result<(Vec<DriveItem>, String)> = if cursor.is_none() {
-                full_relist(token_key.clone())
-                    .await
-                    .map(|(files, c)| (files.into_iter().map(DriveItem::Enumerated).collect(), c))
-            } else {
-                match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await {
-                    Ok((changes, c)) => {
-                        Ok((changes.into_iter().map(DriveItem::Changed).collect(), c))
+            match scope.my_drive_folders.as_deref() {
+                Some(folders) => {
+                    match gather_my_drive_folders(app, &token_key, &email, folders).await {
+                        Ok(mut recon) => items.append(&mut recon),
+                        Err(e) => {
+                            if drive::is_auth_failure(&e) {
+                                auth_failed = true;
+                            }
+                            last_err = Some(e);
+                        }
                     }
-                    Err(e) if drive::is_cursor_expired(&e) => {
+                }
+                None => {
+                    let cursor = {
+                        let state = app.state::<AppState>();
+                        let conn = state.conn()?;
+                        drive::get_cursor(&conn, &email)?
+                    };
+                    // A full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
+                    let full_relist = |token_key: String| async move {
+                        let files = drive::enumerate_drive(&token_key).await?;
+                        let cursor = drive::start_page_token(&token_key, None).await?;
+                        Ok::<_, Error>((files, cursor))
+                    };
+                    let outcome: Result<(Vec<DriveItem>, String)> = if cursor.is_none() {
                         full_relist(token_key.clone()).await.map(|(files, c)| {
                             (files.into_iter().map(DriveItem::Enumerated).collect(), c)
                         })
+                    } else {
+                        match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await
+                        {
+                            Ok((changes, c)) => {
+                                Ok((changes.into_iter().map(DriveItem::Changed).collect(), c))
+                            }
+                            Err(e) if drive::is_cursor_expired(&e) => {
+                                full_relist(token_key.clone()).await.map(|(files, c)| {
+                                    (files.into_iter().map(DriveItem::Enumerated).collect(), c)
+                                })
+                            }
+                            Err(e) => Err(e),
+                        }
+                    };
+                    match outcome {
+                        Ok((mut my_items, c)) => {
+                            items.append(&mut my_items);
+                            new_cursor = Some(c);
+                        }
+                        Err(e) => {
+                            if drive::is_auth_failure(&e) {
+                                auth_failed = true;
+                            }
+                            last_err = Some(e);
+                        }
                     }
-                    Err(e) => Err(e),
-                }
-            };
-            match outcome {
-                Ok((mut my_items, c)) => {
-                    items.append(&mut my_items);
-                    new_cursor = Some(c);
-                }
-                Err(e) => {
-                    if drive::is_auth_failure(&e) {
-                        auth_failed = true;
-                    }
-                    last_err = Some(e);
                 }
             }
         }

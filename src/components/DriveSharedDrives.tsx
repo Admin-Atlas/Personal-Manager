@@ -6,6 +6,11 @@ import { getDriveScope, listDriveFolders, listDriveSharedDrives, setDriveScope }
 import type { DriveFolder, DriveScope, SharedDrive, SharedSelection } from "../lib/types";
 import { Button, SegmentedControl } from "./ui";
 
+/** Sentinel `driveId` the folder picker passes to walk the **personal** My Drive (matches the
+ *  backend's `MY_DRIVE_ROOT`); it's also My Drive's root-folder alias, so it doubles as the top-level
+ *  `parentId`. Shared-drive ids never equal `"root"`. */
+const MY_DRIVE_ROOT = "root";
+
 /**
  * Per-account **shared-drives** manager (Connectors → Drive). My Drive (personal) is indexed whole by
  * default; shared drives (Team Drives) are **opt-in and folder-scoped by default** — they're often
@@ -66,6 +71,17 @@ export function SharedDrivesManager({
 
   const setMyDrive = (on: boolean) => setScope({ ...scope, my_drive: on });
 
+  const myWhole = scope.my_drive_folders == null;
+
+  const setMyDriveWhole = (whole: boolean) =>
+    setScope({ ...scope, my_drive_folders: whole ? null : [] });
+
+  const toggleMyFolder = (folderId: string, checked: boolean) => {
+    const cur = scope.my_drive_folders ?? [];
+    const next = checked ? [...new Set([...cur, folderId])] : cur.filter((f) => f !== folderId);
+    setScope({ ...scope, my_drive_folders: next });
+  };
+
   const toggleDrive = (drive: SharedDrive, included: boolean) =>
     setScope({
       ...scope,
@@ -108,22 +124,44 @@ export function SharedDrivesManager({
 
   return (
     <div className="mt-2 space-y-3" data-help="settings-drive-shared">
-      <label className="flex items-start gap-2 text-xs">
-        <input
-          type="checkbox"
-          checked={scope.my_drive}
-          onChange={(e) => setMyDrive(e.target.checked)}
-          className="mt-0.5"
-        />
-        <span>
-          <span className="text-ink2">My Drive (personal)</span> — index your whole personal drive.{" "}
-          {!scope.my_drive && (
-            <span className="text-ink4">
-              Off: existing My Drive items stay findable, but new changes won’t sync.
-            </span>
-          )}
-        </span>
-      </label>
+      <div>
+        <label className="flex items-start gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={scope.my_drive}
+            onChange={(e) => setMyDrive(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="text-ink2">My Drive (personal)</span> — index your personal drive.{" "}
+            {!scope.my_drive && (
+              <span className="text-ink4">
+                Off: existing My Drive items stay findable, but new changes won’t sync.
+              </span>
+            )}
+          </span>
+        </label>
+        {scope.my_drive && (
+          <div className="mt-2 pl-5">
+            <SegmentedControl
+              value={myWhole ? "whole" : "folders"}
+              onChange={(v) => setMyDriveWhole(v === "whole")}
+              options={[
+                { value: "whole", label: "Entire drive" },
+                { value: "folders", label: "Choose folders" },
+              ]}
+            />
+            {!myWhole && (
+              <FolderPicker
+                email={email}
+                driveId={MY_DRIVE_ROOT}
+                selected={scope.my_drive_folders ?? []}
+                onToggle={toggleMyFolder}
+              />
+            )}
+          </div>
+        )}
+      </div>
 
       <div>
         <div className="font-mono text-[10px] uppercase tracking-wide text-ink4">Shared drives</div>
@@ -185,7 +223,8 @@ export function SharedDrivesManager({
   );
 }
 
-/** Lazy folder tree for one shared drive — the drive root's id equals the drive id. */
+/** Lazy folder tree for one drive — `driveId` is a shared drive's id (its root == the drive id) or
+ *  the `MY_DRIVE_ROOT` sentinel for the personal My Drive; either way it's also the top `parentId`. */
 function FolderPicker({
   email,
   driveId,

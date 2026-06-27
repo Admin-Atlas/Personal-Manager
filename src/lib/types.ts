@@ -418,6 +418,9 @@ export interface SharedSelection {
  *  My Drive on, no shared drives — so a freshly-connected account behaves exactly as before. */
 export interface DriveScope {
   my_drive: boolean;
+  /** `null` = the entire My Drive (delta-cursor sync); otherwise index only these folders
+   *  (recursively, re-enumerated each sync). */
+  my_drive_folders: string[] | null;
   shared: SharedSelection[];
 }
 
