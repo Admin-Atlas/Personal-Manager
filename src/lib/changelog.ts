@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.40.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Groundwork for a new feature arriving shortly: dropping in photos and screenshots so the text inside them becomes searchable, on-device. This update lays the storage and text-recognition plumbing; the drag-and-drop and the “read the text in my screenshots” experience land in the next couple of updates.",
+      "Text recognition (OCR) is an optional add-on you choose to install — it won't bloat PM if you never use it, and you'll be able to remove it again any time from Settings → Storage.",
+    ],
+  },
+  {
     version: "2.39.1-alpha",
     date: "2026-06-28",
     highlights: [

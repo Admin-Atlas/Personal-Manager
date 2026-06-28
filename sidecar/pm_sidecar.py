@@ -6,14 +6,17 @@
 A long-lived helper process that does the jobs the Rust backend cannot do
 natively: convert arbitrary files to Markdown (MarkItDown), embed text locally
 with an on-device ONNX model (fastembed), re-rank passages with a local
-cross-encoder (fastembed), and transcribe voice clips locally (faster-whisper).
+cross-encoder (fastembed), transcribe voice clips locally (faster-whisper), and
+read text + capture metadata out of photos (rapidocr OCR + Pillow EXIF — an
+OPTIONAL component the user installs on demand, like the t-SNE reducer).
 It is the only part of PM that runs Python, and it is deliberately dumb: it
-converts, embeds, scores, and transcribes, nothing else. Chunking, hashing,
-prefixes, the vault, and the database all live in Rust.
+converts, embeds, scores, transcribes, and analyses images, nothing else.
+Chunking, hashing, prefixes, the vault, and the database all live in Rust.
 
-Protocol: newline-delimited JSON over stdio. One request per line:
+Protocol: newline-delimited JSON over stdio. One request per line, where method is one of
+ping, convert, embed, count_tokens, rerank, transcribe, reduce, analyze_image:
 
-    {"id": <int>, "method": "ping|convert|embed|count_tokens|rerank|transcribe", "params": {...}}
+    {"id": <int>, "method": <name>, "params": {...}}
 
 One response per line:
 
@@ -63,6 +66,8 @@ _tokenizers = {}
 _rerankers = {}
 _registered = set()
 _whisper = None
+_ocr_engine = None
+_heif_registered = False
 
 
 def get_markitdown():
@@ -314,6 +319,162 @@ def do_transcribe(params):
     return {"text": clean_text(text)}
 
 
+def get_ocr_engine():
+    """The OPTIONAL on-device OCR engine (rapidocr), cached. Lazy-imported so the engine — and its
+    image-processing deps (opencv/shapely/pyclipper) — only load when OCR is actually requested, and
+    so the base sidecar runs without them installed. `RapidOCR` runs on the SAME onnxruntime that
+    fastembed already ships and downloads its small detection/recognition ONNX models on first use
+    (like the embedder/whisper). Raises ImportError if the optional component isn't installed — the
+    Rust side only requests OCR once the install is confirmed, so that never fires in normal use.
+    """
+    global _ocr_engine
+    if _ocr_engine is None:
+        # rapidocr (3.x) prints model-download/init chatter; keep it off stdout so it can never
+        # corrupt the newline-delimited JSON protocol (stdout is the reply channel).
+        import contextlib
+
+        with contextlib.redirect_stdout(sys.stderr):
+            from rapidocr import RapidOCR
+
+            _ocr_engine = RapidOCR()
+    return _ocr_engine
+
+
+def _open_image(path):
+    """Open an image with Pillow, registering the HEIC opener if pillow-heif is available. Pillow is
+    already present (a markitdown dependency); pillow-heif ships in the optional OCR component, so
+    HEIC decoding needs that component installed — a non-HEIC image opens regardless.
+    """
+    global _heif_registered
+    from PIL import Image
+
+    if not _heif_registered:
+        try:
+            from pillow_heif import register_heif_opener
+
+            register_heif_opener()
+        except Exception:
+            pass  # pillow-heif absent → HEIC won't open, every other format still does
+        _heif_registered = True
+    return Image.open(path)
+
+
+def _gps_to_decimal(value, ref):
+    """Convert an EXIF GPS coordinate (a (deg, min, sec) triple of rationals) + its hemisphere ref
+    ('N'/'S'/'E'/'W') to a signed decimal degree, or None if absent/malformed.
+    """
+    if not value or ref is None:
+        return None
+    try:
+        deg, minute, sec = (float(v) for v in value)
+    except Exception:
+        return None
+    dec = deg + minute / 60.0 + sec / 3600.0
+    if str(ref).strip().upper() in ("S", "W"):
+        dec = -dec
+    return round(dec, 6)
+
+
+def _exif_meta(img):
+    """Best-effort (capture_date, lat, lon) from an image's EXIF. capture_date is the EXIF
+    DateTimeOriginal normalised to 'YYYY-MM-DD' (the GPS/Exif sub-IFDs are where phones keep these);
+    any field absent → None, and the Rust side fills capture_date from the filename/ingest time.
+    """
+    capture_date = lat = lon = None
+    try:
+        exif = img.getexif()
+    except Exception:
+        return capture_date, lat, lon
+    if not exif:
+        return capture_date, lat, lon
+
+    # DateTimeOriginal (0x9003) is in the Exif sub-IFD (0x8769); fall back to base DateTime (306).
+    dt = None
+    try:
+        dt = exif.get_ifd(0x8769).get(0x9003)
+    except Exception:
+        pass
+    dt = dt or exif.get(306)
+    # EXIF stores "YYYY:MM:DD HH:MM:SS"; take the date and switch ':' to '-'. Guard against the
+    # all-zero placeholder some cameras write.
+    if isinstance(dt, str) and len(dt) >= 10 and dt[:4].isdigit() and dt[:4] != "0000":
+        capture_date = dt[:10].replace(":", "-")
+
+    try:
+        gps = exif.get_ifd(0x8825)  # GPS IFD: 1=LatRef 2=Lat 3=LonRef 4=Lon
+    except Exception:
+        gps = None
+    if gps:
+        lat = _gps_to_decimal(gps.get(2), gps.get(1))
+        lon = _gps_to_decimal(gps.get(4), gps.get(3))
+    return capture_date, lat, lon
+
+
+def _run_ocr(engine, img, path):
+    """Recognise text in an image, returning the joined lines (newest rapidocr returns an object
+    with a `.txts` tuple; tolerate the older list-of-[box,text,score] shape too). Pass a decoded RGB
+    array when we already opened the image (HEIC works); else hand rapidocr the path directly.
+    """
+    import contextlib
+
+    if img is not None:
+        import numpy as np
+
+        target = np.array(img.convert("RGB"))
+    else:
+        target = path  # let rapidocr read the file itself (non-HEIC)
+    with contextlib.redirect_stdout(sys.stderr):
+        result = engine(target)
+
+    txts = getattr(result, "txts", None)
+    if txts:
+        return "\n".join(t for t in txts if t)
+    # Older shape: ([[box, text, score], ...], elapse) or [[box, text, score], ...].
+    rows = result
+    if isinstance(result, tuple) and result and isinstance(result[0], (list, tuple)):
+        rows = result[0]
+    if isinstance(rows, (list, tuple)):
+        out = [str(r[1]) for r in rows if isinstance(r, (list, tuple)) and len(r) >= 2]
+        return "\n".join(out)
+    return ""
+
+
+def do_analyze_image(params):
+    """Analyse one image for photo ingestion: EXIF capture metadata (always) + OCR text (only when
+    `run_ocr`). The Rust side sets `run_ocr` from whether the optional component is installed, so
+    a user who declined OCR still gets dimensions + EXIF (date/location) for the metadata chunk.
+    OCR output is untrusted text — `clean_text`-ed like every other string we return. An unreadable
+    image (e.g. HEIC without pillow-heif) yields nulls; Rust falls back to a filename/ingest date.
+    """
+    path = params["path"]
+    run_ocr = bool(params.get("run_ocr", False))
+    width = height = None
+    capture_date = lat = lon = None
+    img = None
+    try:
+        img = _open_image(path)
+        width, height = img.size
+        capture_date, lat, lon = _exif_meta(img)
+    except Exception:
+        pass  # unreadable / HEIC without codec — metadata stays null, OCR may still try the path
+
+    ocr_text = ""
+    ocr_ran = False
+    if run_ocr:
+        ocr_text = _run_ocr(get_ocr_engine(), img, path)
+        ocr_ran = True
+
+    return {
+        "ocr_text": clean_text(ocr_text),
+        "ocr_ran": ocr_ran,
+        "capture_date": capture_date,
+        "lat": lat,
+        "lon": lon,
+        "width": width,
+        "height": height,
+    }
+
+
 def _pca(x, k):
     """Project mean-centred rows `x` (n, d) onto their top-`k` principal axes via SVD.
 
@@ -405,6 +566,7 @@ HANDLERS = {
     "rerank": do_rerank,
     "transcribe": do_transcribe,
     "reduce": do_reduce,
+    "analyze_image": do_analyze_image,
 }
 
 

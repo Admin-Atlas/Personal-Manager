@@ -145,5 +145,75 @@ class ReduceTest(unittest.TestCase):
         self.assertIn(fallback["method"], ("tsne", "pca"))
 
 
+class _OcrResultObj:
+    """Mimics rapidocr 3.x's output object: recognised lines on a `.txts` tuple."""
+
+    def __init__(self, txts):
+        self.txts = txts
+
+
+class _FakeOcrEngine:
+    """A callable standing in for rapidocr — returns whatever shape the test wants, no models."""
+
+    def __init__(self, result):
+        self._result = result
+
+    def __call__(self, _target):
+        return self._result
+
+
+class AnalyzeImageTest(unittest.TestCase):
+    """Photo analysis: EXIF GPS/date parsing (pure), OCR result-shape tolerance (fake engine), and
+    the EXIF-only path when OCR is declined. The OCR engine and HEIC codec are OPTIONAL components,
+    so nothing here installs or downloads anything."""
+
+    def test_gps_to_decimal_signs_and_malformed(self):
+        # 55°57'00"N, 3°11'24"W (Edinburgh-ish). N/E positive, S/W negated.
+        self.assertAlmostEqual(S._gps_to_decimal((55, 57, 0), "N"), 55.95, places=4)
+        self.assertAlmostEqual(S._gps_to_decimal((3, 11, 24), "W"), -3.19, places=4)
+        self.assertAlmostEqual(S._gps_to_decimal((10, 30, 0), "S"), -10.5, places=4)
+        # Absent or malformed → None, never a crash.
+        self.assertIsNone(S._gps_to_decimal(None, "N"))
+        self.assertIsNone(S._gps_to_decimal((1, 2), "N"))
+        self.assertIsNone(S._gps_to_decimal((1, 2, 3), None))
+
+    def test_run_ocr_parses_object_and_list_shapes(self):
+        # New rapidocr: object with a .txts tuple.
+        obj = _OcrResultObj(("hello", "world"))
+        self.assertEqual(S._run_ocr(_FakeOcrEngine(obj), None, "x.png"), "hello\nworld")
+        # Older rapidocr: ([[box, text, score], ...], elapse).
+        old = ([[[0, 0], "line one", 0.9], [[1, 1], "line two", 0.8]], 0.1)
+        self.assertEqual(S._run_ocr(_FakeOcrEngine(old), None, "x.png"), "line one\nline two")
+        # Nothing recognised → empty string, not an error.
+        self.assertEqual(S._run_ocr(_FakeOcrEngine(_OcrResultObj(())), None, "x.png"), "")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("PIL") is not None,
+        "Pillow not installed (image decode is a local-only check)",
+    )
+    def test_analyze_image_exif_only_when_ocr_declined(self):
+        import tempfile
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/shot.png"
+            Image.new("RGB", (24, 16), (10, 20, 30)).save(path)
+            out = S.do_analyze_image({"path": path, "run_ocr": False})
+        # OCR was declined: no engine touched, no text, but dimensions still read.
+        self.assertEqual(out["ocr_ran"], False)
+        self.assertEqual(out["ocr_text"], "")
+        self.assertEqual((out["width"], out["height"]), (24, 16))
+        # A plain generated PNG has no EXIF → date/location null (Rust supplies the fallback date).
+        self.assertIsNone(out["capture_date"])
+        self.assertIsNone(out["lat"])
+
+    def test_analyze_image_unreadable_path_is_null_not_crash(self):
+        out = S.do_analyze_image({"path": "/no/such/image.png", "run_ocr": False})
+        self.assertEqual(out["ocr_ran"], False)
+        self.assertIsNone(out["width"])
+        self.assertIsNone(out["capture_date"])
+
+
 if __name__ == "__main__":
     unittest.main()

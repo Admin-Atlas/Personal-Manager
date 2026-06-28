@@ -610,6 +610,57 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE projects ADD COLUMN importance   TEXT
         CHECK (importance IN ('high','medium','low') OR importance IS NULL);
     "#,
+    // v22: Photo / screenshot ingestion (Stage-3 board card #135). Photos are a new ingestion
+    // source type that REUSES the document pipeline wholesale: each ingested photo becomes a
+    // `documents` row with `source_type='photo'` (so split/embed/FTS/vector/retrieval/Map/citations/
+    // rebuild all work unchanged, exactly as 'index_only' is just a discriminator), PLUS one row in
+    // this new `photos` satellite table holding the image-specific truth (capture date, GPS, the
+    // OCR text, the on-disk hash, and the opt-in vault copy). The chunks attach to the documents row;
+    // `photos` links back by `document_id`.
+    //
+    // Two parts, both additive (rule #3 — no data moved, no column dropped):
+    //   * Relax the `documents.source_type` CHECK to admit 'photo'. SQLite can't ALTER a column CHECK
+    //     in place, so we reuse v17's `writable_schema` text-patch (it edits the stored CREATE TABLE
+    //     text only; `run` then bumps the schema cookie so this connection reparses the new
+    //     constraint). The value list `'vault','index_only'` appears exactly once — in this CHECK,
+    //     added by v11 — and only on `documents`.
+    //   * `photos` (NEW). `file_hash` is the SHA-256 of the image BYTES — the dedupe/identity anchor
+    //     that survives a moved/renamed source (UNIQUE, so re-dropping the same image is a no-op).
+    //     `source_type` is the capture provenance (screenshot/camera_roll/dragged_file/vault_copy),
+    //     a DIFFERENT axis from documents.source_type. `ocr_text` is the indexed content (NULL when
+    //     OCR was declined/empty). `visual_description` is RESERVED for Stage-4 image understanding —
+    //     always NULL on insert, no writer this stage, so that card ships with zero schema change.
+    //     `saved_to_vault`/`vault_path` record the opt-in original copy (NULL path unless copied).
+    //     `document_id` cascades, so a rebuild's `DELETE FROM documents` teardown clears photos too
+    //     (the photo-specific fields round-trip via the vault frontmatter, so rebuild reconstructs them).
+    r#"
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master
+       SET sql = replace(sql, '''vault'',''index_only''', '''vault'',''index_only'',''photo''')
+     WHERE type = 'table' AND name = 'documents';
+    PRAGMA writable_schema = OFF;
+
+    CREATE TABLE photos (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id        INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        source_path        TEXT,
+        source_type        TEXT NOT NULL DEFAULT 'dragged_file'
+                             CHECK (source_type IN ('screenshot','camera_roll','dragged_file','vault_copy')),
+        capture_date       TEXT,
+        file_hash          TEXT NOT NULL,
+        ocr_text           TEXT,
+        visual_description TEXT,
+        saved_to_vault     INTEGER NOT NULL DEFAULT 0 CHECK (saved_to_vault IN (0,1)),
+        vault_path         TEXT,
+        width              INTEGER,
+        height             INTEGER,
+        lat                REAL,
+        lon                REAL,
+        created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_photos_document ON photos(document_id);
+    CREATE UNIQUE INDEX idx_photos_file_hash ON photos(file_hash);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -659,11 +710,12 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 21,
+            version, 22,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
-             project milestones is v20; project active-date + manual priority is v21)"
+             project milestones is v20; project active-date + manual priority is v21; \
+             photo ingestion table is v22)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -844,6 +896,79 @@ mod tests {
         assert_eq!(
             undated, 0,
             "a project with NULL/blank deadline backfills nothing"
+        );
+    }
+
+    /// v22 lands photo ingestion (board card #135): it relaxes the `documents.source_type` CHECK to
+    /// admit 'photo' (proving the writable_schema patch + cookie reparse took effect on this
+    /// connection), and adds the `photos` satellite table with its own provenance CHECK, a UNIQUE
+    /// file_hash, and an ON DELETE CASCADE from the owning document.
+    #[test]
+    fn photos_table_lands_with_check_cascade_and_relaxed_source_type() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // The relaxed CHECK admits a 'photo' document (the satellite's owner).
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash, source_type) \
+             VALUES ('vault/p.md', 'abc123', 'photo')",
+            [],
+        )
+        .expect("source_type='photo' is now allowed");
+        let doc_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE content_hash = 'abc123'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // A photos row inserts with the documented defaults (dragged_file, not saved to vault).
+        conn.execute(
+            "INSERT INTO photos(document_id, file_hash) VALUES (?1, 'abc123')",
+            rusqlite::params![doc_id],
+        )
+        .unwrap();
+        let (st, saved): (String, i64) = conn
+            .query_row(
+                "SELECT source_type, saved_to_vault FROM photos WHERE document_id = ?1",
+                rusqlite::params![doc_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((st.as_str(), saved), ("dragged_file", 0), "photo defaults");
+
+        // The provenance CHECK rejects anything outside the four capture sources.
+        let bad = conn.execute(
+            "INSERT INTO photos(document_id, file_hash, source_type) VALUES (?1, 'x', 'webcam')",
+            rusqlite::params![doc_id],
+        );
+        assert!(bad.is_err(), "source_type CHECK rejects 'webcam'");
+
+        // file_hash is UNIQUE — re-dropping the same image is a no-op, not a duplicate.
+        let dup = conn.execute(
+            "INSERT INTO photos(document_id, file_hash) VALUES (?1, 'abc123')",
+            rusqlite::params![doc_id],
+        );
+        assert!(dup.is_err(), "UNIQUE file_hash rejects a duplicate");
+
+        // Deleting the document cascades its photo (document_id REFERENCES … ON DELETE CASCADE).
+        conn.execute(
+            "DELETE FROM documents WHERE id = ?1",
+            rusqlite::params![doc_id],
+        )
+        .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM photos WHERE document_id = ?1",
+                rusqlite::params![doc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "photos cascade when their document is deleted"
         );
     }
 
