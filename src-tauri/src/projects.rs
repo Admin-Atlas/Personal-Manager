@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::calendar::{self, CalendarMatch};
 use crate::error::Result;
+use crate::milestones::{self, GoverningMilestone, Milestone};
 use crate::openrouter::{self, ChatMessage};
 
 /// A deadline this many days out (or sooner) reads as "Due soon".
@@ -85,16 +86,26 @@ pub struct ProjectOverview {
     pub status: ProjectStatus,
     pub doc_count: i64,
     pub last_activity: Option<String>,
+    /// Legacy single deadline (card 7 superseded this with milestones). Kept as a
+    /// write-through cache for back-compat readers; the status is derived from
+    /// `governing_milestone`, never this field.
     pub deadline: Option<String>,
     pub size: Option<String>,
     pub blocked_by: Option<String>,
     pub parent: Option<String>,
     /// Highest importance among the project's documents ("high"/"medium"/"low"), if any.
     pub importance: Option<String>,
-    /// The soonest upcoming calendar event whose title names this project (Step 6).
-    /// When it falls within the Due-soon window it drives the status; either way the
-    /// focus card shows it, so a calendar-driven "Due soon" is explained, not magic.
+    /// The soonest upcoming calendar event whose title names this project (Step 6) —
+    /// the zero-setup fallback that only kicks in when a project has NO milestones; an
+    /// explicit milestone supersedes it. Populated only in that fallback case so the
+    /// card shows one deadline signal, not two.
     pub calendar_event: Option<CalendarMatch>,
+    /// All of this project's milestones, resolved (calendar-linked dates synced),
+    /// date-ordered — the project-detail surface and the focus triage panel render this.
+    pub milestones: Vec<Milestone>,
+    /// The milestone driving the status + card line (nearest unmet), or `None` when the
+    /// project has no unmet dated milestone.
+    pub governing_milestone: Option<GoverningMilestone>,
 }
 
 /// Every active project (distinct `documents.project`) with its triage metadata
@@ -110,8 +121,6 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
                 MAX(COALESCE(d.last_activity, d.ingested_at)) AS last_activity, \
                 MIN(CASE d.importance WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END) AS imp, \
                 p.deadline, p.size, p.blocked_by, p.parent, \
-                CASE WHEN p.deadline IS NOT NULL \
-                     THEN julianday(date(replace(p.deadline,'Z',''))) - julianday(:today) END AS days_to_deadline, \
                 julianday(:today) - julianday(date(replace(MAX(COALESCE(d.last_activity, d.ingested_at)),'Z',''))) AS days_since \
          FROM documents d \
          LEFT JOIN projects p ON p.name = d.project \
@@ -128,8 +137,7 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
         let size: Option<String> = row.get(5)?;
         let blocked_by: Option<String> = row.get(6)?;
         let parent: Option<String> = row.get(7)?;
-        let days_to_deadline: Option<f64> = row.get(8)?;
-        let days_since: Option<f64> = row.get(9)?;
+        let days_since: Option<f64> = row.get(8)?;
         Ok((
             name,
             doc_count,
@@ -139,7 +147,6 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
             size,
             blocked_by,
             parent,
-            days_to_deadline,
             days_since,
         ))
     })?;
@@ -147,27 +154,37 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     let raw: Vec<_> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
 
-    // Load the upcoming events once (a small set), then match each project by name so
-    // a calendar event can stand in for a manual deadline (Step 6, spec §4.1). Empty
-    // when not connected / nothing synced, so the focus view is unchanged without it.
+    // All milestones, resolved (calendar-linked dates synced) and grouped by project, in
+    // one pass — the milestone set is what now drives the status (card 7).
+    let mut milestones_by_project = milestones::all_by_project(conn, today)?;
+
+    // Load the upcoming events once (a small set) for the zero-setup fallback: a project
+    // with NO milestones still flips Due-soon from a name-matched calendar event, exactly
+    // as before. Empty when not connected, so the focus view is unchanged without it.
     let events = calendar::upcoming_events(conn, calendar::AGENDA_DAYS, 250).unwrap_or_default();
 
     let mut out = Vec::new();
-    for (name, doc_count, last_activity, imp, deadline, size, blocked_by, parent, dtd, dsince) in
-        raw
-    {
-        // The effective deadline signal is the soonest of the manual deadline and a
-        // name-matched calendar event; a deadline (either source) is the loudest signal.
-        let manual_days = deadline.as_ref().and(dtd);
-        let matched = calendar::nearest_match(&name, &events);
-        let calendar_days = matched.map(|m| m.days_until);
-        let calendar_event = matched.map(|m| CalendarMatch {
-            summary: m.event.summary.clone(),
-            start: m.event.start.clone(),
-        });
+    for (name, doc_count, last_activity, imp, deadline, size, blocked_by, parent, dsince) in raw {
+        let project_milestones = milestones_by_project.remove(&name).unwrap_or_default();
+        let governing_milestone = milestones::governing_info(&project_milestones, today);
+
+        // Milestones supersede the legacy name-match: only when a project has none do we
+        // fall back to a name-matched calendar event for the deadline signal + card chip.
+        let (deadline_days, calendar_event) = if project_milestones.is_empty() {
+            let matched = calendar::nearest_match(&name, &events);
+            (
+                matched.map(|m| m.days_until),
+                matched.map(|m| CalendarMatch {
+                    summary: m.event.summary.clone(),
+                    start: m.event.start.clone(),
+                }),
+            )
+        } else {
+            (milestones::governing_days(&project_milestones, today), None)
+        };
 
         let status = derive_status(&StatusSignals {
-            days_until_deadline: min_opt(manual_days, calendar_days),
+            days_until_deadline: deadline_days,
             days_since_activity: dsince,
             size: size.as_deref(),
             blocked_by: blocked_by.as_deref(),
@@ -184,18 +201,11 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
             parent,
             importance: importance_label(imp),
             calendar_event,
+            milestones: project_milestones,
+            governing_milestone,
         });
     }
     Ok(out)
-}
-
-/// The smaller of two optional day-deltas (whichever deadline source is sooner).
-fn min_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.min(y)),
-        (x, None) => x,
-        (None, y) => y,
-    }
 }
 
 /// Map the aggregated importance rank back to a label (3 / NULL = none).
@@ -235,6 +245,12 @@ pub fn set_metadata(
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
         params![name, deadline, size, blocked_by, parent],
     )?;
+    // Milestones are the source of truth (card 7): route a legacy single deadline into the
+    // canonical 'deadline' milestone so the old single-field edit path + AI proposals still
+    // work. A null deadline leaves the milestone list untouched (don't nuke a user's list).
+    if let Some(d) = &deadline {
+        milestones::set_primary_deadline(conn, name, d)?;
+    }
     Ok(())
 }
 
@@ -496,5 +512,76 @@ mod tests {
     fn parse_falls_back_on_garbage() {
         let p = parse_proposal("no json here", "X");
         assert!(p.size.is_none() && p.parent.is_none() && p.blocked_by.is_none());
+    }
+
+    // --- list_overviews × milestones integration (card 7) ---
+
+    const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn overview_for<'a>(rows: &'a [ProjectOverview], name: &str) -> &'a ProjectOverview {
+        rows.iter()
+            .find(|o| o.name == name)
+            .expect("project present")
+    }
+
+    /// Status is derived over the milestone SET: the nearest unmet milestone governs, and
+    /// marking it met flips the governing milestone (and the status) to the next one.
+    #[test]
+    fn status_is_governed_by_nearest_unmet_milestone() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let today = "2026-06-28";
+
+        // One project with a recent document (so it isn't stale) and two unmet milestones.
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash, project, last_activity) \
+             VALUES ('v1','h1','Atlas','2026-06-27T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let near = crate::milestones::add(&conn, "Atlas", "pitch", Some("2026-07-01".into()), None)
+            .unwrap(); // +3 days
+        crate::milestones::add(&conn, "Atlas", "launch", Some("2026-07-28".into()), None).unwrap(); // +30
+
+        let rows = list_overviews(&conn, today).unwrap();
+        let atlas = overview_for(&rows, "Atlas");
+        assert_eq!(atlas.status, ProjectStatus::DueSoon);
+        assert_eq!(atlas.milestones.len(), 2);
+        assert_eq!(
+            atlas.governing_milestone.as_ref().map(|g| g.label.as_str()),
+            Some("pitch"),
+            "the nearest unmet milestone governs"
+        );
+
+        // Mark the nearest one met → the +30 milestone now governs, so it's no longer Due soon.
+        crate::milestones::set_state(&conn, near, true).unwrap();
+        let rows = list_overviews(&conn, today).unwrap();
+        let atlas = overview_for(&rows, "Atlas");
+        assert_ne!(atlas.status, ProjectStatus::DueSoon);
+        assert_eq!(
+            atlas.governing_milestone.as_ref().map(|g| g.label.as_str()),
+            Some("launch")
+        );
+    }
+
+    /// A milestone can be added to a never-triaged (lazy) project — the insert path upserts the
+    /// bare `projects` row so the FK holds.
+    #[test]
+    fn milestone_on_lazy_project_then_governs() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash, project) VALUES ('v1','h1','Fresh')",
+            [],
+        )
+        .unwrap();
+        // No projects row exists for 'Fresh' yet.
+        crate::milestones::add(&conn, "Fresh", "deadline", Some("2026-07-02".into()), None)
+            .unwrap();
+
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        let fresh = overview_for(&rows, "Fresh");
+        assert_eq!(fresh.status, ProjectStatus::DueSoon);
+        assert_eq!(fresh.milestones.len(), 1);
     }
 }

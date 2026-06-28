@@ -15,6 +15,7 @@ use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::error::{Error, Result};
 use crate::google;
 use crate::ingest::{self, Document, IngestEvent};
+use crate::milestones::{self, Milestone};
 use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
@@ -2010,6 +2011,90 @@ pub async fn propose_project_metadata(
     log_background_usage(&app, &models, &usage_rows);
     let _ = on_event.send(ProjectProposalEvent::Finished { proposed });
     Ok(())
+}
+
+// --- personal assistant: project milestones (multi-deadline — card 7) ---
+//
+// A project carries zero or more dated milestones (each its own stable-id row); the focus view's
+// single status is derived from the nearest unmet one. PM-native milestones have a user-set date;
+// calendar-linked ones (event_uid set) sync their date from the read-only calendar mirror. All quick
+// synchronous DB work — no model calls, so the lock is held only briefly (rule #4).
+
+/// One project's milestones, resolved (calendar-linked dates synced) and date-ordered.
+#[tauri::command]
+pub fn list_milestones(state: State<'_, AppState>, project: String) -> Result<Vec<Milestone>> {
+    let conn = state.conn()?;
+    let today = clock::today_sql_in(resolve_zone(&conn));
+    milestones::list_for_project(&conn, project.trim(), &today)
+}
+
+/// Add a milestone to a project (creating the project's metadata row if needed). A non-empty
+/// `event_uid` makes it calendar-linked. Returns the new stable id.
+#[tauri::command]
+pub fn add_milestone(
+    state: State<'_, AppState>,
+    project: String,
+    label: String,
+    due_date: Option<String>,
+    event_uid: Option<String>,
+) -> Result<i64> {
+    let project = project.trim();
+    if project.is_empty() {
+        return Err(Error::Other("project name is empty".into()));
+    }
+    let conn = state.conn()?;
+    milestones::add(&conn, project, &label, due_date, event_uid)
+}
+
+/// Edit a milestone's label and (for a PM-native milestone) its date. A calendar-linked
+/// milestone keeps its calendar-owned date regardless.
+#[tauri::command]
+pub fn update_milestone(
+    state: State<'_, AppState>,
+    id: i64,
+    label: String,
+    due_date: Option<String>,
+) -> Result<()> {
+    let conn = state.conn()?;
+    milestones::update(&conn, id, &label, due_date)
+}
+
+/// Link a milestone to a calendar event (`event_uid` Some, `cached_date` seeds the offline cache)
+/// or unlink it (None — the date becomes editable again).
+#[tauri::command]
+pub fn set_milestone_event(
+    state: State<'_, AppState>,
+    id: i64,
+    event_uid: Option<String>,
+    cached_date: Option<String>,
+) -> Result<()> {
+    let conn = state.conn()?;
+    milestones::set_event(&conn, id, event_uid, cached_date)
+}
+
+/// Mark a milestone met or unmet.
+#[tauri::command]
+pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Result<()> {
+    let conn = state.conn()?;
+    milestones::set_state(&conn, id, met)
+}
+
+/// Delete a milestone by id.
+#[tauri::command]
+pub fn delete_milestone(state: State<'_, AppState>, id: i64) -> Result<()> {
+    let conn = state.conn()?;
+    milestones::remove(&conn, id)
+}
+
+/// Persist a new ordering of a project's milestones (ids in display order).
+#[tauri::command]
+pub fn reorder_milestones(
+    state: State<'_, AppState>,
+    project: String,
+    ordered_ids: Vec<i64>,
+) -> Result<()> {
+    let conn = state.conn()?;
+    milestones::reorder(&conn, project.trim(), &ordered_ids)
 }
 
 // --- personal assistant: calendar (multi-provider, read-only — cards 6A/6B) ---
