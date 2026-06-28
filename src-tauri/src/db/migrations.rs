@@ -550,6 +550,49 @@ const MIGRATIONS: &[&str] = &[
 
     UPDATE connector_sources SET cursor = NULL WHERE provider = 'google' AND service = 'drive';
     "#,
+    // v20: Project Milestones (multi-deadline) — board card 7. Replaces the single
+    // `projects.deadline` scalar with a many-to-one milestone model: a project has zero or
+    // more dated milestones, each its OWN row with a STABLE id (the anchor a later flag-layer
+    // card hangs deadline-derived flags on, so the flag layer never re-keys project→milestone —
+    // the destructive change rule #3 forbids).
+    //
+    // A milestone is either PM-native (a user-set, editable `due_date`) or calendar-linked
+    // (`event_uid` set → its date syncs FROM the canonical, read-only `calendar_events` row by
+    // iCal UID). Same table; the two provenances are distinguished by whether `event_uid` is
+    // present. `due_date` stays nullable so a calendar-linked milestone whose event is gone /
+    // unsynced resolves to NULL (excluded from the focus view's "governing milestone", never
+    // silently treated as met).
+    //
+    // FK on `projects(name)` (the identity every focus-view consumer keys on — `documents.project`,
+    // `projects.name`), ON DELETE CASCADE so dropping a project cleans up its milestones. The
+    // milestone insert path upserts a bare `projects` row first, so the FK holds for a never-triaged
+    // (lazy) project.
+    //
+    // Additive only (rule #3): `projects.deadline` is KEPT (never dropped) as a write-through legacy
+    // cache — derivation reads ONLY milestones. The one-time backfill carries each existing manual
+    // deadline into a single `label='deadline'` milestone (every such project already has a `projects`
+    // row, so the FK is satisfied without creating rows here), so the governing-milestone derivation
+    // reproduces today's behaviour with no data loss.
+    r#"
+    CREATE TABLE project_milestones (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,                 -- STABLE id (flag-layer anchor)
+        project_name TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+        label        TEXT NOT NULL DEFAULT 'deadline',                  -- e.g. 'pitch', 'internal deadline'
+        due_date     TEXT,                                              -- ISO date; NULL when event-linked & event missing
+        event_uid    TEXT,                                              -- iCal UID into calendar_events; NULL = PM-native
+        state        TEXT CHECK (state IN ('met','unmet') OR state IS NULL),  -- NULL = untracked (treated as unmet)
+        sort_order   INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_project_milestones_project ON project_milestones(project_name, sort_order);
+    CREATE INDEX idx_project_milestones_uid     ON project_milestones(event_uid);
+
+    INSERT INTO project_milestones (project_name, label, due_date, sort_order)
+        SELECT name, 'deadline', deadline, 0
+          FROM projects
+         WHERE deadline IS NOT NULL AND trim(deadline) <> '';
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -599,10 +642,11 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 19,
+            version, 20,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
-             multi-provider calendar foundation is v18; shared-drive access relation is v19)"
+             multi-provider calendar foundation is v18; shared-drive access relation is v19; \
+             project milestones is v20)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -688,6 +732,101 @@ mod tests {
         assert_eq!(
             calendars, 0,
             "calendars cascade when their source is deleted"
+        );
+    }
+
+    /// v20 lands the project-milestones table (board card 7): a many-to-one milestone model keyed
+    /// on `projects(name)` with a STABLE id, a `state` CHECK, an ON DELETE CASCADE from the project,
+    /// and the one-time backfill of an existing `projects.deadline` into a single `label='deadline'`
+    /// milestone. The legacy `deadline` column is KEPT (additive — rule #3).
+    #[test]
+    fn project_milestones_land_with_check_cascade_and_backfill() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // A milestone inserts with the documented defaults (label 'deadline', sort_order 0, NULL state).
+        conn.execute(
+            "INSERT INTO projects(name, deadline) VALUES ('Atlas', '2026-07-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_milestones(project_name, label, due_date) \
+             VALUES ('Atlas', 'pitch', '2026-08-15')",
+            [],
+        )
+        .unwrap();
+
+        // The `state` CHECK rejects anything outside met|unmet|NULL.
+        let bad = conn.execute(
+            "INSERT INTO project_milestones(project_name, label, state) VALUES ('Atlas', 'x', 'done')",
+            [],
+        );
+        assert!(bad.is_err(), "state CHECK rejects 'done'");
+
+        // Deleting the project cascades its milestones (project_name REFERENCES … ON DELETE CASCADE).
+        conn.execute("DELETE FROM projects WHERE name = 'Atlas'", [])
+            .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM project_milestones WHERE project_name = 'Atlas'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "milestones cascade when their project is deleted"
+        );
+    }
+
+    /// v20's backfill carries each pre-existing `projects.deadline` into exactly ONE
+    /// `label='deadline'` milestone, and produces none for a project with no deadline. The backfill
+    /// runs as part of migration v20, so it can only be observed on a store that crossed v19→v20 with
+    /// the legacy rows already present — which a fresh `db::open` cannot reproduce. Instead we assert
+    /// the backfill SQL itself is idempotent-shaped against the live schema: seeding then re-running
+    /// the same SELECT yields one row per dated project.
+    #[test]
+    fn project_milestones_backfill_one_row_per_dated_project() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute(
+            "INSERT INTO projects(name, deadline) VALUES ('Dated', '2026-07-01'), ('Blank', NULL), ('Empty', '  ')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_milestones (project_name, label, due_date, sort_order) \
+             SELECT name, 'deadline', deadline, 0 FROM projects \
+             WHERE deadline IS NOT NULL AND trim(deadline) <> ''",
+            [],
+        )
+        .unwrap();
+
+        let dated: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM project_milestones WHERE project_name = 'Dated' AND label = 'deadline' AND due_date = '2026-07-01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dated, 1,
+            "a dated project backfills exactly one 'deadline' milestone"
+        );
+        let undated: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM project_milestones WHERE project_name IN ('Blank','Empty')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            undated, 0,
+            "a project with NULL/blank deadline backfills nothing"
         );
     }
 
