@@ -20,6 +20,7 @@ mod ingest;
 mod layout;
 mod lock_session;
 mod microsoft;
+mod milestones;
 mod model_gateway;
 mod onedrive;
 mod openrouter;
@@ -559,6 +560,13 @@ pub fn run() {
             commands::list_project_overviews,
             commands::set_project_metadata,
             commands::propose_project_metadata,
+            commands::list_milestones,
+            commands::add_milestone,
+            commands::update_milestone,
+            commands::set_milestone_event,
+            commands::set_milestone_state,
+            commands::delete_milestone,
+            commands::reorder_milestones,
             commands::calendar_overview,
             commands::set_calendar_selected,
             commands::connect_google_calendar_account,

@@ -164,8 +164,20 @@ pub fn build_snapshot(
     Some(out)
 }
 
-/// A Due-soon project line, naming the deadline or the calendar event that drives it.
+/// A Due-soon project line, naming the milestone (or fallback calendar event) that
+/// drives it. The governing milestone is the loudest signal (card 7); the calendar
+/// event is the zero-milestone fallback, and the legacy deadline a last resort.
 fn due_soon_line(p: &ProjectOverview, zone: Tz) -> String {
+    if let Some(g) = &p.governing_milestone {
+        if let Some(d) = &g.due_date {
+            return format!(
+                "{} ({}: {})",
+                p.name,
+                g.label,
+                d.chars().take(10).collect::<String>()
+            );
+        }
+    }
     if let Some(ev) = &p.calendar_event {
         let when = clock::to_zone_display(&ev.start, zone);
         format!("{} (event: {} on {when})", p.name, ev.summary)
@@ -275,6 +287,8 @@ mod tests {
             parent: None,
             importance: None,
             calendar_event: None,
+            milestones: Vec::new(),
+            governing_milestone: None,
         }
     }
 

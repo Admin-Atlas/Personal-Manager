@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.35.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "More groundwork for project milestones: PM can now track several deadlines per project under the hood, and a project's focus status (“Due soon”, etc.) is worked out from whichever milestone is nearest and still unmet — so finishing your pitch automatically lets the next deadline take over. The list editor to add and tick off these milestones arrives in the next release; nothing changes in what you see today.",
+    ],
+  },
+  {
     version: "2.34.0-alpha",
     date: "2026-06-28",
     highlights: [
