@@ -742,7 +742,8 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP INDEX idx_calendar_events_uid; \
+            "DROP TABLE project_milestones; \
+             DROP INDEX idx_calendar_events_uid; \
              DROP INDEX idx_calendar_events_entity; \
              DROP INDEX idx_calendar_events_calendar; \
              DROP TABLE calendars; \
@@ -877,7 +878,8 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP INDEX idx_calendar_events_uid; \
+            "DROP TABLE project_milestones; \
+             DROP INDEX idx_calendar_events_uid; \
              DROP INDEX idx_calendar_events_entity; \
              DROP INDEX idx_calendar_events_calendar; \
              DROP TABLE calendars; \

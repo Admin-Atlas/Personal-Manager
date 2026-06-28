@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.34.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Groundwork for project milestones: a project will soon be able to carry several dated deadlines — a pitch, a presentation, an internal due date — instead of just one. This release lays the storage for that; your current single deadline is carried over automatically, so nothing changes in how you use PM yet. The new milestone list arrives in an upcoming release.",
+    ],
+  },
+  {
     version: "2.33.0-alpha",
     date: "2026-06-27",
     highlights: [
