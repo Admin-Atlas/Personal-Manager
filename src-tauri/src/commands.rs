@@ -21,9 +21,9 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, chat, chat_summary, clock, cost, db, drive, entities, index_only,
-    lock_session, microsoft, onedrive, openrouter, outlook_calendar, paths, preferences, recommend,
-    secrets, vault, AppState, VaultRuntime,
+    applock, briefing, chat, chat_summary, clock, context_budget, cost, db, drive, entities,
+    index_only, lock_session, microsoft, onedrive, openrouter, outlook_calendar, paths,
+    preferences, recommend, secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -1055,6 +1055,17 @@ pub async fn send_message(
         )?;
         let id = conn.last_insert_rowid();
         log_usage(&conn, "chat", Some(&used_model), &usage);
+        // Record the exact prompt size OpenRouter just measured as the context-meter's numerator (card 7D).
+        // Because it counted the real assembled prompt, this already reflects everything that rode along —
+        // profile, agenda, rolling summary, recency window, retrieved grounding. Best-effort: a session row
+        // born this turn (card A's vault append below) may not exist yet, so a 0-row UPDATE is fine — the
+        // meter just stays "unknown" until the next reply. Never fail the chat over a meter write.
+        if let Some(pt) = usage.prompt_tokens {
+            let _ = conn.execute(
+                "UPDATE chat_sessions SET last_prompt_tokens = ?1 WHERE conversation_id = ?2",
+                params![pt, conversation_id],
+            );
+        }
         conn.execute(
             "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?1",
             params![conversation_id],
@@ -1085,6 +1096,123 @@ pub async fn send_message(
         citations,
     });
     Ok(())
+}
+
+/// The chat context-usage meter + alert state (card 7D). `percent`/`context_window`/`used_tokens` are
+/// `None` when unknown (a custom model with no catalogued window, or no reply measured yet) ⇒ the UI shows
+/// "unknown" and never alerts. `regime` is "summary" once a rolling summary exists, else "window".
+#[derive(Serialize)]
+pub struct ContextStatus {
+    pub model: String,
+    pub context_window: Option<i64>,
+    pub used_tokens: Option<i64>,
+    pub percent: Option<f64>,
+    /// Whether usage has crossed the alert fraction — decided in Rust (the one source of truth) so the UI
+    /// just renders. Always false when `percent` is unknown.
+    pub alerting: bool,
+    pub regime: String,
+    pub compress: context_budget::CompressDecision,
+    pub upgrade: Vec<context_budget::ModelOption>,
+}
+
+/// How full the SELECTED model's context window is for a conversation, plus what the user can do about it
+/// (board card 7D, #143). Cheap read the chat UI calls after each reply: it joins the measured last-turn
+/// prompt size, the model's window from the daily `model_pricing` catalogue, and the un-summarised tail into
+/// the meter + alert state, with all thresholds decided by the pure `context_budget` logic.
+#[tauri::command]
+pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result<ContextStatus> {
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+
+    // The model the next turn will actually use (the primary of the chat role).
+    let model = effective_models(&conn, CHAT_MODELS_KEY, CHAT_AUTO_SWITCH_KEY)?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+
+    // The selected model's window + the catalogue (latest refresh batch), from the daily price/context fetch.
+    let catalogue = cached_catalogue(&conn)?;
+    let context_window = catalogue
+        .iter()
+        .find(|m| m.id == model)
+        .and_then(|m| m.context_length)
+        .map(|v| v as i64);
+
+    // Per-conversation state: the measured last prompt size, the summary, and its cursor.
+    let session: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT summary, summary_covers_up_to_turn_id, last_prompt_tokens \
+             FROM chat_sessions WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (summary, cursor, used_tokens) = session.unwrap_or((None, None, None));
+
+    let uncovered_pairs = chat::completed_turn_pairs_after(&conn, conversation_id, cursor)?.len();
+    let summary_present = summary
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    let summary_tokens_est = summary
+        .as_deref()
+        .map(context_budget::est_tokens)
+        .unwrap_or(0);
+
+    let percent = context_budget::usage_percent(used_tokens, context_window);
+    let compress =
+        context_budget::compress_plan(uncovered_pairs, summary_tokens_est, context_window);
+    let upgrade = match context_window {
+        Some(w) => {
+            let options: Vec<context_budget::ModelOption> = catalogue
+                .iter()
+                .filter_map(|m| {
+                    m.context_length.map(|cl| context_budget::ModelOption {
+                        id: m.id.clone(),
+                        name: m.name.clone(),
+                        context_length: cl as i64,
+                    })
+                })
+                .collect();
+            context_budget::upgrade_options(w, &options)
+        }
+        None => Vec::new(),
+    };
+
+    Ok(ContextStatus {
+        model,
+        context_window,
+        used_tokens,
+        percent,
+        alerting: context_budget::is_alerting(percent),
+        regime: if summary_present { "summary" } else { "window" }.to_string(),
+        compress,
+        upgrade,
+    })
+}
+
+/// Compress now (card 7D's Compress action): fold the older un-summarised turns into the rolling summary to
+/// reclaim context, returning the bullets that were condensed (the HITL "what was condensed" the user
+/// verifies) and the snapshot to Undo with. `None` when there is nothing to fold.
+#[tauri::command]
+pub async fn compress_chat(
+    app: AppHandle,
+    conversation_id: i64,
+) -> Result<Option<chat_summary::CompressResult>> {
+    chat_summary::compress_now(&app, conversation_id).await
+}
+
+/// Undo a compression (card 7D): restore the snapshot the UI held from `compress_chat`. Stateless — the
+/// summary is append-only, so this just puts the prior summary, cursor, and measured size back.
+#[tauri::command]
+pub async fn revert_compress(
+    app: AppHandle,
+    conversation_id: i64,
+    snapshot: chat_summary::CompressSnapshot,
+) -> Result<()> {
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    chat_summary::revert_to(&conn, conversation_id, &snapshot)
 }
 
 /// Retrieve grounding chunks for a chat query — best-effort. Returns an empty

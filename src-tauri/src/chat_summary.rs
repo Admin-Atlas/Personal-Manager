@@ -36,9 +36,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use crate::commands::{effective_models, BACKGROUND_AUTO_SWITCH_KEY, BACKGROUND_MODELS_KEY};
+use crate::context_budget::{self, COMPRESS_FLOOR_PAIRS};
 use crate::error::Result;
 use crate::openrouter::{self, ChatMessage};
 use crate::{chat, secrets, AppState};
@@ -268,6 +270,165 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
     } else {
         Ok(Outcome::Extended { pairs: total })
     }
+}
+
+/// The pre-compress state a [`compress_now`] returns so the UI can offer a stateless Undo: restoring these
+/// three fields reverses the compression exactly (the summary is append-only, so revert is "put the prior
+/// summary, cursor, and measured size back"). The frontend holds this and echoes it to [`revert_to`] — no
+/// server-side undo state is kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CompressSnapshot {
+    pub prev_summary: Option<String>,
+    pub prev_cursor: Option<i64>,
+    pub prev_prompt_tokens: Option<i64>,
+}
+
+/// The result of an explicit Compress (card 7D): the bullets just folded in (the HITL "what was condensed"
+/// the user verifies), a rough estimate of the tokens reclaimed, and the snapshot to Undo with.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CompressResult {
+    pub condensed_bullets: String,
+    pub reclaimed_est: i64,
+    pub snapshot: CompressSnapshot,
+}
+
+/// The oldest pairs an explicit Compress folds: all but the [`COMPRESS_FLOOR_PAIRS`] most-recent (which stay
+/// verbatim), and the cursor they advance to. `None` when the un-summarised tail is already at/under the
+/// floor — nothing to reclaim. Pure, unit-tested without a model.
+fn compress_segment(mut pairs: Vec<chat::TurnPair>) -> Option<(Vec<chat::TurnPair>, i64)> {
+    let foldable = pairs.len().saturating_sub(COMPRESS_FLOOR_PAIRS);
+    if foldable == 0 {
+        return None;
+    }
+    pairs.truncate(foldable);
+    let new_cursor = pairs.last().expect("foldable > 0 ⇒ non-empty").turn_id;
+    Some((pairs, new_cursor))
+}
+
+/// Explicit, user-triggered compression (card 7D's Compress action): fold the older un-summarised tail into
+/// the rolling summary NOW — down to [`COMPRESS_FLOOR_PAIRS`] verbatim pairs — to reclaim context, even
+/// though the automatic window-aligned trigger hasn't fired. It reuses the exact card-C primitives
+/// ([`render_summary_request`] + [`apply_extension`]): the fold is **append-from-raw**, never a
+/// summary-of-the-summary, honouring the card's no-recursion rule. The model call is made off the DB lock
+/// (AGENTS rule #4), mirroring [`extend_summary`].
+///
+/// Returns `None` when there is nothing to fold (the tail is already at the floor, or no key/session) — the
+/// caller then leaves the alert on Continue/Upgrade. The headline meter stays measured; we only optimistically
+/// drop `last_prompt_tokens` by the estimated reclaim so the bar moves immediately, and the next real reply
+/// re-measures it exactly.
+pub(crate) async fn compress_now(
+    app: &AppHandle,
+    conversation_id: i64,
+) -> Result<Option<CompressResult>> {
+    // 1. Short read lock: snapshot the pre-compress state and the oldest foldable pairs (all but the floor).
+    let (snapshot, segment, new_cursor) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let row: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
+            .query_row(
+                "SELECT summary, summary_covers_up_to_turn_id, last_prompt_tokens \
+                 FROM chat_sessions WHERE conversation_id = ?1",
+                params![conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((prev_summary, prev_cursor, prev_prompt_tokens)) = row else {
+            return Ok(None);
+        };
+        let pairs = chat::completed_turn_pairs_after(&conn, conversation_id, prev_cursor)?;
+        let Some((segment, new_cursor)) = compress_segment(pairs) else {
+            return Ok(None);
+        };
+        (
+            CompressSnapshot {
+                prev_summary,
+                prev_cursor,
+                prev_prompt_tokens,
+            },
+            segment,
+            new_cursor,
+        )
+    };
+
+    // 2. Resolve the background model + key off the lock; no key ⇒ we cannot compress.
+    let Some(api_key) = secrets::get_openrouter_key()? else {
+        return Ok(None);
+    };
+    let models = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?
+    };
+
+    // 3. Summarise the folded span (async, no lock held).
+    let messages = render_summary_request(snapshot.prev_summary.as_deref(), &segment);
+    let completion = openrouter::complete(api_key.expose(), &models, &messages, false).await?;
+    let bullets = completion.text.trim().to_string();
+
+    // Estimated reclaim: the raw tokens leaving the verbatim window, minus the bullets we add back.
+    let raw_folded: String = segment
+        .iter()
+        .map(|p| format!("{} {}", p.user, p.assistant))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reclaimed_est =
+        (context_budget::est_tokens(&raw_folded) - context_budget::est_tokens(&bullets)).max(0);
+
+    // 4. Short write lock: append + advance the cursor, optimistically drop the meter, log the spend.
+    {
+        let state = app.state::<AppState>();
+        let mut conn = state.conn()?;
+        apply_extension(&mut conn, conversation_id, &bullets, new_cursor)?;
+        if let Some(old) = snapshot.prev_prompt_tokens {
+            let optimistic = (old - reclaimed_est).max(0);
+            let _ = conn.execute(
+                "UPDATE chat_sessions SET last_prompt_tokens = ?1 WHERE conversation_id = ?2",
+                params![optimistic, conversation_id],
+            );
+        }
+        let model = completion
+            .model
+            .as_deref()
+            .or_else(|| models.first().map(String::as_str));
+        let _ = conn.execute(
+            "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
+             VALUES (?1, 'chat_compress', ?2, ?3, ?4)",
+            params![
+                model,
+                completion.usage.prompt_tokens,
+                completion.usage.completion_tokens,
+                completion.usage.cost
+            ],
+        );
+    }
+
+    Ok(Some(CompressResult {
+        condensed_bullets: bullets,
+        reclaimed_est,
+        snapshot,
+    }))
+}
+
+/// Stateless Undo for [`compress_now`]: restore the snapshot the frontend echoes back. The summary is
+/// append-only, so this simply puts the prior summary, cursor, and measured prompt size back — reversing
+/// the compression exactly. Pure DB write; unit-tested.
+pub(crate) fn revert_to(
+    conn: &Connection,
+    conversation_id: i64,
+    snap: &CompressSnapshot,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE chat_sessions \
+         SET summary = ?1, summary_covers_up_to_turn_id = ?2, last_prompt_tokens = ?3 \
+         WHERE conversation_id = ?4",
+        params![
+            snap.prev_summary,
+            snap.prev_cursor,
+            snap.prev_prompt_tokens,
+            conversation_id
+        ],
+    )?;
+    Ok(())
 }
 
 /// Extend the summary of every chat session whose un-summarised tail has grown past the window. The launch
@@ -595,5 +756,70 @@ mod tests {
         // With no prior summary the framing changes but the new turns still ride.
         let fresh = render_summary_request(None, &seg);
         assert!(fresh[1].content.contains("start of the summary"));
+    }
+
+    fn pair(turn_id: i64) -> chat::TurnPair {
+        chat::TurnPair {
+            user: format!("u{turn_id}"),
+            assistant: format!("a{turn_id}"),
+            turn_id,
+            at: "2026-06-28T10:00:00.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn compress_segment_folds_all_but_the_floor() {
+        // 8 pairs ⇒ fold the oldest 8 - FLOOR, leaving exactly COMPRESS_FLOOR_PAIRS verbatim.
+        let pairs: Vec<_> = (1..=8).map(pair).collect();
+        let (segment, cursor) = compress_segment(pairs).expect("foldable above the floor");
+        assert_eq!(
+            segment.len(),
+            8 - COMPRESS_FLOOR_PAIRS,
+            "keeps the floor verbatim"
+        );
+        assert_eq!(segment[0].turn_id, 1, "folds the oldest first");
+        assert_eq!(
+            cursor,
+            segment.last().unwrap().turn_id,
+            "cursor advances to the last folded pair"
+        );
+        // At or under the floor there is nothing to fold.
+        assert!(compress_segment((1..=COMPRESS_FLOOR_PAIRS as i64).map(pair).collect()).is_none());
+        assert!(compress_segment(vec![pair(1)]).is_none());
+    }
+
+    #[test]
+    fn revert_restores_the_pre_compress_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(dir.path());
+        // A session already compressed: a long summary, advanced cursor, optimistically-dropped meter.
+        let conv = session_with_pairs(&conn, Some("- A\n- B\n- C"), Some(99), 0);
+        conn.execute(
+            "UPDATE chat_sessions SET last_prompt_tokens = 4000 WHERE conversation_id = ?1",
+            params![conv],
+        )
+        .unwrap();
+        // Undo back to the pre-compress state the UI held.
+        let snap = CompressSnapshot {
+            prev_summary: Some("- A".into()),
+            prev_cursor: Some(20),
+            prev_prompt_tokens: Some(9000),
+        };
+        revert_to(&conn, conv, &snap).unwrap();
+        let (summary, cursor, ltk): (Option<String>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT summary, summary_covers_up_to_turn_id, last_prompt_tokens \
+                 FROM chat_sessions WHERE conversation_id = ?1",
+                params![conv],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(summary.as_deref(), Some("- A"));
+        assert_eq!(cursor, Some(20));
+        assert_eq!(
+            ltk,
+            Some(9000),
+            "meter restored to its pre-compress reading"
+        );
     }
 }

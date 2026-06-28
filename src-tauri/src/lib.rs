@@ -11,6 +11,7 @@ mod clock;
 mod commands;
 mod commands_dev;
 mod components;
+mod context_budget;
 mod cost;
 mod db;
 mod drive;
@@ -598,6 +599,9 @@ pub fn run() {
             commands::create_conversation,
             commands::get_messages,
             commands::send_message,
+            commands::chat_context_status,
+            commands::compress_chat,
+            commands::revert_compress,
             commands::sidecar_status,
             commands::ensure_sidecar,
             commands::ingest_paths,
