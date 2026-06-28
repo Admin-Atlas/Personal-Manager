@@ -312,11 +312,16 @@ export const searchDocuments = (query: string, k?: number) =>
 export const transcribeAudio = (audioBase64: string) =>
   invoke<string>("transcribe_audio", { audioBase64 });
 
-/** Ingest files/folders, streaming progress for each item. */
-export function ingestPaths(paths: string[], onEvent: (event: IngestEvent) => void): Promise<void> {
+/** Ingest files/folders, streaming progress for each item. `copyPhotosToVault` is the drag-drop
+ *  opt-in to save dropped originals into the vault's `photos/` folder (photos only; default off). */
+export function ingestPaths(
+  paths: string[],
+  onEvent: (event: IngestEvent) => void,
+  copyPhotosToVault = false,
+): Promise<void> {
   const channel = new Channel<IngestEvent>();
   channel.onmessage = onEvent;
-  return invoke<void>("ingest_paths", { paths, onEvent: channel });
+  return invoke<void>("ingest_paths", { paths, copyPhotosToVault, onEvent: channel });
 }
 
 /** Drop the index and rebuild it from the Markdown vault. */

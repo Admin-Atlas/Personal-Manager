@@ -352,7 +352,7 @@ fn embed_and_index(
     let texts = ingest::leaf_embed_texts(&chunks);
     let embeddings = gateway.embed_documents(&texts)?;
     ingest::check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
-    ingest::index_document(state, meta, &chunks, &embeddings)
+    ingest::index_document(state, meta, &chunks, &embeddings, None)
 }
 
 /// Register a source as an index-only document: chunk + embed its body (fetched once), store the leaf

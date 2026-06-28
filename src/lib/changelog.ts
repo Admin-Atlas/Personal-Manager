@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.41.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Photos and screenshots can now be ingested (engine side): drop in a JPG/PNG/WebP/HEIC and PM reads the text inside it (when text recognition is enabled), pulls the capture date and location from the photo, and makes it searchable alongside your documents — including a clean “that screenshot from March” style of recall.",
+      "Your originals stay where they are by default; nothing is copied unless you ask. (The drag-and-drop with the “save a copy into my vault” option arrives in the next update.)",
+      "Photos rebuild from your vault like any document, and the recognized text is never re-run on a rebuild — so re-indexing stays fast.",
+    ],
+  },
+  {
     version: "2.40.0-alpha",
     date: "2026-06-28",
     highlights: [
