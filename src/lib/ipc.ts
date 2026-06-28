@@ -425,6 +425,8 @@ export const setProjectMetadata = (
     size?: ProjectSize;
     blockedBy?: string | null;
     parent?: string | null;
+    /** Manual priority ("high"/"medium"/"low"); null = Auto (no tag). */
+    importance?: Importance;
   },
 ) =>
   invoke<void>("set_project_metadata", {
@@ -433,6 +435,7 @@ export const setProjectMetadata = (
     size: meta.size ?? null,
     blockedBy: meta.blockedBy ?? null,
     parent: meta.parent ?? null,
+    importance: meta.importance ?? null,
   });
 
 /** Ask the AI to propose triage metadata for projects, streaming each proposal.

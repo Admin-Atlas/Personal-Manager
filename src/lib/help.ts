@@ -320,7 +320,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "focus-cards": {
     title: "Your projects",
-    body: "Every active project, sorted with the most pressing first. Each row carries one status that answers 'should I look at this now?'. Hover a project, its status, or its Triage panel for more.",
+    body: "Every active project. By default they're sorted with the most pressing first; use the Sort control to reorder by deadline, priority, size, or most-recent activity, and the ↑/↓ button to reverse it. Each row carries one status that answers 'should I look at this now?'. Hover a project, its status, or its Triage panel for more.",
+  },
+  "focus-sort": {
+    title: "Sort your projects",
+    body: "Reorder the list. Smart (the default) keeps the most pressing first — due-soon, then blocked, quick wins, gone-quiet, and so on. Or sort by Deadline (the nearest milestone), Priority (the level you set in Triage), Size, or Recent active (when you last touched the project — including chatting in it or editing its milestones). The ↑/↓ button flips between ascending and descending; your choice is remembered on this device.",
   },
   "focus-briefing": {
     title: "Today's briefing",
@@ -336,7 +340,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "focus-card": {
     title: "Project",
-    body: "One project and its current status. The line beneath shows what drives that status — document count, importance, size, the nearest milestone, blocker, last activity. Click the name to open it; click Triage to set its attributes.",
+    body: "One project and its current status. The line beneath shows what drives that status — document count, priority, size, the nearest milestone, blocker, last activity. Click the name to open it; click Triage to set its attributes.",
   },
   "focus-status-badge": {
     title: "Status",
@@ -344,7 +348,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "focus-triage": {
     title: "Triage a project",
-    body: "Set a size (a 'quick' project becomes a Quick win), a blocker (drives Blocked), or a parent (drives Part of), and add milestones — the project's deadlines. If the AI suggested values, 'Use it' fills the form so you can confirm or tweak before saving.",
+    body: "Set a size (a 'quick' project becomes a Quick win), a priority (High/Medium/Low — or Auto, which shows no tag), a blocker (drives Blocked), or a parent (drives Part of), and add milestones — the project's deadlines. Priority is yours to set: it's no longer guessed from your documents, and you can sort the focus list by it. If the AI suggested values, 'Use it' fills the form so you can confirm or tweak before saving.",
   },
   "project-milestones": {
     title: "Milestones",

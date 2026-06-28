@@ -17,12 +17,14 @@ import { MilestoneList } from "./MilestoneList";
 import type {
   CalendarEvent,
   DailyBriefing,
+  Importance,
   ProjectOverview,
   ProjectProposal,
   ProjectSize,
   ProjectStatus,
 } from "../lib/types";
 import { formatDate } from "../lib/format";
+import { rankImportance } from "../lib/importance";
 import { Button, Card, Select, Skeleton, StatusBadge } from "./ui";
 import { useDepth } from "../theme";
 
@@ -40,6 +42,67 @@ const STATUS_ORDER: ProjectStatus[] = [
   "part_of",
   "on_track",
 ];
+
+// --- focus-view sorting (Step 5 follow-up) ---
+// "Smart" is the default — the status precedence above, the same one the focus view always
+// used. The other keys let the user re-rank by one explicit attribute, in either direction.
+type SortKey = "smart" | "deadline" | "importance" | "size" | "recent";
+interface Sort {
+  key: SortKey;
+  dir: "asc" | "desc";
+}
+const SORT_LABELS: Record<SortKey, string> = {
+  smart: "Smart",
+  deadline: "Deadline",
+  importance: "Importance",
+  size: "Size",
+  recent: "Recent active",
+};
+/** The natural direction for each key when it's first chosen (the ↑/↓ toggle flips it). */
+const DEFAULT_DIR: Record<SortKey, "asc" | "desc"> = {
+  smart: "asc", // most pressing first
+  deadline: "asc", // soonest first
+  importance: "desc", // highest first
+  size: "desc", // largest first
+  recent: "desc", // most recently active first
+};
+const SIZE_RANK: Record<string, number> = { quick: 1, standard: 2, large: 3 };
+const SORT_LS_KEY = "pm.focus.sort";
+
+/** The date a deadline-sort ranks on: the governing milestone, else a name-matched calendar
+ *  event, else a far-future sentinel so undated projects sort last (ascending). */
+function deadlineKey(p: ProjectOverview): string {
+  return (p.governing_milestone?.due_date ?? p.calendar_event?.start ?? "9999-12-31").slice(0, 10);
+}
+
+/** Ascending comparison for one sort key (the ↑/↓ toggle applies the direction outside). */
+function ascCompare(a: ProjectOverview, b: ProjectOverview, key: SortKey): number {
+  switch (key) {
+    case "smart":
+      return STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status);
+    case "deadline":
+      return deadlineKey(a).localeCompare(deadlineKey(b));
+    case "importance":
+      return rankImportance(a.importance) - rankImportance(b.importance);
+    case "size":
+      return (SIZE_RANK[a.size ?? ""] ?? 0) - (SIZE_RANK[b.size ?? ""] ?? 0);
+    case "recent":
+      return (a.last_activity ?? "").localeCompare(b.last_activity ?? "");
+  }
+}
+
+function readSort(): Sort {
+  try {
+    const raw = localStorage.getItem(SORT_LS_KEY);
+    if (raw) {
+      const s = JSON.parse(raw);
+      if (s && s.key in SORT_LABELS && (s.dir === "asc" || s.dir === "desc")) return s;
+    }
+  } catch {
+    /* fall through to the default */
+  }
+  return { key: "smart", dir: "asc" };
+}
 
 // Switching tabs unmounts this view, so without a cache every return refetches and
 // flashes the skeleton. Remember the last good load at module scope and seed state
@@ -147,15 +210,17 @@ export function FocusView({ onOpenProject }: Props) {
   }, []);
 
   const names = useMemo(() => projects.map((p) => p.name), [projects]);
-  const sorted = useMemo(
-    () =>
-      [...projects].sort(
-        (a, b) =>
-          STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status) ||
-          a.name.localeCompare(b.name),
-      ),
-    [projects],
-  );
+  // How the project list is ordered. Defaults to "Smart" (status precedence); remembered per-device.
+  const [sort, setSort] = useState<Sort>(() => readSort());
+  useEffect(() => {
+    localStorage.setItem(SORT_LS_KEY, JSON.stringify(sort));
+  }, [sort]);
+  const sorted = useMemo(() => {
+    const factor = sort.dir === "asc" ? 1 : -1;
+    return [...projects].sort(
+      (a, b) => ascCompare(a, b, sort.key) * factor || a.name.localeCompare(b.name),
+    );
+  }, [projects, sort]);
 
   async function suggestAll() {
     if (proposing || projects.length === 0) return;
@@ -223,25 +288,61 @@ export function FocusView({ onOpenProject }: Props) {
               No projects yet. Ingest some documents and sort them in Review.
             </p>
           ) : (
-            <ul className="flex flex-col gap-2" data-help="focus-cards">
-              {sorted.map((p) => (
-                <ProjectCard
-                  key={p.name}
-                  project={p}
-                  otherProjects={names.filter((n) => n !== p.name)}
-                  events={events}
-                  proposal={proposals[p.name]}
-                  editing={editing === p.name}
-                  onEdit={() => setEditing(editing === p.name ? null : p.name)}
-                  onOpen={() => onOpenProject(p.name)}
-                  onChanged={refresh}
-                  onSaved={async () => {
-                    setEditing(null);
-                    await refresh();
+            <>
+              <div
+                className="mb-2 flex items-center justify-end gap-1.5 text-xs text-ink4"
+                data-help="focus-sort"
+              >
+                <span>Sort</span>
+                <Select
+                  value={sort.key}
+                  onChange={(e) => {
+                    const key = e.target.value as SortKey;
+                    // Choosing a key applies its natural direction; the ↑/↓ button flips it.
+                    setSort((cur) => (cur.key === key ? cur : { key, dir: DEFAULT_DIR[key] }));
                   }}
-                />
-              ))}
-            </ul>
+                  className="h-7 py-0 text-xs"
+                  title="Reorder projects"
+                >
+                  {(Object.keys(SORT_LABELS) as SortKey[]).map((k) => (
+                    <option key={k} value={k}>
+                      {SORT_LABELS[k]}
+                    </option>
+                  ))}
+                </Select>
+                <button
+                  type="button"
+                  onClick={() => setSort((s) => ({ ...s, dir: s.dir === "asc" ? "desc" : "asc" }))}
+                  title={
+                    sort.dir === "asc"
+                      ? "Ascending — click for descending"
+                      : "Descending — click for ascending"
+                  }
+                  className="rounded-[var(--radius-sm)] px-1.5 py-0.5 hover:bg-surface hover:text-ink2"
+                >
+                  {sort.dir === "asc" ? "↑" : "↓"}
+                </button>
+              </div>
+              <ul className="flex flex-col gap-2" data-help="focus-cards">
+                {sorted.map((p) => (
+                  <ProjectCard
+                    key={p.name}
+                    project={p}
+                    otherProjects={names.filter((n) => n !== p.name)}
+                    events={events}
+                    proposal={proposals[p.name]}
+                    editing={editing === p.name}
+                    onEdit={() => setEditing(editing === p.name ? null : p.name)}
+                    onOpen={() => onOpenProject(p.name)}
+                    onChanged={refresh}
+                    onSaved={async () => {
+                      setEditing(null);
+                      await refresh();
+                    }}
+                  />
+                ))}
+              </ul>
+            </>
           )}
         </div>
       </div>
@@ -301,7 +402,7 @@ function ProjectCard({
                   {project.doc_count} doc{project.doc_count === 1 ? "" : "s"}
                 </span>
                 {project.importance && (
-                  <span className="capitalize">{project.importance} importance</span>
+                  <span className="capitalize">{project.importance} priority</span>
                 )}
                 {project.size && <span>{project.size}</span>}
                 {project.governing_milestone?.due_date && (
@@ -363,6 +464,7 @@ function MetaEditor({
   onSaved: () => void;
 }) {
   const [size, setSize] = useState<ProjectSize>(project.size);
+  const [importance, setImportance] = useState<Importance>(project.importance);
   const [blockedBy, setBlockedBy] = useState(project.blocked_by ?? "");
   const [parent, setParent] = useState(project.parent ?? "");
   const [saving, setSaving] = useState(false);
@@ -384,6 +486,7 @@ function MetaEditor({
     try {
       await setProjectMetadata(project.name, {
         size,
+        importance,
         blockedBy: blockedBy || null,
         parent: parent || null,
       });
@@ -433,6 +536,19 @@ function MetaEditor({
             <option value="quick">quick</option>
             <option value="standard">standard</option>
             <option value="large">large</option>
+          </Select>
+        </Field>
+        <Field label="Priority">
+          <Select
+            value={importance ?? ""}
+            onChange={(e) => setImportance((e.target.value || null) as Importance)}
+            className="w-full"
+            title="A manual priority for this project. Auto shows no tag."
+          >
+            <option value="">Auto (no tag)</option>
+            <option value="high">high</option>
+            <option value="medium">medium</option>
+            <option value="low">low</option>
           </Select>
         </Field>
         <Field label="Blocked by">
