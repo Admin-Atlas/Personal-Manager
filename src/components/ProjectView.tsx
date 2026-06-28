@@ -14,6 +14,7 @@ import {
   setDocumentMetadata,
 } from "../lib/ipc";
 import { useChatStream } from "../lib/useChatStream";
+import { useResizable } from "../lib/useResizable";
 import type { CalendarEvent, Document, Milestone } from "../lib/types";
 import { Button, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
@@ -63,6 +64,19 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
   const [projectNames, setProjectNames] = useState<string[]>([]);
   // How the Files panel is ordered. Name A→Z by default; clicking a key again reverses it.
   const [sort, setSort] = useState<FileSort>({ key: "name", dir: "asc" });
+  // The right panel's width is a fraction of the window (drag the left edge to resize, stays
+  // proportional on window resize), clamped so it can't get so narrow the content scrolls.
+  const {
+    width: asideWidth,
+    startResize,
+    resizing,
+  } = useResizable({
+    storageKey: "pm.project.sidebarFrac",
+    defaultFrac: 0.24,
+    minFrac: 0.16,
+    maxFrac: 0.5,
+    edge: "left",
+  });
 
   function toggleSort(key: FileSortKey) {
     setSort((cur) =>
@@ -186,7 +200,7 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
         </div>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className={`flex flex-1 overflow-hidden ${resizing ? "select-none" : ""}`}>
         <main className="flex min-w-0 flex-1 flex-col" data-help="project-chat">
           {chat.error && (
             <div
@@ -205,9 +219,21 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
         </main>
 
         <aside
-          className="w-80 shrink-0 overflow-y-auto border-l border-border bg-panel"
+          style={{ width: asideWidth }}
+          className="relative shrink-0 overflow-y-auto overflow-x-hidden border-l border-border bg-panel"
           data-help="project-files"
         >
+          <div
+            onPointerDown={startResize}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize panel"
+            title="Drag to resize"
+            data-help="project-resize"
+            className={`absolute left-0 top-0 z-10 h-full w-1.5 cursor-col-resize touch-none transition-colors hover:bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] ${
+              resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
+            }`}
+          />
           {(showMeta || milestones.length > 0) && (
             <div className="border-b border-border px-4 pb-3 pt-3" data-help="project-milestones">
               <span className="font-mono text-xs uppercase tracking-wide text-ink4">

@@ -348,7 +348,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "project-milestones": {
     title: "Milestones",
-    body: "A project's deadlines — a pitch, a presentation, an internal due date — each with a label and a date. The nearest one you haven't ticked off drives the 'Due soon' status; tick it and the next takes over. Link a milestone to a calendar event (📅) and its date stays in sync with your calendar automatically.",
+    body: "A project's deadlines — a pitch, a presentation, an internal due date — each with a name and a date. Tick the checkbox on the left to mark one done: it gets a 'Done' tag and a line through it. The nearest one you haven't ticked off drives the 'Due soon' status; tick it and the next takes over. Reorder with the arrows, remove with ×. Link a milestone to a calendar event (📅) and its date stays in sync with your calendar automatically.",
+  },
+  "project-resize": {
+    title: "Resize the panel",
+    body: "Drag this edge to make the side panel wider or narrower. The width is a share of the window, so it stays in proportion as you resize the app, and it's remembered on this device.",
   },
   "project-chat": {
     title: "Project chat",
