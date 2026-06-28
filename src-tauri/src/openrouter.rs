@@ -250,19 +250,22 @@ fn chat_body(
     models: &[String],
     messages: &[ChatMessage],
     stream: bool,
-    cache_prefix: bool,
+    cache_through: Option<usize>,
 ) -> serde_json::Value {
-    // Build the messages array by hand so we can optionally mark the first message (the stable
-    // system prefix) with an ephemeral prompt-cache breakpoint. OpenRouter forwards `cache_control`
-    // to providers that support prompt caching (e.g. Anthropic), which then bill the reused prefix at
-    // the cheap cache-read rate — a big saving when the same prefix repeats across many calls (the
-    // per-document review loop). Providers without caching, or a prefix below their minimum cacheable
-    // size, simply ignore it. Non-prefixed messages serialise exactly as before.
+    // Build the messages array by hand so we can optionally mark a stable system prefix with an
+    // ephemeral prompt-cache breakpoint. `cache_through` is the index of the LAST message of the
+    // stable prefix: OpenRouter forwards `cache_control` to providers that support prompt caching
+    // (e.g. Anthropic), which cache everything up to AND INCLUDING that message and bill the reused
+    // prefix at the cheap cache-read rate — a big saving when the same prefix repeats across calls (the
+    // per-document review loop marks index 0; chat marks the last of its profile/agenda/summary block,
+    // keeping the per-turn grounding + history AFTER the breakpoint where they stay uncached). Providers
+    // without caching, or a prefix below their minimum cacheable size, simply ignore it. Non-marked
+    // messages serialise exactly as before.
     let msgs: Vec<serde_json::Value> = messages
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if cache_prefix && i == 0 {
+            if cache_through == Some(i) {
                 serde_json::json!({
                     "role": m.role,
                     "content": [{
@@ -314,14 +317,17 @@ pub async fn stream_chat<F>(
     api_key: &str,
     models: &[String],
     messages: &[ChatMessage],
+    cache_through: Option<usize>,
     mut on_token: F,
 ) -> Result<Completion>
 where
     F: FnMut(&str),
 {
-    // Chat context (retrieved chunks) differs every turn, so prefix caching wouldn't hit — don't pay
-    // the cache-write premium here.
-    let body = chat_body(models, messages, true, false);
+    // `cache_through` marks the end of the stable system prefix (the profile/agenda/rolling-summary
+    // block, card 7C) so providers cache it and bill it cheaply turn after turn; the per-turn grounding
+    // and growing history sit after it and stay uncached. `None` (no stable block) preserves the old
+    // fully-uncached behaviour.
+    let body = chat_body(models, messages, true, cache_through);
 
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -446,7 +452,8 @@ pub async fn complete(
     messages: &[ChatMessage],
     cache_prefix: bool,
 ) -> Result<Completion> {
-    let body = chat_body(models, messages, false, cache_prefix);
+    // Background callers cache from message 0 (their stable system instruction); `false` ⇒ no breakpoint.
+    let body = chat_body(models, messages, false, cache_prefix.then_some(0));
 
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -529,7 +536,7 @@ mod tests {
     fn chat_body_enforces_zdr_and_keeps_model_routing() {
         // Single model: the "model" field, the ZDR provider object, usage accounting, and the
         // streaming usage opt-in. chat_body is PM's only ZDR enforcement point, so this guards it.
-        let one = chat_body(&["a/b".to_string()], &[], true, false);
+        let one = chat_body(&["a/b".to_string()], &[], true, None);
         assert_eq!(one["provider"]["zdr"], serde_json::json!(true));
         assert_eq!(
             one["provider"]["data_collection"],
@@ -544,7 +551,7 @@ mod tests {
         );
         // Several models: the ordered "models" fallback list, still ZDR-enforced + usage-accounted,
         // no "model" and (non-streaming) no stream_options.
-        let many = chat_body(&["a/b".to_string(), "c/d".to_string()], &[], false, false);
+        let many = chat_body(&["a/b".to_string(), "c/d".to_string()], &[], false, None);
         assert_eq!(many["models"], serde_json::json!(["a/b", "c/d"]));
         assert!(many.get("model").is_none());
         assert_eq!(many["provider"]["zdr"], serde_json::json!(true));
@@ -553,37 +560,50 @@ mod tests {
     }
 
     #[test]
-    fn chat_body_caches_only_the_prefix_when_asked() {
+    fn chat_body_marks_the_cache_breakpoint_at_the_given_index() {
         let msgs = vec![
             ChatMessage {
                 role: "system".into(),
-                content: "stable instructions".into(),
+                content: "profile".into(),
+            },
+            ChatMessage {
+                role: "system".into(),
+                content: "rolling summary".into(),
             },
             ChatMessage {
                 role: "user".into(),
-                content: "the document".into(),
+                content: "the latest turn".into(),
             },
         ];
-        // cache_prefix=false → plain string content, no cache_control anywhere.
-        let plain = chat_body(&["a/b".to_string()], &msgs, false, false);
-        assert_eq!(
-            plain["messages"][0]["content"],
-            serde_json::json!("stable instructions")
+        // None → every message is a plain string, no cache_control anywhere (the old chat behaviour).
+        let plain = chat_body(&["a/b".to_string()], &msgs, false, None);
+        for i in 0..msgs.len() {
+            assert!(
+                plain["messages"][i]["content"].is_string(),
+                "message {i} stays a plain string when uncached"
+            );
+        }
+        // Some(1) → the breakpoint sits on message 1 (the last stable system message), so the provider
+        // caches the prefix through it; the earlier stable message and the dynamic turn after it stay
+        // plain. (Anthropic caches everything up to AND INCLUDING the marked block.)
+        let cached = chat_body(&["a/b".to_string()], &msgs, false, Some(1));
+        assert!(
+            cached["messages"][0]["content"].is_string(),
+            "messages before the breakpoint are not themselves marked"
         );
-        // cache_prefix=true → message[0] becomes a content block carrying the ephemeral breakpoint;
-        // later messages stay plain strings (only the stable prefix is cached).
-        let cached = chat_body(&["a/b".to_string()], &msgs, false, true);
         assert_eq!(
-            cached["messages"][0]["content"][0]["cache_control"]["type"],
-            serde_json::json!("ephemeral")
+            cached["messages"][1]["content"][0]["cache_control"]["type"],
+            serde_json::json!("ephemeral"),
+            "the breakpoint is on the last stable message"
         );
         assert_eq!(
-            cached["messages"][0]["content"][0]["text"],
-            serde_json::json!("stable instructions")
+            cached["messages"][1]["content"][0]["text"],
+            serde_json::json!("rolling summary")
         );
         assert_eq!(
-            cached["messages"][1]["content"],
-            serde_json::json!("the document")
+            cached["messages"][2]["content"],
+            serde_json::json!("the latest turn"),
+            "the dynamic turn after the breakpoint stays uncached"
         );
     }
 }
