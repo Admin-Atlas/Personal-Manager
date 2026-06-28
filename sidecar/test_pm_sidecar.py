@@ -85,6 +85,27 @@ class CountTokensTest(unittest.TestCase):
         self.assertNotEqual(counts[0], max(counts))
 
 
+class EmbedTest(unittest.TestCase):
+    """Embedding must survive a chunk longer than the model's 512-token window. Regression for
+    the get_tokenizer bug: disabling truncation for COUNTING also disabled it on the SAME
+    tokenizer fastembed embeds with, so an over-window chunk crashed ONNX (a 512-vs-N broadcast)
+    instead of being truncated. Real-model, so local-only (skipped where fastembed is absent)."""
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("fastembed") is not None,
+        "fastembed not installed (real embedding is a local-only check)",
+    )
+    def test_over_window_chunk_embeds_without_crashing(self):
+        # ~750 words — comfortably past the 512-token window. Counting first caches the cloned
+        # counting tokenizer; the bug would have stripped the embedder's own truncation, so this
+        # embed would raise instead of truncating to a single 384-d vector.
+        long_text = "lorem ipsum dolor sit amet " * 150
+        S.do_count_tokens({"texts": [long_text]})
+        out = S.do_embed({"texts": [long_text]})
+        self.assertEqual(len(out["vectors"]), 1)
+        self.assertEqual(len(out["vectors"][0]), S.EMBED_DIM)
+
+
 class ReduceTest(unittest.TestCase):
     """The 2-D reducer for the semantic memory map. The PCA path (the bundled default) needs only
     numpy, so these run wherever numpy is present and skip otherwise (CI is model-free)."""
