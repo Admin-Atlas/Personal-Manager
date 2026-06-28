@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.49.0-alpha",
+    date: "2026-06-29",
+    highlights: [
+      "Chat now shows how full the current model's context is — a quiet meter by the message box, tuned to whichever model you're using. As a long conversation approaches that model's limit, PM offers to compress it (folding the older turns into a short summary to free up room, and showing you exactly what was condensed so you can undo if needed), switch to a model with a bigger context, or simply carry on.",
+    ],
+  },
+  {
     version: "2.48.0-alpha",
     date: "2026-06-28",
     highlights: [

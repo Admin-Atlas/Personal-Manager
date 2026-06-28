@@ -6,6 +6,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { ChatView } from "./components/ChatView";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
+import { ContextMeter } from "./components/ContextMeter";
 import { DevView } from "./components/DevView";
 import { DocumentsView } from "./components/DocumentsView";
 import { FocusView } from "./components/FocusView";
@@ -44,6 +45,7 @@ import {
   resumeDriveSync,
   resumeOneDriveSync,
   reviewQueue,
+  setChatModels,
   setHelpMode,
   startSemanticLayout,
   vaultLockStatus,
@@ -357,6 +359,16 @@ export default function App() {
     }
   }
 
+  // Switch the chat to a larger-context model (the context meter's Upgrade option, card 7D). Promote the
+  // chosen model to primary, keep the others as auto-switch fallbacks, then re-read settings so the picker
+  // and sidebar tag reflect it.
+  function handleUpgrade(modelId: string) {
+    const rest = (settings?.chat_models ?? []).filter((m) => m !== modelId);
+    setChatModels([modelId, ...rest])
+      .then(refreshSettings)
+      .catch(() => {});
+  }
+
   if (loading) {
     // A wireframe of the app shell (sidebar + content) rather than a bare spinner, so
     // the first paint already has PM's shape.
@@ -504,6 +516,11 @@ export default function App() {
                 </div>
               )}
               <ChatView messages={chat.messages} streaming={chat.streaming} />
+              <ContextMeter
+                conversationId={activeId}
+                refreshKey={chat.messages.length}
+                onUpgrade={handleUpgrade}
+              />
               <Composer disabled={chat.sending} onSend={handleSend} />
             </main>
           )}

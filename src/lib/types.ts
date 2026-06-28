@@ -184,6 +184,50 @@ export type ChatEvent =
   | { type: "done"; message_id: number; content: string; citations: Citation[] }
   | { type: "error"; message: string };
 
+/** A larger-context model the Upgrade option can switch to (board card 7D). */
+export interface ModelOption {
+  id: string;
+  name: string;
+  context_length: number;
+}
+
+/** Whether Compress can reclaim context, and how much would fold (board card 7D). */
+export interface CompressDecision {
+  available: boolean;
+  foldable: number;
+  reason: string | null;
+}
+
+/** How full the selected model's context window is for a conversation, plus what the user can do
+ *  about it (board card 7D, `chat_context_status`). `context_window`/`used_tokens`/`percent` are null
+ *  when unknown (a custom model with no catalogued window, or no reply measured yet) ⇒ the meter shows
+ *  "unknown" and never alerts. `percent` is a 0–1 fraction (the bar caps it at 1). */
+export interface ContextStatus {
+  model: string;
+  context_window: number | null;
+  used_tokens: number | null;
+  percent: number | null;
+  alerting: boolean;
+  regime: "summary" | "window";
+  compress: CompressDecision;
+  upgrade: ModelOption[];
+}
+
+/** The pre-compress state to Undo with — held by the UI and echoed back to `revert_compress`. */
+export interface CompressSnapshot {
+  prev_summary: string | null;
+  prev_cursor: number | null;
+  prev_prompt_tokens: number | null;
+}
+
+/** Result of a Compress (board card 7D, `compress_chat`): the bullets just folded in (the HITL "what was
+ *  condensed" the user verifies), a rough token reclaim, and the snapshot to Undo with. */
+export interface CompressResult {
+  condensed_bullets: string;
+  reclaimed_est: number;
+  snapshot: CompressSnapshot;
+}
+
 /** Ranked importance of a document. `archive` is an explicit "shelved" level (hidden from the Map,
  *  sunk to the bottom of lists, still searchable); `null` is untriaged / unset — a distinct state. */
 export type Importance = "high" | "medium" | "low" | "archive" | null;

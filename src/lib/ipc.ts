@@ -9,6 +9,9 @@ import type {
   CalendarEvent,
   CalendarOverview,
   ChatEvent,
+  CompressResult,
+  CompressSnapshot,
+  ContextStatus,
   Conversation,
   CostSummary,
   DailyBriefing,
@@ -280,6 +283,20 @@ export function sendMessage(
   channel.onmessage = onEvent;
   return invoke<void>("send_message", { conversationId, content, onEvent: channel });
 }
+
+/** How full the selected model's context window is for a conversation, plus the meter/alert state
+ *  (board card 7D). Cheap; the chat calls it after each reply and after a compress/undo. */
+export const chatContextStatus = (conversationId: number) =>
+  invoke<ContextStatus>("chat_context_status", { conversationId });
+
+/** Compress the conversation now: fold the older turns into the rolling summary to reclaim context.
+ *  Returns the condensed bullets + an Undo snapshot, or null when there is nothing to fold. */
+export const compressChat = (conversationId: number) =>
+  invoke<CompressResult | null>("compress_chat", { conversationId });
+
+/** Undo a compression by restoring the snapshot the UI held from `compressChat`. */
+export const revertCompress = (conversationId: number, snapshot: CompressSnapshot) =>
+  invoke<void>("revert_compress", { conversationId, snapshot });
 
 // --- Archivist: documents ---
 
