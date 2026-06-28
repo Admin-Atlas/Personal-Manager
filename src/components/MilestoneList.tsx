@@ -123,108 +123,139 @@ function MilestoneRow({
     onChanged();
   }
 
+  // Two explicit lines so the row never has to side-scroll, however narrow the panel:
+  // line 1 is the checkbox + label + Done + reorder/remove; line 2 is the date (or the
+  // synced calendar date) + the link picker. Every text field is `min-w-0 flex-1` so it
+  // shrinks rather than forcing horizontal overflow.
   return (
-    <div className="flex items-center gap-2 rounded-[var(--radius-sm)] border border-border bg-surface px-2.5 py-1.5">
-      <input
-        type="checkbox"
-        checked={met}
-        title={met ? "Mark not done" : "Mark done"}
-        onChange={async () => {
-          await setMilestoneState(m.id, !met);
-          onChanged();
-        }}
-        className="shrink-0 accent-[var(--accent)]"
-      />
-      <Input
-        value={label}
-        onChange={(e) => setLabel(e.target.value)}
-        onBlur={persist}
-        placeholder="label"
-        className={`h-7 min-w-0 flex-1 text-xs ${met ? "line-through opacity-60" : ""}`}
-      />
-
-      {m.calendar_linked ? (
-        <span
-          className="flex shrink-0 items-center gap-1 text-xs text-accent-text"
-          title={
-            m.event_missing
-              ? "Linked event not found in your synced calendars"
-              : "Synced from calendar"
-          }
-        >
-          📅 {m.due_date ? formatDate(m.due_date.slice(0, 10)) : "—"}
-          {m.event_missing && <span className="text-st-due">⚠</span>}
+    <div
+      className={`rounded-[var(--radius-sm)] border border-border bg-surface px-2.5 py-1.5 ${
+        met ? "opacity-70" : ""
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={met}
+          title={met ? "Mark not done" : "Mark done"}
+          onChange={async () => {
+            await setMilestoneState(m.id, !met);
+            onChanged();
+          }}
+          className="shrink-0 accent-[var(--accent)]"
+        />
+        <Input
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+          onBlur={persist}
+          placeholder="label"
+          className={`h-7 min-w-0 flex-1 text-xs ${met ? "line-through" : ""}`}
+        />
+        {met && <DonePill />}
+        <div className="flex shrink-0 items-center">
+          <Button
+            variant="tertiary"
+            onClick={() => onMove(-1)}
+            disabled={isFirst}
+            title="Move up"
+            className="px-1.5 py-0.5 disabled:opacity-30"
+          >
+            ↑
+          </Button>
+          <Button
+            variant="tertiary"
+            onClick={() => onMove(1)}
+            disabled={isLast}
+            title="Move down"
+            className="px-1.5 py-0.5 disabled:opacity-30"
+          >
+            ↓
+          </Button>
           <Button
             variant="tertiary"
             onClick={async () => {
-              await setMilestoneEvent(m.id, null, m.due_date?.slice(0, 10) ?? null);
+              await deleteMilestone(m.id);
               onChanged();
             }}
-            title="Unlink from calendar (date becomes editable)"
-            className="px-1 py-0.5 text-[10px]"
+            title="Remove milestone"
+            className="px-1.5 py-0.5 hover:text-st-blocked"
           >
-            Unlink
+            ×
           </Button>
-        </span>
-      ) : (
-        <>
-          <Input
-            type="date"
-            value={date}
-            onChange={(e) => setDate(e.target.value)}
-            onBlur={persist}
-            className="h-7 w-[8.5rem] shrink-0 text-xs"
-          />
-          {linkable.length > 0 && (
-            <Select
-              value=""
-              onChange={(e) => e.target.value && void link(e.target.value)}
-              title="Link to a calendar event — its date will sync automatically"
-              className="h-7 w-7 shrink-0 px-1 text-xs"
-            >
-              <option value="">📅</option>
-              {linkable.map((e) => (
-                <option key={e.id} value={e.uid!}>
-                  {e.summary} · {formatDate(e.start.slice(0, 10))}
-                </option>
-              ))}
-            </Select>
-          )}
-        </>
-      )}
+        </div>
+      </div>
 
-      <div className="flex shrink-0 items-center">
-        <Button
-          variant="tertiary"
-          onClick={() => onMove(-1)}
-          disabled={isFirst}
-          title="Move up"
-          className="px-1.5 py-0.5 disabled:opacity-30"
-        >
-          ↑
-        </Button>
-        <Button
-          variant="tertiary"
-          onClick={() => onMove(1)}
-          disabled={isLast}
-          title="Move down"
-          className="px-1.5 py-0.5 disabled:opacity-30"
-        >
-          ↓
-        </Button>
-        <Button
-          variant="tertiary"
-          onClick={async () => {
-            await deleteMilestone(m.id);
-            onChanged();
-          }}
-          title="Remove milestone"
-          className="px-1.5 py-0.5 hover:text-st-blocked"
-        >
-          ×
-        </Button>
+      <div className="mt-1.5 flex items-center gap-2 pl-6">
+        {m.calendar_linked ? (
+          <span
+            className={`flex min-w-0 flex-1 items-center gap-1 text-xs text-accent-text ${
+              met ? "line-through" : ""
+            }`}
+            title={
+              m.event_missing
+                ? "Linked event not found in your synced calendars"
+                : "Synced from calendar"
+            }
+          >
+            <span className="truncate">
+              📅 {m.due_date ? formatDate(m.due_date.slice(0, 10)) : "—"}
+            </span>
+            {m.event_missing && <span className="shrink-0 text-st-due">⚠</span>}
+            <Button
+              variant="tertiary"
+              onClick={async () => {
+                await setMilestoneEvent(m.id, null, m.due_date?.slice(0, 10) ?? null);
+                onChanged();
+              }}
+              title="Unlink from calendar (date becomes editable)"
+              className="shrink-0 px-1 py-0.5 text-[10px]"
+            >
+              Unlink
+            </Button>
+          </span>
+        ) : (
+          <>
+            <Input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              onBlur={persist}
+              className={`h-7 min-w-0 flex-1 text-xs ${met ? "line-through" : ""}`}
+            />
+            {linkable.length > 0 && (
+              <Select
+                value=""
+                onChange={(e) => e.target.value && void link(e.target.value)}
+                title="Link to a calendar event — its date will sync automatically"
+                className="h-7 w-7 shrink-0 px-1 text-xs"
+              >
+                <option value="">📅</option>
+                {linkable.map((e) => (
+                  <option key={e.id} value={e.uid!}>
+                    {e.summary} · {formatDate(e.start.slice(0, 10))}
+                  </option>
+                ))}
+              </Select>
+            )}
+          </>
+        )}
       </div>
     </div>
+  );
+}
+
+/** A calm "ticked off" tag, shown on a met milestone next to its struck-through label. */
+function DonePill() {
+  return (
+    <span
+      className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+      style={{
+        color: "var(--st-track)",
+        background: "color-mix(in oklab, var(--st-track) 16%, transparent)",
+      }}
+    >
+      Done
+    </span>
   );
 }
 
@@ -247,21 +278,23 @@ function AddMilestone({ project, onChanged }: { project: string; onChanged: () =
     }
   }
 
+  // flex-wrap + min-w-0 basis: the name and date share the row when there's room and the
+  // date drops to its own line when the panel is narrow — never a fixed width that overflows.
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2">
       <Input
         value={label}
         onChange={(e) => setLabel(e.target.value)}
         onKeyDown={(e) => e.key === "Enter" && void add()}
         placeholder="New milestone (e.g. pitch)"
-        className="h-7 min-w-0 flex-1 text-xs"
+        className="h-7 min-w-0 flex-1 basis-28 text-xs"
       />
       <Input
         type="date"
         value={date}
         onChange={(e) => setDate(e.target.value)}
         onKeyDown={(e) => e.key === "Enter" && void add()}
-        className="h-7 w-[8.5rem] shrink-0 text-xs"
+        className="h-7 min-w-0 flex-1 basis-28 text-xs"
       />
       <Button
         variant="secondary"

@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.37.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Milestones got tidier. The name and date fields now fit whatever width you give them, so the side panel never has to scroll sideways — and the date box no longer gets clipped when you triage a project on the Focus view.",
+      "Marking a milestone done is now obvious: tick its checkbox and it gets a “Done” tag with a line through it. The nearest one you still haven't ticked keeps driving the project's “Due soon” status, as before.",
+      "You can resize a project's side panel — drag its left edge to make it wider or narrower. The width is kept in proportion as you resize the app and remembered for next time.",
+    ],
+  },
+  {
     version: "2.36.0-alpha",
     date: "2026-06-28",
     highlights: [
