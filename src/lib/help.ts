@@ -336,7 +336,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "focus-card": {
     title: "Project",
-    body: "One project and its current status. The line beneath shows what drives that status — document count, importance, size, deadline, blocker, last activity. Click the name to open it; click Triage to set its attributes.",
+    body: "One project and its current status. The line beneath shows what drives that status — document count, importance, size, the nearest milestone, blocker, last activity. Click the name to open it; click Triage to set its attributes.",
   },
   "focus-status-badge": {
     title: "Status",
@@ -344,7 +344,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "focus-triage": {
     title: "Triage a project",
-    body: "Set a size (a 'quick' project becomes a Quick win), a deadline (drives Due soon), a blocker (drives Blocked), or a parent (drives Part of). If the AI suggested values, 'Use it' fills the form so you can confirm or tweak before saving.",
+    body: "Set a size (a 'quick' project becomes a Quick win), a blocker (drives Blocked), or a parent (drives Part of), and add milestones — the project's deadlines. If the AI suggested values, 'Use it' fills the form so you can confirm or tweak before saving.",
+  },
+  "project-milestones": {
+    title: "Milestones",
+    body: "A project's deadlines — a pitch, a presentation, an internal due date — each with a label and a date. The nearest one you haven't ticked off drives the 'Due soon' status; tick it and the next takes over. Link a milestone to a calendar event (📅) and its date stays in sync with your calendar automatically.",
   },
   "project-chat": {
     title: "Project chat",

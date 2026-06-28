@@ -314,20 +314,50 @@ export type ProjectStatus =
 /** A rough effort estimate for a project ("quick" → Quick win), or unset. */
 export type ProjectSize = "quick" | "standard" | "large" | null;
 
+/** One project milestone (card 7). A milestone is either PM-native (a user-set,
+ *  editable `due_date`) or calendar-linked (`calendar_linked` / `event_uid` set), in
+ *  which case `due_date` is the read-only date synced from the calendar event. */
+export interface Milestone {
+  id: number;
+  project_name: string;
+  label: string;
+  /** The effective date — user-set for PM-native, synced from the calendar for linked. */
+  due_date: string | null;
+  event_uid: string | null;
+  /** True when the date comes from a linked calendar event (read-only). */
+  calendar_linked: boolean;
+  /** True for a linked milestone whose event isn't in the current mirror (gone/unsynced). */
+  event_missing: boolean;
+  state: "met" | "unmet" | null;
+  sort_order: number;
+}
+
+/** The milestone driving a project's status + card line (nearest unmet). */
+export interface GoverningMilestone {
+  id: number;
+  label: string;
+  due_date: string | null;
+}
+
 /** One focus-view row: a project, its derived status, and the signals behind it. */
 export interface ProjectOverview {
   name: string;
   status: ProjectStatus;
   doc_count: number;
   last_activity: string | null;
+  /** Legacy single deadline — superseded by `milestones` (card 7); kept for compat. */
   deadline: string | null;
   size: ProjectSize;
   blocked_by: string | null;
   parent: string | null;
   importance: Importance;
-  /** The upcoming calendar event whose title names this project (Step 6), if any —
-   *  it can drive "Due soon" and is shown on the card to explain the status. */
+  /** The upcoming calendar event whose title names this project (Step 6) — the
+   *  zero-milestone fallback that drives "Due soon" only when the project has none. */
   calendar_event: CalendarMatch | null;
+  /** All milestones, resolved (calendar-linked dates synced) and date-ordered. */
+  milestones: Milestone[];
+  /** The governing milestone (nearest unmet) driving the status + card line, if any. */
+  governing_milestone: GoverningMilestone | null;
 }
 
 /** The AI's proposed triage metadata for a project (AI-proposes-you-confirm). */
@@ -631,6 +661,8 @@ export interface CalendarEvent {
   end: string | null;
   all_day: boolean;
   html_link: string | null;
+  /** The event's stable iCal UID — the anchor a milestone links to (card 7). */
+  uid: string | null;
 }
 
 /** The upcoming event that named a project (shown on its focus card). */

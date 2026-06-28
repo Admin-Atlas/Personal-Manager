@@ -7,14 +7,17 @@ import { Composer } from "./Composer";
 import {
   createConversation,
   getMessages,
+  listCalendarEvents,
   listDocuments,
+  listMilestones,
   listProjects,
   setDocumentMetadata,
 } from "../lib/ipc";
 import { useChatStream } from "../lib/useChatStream";
-import type { Document } from "../lib/types";
+import type { CalendarEvent, Document, Milestone } from "../lib/types";
 import { Button, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
+import { MilestoneList } from "./MilestoneList";
 import { TagEditor } from "./TagEditor";
 import { rankImportance } from "../lib/importance";
 import { useDepth, useTheme } from "../theme";
@@ -40,6 +43,8 @@ interface Props {
  *  with this project set, so the backend scopes grounding to it). */
 export function ProjectView({ project, focusDocId, onBack }: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
+  const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   const [convId, setConvId] = useState<number | null>(null);
   // Mirror convId for the stream guard so switching projects (which nulls convId)
   // abandons an in-flight reply instead of letting it land in the new project.
@@ -79,6 +84,12 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
     });
   }, [documents, sort]);
 
+  const refreshMilestones = () => {
+    listMilestones(project)
+      .then(setMilestones)
+      .catch(() => {});
+  };
+
   useEffect(() => {
     // Reset chat when switching projects (also abandons any in-flight reply).
     setConvId(null);
@@ -87,6 +98,11 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
     listDocuments()
       .then((all) => setDocuments(all.filter((d) => d.project === project)))
       .catch((e) => chat.setError(String(e)));
+    refreshMilestones();
+    // Upcoming events feed the milestone link picker (empty when no calendar connected).
+    listCalendarEvents()
+      .then(setCalendarEvents)
+      .catch(() => setCalendarEvents([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
 
@@ -192,6 +208,22 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
           className="w-80 shrink-0 overflow-y-auto border-l border-border bg-panel"
           data-help="project-files"
         >
+          {(showMeta || milestones.length > 0) && (
+            <div className="border-b border-border px-4 pb-3 pt-3" data-help="project-milestones">
+              <span className="font-mono text-xs uppercase tracking-wide text-ink4">
+                Milestones
+              </span>
+              <div className="mt-2">
+                <MilestoneList
+                  project={project}
+                  milestones={milestones}
+                  calendarEvents={calendarEvents}
+                  onChanged={refreshMilestones}
+                  readOnly={!showMeta}
+                />
+              </div>
+            </div>
+          )}
           <div className="flex items-center justify-between gap-2 px-4 pb-1 pt-3">
             <span className="font-mono text-xs uppercase tracking-wide text-ink4">Files</span>
             {documents.length > 1 && (

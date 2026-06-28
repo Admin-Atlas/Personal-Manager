@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.36.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Projects can now have more than one deadline. A project usually has several — a pitch, a presentation, an internal due date — so the single deadline box is replaced by a list of milestones, each with its own label and date. Add them when you triage a project on the Focus view, or in the project's own page. Your existing deadline is carried over as a milestone automatically.",
+      "Your project's status stays a single, honest signal: “Due soon” now follows the nearest milestone you haven't ticked off yet — finish your pitch, tick it, and the next deadline quietly takes over.",
+      "Link a milestone to a calendar event and its date keeps itself in sync with your calendar (which stays the source of truth) — handy for the deadlines that are really meetings. Tap 📅 next to a milestone's date to pick the event.",
+    ],
+  },
+  {
     version: "2.35.0-alpha",
     date: "2026-06-28",
     highlights: [

@@ -40,6 +40,7 @@ import type {
   OneDriveSyncEvent,
   OneDriveSyncState,
   Preference,
+  Milestone,
   ProjectOverview,
   ProjectProposalEvent,
   ProjectSize,
@@ -444,6 +445,39 @@ export function proposeProjectMetadata(
   channel.onmessage = onEvent;
   return invoke<void>("propose_project_metadata", { names: names ?? null, onEvent: channel });
 }
+
+// --- Personal Assistant: project milestones (multi-deadline — card 7) ---
+
+/** A project's milestones, resolved (calendar-linked dates synced) and date-ordered. */
+export const listMilestones = (project: string) =>
+  invoke<Milestone[]>("list_milestones", { project });
+
+/** Add a milestone to a project. A non-null `eventUid` makes it calendar-linked. */
+export const addMilestone = (
+  project: string,
+  label: string,
+  dueDate: string | null,
+  eventUid: string | null,
+) => invoke<number>("add_milestone", { project, label, dueDate, eventUid });
+
+/** Edit a milestone's label and (for a PM-native milestone) its date. */
+export const updateMilestone = (id: number, label: string, dueDate: string | null) =>
+  invoke<void>("update_milestone", { id, label, dueDate });
+
+/** Link a milestone to a calendar event (uid + cached date) or unlink it (null uid). */
+export const setMilestoneEvent = (id: number, eventUid: string | null, cachedDate: string | null) =>
+  invoke<void>("set_milestone_event", { id, eventUid, cachedDate });
+
+/** Mark a milestone met or unmet. */
+export const setMilestoneState = (id: number, met: boolean) =>
+  invoke<void>("set_milestone_state", { id, met });
+
+/** Delete a milestone. */
+export const deleteMilestone = (id: number) => invoke<void>("delete_milestone", { id });
+
+/** Persist a new ordering of a project's milestones (ids in display order). */
+export const reorderMilestones = (project: string, orderedIds: number[]) =>
+  invoke<void>("reorder_milestones", { project, orderedIds });
 
 // --- Personal Assistant: Calendar connectors (multi-provider, read-only — cards 6A/6B) ---
 
