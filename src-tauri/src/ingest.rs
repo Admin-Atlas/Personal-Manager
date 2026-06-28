@@ -331,7 +331,9 @@ fn ingest_one(
 /// the identity (SHA-256 = both the dedupe `content_hash` and `photos.file_hash`), so a moved/renamed
 /// file still dedupes. OCR is requested only when the optional component is installed; declining it
 /// still ingests the photo with its EXIF metadata chunk. With `copy_photos_to_vault`, the original is
-/// copied into `vault/photos/` first (following the vault cipher) and recorded on the `photos` row.
+/// copied into `vault/photos/` first (following the vault cipher) and recorded on the `photos` row —
+/// this also applies on a dedupe hit (a re-drop with the opt-in newly checked saves the copy without
+/// re-indexing).
 fn ingest_photo(
     state: &AppState,
     gateway: &ModelGateway<'_>,
@@ -361,6 +363,20 @@ fn ingest_photo(
             )
             .optional_exists()?;
         if exists {
+            // A dedupe hit, but the user may have re-dropped this image with "save a copy" now
+            // checked (e.g. a screenshot they want to keep before deleting it). Honor that opt-in
+            // even though we skip re-indexing: copy the original (idempotent — named by hash) and
+            // flip the existing photos row's saved_to_vault/vault_path so the record reflects it.
+            if opts.copy_photos_to_vault {
+                let rel = copy_original_to_vault(vault, cipher, &bytes, &file_hash, ext)?;
+                conn.execute(
+                    "UPDATE photos SET saved_to_vault = 1, vault_path = ?1 WHERE file_hash = ?2",
+                    params![rel, file_hash],
+                )?;
+                return Ok(Outcome::Skipped(
+                    "already ingested — saved a copy to the vault".into(),
+                ));
+            }
             return Ok(Outcome::Skipped("already ingested".into()));
         }
         iso_now(&conn)?
@@ -1921,6 +1937,47 @@ mod tests {
         );
         let (pf, pb) = parse_frontmatter(&plain).unwrap();
         assert!(photo_from_fields(&pf, "h", pb).is_none());
+    }
+
+    #[test]
+    fn photo_dedupe_save_flips_saved_to_vault_by_file_hash() {
+        // The dedupe-hit path of `ingest_photo`: when the user re-drops an already-ingested image
+        // with "save a copy" newly checked, we skip re-indexing but still flip the existing photos
+        // row's saved_to_vault flag and record the vault path, keyed by file_hash. This guards that
+        // exact UPDATE against the real migrated schema (a column rename would break it silently).
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type) \
+             VALUES ('photos/h.md','Screenshot','imghash','photo')",
+            [],
+        )
+        .unwrap();
+        let doc_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO photos(document_id, source_type, file_hash, saved_to_vault) \
+             VALUES (?1,'screenshot','imghash',0)",
+            params![doc_id],
+        )
+        .unwrap();
+
+        let n = conn
+            .execute(
+                "UPDATE photos SET saved_to_vault = 1, vault_path = ?1 WHERE file_hash = ?2",
+                params!["photos/imghash.png", "imghash"],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "exactly the matching photo row is updated");
+
+        let (saved, path): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT saved_to_vault, vault_path FROM photos WHERE file_hash = 'imghash'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(saved, 1, "the opt-in flag is now set");
+        assert_eq!(path.as_deref(), Some("photos/imghash.png"));
     }
 
     #[test]

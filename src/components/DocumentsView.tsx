@@ -10,8 +10,11 @@ import {
   ensureSidecar,
   fetchIndexOnlyBody,
   ingestPaths,
+  installOptionalOcr,
   listDocuments,
+  onOcrInstall,
   openExternalRef,
+  optionalOcrStatus,
   rebuildIndex,
   sidecarStatus,
   vaultStatus,
@@ -50,6 +53,16 @@ interface DocSort {
 // Columns where "biggest first" is the more useful default on first click.
 const SORT_DESC_FIRST = new Set<SortKey>(["importance", "chunks", "ingested"]);
 
+// Image extensions that go through the photo pipeline (mirrors `PHOTO_EXTS` in the Rust ingest). Used
+// only to decide whether to offer the one-time OCR install before a drop — the backend re-checks.
+const PHOTO_EXTS = new Set(["jpg", "jpeg", "png", "webp", "heic"]);
+function hasPhotos(paths: string[]): boolean {
+  return paths.some((p) => {
+    const ext = p.split(".").pop()?.toLowerCase();
+    return ext != null && PHOTO_EXTS.has(ext);
+  });
+}
+
 interface Props {
   /** Jump to the Review view (the sorting-review queue). */
   onReviewClick?: () => void;
@@ -71,6 +84,14 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [confirmRebuild, setConfirmRebuild] = useState(false);
   const [rebuildNeeded, setRebuildNeeded] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
+  // Photo ingest (board card #135). The opt-in to copy dropped originals into the vault's photos/
+  // folder (off by default — references like documents). When OCR isn't installed and a photo is
+  // dropped, `photoPrompt` holds the paths awaiting the install decision (install, or skip → EXIF
+  // only); `installingOcr`/`ocrFrac` drive the one-time download progress.
+  const [copyPhotosToVault, setCopyPhotosToVault] = useState(false);
+  const [photoPrompt, setPhotoPrompt] = useState<string[] | null>(null);
+  const [installingOcr, setInstallingOcr] = useState(false);
+  const [ocrFrac, setOcrFrac] = useState(0);
   // Dev-only (debug builds): drive the index-only substrate without a real connector.
   const [devTitle, setDevTitle] = useState("");
   const [devBody, setDevBody] = useState("");
@@ -124,9 +145,12 @@ export function DocumentsView({ onReviewClick }: Props) {
     }
   }
 
-  // `busy` inside the drag-drop listener would be stale; read it via a ref.
+  // `busy` inside the drag-drop listener would be stale; read it via a ref. The OCR install runs
+  // outside the `busy` ingest lifecycle, so it gets its own ref to block a second drop mid-download.
   const busyRef = useRef(false);
   busyRef.current = busy;
+  const installingOcrRef = useRef(false);
+  installingOcrRef.current = installingOcr;
 
   // Pop the troubleshooting guide once each time setup enters an error state,
   // resetting when it leaves so a later failure reopens it (and closing it once
@@ -162,13 +186,25 @@ export function DocumentsView({ onReviewClick }: Props) {
         setDragging(false);
       } else if (payload.type === "drop") {
         setDragging(false);
-        if (!busyRef.current && payload.paths.length > 0) {
+        if (!busyRef.current && !installingOcrRef.current && payload.paths.length > 0) {
           runIngest(payload.paths);
         }
       }
     });
     return () => {
       unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Live progress for the one-time OCR download (mirrors the t-SNE install bar in Settings).
+  useEffect(() => {
+    let cancelled = false;
+    const un = onOcrInstall((e) => {
+      if (!cancelled) setOcrFrac(e.fraction);
+    });
+    return () => {
+      cancelled = true;
+      void un.then((fn) => fn());
     };
   }, []);
 
@@ -238,7 +274,24 @@ export function DocumentsView({ onReviewClick }: Props) {
     }
   }
 
+  // Entry point for every ingest (drop + the Add buttons). If photos are in the batch and OCR isn't
+  // installed yet, pause to offer the one-time install (the user can decline → photos still ingest
+  // with their date/location metadata); otherwise go straight to the work.
   async function runIngest(paths: string[]) {
+    if (busy || installingOcr || paths.length === 0) return;
+    if (hasPhotos(paths)) {
+      const ready = await optionalOcrStatus()
+        .then((s) => s.installed)
+        .catch(() => false);
+      if (!ready) {
+        setPhotoPrompt(paths);
+        return;
+      }
+    }
+    await startIngest(paths);
+  }
+
+  async function startIngest(paths: string[]) {
     if (busy || paths.length === 0) return;
     setBusy(true);
     setItems([]);
@@ -248,7 +301,7 @@ export function DocumentsView({ onReviewClick }: Props) {
     setError(null);
     setPrep(null);
     try {
-      await ingestPaths(paths, handleEvent);
+      await ingestPaths(paths, handleEvent, copyPhotosToVault);
       setStatus(await sidecarStatus());
     } catch (e) {
       setError(String(e));
@@ -257,6 +310,33 @@ export function DocumentsView({ onReviewClick }: Props) {
       setBusy(false);
       await refresh();
     }
+  }
+
+  // OCR prompt → "Install": download the component (showing progress), then ingest. A failed install
+  // still falls through to ingest (EXIF-only) so the drop is never lost — the error surfaces in the
+  // banner and OCR can be retried from Settings → Storage.
+  async function installOcrThenIngest() {
+    const paths = photoPrompt;
+    setPhotoPrompt(null);
+    if (!paths) return;
+    setInstallingOcr(true);
+    setOcrFrac(0);
+    setError(null);
+    try {
+      await installOptionalOcr();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setInstallingOcr(false);
+    }
+    await startIngest(paths);
+  }
+
+  // OCR prompt → "Not now" (or dismissed): ingest anyway, EXIF-only. OCR can be enabled later.
+  function skipOcrAndIngest() {
+    const paths = photoPrompt;
+    setPhotoPrompt(null);
+    if (paths) void startIngest(paths);
   }
 
   async function pickFiles() {
@@ -402,16 +482,16 @@ export function DocumentsView({ onReviewClick }: Props) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button onClick={pickFiles} disabled={busy}>
+          <Button onClick={pickFiles} disabled={busy || installingOcr}>
             Add files
           </Button>
-          <Button onClick={pickFolder} disabled={busy}>
+          <Button onClick={pickFolder} disabled={busy || installingOcr}>
             Add folder
           </Button>
           <Button
             variant="tertiary"
             onClick={() => setConfirmRebuild(true)}
-            disabled={busy}
+            disabled={busy || installingOcr}
             data-help="documents-rebuild"
             title="Drop the index and rebuild it from the Markdown vault"
           >
@@ -494,12 +574,38 @@ export function DocumentsView({ onReviewClick }: Props) {
               dragging ? "border-accent bg-surface" : "border-border2 hover:border-border"
             }`}
           >
-            <p className="text-sm text-ink2">{busy ? "Working…" : "Drop files or a folder here"}</p>
+            <p className="text-sm text-ink2">
+              {busy || installingOcr ? "Working…" : "Drop files or a folder here"}
+            </p>
             <p className="mt-1 text-xs text-ink3">
-              PDFs, Office docs, images, HTML, CSV/JSON, text — converted, chunked, embedded, and
-              indexed locally.
+              PDFs, Office docs, photos &amp; screenshots, HTML, CSV/JSON, text — converted,
+              chunked, embedded, and indexed locally.
             </p>
           </div>
+
+          {installingOcr && (
+            <IngestProgress
+              mode="percent"
+              processed={Math.round(ocrFrac * 100)}
+              total={100}
+              label="Downloading photo text recognition"
+              className="mt-2"
+            />
+          )}
+
+          <label className="mt-3 flex cursor-pointer items-start gap-2 text-xs text-ink3">
+            <input
+              type="checkbox"
+              checked={copyPhotosToVault}
+              onChange={(e) => setCopyPhotosToVault(e.target.checked)}
+              className="mt-0.5 accent-[var(--accent)]"
+            />
+            <span>
+              Save a copy of dropped photos in the vault. Off by default, PM references photos where
+              they are; turn this on to keep a copy (useful for screenshots you delete after) — it
+              follows your vault's encryption.
+            </span>
+          </label>
 
           {/* TEST HARNESS — writes synthetic state, so it is build-time gated (tree-shaken from
               release) AND respects the runtime devMode toggle (the master developer switch). See
@@ -779,6 +885,20 @@ export function DocumentsView({ onReviewClick }: Props) {
       >
         This drops the search index and rebuilds it from the Markdown vault. Your documents
         aren&apos;t deleted, but rebuilding can take a while on a large library.
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={photoPrompt != null}
+        title="Read text from your photos?"
+        confirmLabel="Install & continue"
+        cancelLabel="Not now"
+        onConfirm={() => void installOcrThenIngest()}
+        onClose={skipOcrAndIngest}
+      >
+        To make the text inside photos and screenshots searchable, PM can install on-device text
+        recognition (a one-time ~70–100 MB download). It runs fully on your device. If you skip it,
+        the photos are still added — indexed by their date and location — and you can turn text
+        recognition on any time under Settings → Storage.
       </ConfirmDialog>
 
       <DocumentEngineGuide
