@@ -28,6 +28,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::photos::ImageAnalysis;
 use crate::registry::{ModelEntry, Pooling, Source};
 
 /// Build the fastembed `add_custom_model` spec for a non-bundled model, as a JSON object the
@@ -75,6 +76,19 @@ const MAX_SKIP_LINES: usize = 1024;
 /// [`SidecarManager::install_optional_tsne`]). openTSNE pulls scikit-learn + scipy (numpy is already
 /// present via fastembed) and ships a binary wheel for our pinned Python, so there's no compile step.
 const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
+
+/// The OPTIONAL photo-OCR component, pinned. **Not** in `requirements.txt` — like t-SNE, the base
+/// venv stays lean and the user installs it on demand (see [`SidecarManager::install_optional_ocr`]).
+/// `rapidocr` runs OCR on the `onnxruntime` fastembed already ships (it pulls no runtime of its own)
+/// and downloads its small detection/recognition ONNX models on first use; `pillow-heif` adds HEIC
+/// decoding (Pillow itself is already present via markitdown). Both — and rapidocr's image deps
+/// (opencv/shapely/pyclipper) — ship binary wheels for the bundled 3.12 release interpreter and dev
+/// 3.14, so there's no compile step.
+const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.0", "pillow-heif==1.4.0"];
+
+/// The marker's expected contents — the OCR pins joined, so a future bump re-installs. Kept in sync
+/// with [`OPTIONAL_OCR_PINS`]; the `optional_ocr_marker_matches_pins` test guards the join.
+const OPTIONAL_OCR_MARKER: &str = "rapidocr==3.9.0;pillow-heif==1.4.0";
 
 /// Where the sidecar script and its requirements live, and where the venv goes.
 pub struct SidecarPaths {
@@ -127,6 +141,13 @@ impl SidecarPaths {
     /// the base venv just because t-SNE became available. Holds the pin, so a future bump re-installs.
     fn tsne_marker(&self) -> PathBuf {
         self.venv_dir.join(".pm-tsne")
+    }
+
+    /// Marker that the OPTIONAL photo-OCR component is installed in this venv. Separate from
+    /// `.pm-ready` (so the base requirements hash is untouched) and from `.pm-tsne`. Holds the pins,
+    /// so a future bump re-installs.
+    fn ocr_marker(&self) -> PathBuf {
+        self.venv_dir.join(".pm-ocr")
     }
 
     /// Where the speech model's weights are cached — a sibling of the venv under
@@ -580,6 +601,33 @@ impl SidecarManager {
         Ok(result["text"].as_str().unwrap_or_default().to_string())
     }
 
+    /// Analyse one image for photo ingestion: EXIF capture metadata (always) + OCR text (only when
+    /// `run_ocr`). The caller sets `run_ocr` from [`optional_ocr_ready`](Self::optional_ocr_ready),
+    /// so a user who declined the optional OCR component still gets dimensions + EXIF for the photo's
+    /// metadata chunk. The first OCR call downloads rapidocr's small models and is slow; later calls
+    /// are fast and fully local. Blocking, like every sidecar call. EXIF/OCR output is untrusted data —
+    /// scored/indexed, never executed.
+    pub fn analyze_image(&self, path: &Path, run_ocr: bool) -> Result<ImageAnalysis> {
+        let result = self.request(
+            "analyze_image",
+            json!({ "path": path.to_string_lossy(), "run_ocr": run_ocr }),
+        )?;
+        // Treat an empty string the same as a missing field, and drop any non-finite coordinate
+        // rather than placing a photo at infinity on the map.
+        let text_opt = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        let coord_opt = |v: &Value| v.as_f64().filter(|f| f.is_finite());
+        let dim_opt = |v: &Value| v.as_u64().and_then(|u| u32::try_from(u).ok());
+        Ok(ImageAnalysis {
+            ocr_text: result["ocr_text"].as_str().unwrap_or_default().to_string(),
+            ocr_ran: result["ocr_ran"].as_bool().unwrap_or(false),
+            capture_date: text_opt(&result["capture_date"]),
+            lat: coord_opt(&result["lat"]),
+            lon: coord_opt(&result["lon"]),
+            width: dim_opt(&result["width"]),
+            height: dim_opt(&result["height"]),
+        })
+    }
+
     /// Project per-document vectors to 2-D for the semantic memory map. `method` is `"pca"` (the
     /// numpy-only default) or `"tsne"` (only requested when the optional component is installed; the
     /// sidecar falls back to PCA if it isn't, so this always returns a usable layout). Returns the
@@ -702,6 +750,87 @@ impl SidecarManager {
         // Best-effort: the marker is already gone, so a pip hiccup just leaves the (unused) package on
         // disk rather than failing the user's "remove".
         let _ = run_command(&mut pip, "pip uninstall openTSNE");
+        Ok(())
+    }
+
+    /// Whether the OPTIONAL photo-OCR component is installed in this venv at the pinned versions.
+    /// Cheap (a marker read) so the ingest path can check it per photo to decide whether to request
+    /// OCR, and so Settings can show the install/remove state.
+    pub fn optional_ocr_ready(&self) -> bool {
+        self.paths.venv_python().exists()
+            && std::fs::read_to_string(self.paths.ocr_marker())
+                .map(|s| s.trim() == OPTIONAL_OCR_MARKER)
+                .unwrap_or(false)
+    }
+
+    /// Install the OPTIONAL photo-OCR component (rapidocr + pillow-heif) into the managed venv on
+    /// demand — provisions the base venv first if needed, `pip install`s the pins, then stamps the OCR
+    /// marker. Blocking and slow (a download); serialised by the install lock. Idempotent — a no-op
+    /// once the marker is current. `on_progress` reports a monotonic `0.0..=1.0` fraction (from pip's
+    /// phase markers, see [`pip_phase_fraction`]) so Settings can show a real percentage bar.
+    pub fn install_optional_ocr(&self, mut on_progress: impl FnMut(f32)) -> Result<()> {
+        on_progress(0.03);
+        self.ensure_installed()?;
+        on_progress(0.10);
+
+        let _install = self.install.lock().unwrap();
+        if self.optional_ocr_ready() {
+            on_progress(1.0);
+            return Ok(());
+        }
+
+        let py = self.paths.venv_python();
+        let mut downloads = 0u32;
+        let mut last = 0.10f32;
+        let mut args: Vec<&str> = vec![
+            "install",
+            "--disable-pip-version-check",
+            "--progress-bar",
+            "off",
+        ];
+        args.extend_from_slice(OPTIONAL_OCR_PINS);
+        run_pip_streaming(&py, &args, |line| {
+            if let Some(f) = pip_phase_fraction(line, &mut downloads) {
+                if f > last {
+                    last = f;
+                    on_progress(f);
+                }
+            }
+        })?;
+
+        std::fs::write(self.paths.ocr_marker(), OPTIONAL_OCR_MARKER)?;
+        on_progress(1.0);
+        Ok(())
+    }
+
+    /// Remove the OPTIONAL photo-OCR component (the "delete" action). Drops the marker first — that
+    /// alone disables OCR (`optional_ocr_ready` then reports false and future photos ingest EXIF-only)
+    /// — then `pip uninstall`s rapidocr + pillow-heif. Like the t-SNE removal, the heavier transitive
+    /// image deps (opencv / shapely / pyclipper) are LEFT in place here so we can never break the base
+    /// venv; the Storage manager (components.rs) does the guarded cascade that reclaims them. Idempotent.
+    pub fn uninstall_optional_ocr(&self) -> Result<()> {
+        let _install = self.install.lock().unwrap();
+        // Drop the marker first so the feature is off even if the pip call below fails.
+        let _ = std::fs::remove_file(self.paths.ocr_marker());
+        let py = self.paths.venv_python();
+        if !py.exists() {
+            return Ok(());
+        }
+        let mut pip = Command::new(&py);
+        pip.args([
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "--disable-pip-version-check",
+            "rapidocr",
+            "pillow-heif",
+        ]);
+        clean_python_env(&mut pip);
+        no_window(&mut pip);
+        // Best-effort: the marker is already gone, so a pip hiccup just leaves the (unused) packages
+        // on disk rather than failing the user's "remove".
+        let _ = run_command(&mut pip, "pip uninstall rapidocr pillow-heif");
         Ok(())
     }
 
@@ -1280,6 +1409,14 @@ fn no_window(_command: &mut Command) {}
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The OCR marker string must be exactly the pins joined by ';' — the installer writes the marker
+    /// and `optional_ocr_ready` compares it, so a drift here would silently re-install on every check
+    /// or never detect an install. Guards the hand-kept duplication of the two constants.
+    #[test]
+    fn optional_ocr_marker_matches_pins() {
+        assert_eq!(OPTIONAL_OCR_PINS.join(";"), OPTIONAL_OCR_MARKER);
+    }
 
     #[test]
     fn reads_lines_and_stops_at_eof() {

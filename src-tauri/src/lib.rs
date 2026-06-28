@@ -26,6 +26,7 @@ mod onedrive;
 mod openrouter;
 mod outlook_calendar;
 mod paths;
+mod photos;
 mod preferences;
 mod projects;
 mod recommend;

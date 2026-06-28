@@ -742,7 +742,8 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE project_milestones; \
+            "DROP TABLE photos; \
+             DROP TABLE project_milestones; \
              ALTER TABLE projects DROP COLUMN last_touched; \
              ALTER TABLE projects DROP COLUMN importance; \
              DROP INDEX idx_calendar_events_uid; \
@@ -880,7 +881,8 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE project_milestones; \
+            "DROP TABLE photos; \
+             DROP TABLE project_milestones; \
              ALTER TABLE projects DROP COLUMN last_touched; \
              ALTER TABLE projects DROP COLUMN importance; \
              DROP INDEX idx_calendar_events_uid; \
