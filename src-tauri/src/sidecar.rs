@@ -245,6 +245,13 @@ impl SidecarManager {
         self.status.lock().unwrap().clone()
     }
 
+    /// Whether the engine is already provisioned and current — a cheap, non-building probe (no install
+    /// lock, no provisioning). Lets a best-effort background job (the chat-index launch sweep) skip
+    /// itself when the sidecar isn't ready yet rather than triggering a slow first-run build at startup.
+    pub fn is_ready(&self) -> bool {
+        self.is_ready_marker_current().unwrap_or(false)
+    }
+
     fn set_status(&self, status: SidecarStatus) {
         *self.status.lock().unwrap() = status;
     }

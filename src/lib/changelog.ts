@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.44.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Your conversations with PM start becoming searchable. PM now quietly turns each completed back-and-forth into part of its memory — so a decision, fact, or preference you mentioned in chat can resurface later when it's relevant, the same way your documents do.",
+      "It happens on its own and stays out of your way: when you reopen PM, it catches up on any chat that hasn't been indexed yet, in the background. (The ongoing while-you-work indexing and the skip-the-small-talk filter arrive in the very next update.)",
+      "Each piece of a chat keeps its own date, so an old conversation with one fresh decision isn't treated as entirely stale — the fresh part can still surface when it matters.",
+    ],
+  },
+  {
     version: "2.43.0-alpha",
     date: "2026-06-28",
     highlights: [

@@ -330,9 +330,14 @@ fn fetch_ages(conn: &Connection, ids: &[i64]) -> Result<std::collections::HashMa
         return Ok(HashMap::new());
     }
     let placeholders = vec!["?"; ids.len()].join(",");
+    // Recency is per CHUNK when the chunk carries its own timestamp (chat chunks do — board card 7B,
+    // each turn-pair has its own time), else per DOCUMENT (`last_activity`/`ingested_at`). A chat
+    // document spans turns authored months apart, so per-chunk decay keeps a months-old chat with one
+    // fresh decision from going uniformly stale; `chunk_at` is NULL for every other source, which
+    // transparently falls back to the existing per-document behaviour.
     let mut stmt = conn.prepare(&format!(
         "SELECT c.id, julianday('now') \
-         - julianday(replace(COALESCE(d.last_activity, d.ingested_at), 'Z', '')) \
+         - julianday(replace(COALESCE(c.chunk_at, d.last_activity, d.ingested_at), 'Z', '')) \
          FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id IN ({placeholders})",
     ))?;
     let mut ages: HashMap<i64, f64> = HashMap::with_capacity(ids.len());
@@ -697,6 +702,47 @@ mod tests {
             params![chunk_id, content],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn per_chunk_timestamp_overrides_document_recency() {
+        // A chat chunk carries its own `chunk_at` (board card 7B); recency must age it by that, not by
+        // the chat document's freshly-bumped `last_activity` (which tracks the newest turn). So an old
+        // turn-pair in an otherwise-active chat ages like the old turn, not like the whole document.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&path, key).unwrap();
+
+        // One chat document, freshly active, with two chunks: an ancient turn and today's turn.
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, last_activity, source_type) \
+             VALUES ('chat.md', 'Chat', 'chat-hash', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'chat')",
+            [],
+        )
+        .unwrap();
+        let doc_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count, chat_turn_id, chunk_at) \
+             VALUES (?1, 0, 'old turn', 8, 2, strftime('%Y-%m-%dT%H:%M:%fZ','now','-1095 days'))",
+            params![doc_id],
+        )
+        .unwrap();
+        let old_chunk = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count, chat_turn_id, chunk_at) \
+             VALUES (?1, 1, 'new turn', 8, 4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            params![doc_id],
+        )
+        .unwrap();
+        let new_chunk = conn.last_insert_rowid();
+
+        let ages = fetch_ages(&conn, &[old_chunk, new_chunk]).unwrap();
+        assert!(
+            ages[&old_chunk] > 1000.0,
+            "old chunk aged by its own chunk_at (~3 years), not the document's fresh last_activity"
+        );
+        assert!(ages[&new_chunk] < 1.0, "today's chunk is fresh");
     }
 
     #[test]

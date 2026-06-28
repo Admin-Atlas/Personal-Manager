@@ -704,45 +704,7 @@ pub(crate) fn index_document(
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
 
-    let tags_json =
-        serde_json::to_string(&meta.tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
-    // Resolve the document's entity from its canonical project name (creating one only if it is a
-    // genuinely new project — "Unsorted" and any reviewed canonical already exist). On a rebuild
-    // this is what reassigns `entity_id` from the frontmatter name (the ids are an index detail).
-    let entity_id = crate::entities::resolve_project(&tx, &meta.project, true)?;
-    tx.execute(
-        "INSERT INTO documents \
-         (source_path, vault_path, title, content_hash, ext, byte_size, created_at, ingested_at, \
-          project, tags, importance, reviewed, last_activity, entity_id, \
-          source_type, source_state, source_id, external_ref, source_modified_at, \
-          source_content_hash, stored_summary) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-        params![
-            meta.source_path,
-            meta.vault_path,
-            meta.title,
-            meta.content_hash,
-            meta.ext,
-            meta.byte_size,
-            meta.created_at,
-            meta.ingested_at,
-            meta.project,
-            tags_json,
-            meta.importance,
-            meta.reviewed as i64,
-            meta.last_activity,
-            entity_id,
-            meta.source.source_type,
-            meta.source.source_state,
-            meta.source.source_id,
-            meta.source.external_ref,
-            meta.source.source_modified_at,
-            meta.source.source_content_hash,
-            meta.source.stored_summary,
-        ],
-    )?;
-    let doc_id = tx.last_insert_rowid();
+    let doc_id = insert_document_row(&tx, meta)?;
 
     // A photo carries an extra satellite row (its capture/OCR/copy truth), written in the SAME
     // transaction so a document and its photo row are always consistent. `visual_description` is left
@@ -781,6 +743,117 @@ pub(crate) fn index_document(
 
     tx.commit()?;
     load_document(&conn, doc_id)
+}
+
+/// Insert just the `documents` row from a [`DocMeta`] (resolving its entity from the canonical project
+/// name) and return its id. The row-creation half of [`index_document`], extracted so a source whose
+/// chunks land separately — the append-only chat indexer (card B), which births the row on first index
+/// then appends chunks turn-pair by turn-pair — can reuse the exact same INSERT and entity resolution.
+/// Caller owns the transaction.
+pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64> {
+    let tags_json =
+        serde_json::to_string(&meta.tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
+    // Resolve the document's entity from its canonical project name (creating one only if it is a
+    // genuinely new project — "Unsorted" and any reviewed canonical already exist). On a rebuild
+    // this is what reassigns `entity_id` from the frontmatter name (the ids are an index detail).
+    let entity_id = crate::entities::resolve_project(tx, &meta.project, true)?;
+    tx.execute(
+        "INSERT INTO documents \
+         (source_path, vault_path, title, content_hash, ext, byte_size, created_at, ingested_at, \
+          project, tags, importance, reviewed, last_activity, entity_id, \
+          source_type, source_state, source_id, external_ref, source_modified_at, \
+          source_content_hash, stored_summary) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![
+            meta.source_path,
+            meta.vault_path,
+            meta.title,
+            meta.content_hash,
+            meta.ext,
+            meta.byte_size,
+            meta.created_at,
+            meta.ingested_at,
+            meta.project,
+            tags_json,
+            meta.importance,
+            meta.reviewed as i64,
+            meta.last_activity,
+            entity_id,
+            meta.source.source_type,
+            meta.source.source_state,
+            meta.source.source_id,
+            meta.source.external_ref,
+            meta.source.source_modified_at,
+            meta.source.source_content_hash,
+            meta.source.stored_summary,
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// Append one turn-pair's freshly-split chunks to an existing chat document, **continuing** its ordinal
+/// sequence rather than replacing anything — the append-only model card B requires (old chunks are never
+/// re-split or re-embedded). Mirrors [`insert_chunks`]'s rowid invariants (`chunk_vec`/`chunks_fts` keyed
+/// by `chunks.id`, only leaves embedded/indexed) but stamps every row with this pair's `chat_turn_id`
+/// (the navigation/citation pointer) and `chunk_at` (the per-chunk recency timestamp). Returns the next
+/// free ordinal so a caller can append several pairs in one transaction. Caller owns the transaction.
+pub(crate) fn append_chat_chunks(
+    tx: &Connection,
+    doc_id: i64,
+    start_ordinal: i64,
+    chunks: &[splitter::Chunk],
+    embeddings: &[Vec<f32>],
+    chat_turn_id: i64,
+    chunk_at: &str,
+) -> Result<i64> {
+    let mut uid_to_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    let mut leaf_idx = 0usize;
+    let mut ordinal = start_ordinal;
+    for chunk in chunks {
+        let parent_id = chunk
+            .parent_uid
+            .as_deref()
+            .and_then(|uid| uid_to_id.get(uid).copied());
+        tx.execute(
+            "INSERT INTO chunks \
+             (document_id, ordinal, heading, content, char_count, uid, parent_id, kind, \
+              start_offset, end_offset, chat_turn_id, chunk_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                doc_id,
+                ordinal,
+                chunk.heading,
+                chunk.display_content,
+                chunk.display_content.chars().count() as i64,
+                chunk.uid,
+                parent_id,
+                chunk.kind.as_str(),
+                chunk.start_offset as i64,
+                chunk.end_offset as i64,
+                chat_turn_id,
+                chunk_at,
+            ],
+        )?;
+        let chunk_id = tx.last_insert_rowid();
+        uid_to_id.insert(&chunk.uid, chunk_id);
+        ordinal += 1;
+
+        if chunk.kind == ChunkKind::Leaf {
+            let vector = serde_json::to_string(&embeddings[leaf_idx])
+                .map_err(|e| Error::Other(format!("encode embedding: {e}")))?;
+            tx.execute(
+                "INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)",
+                params![chunk_id, vector],
+            )?;
+            tx.execute(
+                "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
+                params![chunk_id, chunk.embed_content],
+            )?;
+            leaf_idx += 1;
+        }
+    }
+    Ok(ordinal)
 }
 
 /// Insert a document's chunk rows + leaf vectors + FTS rows (the shared body of [`index_document`]
@@ -1404,6 +1477,11 @@ pub(crate) const SOURCE_TYPE_INDEX_ONLY: &str = "index_only";
 /// lives in a Markdown file (the synthetic photo body), so it rebuilds from disk; the `photos`
 /// satellite row carries its image-specific truth.
 pub(crate) const SOURCE_TYPE_PHOTO: &str = "photo";
+/// `documents.source_type` for an indexed chat session (board card 7B, #141). Like a vault document
+/// its body lives in a Markdown file (the appended turn-pairs written by card A), so it rebuilds from
+/// disk and the deletion cascade covers it; the `chat_sessions` satellite carries its chat-specific
+/// truth (scope + the index/summary cursors).
+pub(crate) const SOURCE_TYPE_CHAT: &str = "chat";
 /// `documents.source_state` for a reachable source (the default for every document).
 pub(crate) const SOURCE_STATE_OK: &str = "ok";
 /// `documents.source_state` for an index-only item whose source was deleted: a soft state — the
@@ -1454,6 +1532,17 @@ impl SourceMeta {
     fn photo() -> Self {
         Self {
             source_type: SOURCE_TYPE_PHOTO.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Source metadata for an indexed chat: a fully-stored, reachable document discriminated as
+    /// `'chat'`, carrying the stable chat identity (`chat:<conversation_id>`) so an append-growing
+    /// session keeps one UNIQUE `source_id`/`content_hash` across every re-index (card B).
+    pub(crate) fn chat(source_id: String) -> Self {
+        Self {
+            source_type: SOURCE_TYPE_CHAT.into(),
+            source_id: Some(source_id),
             ..Self::default()
         }
     }
@@ -1659,7 +1748,7 @@ pub(crate) fn hex_digest(bytes: &[u8]) -> String {
 /// language no longer matches its index (switched but not yet re-indexed) is sent to the Re-index
 /// flow with a clear message, rather than hitting a cryptic vec0 insert failure. `rebuild` does not
 /// call this: it resizes the table to fit ([`crate::db::ensure_vec_dim`]) after warming the model.
-fn guard_dimension(conn: &rusqlite::Connection, embedder: &ModelEntry) -> Result<()> {
+pub(crate) fn guard_dimension(conn: &rusqlite::Connection, embedder: &ModelEntry) -> Result<()> {
     let vec_dim = crate::db::vec0_dim(conn)?;
     if embedder.dimension != vec_dim {
         return Err(Error::Other(format!(

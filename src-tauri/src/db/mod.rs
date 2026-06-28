@@ -742,7 +742,9 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE chat_sessions; \
+            "ALTER TABLE chunks DROP COLUMN chat_turn_id; \
+             ALTER TABLE chunks DROP COLUMN chunk_at; \
+             DROP TABLE chat_sessions; \
              DROP TABLE photos; \
              DROP TABLE project_milestones; \
              ALTER TABLE projects DROP COLUMN last_touched; \
@@ -882,7 +884,9 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE chat_sessions; \
+            "ALTER TABLE chunks DROP COLUMN chat_turn_id; \
+             ALTER TABLE chunks DROP COLUMN chunk_at; \
+             DROP TABLE chat_sessions; \
              DROP TABLE photos; \
              DROP TABLE project_milestones; \
              ALTER TABLE projects DROP COLUMN last_touched; \
