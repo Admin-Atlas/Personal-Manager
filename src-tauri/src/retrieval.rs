@@ -86,6 +86,11 @@ pub struct Filters {
     pub source: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
+    /// Context-assembly dedup (board card 7C): `(document_id, turn_floor)` of the current chat session.
+    /// Chunks of that document whose `chat_turn_id > turn_floor` are excluded, because those turns are
+    /// already sent VERBATIM in the recency window (everything past the summary cursor) — retrieving a
+    /// chunked copy would duplicate on-screen context. `None` for a non-chat caller or an un-indexed chat.
+    pub exclude_chat: Option<(i64, i64)>,
 }
 
 /// The retrieval strategy — the seam for future adaptive routing and agentic retrieval. Exactly
@@ -113,9 +118,14 @@ pub struct RetrieveQuery<'a> {
 /// **off the DB lock** (AGENTS rule #4 — a sidecar call can block on a model download).
 pub fn retrieve_fused(conn: &Connection, q: &RetrieveQuery) -> Result<Vec<RetrievedChunk>> {
     match q.strategy {
-        Strategy::HybridRrf => {
-            hybrid_core(conn, q.text, q.embedding, q.k, q.filters.project.as_deref())
-        }
+        Strategy::HybridRrf => hybrid_core(
+            conn,
+            q.text,
+            q.embedding,
+            q.k,
+            q.filters.project.as_deref(),
+            q.filters.exclude_chat,
+        ),
     }
 }
 
@@ -180,15 +190,21 @@ fn hybrid_core(
     query_embedding: &[f32],
     k: usize,
     project: Option<&str>,
+    exclude_chat: Option<(i64, i64)>,
 ) -> Result<Vec<RetrievedChunk>> {
     let branch_limit = BRANCH_LIMIT.max(k);
     let allowed = match project {
         Some(p) => Some(project_chunk_ids(conn, p)?),
         None => None,
     };
-    // Over-fetch when scoping so the project's chunks survive the filter even if
-    // they aren't in the global top-N; otherwise fetch exactly the branch limit.
-    let fetch = if allowed.is_some() {
+    let excluded = match exclude_chat {
+        Some((doc_id, turn_floor)) => Some(in_window_chat_chunk_ids(conn, doc_id, turn_floor)?),
+        None => None,
+    };
+    // Over-fetch when either filter is active so the surviving chunks fill the top-k even after the
+    // allow/deny passes; otherwise fetch exactly the branch limit.
+    let scoped = allowed.is_some() || excluded.is_some();
+    let fetch = if scoped {
         SCOPED_POOL.max(branch_limit)
     } else {
         branch_limit
@@ -198,6 +214,13 @@ fn hybrid_core(
     if let Some(allowed) = &allowed {
         vec_hits.retain(|id| allowed.contains(id));
         fts_hits.retain(|id| allowed.contains(id));
+    }
+    if let Some(excluded) = &excluded {
+        // Drop the current chat's in-window turns — the model already has them verbatim.
+        vec_hits.retain(|id| !excluded.contains(id));
+        fts_hits.retain(|id| !excluded.contains(id));
+    }
+    if scoped {
         vec_hits.truncate(branch_limit);
         fts_hits.truncate(branch_limit);
     }
@@ -215,6 +238,25 @@ fn project_chunk_ids(conn: &Connection, project: &str) -> Result<std::collection
     )?;
     let ids = stmt
         .query_map(params![project], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<std::collections::HashSet<i64>, _>>()?;
+    Ok(ids)
+}
+
+/// The in-window chat chunk ids to exclude (board card 7C): chunks of `document_id` whose `chat_turn_id`
+/// is past `turn_floor` (the session's summary cursor). Those turns are everything after the cursor — the
+/// verbatim recency window — so the model already has them and a retrieved copy would just echo on-screen
+/// context. Non-chat chunks have NULL `chat_turn_id` and are never matched. Same shape as
+/// [`project_chunk_ids`]: materialised in memory (the set is one session's recent turns — tiny).
+fn in_window_chat_chunk_ids(
+    conn: &Connection,
+    document_id: i64,
+    turn_floor: i64,
+) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM chunks WHERE document_id = ?1 AND chat_turn_id IS NOT NULL AND chat_turn_id > ?2",
+    )?;
+    let ids = stmt
+        .query_map(params![document_id, turn_floor], |row| row.get::<_, i64>(0))?
         .collect::<std::result::Result<std::collections::HashSet<i64>, _>>()?;
     Ok(ids)
 }
@@ -964,6 +1006,108 @@ mod tests {
         let scoped = retrieve(&conn, &q, None).unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].title, "Beta note");
+    }
+
+    /// Insert one chat chunk (its own row carrying a `chat_turn_id`) into an existing document, vector- +
+    /// FTS-indexed like the real chat indexer.
+    fn insert_chat_chunk(
+        conn: &Connection,
+        doc_id: i64,
+        ordinal: i64,
+        content: &str,
+        emb: &[f32],
+        turn_id: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count, chat_turn_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![doc_id, ordinal, content, content.len() as i64, turn_id],
+        )
+        .unwrap();
+        let chunk_id = conn.last_insert_rowid();
+        let json = serde_json::to_string(emb).unwrap();
+        conn.execute(
+            "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+            params![chunk_id, json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?1, ?2)",
+            params![chunk_id, content],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dedup_excludes_only_the_current_chats_in_window_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&path, key).unwrap();
+
+        // A chat document with two indexed turns: turn 5 is past the summary cursor (3) → in the verbatim
+        // window; turn 2 is at/under the cursor → covered only by the summary, still worth retrieving.
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type) \
+             VALUES ('chat.md', 'This chat', 'chat-h', 'chat')",
+            [],
+        )
+        .unwrap();
+        let chat_doc = conn.last_insert_rowid();
+        insert_chat_chunk(
+            &conn,
+            chat_doc,
+            0,
+            "agenda recent in-window turn",
+            &unit_vec(0),
+            5,
+        );
+        insert_chat_chunk(
+            &conn,
+            chat_doc,
+            1,
+            "agenda older summarised turn",
+            &unit_vec(0),
+            2,
+        );
+        // An unrelated document — never a candidate for this chat's self-dedup.
+        insert_doc_chunk(&conn, "Other file", "agenda from a document", &unit_vec(0));
+
+        let query = unit_vec(0);
+        let with_dedup = RetrieveQuery {
+            text: "agenda",
+            embedding: &query,
+            k: 6,
+            filters: Filters {
+                exclude_chat: Some((chat_doc, 3)),
+                ..Default::default()
+            },
+            strategy: Strategy::HybridRrf,
+        };
+        let got = retrieve(&conn, &with_dedup, None).unwrap();
+        let contents: Vec<&str> = got.iter().map(|c| c.content.as_str()).collect();
+        assert!(
+            !contents.contains(&"agenda recent in-window turn"),
+            "the in-window turn (chat_turn_id 5 > floor 3) is excluded — it's already on screen"
+        );
+        assert!(
+            contents.contains(&"agenda older summarised turn"),
+            "the older turn (<= floor) stays retrievable — only the summary holds it otherwise"
+        );
+        assert!(
+            contents.contains(&"agenda from a document"),
+            "other documents are never touched by the chat dedup"
+        );
+
+        // Control: without the exclusion, the in-window turn is retrieved as normal.
+        let no_dedup = RetrieveQuery {
+            filters: Filters::default(),
+            ..with_dedup
+        };
+        let all = retrieve(&conn, &no_dedup, None).unwrap();
+        assert!(all
+            .iter()
+            .any(|c| c.content == "agenda recent in-window turn"));
     }
 
     #[test]

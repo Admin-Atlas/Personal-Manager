@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.47.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Long conversations are now cheaper and sharper. Instead of resending your whole chat history every message, PM sends the recent turns word-for-word plus the running summary of everything earlier — and keeps that stable part cached, so each new message costs far less as a thread grows.",
+      "PM no longer talks over itself: when it looks things up to answer you, it skips anything that's already visible in the recent conversation, so it pulls in genuinely new context from your other notes and chats rather than echoing what's on screen.",
+    ],
+  },
+  {
     version: "2.46.0-alpha",
     date: "2026-06-28",
     highlights: [
