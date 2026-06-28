@@ -3,13 +3,15 @@
 
 //! On-device storage inventory + a reference-counted, guarded teardown of the large, regenerable
 //! components PM downloads: the optional t-SNE stack (`openTSNE` → `scikit-learn`/`scipy`), the
+//! optional photo-OCR stack (`rapidocr`+`pillow-heif` → `opencv-python`/`shapely`/`pyclipper`), the
 //! Whisper speech model, and a **read-only** view of the active embedder.
 //!
 //! The teardown is a cascade: a heavy shared library can only be removed once nothing still needs it
-//! (`scikit-learn` after `openTSNE`; `scipy` after both). `numpy` is shared with the embedder and is
-//! never offered or removed. The dependency guard is enforced **server-side** here, not just in the
-//! UI, and a final backstop in [`crate::sidecar::SidecarManager::pip_uninstall`] refuses `numpy`
-//! outright. No database is involved — this is pure filesystem inventory + `pip uninstall`.
+//! (`scikit-learn` after `openTSNE`; `scipy` after both; the OCR image libs after `rapidocr`). `numpy`
+//! is shared with the embedder and is never offered or removed. The dependency guard is enforced
+//! **server-side** here, not just in the UI, and a final backstop in
+//! [`crate::sidecar::SidecarManager::pip_uninstall`] refuses `numpy` outright. No database is involved
+//! — this is pure filesystem inventory + `pip uninstall`.
 
 use std::path::{Path, PathBuf};
 
@@ -73,11 +75,19 @@ pub struct StorageReport {
 
 /// Which component (if any) must be removed before `id` can be. `None` = removable now. Used both to
 /// label the UI and to guard the actual removal, so the two can never disagree.
-fn blocker_for(id: &str, tsne_present: bool, sklearn_present: bool) -> Option<&'static str> {
+fn blocker_for(
+    id: &str,
+    tsne_present: bool,
+    sklearn_present: bool,
+    ocr_present: bool,
+) -> Option<&'static str> {
     match id {
         "scikit-learn" if tsne_present => Some("openTSNE"),
         "scipy" if tsne_present => Some("openTSNE"),
         "scipy" if sklearn_present => Some("scikit-learn"),
+        "opencv-python" if ocr_present => Some("ocr"),
+        "shapely" if ocr_present => Some("ocr"),
+        "pyclipper" if ocr_present => Some("ocr"),
         _ => None,
     }
 }
@@ -86,6 +96,7 @@ fn blocker_label(anchor: &str) -> String {
     match anchor {
         "openTSNE" => "Remove the enhanced layout first".into(),
         "scikit-learn" => "Remove scikit-learn first".into(),
+        "ocr" => "Remove photo text recognition first".into(),
         other => format!("Remove {other} first"),
     }
 }
@@ -168,6 +179,34 @@ fn pkg(site: Option<&PathBuf>, primary: &str, patterns: &[&str]) -> (bool, u64) 
     (present, size)
 }
 
+/// Like [`pkg`], but presence is detected from a `*.dist-info` directory rather than an import dir —
+/// for single-file extension modules (e.g. `pyclipper`, which installs `pyclipper.<abi>.pyd`/`.so`
+/// with no package directory). `dist_prefix` is the normalised distribution name (`"pyclipper-"`).
+fn pkg_dist(site: Option<&PathBuf>, dist_prefix: &str, patterns: &[&str]) -> (bool, u64) {
+    let Some(site) = site else {
+        return (false, 0);
+    };
+    let mut present = false;
+    let mut size = 0;
+    if let Ok(rd) = std::fs::read_dir(site) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(dist_prefix) && name.ends_with(".dist-info") {
+                present = true;
+            }
+            if patterns.iter().any(|p| match_pat(&name, p)) {
+                let path = e.path();
+                size += if path.is_dir() {
+                    dir_size(&path)
+                } else {
+                    e.metadata().map(|m| m.len()).unwrap_or(0)
+                };
+            }
+        }
+    }
+    (present, size)
+}
+
 /// Approximate on-disk size of an embedder's weights (its shared fastembed/HF cache is outside the
 /// data dir and unmanaged, so we estimate rather than scan).
 fn embedder_estimate_bytes(id: &str) -> u64 {
@@ -189,10 +228,41 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
     );
     let (scipy_present, scipy_size) = pkg(site.as_ref(), "scipy", &["scipy", "scipy*"]);
 
+    // Optional photo-OCR stack. The top-level component bundles rapidocr + pillow-heif (the two pins
+    // `uninstall_optional_ocr` removes) plus its tiny pure-Python siblings; the heavy image libraries
+    // (opencv-python / shapely / pyclipper) are separate, cascade-removable children. numpy is shared
+    // with the embedder and never listed. pyclipper installs no import dir, so it needs `pkg_dist`.
+    let (ocr_present, ocr_size) = pkg(
+        site.as_ref(),
+        "rapidocr",
+        &[
+            "rapidocr",
+            "rapidocr-*",
+            "rapidocr_*",
+            "pillow_heif",
+            "pillow_heif-*",
+            "pillow_heif.libs",
+            "omegaconf",
+            "omegaconf-*",
+            "colorlog",
+            "colorlog-*",
+        ],
+    );
+    let (cv2_present, cv2_size) = pkg(site.as_ref(), "cv2", &["cv2", "opencv*", "opencv_python*"]);
+    let (shapely_present, shapely_size) = pkg(
+        site.as_ref(),
+        "shapely",
+        &["shapely", "shapely*", "Shapely*"],
+    );
+    let (pyclipper_present, pyclipper_size) =
+        pkg_dist(site.as_ref(), "pyclipper-", &["pyclipper*"]);
+
     let venv_total = dir_size(venv);
-    // The base engine is the venv minus the optional t-SNE libraries (listed separately below), so the
+    // The base engine is the venv minus every optional library (each listed separately below), so the
     // total never double-counts them.
-    let base = venv_total.saturating_sub(tsne_size + sklearn_size + scipy_size);
+    let optional_size =
+        tsne_size + sklearn_size + scipy_size + ocr_size + cv2_size + shapely_size + pyclipper_size;
+    let base = venv_total.saturating_sub(optional_size);
 
     let models = data.join("runtime").join("models");
     let whisper_present = dir_nonempty(&models);
@@ -237,8 +307,14 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
         });
     }
 
-    let mut lib = |id: &'static str, label: &str, detail: &str, size: u64| {
-        let blk = blocker_for(id, tsne_present, sklearn_present);
+    // A cascade-removable child library row (indented under its parent feature). A free fn rather than
+    // a closure so it never holds a long-lived mutable borrow of `components` across the pushes below.
+    let lib = |components: &mut Vec<Component>,
+               id: &'static str,
+               label: &str,
+               detail: &str,
+               size: u64| {
+        let blk = blocker_for(id, tsne_present, sklearn_present, ocr_present);
         components.push(Component {
             id,
             label: label.into(),
@@ -265,6 +341,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
     };
     if sklearn_present {
         lib(
+            &mut components,
             "scikit-learn",
             "scikit-learn",
             "Used by the enhanced layout. Includes joblib and threadpoolctl.",
@@ -273,10 +350,57 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
     }
     if scipy_present {
         lib(
+            &mut components,
             "scipy",
             "scipy",
             "Used by the enhanced layout and scikit-learn.",
             scipy_size,
+        );
+    }
+
+    if ocr_present {
+        components.push(Component {
+            id: "ocr",
+            label: "Photo text recognition (rapidocr)".into(),
+            detail: "Reads text out of dropped photos and screenshots (OCR), on-device.".into(),
+            size_bytes: ocr_size,
+            approximate: false,
+            child: false,
+            status: Status::Removable,
+            blockers: Vec::new(),
+            manage: None,
+            note: Some(
+                "Removing it indexes new photos by date and location only, with no text. \
+                 You can reinstall it any time."
+                    .into(),
+            ),
+        });
+    }
+    if cv2_present {
+        lib(
+            &mut components,
+            "opencv-python",
+            "OpenCV (opencv-python)",
+            "Image processing used by photo text recognition.",
+            cv2_size,
+        );
+    }
+    if shapely_present {
+        lib(
+            &mut components,
+            "shapely",
+            "shapely",
+            "Geometry used by photo text recognition.",
+            shapely_size,
+        );
+    }
+    if pyclipper_present {
+        lib(
+            &mut components,
+            "pyclipper",
+            "pyclipper",
+            "Polygon clipping used by photo text recognition.",
+            pyclipper_size,
         );
     }
 
@@ -311,7 +435,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
         note: Some("Stored in a shared model cache; can't be removed here.".into()),
     });
 
-    let total = base + tsne_size + sklearn_size + scipy_size + whisper_size + embedder_size;
+    let total = base + optional_size + whisper_size + embedder_size;
     StorageReport {
         total_bytes: total,
         components,
@@ -325,10 +449,11 @@ fn do_remove(app: &AppHandle, id: &str, venv: &Path, data: &Path) -> Result<()> 
     let present = |p: &str| site.as_ref().map(|s| s.join(p).is_dir()).unwrap_or(false);
     let tsne = present("openTSNE");
     let sklearn = present("sklearn");
+    let ocr = present("rapidocr");
 
     // Re-check the cascade server-side (defence in depth — the UI greys blocked buttons, but never
     // trust the webview for a destructive uninstall).
-    if let Some(anchor) = blocker_for(id, tsne, sklearn) {
+    if let Some(anchor) = blocker_for(id, tsne, sklearn, ocr) {
         return Err(Error::Other(blocker_label(anchor)));
     }
 
@@ -338,6 +463,10 @@ fn do_remove(app: &AppHandle, id: &str, venv: &Path, data: &Path) -> Result<()> 
         "openTSNE" => sidecar.uninstall_optional_tsne()?,
         "scikit-learn" => sidecar.pip_uninstall(&["scikit-learn", "joblib", "threadpoolctl"])?,
         "scipy" => sidecar.pip_uninstall(&["scipy"])?,
+        "ocr" => sidecar.uninstall_optional_ocr()?,
+        "opencv-python" => sidecar.pip_uninstall(&["opencv-python"])?,
+        "shapely" => sidecar.pip_uninstall(&["shapely"])?,
+        "pyclipper" => sidecar.pip_uninstall(&["pyclipper"])?,
         "whisper" => {
             let m = data.join("runtime").join("models");
             if m.exists() {
@@ -398,16 +527,40 @@ mod tests {
     #[test]
     fn cascade_blocks_then_unblocks_in_order() {
         // While openTSNE is present, neither heavy library can go.
-        assert_eq!(blocker_for("scikit-learn", true, true), Some("openTSNE"));
-        assert_eq!(blocker_for("scipy", true, true), Some("openTSNE"));
+        assert_eq!(
+            blocker_for("scikit-learn", true, true, false),
+            Some("openTSNE")
+        );
+        assert_eq!(blocker_for("scipy", true, true, false), Some("openTSNE"));
         // openTSNE removed → scikit-learn is free, but scipy still waits on scikit-learn.
-        assert_eq!(blocker_for("scikit-learn", false, true), None);
-        assert_eq!(blocker_for("scipy", false, true), Some("scikit-learn"));
+        assert_eq!(blocker_for("scikit-learn", false, true, false), None);
+        assert_eq!(
+            blocker_for("scipy", false, true, false),
+            Some("scikit-learn")
+        );
         // Everything above gone → scipy is free.
-        assert_eq!(blocker_for("scipy", false, false), None);
+        assert_eq!(blocker_for("scipy", false, false, false), None);
         // openTSNE itself, and unrelated ids, are never blocked.
-        assert_eq!(blocker_for("openTSNE", true, true), None);
-        assert_eq!(blocker_for("whisper", true, true), None);
+        assert_eq!(blocker_for("openTSNE", true, true, false), None);
+        assert_eq!(blocker_for("whisper", true, true, false), None);
+    }
+
+    #[test]
+    fn ocr_cascade_blocks_then_unblocks() {
+        // The OCR image libraries wait on rapidocr while it's present...
+        assert_eq!(
+            blocker_for("opencv-python", false, false, true),
+            Some("ocr")
+        );
+        assert_eq!(blocker_for("shapely", false, false, true), Some("ocr"));
+        assert_eq!(blocker_for("pyclipper", false, false, true), Some("ocr"));
+        // ...and free up once rapidocr is gone.
+        assert_eq!(blocker_for("opencv-python", false, false, false), None);
+        assert_eq!(blocker_for("shapely", false, false, false), None);
+        // rapidocr itself is never blocked; the two cascades don't interfere.
+        assert_eq!(blocker_for("ocr", true, true, true), None);
+        assert_eq!(blocker_for("opencv-python", true, true, false), None);
+        assert_eq!(blocker_for("scipy", false, false, true), None);
     }
 
     #[test]
@@ -416,5 +569,10 @@ mod tests {
         assert!(match_pat("scipy", "scipy"));
         assert!(!match_pat("scipython", "scipy"));
         assert!(match_pat("openTSNE-1.0.4.dist-info", "openTSNE-*"));
+        assert!(match_pat("pyclipper-1.3.0.dist-info", "pyclipper*"));
+        assert!(match_pat(
+            "opencv_python-4.10.0.84.dist-info",
+            "opencv_python*"
+        ));
     }
 }

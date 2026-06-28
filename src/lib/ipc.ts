@@ -33,6 +33,8 @@ import type {
   Message,
   ModelInfo,
   ModelRecommendations,
+  OcrInstallEvent,
+  OcrStatus,
   OneDriveAccount,
   OneDriveFolder,
   OneDriveScope,
@@ -675,7 +677,14 @@ export const installOptionalTsne = () => invoke<void>("install_optional_tsne");
 /** Remove the optional t-SNE reducer from the venv (the "delete" action), then recompute with PCA. */
 export const uninstallOptionalTsne = () => invoke<void>("uninstall_optional_tsne");
 
-/** Inventory the large on-device components (venv, t-SNE libraries, speech model, search model). */
+/** Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed. */
+export const optionalOcrStatus = () => invoke<OcrStatus>("optional_ocr_status");
+
+/** Install the optional photo-OCR component into the managed venv (a one-time download). Progress
+ *  rides the `ocr://install` event (see `onOcrInstall`); removal is via `removeStorageComponent`. */
+export const installOptionalOcr = () => invoke<void>("install_optional_ocr");
+
+/** Inventory the large on-device components (venv, t-SNE libraries, OCR stack, speech, search model). */
 export const listStorageComponents = () => invoke<StorageReport>("list_storage_components");
 
 /** Remove an on-device component, enforced by the dependency cascade server-side. */
@@ -689,6 +698,10 @@ export const onLayoutProgress = (handler: (e: LayoutProgressEvent) => void): Pro
 /** Subscribe to the optional t-SNE download's progress (fires from whichever view triggered it). */
 export const onTsneInstall = (handler: (e: TsneInstallEvent) => void): Promise<UnlistenFn> =>
   listen<TsneInstallEvent>("tsne://install", (e) => handler(e.payload));
+
+/** Subscribe to the optional OCR download's progress (fires from whichever view triggered it). */
+export const onOcrInstall = (handler: (e: OcrInstallEvent) => void): Promise<UnlistenFn> =>
+  listen<OcrInstallEvent>("ocr://install", (e) => handler(e.payload));
 
 /** Open an index-only document's source in the system browser (its Drive link). */
 export const openExternalRef = (docId: number) => invoke<void>("open_external_ref", { docId });

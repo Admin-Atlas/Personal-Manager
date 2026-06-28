@@ -9,9 +9,16 @@
 // search model). Removing the big libraries asks for an extra confirm that recommends keeping them.
 
 import { useCallback, useEffect, useState } from "react";
-import { listStorageComponents, removeStorageComponent } from "../lib/ipc";
+import {
+  installOptionalOcr,
+  listStorageComponents,
+  onOcrInstall,
+  optionalOcrStatus,
+  removeStorageComponent,
+} from "../lib/ipc";
 import type { StorageComponent, StorageReport } from "../lib/types";
 import { Button, ConfirmDialog } from "./ui";
+import { IngestProgress } from "./IngestProgress";
 
 /** Human-friendly size; estimates are prefixed with "~". */
 function formatSize(bytes: number, approximate: boolean): string {
@@ -21,8 +28,10 @@ function formatSize(bytes: number, approximate: boolean): string {
   return approximate ? `~${s}` : s;
 }
 
-/** The big shared libraries — removing these gets the extra "recommend keeping" confirm. */
+/** The big t-SNE libraries — removing these gets the extra "recommend keeping" confirm. */
 const HEAVY_LIBS = new Set(["scikit-learn", "scipy"]);
+/** The OCR image libraries — removed in the cascade after photo text recognition; their own confirm. */
+const OCR_LIBS = new Set(["opencv-python", "shapely", "pyclipper"]);
 
 function confirmCopy(c: StorageComponent): { title: string; body: string; danger: boolean } {
   if (HEAVY_LIBS.has(c.id)) {
@@ -32,11 +41,25 @@ function confirmCopy(c: StorageComponent): { title: string; body: string; danger
       body: "These libraries are only used by the enhanced map layout and total roughly 150 MB. We recommend keeping them unless you're short on space — removing them means another download if you re-enable the enhanced layout.",
     };
   }
+  if (OCR_LIBS.has(c.id)) {
+    return {
+      title: `Remove ${c.label}?`,
+      danger: true,
+      body: "This library is only used by photo text recognition. We recommend keeping it unless you're short on space — removing it means another download if you reinstall photo text recognition.",
+    };
+  }
   if (c.id === "openTSNE") {
     return {
       title: "Remove the enhanced layout?",
       danger: true,
       body: "The Map returns to the basic (PCA) layout. You can download the enhanced layout again any time from Settings → Memory map.",
+    };
+  }
+  if (c.id === "ocr") {
+    return {
+      title: "Remove photo text recognition?",
+      danger: true,
+      body: "New photos and screenshots will be indexed by their date and location only, with no text. You can reinstall it any time — from here, or the next time you drop a photo.",
     };
   }
   if (c.id === "whisper") {
@@ -89,6 +112,8 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
 
   return (
     <div data-help="settings-storage">
+      <OcrInstaller onInstalled={load} />
+
       <div className="mt-4 flex items-baseline justify-between border-t border-border pt-4">
         <div>
           <label className="block text-sm font-medium text-ink2">On-device components</label>
@@ -142,6 +167,97 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
       >
         {copy?.body}
       </ConfirmDialog>
+    </div>
+  );
+}
+
+/** The install entry point for optional photo text recognition (OCR). When it's already installed,
+ *  the removable rows in the inventory below take over (the cascade), so this collapses to a short
+ *  note. Mirrors the t-SNE control in Settings → Memory map. `onInstalled` re-scans the inventory so
+ *  the new rows appear immediately. */
+function OcrInstaller({ onInstalled }: { onInstalled: () => void }) {
+  const [installed, setInstalled] = useState<boolean | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [frac, setFrac] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    optionalOcrStatus()
+      .then((s) => setInstalled(s.installed))
+      .catch(() => setInstalled(false));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const un = onOcrInstall((e) => {
+      if (!cancelled) setFrac(e.fraction);
+    });
+    return () => {
+      cancelled = true;
+      void un.then((fn) => fn());
+    };
+  }, []);
+
+  function download() {
+    setInstalling(true);
+    setFrac(0);
+    setError(null);
+    installOptionalOcr()
+      .then(() => optionalOcrStatus())
+      .then((s) => {
+        setInstalled(s.installed);
+        onInstalled();
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setInstalling(false));
+  }
+
+  return (
+    <div className="rounded-[var(--radius)] border border-border p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <label className="block text-sm font-medium text-ink2">
+            Photo text recognition (OCR)
+          </label>
+          <p className="mt-1 text-xs text-ink4">
+            Reads the text out of photos and screenshots you add, so it's searchable — all
+            on-device. Optional: a one-time download (~70–100 MB). Without it, photos are still
+            indexed by their date and location.
+          </p>
+        </div>
+        <div className="shrink-0">
+          {installed === null ? (
+            <span className="text-xs text-ink4">…</span>
+          ) : installed ? (
+            <span className="rounded-[var(--radius-sm)] bg-bg px-2 py-1 font-mono text-[11px] text-ink4">
+              Installed
+            </span>
+          ) : (
+            <Button variant="secondary" onClick={download} disabled={installing}>
+              {installing ? "Downloading…" : "Install"}
+            </Button>
+          )}
+        </div>
+      </div>
+      {installing && (
+        <IngestProgress
+          mode="percent"
+          processed={Math.round(frac * 100)}
+          total={100}
+          label="Downloading photo text recognition"
+          className="mt-2"
+        />
+      )}
+      {installed && (
+        <p className="mt-2 text-xs text-ink4">
+          Installed — remove it (and its image libraries) under On-device components below.
+        </p>
+      )}
+      {error && (
+        <p className="mt-2 text-xs" style={{ color: "var(--st-due)" }}>
+          {error}
+        </p>
+      )}
     </div>
   );
 }

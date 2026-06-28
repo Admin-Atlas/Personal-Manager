@@ -614,6 +614,8 @@ pub fn run() {
             layout::optional_tsne_status,
             layout::install_optional_tsne,
             layout::uninstall_optional_tsne,
+            photos::optional_ocr_status,
+            photos::install_optional_ocr,
             components::list_storage_components,
             components::remove_storage_component,
             commands::open_external_ref,

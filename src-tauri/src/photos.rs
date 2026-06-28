@@ -18,6 +18,12 @@
 
 use std::path::Path;
 
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, State};
+
+use crate::error::{Error, Result};
+use crate::AppState;
+
 /// How a photo entered PM — its capture provenance, the `photos.source_type` enum. Orthogonal to
 /// whether the original was copied into the vault (`saved_to_vault`): a screenshot stays a screenshot
 /// whether or not its bytes were saved.
@@ -236,6 +242,56 @@ pub struct ImageAnalysis {
     pub width: Option<u32>,
     /// Pixel height, or `None` if the image could not be opened.
     pub height: Option<u32>,
+}
+
+// ---- optional OCR component: status + install commands --------------------
+//
+// OCR (rapidocr + pillow-heif) is delivered exactly like the t-SNE reducer (see [`crate::layout`]):
+// an OPTIONAL on-demand component the user installs once. These two commands are the install surface
+// (the drop-time prompt and the Storage tab). Removal goes through the Storage manager's guarded
+// cascade ([`crate::components::remove_storage_component`] with id `"ocr"`), which reclaims the heavy
+// image deps in order — so there is deliberately no standalone uninstall command here.
+
+/// Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed.
+#[derive(Serialize)]
+pub struct OcrStatus {
+    installed: bool,
+}
+
+/// Progress for the optional OCR component download (broadcast on `ocr://install`). Like the t-SNE
+/// download it has no file count, so `fraction` (0.0..=1.0, monotonic) renders as a percentage bar.
+#[derive(Clone, Serialize)]
+pub struct OcrInstallEvent {
+    fraction: f32,
+}
+
+/// Whether the optional photo-OCR component is installed in the managed venv. Cheap (a marker read),
+/// so the UI can check it before a photo drop and the Storage tab can show the install/remove state.
+#[tauri::command]
+pub fn optional_ocr_status(state: State<'_, AppState>) -> Result<OcrStatus> {
+    Ok(OcrStatus {
+        installed: state.sidecar.optional_ocr_ready(),
+    })
+}
+
+/// Install the optional photo-OCR component (rapidocr + pillow-heif) on demand — a pip download into
+/// the managed venv. The blocking install runs off the async runtime; progress rides `ocr://install`
+/// so the Storage tab and the drop-time prompt can show a real percentage bar. Errors surface to the
+/// caller so the UI can show them. Idempotent (a no-op once installed).
+#[tauri::command]
+pub async fn install_optional_ocr(app: AppHandle) -> Result<()> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let progress_app = app2.clone();
+        app2.state::<AppState>()
+            .sidecar
+            .install_optional_ocr(move |fraction| {
+                let _ = progress_app.emit("ocr://install", OcrInstallEvent { fraction });
+            })
+    })
+    .await
+    .map_err(|e| Error::Other(format!("OCR install task panicked: {e}")))??;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -608,6 +608,17 @@ export interface TsneInstallEvent {
   fraction: number;
 }
 
+/** Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed. */
+export interface OcrStatus {
+  installed: boolean;
+}
+
+/** Progress for the optional OCR component download (0..1, monotonic). Rendered as a percentage, like
+ *  the t-SNE download — there is no file count. */
+export interface OcrInstallEvent {
+  fraction: number;
+}
+
 /** One on-device component in the Storage manager (the venv, the t-SNE libraries, the speech model,
  *  the active search model). `status` drives the action: removable now, blocked behind a dependent,
  *  required, or in-use (managed elsewhere). */
