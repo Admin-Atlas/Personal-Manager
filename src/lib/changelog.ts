@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.39.1-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Fixed a bug where a document with a very long unbroken run of text (a dense table, a code dump, a no-spaces blob) could fail to be indexed — the embedder choked on the over-long piece and skipped it silently. Such pieces are now sized correctly and, as a safety net, always trimmed to fit, so the whole document gets indexed.",
+      "Because that changes how a few documents are broken into pieces, PM will re-index your library once on the next launch — no action needed; search just works once it finishes.",
+      "Quieted a stream of harmless “FontBBox” warnings some PDFs printed to the log during import.",
+    ],
+  },
+  {
     version: "2.39.0-alpha",
     date: "2026-06-28",
     highlights: [

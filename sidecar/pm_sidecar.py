@@ -31,8 +31,15 @@ converts/embeds/scores/transcribes bytes; it never executes file contents.
 """
 
 import json
+import logging
 import sys
 import traceback
+
+# pdfminer (which MarkItDown uses to extract text from PDFs) logs a warning for every glyph
+# whose font descriptor has no FontBBox ("None cannot be parsed as 4 floats") — cosmetic noise
+# that can flood the console on a single PDF and tells us nothing actionable. Quiet that logger
+# to errors; genuine extraction failures still surface.
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # The default embedder + dimension (the English model). PR 2 makes embedding
 # model-parameterised: Rust sends the selected model id (and, for a custom model
@@ -105,17 +112,19 @@ def get_embedder(model=None, spec=None):
 
 
 def get_tokenizer(model=None, spec=None):
-    """The selected embedder's tokenizer, for sizing chunks by tokens in Rust.
+    """A tokenizer for sizing chunks by tokens in Rust — an INDEPENDENT COPY of the
+    embedder's tokenizer.
 
-    fastembed wraps a `tokenizers.Tokenizer`; we reach it defensively across
-    versions (the attribute path is internal), falling back to loading the repo's
-    tokenizer directly, then to `None` so the caller can estimate. Truncation is
-    disabled so an oversized chunk reports its *true* length (the splitter must see
-    it overflow to break it up). Padding is deliberately left untouched: this is the
-    SAME tokenizer instance fastembed batches embeddings with, so disabling padding
-    here could break/degrade embedding — `do_count_tokens` strips padding from the
-    count via the attention mask instead. Reuses the embedder's already-downloaded
-    weights — no extra download.
+    We disable truncation so an oversized chunk reports its *true* length (the splitter
+    must see it overflow to break it up). The catch: fastembed's tokenizer is the SAME
+    object it embeds with, and it ships with truncation enabled to the model's 512-token
+    window. Mutating that shared object with `no_truncation()` (as this used to) stripped
+    the embedder's safety net, so a chunk longer than 512 tokens crashed ONNX with a
+    `512 vs N` broadcast error instead of being harmlessly truncated. So we CLONE it
+    (`from_str(to_str())`) and disable truncation on the copy only — the embedder keeps
+    its truncation. The clone reuses the in-memory weights (no download). Padding is left
+    as fastembed set it (batch padding on); `do_count_tokens` strips it via the attention
+    mask. Falls back to loading the repo tokenizer, then to `None` (caller estimates).
     """
     model = model or EMBED_MODEL
     if model in _tokenizers:
@@ -126,19 +135,25 @@ def get_tokenizer(model=None, spec=None):
         getattr(emb, "model", None), "tokenizer", None
     )
     if candidate is not None and hasattr(candidate, "encode"):
-        tok = candidate
+        try:
+            from tokenizers import Tokenizer
+
+            # Independent copy: disabling truncation here must never touch the embedder's.
+            tok = Tokenizer.from_str(candidate.to_str())
+            tok.no_truncation()
+        except Exception:
+            # Clone unavailable: count with the shared tokenizer AS-IS (truncation stays
+            # on, so a long chunk just reports a capped length) — never mutate it.
+            tok = candidate
     if tok is None:
         try:
             from tokenizers import Tokenizer
 
             tok = Tokenizer.from_pretrained(model)
+            tok.no_truncation()
         except Exception:
             tok = None
     if tok is not None:
-        try:
-            tok.no_truncation()
-        except Exception:
-            pass
         # Cache only on success so a transient failure retries next time.
         _tokenizers[model] = tok
     return tok

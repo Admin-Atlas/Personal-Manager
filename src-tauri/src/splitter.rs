@@ -32,9 +32,11 @@ pub const CHUNK_TARGET_TOKENS: usize = 256;
 /// retrievable.
 pub const CHUNK_OVERLAP_TOKENS: usize = 32;
 /// The splitter implementation version. Bump on any change to chunk boundaries; the retrieval
-/// stamp folds this in, so a bump prompts a one-time Rebuild. (Bumped to 2 with the token-count
-/// padding fix: the counter change shifts every chunk boundary, so existing vaults must rechunk.)
-pub const SPLITTER_VERSION: u32 = 2;
+/// stamp folds this in, so a bump prompts a one-time Rebuild. (v2: the token-count padding fix.
+/// v3: hard-split now sizes its char window from each unit's MEASURED token density instead of a
+/// fixed 4 chars/token, so a dense unbreakable line is no longer cut into over-window segments —
+/// boundaries shift for any document that hit that fallback, so existing vaults must rechunk.)
+pub const SPLITTER_VERSION: u32 = 3;
 /// The boundary-strategy id recorded in the retrieval stamp.
 pub const BOUNDARY_STRATEGY: &str = "recursive-structure-v1";
 
@@ -360,13 +362,24 @@ fn split_oversized(u: &Unit, target_tokens: usize) -> Vec<LeafDraft> {
     let est = |s: &str| -> usize {
         ((s.chars().count() as f64 * tokens_per_char).ceil() as usize).max(1)
     };
+    // Char window for hard-splitting an unbreakable line, sized from THIS unit's measured
+    // density rather than a fixed chars/token guess. A dense line (where a token is far fewer
+    // than 4 chars — code, CJK, base64) would otherwise be cut into `target * 4`-char windows
+    // that still blow past the token target — the over-window chunk that crashed the embedder.
+    // Falls back to the English approximation only for a degenerate (zero-density) unit.
+    let chars_per_token = if tokens_per_char > 0.0 {
+        1.0 / tokens_per_char
+    } else {
+        APPROX_CHARS_PER_TOKEN as f64
+    };
+    let window_chars = ((target_tokens as f64 * chars_per_token).floor() as usize).max(1);
 
     // Pieces = lines, each with its byte offset within the unit; a too-long line is hard-split.
     let mut pieces: Vec<(usize, String)> = Vec::new(); // (byte offset within unit, text)
     let mut off = 0usize;
     for line in u.text.split_inclusive('\n') {
         if est(line) > target_tokens {
-            for (rel, seg) in hard_split(line, target_tokens) {
+            for (rel, seg) in hard_split(line, window_chars) {
                 pieces.push((off + rel, seg));
             }
         } else {
@@ -414,10 +427,11 @@ fn push_oversized_leaf(leaves: &mut Vec<LeafDraft>, u: &Unit, start: Option<usiz
     });
 }
 
-/// Hard-split a single over-budget line into char windows (char-safe). Returns (byte offset
-/// within the line, segment). The only place a boundary can fall inside a "line".
-fn hard_split(line: &str, target_tokens: usize) -> Vec<(usize, String)> {
-    let window = (target_tokens * APPROX_CHARS_PER_TOKEN).max(1);
+/// Hard-split a single over-budget line into char windows of `window_chars` (char-safe). Returns
+/// (byte offset within the line, segment). The only place a boundary can fall inside a "line".
+/// `window_chars` is sized by the caller from the unit's measured density (see `split_oversized`).
+fn hard_split(line: &str, window_chars: usize) -> Vec<(usize, String)> {
+    let window = window_chars.max(1);
     let mut out = Vec::new();
     let mut seg = String::new();
     let mut seg_start = 0usize;
@@ -725,6 +739,46 @@ mod tests {
             "oversized block must split: {} leaves",
             leaves.len()
         );
+    }
+
+    /// One token per character — the densest case, where the old fixed `target * 4`-char window
+    /// cut a long unbreakable line into segments well over the token target (the chunk that
+    /// overflowed the embedder's window). The hard-split window must follow the measured density.
+    struct PerCharCounter;
+    impl TokenCounter for PerCharCounter {
+        fn count(&self, texts: &[&str]) -> Result<Vec<usize>> {
+            Ok(texts.iter().map(|t| t.chars().count().max(1)).collect())
+        }
+    }
+
+    #[test]
+    fn dense_unbreakable_line_is_hard_split_under_the_token_target() {
+        let target = 256;
+        // A 600-char line with no whitespace/boundary → the hard-split fallback, at 1 token/char.
+        let body = "x".repeat(600);
+        let s = RecursiveSplitter {
+            target_tokens: target,
+            overlap_tokens: 0,
+        };
+        let meta = SplitMeta {
+            title: "Dense",
+            content_hash: "h",
+        };
+        let chunks = s.split(&body, &meta, &PerCharCounter).unwrap();
+        let leaves: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Leaf)
+            .collect();
+        assert!(
+            leaves.len() > 1,
+            "a 600-token line must split, not pass through whole"
+        );
+        for c in &leaves {
+            // Re-count the leaf's text with the same counter: it must fit the token target,
+            // proving the window followed density (1 char/token) not the 4x char guess.
+            let n = PerCharCounter.count(&[c.display_content.as_str()]).unwrap()[0];
+            assert!(n <= target, "leaf has {n} tokens, over the {target} target");
+        }
     }
 
     #[test]
