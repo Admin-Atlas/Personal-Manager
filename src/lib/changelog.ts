@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.39.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Set a project's priority yourself. Triage now has a Priority picker (High / Medium / Low, or Auto for no tag) — the honest replacement for the old guessed tag. It shows on the project's card and you can sort by it.",
+      "Sort your focus list. A new Sort control reorders your projects by Deadline, Priority, Size, or most-recent activity — and the ↑/↓ button flips the direction. “Smart” (the default) keeps the most pressing first, just as before; your choice is remembered.",
+    ],
+  },
+  {
     version: "2.38.0-alpha",
     date: "2026-06-28",
     highlights: [
