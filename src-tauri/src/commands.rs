@@ -817,6 +817,10 @@ pub async fn send_message(
     // every following request.
     let content: String = content.chars().take(MAX_MESSAGE_CHARS).collect();
 
+    // The user is active right now — hold the idle chat-indexer (card 7B) off until this conversation
+    // settles, so background indexing never competes with a live exchange.
+    state.mark_user_activity();
+
     let api_key = secrets::get_openrouter_key()?
         .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
 
