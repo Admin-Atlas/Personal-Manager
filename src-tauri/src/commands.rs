@@ -21,7 +21,7 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, clock, cost, db, drive, entities, index_only, lock_session, microsoft,
+    applock, briefing, chat, clock, cost, db, drive, entities, index_only, lock_session, microsoft,
     onedrive, openrouter, outlook_calendar, paths, preferences, recommend, secrets, vault,
     AppState, VaultRuntime,
 };
@@ -839,6 +839,9 @@ pub async fn send_message(
             |row| row.get(0),
         )?;
 
+        // Strict turn alternation (card 7A): refuse a second consecutive user turn so a turn-pair is
+        // always unambiguous. The UI already maintains this, so it is an invariant guard, not a new gate.
+        chat::assert_user_turn_allowed(&conn, conversation_id)?;
         conn.execute(
             "INSERT INTO messages(conversation_id, role, content) VALUES (?1, 'user', ?2)",
             params![conversation_id, content],
@@ -975,6 +978,18 @@ pub async fn send_message(
         )?;
         id
     };
+
+    // Append this completed turn-pair to the session's Markdown vault file (the authoritative truth) and
+    // record/refresh its `chat_sessions` row — card 7A's vault-is-truth write, which card B's indexer reads
+    // from. Best-effort: the just-committed `messages` rows are the durable backstop, so a vault hiccup
+    // (e.g. a locked vault) is logged and never fails the chat.
+    if let Err(e) =
+        chat::record_turn_pair(state.inner(), conversation_id, &content, &reply, message_id)
+    {
+        eprintln!(
+            "chat: vault append for conversation {conversation_id} failed ({e}); messages row is the backstop"
+        );
+    }
 
     let _ = on_event.send(ChatEvent::Done {
         message_id,

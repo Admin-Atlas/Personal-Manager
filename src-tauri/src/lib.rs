@@ -4,6 +4,7 @@
 mod applock;
 mod briefing;
 mod calendar;
+mod chat;
 mod clock;
 mod commands;
 mod commands_dev;

@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.43.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Groundwork for a big one: your conversations with PM are on their way to becoming a first-class, searchable source — so a decision or preference you mention in chat can be recalled later, just like a document. This update lays the quiet foundation for how a chat is saved and tracked; nothing changes in how chat looks or works yet.",
+      "Under the hood, each completed back-and-forth is now kept in your vault as it happens — the same durable, rebuildable place your documents live — so once indexing arrives in the next updates, your past chats become part of what PM can draw on.",
+    ],
+  },
+  {
     version: "2.42.0-alpha",
     date: "2026-06-28",
     highlights: [
