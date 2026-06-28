@@ -441,6 +441,28 @@ impl MarkdownCipher {
         std::fs::write(path, bytes)?;
         Ok(())
     }
+
+    /// Encode arbitrary bytes for writing to `path` by the SAME policy as Markdown — encrypted into a
+    /// container (AAD-bound to the path's logical name) when encryption is on, else the bytes as-is.
+    /// Lets an opt-in saved photo original follow the vault's cipher instead of leaking plaintext at
+    /// rest in an otherwise-encrypted vault.
+    pub fn encode_bytes_for(&self, path: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
+        if self.encryption_on() {
+            let key = self.subkey.as_ref().ok_or_else(|| {
+                Error::Other("Markdown encryption is on but no key is loaded".into())
+            })?;
+            crypto::encrypt(bytes, key, &self.vault_id, &Self::aad_stem(path))
+        } else {
+            Ok(bytes.to_vec())
+        }
+    }
+
+    /// Encode + write arbitrary bytes to `path` per policy (see [`encode_bytes_for`](Self::encode_bytes_for)).
+    pub fn write_bytes_to(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let out = self.encode_bytes_for(path, bytes)?;
+        std::fs::write(path, out)?;
+        Ok(())
+    }
 }
 
 /// Build the metadata + master for a NEW shareable vault using already-chosen cost

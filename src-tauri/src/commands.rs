@@ -1079,9 +1079,13 @@ pub async fn ensure_sidecar(app: AppHandle) -> Result<()> {
 pub async fn ingest_paths(
     app: AppHandle,
     paths: Vec<String>,
+    copy_photos_to_vault: Option<bool>,
     on_event: Channel<IngestEvent>,
 ) -> Result<()> {
-    tokio::task::spawn_blocking(move || ingest::run(&app, paths, on_event))
+    let opts = ingest::IngestOpts {
+        copy_photos_to_vault: copy_photos_to_vault.unwrap_or(false),
+    };
+    tokio::task::spawn_blocking(move || ingest::run(&app, paths, opts, on_event))
         .await
         .map_err(|e| Error::Other(format!("ingest task panicked: {e}")))?
 }

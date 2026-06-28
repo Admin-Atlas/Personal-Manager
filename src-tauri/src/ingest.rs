@@ -21,6 +21,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::error::{Error, Result};
 use crate::model_gateway::ModelGateway;
+use crate::photos::{self, PhotoRecord, PhotoSourceType};
 use crate::registry::{self, ModelEntry};
 use crate::retrieval_config::RetrievalConfig;
 use crate::splitter::{self, ChunkKind, SplitMeta, Splitter};
@@ -33,6 +34,19 @@ const SUPPORTED: &[&str] = &[
     "pdf", "docx", "pptx", "xlsx", "doc", "ppt", "xls", "html", "htm", "csv", "json", "xml", "txt",
     "md", "markdown", "rtf", "epub", "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp",
 ];
+
+/// Image extensions routed to the dedicated photo pipeline ([`ingest_photo`]) instead of the
+/// MarkItDown document path — they get OCR + EXIF, a `photos` row, and the synthetic photo body.
+/// Deliberately the spec's set; gif/bmp/tiff stay on the (no-op) document path. `heic` is here but
+/// NOT in `SUPPORTED`, so a HEIC only ingests via this branch.
+const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic"];
+
+/// Per-run ingest options threaded from the command. `copy_photos_to_vault` is the drag-drop opt-in
+/// to save an original image into `vault/photos/` (default off).
+#[derive(Clone, Copy, Default)]
+pub struct IngestOpts {
+    pub copy_photos_to_vault: bool,
+}
 
 /// A document as shown in the Documents view.
 #[derive(Clone, Serialize)]
@@ -104,7 +118,12 @@ pub enum IngestEvent {
 }
 
 /// Convert + index every file under `inputs` (folders are walked). Blocking.
-pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>) -> Result<()> {
+pub fn run(
+    app: &AppHandle,
+    inputs: Vec<String>,
+    opts: IngestOpts,
+    on_event: Channel<IngestEvent>,
+) -> Result<()> {
     let state = app.state::<AppState>();
 
     let _ = on_event.send(IngestEvent::Preparing {
@@ -155,7 +174,7 @@ pub fn run(app: &AppHandle, inputs: Vec<String>, on_event: Channel<IngestEvent>)
             name,
         });
 
-        match ingest_one(&state, &gateway, &vault, &cipher, &path) {
+        match ingest_one(&state, &gateway, &vault, &cipher, &path, opts) {
             Ok(Outcome::Indexed(document)) => {
                 ingested += 1;
                 let _ = on_event.send(IngestEvent::Done { document });
@@ -214,8 +233,13 @@ fn ingest_one(
     vault: &Path,
     cipher: &MarkdownCipher,
     path: &Path,
+    opts: IngestOpts,
 ) -> Result<Outcome> {
     let ext = extension(path);
+    // Images go through the photo pipeline (OCR + EXIF + a `photos` row), not MarkItDown.
+    if matches!(&ext, Some(e) if PHOTO_EXTS.contains(&e.as_str())) {
+        return ingest_photo(state, gateway, vault, cipher, path, ext.as_deref(), opts);
+    }
     match &ext {
         Some(e) if SUPPORTED.contains(&e.as_str()) => {}
         _ => return Ok(Outcome::Skipped("unsupported file type".into())),
@@ -275,6 +299,7 @@ fn ingest_one(
         importance: None,
         last_activity: &ingested_at,
         reviewed: false,
+        photo: None,
     };
     cipher.write_to(
         &vault.join(&vault_name),
@@ -297,8 +322,155 @@ fn ingest_one(
         reviewed: false,
         source: SourceMeta::default(),
     };
-    let document = index_document(state, &meta, &chunks, &embeddings)?;
+    let document = index_document(state, &meta, &chunks, &embeddings, None)?;
     Ok(Outcome::Indexed(document))
+}
+
+/// Ingest one image: OCR + EXIF via the sidecar, then the SAME chunk/embed/index pipeline as a
+/// document, via a synthetic Markdown body (a metadata chunk + the OCR text). The image's bytes are
+/// the identity (SHA-256 = both the dedupe `content_hash` and `photos.file_hash`), so a moved/renamed
+/// file still dedupes. OCR is requested only when the optional component is installed; declining it
+/// still ingests the photo with its EXIF metadata chunk. With `copy_photos_to_vault`, the original is
+/// copied into `vault/photos/` first (following the vault cipher) and recorded on the `photos` row.
+fn ingest_photo(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    path: &Path,
+    ext: Option<&str>,
+    opts: IngestOpts,
+) -> Result<Outcome> {
+    // The image bytes are read once: they are the identity hash, the dedupe key, and (if opted in)
+    // what gets copied into the vault.
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(Outcome::Skipped("empty image file".into()));
+    }
+    let file_hash = hex_digest(&bytes);
+    let byte_size = bytes.len() as i64;
+
+    // Dedupe + ingest timestamp in one short lock; release before the slow OCR/embed.
+    let ingested_at = {
+        let conn = state.conn()?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM documents WHERE content_hash = ?1",
+                params![file_hash],
+                |_| Ok(()),
+            )
+            .optional_exists()?;
+        if exists {
+            return Ok(Outcome::Skipped("already ingested".into()));
+        }
+        iso_now(&conn)?
+    };
+
+    // OCR only if the optional component is installed (the UI prompts to enable it); EXIF/dimensions
+    // come back either way. No DB lock held across this call.
+    let run_ocr = state.sidecar.optional_ocr_ready();
+    let analysis = state.sidecar.analyze_image(path, run_ocr)?;
+
+    let capture_date =
+        photos::resolve_capture_date(analysis.capture_date.as_deref(), path, &ingested_at);
+    let has_camera_exif = analysis.lat.is_some() || analysis.capture_date.is_some();
+    let source_type = photos::infer_source_type(path, has_camera_exif);
+    let ocr_text = {
+        let t = analysis.ocr_text.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+
+    let title = photos::photo_title(source_type, &capture_date);
+    let body = photos::photo_markdown(
+        source_type,
+        &capture_date,
+        analysis.lat,
+        analysis.lon,
+        ocr_text.as_deref().unwrap_or(""),
+    );
+
+    // Opt-in: copy the original into vault/photos/ (per the vault cipher) before writing the record.
+    let (saved_to_vault, image_vault_path) = if opts.copy_photos_to_vault {
+        let rel = copy_original_to_vault(vault, cipher, &bytes, &file_hash, ext)?;
+        (true, Some(rel))
+    } else {
+        (false, None)
+    };
+
+    let chunks = split_document(gateway, &body, &title, &file_hash)?;
+    let texts = leaf_embed_texts(&chunks);
+    let embeddings = gateway.embed_documents(&texts)?;
+    check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
+
+    let photo = PhotoRecord {
+        source_path: Some(path.to_string_lossy().into()),
+        source_type,
+        capture_date: capture_date.clone(),
+        file_hash: file_hash.clone(),
+        ocr_text,
+        saved_to_vault,
+        vault_path: image_vault_path,
+        width: analysis.width,
+        height: analysis.height,
+        lat: analysis.lat,
+        lon: analysis.lon,
+    };
+
+    // Write the vault truth (frontmatter + synthetic body) before indexing, like a document. The
+    // capture date doubles as `created_at` so it round-trips on rebuild; the photo block carries the
+    // rest. last_activity is seeded from ingest time.
+    let vault_name = cipher.on_disk_name(&vault_filename(&title, &file_hash));
+    let front = Frontmatter {
+        title: &title,
+        source_path: &path.to_string_lossy(),
+        ext,
+        content_hash: &file_hash,
+        created_at: &capture_date,
+        ingested_at: &ingested_at,
+        project: "Unsorted",
+        tags: &[],
+        importance: None,
+        last_activity: &ingested_at,
+        reviewed: false,
+        photo: Some(&photo),
+    };
+    cipher.write_to(&vault.join(&vault_name), &render_markdown(&front, &body))?;
+
+    let meta = DocMeta {
+        source_path: Some(path.to_string_lossy().into()),
+        vault_path: vault_name,
+        title,
+        content_hash: file_hash,
+        ext: ext.map(str::to_string),
+        byte_size: Some(byte_size),
+        created_at: Some(capture_date),
+        last_activity: Some(ingested_at.clone()),
+        ingested_at,
+        project: "Unsorted".into(),
+        tags: Vec::new(),
+        importance: None,
+        reviewed: false,
+        source: SourceMeta::photo(),
+    };
+    let document = index_document(state, &meta, &chunks, &embeddings, Some(&photo))?;
+    Ok(Outcome::Indexed(document))
+}
+
+/// Copy a photo's original bytes into `vault/photos/<hash>.<ext>` following the vault cipher (so an
+/// encrypted vault keeps the image encrypted at rest). Returns the vault-relative on-disk path stored
+/// on the `photos` row. Named by content hash so re-saving the same image is idempotent.
+fn copy_original_to_vault(
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    bytes: &[u8],
+    file_hash: &str,
+    ext: Option<&str>,
+) -> Result<String> {
+    let dir = vault.join("photos");
+    std::fs::create_dir_all(&dir)?;
+    let on_disk = cipher.on_disk_name(&format!("{file_hash}.{}", ext.unwrap_or("img")));
+    cipher.write_bytes_to(&dir.join(&on_disk), bytes)?;
+    Ok(format!("photos/{on_disk}"))
 }
 
 /// Drop the derived index and rebuild it from the Markdown vault. Proves the
@@ -460,6 +632,10 @@ fn rebuild_one(
             iso_now(&conn).unwrap_or_default()
         }
     };
+    // A photo round-trips its satellite row from the front-matter photo block (OCR is never re-run —
+    // the text is already in the vault body).
+    let photo = photo_from_fields(&fields, &content_hash, body);
+
     // Organisation metadata round-trips from the vault so a rebuild reproduces
     // the organised store (spec §3 acceptance). Missing fields fall back to the
     // fresh-ingest defaults, so pre-Step-4 vault files rebuild cleanly.
@@ -489,9 +665,13 @@ fn rebuild_one(
             .cloned()
             .or_else(|| Some(ingested_at.clone())),
         ingested_at,
-        source: SourceMeta::default(),
+        source: if photo.is_some() {
+            SourceMeta::photo()
+        } else {
+            SourceMeta::default()
+        },
     };
-    index_document(state, &meta, &chunks, &embeddings)
+    index_document(state, &meta, &chunks, &embeddings, photo.as_ref())
 }
 
 /// Insert a document and its chunks/vectors/FTS rows in one transaction. `embeddings` are the
@@ -503,6 +683,7 @@ pub(crate) fn index_document(
     meta: &DocMeta,
     chunks: &[splitter::Chunk],
     embeddings: &[Vec<f32>],
+    photo: Option<&PhotoRecord>,
 ) -> Result<Document> {
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
@@ -546,6 +727,32 @@ pub(crate) fn index_document(
         ],
     )?;
     let doc_id = tx.last_insert_rowid();
+
+    // A photo carries an extra satellite row (its capture/OCR/copy truth), written in the SAME
+    // transaction so a document and its photo row are always consistent. `visual_description` is left
+    // to its NULL default (reserved for Stage-4 image understanding — no writer this stage).
+    if let Some(p) = photo {
+        tx.execute(
+            "INSERT INTO photos \
+             (document_id, source_path, source_type, capture_date, file_hash, ocr_text, \
+              saved_to_vault, vault_path, width, height, lat, lon) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                doc_id,
+                p.source_path,
+                p.source_type.as_str(),
+                p.capture_date,
+                p.file_hash,
+                p.ocr_text,
+                p.saved_to_vault as i64,
+                p.vault_path,
+                p.width,
+                p.height,
+                p.lat,
+                p.lon,
+            ],
+        )?;
+    }
 
     insert_chunks(
         &tx,
@@ -832,6 +1039,45 @@ pub fn write_document_truth(
     }
 }
 
+/// Reconstruct a photo's satellite record from parsed front-matter fields + body, or `None` if this
+/// isn't a photo document. Shared by the rebuild walk and the metadata-edit rewrite so both preserve
+/// the photo block identically. `content_hash` is the photo's `file_hash`; the OCR text comes from
+/// the body, the rest from the `photo_*` lines.
+fn photo_from_fields(
+    fields: &std::collections::HashMap<String, String>,
+    content_hash: &str,
+    body: &str,
+) -> Option<PhotoRecord> {
+    if fields.get("source_type").map(String::as_str) != Some(SOURCE_TYPE_PHOTO) {
+        return None;
+    }
+    Some(PhotoRecord {
+        source_path: fields.get("source_path").cloned(),
+        source_type: PhotoSourceType::from_db(
+            fields
+                .get("photo_source_type")
+                .map(String::as_str)
+                .unwrap_or("dragged_file"),
+        ),
+        capture_date: fields.get("created_at").cloned().unwrap_or_default(),
+        file_hash: content_hash.to_string(),
+        ocr_text: photos::ocr_text_from_body(body),
+        saved_to_vault: fields
+            .get("photo_saved_to_vault")
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false),
+        vault_path: fields.get("photo_vault_path").cloned(),
+        width: fields
+            .get("photo_width")
+            .and_then(|v| v.trim().parse().ok()),
+        height: fields
+            .get("photo_height")
+            .and_then(|v| v.trim().parse().ok()),
+        lat: fields.get("photo_lat").and_then(|v| v.trim().parse().ok()),
+        lon: fields.get("photo_lon").and_then(|v| v.trim().parse().ok()),
+    })
+}
+
 /// Rewrite a document's organisation metadata in place, *inside a caller-owned
 /// transaction*: update the vault file's front-matter (preserving the body) and
 /// the `documents` row. No re-chunk / re-embed — the body and `content_hash` are
@@ -868,6 +1114,10 @@ fn rewrite_vault_metadata(
     let (fields, body) = parse_frontmatter(&decoded)
         .ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
 
+    // Preserve a photo's block across an organisation edit, so a later Rebuild still reconstructs its
+    // `photos` row (a plain document has none → `None`, unchanged behaviour).
+    let content_hash = fields.get("content_hash").map(String::as_str).unwrap_or("");
+    let photo = photo_from_fields(&fields, content_hash, body);
     let front = Frontmatter {
         title: fields
             .get("title")
@@ -878,7 +1128,7 @@ fn rewrite_vault_metadata(
             .get("ext")
             .map(String::as_str)
             .filter(|s| !s.is_empty()),
-        content_hash: fields.get("content_hash").map(String::as_str).unwrap_or(""),
+        content_hash,
         created_at: fields.get("created_at").map(String::as_str).unwrap_or(""),
         ingested_at: fields.get("ingested_at").map(String::as_str).unwrap_or(""),
         project,
@@ -886,6 +1136,7 @@ fn rewrite_vault_metadata(
         importance,
         last_activity,
         reviewed,
+        photo: photo.as_ref(),
     };
     cipher.write_to(&file, &render_markdown(&front, body))?;
 
@@ -979,6 +1230,9 @@ struct Frontmatter<'a> {
     importance: Option<&'a str>,
     last_activity: &'a str,
     reviewed: bool,
+    /// Present only for a photo: appends `source_type: photo` + the photo-specific fields so a
+    /// Rebuild reconstructs the `photos` satellite row from the vault. `None` for a plain document.
+    photo: Option<&'a PhotoRecord>,
 }
 
 /// Render YAML front-matter + body. `tags` is written flow-style on one line
@@ -999,7 +1253,7 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
          importance: {}\n\
          last_activity: {}\n\
          reviewed: {}\n\
-         ---\n\n{}\n",
+         {}---\n\n{}\n",
         yaml_quote(f.title),
         yaml_quote(f.source_path),
         f.ext.unwrap_or(""),
@@ -1011,8 +1265,36 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
         importance,
         f.last_activity,
         f.reviewed,
+        f.photo.map(render_photo_block).unwrap_or_default(),
         body,
     )
+}
+
+/// The photo-specific front-matter lines (only present for a photo). `source_type: photo` is the
+/// marker `rebuild_one` keys on; `capture_date`/`file_hash` are NOT repeated (they round-trip via
+/// `created_at`/`content_hash`) and `ocr_text` lives in the body. Optional fields are emitted only
+/// when set. The flat parser reads each line back as a field with zero parser changes.
+fn render_photo_block(p: &PhotoRecord) -> String {
+    let mut s = format!(
+        "source_type: photo\n\
+         photo_source_type: {}\n\
+         photo_saved_to_vault: {}\n",
+        p.source_type.as_str(),
+        p.saved_to_vault,
+    );
+    if let Some(vp) = &p.vault_path {
+        s.push_str(&format!("photo_vault_path: {}\n", yaml_quote(vp)));
+    }
+    if let Some(w) = p.width {
+        s.push_str(&format!("photo_width: {w}\n"));
+    }
+    if let Some(h) = p.height {
+        s.push_str(&format!("photo_height: {h}\n"));
+    }
+    if let (Some(lat), Some(lon)) = (p.lat, p.lon) {
+        s.push_str(&format!("photo_lat: {lat:.6}\nphoto_lon: {lon:.6}\n"));
+    }
+    s
 }
 
 /// Serialize a list of strings as a YAML flow sequence on one line.
@@ -1098,6 +1380,10 @@ pub(crate) const SOURCE_TYPE_VAULT: &str = "vault";
 /// `documents.source_type` for an index-only document (body lives at the remote source; we keep a
 /// pointer + embedding + summary, never the bytes — board card 3 / spec §8.1).
 pub(crate) const SOURCE_TYPE_INDEX_ONLY: &str = "index_only";
+/// `documents.source_type` for a photo/screenshot (board card #135). Like a vault document its body
+/// lives in a Markdown file (the synthetic photo body), so it rebuilds from disk; the `photos`
+/// satellite row carries its image-specific truth.
+pub(crate) const SOURCE_TYPE_PHOTO: &str = "photo";
 /// `documents.source_state` for a reachable source (the default for every document).
 pub(crate) const SOURCE_STATE_OK: &str = "ok";
 /// `documents.source_state` for an index-only item whose source was deleted: a soft state — the
@@ -1142,6 +1428,14 @@ impl Default for SourceMeta {
 impl SourceMeta {
     fn is_index_only(&self) -> bool {
         self.source_type == SOURCE_TYPE_INDEX_ONLY
+    }
+
+    /// Source metadata for a photo: a fully-stored, reachable document discriminated as `'photo'`.
+    fn photo() -> Self {
+        Self {
+            source_type: SOURCE_TYPE_PHOTO.into(),
+            ..Self::default()
+        }
     }
 }
 
@@ -1545,6 +1839,7 @@ mod tests {
             importance: Some("high"),
             last_activity: "2026-06-17T00:00:00.000Z",
             reviewed: true,
+            photo: None,
         };
         let rendered = render_markdown(&front, "Body text here.");
         let (fields, body) = parse_frontmatter(&rendered).unwrap();
@@ -1555,6 +1850,77 @@ mod tests {
         assert_eq!(nullable(fields.get("importance")).as_deref(), Some("high"));
         assert_eq!(fields.get("reviewed").map(|s| s.trim()), Some("true"));
         assert_eq!(body.trim_end(), "Body text here.");
+    }
+
+    #[test]
+    fn photo_frontmatter_round_trips_for_rebuild() {
+        // The rebuild-determinism guarantee for photos: a photo's synthetic body + front-matter block
+        // must reconstruct the SAME `photos` record on a Rebuild (and survive a metadata edit, which
+        // re-renders through the same path) — without re-running OCR. No sidecar needed.
+        let rec = PhotoRecord {
+            source_path: Some("/imgs/Screenshot 2026-03-12.png".into()),
+            source_type: PhotoSourceType::Screenshot,
+            capture_date: "2026-03-12".into(),
+            file_hash: "deadbeefcafe".into(),
+            ocr_text: Some("Total due £42.00".into()),
+            saved_to_vault: true,
+            vault_path: Some("photos/deadbeefcafe.png".into()),
+            width: Some(1170),
+            height: Some(2532),
+            lat: Some(55.95),
+            lon: Some(-3.19),
+        };
+        let body = photos::photo_markdown(
+            rec.source_type,
+            &rec.capture_date,
+            rec.lat,
+            rec.lon,
+            rec.ocr_text.as_deref().unwrap_or(""),
+        );
+        let title = photos::photo_title(rec.source_type, &rec.capture_date);
+        let front = Frontmatter {
+            title: &title,
+            source_path: rec.source_path.as_deref().unwrap(),
+            ext: Some("png"),
+            content_hash: &rec.file_hash, // file_hash round-trips via content_hash
+            created_at: &rec.capture_date, // capture_date round-trips via created_at
+            ingested_at: "2026-06-28T00:00:00.000Z",
+            project: "Unsorted",
+            tags: &[],
+            importance: None,
+            last_activity: "2026-06-28T00:00:00.000Z",
+            reviewed: false,
+            photo: Some(&rec),
+        };
+        let rendered = render_markdown(&front, &body);
+        let (fields, parsed_body) = parse_frontmatter(&rendered).unwrap();
+
+        // The marker drives rebuild's source_type='photo' branch.
+        assert_eq!(fields.get("source_type").map(String::as_str), Some("photo"));
+        let recovered = photo_from_fields(&fields, &rec.file_hash, parsed_body)
+            .expect("a photo block reconstructs a record");
+        assert_eq!(recovered, rec, "the photos record round-trips exactly");
+
+        // A plain document carries no block → no record (unchanged behaviour).
+        let plain = render_markdown(
+            &Frontmatter {
+                title: "Doc",
+                source_path: "",
+                ext: None,
+                content_hash: "h",
+                created_at: "",
+                ingested_at: "",
+                project: "Unsorted",
+                tags: &[],
+                importance: None,
+                last_activity: "",
+                reviewed: false,
+                photo: None,
+            },
+            "just text",
+        );
+        let (pf, pb) = parse_frontmatter(&plain).unwrap();
+        assert!(photo_from_fields(&pf, "h", pb).is_none());
     }
 
     #[test]
@@ -1571,6 +1937,7 @@ mod tests {
             importance: None,
             last_activity: "",
             reviewed: false,
+            photo: None,
         };
         let rendered = render_markdown(&front, "x");
         let (fields, _) = parse_frontmatter(&rendered).unwrap();
@@ -1601,6 +1968,7 @@ mod tests {
             importance: None,
             last_activity: "",
             reviewed: false,
+            photo: None,
         };
         let original = render_markdown(&front, "body");
         std::fs::write(vault.join("doc.md"), &original).unwrap();
@@ -1674,6 +2042,7 @@ mod tests {
             importance: None,
             last_activity: "",
             reviewed: false,
+            photo: None,
         };
         let rendered = render_markdown(&front, "body");
         let (fields, _) = parse_frontmatter(&rendered).unwrap();
