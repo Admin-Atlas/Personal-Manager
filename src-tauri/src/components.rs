@@ -6,6 +6,9 @@
 //! optional photo-OCR stack (`rapidocr`+`pillow-heif` → `opencv-python`/`shapely`/`pyclipper`), the
 //! Whisper speech model, and a **read-only** view of the active embedder.
 //!
+//! The photo-OCR stack is also **installable** from this inventory (the one place it's enabled or
+//! disabled): when absent it shows an Install action, when present it's removable with its cascade.
+//!
 //! The teardown is a cascade: a heavy shared library can only be removed once nothing still needs it
 //! (`scikit-learn` after `openTSNE`; `scipy` after both; the OCR image libs after `rapidocr`). `numpy`
 //! is shared with the embedder and is never offered or removed. The dependency guard is enforced
@@ -33,7 +36,15 @@ enum Status {
     Removable,
     /// Removable only after a dependent is removed first (carries `blockers`).
     Blocked,
+    /// An optional component that isn't installed yet — offers an Install action (photo OCR). The
+    /// `size_bytes` on such a row is an estimate of what installing it will use, not on-disk usage.
+    Installable,
 }
+
+/// Rough on-disk footprint of the optional photo-OCR stack once installed (opencv-python is the bulk
+/// at ~110 MB, rapidocr ~30 MB, the rest small). Shown on the not-yet-installed row so the cost is
+/// visible before choosing to install; never added to the on-disk total (nothing is on disk yet).
+const OCR_INSTALL_ESTIMATE_BYTES: u64 = 150 * 1024 * 1024;
 
 /// A dependent that must be removed first; `anchor` is the component id to scroll to in this tab.
 #[derive(Serialize)]
@@ -358,6 +369,9 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
         );
     }
 
+    // The photo-OCR feature is a first-class row whether or not it's installed: when present it's
+    // Removable (the image libraries cascade-remove under it), and when absent it offers an Install
+    // action right here — so the whole feature is enabled/disabled in one place, like the others.
     if ocr_present {
         components.push(Component {
             id: "ocr",
@@ -374,6 +388,21 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry) -> StorageRepor
                  You can reinstall it any time."
                     .into(),
             ),
+        });
+    } else {
+        components.push(Component {
+            id: "ocr",
+            label: "Photo text recognition (rapidocr)".into(),
+            detail: "Reads text out of dropped photos and screenshots (OCR) so it's searchable — \
+                     all on-device. Optional, a one-time download."
+                .into(),
+            size_bytes: OCR_INSTALL_ESTIMATE_BYTES,
+            approximate: true,
+            child: false,
+            status: Status::Installable,
+            blockers: Vec::new(),
+            manage: None,
+            note: Some("Without it, photos are indexed by their date and location only.".into()),
         });
     }
     if cv2_present {

@@ -23,8 +23,8 @@ export const CHANGELOG: ChangelogEntry[] = [
     date: "2026-06-28",
     highlights: [
       "Drop in photos and screenshots — the feature is now fully wired up. The first time you add a photo, PM offers to install on-device text recognition (a one-time ~70–100 MB download). You can skip it and still add the photo (indexed by its date and location), then turn it on later — your choice, no pressure.",
-      "New option when adding photos: “Save a copy in the vault.” It's off by default — PM just references your photos where they are — but flip it on to keep a copy inside PM (handy for screenshots you delete after), and it follows your vault's encryption.",
-      "Manage text recognition any time under Settings → Storage: install it, or remove it (and its image libraries) to reclaim space, with clear confirmations. Removing it just means new photos are indexed by date and location only.",
+      "New option when adding photos: “Save a copy in the vault.” It's off by default — PM just references your photos where they are — but flip it on to keep a copy inside PM (handy for screenshots you delete after), and it follows your vault's encryption. Re-dropping a photo you already added, with this turned on, now saves the copy too.",
+      "Manage text recognition in one place under Settings → Storage: it sits with the other on-device components, where you install it or remove it (and its image libraries) to reclaim space, with clear confirmations. Removing it just means new photos are indexed by date and location only.",
     ],
   },
   {

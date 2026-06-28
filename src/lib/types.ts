@@ -619,10 +619,11 @@ export interface OcrInstallEvent {
   fraction: number;
 }
 
-/** One on-device component in the Storage manager (the venv, the t-SNE libraries, the speech model,
- *  the active search model). `status` drives the action: removable now, blocked behind a dependent,
- *  required, or in-use (managed elsewhere). */
-export type StorageStatus = "required" | "in_use" | "removable" | "blocked";
+/** One on-device component in the Storage manager (the venv, the t-SNE libraries, the photo-OCR
+ *  stack, the speech model, the active search model). `status` drives the action: removable now,
+ *  blocked behind a dependent, required, in-use (managed elsewhere), or installable (an optional
+ *  component not yet downloaded — the photo-OCR stack, whose `size_bytes` is then an estimate). */
+export type StorageStatus = "required" | "in_use" | "removable" | "blocked" | "installable";
 export interface StorageBlocker {
   label: string;
   /** The component id to scroll to (remove that one first). */
