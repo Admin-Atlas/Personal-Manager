@@ -6,6 +6,7 @@ mod briefing;
 mod calendar;
 mod chat;
 mod chat_index;
+mod chat_summary;
 mod clock;
 mod commands;
 mod commands_dev;
@@ -173,6 +174,9 @@ pub struct AppState {
     pub last_user_activity: Mutex<Instant>,
     /// Single-flight guard shared by the chat-index launch sweep and idle loop, so the two never overlap.
     pub chat_index_busy: AtomicBool,
+    /// Single-flight guard shared by the rolling-summary eager nudge and the launch/idle scheduler
+    /// (`chat_summary`), so a per-conversation extend and a full reconcile never overlap.
+    pub summary_busy: AtomicBool,
 }
 
 impl AppState {
@@ -511,6 +515,7 @@ pub fn run() {
                 layout_job: Mutex::new(layout::LayoutJobState::default()),
                 last_user_activity: Mutex::new(Instant::now()),
                 chat_index_busy: AtomicBool::new(false),
+                summary_busy: AtomicBool::new(false),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -540,6 +545,12 @@ pub fn run() {
             // active use), so nothing waits for the next launch.
             chat_index::spawn_launch_sweep(handle.clone());
             chat_index::spawn_idle_indexer(handle.clone());
+
+            // Keep each long chat's rolling summary (board card 7C) caught up in the background: a launch
+            // pass folds any backlog that grew while the app was closed, then an idle backstop reconciles
+            // during lulls. The eager per-conversation nudge fires from `send_message`; this scheduler is
+            // the catch-up net for sessions whose nudge never ran (no key at the time, app closed first).
+            chat_summary::spawn_summary_scheduler(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

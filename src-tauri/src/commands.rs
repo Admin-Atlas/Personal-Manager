@@ -21,9 +21,9 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, chat, clock, cost, db, drive, entities, index_only, lock_session, microsoft,
-    onedrive, openrouter, outlook_calendar, paths, preferences, recommend, secrets, vault,
-    AppState, VaultRuntime,
+    applock, briefing, chat, chat_summary, clock, cost, db, drive, entities, index_only,
+    lock_session, microsoft, onedrive, openrouter, outlook_calendar, paths, preferences, recommend,
+    secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -33,9 +33,9 @@ const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.6";
 /// Settings keys for the two model roles. Each holds a JSON array of model ids
 /// (ordered, first = primary); the `*_AUTO_SWITCH` keys hold "true"/"false".
 const CHAT_MODELS_KEY: &str = "chat_models";
-const BACKGROUND_MODELS_KEY: &str = "background_models";
+pub(crate) const BACKGROUND_MODELS_KEY: &str = "background_models";
 const CHAT_AUTO_SWITCH_KEY: &str = "chat_auto_switch";
-const BACKGROUND_AUTO_SWITCH_KEY: &str = "background_auto_switch";
+pub(crate) const BACKGROUND_AUTO_SWITCH_KEY: &str = "background_auto_switch";
 
 /// The user's IANA time-zone name (e.g. "America/New_York"), supplied by the
 /// frontend via `Intl.DateTimeFormat().resolvedOptions().timeZone`. Empty/unset →
@@ -994,6 +994,11 @@ pub async fn send_message(
             "chat: vault append for conversation {conversation_id} failed ({e}); messages row is the backstop"
         );
     }
+
+    // Eagerly extend this conversation's rolling summary (board card 7C) in the background once its older
+    // arc has grown past the recency window — keeps the cached summary fresh for the next turn without
+    // delaying this reply. Fire-and-forget + single-flight; a no-op for a short chat.
+    chat_summary::spawn_extend_after_reply(app.clone(), conversation_id);
 
     let _ = on_event.send(ChatEvent::Done {
         message_id,
@@ -5086,7 +5091,11 @@ fn models_for(conn: &Connection, key: &str) -> Result<Vec<String>> {
 /// The effective list to send for a role: the full ordered list when auto-switch
 /// is on (so OpenRouter can fall through to the next model on a rate-limit/quota
 /// error), otherwise just the primary. Never empty.
-fn effective_models(conn: &Connection, models_key: &str, auto_key: &str) -> Result<Vec<String>> {
+pub(crate) fn effective_models(
+    conn: &Connection,
+    models_key: &str,
+    auto_key: &str,
+) -> Result<Vec<String>> {
     let models = models_for(conn, models_key)?;
     let auto = db::get_setting(conn, auto_key)?.as_deref() == Some("true");
     if auto {
