@@ -27,6 +27,7 @@
 //! background job and the triviality gate are card 7B's second PR. Context assembly (C), the
 //! navigation pointer's UI (E), and learning-loop routing (F) are later cards.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -43,6 +44,11 @@ use crate::{chat, registry, AppState};
 /// session never unlocks this run, the next launch — or the PR2 idle job — catches up.
 const LAUNCH_WAIT_TICKS: u32 = 60;
 const LAUNCH_WAIT_SECS: u64 = 5;
+
+/// Idle scheduler cadence: check every `IDLE_TICK_SECS`, and run a background sweep once the user has
+/// been idle for at least `IDLE_THRESHOLD_SECS` (≈15 min) so indexing never competes with active use.
+const IDLE_TICK_SECS: u64 = 300;
+const IDLE_THRESHOLD_SECS: u64 = 900;
 
 /// The result of indexing one session.
 pub(crate) enum Outcome {
@@ -162,11 +168,17 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
     )
     .with_embed_batch(embed_batch);
 
-    // 3. Chunk + embed each new pair. The per-pair content-hash seed keeps leaf UIDs unique across
-    //    turns (two single-paragraph turns would otherwise collide) yet stable on a rebuild.
+    // 3. Chunk + embed each SUBSTANTIVE new pair. The triviality gate (card B's lean firehose filter)
+    //    skips pure-acknowledgement/greeting pairs from the index — they are never chunked, so they can't
+    //    pollute retrieval — while the cursor still advances past them below (they are handled, not
+    //    reconsidered). The per-pair content-hash seed keeps leaf UIDs unique across turns (two
+    //    single-paragraph turns would otherwise collide) yet stable on a rebuild.
     let chat_hash = chat::content_hash(conversation_id);
     let mut segments: Vec<IndexedSegment> = Vec::with_capacity(pairs.len());
     for pair in &pairs {
+        if matches!(chat::triviality(pair), chat::Triviality::Trivial) {
+            continue;
+        }
         let body = render_authored_segment(pair);
         let seed = format!("{chat_hash}:{}", pair.turn_id);
         let chunks = ingest::split_document(&gateway, &body, &plan.title, &seed)?;
@@ -181,75 +193,90 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
         });
     }
 
-    // 4. Land it all in one transaction (births the documents row on first index).
+    // 4. Land it all in one transaction. The cursor advances to the newest pair PROCESSED — including any
+    //    trivial pairs that were skipped — so a stretch of small talk is never re-examined every sweep.
+    let newest = pairs
+        .iter()
+        .max_by_key(|p| p.turn_id)
+        .expect("pairs is non-empty here");
+    let indexed_turns = segments.len();
     let mut conn = state.conn()?;
-    let (_doc_id, chunks) = commit_session_index(&mut conn, &plan, &segments)?;
+    let (_doc_id, chunks) =
+        commit_session_index(&mut conn, &plan, &segments, newest.turn_id, &newest.at)?;
     Ok(Outcome::Indexed {
-        turns: pairs.len(),
+        turns: indexed_turns,
         chunks,
     })
 }
 
-/// Land a session's pre-split, pre-embedded segments: birth the `documents` row on the first index
-/// (linking it back onto the session), append every segment's chunks continuing the document's ordinal
-/// sequence, and advance the index cursor — all atomically. Returns `(document_id, appended_chunks)`.
-/// Pure DB logic (no sidecar), so the append-only invariants are unit-tested directly. Caller owns the
-/// connection; this opens and commits its own transaction.
+/// Land a session's pre-split, pre-embedded segments: birth the `documents` row on the first index that
+/// has substance (linking it back onto the session), append every segment's chunks continuing the
+/// document's ordinal sequence, and advance the index cursor to `cursor_to` — all atomically. Returns
+/// `(document_id_or_none, appended_chunks)`. `cursor_to`/`cursor_at` are the newest turn-pair *processed*
+/// (which may be a skipped trivial pair), so the cursor always moves past everything examined; with no
+/// substantive `segments` this advances the cursor only and births nothing (a chat that has only ever
+/// exchanged small talk gets no empty document). Pure DB logic (no sidecar), so the append-only
+/// invariants are unit-tested directly. Caller owns the connection; this opens and commits its own
+/// transaction.
 fn commit_session_index(
     conn: &mut Connection,
     plan: &SessionPlan,
     segments: &[IndexedSegment],
-) -> Result<(i64, usize)> {
+    cursor_to: i64,
+    cursor_at: &str,
+) -> Result<(Option<i64>, usize)> {
     let tx = conn.transaction()?;
 
-    let doc_id = match plan.document_id {
-        Some(id) => id,
-        None => {
-            let meta = chat_doc_meta(plan, segments);
+    // Birth the documents row only when there is substance to append (never for a trivial-only sweep).
+    let doc_id = match (plan.document_id, segments.is_empty()) {
+        (existing, true) => existing,
+        (Some(id), false) => Some(id),
+        (None, false) => {
+            let meta = chat_doc_meta(plan, cursor_at);
             let id = ingest::insert_document_row(&tx, &meta)?;
             tx.execute(
                 "UPDATE chat_sessions SET document_id = ?1 WHERE conversation_id = ?2",
                 params![id, plan.conversation_id],
             )?;
-            id
+            Some(id)
         }
     };
 
-    // Append-only: continue after the document's current highest ordinal — never renumber old chunks.
-    let mut ordinal: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM chunks WHERE document_id = ?1",
-        params![doc_id],
-        |r| r.get(0),
-    )?;
     let mut appended = 0usize;
-    for seg in segments {
-        let before = ordinal;
-        ordinal = ingest::append_chat_chunks(
-            &tx,
-            doc_id,
-            ordinal,
-            &seg.chunks,
-            &seg.embeddings,
-            seg.turn_id,
-            &seg.at,
-        )?;
-        appended += (ordinal - before) as usize;
+    if let Some(doc_id) = doc_id {
+        if !segments.is_empty() {
+            // Append-only: continue after the document's highest ordinal — never renumber old chunks.
+            let mut ordinal: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM chunks WHERE document_id = ?1",
+                params![doc_id],
+                |r| r.get(0),
+            )?;
+            for seg in segments {
+                let before = ordinal;
+                ordinal = ingest::append_chat_chunks(
+                    &tx,
+                    doc_id,
+                    ordinal,
+                    &seg.chunks,
+                    &seg.embeddings,
+                    seg.turn_id,
+                    &seg.at,
+                )?;
+                appended += (ordinal - before) as usize;
+            }
+            tx.execute(
+                "UPDATE documents SET last_activity = ?1 WHERE id = ?2",
+                params![cursor_at, doc_id],
+            )?;
+        }
     }
 
-    // Advance the index cursor to the newest turn-pair just landed, and refresh recency. The cursor and
-    // the chunks commit together — that is the crash-safety guarantee.
-    let newest = segments
-        .iter()
-        .max_by_key(|s| s.turn_id)
-        .expect("commit is only called with at least one segment");
+    // Advance the index cursor past everything processed. The cursor and the chunks commit together —
+    // that is the crash-safety guarantee.
     tx.execute(
         "UPDATE chat_sessions SET last_indexed_turn_id = ?1, last_active_at = ?2 \
          WHERE conversation_id = ?3",
-        params![newest.turn_id, newest.at, plan.conversation_id],
-    )?;
-    tx.execute(
-        "UPDATE documents SET last_activity = ?1 WHERE id = ?2",
-        params![newest.at, doc_id],
+        params![cursor_to, cursor_at, plan.conversation_id],
     )?;
 
     tx.commit()?;
@@ -261,7 +288,7 @@ fn commit_session_index(
 /// chat belongs to its project, a general chat lands in `Unsorted` (card F may refile either). The stable
 /// `chat:<id>` identity + body-independent `content_hash` are what let an append-growing chat keep one
 /// UNIQUE document identity across every re-index.
-fn chat_doc_meta(plan: &SessionPlan, segments: &[IndexedSegment]) -> DocMeta {
+fn chat_doc_meta(plan: &SessionPlan, last_at: &str) -> DocMeta {
     let project = if plan.scope == "project" {
         plan.project
             .as_deref()
@@ -272,11 +299,6 @@ fn chat_doc_meta(plan: &SessionPlan, segments: &[IndexedSegment]) -> DocMeta {
     } else {
         "Unsorted".to_string()
     };
-    let last_at = segments
-        .iter()
-        .max_by_key(|s| s.turn_id)
-        .map(|s| s.at.clone())
-        .unwrap_or_default();
     DocMeta {
         source_path: None,
         vault_path: plan.vault_path.clone(),
@@ -285,12 +307,12 @@ fn chat_doc_meta(plan: &SessionPlan, segments: &[IndexedSegment]) -> DocMeta {
         ext: Some("md".into()),
         byte_size: None,
         created_at: Some(plan.created_at.clone()),
-        ingested_at: last_at.clone(),
+        ingested_at: last_at.to_string(),
         project,
         tags: Vec::new(),
         importance: None,
         reviewed: false,
-        last_activity: Some(last_at),
+        last_activity: Some(last_at.to_string()),
         source: SourceMeta::chat(chat::source_id(plan.conversation_id)),
     }
 }
@@ -342,32 +364,102 @@ pub(crate) fn reconcile_chat_index(state: &AppState) -> Result<Summary> {
     Ok(summary)
 }
 
+/// The pure idle-gate decision, factored out so it is unit-tested without a wall-clock and so the future
+/// screen-capture subsystem can share the same gate: run a background sweep only when the user has been
+/// idle past `threshold`, no Drive/OneDrive sync is using the engine, and no sweep is already in flight.
+pub(crate) fn should_run_now(
+    idle_for: Duration,
+    threshold: Duration,
+    sync_active: bool,
+    already_running: bool,
+) -> bool {
+    idle_for >= threshold && !sync_active && !already_running
+}
+
+/// Run a reconcile sweep under the single-flight guard the launch sweep and the idle loop share, so the
+/// two never overlap. Blocking (it embeds) — only ever called from a blocking context.
+fn run_sweep_guarded(state: &AppState, label: &str) {
+    if state
+        .chat_index_busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return; // another sweep is already in flight
+    }
+    let result = reconcile_chat_index(state);
+    state.chat_index_busy.store(false, Ordering::SeqCst);
+    match result {
+        Ok(s) if s.sessions > 0 || s.failed > 0 => eprintln!(
+            "chat-index: {label} indexed {} turn(s) across {} session(s) ({} failed)",
+            s.turns, s.sessions, s.failed
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("chat-index: {label} skipped ({e})"),
+    }
+}
+
+/// Poll (bounded) until the vault is unlocked and the engine is provisioned, without ever triggering a
+/// first-run build. Returns false if neither happened within the launch window (the idle loop / next
+/// launch will catch up).
+async fn wait_until_ready(app: &AppHandle) -> bool {
+    for _ in 0..LAUNCH_WAIT_TICKS {
+        {
+            let state = app.state::<AppState>();
+            if state.conn().is_ok() && state.sidecar.is_ready() {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(LAUNCH_WAIT_SECS)).await;
+    }
+    false
+}
+
 /// Fire-and-forget the app-launch reconcile sweep: catches up any chat whose turns ran ahead of the
 /// index while the app was closed (or whose live append landed but the index step never ran). Background
-/// and best-effort. Waits for the vault to unlock + the engine to be provisioned, and never triggers a
-/// first-run engine build itself (skips if the sidecar isn't already ready — the next launch picks it
-/// up). Modelled on `commands::spawn_preferences_migration`.
+/// and best-effort; the heavy embed runs on a blocking thread. Modelled on
+/// `commands::spawn_preferences_migration`.
 pub fn spawn_launch_sweep(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
-        let mut ready = false;
-        for _ in 0..LAUNCH_WAIT_TICKS {
-            if state.conn().is_ok() && state.sidecar.is_ready() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(LAUNCH_WAIT_SECS)).await;
-        }
-        if !ready {
+        if !wait_until_ready(&app).await {
             return;
         }
-        match reconcile_chat_index(&state) {
-            Ok(s) if s.sessions > 0 || s.failed > 0 => eprintln!(
-                "chat-index: launch sweep indexed {} turn(s) across {} session(s) ({} failed)",
-                s.turns, s.sessions, s.failed
-            ),
-            Ok(_) => {}
-            Err(e) => eprintln!("chat-index: launch sweep skipped ({e})"),
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            run_sweep_guarded(&app.state::<AppState>(), "launch sweep");
+        })
+        .await;
+    });
+}
+
+/// Fire-and-forget the idle-time background indexer: on an idle cadence it sweeps any chat with content
+/// past its cursor, so a long live session is *progressively* indexed and nothing waits for the next
+/// launch. It only ever touches *completed* turn-pairs, so it is safe even on the currently-open session.
+/// Never competes with active use ([`should_run_now`] gates on idle + no active sync) and shares the
+/// launch sweep's single-flight guard. The minimal scheduler this card builds (there is none to hook
+/// into yet); `should_run_now` is the reusable seam the screen-capture subsystem can later share.
+/// Modelled on `lock_session::spawn_watcher`.
+pub fn spawn_idle_indexer(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let threshold = Duration::from_secs(IDLE_THRESHOLD_SECS);
+        loop {
+            tokio::time::sleep(Duration::from_secs(IDLE_TICK_SECS)).await;
+            let (idle, sync_active, busy, ready) = {
+                let state = app.state::<AppState>();
+                let ready = state.conn().is_ok() && state.sidecar.is_ready();
+                (
+                    state.idle_for(),
+                    state.sync_active(),
+                    state.chat_index_busy.load(Ordering::SeqCst),
+                    ready,
+                )
+            };
+            if !ready || !should_run_now(idle, threshold, sync_active, busy) {
+                continue;
+            }
+            let app2 = app.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                run_sweep_guarded(&app2.state::<AppState>(), "idle sweep");
+            })
+            .await;
         }
     });
 }
@@ -459,7 +551,9 @@ mod tests {
             "**You:** hi\n\n**PM:** hello",
         )];
         let p = plan(&conn, conv);
-        let (doc_id, appended) = commit_session_index(&mut conn, &p, &segs).unwrap();
+        let (doc_id, appended) =
+            commit_session_index(&mut conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
+        let doc_id = doc_id.expect("a substantive sweep births the document");
         assert_eq!(appended, 1, "one chunk appended");
 
         // The documents row is born with the chat discriminator + stable identity.
@@ -523,8 +617,11 @@ mod tests {
             &mut conn,
             &p,
             &[segment(2, "2026-06-28T10:00:01.000Z", "first")],
+            2,
+            "2026-06-28T10:00:01.000Z",
         )
         .unwrap();
+        let doc_id = doc_id.unwrap();
         let first_chunk_id: i64 = conn
             .query_row(
                 "SELECT id FROM chunks WHERE document_id = ?1 AND ordinal = 0",
@@ -539,9 +636,11 @@ mod tests {
             &mut conn,
             &p2,
             &[segment(4, "2026-06-28T10:05:00.000Z", "second")],
+            4,
+            "2026-06-28T10:05:00.000Z",
         )
         .unwrap();
-        assert_eq!(doc_id_2, doc_id, "same document, not a new one");
+        assert_eq!(doc_id_2, Some(doc_id), "same document, not a new one");
         assert_eq!(appended, 1);
 
         let docs: i64 = conn
@@ -577,6 +676,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor, Some(4));
+    }
+
+    #[test]
+    fn trivial_only_sweep_advances_cursor_without_birthing_a_document() {
+        // When every new pair is trivial (skipped from embedding), `index_session` calls commit with an
+        // empty segment list but a cursor past the small talk. The cursor must advance (so the chatter is
+        // never re-examined) yet no empty document is born.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+
+        let p = plan(&conn, conv);
+        let (doc_id, appended) =
+            commit_session_index(&mut conn, &p, &[], 6, "2026-06-28T10:10:00.000Z").unwrap();
+        assert_eq!(doc_id, None, "no document born for a trivial-only sweep");
+        assert_eq!(appended, 0);
+
+        let docs: i64 = conn
+            .query_row("SELECT count(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 0, "no empty chat document created");
+
+        let (linked, cursor): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT document_id, last_indexed_turn_id FROM chat_sessions WHERE conversation_id = ?1",
+                params![conv],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(linked, None, "still unlinked");
+        assert_eq!(cursor, Some(6), "but the cursor advanced past the chatter");
+    }
+
+    #[test]
+    fn should_run_now_gates_on_idle_sync_and_single_flight() {
+        let threshold = Duration::from_secs(900);
+        // Idle long enough, nothing else running → go.
+        assert!(should_run_now(
+            Duration::from_secs(1000),
+            threshold,
+            false,
+            false
+        ));
+        // Still active (under threshold) → wait.
+        assert!(!should_run_now(
+            Duration::from_secs(60),
+            threshold,
+            false,
+            false
+        ));
+        // A sync is running → defer to it.
+        assert!(!should_run_now(
+            Duration::from_secs(1000),
+            threshold,
+            true,
+            false
+        ));
+        // A sweep is already in flight → single-flight.
+        assert!(!should_run_now(
+            Duration::from_secs(1000),
+            threshold,
+            false,
+            true
+        ));
     }
 
     #[test]

@@ -346,6 +346,111 @@ fn anchor_stamp(at: &str) -> String {
     }
 }
 
+// --- triviality gate (board card 7B, PR2) ---
+
+/// Whether a completed turn-pair carries indexable substance, or is throwaway chatter that would only
+/// pollute retrieval and bloat the store ("thanks", "ok", a bare greeting).
+pub(crate) enum Triviality {
+    /// Pure acknowledgement / greeting on both sides — skipped from the index (the cursor still advances
+    /// past it, so it is *handled*, not reconsidered forever). The vault keeps the turn, so card F can
+    /// revisit it.
+    Trivial,
+    /// Carries content (a decision, a fact, a real question/answer) — indexed normally.
+    Substantive,
+}
+
+/// The lean, deterministic importance gate card B uses to keep the chat firehose out of the index — NO
+/// model call (running the document-inbox LLM scorer per turn-pair in a background job would be a cost
+/// firehose, and the full importance/archive routing is card F's job). Conservative by construction: a
+/// pair is `Trivial` only when **both** sides are short AND the user turn is a pure acknowledgement or
+/// greeting — so a terse question with a substantive answer, or any longer exchange, is always kept. This
+/// decides only whether a pair is *embedded*; the document-level archive outcome lives in card F.
+pub(crate) fn triviality(pair: &TurnPair) -> Triviality {
+    // A substantive answer (long, or multi-line) means the exchange carried content even if the user's
+    // prompt was terse, so the length gate alone keeps "explain X?" → "<long answer>".
+    const SHORT_CHARS: usize = 64;
+    if pair.user.trim().chars().count() > SHORT_CHARS
+        || pair.assistant.trim().chars().count() > SHORT_CHARS
+    {
+        return Triviality::Substantive;
+    }
+    if is_pure_chatter(&pair.user) {
+        Triviality::Trivial
+    } else {
+        Triviality::Substantive
+    }
+}
+
+/// Reduce a message to its bare alphanumerics, lowercased (punctuation, emoji, and whitespace dropped),
+/// then test it against a tight allow-list of acknowledgements/greetings. Kept deliberately small: a
+/// false *Substantive* only means a trivial pair is indexed (mild), while a false *Trivial* would drop
+/// real content (bad) — so when in doubt this returns false.
+fn is_pure_chatter(text: &str) -> bool {
+    let normalized: String = text
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    // A message that was punctuation/emoji only (e.g. "👍") normalises to empty — also chatter.
+    if normalized.is_empty() {
+        return !text.trim().is_empty();
+    }
+    matches!(
+        normalized.as_str(),
+        "thanks"
+            | "thank"
+            | "thankyou"
+            | "thanksalot"
+            | "thankssomuch"
+            | "ty"
+            | "tysm"
+            | "thx"
+            | "ok"
+            | "okay"
+            | "okthanks"
+            | "k"
+            | "kk"
+            | "gotit"
+            | "got"
+            | "cool"
+            | "nice"
+            | "great"
+            | "perfect"
+            | "awesome"
+            | "amazing"
+            | "soundsgood"
+            | "sounds"
+            | "sg"
+            | "yes"
+            | "yep"
+            | "yeah"
+            | "yup"
+            | "no"
+            | "nope"
+            | "sure"
+            | "alright"
+            | "gotcha"
+            | "makessense"
+            | "willdo"
+            | "np"
+            | "yw"
+            | "hi"
+            | "hello"
+            | "hey"
+            | "heythere"
+            | "hiya"
+            | "yo"
+            | "goodmorning"
+            | "gm"
+            | "goodnight"
+            | "gn"
+            | "bye"
+            | "cheers"
+            | "lol"
+            | "haha"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +654,45 @@ mod tests {
             "encrypted on-disk name carries .pmenc"
         );
         append_round_trip(&cipher);
+    }
+
+    fn pair(user: &str, assistant: &str) -> TurnPair {
+        TurnPair {
+            user: user.into(),
+            assistant: assistant.into(),
+            turn_id: 2,
+            at: "2026-06-28T10:00:00.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn triviality_skips_chatter_but_keeps_substance() {
+        let trivial = |u: &str, a: &str| matches!(triviality(&pair(u, a)), Triviality::Trivial);
+
+        // Pure acknowledgement / greeting on both sides → trivial (skipped from the index).
+        assert!(trivial("thanks!", "You're welcome."));
+        assert!(trivial("ok", "👍"));
+        assert!(trivial("got it", "Great."));
+        assert!(trivial("👍", "👍"));
+        assert!(trivial("Hey there", "Hello!"));
+
+        // Anything stating a decision/fact/preference, or a real Q&A, is kept — even when terse.
+        assert!(!trivial(
+            "Let's call the org Atlas.",
+            "Noted — Atlas it is."
+        ));
+        assert!(!trivial(
+            "thanks",
+            "Before you go: remember the launch is on 1 July and the demo needs the new build."
+        ));
+        assert!(!trivial(
+            "What's our deadline?",
+            "The pitch milestone is due 15 August."
+        ));
+        // A bare acknowledgement that is actually long enough to carry content is kept (length gate).
+        assert!(!trivial(
+            "ok but actually I changed my mind, let's ship on Friday instead of Monday",
+            "Sure."
+        ));
     }
 }

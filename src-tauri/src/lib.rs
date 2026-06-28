@@ -46,6 +46,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 
 use rusqlite::Connection;
 use tauri::Manager;
@@ -167,6 +168,41 @@ pub struct AppState {
     /// Snapshot of the semantic-map layout precompute (single-flight; running/method/last-error), so
     /// the Map can show progress and a second request folds into the running one. See `layout`.
     pub layout_job: Mutex<layout::LayoutJobState>,
+    /// When the user was last active (a chat send / an ingest). The idle chat-indexer (`chat_index`)
+    /// reads this so it only runs during a lull and never competes with active use.
+    pub last_user_activity: Mutex<Instant>,
+    /// Single-flight guard shared by the chat-index launch sweep and idle loop, so the two never overlap.
+    pub chat_index_busy: AtomicBool,
+}
+
+impl AppState {
+    /// Mark the user as active right now — bumped on a chat send and on ingest, so the idle chat-indexer
+    /// backs off while work is happening.
+    pub fn mark_user_activity(&self) {
+        if let Ok(mut t) = self.last_user_activity.lock() {
+            *t = Instant::now();
+        }
+    }
+
+    /// How long since the last marked user activity (poisoned lock → treat as just-active).
+    pub fn idle_for(&self) -> std::time::Duration {
+        self.last_user_activity
+            .lock()
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
+    }
+
+    /// Whether a Drive or OneDrive sync is currently running — the idle indexer defers to either so they
+    /// don't contend for the engine (mirrors the layout precompute's idle-priority).
+    pub fn sync_active(&self) -> bool {
+        let drive = self.drive_sync.lock().map(|s| s.running).unwrap_or(false);
+        let onedrive = self
+            .onedrive_sync
+            .lock()
+            .map(|s| s.running)
+            .unwrap_or(false);
+        drive || onedrive
+    }
 }
 
 /// A borrow of the open connection. Derefs to [`Connection`], so call sites read just
@@ -473,6 +509,8 @@ pub fn run() {
                 onedrive_sync: Mutex::new(OneDriveSyncState::default()),
                 onedrive_sync_cancel: AtomicBool::new(false),
                 layout_job: Mutex::new(layout::LayoutJobState::default()),
+                last_user_activity: Mutex::new(Instant::now()),
+                chat_index_busy: AtomicBool::new(false),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -497,8 +535,11 @@ pub fn run() {
 
             // Catch up chat indexing for anything whose turn-pairs ran ahead of the index while the app
             // was closed (board card 7B). Background, best-effort; waits for the vault to unlock + the
-            // engine to be provisioned, and never triggers a first-run engine build itself.
+            // engine to be provisioned, and never triggers a first-run engine build itself. The idle
+            // indexer then keeps a live session progressively indexed during lulls (never competing with
+            // active use), so nothing waits for the next launch.
             chat_index::spawn_launch_sweep(handle.clone());
+            chat_index::spawn_idle_indexer(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

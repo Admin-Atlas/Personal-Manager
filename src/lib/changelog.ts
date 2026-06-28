@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.45.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "PM now keeps up with your conversations as you go. While you're not actively chatting, it quietly indexes new back-and-forths in the background — so a long session becomes searchable bit by bit, and you no longer have to reopen the app for it to catch up. It always waits for a lull, so it never gets in the way of what you're doing.",
+      'Small talk stays out of the way: a quick "thanks" or "ok" no longer clutters what PM can recall — only the parts of a conversation that actually carry something (a decision, a fact, an answer) become searchable. Your full chat is always kept either way.',
+    ],
+  },
+  {
     version: "2.44.0-alpha",
     date: "2026-06-28",
     highlights: [

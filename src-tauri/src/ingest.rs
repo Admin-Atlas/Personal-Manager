@@ -126,6 +126,9 @@ pub fn run(
 ) -> Result<()> {
     let state = app.state::<AppState>();
 
+    // Indexing is active use — hold the idle chat-indexer (card 7B) off so it doesn't contend with it.
+    state.mark_user_activity();
+
     let _ = on_event.send(IngestEvent::Preparing {
         message: "Preparing the document engine…".into(),
     });
@@ -493,6 +496,9 @@ fn copy_original_to_vault(
 /// store is reconstructable from disk (spec §3 acceptance).
 pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
     let state = app.state::<AppState>();
+
+    // Indexing is active use — hold the idle chat-indexer (card 7B) off so it doesn't contend with it.
+    state.mark_user_activity();
 
     let _ = on_event.send(IngestEvent::Preparing {
         message: "Preparing the document engine…".into(),
