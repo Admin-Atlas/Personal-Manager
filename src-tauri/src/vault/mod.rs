@@ -324,6 +324,17 @@ impl MarkdownCipher {
         }
     }
 
+    /// An encrypting cipher with a fixed subkey (no KDF) — for file-IO tests in sibling modules that
+    /// need to prove their writes round-trip under encryption (the crypto itself is covered here).
+    #[cfg(test)]
+    pub(crate) fn for_test_encrypted(vault_id: &str) -> Self {
+        Self {
+            vault_id: vault_id.to_string(),
+            encryption: MarkdownEncryption::XChaCha20Poly1305,
+            subkey: Some(Zeroizing::new([7u8; 32])),
+        }
+    }
+
     /// Build the cipher for a vault from its metadata + the resolved master key. The
     /// Markdown subkey is derived only when the policy calls for encryption, so a
     /// device vault never holds a Markdown key it won't use.

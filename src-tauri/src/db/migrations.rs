@@ -661,6 +661,60 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_photos_document ON photos(document_id);
     CREATE UNIQUE INDEX idx_photos_file_hash ON photos(file_hash);
     "#,
+    // v23: Chat ingestion foundation (Stage-3 board card 7A, #140). The substrate that turns PM's own
+    // conversations into a first-class ingestion source — modelled like a document so the existing
+    // pipeline (chunk → embed → index → hybrid retrieval) treats an indexed chat as "just another
+    // document". This card lands ONLY the data-model + write-discipline seam: no indexing (card B), no
+    // UI (cards C/E), no retrieval (card C), and no user-visible behaviour change.
+    //
+    // Two additive parts (rule #3 — no data moved, no column dropped):
+    //   * Relax the `documents.source_type` CHECK to admit 'chat'. SQLite can't ALTER a column CHECK in
+    //     place, so we reuse the v17/v22 `writable_schema` text-patch (it edits the stored CREATE TABLE
+    //     text only; `run` then bumps the schema cookie so this connection reparses the new constraint).
+    //     The value list `'vault','index_only','photo'` appears exactly once — in this CHECK — and only on
+    //     `documents`. A chat session, when card B indexes it, becomes a `documents` row with
+    //     `source_type='chat'` backed by a real Markdown vault file, so split/embed/FTS/vector/retrieval/
+    //     Map/citations/rebuild/deletion all work unchanged (exactly as 'index_only'/'photo' are just
+    //     discriminators). The org fields it needs — project/tags/importance/archive/reviewed/source_state
+    //     — therefore live on `documents` (reused, not duplicated), which is what lets card F file chat
+    //     through the same `write_document_truth` path documents use and lets the Stage-4 M:N migration
+    //     (card ii) carry chat as one shared migration. Nobody writes a 'chat' row THIS card.
+    //   * `chat_sessions` (NEW) is the thin satellite holding the chat-specific state a document doesn't
+    //     have. Keyed by `conversation_id` (one session per conversation; FK ON DELETE CASCADE so deleting
+    //     a chat drops its session row — card G's deletion cascade also purges the documents row + chunks +
+    //     vault file). `document_id` is the link to the source row card B creates; it stays NULL until then
+    //     (ON DELETE SET NULL so a Rebuild's `DELETE FROM documents` teardown leaves the session row, and
+    //     card B re-links on re-index). `scope` records ORIGIN — a chat opened global vs project-scoped —
+    //     which is what card F routes on (general → review queue, project → skip), distinct from whichever
+    //     project the chat is later FILED under (that's `documents.project`). The two cursors are the heart
+    //     of the card: `last_indexed_turn_id` is an INDEX-STATE cursor (the assistant message id of the
+    //     last indexed turn-pair) recording how far the index has caught up — NOT a truth cursor; card B
+    //     only ever embeds turn-pairs past it, idempotently, so "is the conversation done?" never needs
+    //     answering — only "is there content past the cursor?". `summary_covers_up_to_turn_id` records
+    //     which turns the rolling summary already accounts for so card C extends it from the new tail
+    //     rather than re-reading the whole history. Both cursors are NULL here (nothing indexed/summarised
+    //     yet) and advanced by B/C. `vault_path` is the session's `.md` on-disk name, set when 7A first
+    //     appends a turn-pair to the vault. All additive — an existing store just gains an empty table,
+    //     no backfill (rule #3). Vectors and every existing query are untouched.
+    r#"
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master
+       SET sql = replace(sql, '''vault'',''index_only'',''photo''', '''vault'',''index_only'',''photo'',''chat''')
+     WHERE type = 'table' AND name = 'documents';
+    PRAGMA writable_schema = OFF;
+
+    CREATE TABLE chat_sessions (
+        conversation_id              INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+        document_id                  INTEGER REFERENCES documents(id) ON DELETE SET NULL, -- the source row card B creates; NULL until then
+        scope                        TEXT NOT NULL CHECK (scope IN ('general','project')), -- ORIGIN (global vs project-scoped), card F routes on it
+        vault_path                   TEXT,        -- the session's .md on-disk name; NULL until the first turn-pair is appended
+        last_indexed_turn_id         INTEGER,     -- index-state cursor (assistant msg id of last indexed pair); card B advances. NOT a truth cursor
+        summary_covers_up_to_turn_id INTEGER,     -- rolling-summary cursor; card C advances
+        last_active_at               TEXT,
+        created_at                   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_chat_sessions_document ON chat_sessions(document_id);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -710,12 +764,12 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 22,
+            version, 23,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
              project milestones is v20; project active-date + manual priority is v21; \
-             photo ingestion table is v22)"
+             photo ingestion table is v22; chat ingestion foundation is v23)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -969,6 +1023,105 @@ mod tests {
         assert_eq!(
             remaining, 0,
             "photos cascade when their document is deleted"
+        );
+    }
+
+    /// v23 lands the chat ingestion foundation (board card 7A): it relaxes the `documents.source_type`
+    /// CHECK to admit 'chat' (proving the writable_schema patch + cookie reparse took effect on this
+    /// connection), and adds the `chat_sessions` satellite with its `scope` CHECK, the two NULL-by-default
+    /// cursors, an ON DELETE CASCADE from the owning conversation, and an ON DELETE SET NULL link to the
+    /// documents row card B will create.
+    #[test]
+    fn chat_sessions_land_with_scope_check_and_cascade() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // The relaxed CHECK admits a 'chat' document (the source row card B will create).
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash, source_type) \
+             VALUES ('vault/chat.md', 'chat-hash', 'chat')",
+            [],
+        )
+        .expect("source_type='chat' is now allowed");
+        let doc_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE content_hash = 'chat-hash'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // A conversation + its session row insert with the documented defaults (NULL cursors / document).
+        conn.execute("INSERT INTO conversations DEFAULT VALUES", [])
+            .unwrap();
+        let conv_id: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope) VALUES (?1, 'general')",
+            rusqlite::params![conv_id],
+        )
+        .unwrap();
+        let (doc, indexed, summ): (Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT document_id, last_indexed_turn_id, summary_covers_up_to_turn_id \
+                 FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (doc, indexed, summ),
+            (None, None, None),
+            "session cursors/link default NULL"
+        );
+
+        // The scope CHECK rejects anything outside general|project.
+        let bad = conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope) VALUES (?1, 'team')",
+            rusqlite::params![conv_id],
+        );
+        assert!(bad.is_err(), "scope CHECK rejects 'team'");
+
+        // Linking the document then deleting it leaves the session row but NULLs the link (SET NULL).
+        conn.execute(
+            "UPDATE chat_sessions SET document_id = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![doc_id, conv_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM documents WHERE id = ?1",
+            rusqlite::params![doc_id],
+        )
+        .unwrap();
+        let after: (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT count(*), max(document_id) FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after,
+            (1, None),
+            "deleting the document NULLs the link, keeps the session"
+        );
+
+        // Deleting the conversation cascades its session row (conversation_id REFERENCES … ON DELETE CASCADE).
+        conn.execute(
+            "DELETE FROM conversations WHERE id = ?1",
+            rusqlite::params![conv_id],
+        )
+        .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "session rows cascade when their conversation is deleted"
         );
     }
 

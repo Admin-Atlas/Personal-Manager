@@ -1314,14 +1314,18 @@ fn render_photo_block(p: &PhotoRecord) -> String {
 }
 
 /// Serialize a list of strings as a YAML flow sequence on one line.
-fn render_yaml_list(items: &[String]) -> String {
+pub(crate) fn render_yaml_list(items: &[String]) -> String {
     let inner: Vec<String> = items.iter().map(|s| yaml_quote(s)).collect();
     format!("[{}]", inner.join(", "))
 }
 
 /// Parse our own front-matter back out: returns the simple key→value fields and
 /// the body. Only the flat scalar fields we wrote are read (enough to rebuild).
-fn parse_frontmatter(raw: &str) -> Option<(std::collections::HashMap<String, String>, &str)> {
+/// Shared with the chat-session layer (`chat.rs`), whose vault files use the same
+/// flat front-matter so a Rebuild reads them with this one parser.
+pub(crate) fn parse_frontmatter(
+    raw: &str,
+) -> Option<(std::collections::HashMap<String, String>, &str)> {
     let rest = raw.strip_prefix("---\n")?;
     let end = rest.find("\n---")?;
     let header = &rest[..end];
@@ -1361,7 +1365,7 @@ fn nullable(value: Option<&String>) -> Option<String> {
         .map(String::from)
 }
 
-fn yaml_quote(value: &str) -> String {
+pub(crate) fn yaml_quote(value: &str) -> String {
     // Collapse control characters (notably CR/LF) to a space first. Our
     // front-matter parser is line-based, so a newline inside a value — e.g. a
     // document title taken from untrusted file content (an HTML <title>, PDF
