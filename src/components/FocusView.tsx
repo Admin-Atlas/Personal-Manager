@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  addMilestone,
   calendarOverview,
   getDailyBriefing,
   listCalendarEvents,
@@ -12,6 +13,7 @@ import {
   setProjectMetadata,
   syncCalendar,
 } from "../lib/ipc";
+import { MilestoneList } from "./MilestoneList";
 import type {
   CalendarEvent,
   DailyBriefing,
@@ -21,7 +23,7 @@ import type {
   ProjectStatus,
 } from "../lib/types";
 import { formatDate } from "../lib/format";
-import { Button, Card, Input, Select, Skeleton, StatusBadge } from "./ui";
+import { Button, Card, Select, Skeleton, StatusBadge } from "./ui";
 import { useDepth } from "../theme";
 
 interface Props {
@@ -227,10 +229,12 @@ export function FocusView({ onOpenProject }: Props) {
                   key={p.name}
                   project={p}
                   otherProjects={names.filter((n) => n !== p.name)}
+                  events={events}
                   proposal={proposals[p.name]}
                   editing={editing === p.name}
                   onEdit={() => setEditing(editing === p.name ? null : p.name)}
                   onOpen={() => onOpenProject(p.name)}
+                  onChanged={refresh}
                   onSaved={async () => {
                     setEditing(null);
                     await refresh();
@@ -248,18 +252,22 @@ export function FocusView({ onOpenProject }: Props) {
 function ProjectCard({
   project,
   otherProjects,
+  events,
   proposal,
   editing,
   onEdit,
   onOpen,
+  onChanged,
   onSaved,
 }: {
   project: ProjectOverview;
   otherProjects: string[];
+  events: CalendarEvent[];
   proposal?: ProjectProposal;
   editing: boolean;
   onEdit: () => void;
   onOpen: () => void;
+  onChanged: () => void;
   onSaved: () => void;
 }) {
   const { minimal, showMeta } = useDepth();
@@ -296,7 +304,13 @@ function ProjectCard({
                   <span className="capitalize">{project.importance} importance</span>
                 )}
                 {project.size && <span>{project.size}</span>}
-                {project.deadline && <span>due {formatDate(project.deadline.slice(0, 10))}</span>}
+                {project.governing_milestone?.due_date && (
+                  <span>
+                    {project.governing_milestone.label}{" "}
+                    {formatDate(project.governing_milestone.due_date.slice(0, 10))}
+                    {project.milestones.length > 1 ? ` +${project.milestones.length - 1}` : ""}
+                  </span>
+                )}
                 {project.blocked_by && <span>blocked by {project.blocked_by}</span>}
                 {project.last_activity && <span>active {formatDate(project.last_activity)}</span>}
               </div>
@@ -320,7 +334,9 @@ function ProjectCard({
           <MetaEditor
             project={project}
             otherProjects={otherProjects}
+            events={events}
             proposal={proposal}
+            onChanged={onChanged}
             onSaved={onSaved}
           />
         )}
@@ -334,33 +350,39 @@ function ProjectCard({
 function MetaEditor({
   project,
   otherProjects,
+  events,
   proposal,
+  onChanged,
   onSaved,
 }: {
   project: ProjectOverview;
   otherProjects: string[];
+  events: CalendarEvent[];
   proposal?: ProjectProposal;
+  onChanged: () => void;
   onSaved: () => void;
 }) {
-  const [deadline, setDeadline] = useState(project.deadline?.slice(0, 10) ?? "");
   const [size, setSize] = useState<ProjectSize>(project.size);
   const [blockedBy, setBlockedBy] = useState(project.blocked_by ?? "");
   const [parent, setParent] = useState(project.parent ?? "");
   const [saving, setSaving] = useState(false);
 
-  function applyProposal() {
+  async function applyProposal() {
     if (!proposal) return;
     setSize(proposal.size);
-    if (proposal.deadline) setDeadline(proposal.deadline.slice(0, 10));
     if (proposal.blocked_by) setBlockedBy(proposal.blocked_by);
     if (proposal.parent) setParent(proposal.parent);
+    // A proposed deadline becomes a milestone straight away (milestones persist live).
+    if (proposal.deadline) {
+      await addMilestone(project.name, "deadline", proposal.deadline.slice(0, 10), null);
+      onChanged();
+    }
   }
 
   async function save() {
     setSaving(true);
     try {
       await setProjectMetadata(project.name, {
-        deadline: deadline || null,
         size,
         blockedBy: blockedBy || null,
         parent: parent || null,
@@ -413,15 +435,24 @@ function MetaEditor({
             <option value="large">large</option>
           </Select>
         </Field>
-        <Field label="Deadline (Due soon)">
-          <Input type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)} />
-        </Field>
         <Field label="Blocked by">
           <ProjectSelect value={blockedBy} options={otherProjects} onChange={setBlockedBy} />
         </Field>
         <Field label="Part of (parent)">
           <ProjectSelect value={parent} options={otherProjects} onChange={setParent} />
         </Field>
+      </div>
+
+      <div className="mt-3">
+        <span className="text-xs text-ink3">Milestones (the nearest unmet drives Due soon)</span>
+        <div className="mt-1.5">
+          <MilestoneList
+            project={project.name}
+            milestones={project.milestones}
+            calendarEvents={events}
+            onChanged={onChanged}
+          />
+        </div>
       </div>
 
       <div className="mt-3 flex justify-end gap-2">
