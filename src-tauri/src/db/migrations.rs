@@ -715,6 +715,27 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_chat_sessions_document ON chat_sessions(document_id);
     "#,
+    // v24: Incremental chat indexing — per-chunk provenance + timestamp (Stage-3 board card 7B, #141).
+    // Card A (v23) made a chat a vault-truth file + cursors; card B is the engine that embeds completed
+    // turn-pairs into chunks, append-only off `last_indexed_turn_id`. Two locked card-B decisions need a
+    // per-CHUNK home that `chunks` doesn't have yet, so this migration adds two additive, nullable columns
+    // (rule #3 — nothing moved, nothing dropped; existing rows keep NULL and behave exactly as before):
+    //   * `chat_turn_id` — the turn-pair a chat chunk came from (the assistant message's id, card A's turn
+    //     identity). With the chat's `documents.vault_path` and `chat_sessions.conversation_id` (reachable
+    //     via `documents.id = chat_sessions.document_id`) this is the full source pointer card E needs to
+    //     "open the chat to this turn" — stored as navigation metadata ALONGSIDE the vector, never embedded.
+    //     NULL for every non-chat chunk.
+    //   * `chunk_at` — a per-chunk timestamp (the turn-pair's own time). Chat is indexed append-only, so one
+    //     document spans turns authored months apart; per-chunk recency means a months-old chat with one
+    //     fresh decision isn't uniformly stale. Retrieval prefers this over the document's `last_activity`
+    //     via COALESCE, so a NULL (every document/photo/index-only chunk) transparently falls back to the
+    //     existing per-document recency — no behaviour change for anything but chat.
+    // Both leave `chunk_vec`/`chunks_fts` (keyed by `chunks.id`) untouched; no Rebuild is forced (boundaries
+    // and the SPLITTER_VERSION stamp are unchanged — these are pure metadata columns).
+    r#"
+    ALTER TABLE chunks ADD COLUMN chat_turn_id INTEGER;
+    ALTER TABLE chunks ADD COLUMN chunk_at     TEXT;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -764,12 +785,13 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 23,
+            version, 24,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
              project milestones is v20; project active-date + manual priority is v21; \
-             photo ingestion table is v22; chat ingestion foundation is v23)"
+             photo ingestion table is v22; chat ingestion foundation is v23; \
+             chat per-chunk provenance + timestamp is v24)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1123,6 +1145,55 @@ mod tests {
             remaining, 0,
             "session rows cascade when their conversation is deleted"
         );
+    }
+
+    /// v24 adds the two additive, nullable chat-chunk columns (board card 7B): `chat_turn_id` (the
+    /// turn-pair source pointer) and `chunk_at` (per-chunk recency timestamp). Existing rows keep NULL;
+    /// a chat chunk round-trips both.
+    #[test]
+    fn chat_chunk_columns_land_nullable() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash) VALUES ('vault/d.md', 'd-hash')",
+            [],
+        )
+        .unwrap();
+        let doc_id: i64 = conn.last_insert_rowid();
+
+        // A plain (non-chat) chunk leaves both new columns NULL — existing inserts are unaffected.
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count) VALUES (?1, 0, 'body', 4)",
+            rusqlite::params![doc_id],
+        )
+        .unwrap();
+        let (turn, at): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT chat_turn_id, chunk_at FROM chunks WHERE document_id = ?1 AND ordinal = 0",
+                rusqlite::params![doc_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((turn, at), (None, None), "new columns default NULL");
+
+        // A chat chunk round-trips its turn pointer + per-chunk timestamp.
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count, chat_turn_id, chunk_at) \
+             VALUES (?1, 1, 'You: hi', 7, 42, '2026-06-28T10:00:00.000Z')",
+            rusqlite::params![doc_id],
+        )
+        .unwrap();
+        let (turn, at): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT chat_turn_id, chunk_at FROM chunks WHERE document_id = ?1 AND ordinal = 1",
+                rusqlite::params![doc_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(turn, Some(42));
+        assert_eq!(at.as_deref(), Some("2026-06-28T10:00:00.000Z"));
     }
 
     /// v17 relaxed the `documents.importance` CHECK: 'archive' is now a valid level (and the

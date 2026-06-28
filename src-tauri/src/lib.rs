@@ -5,6 +5,7 @@ mod applock;
 mod briefing;
 mod calendar;
 mod chat;
+mod chat_index;
 mod clock;
 mod commands;
 mod commands_dev;
@@ -493,6 +494,11 @@ pub fn run() {
             // it), best-effort; a no-op when the vault is locked or it has already run. Also retried
             // after a review commit, so a vault locked at startup still migrates once unlocked.
             commands::spawn_preferences_migration(handle.clone());
+
+            // Catch up chat indexing for anything whose turn-pairs ran ahead of the index while the app
+            // was closed (board card 7B). Background, best-effort; waits for the vault to unlock + the
+            // engine to be provisioned, and never triggers a first-run engine build itself.
+            chat_index::spawn_launch_sweep(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
