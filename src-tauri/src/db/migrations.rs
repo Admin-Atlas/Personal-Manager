@@ -750,6 +750,18 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE chat_sessions ADD COLUMN summary TEXT;
     "#,
+    // v26: Last-turn prompt size for the context-usage meter (Stage-3 board card 7D, #143). The meter shows
+    // how full the SELECTED model's context window is; rather than estimate the prompt size with a local
+    // tokenizer or a char heuristic, we persist the EXACT `prompt_tokens` OpenRouter reports for each reply
+    // (already captured in `send_message`). One additive, nullable column (rule #3 — existing rows keep NULL):
+    //   * `last_prompt_tokens` — the measured prompt-token count of this conversation's most recent turn, the
+    //     meter's numerator over `model_pricing.context_length`. Because OpenRouter counted the real assembled
+    //     prompt, it already reflects everything that rode along (profile, agenda, rolling summary, recency
+    //     window, retrieved grounding). NULL until the first reply lands ⇒ the meter shows "unknown", never a
+    //     wrong number. A cost/measurement artifact, not truth.
+    r#"
+    ALTER TABLE chat_sessions ADD COLUMN last_prompt_tokens INTEGER;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -799,13 +811,14 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 25,
+            version, 26,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
              project milestones is v20; project active-date + manual priority is v21; \
              photo ingestion table is v22; chat ingestion foundation is v23; \
-             chat per-chunk provenance + timestamp is v24; rolling chat summary is v25)"
+             chat per-chunk provenance + timestamp is v24; rolling chat summary is v25; \
+             last-turn prompt size for the context meter is v26)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1253,6 +1266,48 @@ mod tests {
             .unwrap();
         assert_eq!(summary.as_deref(), Some("- Decided to ship Friday."));
         assert_eq!(cursor, Some(7));
+    }
+
+    /// v26 adds the context-meter numerator: `chat_sessions.last_prompt_tokens` lands nullable (a session
+    /// with no reply yet has no measured prompt size ⇒ the meter shows "unknown") and round-trips the exact
+    /// `prompt_tokens` card D records from each OpenRouter reply.
+    #[test]
+    fn last_prompt_tokens_column_lands_nullable() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute("INSERT INTO conversations DEFAULT VALUES", [])
+            .unwrap();
+        let conv: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope) VALUES (?1, 'general')",
+            rusqlite::params![conv],
+        )
+        .unwrap();
+        let measured: Option<i64> = conn
+            .query_row(
+                "SELECT last_prompt_tokens FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(measured, None, "no reply yet ⇒ NULL (meter is 'unknown')");
+
+        // The post-reply write records OpenRouter's measured prompt size; it round-trips.
+        conn.execute(
+            "UPDATE chat_sessions SET last_prompt_tokens = 12345 WHERE conversation_id = ?1",
+            rusqlite::params![conv],
+        )
+        .unwrap();
+        let measured: Option<i64> = conn
+            .query_row(
+                "SELECT last_prompt_tokens FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(measured, Some(12345));
     }
 
     /// v17 relaxed the `documents.importance` CHECK: 'archive' is now a valid level (and the

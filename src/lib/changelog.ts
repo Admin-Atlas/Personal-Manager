@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.48.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "PM now shows how full the current model's context is. Each model has its own size limit, so the meter is tuned to whichever model you've picked — giving you a quiet heads-up as a long conversation starts to fill it up. (The on-screen meter itself arrives in the next update; this release adds the model-aware measurement and the controls behind it.)",
+    ],
+  },
+  {
     version: "2.47.0-alpha",
     date: "2026-06-28",
     highlights: [
