@@ -736,6 +736,20 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE chunks ADD COLUMN chat_turn_id INTEGER;
     ALTER TABLE chunks ADD COLUMN chunk_at     TEXT;
     "#,
+    // v25: Rolling conversation summary storage (Stage-3 board card 7C, #142). Card A (v23) reserved the
+    // `summary_covers_up_to_turn_id` cursor on `chat_sessions` but left nowhere to PUT the summary it
+    // bounds; card C is context assembly, which needs the summary text persisted so it survives a relaunch
+    // and rides in the cache-stable prompt prefix turn after turn. One additive, nullable column (rule #3 —
+    // existing rows keep NULL and assemble exactly as before, i.e. the whole recent window verbatim):
+    //   * `summary` — the rolling summary of the conversation arc BEFORE the recency window, append-extended
+    //     from the RAW indexed turns one segment at a time (never re-summarised — that would be lossy
+    //     compounding). NULL until the conversation first grows past the window+batch threshold. Disposable
+    //     by design: the markdown vault keeps every raw turn (card A), so this can be discarded and
+    //     regenerated from the index at any time — it is a generation-time cost artifact, never a source of
+    //     truth, and is never itself embedded.
+    r#"
+    ALTER TABLE chat_sessions ADD COLUMN summary TEXT;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -785,13 +799,13 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 24,
+            version, 25,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
              project milestones is v20; project active-date + manual priority is v21; \
              photo ingestion table is v22; chat ingestion foundation is v23; \
-             chat per-chunk provenance + timestamp is v24)"
+             chat per-chunk provenance + timestamp is v24; rolling chat summary is v25)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1194,6 +1208,51 @@ mod tests {
             .unwrap();
         assert_eq!(turn, Some(42));
         assert_eq!(at.as_deref(), Some("2026-06-28T10:00:00.000Z"));
+    }
+
+    /// v25 adds the rolling-summary store: `chat_sessions.summary` lands nullable (a session born before
+    /// card C has no summary, and assembles the same as before) and round-trips text once card C writes one.
+    #[test]
+    fn chat_summary_column_lands_nullable() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute("INSERT INTO conversations DEFAULT VALUES", [])
+            .unwrap();
+        let conv: i64 = conn.last_insert_rowid();
+
+        // A session row born without a summary keeps it NULL (the cursor is the only summary state card A left).
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope) VALUES (?1, 'general')",
+            rusqlite::params![conv],
+        )
+        .unwrap();
+        let summary: Option<String> = conn
+            .query_row(
+                "SELECT summary FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(summary, None, "summary defaults NULL");
+
+        // Card C writes a summary + advances the cursor together; both round-trip.
+        conn.execute(
+            "UPDATE chat_sessions SET summary = ?2, summary_covers_up_to_turn_id = 7 \
+             WHERE conversation_id = ?1",
+            rusqlite::params![conv, "- Decided to ship Friday."],
+        )
+        .unwrap();
+        let (summary, cursor): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT summary, summary_covers_up_to_turn_id FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(summary.as_deref(), Some("- Decided to ship Friday."));
+        assert_eq!(cursor, Some(7));
     }
 
     /// v17 relaxed the `documents.importance` CHECK: 'archive' is now a valid level (and the

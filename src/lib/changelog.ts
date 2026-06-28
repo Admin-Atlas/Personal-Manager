@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.46.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Long chats now stay affordable and stay on-point. PM keeps a short, running summary of the earlier part of each conversation, updated quietly in the background as you talk — so it can remember the gist of where you've been without re-reading the whole thread every message. The full conversation is always kept word-for-word in your vault; the summary is just a lightweight memory aid PM can rebuild any time.",
+    ],
+  },
+  {
     version: "2.45.0-alpha",
     date: "2026-06-28",
     highlights: [
