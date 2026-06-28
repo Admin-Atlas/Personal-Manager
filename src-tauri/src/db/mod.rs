@@ -743,6 +743,8 @@ mod tests {
 
         conn.execute_batch(
             "DROP TABLE project_milestones; \
+             ALTER TABLE projects DROP COLUMN last_touched; \
+             ALTER TABLE projects DROP COLUMN importance; \
              DROP INDEX idx_calendar_events_uid; \
              DROP INDEX idx_calendar_events_entity; \
              DROP INDEX idx_calendar_events_calendar; \
@@ -879,6 +881,8 @@ mod tests {
 
         conn.execute_batch(
             "DROP TABLE project_milestones; \
+             ALTER TABLE projects DROP COLUMN last_touched; \
+             ALTER TABLE projects DROP COLUMN importance; \
              DROP INDEX idx_calendar_events_uid; \
              DROP INDEX idx_calendar_events_entity; \
              DROP INDEX idx_calendar_events_calendar; \

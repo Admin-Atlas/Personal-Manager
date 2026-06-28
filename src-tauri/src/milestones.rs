@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::error::Result;
@@ -348,6 +348,18 @@ pub fn set_state(conn: &Connection, id: i64, met: bool) -> Result<()> {
 pub fn remove(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("DELETE FROM project_milestones WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+/// The project a milestone belongs to, or `None` if the id is unknown. Used by the command
+/// layer to bump that project's activity date (`projects::touch`) after an id-only edit.
+pub fn project_of(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT project_name FROM project_milestones WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?)
 }
 
 /// Rewrite the ordering of a project's milestones from a caller-supplied id list

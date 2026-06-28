@@ -593,6 +593,23 @@ const MIGRATIONS: &[&str] = &[
           FROM projects
          WHERE deadline IS NOT NULL AND trim(deadline) <> '';
     "#,
+    // v21: Project active-date + manual priority (Stage-3 focus follow-ups). Two additive
+    // columns on `projects` (rule #3 — never drop/rewrite existing data):
+    //   * last_touched — bumped when the user engages a project OUTSIDE document ingest
+    //     (sends a message in its scoped chat, or edits its milestones). `list_overviews`
+    //     takes the project's "active" date as MAX(document activity, last_touched), so
+    //     chatting/triaging a project counts as activity (and so feeds the Take-a-look
+    //     staleness signal and the Recent-active sort). NULL until first touched.
+    //   * importance — a MANUAL priority override (high/medium/low) set in Triage. NULL = Auto
+    //     (shows no tag). This replaces the old "highest-importance document" heuristic, which
+    //     was misleading: one important document doesn't make the PROJECT important. A real,
+    //     structural auto-importance signal (e.g. depended-on by other projects) is deferred.
+    // Additive only; no backfill — every project starts on Auto, untouched.
+    r#"
+    ALTER TABLE projects ADD COLUMN last_touched TEXT;
+    ALTER TABLE projects ADD COLUMN importance   TEXT
+        CHECK (importance IN ('high','medium','low') OR importance IS NULL);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -642,11 +659,11 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 20,
+            version, 21,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
-             project milestones is v20)"
+             project milestones is v20; project active-date + manual priority is v21)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
