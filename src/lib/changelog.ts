@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.38.0-alpha",
+    date: "2026-06-28",
+    highlights: [
+      "Chatting in a project or editing its milestones now counts as activity. A project's “active” date — and whether it's gone quiet enough to read “Take a look” — used to move only when its documents changed; now engaging with the project itself keeps it current.",
+      "A project's priority is now something you set, not a guess. The old “high/medium” tag was inferred from your most important document in the project, which didn't really say whether the project mattered — so it's gone. You'll set priority yourself in Triage in the next update; until then a project simply shows no priority tag.",
+    ],
+  },
+  {
     version: "2.37.0-alpha",
     date: "2026-06-28",
     highlights: [

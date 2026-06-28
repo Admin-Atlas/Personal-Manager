@@ -853,6 +853,12 @@ pub async fn send_message(
             )?;
         }
 
+        // A message in a project-scoped chat counts as engaging with that project, so bump its
+        // activity date (no-op for an unscoped chat — `touch` ignores a blank/absent name).
+        if let Some(project) = scope.as_deref() {
+            projects::touch(&conn, project)?;
+        }
+
         let models = effective_models(&conn, CHAT_MODELS_KEY, CHAT_AUTO_SWITCH_KEY)?;
         // Replay only the most recent turns (newest N by id, then back into
         // chronological order) so a long conversation can't grow every request.
@@ -1935,13 +1941,16 @@ pub fn set_project_metadata(
     size: Option<String>,
     blocked_by: Option<String>,
     parent: Option<String>,
+    // Manual priority override ("high"/"medium"/"low"); None / "auto" / blank = Auto (no tag).
+    // Optional on the wire so an older caller that omits it still deserializes (serde → None).
+    importance: Option<String>,
 ) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
         return Err(Error::Other("project name is empty".into()));
     }
     let conn = state.conn()?;
-    projects::set_metadata(&conn, name, deadline, size, blocked_by, parent)
+    projects::set_metadata(&conn, name, deadline, size, blocked_by, parent, importance)
 }
 
 /// Propose triage metadata (size/parent/blocked-by/deadline) for projects, on
@@ -2020,6 +2029,15 @@ pub async fn propose_project_metadata(
 // calendar-linked ones (event_uid set) sync their date from the read-only calendar mirror. All quick
 // synchronous DB work — no model calls, so the lock is held only briefly (rule #4).
 
+/// Bump the activity date of the project owning milestone `id` — editing a milestone counts
+/// as engaging with its project. Best-effort: an unknown id is a no-op.
+fn touch_milestone_project(conn: &Connection, id: i64) -> Result<()> {
+    if let Some(project) = milestones::project_of(conn, id)? {
+        projects::touch(conn, &project)?;
+    }
+    Ok(())
+}
+
 /// One project's milestones, resolved (calendar-linked dates synced) and date-ordered.
 #[tauri::command]
 pub fn list_milestones(state: State<'_, AppState>, project: String) -> Result<Vec<Milestone>> {
@@ -2043,7 +2061,9 @@ pub fn add_milestone(
         return Err(Error::Other("project name is empty".into()));
     }
     let conn = state.conn()?;
-    milestones::add(&conn, project, &label, due_date, event_uid)
+    let id = milestones::add(&conn, project, &label, due_date, event_uid)?;
+    projects::touch(&conn, project)?;
+    Ok(id)
 }
 
 /// Edit a milestone's label and (for a PM-native milestone) its date. A calendar-linked
@@ -2056,7 +2076,9 @@ pub fn update_milestone(
     due_date: Option<String>,
 ) -> Result<()> {
     let conn = state.conn()?;
-    milestones::update(&conn, id, &label, due_date)
+    milestones::update(&conn, id, &label, due_date)?;
+    touch_milestone_project(&conn, id)?;
+    Ok(())
 }
 
 /// Link a milestone to a calendar event (`event_uid` Some, `cached_date` seeds the offline cache)
@@ -2069,21 +2091,31 @@ pub fn set_milestone_event(
     cached_date: Option<String>,
 ) -> Result<()> {
     let conn = state.conn()?;
-    milestones::set_event(&conn, id, event_uid, cached_date)
+    milestones::set_event(&conn, id, event_uid, cached_date)?;
+    touch_milestone_project(&conn, id)?;
+    Ok(())
 }
 
 /// Mark a milestone met or unmet.
 #[tauri::command]
 pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Result<()> {
     let conn = state.conn()?;
-    milestones::set_state(&conn, id, met)
+    milestones::set_state(&conn, id, met)?;
+    touch_milestone_project(&conn, id)?;
+    Ok(())
 }
 
 /// Delete a milestone by id.
 #[tauri::command]
 pub fn delete_milestone(state: State<'_, AppState>, id: i64) -> Result<()> {
     let conn = state.conn()?;
-    milestones::remove(&conn, id)
+    // Resolve the owning project before the row is gone, then bump its activity.
+    let project = milestones::project_of(&conn, id)?;
+    milestones::remove(&conn, id)?;
+    if let Some(project) = project {
+        projects::touch(&conn, &project)?;
+    }
+    Ok(())
 }
 
 /// Persist a new ordering of a project's milestones (ids in display order).
@@ -2094,7 +2126,10 @@ pub fn reorder_milestones(
     ordered_ids: Vec<i64>,
 ) -> Result<()> {
     let conn = state.conn()?;
-    milestones::reorder(&conn, project.trim(), &ordered_ids)
+    let project = project.trim();
+    milestones::reorder(&conn, project, &ordered_ids)?;
+    projects::touch(&conn, project)?;
+    Ok(())
 }
 
 // --- personal assistant: calendar (multi-provider, read-only — cards 6A/6B) ---

@@ -93,7 +93,9 @@ pub struct ProjectOverview {
     pub size: Option<String>,
     pub blocked_by: Option<String>,
     pub parent: Option<String>,
-    /// Highest importance among the project's documents ("high"/"medium"/"low"), if any.
+    /// The project's MANUAL priority ("high"/"medium"/"low"), set in Triage. `None` = Auto,
+    /// which shows no tag. (The old "highest document importance" heuristic was dropped as
+    /// misleading; a structural auto-importance signal is a deferred follow-up.)
     pub importance: Option<String>,
     /// The soonest upcoming calendar event whose title names this project (Step 6) —
     /// the zero-setup fallback that only kicks in when a project has NO milestones; an
@@ -115,13 +117,19 @@ pub struct ProjectOverview {
 /// deltas reason against this one `:today` midnight, so the deadline and activity
 /// boundaries can't disagree (the V1 bug mixed OS-localtime and UTC nows).
 pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverview>> {
+    // A project's "active" date is the LATER of its newest document activity and `last_touched`
+    // (bumped on scoped-chat sends and milestone edits — engagement outside document ingest).
+    // `COALESCE(p.last_touched,'')` keeps the never-touched case working: the scalar `max(a,b)`
+    // returns NULL if any argument is NULL, so the empty-string sentinel (which sorts below any
+    // ISO timestamp) lets the document date win cleanly. `importance` is now the manual override
+    // (NULL = Auto / no tag); the old document-derived aggregate is gone.
     let mut stmt = conn.prepare(
         "SELECT d.project, \
                 COUNT(*) AS doc_count, \
-                MAX(COALESCE(d.last_activity, d.ingested_at)) AS last_activity, \
-                MIN(CASE d.importance WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END) AS imp, \
-                p.deadline, p.size, p.blocked_by, p.parent, \
-                julianday(:today) - julianday(date(replace(MAX(COALESCE(d.last_activity, d.ingested_at)),'Z',''))) AS days_since \
+                max(MAX(COALESCE(d.last_activity, d.ingested_at)), COALESCE(p.last_touched,'')) AS last_activity, \
+                p.deadline, p.size, p.blocked_by, p.parent, p.importance, \
+                julianday(:today) - julianday(date(replace( \
+                    max(MAX(COALESCE(d.last_activity, d.ingested_at)), COALESCE(p.last_touched,'')),'Z',''))) AS days_since \
          FROM documents d \
          LEFT JOIN projects p ON p.name = d.project \
          GROUP BY d.project \
@@ -132,21 +140,21 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
         let name: String = row.get(0)?;
         let doc_count: i64 = row.get(1)?;
         let last_activity: Option<String> = row.get(2)?;
-        let imp: Option<i64> = row.get(3)?;
-        let deadline: Option<String> = row.get(4)?;
-        let size: Option<String> = row.get(5)?;
-        let blocked_by: Option<String> = row.get(6)?;
-        let parent: Option<String> = row.get(7)?;
+        let deadline: Option<String> = row.get(3)?;
+        let size: Option<String> = row.get(4)?;
+        let blocked_by: Option<String> = row.get(5)?;
+        let parent: Option<String> = row.get(6)?;
+        let importance: Option<String> = row.get(7)?;
         let days_since: Option<f64> = row.get(8)?;
         Ok((
             name,
             doc_count,
             last_activity,
-            imp,
             deadline,
             size,
             blocked_by,
             parent,
+            importance,
             days_since,
         ))
     })?;
@@ -164,7 +172,9 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     let events = calendar::upcoming_events(conn, calendar::AGENDA_DAYS, 250).unwrap_or_default();
 
     let mut out = Vec::new();
-    for (name, doc_count, last_activity, imp, deadline, size, blocked_by, parent, dsince) in raw {
+    for (name, doc_count, last_activity, deadline, size, blocked_by, parent, importance, dsince) in
+        raw
+    {
         let project_milestones = milestones_by_project.remove(&name).unwrap_or_default();
         let governing_milestone = milestones::governing_info(&project_milestones, today);
 
@@ -199,7 +209,7 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
             size,
             blocked_by,
             parent,
-            importance: importance_label(imp),
+            importance,
             calendar_event,
             milestones: project_milestones,
             governing_milestone,
@@ -208,14 +218,22 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     Ok(out)
 }
 
-/// Map the aggregated importance rank back to a label (3 / NULL = none).
-fn importance_label(rank: Option<i64>) -> Option<String> {
-    match rank {
-        Some(0) => Some("high".into()),
-        Some(1) => Some("medium".into()),
-        Some(2) => Some("low".into()),
-        _ => None,
+/// Bump a project's `last_touched` to now, creating a bare row if needed. Called when the
+/// user engages a project outside document ingest — sends a message in its scoped chat, or
+/// edits its milestones — so that engagement counts toward the focus view's "active" date
+/// (and the Recent-active sort / Take-a-look staleness). A blank name is a no-op.
+pub fn touch(conn: &Connection, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(());
     }
+    conn.execute(
+        "INSERT INTO projects(name, last_touched) \
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+         ON CONFLICT(name) DO UPDATE SET last_touched = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        params![name],
+    )?;
+    Ok(())
 }
 
 /// Upsert a project's triage metadata, creating the row on first set. Each field is
@@ -228,9 +246,11 @@ pub fn set_metadata(
     size: Option<String>,
     blocked_by: Option<String>,
     parent: Option<String>,
+    importance: Option<String>,
 ) -> Result<()> {
     let deadline = clean(deadline);
     let size = normalize_size(size);
+    let importance = normalize_importance(importance);
     // Case-insensitive but Unicode-aware: ASCII-only eq_ignore_ascii_case let a
     // non-ASCII name (e.g. "Café"/"CAFÉ") block or parent itself.
     let name_lc = name.to_lowercase();
@@ -238,12 +258,12 @@ pub fn set_metadata(
     let parent = clean(parent).filter(|p| p.to_lowercase() != name_lc);
 
     conn.execute(
-        "INSERT INTO projects(name, deadline, size, blocked_by, parent, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+        "INSERT INTO projects(name, deadline, size, blocked_by, parent, importance, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
          ON CONFLICT(name) DO UPDATE SET \
-            deadline = ?2, size = ?3, blocked_by = ?4, parent = ?5, \
+            deadline = ?2, size = ?3, blocked_by = ?4, parent = ?5, importance = ?6, \
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-        params![name, deadline, size, blocked_by, parent],
+        params![name, deadline, size, blocked_by, parent, importance],
     )?;
     // Milestones are the source of truth (card 7): route a legacy single deadline into the
     // canonical 'deadline' milestone so the old single-field edit path + AI proposals still
@@ -264,6 +284,13 @@ pub fn normalize_size(value: Option<String>) -> Option<String> {
     value
         .map(|s| s.trim().to_lowercase())
         .filter(|s| matches!(s.as_str(), "quick" | "standard" | "large"))
+}
+
+/// Keep only a valid manual priority level; anything else (incl. "auto"/blank) → `None` (Auto).
+pub fn normalize_importance(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| matches!(s.as_str(), "high" | "medium" | "low"))
 }
 
 // --- AI-proposes-you-confirm (mirrors review.rs) ---
@@ -583,5 +610,76 @@ mod tests {
         let fresh = overview_for(&rows, "Fresh");
         assert_eq!(fresh.status, ProjectStatus::DueSoon);
         assert_eq!(fresh.milestones.len(), 1);
+    }
+
+    /// Importance is the MANUAL override only: a high-importance *document* must NOT set the
+    /// project's tag, and setting it in Triage does (with Auto/blank clearing it back to none).
+    #[test]
+    fn importance_is_manual_not_document_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // A document marked 'high' must NOT make the project high — the old heuristic is gone.
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash, project, importance, last_activity) \
+             VALUES ('v1','h1','Imp','high','2026-06-27T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        assert_eq!(
+            overview_for(&rows, "Imp").importance,
+            None,
+            "a high-importance document must not set the project's priority"
+        );
+
+        // Setting it manually in Triage is what drives the tag.
+        set_metadata(&conn, "Imp", None, None, None, None, Some("high".into())).unwrap();
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        assert_eq!(
+            overview_for(&rows, "Imp").importance.as_deref(),
+            Some("high")
+        );
+
+        // Auto / blank clears it back to no tag.
+        set_metadata(&conn, "Imp", None, None, None, None, Some("auto".into())).unwrap();
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        assert_eq!(overview_for(&rows, "Imp").importance, None);
+    }
+
+    /// `touch` makes a project read as active: a project whose only document is ancient is
+    /// "Take a look", but touching it (a scoped chat / milestone edit) clears the staleness.
+    #[test]
+    fn touch_counts_as_activity_and_clears_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        // Use the real UTC date so it agrees with `touch`'s strftime('now'); the document is
+        // far enough in the past to be stale against any plausible today.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash, project, last_activity) \
+             VALUES ('v1','h1','Quiet','2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let rows = list_overviews(&conn, &today).unwrap();
+        assert_eq!(
+            overview_for(&rows, "Quiet").status,
+            ProjectStatus::TakeALook
+        );
+
+        touch(&conn, "Quiet").unwrap();
+        let rows = list_overviews(&conn, &today).unwrap();
+        let quiet = overview_for(&rows, "Quiet");
+        assert_ne!(
+            quiet.status,
+            ProjectStatus::TakeALook,
+            "touching a project should clear its staleness"
+        );
+        assert!(
+            quiet.last_activity.as_deref().unwrap() > "2020-01-01",
+            "the active date should reflect the touch, not the ancient document"
+        );
     }
 }
