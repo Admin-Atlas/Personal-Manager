@@ -4,11 +4,27 @@
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { Citation, Message } from "../lib/types";
 import { useDepth } from "../theme";
+import { formatDate } from "../lib/format";
 
 interface Props {
   messages: Message[];
   /** Live assistant text while a reply streams in; null when idle. */
   streaming: string | null;
+}
+
+/** A conversation reopened after this long reads as "resumed" — we mark it so the user knows they're
+ *  continuing an older thread rather than mid-flow (board card 7E). 12h ≈ "not the same sitting". */
+const RESUME_AFTER_MS = 12 * 60 * 60 * 1000;
+
+/** The last-active date to show as a "resumed" marker, or null when the thread is fresh/current. Pure: the
+ *  most recent message older than the resume threshold ⇒ this is a reopened conversation. Once the user
+ *  sends again the newest message is current, so the marker naturally clears. */
+function resumeMarkerDate(messages: Message[], now: number): string | null {
+  const last = messages[messages.length - 1];
+  if (!last) return null;
+  const t = new Date(last.created_at).getTime();
+  if (Number.isNaN(t) || now - t < RESUME_AFTER_MS) return null;
+  return formatDate(last.created_at);
 }
 
 /** Render assistant text with inline `[n]` citation markers turned into buttons that
@@ -136,12 +152,16 @@ function MessageBlock({ message }: { message: Message }) {
 
 export function ChatView({ messages, streaming }: Props) {
   const endRef = useRef<HTMLDivElement>(null);
+  const { atLeast } = useDepth();
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streaming]);
 
   const empty = messages.length === 0 && streaming === null;
+  // Only meaningful while idle (a streaming reply means we're mid-flow, not resuming).
+  const resumedOn =
+    atLeast("standard") && streaming === null ? resumeMarkerDate(messages, Date.now()) : null;
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -149,6 +169,13 @@ export function ChatView({ messages, streaming }: Props) {
         {empty && (
           <div className="mt-24 text-center text-ink3">
             <p className="text-sm">Start a conversation.</p>
+          </div>
+        )}
+        {resumedOn && (
+          <div className="flex justify-center" data-help="chat-resumed">
+            <span className="rounded-full bg-surface px-3 py-1 text-xs text-ink4">
+              Resumed · last active {resumedOn}
+            </span>
           </div>
         )}
         {messages.map((m) => (

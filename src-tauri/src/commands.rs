@@ -21,8 +21,8 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, chat, chat_summary, clock, context_budget, cost, db, drive, entities,
-    index_only, lock_session, microsoft, onedrive, openrouter, outlook_calendar, paths,
+    applock, briefing, chat, chat_summary, chat_title, clock, context_budget, cost, db, drive,
+    entities, index_only, lock_session, microsoft, onedrive, openrouter, outlook_calendar, paths,
     preferences, recommend, secrets, vault, AppState, VaultRuntime,
 };
 
@@ -786,6 +786,36 @@ pub fn create_conversation(
     )?)
 }
 
+/// Rename a conversation (board card 7E): the user's edit to an auto-generated history label. Besides
+/// writing the new title, it latches `chat_sessions.title_state` to `custom` so the background title pass
+/// (`chat_title`) never overwrites the user's choice. Trims and clamps; a blank title is rejected. Returns
+/// the saved title so the UI can echo exactly what landed.
+#[tauri::command]
+pub fn rename_conversation(
+    state: State<'_, AppState>,
+    conversation_id: i64,
+    title: String,
+) -> Result<String> {
+    let title: String = title.trim().chars().take(120).collect();
+    if title.is_empty() {
+        return Err(crate::error::Error::Other(
+            "A conversation title can't be empty.".into(),
+        ));
+    }
+    let conn = state.conn()?;
+    conn.execute(
+        "UPDATE conversations SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![title, conversation_id],
+    )?;
+    // No-op when the session row doesn't exist yet (a conversation with no recorded turn-pair) — that chat
+    // is not eligible for background titling anyway, so the user's title is safe regardless.
+    conn.execute(
+        "UPDATE chat_sessions SET title_state = 'custom' WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    Ok(title)
+}
+
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, conversation_id: i64) -> Result<Vec<Message>> {
     let conn = state.conn()?;
@@ -1089,6 +1119,10 @@ pub async fn send_message(
     // arc has grown past the recency window — keeps the cached summary fresh for the next turn without
     // delaying this reply. Fire-and-forget + single-flight; a no-op for a short chat.
     chat_summary::spawn_extend_after_reply(app.clone(), conversation_id);
+
+    // Once the conversation has a few turns, give it a real title in the background (board card 7E) — keeps
+    // the history list readable. Fire-and-forget + single-flight; a no-op until the turn floor, and once.
+    chat_title::spawn_title_after_reply(app.clone(), conversation_id);
 
     let _ = on_event.send(ChatEvent::Done {
         message_id,

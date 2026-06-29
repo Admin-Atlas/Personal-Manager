@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.50.0-alpha",
+    date: "2026-06-29",
+    highlights: [
+      "Your chats name themselves. After a few exchanges, PM gives a conversation a short, fitting title (using the background model, so it never slows down the chat you're having) — and you can rename any conversation just by clicking its title.",
+      "Reopen an old conversation and PM marks it as resumed, with the date it was last active, so you always know whether you're picking up an older thread or carrying on a current one.",
+    ],
+  },
+  {
     version: "2.49.0-alpha",
     date: "2026-06-29",
     highlights: [

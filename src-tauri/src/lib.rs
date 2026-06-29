@@ -7,6 +7,7 @@ mod calendar;
 mod chat;
 mod chat_index;
 mod chat_summary;
+mod chat_title;
 mod clock;
 mod commands;
 mod commands_dev;
@@ -178,6 +179,9 @@ pub struct AppState {
     /// Single-flight guard shared by the rolling-summary eager nudge and the launch/idle scheduler
     /// (`chat_summary`), so a per-conversation extend and a full reconcile never overlap.
     pub summary_busy: AtomicBool,
+    /// Single-flight guard shared by the chat-title eager nudge and the launch catch-up (`chat_title`),
+    /// so a per-conversation title generation and a full reconcile never overlap.
+    pub title_busy: AtomicBool,
 }
 
 impl AppState {
@@ -517,6 +521,7 @@ pub fn run() {
                 last_user_activity: Mutex::new(Instant::now()),
                 chat_index_busy: AtomicBool::new(false),
                 summary_busy: AtomicBool::new(false),
+                title_busy: AtomicBool::new(false),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -552,6 +557,11 @@ pub fn run() {
             // during lulls. The eager per-conversation nudge fires from `send_message`; this scheduler is
             // the catch-up net for sessions whose nudge never ran (no key at the time, app closed first).
             chat_summary::spawn_summary_scheduler(handle.clone());
+
+            // Give each conversation a real 5-7 word title (board card 7E) once it has a few turns: a launch
+            // pass titles any session that crossed the threshold while the app was closed (the eager
+            // per-conversation nudge fires from `send_message`). Background, best-effort, single model call.
+            chat_title::spawn_title_scheduler(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -598,6 +608,7 @@ pub fn run() {
             commands::list_conversations,
             commands::create_conversation,
             commands::get_messages,
+            commands::rename_conversation,
             commands::send_message,
             commands::chat_context_status,
             commands::compress_chat,
