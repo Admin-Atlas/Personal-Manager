@@ -762,6 +762,20 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE chat_sessions ADD COLUMN last_prompt_tokens INTEGER;
     "#,
+    // v27: Title provenance for auto-generated, editable chat titles (Stage-3 board card 7E, #144). A chat's
+    // history label starts as the first-message placeholder (card A names it the first 48 chars); once the
+    // conversation has a few turns the BACKGROUND model writes a real 5-7 word title ONCE, and the user can
+    // edit it. We must (a) generate exactly once, never on every idle tick, and (b) never overwrite a user
+    // edit — so we track which of the three a title is. One additive, NOT-NULL-with-default column (existing
+    // rows take 'pending', matching the placeholder they already carry):
+    //   * `title_state` — 'pending' (still the placeholder; eligible for one background generation) →
+    //     'generated' (the background model named it once; locked from regen) | 'custom' (the user renamed it;
+    //     locked). The background pass guards its write with `WHERE title_state = 'pending'`, so a concurrent
+    //     rename always wins.
+    r#"
+    ALTER TABLE chat_sessions ADD COLUMN title_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (title_state IN ('pending','generated','custom'));
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -811,14 +825,14 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 26,
+            version, 27,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
              project milestones is v20; project active-date + manual priority is v21; \
              photo ingestion table is v22; chat ingestion foundation is v23; \
              chat per-chunk provenance + timestamp is v24; rolling chat summary is v25; \
-             last-turn prompt size for the context meter is v26)"
+             last-turn prompt size for the context meter is v26; chat title provenance is v27)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1308,6 +1322,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(measured, Some(12345));
+    }
+
+    /// v27 lands chat title provenance (board card 7E): `chat_sessions.title_state` defaults to 'pending'
+    /// (the placeholder a fresh session carries), the CHECK rejects anything outside the three states, and a
+    /// user rename to 'custom' round-trips — the value the background title pass keys on to never overwrite.
+    #[test]
+    fn title_state_column_lands_pending_with_check() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute("INSERT INTO conversations DEFAULT VALUES", [])
+            .unwrap();
+        let conv: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope) VALUES (?1, 'general')",
+            rusqlite::params![conv],
+        )
+        .unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT title_state FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "pending", "a fresh session is still the placeholder");
+
+        // The CHECK rejects an out-of-set value.
+        let bad = conn.execute(
+            "UPDATE chat_sessions SET title_state = 'whatever' WHERE conversation_id = ?1",
+            rusqlite::params![conv],
+        );
+        assert!(bad.is_err(), "title_state CHECK rejects an unknown value");
+
+        // A user rename to 'custom' round-trips.
+        conn.execute(
+            "UPDATE chat_sessions SET title_state = 'custom' WHERE conversation_id = ?1",
+            rusqlite::params![conv],
+        )
+        .unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT title_state FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "custom");
     }
 
     /// v17 relaxed the `documents.importance` CHECK: 'archive' is now a valid level (and the

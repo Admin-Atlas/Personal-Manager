@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { ChatView } from "./components/ChatView";
+import { ConversationTitle } from "./components/ConversationTitle";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
 import { ContextMeter } from "./components/ContextMeter";
@@ -89,6 +90,8 @@ export default function App() {
   // send must not write its result into a conversation the user has since left.
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
+  // The on-screen conversation's row (for the editable title header); null on a fresh, unsent chat.
+  const activeConv = conversations.find((c) => c.id === activeId) ?? null;
   // Chat send/stream state lives in a shared hook so the global chat and the
   // per-project chat can't drift apart (see useChatStream). The guard key is the
   // conversation currently on screen.
@@ -513,6 +516,19 @@ export default function App() {
                   }}
                 >
                   {chat.error}
+                </div>
+              )}
+              {activeConv && (
+                <div className="flex items-center border-b border-rule px-4 py-2">
+                  <ConversationTitle
+                    conversationId={activeConv.id}
+                    title={activeConv.title}
+                    onRenamed={(title) =>
+                      setConversations((prev) =>
+                        prev.map((c) => (c.id === activeConv.id ? { ...c, title } : c)),
+                      )
+                    }
+                  />
                 </div>
               )}
               <ChatView messages={chat.messages} streaming={chat.streaming} />

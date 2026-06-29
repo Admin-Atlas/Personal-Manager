@@ -269,6 +269,11 @@ export const createConversation = (project?: string | null) =>
 export const getMessages = (conversationId: number) =>
   invoke<Message[]>("get_messages", { conversationId });
 
+/** Rename a conversation (board card 7E). Latches the title as user-chosen so the background title pass
+ *  never overwrites it. Returns the saved (trimmed/clamped) title. */
+export const renameConversation = (conversationId: number, title: string) =>
+  invoke<string>("rename_conversation", { conversationId, title });
+
 /**
  * Send a message and stream the assistant's reply. `onEvent` fires for every
  * token, then once on completion (or error). The returned promise resolves when
