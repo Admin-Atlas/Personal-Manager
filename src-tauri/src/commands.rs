@@ -1198,7 +1198,7 @@ pub async fn send_message(
 
 /// The chat context-usage meter + alert state (card 7D). `percent`/`context_window`/`used_tokens` are
 /// `None` when unknown (a custom model with no catalogued window, or no reply measured yet) ⇒ the UI shows
-/// "unknown" and never alerts. `regime` is "summary" once a rolling summary exists, else "window".
+/// "unknown" and never alerts.
 #[derive(Serialize)]
 pub struct ContextStatus {
     pub model: String,
@@ -1208,7 +1208,6 @@ pub struct ContextStatus {
     /// Whether usage has crossed the alert fraction — decided in Rust (the one source of truth) so the UI
     /// just renders. Always false when `percent` is unknown.
     pub alerting: bool,
-    pub regime: String,
     pub compress: context_budget::CompressDecision,
     pub upgrade: Vec<context_budget::ModelOption>,
 }
@@ -1248,10 +1247,6 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
     let (summary, cursor, used_tokens) = session.unwrap_or((None, None, None));
 
     let uncovered_pairs = chat::completed_turn_pairs_after(&conn, conversation_id, cursor)?.len();
-    let summary_present = summary
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty());
     let summary_tokens_est = summary
         .as_deref()
         .map(context_budget::est_tokens)
@@ -1283,7 +1278,6 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
         used_tokens,
         percent,
         alerting: context_budget::is_alerting(percent),
-        regime: if summary_present { "summary" } else { "window" }.to_string(),
         compress,
         upgrade,
     })
