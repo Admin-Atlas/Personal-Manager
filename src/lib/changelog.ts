@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.58.0-alpha",
+    date: "2026-07-01",
+    highlights: [
+      "Your calendars, together at last. A new Calendar tab gathers every calendar you’ve connected — Google, Outlook, and iCal — into one read-only agenda, colour-coded by source. Show or hide any calendar on the fly (it’s instant, nothing re-syncs), step through by month, and hit Refresh for the latest; PM also keeps the view quietly up to date in the background.",
+      "Under the hood, PM now mirrors a full year ahead (and the month behind), not just the next three weeks — so the calendar has the room to grow. Month, week, day, and year views are coming next.",
+    ],
+  },
+  {
     version: "2.57.1-alpha",
     date: "2026-07-01",
     highlights: [

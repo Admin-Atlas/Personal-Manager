@@ -587,6 +587,10 @@ export const syncCalendar = () => invoke<number>("sync_calendar");
 /** Upcoming events in the mirror, for the focus-view agenda. */
 export const listCalendarEvents = () => invoke<CalendarEvent[]>("list_calendar_events");
 
+/** Every mirrored event across the widened band (previous month → ~a year ahead), for the unified
+ *  calendar view (card 8). The client filters to the visible range + locally-hidden calendars. */
+export const listAllCalendarEvents = () => invoke<CalendarEvent[]>("list_all_calendar_events");
+
 // --- Google Drive (index-only connector, board card 4A) ---
 
 /** The Drive connector's state: whether the shared Google client is set up + connected accounts. */

@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { CalendarView } from "./components/calendar/CalendarView";
 import { ChatView } from "./components/ChatView";
 import { ConversationTitle } from "./components/ConversationTitle";
 import { CommandPalette } from "./components/CommandPalette";
@@ -53,6 +54,7 @@ import {
   setChatModels,
   setHelpMode,
   startSemanticLayout,
+  syncCalendar,
   vaultLockStatus,
   vaultStatus,
 } from "./lib/ipc";
@@ -324,6 +326,29 @@ export default function App() {
     if (keySet) void resumeOneDriveSync().catch(() => {});
   }, [keySet]);
 
+  // Keep the read-only calendar mirror fresh in the background: one poll shortly after unlock, then
+  // every 15 minutes. The mirror feeds the calendar view, the focus agenda, the daily briefing, and
+  // chat's "what's on" answer, so it belongs at app scope (not the tab, which unmounts). Best-effort
+  // and guarded against overlap; a manual "Refresh now" in the calendar header re-polls on demand.
+  useEffect(() => {
+    if (!keySet) return;
+    let syncing = false;
+    const poll = async () => {
+      if (syncing) return;
+      syncing = true;
+      try {
+        await syncCalendar();
+      } catch {
+        // A provider being unreachable is surfaced in the calendar header, not here.
+      } finally {
+        syncing = false;
+      }
+    };
+    void poll();
+    const id = setInterval(() => void poll(), 15 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [keySet]);
+
   // Pre-compute the Map's layouts in the background after unlock, at idle priority: the by-project
   // force layout off the main thread (a worker), and the semantic layout in the backend (which defers
   // to an active Drive sync). Both prime caches so opening the Map is instant and never stutters launch.
@@ -535,6 +560,10 @@ export default function App() {
                 onOpenChatCitation={openChatCitation}
                 onBack={() => setView("focus")}
               />
+            </main>
+          ) : view === "calendar" ? (
+            <main className="flex h-full flex-1 flex-col">
+              <CalendarView />
             </main>
           ) : view === "documents" ? (
             <main className="flex h-full flex-1 flex-col">

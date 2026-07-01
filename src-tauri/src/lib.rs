@@ -693,6 +693,7 @@ pub fn run() {
             commands::clear_google_client,
             commands::sync_calendar,
             commands::list_calendar_events,
+            commands::list_all_calendar_events,
             commands::connect_drive,
             commands::disconnect_drive,
             commands::list_drive_accounts,

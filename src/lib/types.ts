@@ -463,8 +463,14 @@ export interface CalendarOverview {
   calendars: Calendar[];
   /** ISO timestamp of the last successful sync, if any. */
   last_sync: string | null;
-  /** How far ahead PM mirrors events (and the agenda horizon), in days. */
+  /** How far ahead the focus-view agenda looks (the narrow horizon), in days. */
   window_days: number;
+  /** The mirrored band start (RFC3339): the unified view shows an "outside synced range" hint
+   *  when the user pages before this. */
+  mirror_start: string;
+  /** The mirrored band end (RFC3339): the unified view shows an "outside synced range" hint when
+   *  the user pages after this. */
+  mirror_end: string;
 }
 
 /** A subscribed iCal feed, without its secret URL (for display). `provider` tags it for grouping. */

@@ -11,6 +11,7 @@ export type View =
   | "focus"
   | "project"
   | "chat"
+  | "calendar"
   | "documents"
   | "review"
   | "teach"
@@ -116,6 +117,13 @@ export function Sidebar({
         </NavItem>
         <NavItem active={view === "chat"} onClick={() => onNavigate("chat")} helpId="nav-chat">
           Chat
+        </NavItem>
+        <NavItem
+          active={view === "calendar"}
+          onClick={() => onNavigate("calendar")}
+          helpId="nav-calendar"
+        >
+          Calendar
         </NavItem>
         <NavItem
           active={view === "documents"}

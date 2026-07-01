@@ -30,3 +30,5 @@ export { useDepth } from "./depth";
 export type { DepthState } from "./depth";
 
 export { graphColor } from "./graphPalette";
+
+export { sourcePalette, sourceColors } from "./sourcePalette";

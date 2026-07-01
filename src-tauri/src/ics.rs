@@ -17,20 +17,6 @@ use chrono_tz::Tz as ChronoTz;
 
 use crate::calendar::CalendarEvent;
 
-/// Parse an ICS feed into events from yesterday through `window_days` ahead. `tz` is
-/// the user's zone, used to anchor floating/all-day values (an ICS feed carries no
-/// viewer zone). The window itself stays an absolute UTC instant range.
-pub fn parse_feed(text: &str, feed_id: &str, window_days: i64, tz: ChronoTz) -> Vec<CalendarEvent> {
-    let now = Utc::now();
-    parse_feed_within(
-        text,
-        feed_id,
-        now - Duration::days(1),
-        now + Duration::days(window_days),
-        tz,
-    )
-}
-
 /// Defensive caps for a hostile or oversized feed: bound how many VEVENT blocks we
 /// parse and how many expanded occurrences we keep. The 10 MiB body cap (see
 /// `calendar::read_capped`) already bounds the input; these bound the work and the
