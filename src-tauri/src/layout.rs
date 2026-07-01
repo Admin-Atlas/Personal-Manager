@@ -213,12 +213,16 @@ fn importance_ranks(conn: &Connection) -> Result<HashMap<i64, u8>> {
 }
 
 /// Cheap signature of the document set (ids + leaf-chunk counts), without reading any vector blobs —
-/// so the freshness check on a warm cache stays fast.
+/// so the freshness check on a warm cache stays fast. Archived documents (any source, chat included) are
+/// excluded here exactly as in [`document_vectors`], so archiving/un-archiving shifts the signature and
+/// invalidates the cache — the Map recomputes without the archived node.
 fn doc_signatures(conn: &Connection) -> Result<Vec<(i64, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT c.document_id, count(*) \
          FROM chunk_vec cv JOIN chunks c ON cv.rowid = c.id \
-         WHERE c.kind = 'leaf' GROUP BY c.document_id ORDER BY c.document_id",
+         JOIN documents d ON d.id = c.document_id \
+         WHERE c.kind = 'leaf' AND d.importance IS NOT 'archive' \
+         GROUP BY c.document_id ORDER BY c.document_id",
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -241,11 +245,15 @@ fn document_vectors(conn: &Connection) -> Result<Vec<DocVec>> {
     let dim = db::vec0_dim(conn)?;
     let importance = importance_ranks(conn)?;
 
+    // Archive-as-outcome (card F): an archived document — of ANY source, chat included — is hidden from the
+    // Map (`d.importance IS NOT 'archive'` also admits the NULL/untriaged case). It stays keyword-findable
+    // via FTS; only the semantic graph excludes it.
     let mut acc: BTreeMap<i64, (Vec<f64>, usize)> = BTreeMap::new();
     let mut stmt = conn.prepare(
         "SELECT c.document_id, cv.embedding \
          FROM chunk_vec cv JOIN chunks c ON cv.rowid = c.id \
-         WHERE c.kind = 'leaf'",
+         JOIN documents d ON d.id = c.document_id \
+         WHERE c.kind = 'leaf' AND d.importance IS NOT 'archive'",
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -646,5 +654,52 @@ mod tests {
         // The cheap signature path sees the same single document with two leaves.
         let sigs = doc_signatures(&conn).unwrap();
         assert_eq!(sigs, vec![(doc_id, 2)]);
+    }
+
+    /// Archive-as-outcome (card F): an archived document is hidden from the Map — absent from both the
+    /// vector assembly and the freshness signature — while an active document stays. Applies to any source.
+    #[test]
+    fn archived_documents_are_excluded_from_the_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("pm.sqlite"), KEY).unwrap();
+        let dim = db::vec0_dim(&conn).unwrap();
+        let make_vec = |v: f64| format!("[{}]", vec![v.to_string(); dim].join(","));
+
+        // One active document, one archived — each with a single leaf chunk + vector.
+        let add = |vault: &str, importance: &str, val: f64| -> i64 {
+            conn.execute(
+                "INSERT INTO documents(vault_path, title, content_hash, project, importance) \
+                 VALUES (?1, 'T', ?1, 'PM', ?2)",
+                params![vault, importance],
+            )
+            .unwrap();
+            let doc_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO chunks(document_id, ordinal, content, char_count, kind) \
+                 VALUES (?1, 0, 'c', 1, 'leaf')",
+                params![doc_id],
+            )
+            .unwrap();
+            let chunk_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+                params![chunk_id, make_vec(val)],
+            )
+            .unwrap();
+            doc_id
+        };
+        let active = add("active.md", "high", 0.1);
+        add("archived.md", "archive", 0.2);
+
+        let docs = document_vectors(&conn).unwrap();
+        assert_eq!(docs.len(), 1, "only the active document is a node");
+        assert_eq!(docs[0].doc_id, active);
+
+        let sigs = doc_signatures(&conn).unwrap();
+        assert_eq!(
+            sigs,
+            vec![(active, 1)],
+            "archived doc absent from the signature too"
+        );
     }
 }

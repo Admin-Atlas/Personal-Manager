@@ -268,6 +268,13 @@ fn commit_session_index(
                 "UPDATE documents SET last_activity = ?1 WHERE id = ?2",
                 params![cursor_at, doc_id],
             )?;
+            // Card F append re-evaluation: substantive new turns on an ALREADY-EXISTING chat row can turn a
+            // throwaway (archived) or already-filed chat into a real discussion — the classification must not
+            // be sticky. Only fires on an append (`plan.document_id` was set on entry), never on the birth
+            // above (which was just classified). Keys on the appended turns, not the whole history.
+            if plan.document_id.is_some() {
+                reevaluate_on_append(&tx, doc_id, &plan.scope)?;
+            }
         }
     }
 
@@ -283,13 +290,17 @@ fn commit_session_index(
     Ok((doc_id, appended))
 }
 
-/// The `documents` row for a chat session, born on first index. The org fields take ingest defaults
-/// (the chat enters the system like a fresh document); `project` is the chat's ORIGIN — a project-scoped
-/// chat belongs to its project, a general chat lands in `Unsorted` (card F may refile either). The stable
-/// `chat:<id>` identity + body-independent `content_hash` are what let an append-growing chat keep one
-/// UNIQUE document identity across every re-index.
+/// The `documents` row for a chat session, born on first index. Card F routing keys on the chat's ORIGIN
+/// scope: a **project** chat is born already-filed — linked to its project, HIGH importance (most relevant
+/// and recent), and `reviewed: true` so it skips the review queue (already scoped and trusted). A
+/// **general** chat takes ingest defaults — `Unsorted`, no importance, `reviewed: false` — so it lands in
+/// the review queue for the AI to propose project/tags/importance and the user to approve (card F refiles).
+/// This mirrors the vault front-matter [`chat::render_chat_frontmatter`] writes at creation, so file and
+/// row agree without a cross-write. The stable `chat:<id>` identity + body-independent `content_hash` are
+/// what let an append-growing chat keep one UNIQUE document identity across every re-index.
 fn chat_doc_meta(plan: &SessionPlan, last_at: &str) -> DocMeta {
-    let project = if plan.scope == "project" {
+    let is_project = plan.scope == "project";
+    let project = if is_project {
         plan.project
             .as_deref()
             .map(str::trim)
@@ -310,11 +321,55 @@ fn chat_doc_meta(plan: &SessionPlan, last_at: &str) -> DocMeta {
         ingested_at: last_at.to_string(),
         project,
         tags: Vec::new(),
-        importance: None,
-        reviewed: false,
+        importance: is_project.then(|| "high".to_string()),
+        reviewed: is_project,
         last_activity: Some(last_at.to_string()),
         source: SourceMeta::chat(chat::source_id(plan.conversation_id)),
     }
+}
+
+/// Card F append re-evaluation: when substantive new turns land on a chat's already-existing `documents`
+/// row, re-open its classification so a sticky bucket can't quietly bury content (an archived "what's the
+/// weather" chat that becomes a real planning session must not stay archived + downranked). Applied to the
+/// appended turns only — the caller fires this exactly when the sweep produced new chunks. Pure DB, inside
+/// the caller's transaction, so it commits atomically with the chunks + cursor.
+///
+/// The rules, by the doc's current `(importance, reviewed)` and the chat's ORIGIN `scope`:
+/// - **Archived, project chat** → un-archive back to the trusted-scope defaults (`high` / `reviewed`).
+/// - **Archived, general chat** → un-archive and re-open the review queue (`importance` cleared,
+///   `reviewed = 0`) so the AI re-proposes on the new content.
+/// - **Filed (reviewed) general chat** → re-open the queue (`reviewed = 0`) for another review pass, since
+///   the appended turns may change its bucket. (Accepted review-queue churn on an actively-used chat.)
+/// - **Project chat, not archived** → no-op: it is already `high` / `reviewed` / filed to its project.
+fn reevaluate_on_append(tx: &Connection, doc_id: i64, scope: &str) -> Result<()> {
+    let (importance, reviewed): (Option<String>, bool) = tx.query_row(
+        "SELECT importance, reviewed FROM documents WHERE id = ?1",
+        params![doc_id],
+        |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+    )?;
+    let archived = importance.as_deref() == Some("archive");
+    let is_project = scope == "project";
+
+    if archived && is_project {
+        tx.execute(
+            "UPDATE documents SET importance = 'high', reviewed = 1 WHERE id = ?1",
+            params![doc_id],
+        )?;
+    } else if archived {
+        // General chat: clear the archive shelving and send it back through review.
+        tx.execute(
+            "UPDATE documents SET importance = NULL, reviewed = 0 WHERE id = ?1",
+            params![doc_id],
+        )?;
+    } else if !is_project && reviewed {
+        // Already-filed general chat: re-open review so the new turns can re-file it.
+        tx.execute(
+            "UPDATE documents SET reviewed = 0 WHERE id = ?1",
+            params![doc_id],
+        )?;
+    }
+    // Project chat that is not archived is already filed correctly — nothing to do.
+    Ok(())
 }
 
 /// One turn-pair as the text we embed: **authored content only** — exactly what the user wrote and what
@@ -707,6 +762,167 @@ mod tests {
             .unwrap();
         assert_eq!(linked, None, "still unlinked");
         assert_eq!(cursor, Some(6), "but the cursor advanced past the chatter");
+    }
+
+    /// A project-scoped session: `conversations.project` set (the ORIGIN), `chat_sessions.scope='project'`.
+    fn new_project_session(conn: &Connection, project: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO conversations(title, project) VALUES ('My chat', ?1)",
+            params![project],
+        )
+        .unwrap();
+        let conv = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope, vault_path) VALUES (?1, 'project', ?2)",
+            params![conv, format!("vault/chat-{conv}.md")],
+        )
+        .unwrap();
+        conv
+    }
+
+    fn doc_org(conn: &Connection, doc_id: i64) -> (String, Option<String>, bool) {
+        conn.query_row(
+            "SELECT project, importance, reviewed FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn general_chat_is_born_unsorted_for_the_review_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+        let p = plan(&conn, conv);
+        let (doc_id, _) = commit_session_index(
+            &mut conn,
+            &p,
+            &[segment(2, "2026-06-28T10:00:01.000Z", "hi")],
+            2,
+            "2026-06-28T10:00:01.000Z",
+        )
+        .unwrap();
+        let (project, importance, reviewed) = doc_org(&conn, doc_id.unwrap());
+        assert_eq!(project, "Unsorted");
+        assert_eq!(importance, None, "no importance until the user reviews it");
+        assert!(!reviewed, "general chat lands in the review queue");
+    }
+
+    #[test]
+    fn project_chat_is_born_filed_and_skips_the_review_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_project_session(&conn, "Atlas - PM");
+        let p = plan(&conn, conv);
+        let (doc_id, _) = commit_session_index(
+            &mut conn,
+            &p,
+            &[segment(2, "2026-06-28T10:00:01.000Z", "hi")],
+            2,
+            "2026-06-28T10:00:01.000Z",
+        )
+        .unwrap();
+        let (project, importance, reviewed) = doc_org(&conn, doc_id.unwrap());
+        assert_eq!(project, "Atlas - PM", "auto-linked to its origin project");
+        assert_eq!(
+            importance.as_deref(),
+            Some("high"),
+            "most relevant + recent"
+        );
+        assert!(reviewed, "trusted scope skips the review queue");
+    }
+
+    /// Card F append re-evaluation. Helper: birth a chat doc, force it into a `(importance, reviewed)`
+    /// state, then append one more substantive turn and return the re-evaluated org.
+    fn append_after(
+        conn: &mut Connection,
+        conv: i64,
+        set_importance: Option<&str>,
+        set_reviewed: bool,
+    ) -> (Option<String>, bool) {
+        let p = plan(conn, conv);
+        let (doc_id, _) = commit_session_index(
+            conn,
+            &p,
+            &[segment(2, "2026-06-28T10:00:01.000Z", "first")],
+            2,
+            "2026-06-28T10:00:01.000Z",
+        )
+        .unwrap();
+        let doc_id = doc_id.unwrap();
+        conn.execute(
+            "UPDATE documents SET importance = ?1, reviewed = ?2 WHERE id = ?3",
+            params![set_importance, set_reviewed as i64, doc_id],
+        )
+        .unwrap();
+        // A later substantive turn on the now-existing row triggers re-evaluation.
+        let p2 = plan(conn, conv);
+        commit_session_index(
+            conn,
+            &p2,
+            &[segment(
+                4,
+                "2026-06-28T10:05:00.000Z",
+                "a real discussion now",
+            )],
+            4,
+            "2026-06-28T10:05:00.000Z",
+        )
+        .unwrap();
+        let (_, importance, reviewed) = doc_org(conn, doc_id);
+        (importance, reviewed)
+    }
+
+    #[test]
+    fn append_unarchives_and_requeues_a_general_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+        let (importance, reviewed) = append_after(&mut conn, conv, Some("archive"), false);
+        assert_eq!(importance, None, "un-archived");
+        assert!(
+            !reviewed,
+            "re-opened for review so the new content is re-proposed"
+        );
+    }
+
+    #[test]
+    fn append_unarchives_a_project_chat_back_to_high() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_project_session(&conn, "Atlas - PM");
+        let (importance, reviewed) = append_after(&mut conn, conv, Some("archive"), false);
+        assert_eq!(
+            importance.as_deref(),
+            Some("high"),
+            "trusted scope returns to high"
+        );
+        assert!(reviewed, "still skips the queue");
+    }
+
+    #[test]
+    fn append_requeues_an_already_filed_general_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+        let (importance, reviewed) = append_after(&mut conn, conv, Some("medium"), true);
+        assert_eq!(
+            importance.as_deref(),
+            Some("medium"),
+            "importance preserved"
+        );
+        assert!(!reviewed, "re-opened for another review pass");
+    }
+
+    #[test]
+    fn append_leaves_an_active_project_chat_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_project_session(&conn, "Atlas - PM");
+        let (importance, reviewed) = append_after(&mut conn, conv, Some("high"), true);
+        assert_eq!(importance.as_deref(), Some("high"));
+        assert!(reviewed, "already filed correctly — a no-op");
     }
 
     #[test]
