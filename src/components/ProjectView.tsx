@@ -221,9 +221,12 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
                   : ""
               }`}
             >
-              <div className="flex items-center gap-1.5">
+              <div className="flex min-w-0 items-center gap-1.5">
                 {d.source_type === "chat" && <ChatBadge compact />}
-                <span className="truncate font-head text-sm text-ink2" title={d.title}>
+                <span
+                  className="min-w-0 flex-1 truncate font-head text-sm text-ink2"
+                  title={d.title}
+                >
                   {d.title}
                 </span>
               </div>

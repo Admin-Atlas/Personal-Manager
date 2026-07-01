@@ -223,7 +223,7 @@ function PreferenceRow({
                 className="rounded-[var(--radius-sm)] border border-border px-1.5 py-0.5 text-ink4"
                 title={
                   fromChat
-                    ? "PM noticed you state this in chat — keep it if it's right."
+                    ? "PM noticed you said this in chat — keep it if it's right."
                     : "PM carried this over from your earlier profile — keep it if it's right."
                 }
               >

@@ -20,8 +20,9 @@ export function ChatBadge({ compact = false }: { compact?: boolean }) {
     <span
       className="inline-flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-accent-text"
       title={TITLE}
+      aria-label="From a conversation"
     >
-      💬 Chat
+      <span aria-hidden="true">💬</span> Chat
     </span>
   );
 }
