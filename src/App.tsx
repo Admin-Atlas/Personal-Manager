@@ -28,6 +28,8 @@ import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { useChatStream } from "./lib/useChatStream";
+import { useProjectChat } from "./lib/useProjectChat";
+import { isNewChatTrigger } from "./lib/chatSession";
 import { useUpdater } from "./lib/useUpdater";
 import { useDevMode } from "./lib/capabilities";
 import { useTheme } from "./theme";
@@ -83,6 +85,12 @@ export default function App() {
     setSelectedDocId(focusDocId ?? null);
     setView("project");
   }
+
+  // The open project's scoped chat session. Lifted here (not inside ProjectView) so the left
+  // sidebar can list this project's conversations like the global chat, while ProjectView renders
+  // the active thread — both read one source (board card 7E). Dormant when no project is open.
+  const projectChat = useProjectChat(selectedProject);
+  const inProject = view === "project" && selectedProject != null;
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
@@ -334,6 +342,12 @@ export default function App() {
   }
 
   async function handleSend(text: string) {
+    // Power-user parity with "+ New": /new · /done starts a fresh chat instead of sending, so the
+    // trigger never reaches the model or the vault (board card 7E).
+    if (isNewChatTrigger(text)) {
+      newConversation();
+      return;
+    }
     let convId = activeId;
     if (convId == null) {
       try {
@@ -443,17 +457,25 @@ export default function App() {
           <Sidebar
             view={view}
             onNavigate={setView}
-            conversations={conversations}
-            activeId={activeId}
+            conversations={inProject ? projectChat.conversations : conversations}
+            activeId={inProject ? projectChat.convId : activeId}
             reviewCount={reviewCount}
-            onSelect={(id) => {
-              setView("chat");
-              selectConversation(id);
-            }}
-            onNew={() => {
-              setView("chat");
-              newConversation();
-            }}
+            onSelect={
+              inProject
+                ? projectChat.openConversation
+                : (id) => {
+                    setView("chat");
+                    selectConversation(id);
+                  }
+            }
+            onNew={
+              inProject
+                ? projectChat.newChat
+                : () => {
+                    setView("chat");
+                    newConversation();
+                  }
+            }
             onOpenSettings={() => setShowSettings(true)}
             onOpenWhatsNew={() => setShowWhatsNew(true)}
             onOpenPalette={() => setShowPalette(true)}
@@ -477,6 +499,7 @@ export default function App() {
             <main className="flex h-full flex-1 flex-col">
               <ProjectView
                 project={selectedProject}
+                chat={projectChat}
                 focusDocId={selectedDocId}
                 onBack={() => setView("focus")}
               />

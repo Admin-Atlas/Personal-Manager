@@ -5,16 +5,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Composer } from "./Composer";
 import {
-  createConversation,
-  getMessages,
   listCalendarEvents,
   listDocuments,
   listMilestones,
   listProjects,
   setDocumentMetadata,
 } from "../lib/ipc";
-import { useChatStream } from "../lib/useChatStream";
 import { useResizable } from "../lib/useResizable";
+import { useSidebarSplit } from "../lib/useSidebarSplit";
+import { idleSince } from "../lib/chatSession";
+import type { ProjectChat } from "../lib/useProjectChat";
 import type { CalendarEvent, Document, Milestone } from "../lib/types";
 import { Button, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
@@ -33,29 +33,25 @@ interface FileSort {
 
 interface Props {
   project: string;
+  /** The project's scoped chat session (owned by App so the left sidebar can list it too). */
+  chat: ProjectChat;
   /** A file to scroll to and briefly highlight (set by the command palette). */
   focusDocId?: number | null;
   onBack: () => void;
 }
 
-/** Per-project scoped view (spec §4): the project's files alongside a chat whose
- *  retrieval is confined to just this project — "everything narrows to just it".
- *  The scoped chat keeps its own conversation (created lazily on first message
- *  with this project set, so the backend scopes grounding to it). */
-export function ProjectView({ project, focusDocId, onBack }: Props) {
+/** Per-project scoped view (spec §4): the project's files alongside a chat whose retrieval is
+ *  confined to just this project — "everything narrows to just it". The scoped chat's session lives
+ *  in App (so the left sidebar lists this project's conversations, like the global chat); this view
+ *  renders the active thread plus the project's milestones and documents. */
+export function ProjectView({ project, chat, focusDocId, onBack }: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
-  const [convId, setConvId] = useState<number | null>(null);
-  // Mirror convId for the stream guard so switching projects (which nulls convId)
-  // abandons an in-flight reply instead of letting it land in the new project.
-  const convIdRef = useRef(convId);
-  convIdRef.current = convId;
-  const chat = useChatStream(() => convIdRef.current);
   /** The file the palette jumped to — flashed briefly, then cleared. */
   const [flashId, setFlashId] = useState<number | null>(null);
   const filesRef = useRef<HTMLUListElement>(null);
-  const { showMeta, showPower } = useDepth();
+  const { atLeast, showMeta, showPower } = useDepth();
   // The focus-panel triage controls are the same learning tool as the Review/Teach tabs, so they
   // ride the same Settings switch: when the user trusts the AI's filing and hides those tabs, these
   // hide too (the panel falls back to the read-only display below).
@@ -77,6 +73,14 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
     maxFrac: 0.5,
     edge: "left",
   });
+  // The sidebar's Milestones (top) / Files (bottom) split. The ratio is a hard pref across the app
+  // (card 7E) — see useSidebarSplit. Only in play when the Milestones panel is shown.
+  const {
+    topFrac,
+    containerRef: splitRef,
+    startResize: startSplit,
+    resizing: splitting,
+  } = useSidebarSplit();
 
   function toggleSort(key: FileSortKey) {
     setSort((cur) =>
@@ -105,10 +109,8 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
   };
 
   useEffect(() => {
-    // Reset chat when switching projects (also abandons any in-flight reply).
-    setConvId(null);
-    chat.clearTransient();
-    chat.setMessages([]);
+    // Load this project's documents/milestones/calendar. The chat session (App-owned) re-inits
+    // itself on the same project change.
     listDocuments()
       .then((all) => setDocuments(all.filter((d) => d.project === project)))
       .catch((e) => chat.setError(String(e)));
@@ -162,28 +164,120 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
     }
   }
 
-  async function handleSend(text: string) {
-    let id = convId;
-    if (id == null) {
-      try {
-        const created = await createConversation(project);
-        id = created.id;
-        setConvId(id);
-      } catch (e) {
-        chat.setError(String(e));
-        return;
-      }
-    }
+  // Reopening a chat idle > 24h offers a clean start (card 7E) — purely UX framing; the turns were
+  // already indexed under card B. Only for a loaded, settled thread the user hasn't dismissed.
+  const idleDate =
+    atLeast("standard") &&
+    chat.convId != null &&
+    chat.streaming === null &&
+    chat.dismissedIdleFor !== chat.convId
+      ? idleSince(chat.messages, Date.now())
+      : null;
 
-    await chat.send(id, text);
+  // Split the sidebar 50-50 (draggable) only when there are actual milestones to balance against
+  // Files. With none, Files fills the space — the add-a-milestone control (Depth-gated) just sits
+  // above it at its natural height, no divider. So an empty project doesn't waste half the sidebar.
+  const hasMilestones = milestones.length > 0;
+  const showAddMilestone = showMeta && !hasMilestones;
 
-    // Adopt the persisted messages only if we're still on this project's chat.
-    try {
-      if (convIdRef.current === id) chat.setMessages(await getMessages(id));
-    } catch {
-      /* keep optimistic state on reload failure */
-    }
-  }
+  const filesPanel = (
+    <>
+      <div className="flex items-center justify-between gap-2 px-4 pb-1 pt-3">
+        <span className="font-mono text-xs uppercase tracking-wide text-ink4">Files</span>
+        {documents.length > 1 && (
+          <div className="flex items-center gap-2 text-[10px] text-ink4">
+            <FileSortButton label="Name" sortKey="name" sort={sort} onSort={toggleSort} />
+            <FileSortButton
+              label="Importance"
+              sortKey="importance"
+              sort={sort}
+              onSort={toggleSort}
+            />
+          </div>
+        )}
+      </div>
+      {teachVisible && showPower && (
+        <datalist id={PROJECT_LIST_ID}>
+          {projectNames.map((name) => (
+            <option key={name} value={name} />
+          ))}
+        </datalist>
+      )}
+      {documents.length === 0 ? (
+        <p className="px-4 py-2 text-xs text-ink4">No documents in this project.</p>
+      ) : (
+        <ul ref={filesRef} className="flex flex-col gap-0.5 px-2 pb-4">
+          {sortedDocs.map((d) => (
+            <li
+              key={d.id}
+              data-doc-id={d.id}
+              className={`rounded-[var(--radius-sm)] px-2 py-1.5 transition-colors hover:bg-surface ${
+                flashId === d.id
+                  ? "bg-surface ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]"
+                  : ""
+              }`}
+            >
+              <div className="truncate font-head text-sm text-ink2" title={d.title}>
+                {d.title}
+              </div>
+              {teachVisible ? (
+                // Manual triage, same controls as the Review tab. Everyone gets the importance
+                // toggle; power depth also gets project (re-file) + tags, like a Review row.
+                <div className="mt-1.5 flex flex-col gap-1.5">
+                  {showPower && (
+                    <label className="flex items-center gap-1.5 text-xs text-ink4">
+                      <span className="shrink-0">Project</span>
+                      <Input
+                        key={d.project}
+                        list={PROJECT_LIST_ID}
+                        defaultValue={d.project}
+                        onBlur={(e) => {
+                          const v = e.target.value.trim();
+                          if (v && v !== d.project) void saveMeta(d, { project: v });
+                        }}
+                        className="h-6 w-full text-xs"
+                      />
+                    </label>
+                  )}
+                  <ImportancePicker
+                    value={d.importance}
+                    onChange={(importance) => void saveMeta(d, { importance })}
+                  />
+                  {showPower && (
+                    <TagEditor tags={d.tags} onChange={(tags) => void saveMeta(d, { tags })} />
+                  )}
+                </div>
+              ) : (
+                showMeta && (
+                  <div className="flex gap-2 font-mono text-xs text-ink4">
+                    {d.importance && <span className="capitalize">{d.importance}</span>}
+                    <span>
+                      {d.chunk_count} chunk{d.chunk_count === 1 ? "" : "s"}
+                    </span>
+                  </div>
+                )
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+
+  const milestonesPanel = (
+    <div className="px-4 pb-3 pt-3" data-help="project-milestones">
+      <span className="font-mono text-xs uppercase tracking-wide text-ink4">Milestones</span>
+      <div className="mt-2">
+        <MilestoneList
+          project={project}
+          milestones={milestones}
+          calendarEvents={calendarEvents}
+          onChanged={refreshMilestones}
+          readOnly={!showMeta}
+        />
+      </div>
+    </div>
+  );
 
   return (
     <div className="flex h-full flex-col">
@@ -215,13 +309,34 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
             </div>
           )}
           <ChatView messages={chat.messages} streaming={chat.streaming} />
-          <Composer disabled={chat.sending} onSend={handleSend} />
+          {idleDate && (
+            <div
+              className="flex items-center justify-between gap-3 border-t border-border px-4 py-2 text-xs text-ink3"
+              data-help="chat-idle-prompt"
+            >
+              <span>This conversation has been idle since {idleDate}. Start a new one?</span>
+              <div className="flex shrink-0 items-center gap-3">
+                <Button variant="secondary" onClick={chat.newChat} className="px-2 py-1 text-xs">
+                  New chat
+                </Button>
+                <button
+                  type="button"
+                  onClick={() => chat.setDismissedIdleFor(chat.convId)}
+                  title="Dismiss"
+                  className="text-ink4 hover:text-ink2"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
+          <Composer disabled={chat.sending} onSend={chat.handleSend} />
         </main>
 
         <aside
           style={{ width: asideWidth }}
-          className="relative shrink-0 overflow-y-auto overflow-x-hidden border-l border-border bg-panel"
-          data-help="project-files"
+          className="relative flex shrink-0 flex-col overflow-hidden border-l border-border bg-panel"
+          data-help="project-sidebar"
         >
           <div
             onPointerDown={startResize}
@@ -234,100 +349,43 @@ export function ProjectView({ project, focusDocId, onBack }: Props) {
               resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
             }`}
           />
-          {(showMeta || milestones.length > 0) && (
-            <div className="border-b border-border px-4 pb-3 pt-3" data-help="project-milestones">
-              <span className="font-mono text-xs uppercase tracking-wide text-ink4">
-                Milestones
-              </span>
-              <div className="mt-2">
-                <MilestoneList
-                  project={project}
-                  milestones={milestones}
-                  calendarEvents={calendarEvents}
-                  onChanged={refreshMilestones}
-                  readOnly={!showMeta}
-                />
+          {hasMilestones ? (
+            // Milestones (top) + Files (bottom), split by a draggable divider (hard-pref ratio).
+            <div ref={splitRef} className="flex min-h-0 flex-1 flex-col">
+              <div
+                style={{ flexBasis: `${topFrac * 100}%` }}
+                className="min-h-0 shrink-0 grow-0 overflow-y-auto overflow-x-hidden"
+                data-help="project-milestones-panel"
+              >
+                {milestonesPanel}
+              </div>
+              <div
+                onPointerDown={startSplit}
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label="Resize milestones and files"
+                title="Drag to resize"
+                data-help="project-split"
+                className={`h-1.5 shrink-0 cursor-row-resize touch-none border-y border-border transition-colors hover:bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] ${
+                  splitting ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
+                }`}
+              />
+              <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">{filesPanel}</div>
+            </div>
+          ) : (
+            // No milestones yet: the (Depth-gated) add control sits at its natural height, Files
+            // fills the rest of the sidebar.
+            <div className="flex min-h-0 flex-1 flex-col">
+              {showAddMilestone && (
+                <div className="shrink-0 border-b border-border">{milestonesPanel}</div>
+              )}
+              <div
+                className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+                data-help="project-files"
+              >
+                {filesPanel}
               </div>
             </div>
-          )}
-          <div className="flex items-center justify-between gap-2 px-4 pb-1 pt-3">
-            <span className="font-mono text-xs uppercase tracking-wide text-ink4">Files</span>
-            {documents.length > 1 && (
-              <div className="flex items-center gap-2 text-[10px] text-ink4">
-                <FileSortButton label="Name" sortKey="name" sort={sort} onSort={toggleSort} />
-                <FileSortButton
-                  label="Importance"
-                  sortKey="importance"
-                  sort={sort}
-                  onSort={toggleSort}
-                />
-              </div>
-            )}
-          </div>
-          {teachVisible && showPower && (
-            <datalist id={PROJECT_LIST_ID}>
-              {projectNames.map((name) => (
-                <option key={name} value={name} />
-              ))}
-            </datalist>
-          )}
-          {documents.length === 0 ? (
-            <p className="px-4 py-2 text-xs text-ink4">No documents in this project.</p>
-          ) : (
-            <ul ref={filesRef} className="flex flex-col gap-0.5 px-2 pb-4">
-              {sortedDocs.map((d) => (
-                <li
-                  key={d.id}
-                  data-doc-id={d.id}
-                  className={`rounded-[var(--radius-sm)] px-2 py-1.5 transition-colors hover:bg-surface ${
-                    flashId === d.id
-                      ? "bg-surface ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]"
-                      : ""
-                  }`}
-                >
-                  <div className="truncate font-head text-sm text-ink2" title={d.title}>
-                    {d.title}
-                  </div>
-                  {teachVisible ? (
-                    // Manual triage, same controls as the Review tab. Everyone gets the importance
-                    // toggle; power depth also gets project (re-file) + tags, like a Review row.
-                    <div className="mt-1.5 flex flex-col gap-1.5">
-                      {showPower && (
-                        <label className="flex items-center gap-1.5 text-xs text-ink4">
-                          <span className="shrink-0">Project</span>
-                          <Input
-                            key={d.project}
-                            list={PROJECT_LIST_ID}
-                            defaultValue={d.project}
-                            onBlur={(e) => {
-                              const v = e.target.value.trim();
-                              if (v && v !== d.project) void saveMeta(d, { project: v });
-                            }}
-                            className="h-6 w-full text-xs"
-                          />
-                        </label>
-                      )}
-                      <ImportancePicker
-                        value={d.importance}
-                        onChange={(importance) => void saveMeta(d, { importance })}
-                      />
-                      {showPower && (
-                        <TagEditor tags={d.tags} onChange={(tags) => void saveMeta(d, { tags })} />
-                      )}
-                    </div>
-                  ) : (
-                    showMeta && (
-                      <div className="flex gap-2 font-mono text-xs text-ink4">
-                        {d.importance && <span className="capitalize">{d.importance}</span>}
-                        <span>
-                          {d.chunk_count} chunk{d.chunk_count === 1 ? "" : "s"}
-                        </span>
-                      </div>
-                    )
-                  )}
-                </li>
-              ))}
-            </ul>
           )}
         </aside>
       </div>

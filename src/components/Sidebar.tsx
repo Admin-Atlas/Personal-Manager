@@ -75,7 +75,7 @@ export function Sidebar({
             Alpha
           </span>
         </div>
-        {view === "chat" && (
+        {(view === "chat" || view === "project") && (
           <button
             onClick={onNew}
             title="New conversation"
@@ -150,7 +150,9 @@ export function Sidebar({
       </nav>
 
       <div className="flex-1 overflow-y-auto px-2">
-        {view === "chat" && (
+        {/* The global chat lists all conversations; an open project lists just its own (fed from
+            App's project chat session), so a project's history sits here like the global chat's. */}
+        {(view === "chat" || view === "project") && (
           <div data-help="conversations-list">
             <p className="px-2 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-faint">
               Conversations
