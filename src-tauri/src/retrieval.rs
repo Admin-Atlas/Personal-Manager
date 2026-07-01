@@ -47,6 +47,19 @@ pub struct RetrievedChunk {
     pub heading: Option<String>,
     pub content: String,
     pub ordinal: i64,
+    /// Provenance used only to build a chat-aware [`Citation`] (board card 7E PR3), never part of a
+    /// chunk's wire shape — `#[serde(skip)]` keeps search/explain payloads unchanged. `source_type`
+    /// is the document's kind ('vault'/'index_only'/'chat'…); the rest are populated only for a chat
+    /// chunk: `chat_turn_id` is the assistant message id the chunk came from, `chunk_at` its
+    /// timestamp, and `conversation_id` the chat it belongs to (via `chat_sessions.document_id`).
+    #[serde(skip)]
+    pub source_type: Option<String>,
+    #[serde(skip)]
+    pub chat_turn_id: Option<i64>,
+    #[serde(skip)]
+    pub chunk_at: Option<String>,
+    #[serde(skip)]
+    pub conversation_id: Option<i64>,
 }
 
 /// A document cited in an answer — the distinct documents the retrieved chunks
@@ -58,6 +71,18 @@ pub struct Citation {
     pub title: String,
     pub source_path: Option<String>,
     pub vault_path: String,
+    /// Chat-source provenance (board card 7E PR3): a citation drawn from a past chat carries a
+    /// pointer back to the exact turn so the UI can open the archived conversation there instead of
+    /// rendering it like a plain file. `#[serde(default)]` keeps citations persisted before this
+    /// field (in older `messages.citations` JSON) deserialising — they read back as non-chat.
+    #[serde(default)]
+    pub is_chat: bool,
+    #[serde(default)]
+    pub conversation_id: Option<i64>,
+    #[serde(default)]
+    pub turn_id: Option<i64>,
+    #[serde(default)]
+    pub dated: Option<String>,
 }
 
 /// Candidate pool per branch when scoping to one project (Step 5). The `vec0` KNN
@@ -431,9 +456,16 @@ fn load_chunks(conn: &Connection, ids: &[i64]) -> Result<Vec<RetrievedChunk>> {
     // `AND c.kind = 'leaf'` is belt-and-suspenders: parents are never in chunk_vec/chunks_fts,
     // so a fused id is always a leaf — but the guard means a stray parent id would be skipped
     // rather than surfaced as a citation.
+    // The LEFT JOIN resolves a chat document's conversation (1:1 via `chat_sessions.document_id`);
+    // a non-chat document has no session row, so `conversation_id` comes back NULL. `chat_turn_id` /
+    // `chunk_at` are NULL for every non-chat chunk. Together they let `citations_from` tag a chat
+    // citation with a turn pointer (card 7E PR3) without a second query.
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.document_id, d.title, d.source_path, d.vault_path, c.heading, c.content, c.ordinal \
-         FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = ?1 AND c.kind = 'leaf'",
+        "SELECT c.id, c.document_id, d.title, d.source_path, d.vault_path, c.heading, c.content, c.ordinal, \
+                d.source_type, c.chat_turn_id, c.chunk_at, cs.conversation_id \
+         FROM chunks c JOIN documents d ON d.id = c.document_id \
+         LEFT JOIN chat_sessions cs ON cs.document_id = d.id \
+         WHERE c.id = ?1 AND c.kind = 'leaf'",
     )?;
     let mut out = Vec::with_capacity(ids.len());
     for &id in ids {
@@ -447,6 +479,10 @@ fn load_chunks(conn: &Connection, ids: &[i64]) -> Result<Vec<RetrievedChunk>> {
                 heading: row.get(5)?,
                 content: row.get(6)?,
                 ordinal: row.get(7)?,
+                source_type: row.get(8)?,
+                chat_turn_id: row.get(9)?,
+                chunk_at: row.get(10)?,
+                conversation_id: row.get(11)?,
             })
         }) {
             Ok(c) => out.push(c),
@@ -583,11 +619,18 @@ pub fn citations_from(chunks: &[RetrievedChunk]) -> Vec<Citation> {
     let mut out = Vec::new();
     for c in chunks {
         if seen.insert(c.document_id) {
+            // A chat citation carries the first-seen turn's pointer so the UI can reopen that
+            // conversation at the exact turn; a plain document leaves the chat fields empty.
+            let is_chat = c.source_type.as_deref() == Some("chat");
             out.push(Citation {
                 document_id: c.document_id,
                 title: c.title.clone(),
                 source_path: c.source_path.clone(),
                 vault_path: c.vault_path.clone(),
+                is_chat,
+                conversation_id: if is_chat { c.conversation_id } else { None },
+                turn_id: if is_chat { c.chat_turn_id } else { None },
+                dated: if is_chat { c.chunk_at.clone() } else { None },
             });
         }
     }
@@ -852,6 +895,81 @@ mod tests {
         // Citations collapse to the distinct source document.
         let cites = citations_from(&hits);
         assert_eq!(cites[0].title, "Cat facts");
+        // A vault document cite carries no chat pointer (card 7E PR3 back-compat with plain sources).
+        assert!(!cites[0].is_chat);
+        assert_eq!(cites[0].turn_id, None);
+        assert_eq!(cites[0].conversation_id, None);
+        assert_eq!(cites[0].dated, None);
+    }
+
+    #[test]
+    fn chat_citation_carries_turn_pointer_and_a_document_stays_bare() {
+        // A citation drawn from a past chat must resolve back to the conversation + the exact turn
+        // (card 7E PR3), so the answer can link straight into the archived thread; a plain document
+        // citation stays a bare source with no chat pointer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&path, key).unwrap();
+
+        // A chat document with its session satellite and one indexed turn (assistant message id 7).
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type) \
+             VALUES ('chat.md', 'Planning chat', 'chat-h', 'chat')",
+            [],
+        )
+        .unwrap();
+        let chat_doc = conn.last_insert_rowid();
+        conn.execute("INSERT INTO conversations DEFAULT VALUES", [])
+            .unwrap();
+        let conv_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, document_id, scope) VALUES (?1, ?2, 'general')",
+            params![conv_id, chat_doc],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count, chat_turn_id, chunk_at) \
+             VALUES (?1, 0, 'the launch date is May', 22, 7, '2026-05-01T09:00:00Z')",
+            params![chat_doc],
+        )
+        .unwrap();
+        let chat_chunk = conn.last_insert_rowid();
+        let json = serde_json::to_string(&unit_vec(0)).unwrap();
+        conn.execute(
+            "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+            params![chat_chunk, json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?1, 'the launch date is May')",
+            params![chat_chunk],
+        )
+        .unwrap();
+
+        // An ordinary vault document that also matches the query.
+        insert_doc_chunk(&conn, "Notes", "the launch date is May", &unit_vec(0));
+
+        let hits = search(&conn, "launch", &unit_vec(0), 6, None);
+        let cites = citations_from(&hits);
+
+        let chat_cite = cites
+            .iter()
+            .find(|c| c.title == "Planning chat")
+            .expect("the chat should be cited");
+        assert!(chat_cite.is_chat);
+        assert_eq!(chat_cite.conversation_id, Some(conv_id));
+        assert_eq!(chat_cite.turn_id, Some(7), "= the chunk's chat_turn_id");
+        assert_eq!(chat_cite.dated.as_deref(), Some("2026-05-01T09:00:00Z"));
+
+        let doc_cite = cites
+            .iter()
+            .find(|c| c.title == "Notes")
+            .expect("the document should be cited");
+        assert!(!doc_cite.is_chat);
+        assert_eq!(doc_cite.conversation_id, None);
+        assert_eq!(doc_cite.turn_id, None);
+        assert_eq!(doc_cite.dated, None);
     }
 
     /// Insert a document (with a project label) + one chunk, indexed in both branches.

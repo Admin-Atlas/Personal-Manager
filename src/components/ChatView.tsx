@@ -10,6 +10,13 @@ interface Props {
   messages: Message[];
   /** Live assistant text while a reply streams in; null when idle. */
   streaming: string | null;
+  /** Open a past chat a citation points to, at its cited turn (board card 7E PR3). Absent in surfaces
+   *  where chat citations don't navigate. */
+  onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
+  /** A turn to scroll to and briefly flash — set when a chat citation clicked elsewhere navigated here
+   *  to this exact turn. Carries a `nonce` that bumps on every click so clicking the *same* citation
+   *  again re-fires the jump (a bare id wouldn't: React bails on a same-value state set). */
+  focusTurn?: { id: number; nonce: number } | null;
 }
 
 /** A conversation reopened after this long reads as "resumed" — we mark it so the user knows they're
@@ -90,29 +97,50 @@ function Sources({
   citations,
   itemRefs,
   flash,
+  onOpenChatCitation,
 }: {
   citations: Citation[];
   itemRefs: RefObject<(HTMLLIElement | null)[]>;
   flash: number | null;
+  onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
 }) {
   return (
     <div className="flex justify-start" data-help="chat-sources">
       <div className="max-w-[80%] text-xs text-ink4">
         <span className="mr-2 font-medium text-ink3">Sources</span>
         <ol className="mt-1 flex flex-col gap-0.5">
-          {citations.map((c, i) => (
-            <li
-              key={`${c.document_id}-${i}`}
-              ref={(el) => {
-                itemRefs.current[i] = el;
-              }}
-              title={c.source_path ?? c.vault_path}
-              className="rounded-[var(--radius-sm)] px-1 transition-colors duration-500 motion-reduce:transition-none"
-              style={flash === i + 1 ? { background: "var(--accent-soft)" } : undefined}
-            >
-              <span className="text-faint">[{i + 1}]</span> {c.title}
-            </li>
-          ))}
+          {citations.map((c, i) => {
+            // A chat citation reads "from [chat], DATE" and opens the archived conversation at the
+            // cited turn; a document citation stays a plain "[n] title" source (card 7E PR3).
+            const chatLink = c.is_chat && c.conversation_id != null && onOpenChatCitation;
+            return (
+              <li
+                key={`${c.document_id}-${i}`}
+                ref={(el) => {
+                  itemRefs.current[i] = el;
+                }}
+                title={
+                  chatLink ? "Open this chat at the cited turn" : (c.source_path ?? c.vault_path)
+                }
+                className="rounded-[var(--radius-sm)] px-1 transition-colors duration-500 motion-reduce:transition-none"
+                style={flash === i + 1 ? { background: "var(--accent-soft)" } : undefined}
+              >
+                <span className="text-faint">[{i + 1}]</span>{" "}
+                {chatLink ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenChatCitation(c.conversation_id!, c.turn_id ?? null)}
+                    className="border-0 bg-transparent p-0 text-left align-baseline text-accent-text underline decoration-dotted underline-offset-2 transition hover:brightness-110 motion-reduce:transition-none"
+                  >
+                    from {c.title}
+                    {c.dated ? `, ${formatDate(c.dated)}` : ""}
+                  </button>
+                ) : (
+                  c.title
+                )}
+              </li>
+            );
+          })}
         </ol>
       </div>
     </div>
@@ -120,8 +148,19 @@ function Sources({
 }
 
 /** One message and, for a grounded assistant turn, its sources — wired so an inline
- *  `[n]` marker scrolls to and flashes source n. */
-function MessageBlock({ message }: { message: Message }) {
+ *  `[n]` marker scrolls to and flashes source n. `highlight` flashes the whole turn when a chat
+ *  citation navigated here to it (card 7E PR3); `blockRef` lets the parent scroll it into view. */
+function MessageBlock({
+  message,
+  onOpenChatCitation,
+  highlight,
+  blockRef,
+}: {
+  message: Message;
+  onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
+  highlight?: boolean;
+  blockRef?: (el: HTMLDivElement | null) => void;
+}) {
   const { atLeast } = useDepth();
   const itemRefs = useRef<(HTMLLIElement | null)[]>([]);
   const [flash, setFlash] = useState<number | null>(null);
@@ -138,25 +177,61 @@ function MessageBlock({ message }: { message: Message }) {
   };
 
   return (
-    <div className="flex flex-col gap-1.5">
+    <div
+      ref={blockRef}
+      className={`flex flex-col gap-1.5 rounded-[var(--radius)] transition-shadow duration-500 motion-reduce:transition-none ${
+        highlight ? "ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]" : ""
+      }`}
+    >
       <Bubble
         role={message.role}
         content={message.content}
         citationCount={showSources ? citations.length : 0}
         onCite={showSources ? jumpToSource : undefined}
       />
-      {showSources && <Sources citations={citations} itemRefs={itemRefs} flash={flash} />}
+      {showSources && (
+        <Sources
+          citations={citations}
+          itemRefs={itemRefs}
+          flash={flash}
+          onOpenChatCitation={onOpenChatCitation}
+        />
+      )}
     </div>
   );
 }
 
-export function ChatView({ messages, streaming }: Props) {
+export function ChatView({ messages, streaming, onOpenChatCitation, focusTurn }: Props) {
   const endRef = useRef<HTMLDivElement>(null);
   const { atLeast } = useDepth();
+  // Per-turn refs so a chat citation that navigated here can scroll straight to its turn.
+  const blockRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const [flashMsg, setFlashMsg] = useState<number | null>(null);
+  // The nonce of the focus request we've already handled, so a later message arriving (a reply
+  // streaming in) doesn't yank the scroll back up to the old cited turn. Keyed on the nonce, not the
+  // turn id, so re-clicking the *same* citation (fresh nonce) re-fires while streaming replies don't.
+  const lastNonceRef = useRef<number | null>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streaming]);
+
+  // Arrive on a cited turn: scroll it into view and flash it once (mirrors ProjectView's file focus).
+  // Depends on `messages` too, so it still fires when the target conversation's turns load a tick after
+  // the request is set. Declared after the scroll-to-bottom effect so it wins the final scroll position.
+  useEffect(() => {
+    if (focusTurn == null || focusTurn.nonce === lastNonceRef.current) return;
+    const el = blockRefs.current.get(focusTurn.id);
+    if (!el) return; // turns not loaded yet — the messages-dep re-run will catch it
+    lastNonceRef.current = focusTurn.nonce;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setFlashMsg(focusTurn.id);
+    const clear = window.setTimeout(
+      () => setFlashMsg((cur) => (cur === focusTurn.id ? null : cur)),
+      2000,
+    );
+    return () => window.clearTimeout(clear);
+  }, [focusTurn, messages]);
 
   const empty = messages.length === 0 && streaming === null;
   // Only meaningful while idle (a streaming reply means we're mid-flow, not resuming).
@@ -179,7 +254,16 @@ export function ChatView({ messages, streaming }: Props) {
           </div>
         )}
         {messages.map((m) => (
-          <MessageBlock key={m.id} message={m} />
+          <MessageBlock
+            key={m.id}
+            message={m}
+            onOpenChatCitation={onOpenChatCitation}
+            highlight={flashMsg === m.id}
+            blockRef={(el) => {
+              if (el) blockRefs.current.set(m.id, el);
+              else blockRefs.current.delete(m.id);
+            }}
+          />
         ))}
         {streaming !== null && <Bubble role="assistant" content={streaming} />}
         <div ref={endRef} />

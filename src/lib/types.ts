@@ -165,6 +165,13 @@ export interface Citation {
   title: string;
   source_path: string | null;
   vault_path: string;
+  /** Chat-source provenance (board card 7E PR3): when the citation is a past chat, these point back
+   *  to the exact turn so clicking it reopens that conversation there. Absent/false for a document
+   *  (and for citations persisted before this shipped). */
+  is_chat?: boolean;
+  conversation_id?: number | null;
+  turn_id?: number | null;
+  dated?: string | null;
 }
 
 /** A chunk returned by hybrid search (the `search_documents` command). */

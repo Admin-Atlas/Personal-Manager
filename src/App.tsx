@@ -77,6 +77,9 @@ export default function App() {
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   /** A file to highlight when the project opens (set by the command palette). */
   const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
+  /** A chat turn to scroll to and flash after a chat citation navigates here (card 7E PR3). The
+   *  `nonce` bumps on every click so re-clicking the same citation re-fires the jump. */
+  const [focusTurn, setFocusTurn] = useState<{ id: number; nonce: number } | null>(null);
   const [reviewCount, setReviewCount] = useState(0);
   const [showPalette, setShowPalette] = useState(false);
 
@@ -335,6 +338,18 @@ export default function App() {
     chat.setMessages(await getMessages(id));
   }
 
+  // A chat citation clicked anywhere opens that archived conversation in the global chat view,
+  // scrolled to the cited turn (board card 7E PR3). The cited chat may be any conversation (general
+  // or another project's), so it always lands in the global chat, not the current project pane. The
+  // turn id is set only after its messages load, so ChatView finds the target turn to flash.
+  function openChatCitation(conversationId: number, turnId: number | null) {
+    setView("chat");
+    void selectConversation(conversationId).then(() => {
+      if (turnId == null) return; // a chat cited without a specific turn — just open it
+      setFocusTurn((prev) => ({ id: turnId, nonce: (prev?.nonce ?? 0) + 1 }));
+    });
+  }
+
   function newConversation() {
     setActiveId(null);
     chat.clearTransient();
@@ -501,6 +516,7 @@ export default function App() {
                 project={selectedProject}
                 chat={projectChat}
                 focusDocId={selectedDocId}
+                onOpenChatCitation={openChatCitation}
                 onBack={() => setView("focus")}
               />
             </main>
@@ -554,7 +570,12 @@ export default function App() {
                   />
                 </div>
               )}
-              <ChatView messages={chat.messages} streaming={chat.streaming} />
+              <ChatView
+                messages={chat.messages}
+                streaming={chat.streaming}
+                onOpenChatCitation={openChatCitation}
+                focusTurn={focusTurn}
+              />
               <ContextMeter
                 conversationId={activeId}
                 refreshKey={chat.messages.length}
