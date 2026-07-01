@@ -165,11 +165,19 @@ pub fn list_preferences(conn: &Connection) -> Result<Vec<Preference>> {
 /// their condition so the model self-gates) ∪ `scope='project'` **only** for the active entity. When
 /// `ctx.entity_id` is `None` the project clause's `= NULL` matches nothing, so project preferences
 /// drop out automatically. Ordered user-stated-first, then by confidence.
+///
+/// A machine-derived record (`source` chat or inferred) is injected into the live prompt **only once the
+/// user has kept it** (`user_confirmed = 1`). This is the "a suggestion in Teach, never a silently-applied
+/// rule" contract (card 7F / the v2.54 changelog): an unconfirmed suggestion — captured from a passing
+/// remark in chat, or migrated from the old learning blob — must not steer the model before the user
+/// clicks Keep. User-stated preferences (`source='user'`) are always confirmed at insert, so they are
+/// unaffected.
 pub fn relevant_preferences(conn: &Connection, ctx: PrefContext) -> Result<Vec<Preference>> {
     let sql = format!(
         "SELECT {SELECT_COLS} FROM preferences p LEFT JOIN entities e ON e.id = p.entity_id \
-         WHERE p.scope = 'global' OR p.scope = 'context' \
-            OR (p.scope = 'project' AND p.entity_id = ?1) \
+         WHERE (p.scope = 'global' OR p.scope = 'context' \
+                OR (p.scope = 'project' AND p.entity_id = ?1)) \
+           AND (p.source NOT IN ('chat', 'inferred') OR p.user_confirmed = 1) \
          ORDER BY (p.source = 'user') DESC, p.confidence DESC, p.id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -893,6 +901,53 @@ mod tests {
 
         delete_preference(&conn, id).unwrap();
         assert!(list_preferences(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn relevant_preferences_withholds_unconfirmed_machine_records_until_kept() {
+        // Card 7F / M2 fix: a chat- or inferred-derived record is a SUGGESTION — it must not steer the live
+        // prompt until the user keeps it. A user-stated record (confirmed at insert) is always applied.
+        let (_d, conn) = store();
+        let user = add_preference(
+            &conn,
+            SCOPE_GLOBAL,
+            None,
+            None,
+            "call me Bob",
+            SOURCE_USER,
+            1.0,
+            true,
+        )
+        .unwrap();
+        let chat = add_preference(
+            &conn,
+            SCOPE_GLOBAL,
+            None,
+            None,
+            "keep answers terse",
+            SOURCE_CHAT,
+            0.6,
+            false,
+        )
+        .unwrap();
+
+        let relevant = relevant_preferences(&conn, PrefContext::for_entity(None)).unwrap();
+        assert!(
+            relevant.iter().any(|p| p.id == user),
+            "a user-stated pref is always applied"
+        );
+        assert!(
+            !relevant.iter().any(|p| p.id == chat),
+            "an unconfirmed chat suggestion is NOT applied before the user keeps it"
+        );
+
+        // Keeping it makes it live.
+        confirm_preference(&conn, chat).unwrap();
+        let relevant = relevant_preferences(&conn, PrefContext::for_entity(None)).unwrap();
+        assert!(
+            relevant.iter().any(|p| p.id == chat),
+            "a kept chat pref is now applied"
+        );
     }
 
     #[test]
