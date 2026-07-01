@@ -330,7 +330,7 @@ pub fn set_time_zone(state: State<'_, AppState>, zone: String) -> Result<()> {
 /// list here (rather than letting the webview write any key) keeps presentation
 /// state out of the schema-critical rows: the webview must never be able to
 /// rewrite e.g. `embedding_dim` and silently corrupt the index.
-const WRITABLE_PREFS: &[&str] = &["appearance", "pinboard", "dev_mode", "map", "chat_ui"];
+const WRITABLE_PREFS: &[&str] = &["appearance", "pinboard", "dev_mode", "map", "project_ui"];
 
 /// Read a UI preference blob the webview previously stored (theme axes, pinboard
 /// layout). These live in the encrypted `settings` table — not the webview's

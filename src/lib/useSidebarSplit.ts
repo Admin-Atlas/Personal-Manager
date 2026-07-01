@@ -4,14 +4,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getPref, setPref } from "./ipc";
 
-// The project sidebar's vertical split: the fraction of height given to the chat-history panel
-// (top), with project documents filling the rest (bottom). Per board card 7E this is a *hard*
+// The project sidebar's vertical split: the fraction of height given to the Milestones panel
+// (top), with the project's Files filling the rest (bottom). Per board card 7E this is a *hard*
 // preference — localStorage is the flash-free fast path (a synchronous read on first paint), and
-// it's *also* mirrored into the encrypted `settings` table via `set_pref("chat_ui", …)` so the
+// it's *also* mirrored into the encrypted `settings` table via `set_pref("project_ui", …)` so the
 // ratio travels with the data folder to another machine, exactly like the theme (see ThemeContext).
 
-const LS_KEY = "pm.sidebar.historyFrac";
-const PREF_KEY = "chat_ui";
+const LS_KEY = "pm.project.milestonesFrac";
+const PREF_KEY = "project_ui";
 const DEFAULT_FRAC = 0.5; // card default: even 50-50 split
 const MIN_FRAC = 0.2;
 const MAX_FRAC = 0.8;
@@ -35,10 +35,10 @@ function writeLs(frac: number): void {
 }
 
 /**
- * Drives the chat-history / documents split. Returns `topFrac` (the history panel's height
- * fraction, for a flex-basis), a `containerRef` to attach to the split container (its height is
- * the drag basis, so the ratio stays proportional as the window resizes), a `startResize`
- * pointer-down handler for the divider, and `resizing` for cursor/select-none feedback.
+ * Drives the Milestones / Files split. Returns `topFrac` (the Milestones panel's height fraction,
+ * for a flex-basis), a `containerRef` to attach to the split container (its height is the drag
+ * basis, so the ratio stays proportional as the window resizes), a `startResize` pointer-down
+ * handler for the divider, and `resizing` for cursor/select-none feedback.
  */
 export function useSidebarSplit() {
   const [frac, setFrac] = useState<number>(() =>
@@ -61,9 +61,9 @@ export function useSidebarSplit() {
       .then((raw) => {
         if (cancelled || !bootEmpty || raw == null) return;
         try {
-          const blob = JSON.parse(raw) as { historyFrac?: unknown };
-          if (typeof blob.historyFrac === "number") {
-            const f = clamp(blob.historyFrac, MIN_FRAC, MAX_FRAC);
+          const blob = JSON.parse(raw) as { milestonesFrac?: unknown };
+          if (typeof blob.milestonesFrac === "number") {
+            const f = clamp(blob.milestonesFrac, MIN_FRAC, MAX_FRAC);
             setFrac(f);
             writeLs(f); // make the next boot flash-free
           }
@@ -102,7 +102,7 @@ export function useSidebarSplit() {
       setResizing(false);
       const f = fracRef.current;
       writeLs(f);
-      setPref(PREF_KEY, JSON.stringify({ historyFrac: f })).catch(() => {
+      setPref(PREF_KEY, JSON.stringify({ milestonesFrac: f })).catch(() => {
         /* fire-and-forget — localStorage already holds the value */
       });
     };
