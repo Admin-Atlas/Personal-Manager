@@ -29,7 +29,6 @@
 //! while the app was closed. Both run fully async (the model call is async; DB locks are short and never
 //! held across an await, AGENTS rule #4) and share a single-flight guard.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -266,19 +265,12 @@ where
     F: FnOnce(AppHandle) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    {
-        let state = app.state::<AppState>();
-        if state
-            .prefs_busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-    }
-    op(app.clone()).await;
     let state = app.state::<AppState>();
-    state.prefs_busy.store(false, Ordering::SeqCst);
+    let Some(_guard) = crate::BusyGuard::acquire(&state.prefs_busy) else {
+        return; // another pass holds the single-flight
+    };
+    // `_guard` resets the flag on drop — including if `op` panics — so extraction can't wedge.
+    op(app.clone()).await;
 }
 
 /// Whether the vault is unlocked and an OpenRouter key is set — the minimum to extract (a pure model

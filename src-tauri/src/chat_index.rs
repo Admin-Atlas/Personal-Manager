@@ -502,15 +502,11 @@ pub(crate) fn should_run_now(
 /// Run a reconcile sweep under the single-flight guard the launch sweep and the idle loop share, so the
 /// two never overlap. Blocking (it embeds) — only ever called from a blocking context.
 fn run_sweep_guarded(state: &AppState, label: &str) {
-    if state
-        .chat_index_busy
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(_guard) = crate::BusyGuard::acquire(&state.chat_index_busy) else {
         return; // another sweep is already in flight
-    }
+    };
+    // `_guard` resets the flag on drop — including if the sweep panics — so indexing can't wedge.
     let result = reconcile_chat_index(state);
-    state.chat_index_busy.store(false, Ordering::SeqCst);
     match result {
         Ok(s) if s.sessions > 0 || s.failed > 0 => eprintln!(
             "chat-index: {label} indexed {} turn(s) across {} session(s) ({} failed)",
