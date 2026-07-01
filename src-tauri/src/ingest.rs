@@ -571,10 +571,24 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
             path: path.to_string_lossy().into(),
             name,
         });
-        match rebuild_one(&state, &gateway, &cipher, &path) {
-            Ok(document) => {
+        // A chat session's `.md` must round-trip its chat IDENTITY (source_type/source_id, per-chunk
+        // turn pointer + timestamp, and the session→document link), not re-index as a plain document —
+        // otherwise citations lose their jump-to-turn and a later idle sweep births a duplicate. Route it
+        // through the live chat engine, which reads the (un-wiped) messages table and rebuilds all of that.
+        let outcome = if is_chat_vault_file(&cipher, &path) {
+            rebuild_chat(&state, &cipher, &path)
+        } else {
+            rebuild_one(&state, &gateway, &cipher, &path).map(Some)
+        };
+        match outcome {
+            Ok(Some(document)) => {
                 ingested += 1;
                 let _ = on_event.send(IngestEvent::Done { document });
+            }
+            // A chat that only ever exchanged small talk indexes no substantive turns, so it (correctly)
+            // births no document — count it done, but there is nothing to surface.
+            Ok(None) => {
+                ingested += 1;
             }
             Err(e) => {
                 failed += 1;
@@ -694,6 +708,66 @@ fn rebuild_one(
         },
     };
     index_document(state, &meta, &chunks, &embeddings, photo.as_ref())
+}
+
+/// Does this vault file carry a chat session (`source_type: chat`)? Cheap front-matter peek so the rebuild
+/// loop can route chats through the chat engine (which preserves their identity) rather than the generic
+/// document path. An unreadable/headerless file is treated as non-chat (it falls to `rebuild_one`, which
+/// reports the real error).
+fn is_chat_vault_file(cipher: &MarkdownCipher, vault_file: &Path) -> bool {
+    cipher
+        .read(vault_file)
+        .ok()
+        .and_then(|raw| parse_frontmatter(&raw).map(|(fields, _)| fields))
+        .and_then(|fields| fields.get("source_type").cloned())
+        .as_deref()
+        == Some(SOURCE_TYPE_CHAT)
+}
+
+/// Rebuild a chat session from its vault `.md`. Rebuild wiped `documents` + `chunks` (FK-nulling
+/// `chat_sessions.document_id`), but left `conversations` / `messages` / `chat_sessions` intact — so the
+/// authored turns are still the source of truth. We reset the index cursor to NULL and re-run the SAME
+/// engine the live/idle indexer uses ([`chat_index::index_session`]): it re-births the `documents` row with
+/// the chat's `source_type`/`source_id`, re-appends every completed turn-pair stamping per-chunk
+/// `chat_turn_id` + `chunk_at`, and re-links `chat_sessions.document_id`. That is what keeps chat citations
+/// (jump-to-turn) and per-chunk recency intact across a Rebuild, and stops the next idle sweep from birthing
+/// a duplicate document. Returns the re-birthed [`Document`], or `None` for a chat with no substantive turns
+/// (small-talk-only ⇒ no document, by design).
+fn rebuild_chat(
+    state: &AppState,
+    cipher: &MarkdownCipher,
+    vault_file: &Path,
+) -> Result<Option<Document>> {
+    let raw = cipher.read(vault_file)?;
+    let (fields, _body) = parse_frontmatter(&raw)
+        .ok_or_else(|| Error::Other("chat vault file missing front-matter".into()))?;
+    let conversation_id: i64 = fields
+        .get("chat_conversation_id")
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| Error::Other("chat vault file missing chat_conversation_id".into()))?;
+
+    {
+        let conn = state.conn()?;
+        conn.execute(
+            "UPDATE chat_sessions SET document_id = NULL, last_indexed_turn_id = NULL \
+             WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+    }
+    crate::chat_index::index_session(state, conversation_id)?;
+
+    // The session row exists (its vault file implies an earlier `record_turn_pair` upsert). document_id is
+    // NULL again only if index_session found nothing substantive to index (small-talk-only chat).
+    let conn = state.conn()?;
+    let doc_id: Option<i64> = conn.query_row(
+        "SELECT document_id FROM chat_sessions WHERE conversation_id = ?1",
+        params![conversation_id],
+        |r| r.get(0),
+    )?;
+    match doc_id {
+        Some(id) => Ok(Some(load_document(&conn, id)?)),
+        None => Ok(None),
+    }
 }
 
 /// Insert a document and its chunks/vectors/FTS rows in one transaction. `embeddings` are the
@@ -2024,6 +2098,29 @@ mod tests {
         assert!(collected.iter().any(|n| n.ends_with(".md.pmenc")));
         assert!(!collected.iter().any(|n| n.ends_with(".tmp")));
         assert_eq!(collected.len(), 3, "two chats + one document, not the .tmp");
+    }
+
+    #[test]
+    fn is_chat_vault_file_routes_only_chat_frontmatter() {
+        // Card 7G / H2 fix: a Rebuild must route a chat `.md` through the chat engine (which preserves its
+        // identity — source_type='chat', per-chunk turn pointer, and the session→document link), not the
+        // generic document path. This predicate is the router; guard it so a chat file is never mistaken for
+        // a plain document (which would drop the chat identity and orphan the session link), and vice-versa.
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = MarkdownCipher::plaintext("vault-test");
+        let chat = dir.path().join("chat-28-06-2026-abc.md");
+        let doc = dir.path().join("report-01-07-2026-ff00.md");
+        std::fs::write(
+            &chat,
+            "---\nsource_type: chat\nchat_conversation_id: 7\ntitle: Hi\n---\n\nhello",
+        )
+        .unwrap();
+        std::fs::write(&doc, "---\ntitle: Report\n---\n\nbody").unwrap();
+        assert!(is_chat_vault_file(&cipher, &chat));
+        assert!(!is_chat_vault_file(&cipher, &doc));
+        // A missing / headerless file is treated as non-chat: it falls to rebuild_one, which surfaces the
+        // real read/parse error instead of silently taking the chat path.
+        assert!(!is_chat_vault_file(&cipher, &dir.path().join("nope.md")));
     }
 
     #[test]
