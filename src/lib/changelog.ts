@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.55.0-alpha",
+    date: "2026-07-01",
+    highlights: [
+      "Chats now wear their colours everywhere they show up: a little 💬 marks them in your review inbox and in a project’s file list, so at a glance you can tell a conversation apart from a document you saved.",
+      "When PM suggests a preference it picked up from something you said in chat, Teach now says “Suggested from chat” — so you know where the idea came from before you decide whether to keep it.",
+    ],
+  },
+  {
     version: "2.54.0-alpha",
     date: "2026-07-01",
     highlights: [

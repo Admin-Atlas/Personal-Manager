@@ -256,9 +256,10 @@ export interface Document {
   last_activity: string | null;
   /**
    * "vault" — a fully-stored document (its body lives in the Markdown vault); "index_only" — a
-   * pointer we index but don't hold (body fetched live, only a summary readable offline).
+   * pointer we index but don't hold (body fetched live, only a summary readable offline); "chat" — a
+   * conversation, born as a document on first index and backed by a Markdown vault file (epic 7).
    */
-  source_type: "vault" | "index_only";
+  source_type: "vault" | "index_only" | "chat";
   /**
    * Reachability of an index-only item's source. "ok" normally; "source_missing" (deleted at the
    * source, kept findable) and "unreachable" (expired auth / offline drive) are set by the

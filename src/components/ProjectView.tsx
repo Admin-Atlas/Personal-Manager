@@ -20,6 +20,7 @@ import { Button, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { MilestoneList } from "./MilestoneList";
 import { TagEditor } from "./TagEditor";
+import { ChatBadge } from "./ChatBadge";
 import { rankImportance } from "../lib/importance";
 import { useDepth, useTheme } from "../theme";
 
@@ -220,8 +221,14 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
                   : ""
               }`}
             >
-              <div className="truncate font-head text-sm text-ink2" title={d.title}>
-                {d.title}
+              <div className="flex min-w-0 items-center gap-1.5">
+                {d.source_type === "chat" && <ChatBadge compact />}
+                <span
+                  className="min-w-0 flex-1 truncate font-head text-sm text-ink2"
+                  title={d.title}
+                >
+                  {d.title}
+                </span>
               </div>
               {teachVisible ? (
                 // Manual triage, same controls as the Review tab. Everyone gets the importance
