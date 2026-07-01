@@ -776,6 +776,27 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE chat_sessions ADD COLUMN title_state TEXT NOT NULL DEFAULT 'pending'
         CHECK (title_state IN ('pending','generated','custom'));
     "#,
+    // v28: chat in the learning loop, preference extraction (Stage 3, board card 7F). An EXPLICIT
+    // preference the user states in a chat ("I always want X as Y") becomes a typed preference record,
+    // gated through Teach for confirmation like any other — so it needs (a) a new `source` value, and
+    // (b) a per-session cursor so extraction, like indexing and summarising, only ever looks at the
+    // turns past what it has already read.
+    //   * Relax `preferences.source` to admit 'chat' (the chat-stated origin, distinct from the
+    //     user-typed 'user' and the PM-'inferred' still deferred to Stage 5). SQLite can't ALTER a
+    //     column CHECK in place, so we reuse the v17/v22/v23 `writable_schema` text-patch: it edits the
+    //     stored CREATE TABLE text only, moves no data, and touches nothing else. The value list
+    //     `'user','inferred'` appears exactly once (this CHECK) and only on `preferences`; the schema
+    //     cookie bump in `run` reparses the relaxed constraint on this connection.
+    //   * `prefs_covers_up_to_turn_id` — the extraction cursor on `chat_sessions`, mirroring
+    //     `summary_covers_up_to_turn_id`. Additive, NULL until the first extraction pass advances it.
+    r#"
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master
+       SET sql = replace(sql, '''user'',''inferred''', '''user'',''inferred'',''chat''')
+     WHERE type = 'table' AND name = 'preferences';
+    PRAGMA writable_schema = OFF;
+    ALTER TABLE chat_sessions ADD COLUMN prefs_covers_up_to_turn_id INTEGER;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -825,14 +846,15 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 27,
+            version, 28,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
              project milestones is v20; project active-date + manual priority is v21; \
              photo ingestion table is v22; chat ingestion foundation is v23; \
              chat per-chunk provenance + timestamp is v24; rolling chat summary is v25; \
-             last-turn prompt size for the context meter is v26; chat title provenance is v27)"
+             last-turn prompt size for the context meter is v26; chat title provenance is v27; \
+             chat preference source + extraction cursor is v28)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1406,5 +1428,50 @@ mod tests {
             insert("bad", Some("urgent")).is_err(),
             "an unknown importance must still violate the CHECK"
         );
+    }
+
+    /// v28 (board card 7F) relaxes the `preferences.source` CHECK to admit 'chat' (proving the
+    /// writable_schema patch + cookie reparse took effect on this connection) and adds the additive,
+    /// nullable `chat_sessions.prefs_covers_up_to_turn_id` extraction cursor.
+    #[test]
+    fn preferences_admit_chat_source_and_extraction_cursor_lands() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // All three sources now insert; an unknown one is still rejected.
+        for src in ["user", "inferred", "chat"] {
+            conn.execute(
+                "INSERT INTO preferences(scope, value, source) VALUES ('global', ?1, ?2)",
+                rusqlite::params![format!("v-{src}"), src],
+            )
+            .unwrap_or_else(|e| panic!("source='{src}' should insert: {e}"));
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO preferences(scope, value, source) VALUES ('global', 'x', 'imported')",
+                [],
+            )
+            .is_err(),
+            "an unknown source must still violate the relaxed CHECK"
+        );
+
+        // The extraction cursor is present and NULL by default on a fresh session row.
+        conn.execute("INSERT INTO conversations DEFAULT VALUES", [])
+            .unwrap();
+        let conv_id: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope) VALUES (?1, 'general')",
+            rusqlite::params![conv_id],
+        )
+        .unwrap();
+        let cursor: Option<i64> = conn
+            .query_row(
+                "SELECT prefs_covers_up_to_turn_id FROM chat_sessions WHERE conversation_id = ?1",
+                rusqlite::params![conv_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, None, "extraction cursor defaults NULL");
     }
 }
