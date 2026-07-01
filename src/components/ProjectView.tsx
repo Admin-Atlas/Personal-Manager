@@ -37,6 +37,9 @@ interface Props {
   chat: ProjectChat;
   /** A file to scroll to and briefly highlight (set by the command palette). */
   focusDocId?: number | null;
+  /** Open a past chat a citation points to, at its cited turn — routes up to App's global chat view
+   *  (the cited chat may not be this project's) (board card 7E PR3). */
+  onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
   onBack: () => void;
 }
 
@@ -44,7 +47,7 @@ interface Props {
  *  confined to just this project — "everything narrows to just it". The scoped chat's session lives
  *  in App (so the left sidebar lists this project's conversations, like the global chat); this view
  *  renders the active thread plus the project's milestones and documents. */
-export function ProjectView({ project, chat, focusDocId, onBack }: Props) {
+export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onBack }: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
@@ -308,7 +311,11 @@ export function ProjectView({ project, chat, focusDocId, onBack }: Props) {
               {chat.error}
             </div>
           )}
-          <ChatView messages={chat.messages} streaming={chat.streaming} />
+          <ChatView
+            messages={chat.messages}
+            streaming={chat.streaming}
+            onOpenChatCitation={onOpenChatCitation}
+          />
           {idleDate && (
             <div
               className="flex items-center justify-between gap-3 border-t border-border px-4 py-2 text-xs text-ink3"
