@@ -18,8 +18,16 @@ export const CALENDAR_VIEW_MODES: readonly CalendarViewMode[] = [
   "agenda",
 ];
 
+/** The time-grid vertical scale (Week/Day only): the visible hour band + row height.
+ *  `work` = a tall business-hours grid, `day` = the everyday whole-day grid, `full` = a compact
+ *  all-24h grid. Maps to a px-per-hour + a scroll-to-hour in TimeGridView. */
+export type CalendarRange = "work" | "day" | "full";
+
+export const CALENDAR_RANGES: readonly CalendarRange[] = ["work", "day", "full"];
+
 const VIEW_KEY = "pm.calendar.view";
 const HIDDEN_KEY = "pm.calendar.hidden";
+const RANGE_KEY = "pm.calendar.range";
 
 /** The last view the user had open, clamped to `allowed` (so a value from a newer build that isn't
  *  available yet falls back to the first allowed mode). */
@@ -65,6 +73,27 @@ export function readHidden(): Set<string> {
 export function writeHidden(hidden: Set<string>): void {
   try {
     localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden]));
+  } catch {
+    // Best-effort.
+  }
+}
+
+/** The last time-grid range the user chose (Week/Day). Defaults to the everyday whole-day grid. */
+export function readRange(): CalendarRange {
+  try {
+    const raw = localStorage.getItem(RANGE_KEY);
+    if (raw && (CALENDAR_RANGES as readonly string[]).includes(raw)) {
+      return raw as CalendarRange;
+    }
+  } catch {
+    // Unavailable — fall through to the default.
+  }
+  return "day";
+}
+
+export function writeRange(range: CalendarRange): void {
+  try {
+    localStorage.setItem(RANGE_KEY, range);
   } catch {
     // Best-effort.
   }

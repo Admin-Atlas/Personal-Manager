@@ -11,8 +11,9 @@ import { cn } from "../ui";
 interface Props {
   /** Renders the trigger; `open` reflects state and `toggle` opens/closes. */
   trigger: (args: { open: boolean; toggle: () => void }) => ReactNode;
-  /** Panel contents. */
-  children: ReactNode;
+  /** Panel contents. A function form receives `close` so an action inside can dismiss the popover
+   *  (e.g. picking a date); a plain node stays open for multi-select. */
+  children: ReactNode | ((args: { close: () => void }) => ReactNode);
   /** Which edge the panel aligns to under the trigger. */
   align?: "left" | "right";
   panelClassName?: string;
@@ -50,7 +51,7 @@ export function Popover({ trigger, children, align = "left", panelClassName }: P
             panelClassName,
           )}
         >
-          {children}
+          {typeof children === "function" ? children({ close: () => setOpen(false) }) : children}
         </div>
       )}
     </div>
