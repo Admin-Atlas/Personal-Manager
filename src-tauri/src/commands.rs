@@ -1221,13 +1221,27 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
     let state = app.state::<AppState>();
     let conn = state.conn()?;
 
-    // The model the next turn will actually use (the primary of the chat role).
-    let model = effective_models(&conn, CHAT_MODELS_KEY, CHAT_AUTO_SWITCH_KEY)?
+    // The model the meter reports on: the one that actually SERVED the last reply. With chat auto-switch on
+    // a fallback may have answered while the primary is unchanged — and `last_prompt_tokens` (the numerator)
+    // was measured for THAT model, so the window (denominator) must come from the same model, or the
+    // percentage divides usage by the wrong window. Fall back to the primary (next-turn model) before any
+    // reply has been measured.
+    let primary = effective_models(&conn, CHAT_MODELS_KEY, CHAT_AUTO_SWITCH_KEY)?
         .into_iter()
         .next()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let served: Option<String> = conn
+        .query_row(
+            "SELECT model FROM messages \
+             WHERE conversation_id = ?1 AND role = 'assistant' AND model IS NOT NULL \
+             ORDER BY id DESC LIMIT 1",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let model = served.unwrap_or(primary);
 
-    // The selected model's window + the catalogue (latest refresh batch), from the daily price/context fetch.
+    // The reported model's window + the catalogue (latest refresh batch), from the daily price/context fetch.
     let catalogue = cached_catalogue(&conn)?;
     let context_window = catalogue
         .iter()
