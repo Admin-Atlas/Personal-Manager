@@ -764,10 +764,41 @@ fn rebuild_chat(
         params![conversation_id],
         |r| r.get(0),
     )?;
-    match doc_id {
-        Some(id) => Ok(Some(load_document(&conn, id)?)),
-        None => Ok(None),
-    }
+    let Some(id) = doc_id else {
+        return Ok(None);
+    };
+
+    // index_session re-births the row classified from the chat's ORIGIN scope (`chat_doc_meta`), which would
+    // discard a user's later filing/archiving. The vault front-matter is a chat's organisational TRUTH (card
+    // F, like any document), so restore project/tags/importance/reviewed from the file — and re-resolve the
+    // entity from the project name exactly as `insert_document_row` does, since the ids are an index detail.
+    let project = fields
+        .get("project")
+        .cloned()
+        .unwrap_or_else(|| "Unsorted".into());
+    let tags: Vec<String> = fields
+        .get("tags")
+        .map(|s| parse_yaml_list(s))
+        .unwrap_or_default();
+    let importance = nullable(fields.get("importance"));
+    let reviewed = fields
+        .get("reviewed")
+        .map(|v| v.trim() == "true")
+        .unwrap_or(false);
+    let entity_id = crate::entities::resolve_project(&conn, &project, true)?;
+    conn.execute(
+        "UPDATE documents SET project = ?1, tags = ?2, importance = ?3, reviewed = ?4, entity_id = ?5 \
+         WHERE id = ?6",
+        params![
+            project,
+            serde_json::to_string(&tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?,
+            importance,
+            reviewed as i64,
+            entity_id,
+            id
+        ],
+    )?;
+    Ok(Some(load_document(&conn, id)?))
 }
 
 /// Insert a document and its chunks/vectors/FTS rows in one transaction. `embeddings` are the
