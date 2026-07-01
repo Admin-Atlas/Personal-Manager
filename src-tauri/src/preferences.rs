@@ -300,7 +300,9 @@ pub fn pref_exists(
     entity_id: Option<i64>,
     value: &str,
 ) -> Result<bool> {
-    let needle = value.trim().to_lowercase();
+    // SQLite's built-in `lower()` is ASCII-only (no ICU), so normalise the Rust side the same way —
+    // `to_ascii_lowercase()` keeps both sides in lockstep and avoids false-negative dedup on non-ASCII.
+    let needle = value.trim().to_ascii_lowercase();
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM preferences \
          WHERE scope = ?1 AND entity_id IS ?2 AND lower(trim(value)) = ?3",
@@ -500,11 +502,10 @@ pub fn render_chat_extract_request(
     user_turns: &[String],
     project_names: &[String],
 ) -> Vec<ChatMessage> {
-    let projects = if project_names.is_empty() {
-        "(none yet)".to_string()
-    } else {
-        project_names.join(", ")
-    };
+    // Emit the project list as a JSON array string: names come from `entities.canonical_name` (user
+    // controlled) and can carry commas/quotes/newlines, which a bare `join(", ")` would render
+    // ambiguous inside the "EXACT match from this list" instruction (and widen the injection surface).
+    let projects = serde_json::to_string(project_names).unwrap_or_else(|_| "[]".to_string());
     let joined = user_turns
         .iter()
         .map(|t| t.trim())
