@@ -972,4 +972,213 @@ mod tests {
             "**You:** what should I name the org?\n\n**PM:** Atlas."
         );
     }
+
+    /// Create the vault file at exactly the path `delete_conversation_inner` will compute
+    /// (`vault_dir.join(stored vault_path)`), and return that path so the test can assert its removal.
+    fn materialise_vault_file(
+        conn: &Connection,
+        vault_dir: &std::path::Path,
+        conv: i64,
+    ) -> std::path::PathBuf {
+        let stored: String = conn
+            .query_row(
+                "SELECT vault_path FROM chat_sessions WHERE conversation_id = ?1",
+                params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let file = vault_dir.join(stored);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "chat body").unwrap();
+        file
+    }
+
+    fn count(conn: &Connection, sql: &str, id: i64) -> i64 {
+        conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn deleting_an_indexed_chat_purges_document_chunks_vectors_fts_and_vault_file() {
+        // The card 7G cascade end-to-end: an indexed chat leaves nothing behind — not the conversation,
+        // its messages, its session row, its document, its chunks, the two rowid-keyed mirrors, or its
+        // vault file.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+        conn.execute(
+            "INSERT INTO messages(conversation_id, role, content) VALUES (?1,'user','hi'),(?1,'assistant','hello')",
+            params![conv],
+        )
+        .unwrap();
+
+        let segs = vec![segment(
+            2,
+            "2026-06-28T10:00:01.000Z",
+            "**You:** hi\n\n**PM:** hello",
+        )];
+        let p = plan(&conn, conv);
+        let (doc_id, _) =
+            commit_session_index(&mut conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
+        let doc_id = doc_id.expect("a substantive sweep births the document");
+
+        let vault_dir = dir.path().join("md");
+        let file = materialise_vault_file(&conn, &vault_dir, conv);
+        assert!(file.exists());
+
+        chat::delete_conversation_inner(&conn, &vault_dir, conv).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM conversations WHERE id=?1",
+                conv
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM messages WHERE conversation_id=?1",
+                conv
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM chat_sessions WHERE conversation_id=?1",
+                conv
+            ),
+            0
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM documents WHERE id=?1", doc_id),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM chunks WHERE document_id=?1",
+                doc_id
+            ),
+            0
+        );
+        let vec_total: i64 = conn
+            .query_row("SELECT count(*) FROM chunk_vec", [], |r| r.get(0))
+            .unwrap();
+        let fts_total: i64 = conn
+            .query_row("SELECT count(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_total, 0, "vector mirror purged");
+        assert_eq!(fts_total, 0, "fts mirror purged");
+        assert!(!file.exists(), "vault file removed");
+    }
+
+    #[test]
+    fn deleting_a_not_yet_indexed_conversation_removes_conversation_and_messages() {
+        // A brand-new chat that never recorded a turn-pair has no session row and no document; delete must
+        // still clear the conversation + its messages and not error on the absent document/file.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(dir.path());
+        conn.execute(
+            "INSERT INTO conversations(title, project) VALUES ('Fresh', NULL)",
+            [],
+        )
+        .unwrap();
+        let conv = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO messages(conversation_id, role, content) VALUES (?1,'user','unsent thought')",
+            params![conv],
+        )
+        .unwrap();
+
+        chat::delete_conversation_inner(&conn, &dir.path().join("md"), conv).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM conversations WHERE id=?1",
+                conv
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM messages WHERE conversation_id=?1",
+                conv
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn deleting_one_chat_leaves_a_second_chats_chunks_intact() {
+        // Deleting one indexed chat must not touch another's document/chunks/vectors.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let index_one = |conn: &mut Connection| -> (i64, i64) {
+            let conv = new_session(conn, "general");
+            let segs = vec![segment(
+                2,
+                "2026-06-28T10:00:01.000Z",
+                "**You:** hi\n\n**PM:** hello",
+            )];
+            let p = plan(conn, conv);
+            let (doc_id, _) =
+                commit_session_index(conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
+            (conv, doc_id.unwrap())
+        };
+        let (keep_conv, keep_doc) = index_one(&mut conn);
+        let (drop_conv, drop_doc) = index_one(&mut conn);
+
+        chat::delete_conversation_inner(&conn, &dir.path().join("md"), drop_conv).unwrap();
+
+        // The dropped chat is gone...
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM documents WHERE id=?1",
+                drop_doc
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM chunks WHERE document_id=?1",
+                drop_doc
+            ),
+            0
+        );
+        // ...the kept chat is fully intact: conversation, document, chunk, and both mirrors.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM conversations WHERE id=?1",
+                keep_conv
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM documents WHERE id=?1",
+                keep_doc
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM chunks WHERE document_id=?1",
+                keep_doc
+            ),
+            1
+        );
+        let vec_total: i64 = conn
+            .query_row("SELECT count(*) FROM chunk_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_total, 1, "only the kept chat's vector remains");
+    }
 }

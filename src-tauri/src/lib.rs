@@ -619,6 +619,7 @@ pub fn run() {
             commands::create_conversation,
             commands::get_messages,
             commands::rename_conversation,
+            commands::delete_conversation,
             commands::send_message,
             commands::chat_context_status,
             commands::compress_chat,

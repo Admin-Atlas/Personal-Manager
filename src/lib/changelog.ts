@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.56.0-alpha",
+    date: "2026-07-01",
+    highlights: [
+      "You can now delete a past conversation: hover it in the sidebar, hit the trash, confirm — and it’s gone for good, along with its messages and everything it had added to search. Nothing’s left dangling behind the scenes.",
+    ],
+  },
+  {
     version: "2.55.0-alpha",
     date: "2026-07-01",
     highlights: [

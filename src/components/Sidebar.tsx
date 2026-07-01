@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { useState } from "react";
 import type { Conversation } from "../lib/types";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme } from "../theme";
-import { NavItem } from "./ui";
+import { ConfirmDialog, NavItem } from "./ui";
 
 export type View =
   | "focus"
@@ -28,6 +29,8 @@ interface Props {
   activeId: number | null;
   reviewCount: number;
   onSelect: (id: number) => void;
+  /** Delete a conversation for good (card 7G) — the parent owns the mutation + list refresh. */
+  onDelete: (id: number) => void;
   onNew: () => void;
   onOpenSettings: () => void;
   onOpenWhatsNew: () => void;
@@ -47,6 +50,7 @@ export function Sidebar({
   activeId,
   reviewCount,
   onSelect,
+  onDelete,
   onNew,
   onOpenSettings,
   onOpenWhatsNew,
@@ -63,6 +67,10 @@ export function Sidebar({
   // The Dev tab is an orthogonal capability reveal (issue #78) — independent of Depth, shown only
   // when the user turns Developer mode on in Settings.
   const { devMode } = useDevMode();
+  // The conversation awaiting a delete confirmation (null = no dialog open). Held here so the row's
+  // hover trash and the confirm modal stay a local concern; the actual purge is `onDelete` (App owns
+  // the mutation + list refresh + reselecting after the active chat is deleted).
+  const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null);
   return (
     <aside className="flex h-full w-64 flex-col border-r border-border bg-panel">
       <div className="flex items-center justify-between px-4 py-3">
@@ -161,18 +169,51 @@ export function Sidebar({
               <p className="px-2 py-2 text-xs text-faint">No conversations yet.</p>
             )}
             {conversations.map((c) => (
-              <NavItem
-                key={c.id}
-                active={c.id === activeId}
-                onClick={() => onSelect(c.id)}
-                className="mb-1"
-              >
-                <span title={c.title}>{c.title}</span>
-              </NavItem>
+              // The trash sits OUTSIDE the NavItem (itself a <button>) — a button can't nest a button.
+              // It's a hover-revealed sibling overlaid on the row's right edge; `pr-8` on the NavItem
+              // keeps a long title from sliding under it.
+              <div key={c.id} className="group relative">
+                <NavItem
+                  active={c.id === activeId}
+                  onClick={() => onSelect(c.id)}
+                  className="mb-1 pr-8"
+                >
+                  <span title={c.title}>{c.title}</span>
+                </NavItem>
+                <button
+                  type="button"
+                  onClick={() => setPendingDelete(c)}
+                  title="Delete chat"
+                  aria-label={`Delete conversation “${c.title}”`}
+                  className="absolute right-1 top-1/2 -translate-y-1/2 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
+                >
+                  <span aria-hidden="true">🗑</span>
+                </button>
+              </div>
             ))}
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingDelete != null}
+        title="Delete this conversation?"
+        danger
+        confirmLabel="Delete"
+        onConfirm={() => {
+          const id = pendingDelete?.id;
+          setPendingDelete(null);
+          if (id != null) onDelete(id);
+        }}
+        onClose={() => setPendingDelete(null)}
+      >
+        {pendingDelete && (
+          <p className="text-ink2">
+            “{pendingDelete.title}” and its messages will be permanently deleted, along with
+            anything it added to search. This can’t be undone.
+          </p>
+        )}
+      </ConfirmDialog>
 
       <div className="border-t border-border p-2">
         <button

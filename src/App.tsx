@@ -38,6 +38,7 @@ const LAST_SEEN_VERSION_KEY = "pm:lastSeenVersion";
 import {
   appLockStatus,
   createConversation,
+  deleteConversation,
   getMessages,
   getSettings,
   hasOpenRouterKey,
@@ -356,6 +357,19 @@ export default function App() {
     chat.setMessages([]);
   }
 
+  // Delete a global conversation for good (card 7G). If it's the one on screen, drop back to a blank
+  // new chat; then refresh the sidebar list. The sidebar confirms before calling this.
+  async function handleDeleteConversation(id: number) {
+    try {
+      await deleteConversation(id);
+    } catch (e) {
+      chat.setError(String(e));
+      return;
+    }
+    if (activeIdRef.current === id) newConversation();
+    await refreshConversations();
+  }
+
   async function handleSend(text: string) {
     // Power-user parity with "+ New": /new · /done starts a fresh chat instead of sending, so the
     // trigger never reaches the model or the vault (board card 7E).
@@ -483,6 +497,7 @@ export default function App() {
                     selectConversation(id);
                   }
             }
+            onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
             onNew={
               inProject
                 ? projectChat.newChat

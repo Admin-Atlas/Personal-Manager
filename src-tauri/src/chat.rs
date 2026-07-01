@@ -21,10 +21,11 @@
 //!     session's vault path, last-active). The two cursors on that row are written by cards B and C; this
 //!     card leaves them NULL.
 //!
-//! Out of scope (later cards): embedding/indexing (B), context assembly + rolling summary (C), review
-//! routing + importance (F), Rebuild + deletion (G). The `documents` row a chat becomes — carrying
-//! project/importance/source_state and the stable `source_id`/`content_hash` reserved here — is created by
-//! card B, not this card; that is why nothing here surfaces a chat on the Map or in the review inbox.
+//! Later cards extend this module: embedding/indexing (B) and context assembly + rolling summary (C)
+//! live elsewhere, but card G's deletion cascade — [`delete_conversation_inner`] — now lives here, beside
+//! the write path it inverts (the Rebuild re-embed sweep it pairs with is `ingest::rebuild`). The
+//! `documents` row a chat becomes — carrying project/importance/source_state and the stable
+//! `source_id`/`content_hash` reserved here — is created by card B, not this card.
 
 use std::path::Path;
 
@@ -273,6 +274,53 @@ pub(crate) fn record_turn_pair(
     // Then record/refresh the session row.
     let conn = state.conn()?;
     ensure_session(&conn, conversation_id, scope, &on_disk, &msg_at)?;
+    Ok(())
+}
+
+/// Delete a conversation and everything it produced (board card 7G), given an already-locked connection
+/// and the resolved vault dir. The DB half runs in one transaction: purge the chat's `documents` row +
+/// chunks + vector/FTS mirrors (via [`ingest::delete_document`]) when it was ever indexed, then delete the
+/// `conversations` row — which cascades `messages` and the `chat_sessions` satellite (both ON DELETE
+/// CASCADE). A brand-new chat with no recorded turn-pair has no session row, so there's nothing on the
+/// document side to purge. The vault file is removed AFTER the commit, best-effort: a leftover orphan file
+/// is harmless and self-healing (a future Rebuild re-embeds it as a doc with no conversation), whereas
+/// removing it before a failed commit would strand a live session pointing at a truth file that's gone —
+/// leftover file ≪ dangling live session. Local unlink only, so no network runs under the lock.
+pub(crate) fn delete_conversation_inner(
+    conn: &Connection,
+    vault_dir: &Path,
+    conversation_id: i64,
+) -> Result<()> {
+    // The session row exists only once a turn-pair has been appended; a never-indexed chat has none.
+    let session: Option<(Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT document_id, vault_path FROM chat_sessions WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let tx = conn.unchecked_transaction()?;
+    let vault_file = match session {
+        Some((doc_id, vault_path)) => {
+            if let Some(doc_id) = doc_id {
+                crate::ingest::delete_document(&tx, doc_id)?;
+            }
+            vault_path
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| vault_dir.join(p))
+        }
+        None => None,
+    };
+    tx.execute(
+        "DELETE FROM conversations WHERE id = ?1",
+        params![conversation_id],
+    )?;
+    tx.commit()?;
+
+    if let Some(path) = vault_file {
+        let _ = std::fs::remove_file(&path);
+    }
     Ok(())
 }
 
