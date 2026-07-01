@@ -834,8 +834,10 @@ pub fn rename_conversation(
 /// `chat_sessions` row, and — if the chat was ever indexed — its `documents` row + chunks + vector/FTS
 /// mirrors and its vault Markdown file. A never-indexed chat (no recorded turn-pair) just loses its
 /// conversation + messages. Preferences the chat produced are intentionally kept — they're user-facing
-/// typed records the user may have confirmed in Teach, with their own lifecycle. Grab the vault lock
-/// before the DB lock (the order `record_turn_pair` uses) so the two never nest the other way.
+/// typed records the user may have confirmed in Teach, with their own lifecycle. `markdown_io` clones the
+/// vault dir + cipher and drops the vault lock before returning, so the vault and DB locks are never held
+/// at once; calling it before `conn()` is a consistency convention (the order `record_turn_pair` follows),
+/// not a deadlock-avoidance nesting order.
 #[tauri::command]
 pub fn delete_conversation(state: State<'_, AppState>, conversation_id: i64) -> Result<()> {
     let (vault_dir, _cipher) = state.markdown_io()?;

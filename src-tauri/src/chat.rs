@@ -350,6 +350,11 @@ fn render_turn_block(pair: &TurnPair) -> String {
 /// and is Rebuild-safe. A **general** chat takes ingest defaults (`Unsorted` / no importance / unreviewed)
 /// until card F files it through the shared `write_document_truth` path. Written by the file's sole writer
 /// ([`append_turn_pair`]) at creation, so there is no cross-writer race on the authoritative vault file.
+///
+/// Note the `last_activity`/`ingested_at` scalars here are a creation-time snapshot and are NOT refreshed as
+/// the chat grows — a chat's authoritative recency is per-turn (`chunks.chunk_at`, card B), and a Rebuild
+/// re-derives `documents.last_activity` from the indexed turns (`chat_index::index_session`), not from these
+/// lines. They exist for parity with a document's front-matter, not as a recency source.
 fn render_chat_frontmatter(
     title: &str,
     conversation_id: i64,
