@@ -298,23 +298,32 @@ pub fn add_preference(
     Ok(conn.last_insert_rowid())
 }
 
-/// Whether a preference with this `scope` + `entity_id` + (case-insensitive, trimmed) `value` already
-/// exists. The dedup guard for the chat extractor, so a preference the user re-states — or that the
-/// model re-surfaces across turns — is captured once, never re-inserted on every sweep. `entity_id`
-/// match is null-safe (`IS`): NULL matches NULL for global/context, the project id for project scope.
+/// Whether a preference with this `scope` + `entity_id` + `condition` + (case-insensitive, trimmed)
+/// `value` already exists. The dedup guard for the chat extractor, so a preference the user re-states —
+/// or that the model re-surfaces across turns — is captured once, never re-inserted on every sweep.
+/// `entity_id` match is null-safe (`IS`): NULL matches NULL for global/context, the project id for
+/// project scope. `condition` is part of the key too (normalised, NULL≡""): two context preferences with
+/// the SAME value but a DIFFERENT condition ("terse in the mornings" vs "terse for Atlas standups") are
+/// distinct rules, so keying on value alone would silently drop the second.
 pub fn pref_exists(
     conn: &Connection,
     scope: &str,
     entity_id: Option<i64>,
+    condition: Option<&str>,
     value: &str,
 ) -> Result<bool> {
     // SQLite's built-in `lower()` is ASCII-only (no ICU), so normalise the Rust side the same way —
     // `to_ascii_lowercase()` keeps both sides in lockstep and avoids false-negative dedup on non-ASCII.
     let needle = value.trim().to_ascii_lowercase();
+    // Normalise the condition the same way; NULL and "" both mean "no condition" (IFNULL on both sides).
+    let cond = condition
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty());
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM preferences \
-         WHERE scope = ?1 AND entity_id IS ?2 AND lower(trim(value)) = ?3",
-        params![scope, entity_id, needle],
+         WHERE scope = ?1 AND entity_id IS ?2 AND lower(trim(value)) = ?3 \
+           AND IFNULL(lower(trim(condition)), '') = IFNULL(?4, '')",
+        params![scope, entity_id, needle, cond],
         |r| r.get(0),
     )?;
     Ok(n > 0)
@@ -1054,10 +1063,47 @@ mod tests {
             .unwrap();
         pref(&conn, SCOPE_GLOBAL, None, None, "Use DD-MM-YYYY dates");
 
-        assert!(pref_exists(&conn, SCOPE_GLOBAL, None, "  use dd-mm-yyyy DATES ").unwrap());
+        assert!(pref_exists(&conn, SCOPE_GLOBAL, None, None, "  use dd-mm-yyyy DATES ").unwrap());
         // Same value text but a different scope/entity is a different preference.
-        assert!(!pref_exists(&conn, SCOPE_PROJECT, Some(pm), "Use DD-MM-YYYY dates").unwrap());
-        assert!(!pref_exists(&conn, SCOPE_GLOBAL, None, "something else").unwrap());
+        assert!(
+            !pref_exists(&conn, SCOPE_PROJECT, Some(pm), None, "Use DD-MM-YYYY dates").unwrap()
+        );
+        assert!(!pref_exists(&conn, SCOPE_GLOBAL, None, None, "something else").unwrap());
+    }
+
+    #[test]
+    fn pref_exists_distinguishes_context_prefs_by_condition() {
+        // Card 7F fix: two context preferences with the same value but a different condition are distinct
+        // rules — the dedup must not collapse them, or the second is silently dropped by the extractor.
+        let (_d, conn) = store();
+        pref(
+            &conn,
+            SCOPE_CONTEXT,
+            None,
+            Some("in the mornings"),
+            "keep replies short",
+        );
+        // Same value, same (empty entity) — but a different condition ⇒ NOT a duplicate.
+        assert!(
+            !pref_exists(
+                &conn,
+                SCOPE_CONTEXT,
+                None,
+                Some("for Atlas standups"),
+                "keep replies short"
+            )
+            .unwrap(),
+            "a different condition is a different preference"
+        );
+        // Identical condition (case/space-insensitive) ⇒ a duplicate.
+        assert!(pref_exists(
+            &conn,
+            SCOPE_CONTEXT,
+            None,
+            Some("  In The Mornings "),
+            "Keep Replies Short"
+        )
+        .unwrap());
     }
 
     #[test]

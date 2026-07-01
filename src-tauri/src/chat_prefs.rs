@@ -104,7 +104,13 @@ fn persist_extraction(
     let mut inserted = 0usize;
     for draft in drafts {
         let (scope, entity_id) = resolve_draft_target(&tx, draft)?;
-        if preferences::pref_exists(&tx, &scope, entity_id, &draft.value)? {
+        if preferences::pref_exists(
+            &tx,
+            &scope,
+            entity_id,
+            draft.condition.as_deref(),
+            &draft.value,
+        )? {
             continue; // already stored (user re-stated it, or a prior sweep captured it)
         }
         preferences::add_preference(
