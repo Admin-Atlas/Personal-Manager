@@ -226,9 +226,10 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
 }
 
 /// Mirror a re-evaluated chat's classification from the (already-committed) `documents` row into its vault
-/// front-matter, so file and row stay consistent for a later Rebuild. Reads the current importance/reviewed
-/// + vault path under a short lock, then patches the file off the lock via [`chat::rewrite_chat_classification`]
-/// (which touches only those two front-matter scalars, preserving the chat identity + body).
+/// front-matter, so file and row stay consistent for a later Rebuild. Reads the current importance, reviewed
+/// flag, and vault path under a short lock, then patches the file off the lock via
+/// [`chat::rewrite_chat_classification`], which touches only those two front-matter scalars (the chat
+/// identity and body are preserved).
 fn sync_chat_frontmatter(state: &AppState, doc_id: i64) -> Result<()> {
     let (vault_path, importance, reviewed) = {
         let conn = state.conn()?;
@@ -403,6 +404,7 @@ fn chat_doc_meta(plan: &SessionPlan, last_at: &str) -> DocMeta {
 /// - **Filed (reviewed) general chat** → re-open the queue (`reviewed = 0`) for another review pass, since
 ///   the appended turns may change its bucket. (Accepted review-queue churn on an actively-used chat.)
 /// - **Project chat, not archived** → no-op: it is already `high` / `reviewed` / filed to its project.
+///
 /// Returns `true` iff it changed the row's classification — the caller uses that to mirror the change back
 /// into the vault front-matter (so file and row agree across a Rebuild).
 fn reevaluate_on_append(tx: &Connection, doc_id: i64, scope: &str) -> Result<bool> {
