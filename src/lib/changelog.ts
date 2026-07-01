@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.53.0-alpha",
+    date: "2026-07-01",
+    highlights: [
+      "Your conversations now sort themselves like everything else. A chat you start inside a project files itself there straightaway (marked important, kept close to hand), while a general chat drops into your review inbox for you to place — the same approve-or-correct step your documents already get.",
+      "Nothing stays wrongly buried: pick a chat back up and let it turn into a real discussion, and PM re-evaluates it — a throwaway you'd archived comes back out of the archive, and an already-filed chat returns to review so it can be re-placed.",
+      "Archiving now truly tidies up — an archived chat or document drops off the semantic Map, so the picture stays about what matters (it's still there in search whenever you go looking).",
+    ],
+  },
+  {
     version: "2.52.0-alpha",
     date: "2026-07-01",
     highlights: [

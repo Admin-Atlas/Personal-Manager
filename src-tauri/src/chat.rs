@@ -146,6 +146,7 @@ pub(crate) fn append_turn_pair(
     title: &str,
     conversation_id: i64,
     scope: &str,
+    project: &str,
     created_at: &str,
     ingested_at: &str,
     pair: &TurnPair,
@@ -155,7 +156,14 @@ pub(crate) fn append_turn_pair(
         let bytes = std::fs::read(&path)?;
         cipher.decode(&bytes, &path)?
     } else {
-        render_chat_frontmatter(title, conversation_id, scope, created_at, ingested_at)
+        render_chat_frontmatter(
+            title,
+            conversation_id,
+            scope,
+            project,
+            created_at,
+            ingested_at,
+        )
     };
     // Idempotent: skip a turn already present (re-run / crash-recovery re-fire). The anchor carries the
     // turn id, which card B also reads to map the vault tail back to turn ids.
@@ -232,11 +240,8 @@ pub(crate) fn record_turn_pair(
 
     // Scope is ORIGIN: a chat opened global vs scoped to a project (the `conversations.project` set at
     // creation). Distinct from whichever project the chat is later FILED under (card F).
-    let scope = if project
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|p| !p.is_empty())
-    {
+    let filed_project = project.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let scope = if filed_project.is_some() {
         "project"
     } else {
         "general"
@@ -258,6 +263,7 @@ pub(crate) fn record_turn_pair(
         &title,
         conversation_id,
         scope,
+        filed_project.unwrap_or("Unsorted"),
         &created_at,
         &msg_at,
         &pair,
@@ -289,15 +295,26 @@ fn render_turn_block(pair: &TurnPair) -> String {
 }
 
 /// The chat document's flat front-matter — read back by `ingest::parse_frontmatter` on a Rebuild (card G).
-/// `source_type: chat` is the discriminator; the standard org fields take ingest defaults until cards B/F
-/// classify the session (then they round-trip through the shared filing path).
+/// `source_type: chat` is the discriminator. Filing (card F): a **project** chat is born already-filed —
+/// linked to its origin `project`, high importance, and `reviewed: true` so it skips the review queue —
+/// which keeps the front-matter consistent with the DB row [`crate::chat_index::chat_doc_meta`] births,
+/// and is Rebuild-safe. A **general** chat takes ingest defaults (`Unsorted` / no importance / unreviewed)
+/// until card F files it through the shared `write_document_truth` path. Written by the file's sole writer
+/// ([`append_turn_pair`]) at creation, so there is no cross-writer race on the authoritative vault file.
 fn render_chat_frontmatter(
     title: &str,
     conversation_id: i64,
     scope: &str,
+    project: &str,
     created_at: &str,
     ingested_at: &str,
 ) -> String {
+    // A project chat is filed to its origin project at birth; a general chat is unsorted until review.
+    let (filed_project, importance, reviewed) = if scope == "project" {
+        (project, "high", "true")
+    } else {
+        ("Unsorted", "null", "false")
+    };
     format!(
         "---\n\
          title: {title}\n\
@@ -308,8 +325,8 @@ fn render_chat_frontmatter(
          chat_source_id: {sid}\n\
          project: {project}\n\
          tags: []\n\
-         importance: null\n\
-         reviewed: false\n\
+         importance: {importance}\n\
+         reviewed: {reviewed}\n\
          created_at: {created_at}\n\
          ingested_at: {ingested_at}\n\
          last_activity: {ingested_at}\n\
@@ -319,7 +336,9 @@ fn render_chat_frontmatter(
         cid = conversation_id,
         scope = scope,
         sid = source_id(conversation_id),
-        project = ingest::yaml_quote("Unsorted"),
+        project = ingest::yaml_quote(filed_project),
+        importance = importance,
+        reviewed = reviewed,
         created_at = created_at,
         ingested_at = ingested_at,
     )
@@ -576,6 +595,7 @@ mod tests {
             args.1,
             args.2,
             args.3,
+            "Unsorted",
             args.4,
             args.5,
             &p1,
@@ -589,6 +609,7 @@ mod tests {
             args.1,
             args.2,
             args.3,
+            "Unsorted",
             args.4,
             args.5,
             &p1,
@@ -631,6 +652,7 @@ mod tests {
             args.1,
             args.2,
             args.3,
+            "Unsorted",
             args.4,
             args.5,
             &p2,
@@ -654,6 +676,54 @@ mod tests {
             "encrypted on-disk name carries .pmenc"
         );
         append_round_trip(&cipher);
+    }
+
+    /// Card F routing: a general chat is born unsorted/unreviewed (heads to the review queue), a project
+    /// chat is born filed to its origin project with high importance and `reviewed: true` (skips the
+    /// queue) — the front-matter matching the `documents` row `chat_index::chat_doc_meta` births.
+    #[test]
+    fn front_matter_routes_general_to_queue_and_files_project_chats() {
+        let cipher = MarkdownCipher::plaintext("v");
+        let dir = tempfile::tempdir().unwrap();
+        let read = |n: &str| {
+            let p = dir.path().join(n);
+            cipher.decode(&std::fs::read(&p).unwrap(), &p).unwrap()
+        };
+        let fields_of = |scope: &str, project: &str, cid: i64| {
+            let name = cipher.on_disk_name(&chat_vault_filename(cid, "2026-06-28T10:00:00.000Z"));
+            append_turn_pair(
+                dir.path(),
+                &cipher,
+                &name,
+                "My chat",
+                cid,
+                scope,
+                project,
+                "2026-06-28T10:00:00.000Z",
+                "2026-06-28T10:00:01.000Z",
+                &pair(
+                    "what's the plan for Q3?",
+                    "Here is a detailed plan for the quarter ahead.",
+                ),
+            )
+            .unwrap();
+            ingest::parse_frontmatter(&read(&name))
+                .expect("front-matter parses")
+                .0
+        };
+
+        let general = fields_of("general", "Unsorted", 7);
+        assert_eq!(general.get("project").map(String::as_str), Some("Unsorted"));
+        assert_eq!(general.get("importance").map(String::as_str), Some("null"));
+        assert_eq!(general.get("reviewed").map(String::as_str), Some("false"));
+
+        let project = fields_of("project", "Atlas - PM", 8);
+        assert_eq!(
+            project.get("project").map(String::as_str),
+            Some("Atlas - PM")
+        );
+        assert_eq!(project.get("importance").map(String::as_str), Some("high"));
+        assert_eq!(project.get("reviewed").map(String::as_str), Some("true"));
     }
 
     fn pair(user: &str, assistant: &str) -> TurnPair {
