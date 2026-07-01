@@ -39,6 +39,7 @@ mod recommend;
 mod registry;
 mod retrieval;
 mod retrieval_config;
+mod retrieval_diag;
 mod review;
 mod secret;
 mod secrets;
@@ -587,6 +588,9 @@ pub fn run() {
             commands::set_background_auto_switch,
             commands::set_help_mode,
             commands::set_reranking,
+            commands::set_retrieval_k,
+            commands::retrieval_explain,
+            commands::retrieval_diagnose,
             commands::language_options,
             commands::set_vault_embedder,
             commands::get_time_zone,

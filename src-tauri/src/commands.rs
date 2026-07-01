@@ -18,6 +18,7 @@ use crate::ingest::{self, Document, IngestEvent};
 use crate::milestones::{self, Milestone};
 use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
+use crate::retrieval_diag;
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
@@ -103,6 +104,9 @@ pub struct Settings {
     /// Indexing speed: "fast" (default, max throughput) or "gentle" (paced so a low-end machine
     /// stays usable while indexing runs in the background).
     pub indexing_speed: String,
+    /// Retrieval depth `k` — how many fused candidates reach the reranker (card 7H). The lever the
+    /// in-chat Retrieval-explain panel tunes; default [`retrieval::DEFAULT_TOP_K`], stateless.
+    pub retrieval_k: usize,
 }
 
 /// Streamed back to the UI over a Tauri channel as the assistant replies.
@@ -168,6 +172,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
         reranking: db::reranking_enabled(&conn)?,
         indexing_speed: db::get_setting(&conn, db::INDEXING_SPEED_KEY)?
             .unwrap_or_else(|| "fast".into()),
+        retrieval_k: db::retrieval_k(&conn),
     })
 }
 
@@ -226,6 +231,15 @@ pub fn set_help_mode(state: State<'_, AppState>, enabled: bool) -> Result<()> {
 pub fn set_reranking(state: State<'_, AppState>, enabled: bool) -> Result<()> {
     let conn = state.conn()?;
     db::set_reranking(&conn, enabled)
+}
+
+/// Set the retrieval depth `k` — the candidate pool that reaches the reranker (card 7H). The user
+/// commits this from the in-chat Retrieval-explain panel ("Use this depth for retrieval"). Clamped
+/// in `db::set_retrieval_k`; stateless, so the effect lands on the next chat turn's retrieval.
+#[tauri::command]
+pub fn set_retrieval_k(state: State<'_, AppState>, k: usize) -> Result<()> {
+    let conn = state.conn()?;
+    db::set_retrieval_k(&conn, k)
 }
 
 /// One language/embedder choice offered at vault creation.
@@ -1294,11 +1308,17 @@ async fn retrieve_grounding(
             return Ok(Vec::new());
         }
 
-        // Resolve the vault's models + the reranking toggle in one short lock, then drop it so
-        // neither the query embed nor the rerank holds the DB lock across a sidecar call (#4).
-        let (gateway, rerank_on) = {
+        // Resolve the vault's models + the reranking toggle + the user's retrieval depth in one
+        // short lock, then drop it so neither the query embed nor the rerank holds the DB lock
+        // across a sidecar call (#4). `k` is the user-tunable candidate pool (card 7H) — it gates
+        // what the reranker ever sees, so it's read here, not fixed at the DEFAULT_TOP_K constant.
+        let (gateway, rerank_on, k) = {
             let conn = state.conn()?;
-            (state.gateway(&conn)?, crate::db::reranking_enabled(&conn)?)
+            (
+                state.gateway(&conn)?,
+                crate::db::reranking_enabled(&conn)?,
+                crate::db::retrieval_k(&conn),
+            )
         };
 
         let embeddings = gateway.embed_query(std::slice::from_ref(&query))?;
@@ -1309,7 +1329,7 @@ async fn retrieve_grounding(
         let q = retrieval::RetrieveQuery {
             text: &query,
             embedding: &query_vec,
-            k: retrieval::DEFAULT_TOP_K,
+            k,
             filters: retrieval::Filters {
                 project: project.clone(),
                 exclude_chat,
@@ -1332,6 +1352,55 @@ async fn retrieve_grounding(
         Ok(Ok(chunks)) => chunks,
         _ => Vec::new(),
     }
+}
+
+/// In-chat "Retrieval explain" (card 7H): the same instrumented read the Developer-mode panel runs,
+/// surfaced to graduated users so they can see which chunks a query retrieves and how they scored.
+/// `k` defaults to the user's saved retrieval depth — so the panel opens showing what a real chat
+/// turn would retrieve — while the live slider passes an explicit override to preview a different
+/// candidate pool without committing it. Strictly read-only; delegates to the shared helper.
+#[tauri::command]
+pub async fn retrieval_explain(
+    app: AppHandle,
+    query: String,
+    project: Option<String>,
+    k: Option<usize>,
+) -> Result<crate::commands_dev::DevRetrievalExplain> {
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let k = match k {
+            Some(k) => k,
+            None => {
+                let conn = state.conn()?;
+                crate::db::retrieval_k(&conn)
+            }
+        };
+        crate::commands_dev::run_retrieval_explain(&state, &query, project.as_deref(), k)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("retrieval explain task panicked: {e}")))?
+}
+
+/// Natural-language retrieval diagnostic (card 7H): the user describes a symptom, and the background
+/// model — reading their own current explain state — explains what it usually means and what to
+/// change and why. RECOMMEND-only: it writes nothing; the user commits any change themselves via the
+/// depth slider. Runs on the background key; resolves models under a short lock, then drops it before
+/// the network call (rule #4).
+#[tauri::command]
+pub async fn retrieval_diagnose(
+    app: AppHandle,
+    symptom: String,
+    query: String,
+    explain: crate::commands_dev::DevRetrievalExplain,
+) -> Result<String> {
+    let api_key = secrets::get_background_or_primary_key()?
+        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+    let models = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?
+    };
+    retrieval_diag::diagnose(api_key.expose(), &models, &symptom, &query, &explain).await
 }
 
 // --- archivist: documents ---

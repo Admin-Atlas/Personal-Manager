@@ -390,6 +390,23 @@ export const devDocumentChunks = (documentId: number) =>
 export const devRetrievalExplain = (query: string, project?: string, k?: number) =>
   invoke<DevRetrievalExplain>("dev_retrieval_explain", { query, project, k });
 
+/** In-chat "Retrieval explain" (card 7H): the same instrumented read as the dev panel, for
+ *  graduated users. When `k` is omitted it defaults to the user's saved retrieval depth (what a
+ *  real chat turn uses); pass an explicit `k` to preview a different candidate pool without
+ *  committing it. Read-only; needs the document engine ready. */
+export const retrievalExplain = (query: string, project?: string, k?: number) =>
+  invoke<DevRetrievalExplain>("retrieval_explain", { query, project, k });
+
+/** Commit the retrieval depth `k` — the candidate pool that reaches the reranker — as the value
+ *  every future chat turn retrieves at (card 7H). Clamped 1–50 in the backend; stateless. */
+export const setRetrievalK = (k: number) => invoke<void>("set_retrieval_k", { k });
+
+/** Ask the background model to diagnose a retrieval symptom from the user's own explain state
+ *  (card 7H). RECOMMEND-only: it returns plain-text advice and never changes any setting — the
+ *  user makes any change themselves via the depth slider. */
+export const retrievalDiagnose = (symptom: string, query: string, explain: DevRetrievalExplain) =>
+  invoke<string>("retrieval_diagnose", { symptom, query, explain });
+
 // --- Archivist: sorting review & organisation (Step 4) ---
 
 /** Distinct project labels across all documents. */

@@ -144,6 +144,35 @@ pub fn set_reranking(conn: &Connection, enabled: bool) -> Result<()> {
     )
 }
 
+/// The `settings` key for the retrieval depth `k` — how many fused candidates survive to the
+/// reranker (card 7H). Query-time and stateless (like reranking): changing it never re-indexes.
+const RETRIEVAL_K_KEY: &str = "retrieval_k";
+
+/// Smallest / largest retrieval depth the user can set. Mirrors the bounds the Retrieval-explain
+/// panel clamps to; 1 keeps at least one candidate, 50 caps the reranker's workload.
+pub const RETRIEVAL_K_MIN: usize = 1;
+pub const RETRIEVAL_K_MAX: usize = 50;
+
+/// The retrieval depth `k` this vault uses — the number of fused candidates that reach the
+/// reranker (and, after it, the model). Absent/invalid ⇒ [`crate::retrieval::DEFAULT_TOP_K`], so an
+/// upgraded vault behaves exactly as before until the user tunes it. Always clamped to
+/// `[RETRIEVAL_K_MIN, RETRIEVAL_K_MAX]` so a hand-edited setting can't widen the pool unbounded.
+pub fn retrieval_k(conn: &Connection) -> usize {
+    get_setting(conn, RETRIEVAL_K_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|k| k.clamp(RETRIEVAL_K_MIN, RETRIEVAL_K_MAX))
+        .unwrap_or(crate::retrieval::DEFAULT_TOP_K)
+}
+
+/// Set the retrieval depth `k`, clamped to `[RETRIEVAL_K_MIN, RETRIEVAL_K_MAX]`. Stateless — the
+/// effect lands on the next query, no Rebuild.
+pub fn set_retrieval_k(conn: &Connection, k: usize) -> Result<()> {
+    let k = k.clamp(RETRIEVAL_K_MIN, RETRIEVAL_K_MAX);
+    set_setting(conn, RETRIEVAL_K_KEY, &k.to_string())
+}
+
 /// The **live** vector width of this vault's `chunk_vec`, read from the table's own DDL. Migration
 /// v2 creates it at `float[384]`; a multilingual vault is drop+recreated to a wider column by
 /// [`ensure_vec_dim`] at re-index time, so this reflects the *current physical* width — the source
@@ -482,6 +511,31 @@ mod tests {
             .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn retrieval_k_defaults_roundtrips_and_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        // Unset ⇒ the retriever's default depth, so an upgraded vault behaves exactly as before.
+        assert_eq!(retrieval_k(&conn), crate::retrieval::DEFAULT_TOP_K);
+
+        // A normal value round-trips.
+        set_retrieval_k(&conn, 12).unwrap();
+        assert_eq!(retrieval_k(&conn), 12);
+
+        // Out-of-range writes are clamped to the bounds, not rejected — the panel can't persist a
+        // pool that's empty or unbounded even if the frontend sent a wild value.
+        set_retrieval_k(&conn, 0).unwrap();
+        assert_eq!(retrieval_k(&conn), RETRIEVAL_K_MIN);
+        set_retrieval_k(&conn, 9999).unwrap();
+        assert_eq!(retrieval_k(&conn), RETRIEVAL_K_MAX);
+
+        // A garbage stored value (hand-edited) also falls back to the default rather than panicking.
+        set_setting(&conn, RETRIEVAL_K_KEY, "not-a-number").unwrap();
+        assert_eq!(retrieval_k(&conn), crate::retrieval::DEFAULT_TOP_K);
     }
 
     #[test]

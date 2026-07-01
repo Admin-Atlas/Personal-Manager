@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.57.0-alpha",
+    date: "2026-07-01",
+    highlights: [
+      "Chat can now show its work. Open “Explain retrieval” under any conversation to see exactly which of your notes it pulled and how each one scored. Drag one dial — depth — to widen the pool the ranker gets to weigh (not just how many results show), then hit “Use this depth” to make it stick.",
+      "Not sure why it missed something? Describe it in plain words and PM will tell you what to try and why — it only ever suggests, and never changes a setting on its own; the dial stays in your hands. (Shows up on the fuller layouts; hide it any time from Appearance.)",
+    ],
+  },
+  {
     version: "2.56.0-alpha",
     date: "2026-07-01",
     highlights: [
