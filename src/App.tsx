@@ -8,6 +8,7 @@ import { ConversationTitle } from "./components/ConversationTitle";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
 import { ContextMeter } from "./components/ContextMeter";
+import { RetrievalExplainPanel } from "./components/RetrievalExplainPanel";
 import { DevView } from "./components/DevView";
 import { DocumentsView } from "./components/DocumentsView";
 import { FocusView } from "./components/FocusView";
@@ -596,6 +597,7 @@ export default function App() {
                 refreshKey={chat.messages.length}
                 onUpgrade={handleUpgrade}
               />
+              <RetrievalExplainPanel messages={chat.messages} />
               <Composer disabled={chat.sending} onSend={handleSend} />
             </main>
           )}

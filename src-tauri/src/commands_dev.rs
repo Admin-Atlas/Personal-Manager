@@ -19,7 +19,7 @@
 
 use rusqlite::types::Value;
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::{Error, Result};
@@ -329,8 +329,9 @@ const PREVIEW_CHARS: usize = 160;
 
 /// One ranked candidate in a "Retrieval explain" run, with every per-stage score. Mirrors
 /// [`crate::retrieval::ExplainCandidate`] but with the chunk body replaced by a truncated preview
-/// and the reranker score attached. Every value here is safe to display.
-#[derive(Serialize)]
+/// and the reranker score attached. Every value here is safe to display. `Deserialize` so the
+/// in-chat diagnostic (card 7H) can take the panel's own explain payload back as read-only context.
+#[derive(Serialize, Deserialize)]
 pub struct DevRetrievalRow {
     pub final_rank: usize,
     pub chunk_id: i64,
@@ -349,7 +350,7 @@ pub struct DevRetrievalRow {
 
 /// The result of a "Retrieval explain" run: the ranked rows plus the engine context needed to read
 /// them (embedder, whether reranking is on and actually ran, the RRF constant and half-life).
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DevRetrievalExplain {
     pub embedder_id: String,
     pub embedder_label: String,
@@ -606,97 +607,113 @@ pub async fn dev_retrieval_explain(
 ) -> Result<DevRetrievalExplain> {
     tokio::task::spawn_blocking(move || -> Result<DevRetrievalExplain> {
         let state = app.state::<AppState>();
-        let k = k.unwrap_or(retrieval::DEFAULT_TOP_K).clamp(1, 50);
-
-        // Don't trigger a slow first-run install mid-inspection — require the engine ready.
-        if !matches!(state.sidecar.status(), SidecarStatus::Ready) {
-            return Err(Error::Other(
-                "the document engine isn't ready yet — finish setup first".into(),
-            ));
-        }
-
-        // Resolve the vault's models + reranking toggle + embedder identity in one short lock, then
-        // drop it so neither the embed nor the rerank holds the DB lock across a sidecar call (#4).
-        let (gateway, rerank_on, embedder) = {
-            let conn = state.conn()?;
-            (
-                state.gateway(&conn)?,
-                db::reranking_enabled(&conn)?,
-                db::selected_embedder(&conn)?,
-            )
-        };
-
-        let embeddings = gateway.embed_query(std::slice::from_ref(&query))?;
-        let Some(query_vec) = embeddings.into_iter().next() else {
-            return Err(Error::Other("failed to embed the query".into()));
-        };
-
-        // Fused + recency-decayed candidates with per-stage scores, under one short lock.
-        let candidates = {
-            let conn = state.conn()?;
-            retrieval::explain(&conn, &query, &query_vec, k, project.as_deref())?
-        };
-
-        // Off-lock reranking: capture each candidate's score and reorder, mirroring production but
-        // keeping the scores. A `None`/mismatched result leaves the fused order (`reranked=false`).
-        let mut scored: Vec<(retrieval::ExplainCandidate, Option<f32>)> =
-            candidates.into_iter().map(|c| (c, None)).collect();
-        let mut reranked = false;
-        if rerank_on {
-            let texts: Vec<&str> = scored
-                .iter()
-                .map(|(c, _)| c.chunk.content.as_str())
-                .collect();
-            let reranker = &gateway as &dyn retrieval::Reranker;
-            if let Some(scores) = reranker.scores(&query, &texts)? {
-                if scores.len() == scored.len() {
-                    for ((_, slot), s) in scored.iter_mut().zip(scores.iter()) {
-                        *slot = Some(*s);
-                    }
-                    scored.sort_by(|a, b| {
-                        b.1.unwrap_or(f32::MIN)
-                            .partial_cmp(&a.1.unwrap_or(f32::MIN))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then(a.0.chunk.chunk_id.cmp(&b.0.chunk.chunk_id))
-                    });
-                    reranked = true;
-                }
-            }
-        }
-
-        let rows = scored
-            .into_iter()
-            .enumerate()
-            .map(|(i, (c, reranker_score))| DevRetrievalRow {
-                final_rank: i,
-                chunk_id: c.chunk.chunk_id,
-                document_id: c.chunk.document_id,
-                title: c.chunk.title,
-                heading: c.chunk.heading,
-                preview: truncate(&c.chunk.content, PREVIEW_CHARS),
-                vector_rank: c.vector_rank,
-                vector_distance: c.vector_distance,
-                keyword_rank: c.keyword_rank,
-                fused_score: c.fused_score,
-                decay_factor: c.decay_factor,
-                decayed_score: c.decayed_score,
-                reranker_score,
-            })
-            .collect();
-
-        Ok(DevRetrievalExplain {
-            embedder_id: embedder.id.to_string(),
-            embedder_label: embedder.label.to_string(),
-            reranking_enabled: rerank_on,
-            reranked,
-            rrf_k: retrieval::RRF_K,
-            half_life_days: retrieval::HALF_LIFE_DAYS,
-            k,
-            rows,
-        })
+        let k = k.unwrap_or(retrieval::DEFAULT_TOP_K);
+        run_retrieval_explain(&state, &query, project.as_deref(), k)
     })
     .await
     .map_err(|e| Error::Other(format!("retrieval explain task panicked: {e}")))?
+}
+
+/// Run one "Retrieval explain": embed `query`, fuse + recency-decay the candidates with per-stage
+/// scores, and (when reranking is on) re-score them off the DB lock — returning the ranked rows plus
+/// the engine context. Blocking (embeds + optionally reranks via the sidecar); callers wrap it in
+/// `spawn_blocking`. Shared by the Developer-mode panel and the in-chat panel (card 7H) so both read
+/// the exact same instrumented pipeline; `k` is clamped to the retrieval-depth bounds here.
+pub(crate) fn run_retrieval_explain(
+    state: &AppState,
+    query: &str,
+    project: Option<&str>,
+    k: usize,
+) -> Result<DevRetrievalExplain> {
+    let k = k.clamp(db::RETRIEVAL_K_MIN, db::RETRIEVAL_K_MAX);
+
+    // Don't trigger a slow first-run install mid-inspection — require the engine ready.
+    if !matches!(state.sidecar.status(), SidecarStatus::Ready) {
+        return Err(Error::Other(
+            "the document engine isn't ready yet — finish setup first".into(),
+        ));
+    }
+
+    // Resolve the vault's models + reranking toggle + embedder identity in one short lock, then
+    // drop it so neither the embed nor the rerank holds the DB lock across a sidecar call (#4).
+    let (gateway, rerank_on, embedder) = {
+        let conn = state.conn()?;
+        (
+            state.gateway(&conn)?,
+            db::reranking_enabled(&conn)?,
+            db::selected_embedder(&conn)?,
+        )
+    };
+
+    let query_owned = query.to_string();
+    let embeddings = gateway.embed_query(std::slice::from_ref(&query_owned))?;
+    let Some(query_vec) = embeddings.into_iter().next() else {
+        return Err(Error::Other("failed to embed the query".into()));
+    };
+
+    // Fused + recency-decayed candidates with per-stage scores, under one short lock.
+    let candidates = {
+        let conn = state.conn()?;
+        retrieval::explain(&conn, query, &query_vec, k, project)?
+    };
+
+    // Off-lock reranking: capture each candidate's score and reorder, mirroring production but
+    // keeping the scores. A `None`/mismatched result leaves the fused order (`reranked=false`).
+    let mut scored: Vec<(retrieval::ExplainCandidate, Option<f32>)> =
+        candidates.into_iter().map(|c| (c, None)).collect();
+    let mut reranked = false;
+    if rerank_on {
+        let texts: Vec<&str> = scored
+            .iter()
+            .map(|(c, _)| c.chunk.content.as_str())
+            .collect();
+        let reranker = &gateway as &dyn retrieval::Reranker;
+        if let Some(scores) = reranker.scores(query, &texts)? {
+            if scores.len() == scored.len() {
+                for ((_, slot), s) in scored.iter_mut().zip(scores.iter()) {
+                    *slot = Some(*s);
+                }
+                scored.sort_by(|a, b| {
+                    b.1.unwrap_or(f32::MIN)
+                        .partial_cmp(&a.1.unwrap_or(f32::MIN))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.chunk.chunk_id.cmp(&b.0.chunk.chunk_id))
+                });
+                reranked = true;
+            }
+        }
+    }
+
+    let rows = scored
+        .into_iter()
+        .enumerate()
+        .map(|(i, (c, reranker_score))| DevRetrievalRow {
+            final_rank: i,
+            chunk_id: c.chunk.chunk_id,
+            document_id: c.chunk.document_id,
+            title: c.chunk.title,
+            heading: c.chunk.heading,
+            preview: truncate(&c.chunk.content, PREVIEW_CHARS),
+            vector_rank: c.vector_rank,
+            vector_distance: c.vector_distance,
+            keyword_rank: c.keyword_rank,
+            fused_score: c.fused_score,
+            decay_factor: c.decay_factor,
+            decayed_score: c.decayed_score,
+            reranker_score,
+        })
+        .collect();
+
+    Ok(DevRetrievalExplain {
+        embedder_id: embedder.id.to_string(),
+        embedder_label: embedder.label.to_string(),
+        reranking_enabled: rerank_on,
+        reranked,
+        rrf_k: retrieval::RRF_K,
+        half_life_days: retrieval::HALF_LIFE_DAYS,
+        k,
+        rows,
+    })
 }
 
 #[cfg(test)]

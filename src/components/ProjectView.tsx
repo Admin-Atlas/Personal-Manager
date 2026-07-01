@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Composer } from "./Composer";
+import { RetrievalExplainPanel } from "./RetrievalExplainPanel";
 import {
   listCalendarEvents,
   listDocuments,
@@ -344,6 +345,7 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
               </div>
             </div>
           )}
+          <RetrievalExplainPanel messages={chat.messages} project={project} />
           <Composer disabled={chat.sending} onSend={chat.handleSend} />
         </main>
 

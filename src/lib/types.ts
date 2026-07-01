@@ -40,6 +40,9 @@ export interface Settings {
   /** Indexing speed: "fast" (default, max throughput) or "gentle" (paced so a low-end machine
    *  stays usable while indexing runs in the background). */
   indexing_speed: string;
+  /** Retrieval depth `k` — how many fused candidates reach the reranker (card 7H). The lever the
+   *  in-chat Retrieval-explain panel tunes; default 6, stateless. */
+  retrieval_k: number;
 }
 
 /** One search-language / embedder choice offered at vault creation. */
