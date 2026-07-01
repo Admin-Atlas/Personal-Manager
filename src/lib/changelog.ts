@@ -22,7 +22,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     version: "2.52.0-alpha",
     date: "2026-07-01",
     highlights: [
-      "When an answer draws on one of your past chats, it now says so — the source reads “from [that conversation], and the date” instead of looking like a plain file. Click it and PM jumps you straight back to that conversation, scrolled to the exact turn it drew from, so you can see the full context behind the answer.",
+      "When an answer draws on one of your past chats, it now says so — the source reads “from [the chat’s name], [date]” instead of looking like a plain file. Click it and PM jumps you straight back to that conversation, scrolled to the exact turn it drew from, so you can see the full context behind the answer.",
     ],
   },
   {

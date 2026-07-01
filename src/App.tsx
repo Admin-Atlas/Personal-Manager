@@ -77,8 +77,9 @@ export default function App() {
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   /** A file to highlight when the project opens (set by the command palette). */
   const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
-  /** A chat turn to scroll to and flash after a chat citation navigates here (card 7E PR3). */
-  const [focusMessageId, setFocusMessageId] = useState<number | null>(null);
+  /** A chat turn to scroll to and flash after a chat citation navigates here (card 7E PR3). The
+   *  `nonce` bumps on every click so re-clicking the same citation re-fires the jump. */
+  const [focusTurn, setFocusTurn] = useState<{ id: number; nonce: number } | null>(null);
   const [reviewCount, setReviewCount] = useState(0);
   const [showPalette, setShowPalette] = useState(false);
 
@@ -343,7 +344,10 @@ export default function App() {
   // turn id is set only after its messages load, so ChatView finds the target turn to flash.
   function openChatCitation(conversationId: number, turnId: number | null) {
     setView("chat");
-    void selectConversation(conversationId).then(() => setFocusMessageId(turnId));
+    void selectConversation(conversationId).then(() => {
+      if (turnId == null) return; // a chat cited without a specific turn — just open it
+      setFocusTurn((prev) => ({ id: turnId, nonce: (prev?.nonce ?? 0) + 1 }));
+    });
   }
 
   function newConversation() {
@@ -570,7 +574,7 @@ export default function App() {
                 messages={chat.messages}
                 streaming={chat.streaming}
                 onOpenChatCitation={openChatCitation}
-                focusMessageId={focusMessageId}
+                focusTurn={focusTurn}
               />
               <ContextMeter
                 conversationId={activeId}

@@ -13,9 +13,10 @@ interface Props {
   /** Open a past chat a citation points to, at its cited turn (board card 7E PR3). Absent in surfaces
    *  where chat citations don't navigate. */
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
-  /** A message (turn) to scroll to and briefly flash — set when a chat citation clicked elsewhere
-   *  navigated here to this exact turn. */
-  focusMessageId?: number | null;
+  /** A turn to scroll to and briefly flash — set when a chat citation clicked elsewhere navigated here
+   *  to this exact turn. Carries a `nonce` that bumps on every click so clicking the *same* citation
+   *  again re-fires the jump (a bare id wouldn't: React bails on a same-value state set). */
+  focusTurn?: { id: number; nonce: number } | null;
 }
 
 /** A conversation reopened after this long reads as "resumed" — we mark it so the user knows they're
@@ -200,16 +201,16 @@ function MessageBlock({
   );
 }
 
-export function ChatView({ messages, streaming, onOpenChatCitation, focusMessageId }: Props) {
+export function ChatView({ messages, streaming, onOpenChatCitation, focusTurn }: Props) {
   const endRef = useRef<HTMLDivElement>(null);
   const { atLeast } = useDepth();
   // Per-turn refs so a chat citation that navigated here can scroll straight to its turn.
   const blockRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const [flashMsg, setFlashMsg] = useState<number | null>(null);
-  // Which turn we've already flashed, so a later message arriving (a reply streaming in) doesn't yank
-  // the scroll back up to the old cited turn. Message ids are globally unique, so equality means the
-  // very same turn.
-  const lastFocusRef = useRef<number | null>(null);
+  // The nonce of the focus request we've already handled, so a later message arriving (a reply
+  // streaming in) doesn't yank the scroll back up to the old cited turn. Keyed on the nonce, not the
+  // turn id, so re-clicking the *same* citation (fresh nonce) re-fires while streaming replies don't.
+  const lastNonceRef = useRef<number | null>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -217,20 +218,20 @@ export function ChatView({ messages, streaming, onOpenChatCitation, focusMessage
 
   // Arrive on a cited turn: scroll it into view and flash it once (mirrors ProjectView's file focus).
   // Depends on `messages` too, so it still fires when the target conversation's turns load a tick after
-  // the id is set. Declared after the scroll-to-bottom effect so it wins the final scroll position.
+  // the request is set. Declared after the scroll-to-bottom effect so it wins the final scroll position.
   useEffect(() => {
-    if (focusMessageId == null || focusMessageId === lastFocusRef.current) return;
-    const el = blockRefs.current.get(focusMessageId);
+    if (focusTurn == null || focusTurn.nonce === lastNonceRef.current) return;
+    const el = blockRefs.current.get(focusTurn.id);
     if (!el) return; // turns not loaded yet — the messages-dep re-run will catch it
-    lastFocusRef.current = focusMessageId;
+    lastNonceRef.current = focusTurn.nonce;
     el.scrollIntoView({ behavior: "smooth", block: "center" });
-    setFlashMsg(focusMessageId);
+    setFlashMsg(focusTurn.id);
     const clear = window.setTimeout(
-      () => setFlashMsg((cur) => (cur === focusMessageId ? null : cur)),
+      () => setFlashMsg((cur) => (cur === focusTurn.id ? null : cur)),
       2000,
     );
     return () => window.clearTimeout(clear);
-  }, [focusMessageId, messages]);
+  }, [focusTurn, messages]);
 
   const empty = messages.length === 0 && streaming === null;
   // Only meaningful while idle (a streaming reply means we're mid-flow, not resuming).
