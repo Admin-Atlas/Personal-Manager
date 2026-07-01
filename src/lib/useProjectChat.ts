@@ -28,14 +28,22 @@ export function useProjectChat(project: string | null) {
   const convIdRef = useRef(convId);
   convIdRef.current = convId;
   const chat = useChatStream(() => convIdRef.current);
+  // Latest open project, tracked synchronously so a slow `listConversations()` started for the
+  // previous project can't resolve late and overwrite the list with the wrong project's chats.
+  const projectRef = useRef(project);
+  projectRef.current = project;
 
   const refreshConversations = useCallback(() => {
-    if (project == null) {
+    const p = project;
+    if (p == null) {
       setConversations([]);
       return;
     }
     listConversations()
-      .then((all) => setConversations(all.filter((c) => c.project === project)))
+      .then((all) => {
+        if (projectRef.current !== p) return; // stale — the project changed mid-flight
+        setConversations(all.filter((c) => c.project === p));
+      })
       .catch(() => {});
   }, [project]);
 
@@ -55,6 +63,9 @@ export function useProjectChat(project: string | null) {
   const openConversation = useCallback(
     async (id: number) => {
       if (id === convIdRef.current) return;
+      // Adopt the id synchronously (not just via the next render) so the post-await guard is
+      // reliable even if getMessages resolves before React commits setConvId.
+      convIdRef.current = id;
       setConvId(id);
       setDismissedIdleFor(null);
       chat.clearTransient();
@@ -89,6 +100,7 @@ export function useProjectChat(project: string | null) {
         try {
           const created = await createConversation(project);
           id = created.id;
+          convIdRef.current = id; // adopt synchronously so the post-send guard is reliable
           setConvId(id);
         } catch (e) {
           chat.setError(String(e));

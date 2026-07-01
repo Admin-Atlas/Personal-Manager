@@ -174,9 +174,11 @@ export function ProjectView({ project, chat, focusDocId, onBack }: Props) {
       ? idleSince(chat.messages, Date.now())
       : null;
 
-  // The Milestones panel only shows when there are milestones (or the user's Depth surfaces the
-  // add control). With no panel, Files takes the whole sidebar — no split, no divider.
-  const showMilestones = showMeta || milestones.length > 0;
+  // Split the sidebar 50-50 (draggable) only when there are actual milestones to balance against
+  // Files. With none, Files fills the space — the add-a-milestone control (Depth-gated) just sits
+  // above it at its natural height, no divider. So an empty project doesn't waste half the sidebar.
+  const hasMilestones = milestones.length > 0;
+  const showAddMilestone = showMeta && !hasMilestones;
 
   const filesPanel = (
     <>
@@ -347,13 +349,13 @@ export function ProjectView({ project, chat, focusDocId, onBack }: Props) {
               resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
             }`}
           />
-          {showMilestones ? (
+          {hasMilestones ? (
             // Milestones (top) + Files (bottom), split by a draggable divider (hard-pref ratio).
             <div ref={splitRef} className="flex min-h-0 flex-1 flex-col">
               <div
                 style={{ flexBasis: `${topFrac * 100}%` }}
                 className="min-h-0 shrink-0 grow-0 overflow-y-auto overflow-x-hidden"
-                data-help="project-files"
+                data-help="project-milestones-panel"
               >
                 {milestonesPanel}
               </div>
@@ -371,11 +373,18 @@ export function ProjectView({ project, chat, focusDocId, onBack }: Props) {
               <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">{filesPanel}</div>
             </div>
           ) : (
-            <div
-              className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
-              data-help="project-files"
-            >
-              {filesPanel}
+            // No milestones yet: the (Depth-gated) add control sits at its natural height, Files
+            // fills the rest of the sidebar.
+            <div className="flex min-h-0 flex-1 flex-col">
+              {showAddMilestone && (
+                <div className="shrink-0 border-b border-border">{milestonesPanel}</div>
+              )}
+              <div
+                className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+                data-help="project-files"
+              >
+                {filesPanel}
+              </div>
             </div>
           )}
         </aside>

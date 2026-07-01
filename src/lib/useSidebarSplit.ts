@@ -90,7 +90,12 @@ export function useSidebarSplit() {
     setResizing(true);
     const onMove = (ev: PointerEvent) => {
       const dy = ev.clientY - startY;
-      setFrac(clamp(startFrac + dy / height, MIN_FRAC, MAX_FRAC));
+      const next = clamp(startFrac + dy / height, MIN_FRAC, MAX_FRAC);
+      // Track the ref synchronously too: `finish` reads it on pointerup, which can fire before
+      // React has committed the last `setFrac` render, so relying on the render would persist a
+      // stale fraction (a slight snap-back on next boot).
+      fracRef.current = next;
+      setFrac(next);
     };
     // Commit once on release (localStorage + the cross-machine mirror); pointercancel/blur end a
     // gesture handed off to the OS.
