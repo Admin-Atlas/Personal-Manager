@@ -21,9 +21,9 @@ use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, chat, chat_summary, chat_title, clock, context_budget, cost, db, drive,
-    entities, index_only, lock_session, microsoft, onedrive, openrouter, outlook_calendar, paths,
-    preferences, recommend, secrets, vault, AppState, VaultRuntime,
+    applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, context_budget, cost, db,
+    drive, entities, index_only, lock_session, microsoft, onedrive, openrouter, outlook_calendar,
+    paths, preferences, recommend, secrets, vault, AppState, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -1123,6 +1123,10 @@ pub async fn send_message(
     // Once the conversation has a few turns, give it a real title in the background (board card 7E) — keeps
     // the history list readable. Fire-and-forget + single-flight; a no-op until the turn floor, and once.
     chat_title::spawn_title_after_reply(app.clone(), conversation_id);
+
+    // Notice any preference the user just STATED in this turn (board card 7F) and suggest it in Teach.
+    // Fire-and-forget + single-flight, off the background model; explicit-only, deduped, best-effort.
+    chat_prefs::spawn_extract_after_reply(app.clone(), conversation_id);
 
     let _ = on_event.send(ChatEvent::Done {
         message_id,

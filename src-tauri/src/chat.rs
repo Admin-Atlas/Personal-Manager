@@ -239,9 +239,10 @@ pub(crate) fn record_turn_pair(
     };
 
     // Scope is ORIGIN: a chat opened global vs scoped to a project (the `conversations.project` set at
-    // creation). Distinct from whichever project the chat is later FILED under (card F).
-    let filed_project = project.as_deref().map(str::trim).filter(|p| !p.is_empty());
-    let scope = if filed_project.is_some() {
+    // creation). A project chat is filed to this origin project at birth; a general chat is later filed
+    // by review (card F). `origin_project` is that creation-time project, NOT a post-review destination.
+    let origin_project = project.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let scope = if origin_project.is_some() {
         "project"
     } else {
         "general"
@@ -263,7 +264,7 @@ pub(crate) fn record_turn_pair(
         &title,
         conversation_id,
         scope,
-        filed_project.unwrap_or("Unsorted"),
+        origin_project.unwrap_or("Unsorted"),
         &created_at,
         &msg_at,
         &pair,

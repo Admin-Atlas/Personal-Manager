@@ -6,6 +6,7 @@ mod briefing;
 mod calendar;
 mod chat;
 mod chat_index;
+mod chat_prefs;
 mod chat_summary;
 mod chat_title;
 mod clock;
@@ -182,6 +183,9 @@ pub struct AppState {
     /// Single-flight guard shared by the chat-title eager nudge and the launch catch-up (`chat_title`),
     /// so a per-conversation title generation and a full reconcile never overlap.
     pub title_busy: AtomicBool,
+    /// Single-flight guard shared by the chat-preference eager nudge and the launch catch-up
+    /// (`chat_prefs`), so a per-conversation extraction and a full reconcile never overlap.
+    pub prefs_busy: AtomicBool,
 }
 
 impl AppState {
@@ -522,6 +526,7 @@ pub fn run() {
                 chat_index_busy: AtomicBool::new(false),
                 summary_busy: AtomicBool::new(false),
                 title_busy: AtomicBool::new(false),
+                prefs_busy: AtomicBool::new(false),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -562,6 +567,11 @@ pub fn run() {
             // pass titles any session that crossed the threshold while the app was closed (the eager
             // per-conversation nudge fires from `send_message`). Background, best-effort, single model call.
             chat_title::spawn_title_scheduler(handle.clone());
+
+            // Capture preferences a user STATED in chat (board card 7F) as suggested Teach records: a
+            // launch pass scans turns added while the app was closed (the eager per-conversation nudge
+            // fires from `send_message`). Background, best-effort, explicit-only — never inferred.
+            chat_prefs::spawn_prefs_scheduler(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

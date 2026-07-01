@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.54.0-alpha",
+    date: "2026-07-01",
+    highlights: [
+      "PM now notices when you state a preference in a chat — say “I always want dates as DD-MM-YYYY” or “keep replies short for the Atlas project” and it quietly turns up in Teach as a suggestion you can keep with one click (or ignore). It only ever picks up things you actually said, never guesses, and it never applies one until you’ve kept it.",
+    ],
+  },
+  {
     version: "2.53.0-alpha",
     date: "2026-07-01",
     highlights: [
