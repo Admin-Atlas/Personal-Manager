@@ -816,6 +816,19 @@ pub fn rename_conversation(
     Ok(title)
 }
 
+/// Delete a chat conversation and everything it produced (board card 7G): its `messages`, its
+/// `chat_sessions` row, and — if the chat was ever indexed — its `documents` row + chunks + vector/FTS
+/// mirrors and its vault Markdown file. A never-indexed chat (no recorded turn-pair) just loses its
+/// conversation + messages. Preferences the chat produced are intentionally kept — they're user-facing
+/// typed records the user may have confirmed in Teach, with their own lifecycle. Grab the vault lock
+/// before the DB lock (the order `record_turn_pair` uses) so the two never nest the other way.
+#[tauri::command]
+pub fn delete_conversation(state: State<'_, AppState>, conversation_id: i64) -> Result<()> {
+    let (vault_dir, _cipher) = state.markdown_io()?;
+    let conn = state.conn()?;
+    chat::delete_conversation_inner(&conn, &vault_dir, conversation_id)
+}
+
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, conversation_id: i64) -> Result<Vec<Message>> {
     let conn = state.conn()?;

@@ -970,6 +970,30 @@ pub(crate) fn replace_chunks(
     insert_chunks(tx, doc_id, chunks, embeddings, index_only, stored_summary)
 }
 
+/// Purge one document entirely: its `chunk_vec` + `chunks_fts` mirror rows, its `chunks`, and the
+/// `documents` row itself. This is the exact cascade a "delete document" uses (card 7G deletes a chat
+/// through it); it also matches the global teardown order at the top of [`rebuild`].
+///
+/// Order matters. `chunk_vec` (sqlite-vec vec0) and `chunks_fts` (FTS5) are NOT FK targets — they are
+/// keyed by `chunks.id` (rowid mirror), so their rows MUST be deleted while the `chunks` rows they key
+/// off still exist (exactly as [`replace_chunks`] does). Then `chunks`, then the `documents` row.
+/// Deleting `documents` is explicit: `chunks.document_id` cascades in the *delete-documents* direction,
+/// but we delete bottom-up, so without this the `documents` row would be left orphaned. Caller owns the
+/// transaction.
+pub(crate) fn delete_document(tx: &Connection, doc_id: i64) -> Result<()> {
+    tx.execute(
+        "DELETE FROM chunk_vec WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
+        params![doc_id],
+    )?;
+    tx.execute(
+        "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
+        params![doc_id],
+    )?;
+    tx.execute("DELETE FROM chunks WHERE document_id = ?1", params![doc_id])?;
+    tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])?;
+    Ok(())
+}
+
 /// Split a document body into chunks with the active splitter, sizing by tokens through the given
 /// counter (the gateway → the selected embedder's tokenizer). The title + content hash feed the
 /// heading breadcrumb and the stable, rebuild-reproducible chunk uids.
@@ -1880,6 +1904,126 @@ mod tests {
             truth_source(&conn, index_id).unwrap(),
             TruthSource::IndexManifest
         ));
+    }
+
+    #[test]
+    fn delete_document_purges_all_four_tables() {
+        // The cascade card 7G's chat-delete rides on: one document's rows must vanish from
+        // `documents`, `chunks`, and the two rowid-keyed mirrors (`chunk_vec`, `chunks_fts`), while a
+        // second document is left completely untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        // Seed a document with one leaf chunk mirrored into chunk_vec (a 384-d zero vector, encoded as
+        // vec0 expects — a JSON array string) and chunks_fts.
+        let seed = |vp: &str, hash: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO documents(vault_path, title, content_hash) VALUES (?1,'T',?2)",
+                params![vp, hash],
+            )
+            .unwrap();
+            let doc = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO chunks(document_id, ordinal, content, char_count) VALUES (?1, 0, 'body', 4)",
+                params![doc],
+            )
+            .unwrap();
+            let chunk = conn.last_insert_rowid();
+            let vector = serde_json::to_string(&vec![0f32; 384]).unwrap();
+            conn.execute(
+                "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+                params![chunk, vector],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, content) VALUES (?1, 'body')",
+                params![chunk],
+            )
+            .unwrap();
+            doc
+        };
+        let a = seed("a.md", "ha");
+        let b = seed("b.md", "hb");
+
+        let tx = conn.unchecked_transaction().unwrap();
+        delete_document(&tx, a).unwrap();
+        tx.commit().unwrap();
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        // Document a is gone from documents + chunks...
+        assert_eq!(
+            count(&format!("SELECT count(*) FROM documents WHERE id={a}")),
+            0
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT count(*) FROM chunks WHERE document_id={a}"
+            )),
+            0
+        );
+        // ...and — the whole point — its mirror rows are gone too. The mirrors are keyed by chunks.id
+        // with no FK, so the only surviving rows must be document b's single chunk.
+        assert_eq!(
+            count("SELECT count(*) FROM chunk_vec"),
+            1,
+            "only b's vector"
+        );
+        assert_eq!(count("SELECT count(*) FROM chunks_fts"), 1, "only b's fts");
+        // Document b is completely untouched.
+        assert_eq!(
+            count(&format!("SELECT count(*) FROM documents WHERE id={b}")),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT count(*) FROM chunks WHERE document_id={b}"
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn is_vault_markdown_matches_chat_filenames() {
+        // Card 7G invariant: a Rebuild's flat-vault sweep must keep collecting chat files so their
+        // chunks are re-embedded on a tier switch. Chats are named `chat-<date>-<hash>.md[.pmenc]` and
+        // live in the same flat `vault/` dir as documents — guard the extension predicate against anyone
+        // narrowing it (e.g. to only `.md`, or to a `documents/` prefix).
+        assert!(is_vault_markdown(Path::new(
+            "chat-28-06-2026-abc123def456.md"
+        )));
+        assert!(is_vault_markdown(Path::new(
+            "chat-28-06-2026-abc123def456.md.pmenc"
+        )));
+        // A plain document file still matches (shared predicate), a stray non-markdown file does not.
+        assert!(is_vault_markdown(Path::new("report-01-07-2026-ff00.md")));
+        assert!(!is_vault_markdown(Path::new("chat-28-06-2026-abc.json")));
+    }
+
+    #[test]
+    fn rebuild_sweep_collects_a_chat_vault_file() {
+        // Guards the sweep ROOT + predicate together: the exact `read_dir(&vault).filter(is_vault_markdown)`
+        // expression rebuild uses must pick up chat files sitting in the flat vault dir, plaintext and
+        // encrypted alike. If someone re-scopes rebuild to a documents subdir, this fails.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("report-01-07-2026-ff00.md"), "doc").unwrap();
+        std::fs::write(vault.join("chat-28-06-2026-abc123def456.md"), "chat").unwrap();
+        std::fs::write(vault.join("chat-28-06-2026-def456abc123.md.pmenc"), b"enc").unwrap();
+        std::fs::write(vault.join("scratch.tmp"), "ignore").unwrap();
+
+        let collected: Vec<String> = std::fs::read_dir(&vault)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| is_vault_markdown(path))
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(collected
+            .iter()
+            .any(|n| n.starts_with("chat-") && n.ends_with(".md")));
+        assert!(collected.iter().any(|n| n.ends_with(".md.pmenc")));
+        assert!(!collected.iter().any(|n| n.ends_with(".tmp")));
+        assert_eq!(collected.len(), 3, "two chats + one document, not the .tmp");
     }
 
     #[test]

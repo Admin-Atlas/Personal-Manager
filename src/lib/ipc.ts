@@ -274,6 +274,12 @@ export const getMessages = (conversationId: number) =>
 export const renameConversation = (conversationId: number, title: string) =>
   invoke<string>("rename_conversation", { conversationId, title });
 
+/** Delete a conversation and everything it produced (board card 7G): its messages, its session, and —
+ *  if the chat was indexed — its document, chunks/vectors/FTS rows and vault file. Preferences it
+ *  produced are kept. Irreversible. */
+export const deleteConversation = (conversationId: number) =>
+  invoke<void>("delete_conversation", { conversationId });
+
 /**
  * Send a message and stream the assistant's reply. `onEvent` fires for every
  * token, then once on completion (or error). The returned promise resolves when

@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createConversation, getMessages, listConversations } from "./ipc";
+import {
+  createConversation,
+  deleteConversation as apiDeleteConversation,
+  getMessages,
+  listConversations,
+} from "./ipc";
 import { useChatStream } from "./useChatStream";
 import { isNewChatTrigger } from "./chatSession";
 import type { Conversation } from "./types";
@@ -87,6 +92,22 @@ export function useProjectChat(project: string | null) {
     chat.setMessages([]);
   }, [chat]);
 
+  /** Delete a past chat from the sidebar (card 7G). If it was the one open in the pane, reset to a
+   *  fresh chat; then refresh this project's list. Irreversible — the caller confirms first. */
+  const deleteConversation = useCallback(
+    async (id: number) => {
+      try {
+        await apiDeleteConversation(id);
+      } catch (e) {
+        chat.setError(String(e));
+        return;
+      }
+      if (convIdRef.current === id) newChat();
+      refreshConversations();
+    },
+    [chat, newChat, refreshConversations],
+  );
+
   const handleSend = useCallback(
     async (text: string) => {
       // /new · /done starts a fresh chat instead of sending — never reaches the model or the vault.
@@ -134,6 +155,7 @@ export function useProjectChat(project: string | null) {
     setDismissedIdleFor,
     openConversation,
     newChat,
+    deleteConversation,
     handleSend,
     refreshConversations,
   };
