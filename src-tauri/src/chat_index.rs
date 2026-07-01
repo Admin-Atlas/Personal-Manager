@@ -227,6 +227,23 @@ fn commit_session_index(
 ) -> Result<(Option<i64>, usize)> {
     let tx = conn.transaction()?;
 
+    // Guard against a delete that raced this sweep. `index_session` reads the plan under one lock, RELEASES
+    // it to embed off-lock, then re-acquires to commit here — and `delete_conversation` does NOT take the
+    // chat-index single-flight guard, so it can delete the conversation (cascading its session row) in that
+    // window. If it did, birthing the `(None, false)` documents row below would strand an orphan: a chat
+    // document for a conversation that no longer exists, with no FK back to clean it up, retrievable
+    // forever. The store is one mutex'd connection, so any racing delete has already committed by the time
+    // we hold this transaction's lock — a single existence check closes the window. Nothing survives to
+    // index, so abandon the commit (the empty tx rolls back on drop).
+    let conversation_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+        params![plan.conversation_id],
+        |r| r.get(0),
+    )?;
+    if !conversation_exists {
+        return Ok((None, 0));
+    }
+
     // Birth the documents row only when there is substance to append (never for a trivial-only sweep).
     let doc_id = match (plan.document_id, segments.is_empty()) {
         (existing, true) => existing,
@@ -592,6 +609,41 @@ mod tests {
             project,
             created_at,
         }
+    }
+
+    #[test]
+    fn commit_abandons_birth_when_the_conversation_was_deleted_mid_sweep() {
+        // Card 7G / M4 fix: index_session reads the plan, releases the lock to embed, then commits here.
+        // A delete can land in that window (it does not take the chat-index single-flight). If it does we
+        // must NOT birth a documents row — it would be an orphan with no conversation and no FK to reap it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+        // Plan captured while the conversation still exists (document_id NULL ⇒ the birth branch).
+        let p = plan(&conn, conv);
+        let segs = vec![segment(
+            2,
+            "2026-06-28T10:00:01.000Z",
+            "**You:** hi\n\n**PM:** hello",
+        )];
+
+        // The racing delete: remove the conversation (its chat_sessions row cascades away).
+        conn.execute("DELETE FROM conversations WHERE id = ?1", params![conv])
+            .unwrap();
+
+        let (doc_id, appended) =
+            commit_session_index(&mut conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
+        assert_eq!(
+            doc_id, None,
+            "no document is born for a deleted conversation"
+        );
+        assert_eq!(appended, 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM documents", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "no orphan documents row survives the raced delete",
+        );
     }
 
     #[test]
