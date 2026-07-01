@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.57.1-alpha",
+    date: "2026-07-01",
+    highlights: [
+      "Chat polish, under the hood. Long general chats now genuinely stay cheap as they grow (the running summary is cached properly again), and a chat that runs on never balloons its cost even if the summary falls behind.",
+      "Your conversations survive a re-index intact. Rebuilding search now keeps each chat’s identity — answers still jump to the exact turn they drew from, and a chat you filed into a project (or archived) stays exactly where you put it.",
+      "A preference PM notices in chat truly waits for you. It stays a suggestion in Teach and never steers a reply until you’ve kept it. Plus smaller fixes: the context meter reads true even when a backup model answers, deleting a conversation leaves nothing behind, and auto-naming an old chat no longer bumps it to the top of the list.",
+    ],
+  },
+  {
     version: "2.57.0-alpha",
     date: "2026-07-01",
     highlights: [

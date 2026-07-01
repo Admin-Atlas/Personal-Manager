@@ -28,7 +28,6 @@
 //! await, AGENTS rule #4) and share a single-flight guard. A one-shot per conversation — there is no idle
 //! loop because once a title is `generated`/`custom` there is nothing left to do.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -129,8 +128,12 @@ fn apply_title(conn: &mut Connection, conversation_id: i64, title: &str) -> Resu
         // A rename landed first (custom), or the session vanished — leave the user's choice alone.
         return Ok(false);
     }
+    // Title only — deliberately NOT bumping `updated_at`. That column is the sidebar's ordering key (and
+    // the chat's "last activity"), and a background title write is not activity: bumping it would hoist an
+    // idle chat the launch catch-up just titled to the top of the Conversations list, ahead of chats the
+    // user actually used more recently.
     tx.execute(
-        "UPDATE conversations SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+        "UPDATE conversations SET title = ?1 WHERE id = ?2",
         params![title, conversation_id],
     )?;
     tx.execute(
@@ -251,19 +254,12 @@ where
     F: FnOnce(AppHandle) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    {
-        let state = app.state::<AppState>();
-        if state
-            .title_busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-    }
-    op(app.clone()).await;
     let state = app.state::<AppState>();
-    state.title_busy.store(false, Ordering::SeqCst);
+    let Some(_guard) = crate::BusyGuard::acquire(&state.title_busy) else {
+        return; // another pass holds the single-flight
+    };
+    // `_guard` resets the flag on drop — including if `op` panics — so titling can't wedge.
+    op(app.clone()).await;
 }
 
 /// Whether the vault is unlocked and an OpenRouter key is set — the minimum to title (no sidecar needed; this

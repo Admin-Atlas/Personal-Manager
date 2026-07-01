@@ -218,7 +218,6 @@ export interface ContextStatus {
   used_tokens: number | null;
   percent: number | null;
   alerting: boolean;
-  regime: "summary" | "window";
   compress: CompressDecision;
   upgrade: ModelOption[];
 }

@@ -468,19 +468,12 @@ where
     F: FnOnce(AppHandle) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    {
-        let state = app.state::<AppState>();
-        if state
-            .summary_busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-    }
-    op(app.clone()).await;
     let state = app.state::<AppState>();
-    state.summary_busy.store(false, Ordering::SeqCst);
+    let Some(_guard) = crate::BusyGuard::acquire(&state.summary_busy) else {
+        return; // another pass holds the single-flight
+    };
+    // `_guard` resets the flag on drop — including if `op` panics — so the summariser can't wedge.
+    op(app.clone()).await;
 }
 
 /// Whether the vault is unlocked and an OpenRouter key is set — the minimum to summarise. (Unlike the

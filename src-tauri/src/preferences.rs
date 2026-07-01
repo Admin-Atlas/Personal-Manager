@@ -165,11 +165,19 @@ pub fn list_preferences(conn: &Connection) -> Result<Vec<Preference>> {
 /// their condition so the model self-gates) ∪ `scope='project'` **only** for the active entity. When
 /// `ctx.entity_id` is `None` the project clause's `= NULL` matches nothing, so project preferences
 /// drop out automatically. Ordered user-stated-first, then by confidence.
+///
+/// A machine-derived record (`source` chat or inferred) is injected into the live prompt **only once the
+/// user has kept it** (`user_confirmed = 1`). This is the "a suggestion in Teach, never a silently-applied
+/// rule" contract (card 7F / the v2.54 changelog): an unconfirmed suggestion — captured from a passing
+/// remark in chat, or migrated from the old learning blob — must not steer the model before the user
+/// clicks Keep. User-stated preferences (`source='user'`) are always confirmed at insert, so they are
+/// unaffected.
 pub fn relevant_preferences(conn: &Connection, ctx: PrefContext) -> Result<Vec<Preference>> {
     let sql = format!(
         "SELECT {SELECT_COLS} FROM preferences p LEFT JOIN entities e ON e.id = p.entity_id \
-         WHERE p.scope = 'global' OR p.scope = 'context' \
-            OR (p.scope = 'project' AND p.entity_id = ?1) \
+         WHERE (p.scope = 'global' OR p.scope = 'context' \
+                OR (p.scope = 'project' AND p.entity_id = ?1)) \
+           AND (p.source NOT IN ('chat', 'inferred') OR p.user_confirmed = 1) \
          ORDER BY (p.source = 'user') DESC, p.confidence DESC, p.id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -290,23 +298,32 @@ pub fn add_preference(
     Ok(conn.last_insert_rowid())
 }
 
-/// Whether a preference with this `scope` + `entity_id` + (case-insensitive, trimmed) `value` already
-/// exists. The dedup guard for the chat extractor, so a preference the user re-states — or that the
-/// model re-surfaces across turns — is captured once, never re-inserted on every sweep. `entity_id`
-/// match is null-safe (`IS`): NULL matches NULL for global/context, the project id for project scope.
+/// Whether a preference with this `scope` + `entity_id` + `condition` + (case-insensitive, trimmed)
+/// `value` already exists. The dedup guard for the chat extractor, so a preference the user re-states —
+/// or that the model re-surfaces across turns — is captured once, never re-inserted on every sweep.
+/// `entity_id` match is null-safe (`IS`): NULL matches NULL for global/context, the project id for
+/// project scope. `condition` is part of the key too (normalised, NULL≡""): two context preferences with
+/// the SAME value but a DIFFERENT condition ("terse in the mornings" vs "terse for Atlas standups") are
+/// distinct rules, so keying on value alone would silently drop the second.
 pub fn pref_exists(
     conn: &Connection,
     scope: &str,
     entity_id: Option<i64>,
+    condition: Option<&str>,
     value: &str,
 ) -> Result<bool> {
     // SQLite's built-in `lower()` is ASCII-only (no ICU), so normalise the Rust side the same way —
     // `to_ascii_lowercase()` keeps both sides in lockstep and avoids false-negative dedup on non-ASCII.
     let needle = value.trim().to_ascii_lowercase();
+    // Normalise the condition the same way; NULL and "" both mean "no condition" (IFNULL on both sides).
+    let cond = condition
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty());
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM preferences \
-         WHERE scope = ?1 AND entity_id IS ?2 AND lower(trim(value)) = ?3",
-        params![scope, entity_id, needle],
+         WHERE scope = ?1 AND entity_id IS ?2 AND lower(trim(value)) = ?3 \
+           AND IFNULL(lower(trim(condition)), '') = IFNULL(?4, '')",
+        params![scope, entity_id, needle, cond],
         |r| r.get(0),
     )?;
     Ok(n > 0)
@@ -896,6 +913,53 @@ mod tests {
     }
 
     #[test]
+    fn relevant_preferences_withholds_unconfirmed_machine_records_until_kept() {
+        // Card 7F / M2 fix: a chat- or inferred-derived record is a SUGGESTION — it must not steer the live
+        // prompt until the user keeps it. A user-stated record (confirmed at insert) is always applied.
+        let (_d, conn) = store();
+        let user = add_preference(
+            &conn,
+            SCOPE_GLOBAL,
+            None,
+            None,
+            "call me Bob",
+            SOURCE_USER,
+            1.0,
+            true,
+        )
+        .unwrap();
+        let chat = add_preference(
+            &conn,
+            SCOPE_GLOBAL,
+            None,
+            None,
+            "keep answers terse",
+            SOURCE_CHAT,
+            0.6,
+            false,
+        )
+        .unwrap();
+
+        let relevant = relevant_preferences(&conn, PrefContext::for_entity(None)).unwrap();
+        assert!(
+            relevant.iter().any(|p| p.id == user),
+            "a user-stated pref is always applied"
+        );
+        assert!(
+            !relevant.iter().any(|p| p.id == chat),
+            "an unconfirmed chat suggestion is NOT applied before the user keeps it"
+        );
+
+        // Keeping it makes it live.
+        confirm_preference(&conn, chat).unwrap();
+        let relevant = relevant_preferences(&conn, PrefContext::for_entity(None)).unwrap();
+        assert!(
+            relevant.iter().any(|p| p.id == chat),
+            "a kept chat pref is now applied"
+        );
+    }
+
+    #[test]
     fn parse_pref_array_is_defensive() {
         // Wrapped in prose + code fences, with a bad scope, a missing value, and a junk row.
         let raw = "Here you go:\n```json\n[\
@@ -999,10 +1063,47 @@ mod tests {
             .unwrap();
         pref(&conn, SCOPE_GLOBAL, None, None, "Use DD-MM-YYYY dates");
 
-        assert!(pref_exists(&conn, SCOPE_GLOBAL, None, "  use dd-mm-yyyy DATES ").unwrap());
+        assert!(pref_exists(&conn, SCOPE_GLOBAL, None, None, "  use dd-mm-yyyy DATES ").unwrap());
         // Same value text but a different scope/entity is a different preference.
-        assert!(!pref_exists(&conn, SCOPE_PROJECT, Some(pm), "Use DD-MM-YYYY dates").unwrap());
-        assert!(!pref_exists(&conn, SCOPE_GLOBAL, None, "something else").unwrap());
+        assert!(
+            !pref_exists(&conn, SCOPE_PROJECT, Some(pm), None, "Use DD-MM-YYYY dates").unwrap()
+        );
+        assert!(!pref_exists(&conn, SCOPE_GLOBAL, None, None, "something else").unwrap());
+    }
+
+    #[test]
+    fn pref_exists_distinguishes_context_prefs_by_condition() {
+        // Card 7F fix: two context preferences with the same value but a different condition are distinct
+        // rules — the dedup must not collapse them, or the second is silently dropped by the extractor.
+        let (_d, conn) = store();
+        pref(
+            &conn,
+            SCOPE_CONTEXT,
+            None,
+            Some("in the mornings"),
+            "keep replies short",
+        );
+        // Same value, same (empty entity) — but a different condition ⇒ NOT a duplicate.
+        assert!(
+            !pref_exists(
+                &conn,
+                SCOPE_CONTEXT,
+                None,
+                Some("for Atlas standups"),
+                "keep replies short"
+            )
+            .unwrap(),
+            "a different condition is a different preference"
+        );
+        // Identical condition (case/space-insensitive) ⇒ a duplicate.
+        assert!(pref_exists(
+            &conn,
+            SCOPE_CONTEXT,
+            None,
+            Some("  In The Mornings "),
+            "Keep Replies Short"
+        )
+        .unwrap());
     }
 
     #[test]

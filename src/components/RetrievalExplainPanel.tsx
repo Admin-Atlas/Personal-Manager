@@ -14,10 +14,11 @@
 // that gate, so both chat surfaces (global + project) mount it unconditionally.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { DevRetrievalExplain, DevRetrievalRow, Message } from "../lib/types";
+import type { DevRetrievalExplain, Message } from "../lib/types";
 import { getSettings, retrievalDiagnose, retrievalExplain, setRetrievalK } from "../lib/ipc";
 import { useTheme } from "../theme";
-import { Button, HScroll } from "./ui";
+import { RetrievalScoreTable } from "./RetrievalScoreTable";
+import { Button } from "./ui";
 
 /** The depth bounds mirror the backend clamp (`db::RETRIEVAL_K_{MIN,MAX}`). */
 const K_MIN = 1;
@@ -30,14 +31,6 @@ interface Props {
   project?: string;
 }
 
-/** The vector branch's cell: the raw `vec0` distance (lower = nearer), rank on hover; "—" when the
- *  chunk surfaced via the keyword branch only. Mirrors the Developer-mode panel. */
-function vecCell(r: DevRetrievalRow): { text: string; title: string } {
-  if (r.vector_rank == null) return { text: "—", title: "not in the vector branch" };
-  const dist = r.vector_distance != null ? r.vector_distance.toFixed(3) : "?";
-  return { text: dist, title: `vector rank ${r.vector_rank}` };
-}
-
 export function RetrievalExplainPanel({ messages, project }: Props) {
   const { teachVisible } = useTheme();
 
@@ -48,6 +41,9 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
   const [savedK, setSavedK] = useState<number | null>(null);
   const [k, setK] = useState(6);
   const [explain, setExplain] = useState<DevRetrievalExplain | null>(null);
+  // The query the current `explain` was actually run with — passed to the diagnostic so it never reasons
+  // about a query the displayed rows didn't come from (the user may edit the box after Explain without re-running).
+  const [explainedQuery, setExplainedQuery] = useState("");
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [committing, setCommitting] = useState(false);
@@ -71,14 +67,19 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
       const text = q.trim();
       if (!text) {
         setExplain(null);
+        setExplainedQuery("");
         return;
       }
       setRunning(true);
       setErr(null);
       retrievalExplain(text, project, depth)
-        .then(setExplain)
+        .then((res) => {
+          setExplain(res);
+          setExplainedQuery(text);
+        })
         .catch((e) => {
           setExplain(null);
+          setExplainedQuery("");
           setErr(String(e));
         })
         .finally(() => setRunning(false));
@@ -133,11 +134,13 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
     setDiagnosing(true);
     setDiagErr(null);
     setAdvice(null);
-    retrievalDiagnose(s, queryRef.current.trim(), explain)
+    // Use the query the explain actually ran with, NOT the live box (which may have been edited since),
+    // so the model reasons about the same query/rows pair it's shown.
+    retrievalDiagnose(s, explainedQuery, explain)
       .then(setAdvice)
       .catch((e) => setDiagErr(String(e)))
       .finally(() => setDiagnosing(false));
-  }, [symptom, explain]);
+  }, [symptom, explain, explainedQuery]);
 
   if (!teachVisible) return null;
 
@@ -232,60 +235,7 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
                   No candidates — nothing indexed matched this query.
                 </p>
               ) : (
-                <HScroll className="mt-2">
-                  <table className="w-full border-collapse text-left text-xs">
-                    <thead>
-                      <tr className="text-ink4">
-                        <th className="py-1 pr-2 font-medium">#</th>
-                        <th className="py-1 pr-2 font-medium">chunk</th>
-                        <th className="py-1 pr-2 text-right font-medium">vec</th>
-                        <th className="py-1 pr-2 text-right font-medium">kw</th>
-                        <th className="py-1 pr-2 text-right font-medium">fused</th>
-                        <th className="py-1 pr-2 text-right font-medium">decay</th>
-                        <th className="py-1 text-right font-medium">rerank</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {explain.rows.map((r) => {
-                        const vec = vecCell(r);
-                        return (
-                          <tr key={r.chunk_id} className="border-t border-rule align-top">
-                            <td className="py-1 pr-2 font-mono text-ink3">{r.final_rank + 1}</td>
-                            <td className="py-1 pr-2">
-                              <div className="text-ink2">
-                                {r.title}
-                                {r.heading ? (
-                                  <span className="text-ink4"> §{r.heading}</span>
-                                ) : null}
-                              </div>
-                              <div className="max-w-md whitespace-pre-wrap break-words text-ink4">
-                                {r.preview}
-                              </div>
-                            </td>
-                            <td
-                              className="py-1 pr-2 text-right font-mono text-ink3"
-                              title={vec.title}
-                            >
-                              {vec.text}
-                            </td>
-                            <td className="py-1 pr-2 text-right font-mono text-ink3">
-                              {r.keyword_rank ?? "—"}
-                            </td>
-                            <td className="py-1 pr-2 text-right font-mono text-ink3">
-                              {r.fused_score.toFixed(4)}
-                            </td>
-                            <td className="py-1 pr-2 text-right font-mono text-ink3">
-                              {r.decay_factor.toFixed(2)}
-                            </td>
-                            <td className="py-1 text-right font-mono text-ink3">
-                              {r.reranker_score != null ? r.reranker_score.toFixed(3) : "—"}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </HScroll>
+                <RetrievalScoreTable rows={explain.rows} />
               )}
             </div>
           )}

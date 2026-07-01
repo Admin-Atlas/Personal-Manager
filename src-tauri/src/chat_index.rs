@@ -200,13 +200,58 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
         .max_by_key(|p| p.turn_id)
         .expect("pairs is non-empty here");
     let indexed_turns = segments.len();
-    let mut conn = state.conn()?;
-    let (_doc_id, chunks) =
-        commit_session_index(&mut conn, &plan, &segments, newest.turn_id, &newest.at)?;
+    let (doc_id, chunks, reclassified) = {
+        let mut conn = state.conn()?;
+        commit_session_index(&mut conn, &plan, &segments, newest.turn_id, &newest.at)?
+    };
+
+    // If the append re-evaluated the chat's bucket (card F), mirror the new importance/reviewed back into
+    // the vault front-matter so file and row agree — a Rebuild reads the file as truth (card G). Best-effort
+    // and OFF the commit: the row is already authoritative; a failure just leaves the file to re-sync on the
+    // next re-eval.
+    if reclassified {
+        if let Some(doc_id) = doc_id {
+            if let Err(e) = sync_chat_frontmatter(state, doc_id) {
+                eprintln!(
+                    "chat_index: front-matter re-sync after re-eval failed (doc {doc_id}): {e}"
+                );
+            }
+        }
+    }
+
     Ok(Outcome::Indexed {
         turns: indexed_turns,
         chunks,
     })
+}
+
+/// Mirror a re-evaluated chat's classification from the (already-committed) `documents` row into its vault
+/// front-matter, so file and row stay consistent for a later Rebuild. Reads the current importance, reviewed
+/// flag, and vault path under a short lock, then patches the file off the lock via
+/// [`chat::rewrite_chat_classification`], which touches only those two front-matter scalars (the chat
+/// identity and body are preserved).
+fn sync_chat_frontmatter(state: &AppState, doc_id: i64) -> Result<()> {
+    let (vault_path, importance, reviewed) = {
+        let conn = state.conn()?;
+        conn.query_row(
+            "SELECT vault_path, importance, reviewed FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )?
+    };
+    let (vault, cipher) = state.markdown_io()?;
+    chat::rewrite_chat_classification(
+        &cipher,
+        &vault.join(&vault_path),
+        importance.as_deref(),
+        reviewed,
+    )
 }
 
 /// Land a session's pre-split, pre-embedded segments: birth the `documents` row on the first index that
@@ -224,8 +269,25 @@ fn commit_session_index(
     segments: &[IndexedSegment],
     cursor_to: i64,
     cursor_at: &str,
-) -> Result<(Option<i64>, usize)> {
+) -> Result<(Option<i64>, usize, bool)> {
     let tx = conn.transaction()?;
+
+    // Guard against a delete that raced this sweep. `index_session` reads the plan under one lock, RELEASES
+    // it to embed off-lock, then re-acquires to commit here — and `delete_conversation` does NOT take the
+    // chat-index single-flight guard, so it can delete the conversation (cascading its session row) in that
+    // window. If it did, birthing the `(None, false)` documents row below would strand an orphan: a chat
+    // document for a conversation that no longer exists, with no FK back to clean it up, retrievable
+    // forever. The store is one mutex'd connection, so any racing delete has already committed by the time
+    // we hold this transaction's lock — a single existence check closes the window. Nothing survives to
+    // index, so abandon the commit (the empty tx rolls back on drop).
+    let conversation_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+        params![plan.conversation_id],
+        |r| r.get(0),
+    )?;
+    if !conversation_exists {
+        return Ok((None, 0, false));
+    }
 
     // Birth the documents row only when there is substance to append (never for a trivial-only sweep).
     let doc_id = match (plan.document_id, segments.is_empty()) {
@@ -243,6 +305,7 @@ fn commit_session_index(
     };
 
     let mut appended = 0usize;
+    let mut reclassified = false;
     if let Some(doc_id) = doc_id {
         if !segments.is_empty() {
             // Append-only: continue after the document's highest ordinal — never renumber old chunks.
@@ -273,7 +336,7 @@ fn commit_session_index(
             // be sticky. Only fires on an append (`plan.document_id` was set on entry), never on the birth
             // above (which was just classified). Keys on the appended turns, not the whole history.
             if plan.document_id.is_some() {
-                reevaluate_on_append(&tx, doc_id, &plan.scope)?;
+                reclassified = reevaluate_on_append(&tx, doc_id, &plan.scope)?;
             }
         }
     }
@@ -287,7 +350,7 @@ fn commit_session_index(
     )?;
 
     tx.commit()?;
-    Ok((doc_id, appended))
+    Ok((doc_id, appended, reclassified))
 }
 
 /// The `documents` row for a chat session, born on first index. Card F routing keys on the chat's ORIGIN
@@ -341,7 +404,10 @@ fn chat_doc_meta(plan: &SessionPlan, last_at: &str) -> DocMeta {
 /// - **Filed (reviewed) general chat** → re-open the queue (`reviewed = 0`) for another review pass, since
 ///   the appended turns may change its bucket. (Accepted review-queue churn on an actively-used chat.)
 /// - **Project chat, not archived** → no-op: it is already `high` / `reviewed` / filed to its project.
-fn reevaluate_on_append(tx: &Connection, doc_id: i64, scope: &str) -> Result<()> {
+///
+/// Returns `true` iff it changed the row's classification — the caller uses that to mirror the change back
+/// into the vault front-matter (so file and row agree across a Rebuild).
+fn reevaluate_on_append(tx: &Connection, doc_id: i64, scope: &str) -> Result<bool> {
     let (importance, reviewed): (Option<String>, bool) = tx.query_row(
         "SELECT importance, reviewed FROM documents WHERE id = ?1",
         params![doc_id],
@@ -355,21 +421,25 @@ fn reevaluate_on_append(tx: &Connection, doc_id: i64, scope: &str) -> Result<()>
             "UPDATE documents SET importance = 'high', reviewed = 1 WHERE id = ?1",
             params![doc_id],
         )?;
+        Ok(true)
     } else if archived {
         // General chat: clear the archive shelving and send it back through review.
         tx.execute(
             "UPDATE documents SET importance = NULL, reviewed = 0 WHERE id = ?1",
             params![doc_id],
         )?;
+        Ok(true)
     } else if !is_project && reviewed {
         // Already-filed general chat: re-open review so the new turns can re-file it.
         tx.execute(
             "UPDATE documents SET reviewed = 0 WHERE id = ?1",
             params![doc_id],
         )?;
+        Ok(true)
+    } else {
+        // Project chat that is not archived is already filed correctly — nothing to do.
+        Ok(false)
     }
-    // Project chat that is not archived is already filed correctly — nothing to do.
-    Ok(())
 }
 
 /// One turn-pair as the text we embed: **authored content only** — exactly what the user wrote and what
@@ -434,15 +504,11 @@ pub(crate) fn should_run_now(
 /// Run a reconcile sweep under the single-flight guard the launch sweep and the idle loop share, so the
 /// two never overlap. Blocking (it embeds) — only ever called from a blocking context.
 fn run_sweep_guarded(state: &AppState, label: &str) {
-    if state
-        .chat_index_busy
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(_guard) = crate::BusyGuard::acquire(&state.chat_index_busy) else {
         return; // another sweep is already in flight
-    }
+    };
+    // `_guard` resets the flag on drop — including if the sweep panics — so indexing can't wedge.
     let result = reconcile_chat_index(state);
-    state.chat_index_busy.store(false, Ordering::SeqCst);
     match result {
         Ok(s) if s.sessions > 0 || s.failed > 0 => eprintln!(
             "chat-index: {label} indexed {} turn(s) across {} session(s) ({} failed)",
@@ -595,6 +661,41 @@ mod tests {
     }
 
     #[test]
+    fn commit_abandons_birth_when_the_conversation_was_deleted_mid_sweep() {
+        // Card 7G / M4 fix: index_session reads the plan, releases the lock to embed, then commits here.
+        // A delete can land in that window (it does not take the chat-index single-flight). If it does we
+        // must NOT birth a documents row — it would be an orphan with no conversation and no FK to reap it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+        // Plan captured while the conversation still exists (document_id NULL ⇒ the birth branch).
+        let p = plan(&conn, conv);
+        let segs = vec![segment(
+            2,
+            "2026-06-28T10:00:01.000Z",
+            "**You:** hi\n\n**PM:** hello",
+        )];
+
+        // The racing delete: remove the conversation (its chat_sessions row cascades away).
+        conn.execute("DELETE FROM conversations WHERE id = ?1", params![conv])
+            .unwrap();
+
+        let (doc_id, appended, _) =
+            commit_session_index(&mut conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
+        assert_eq!(
+            doc_id, None,
+            "no document is born for a deleted conversation"
+        );
+        assert_eq!(appended, 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM documents", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "no orphan documents row survives the raced delete",
+        );
+    }
+
+    #[test]
     fn first_index_births_chat_document_and_advances_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open_db(dir.path());
@@ -606,7 +707,7 @@ mod tests {
             "**You:** hi\n\n**PM:** hello",
         )];
         let p = plan(&conn, conv);
-        let (doc_id, appended) =
+        let (doc_id, appended, _) =
             commit_session_index(&mut conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
         let doc_id = doc_id.expect("a substantive sweep births the document");
         assert_eq!(appended, 1, "one chunk appended");
@@ -668,7 +769,7 @@ mod tests {
         let conv = new_session(&conn, "general");
 
         let p = plan(&conn, conv);
-        let (doc_id, _) = commit_session_index(
+        let (doc_id, _, _) = commit_session_index(
             &mut conn,
             &p,
             &[segment(2, "2026-06-28T10:00:01.000Z", "first")],
@@ -687,7 +788,7 @@ mod tests {
 
         // A later sweep with a new turn-pair appends to the SAME document, continuing ordinals.
         let p2 = plan(&conn, conv); // document_id is now set, so no second row is born
-        let (doc_id_2, appended) = commit_session_index(
+        let (doc_id_2, appended, _) = commit_session_index(
             &mut conn,
             &p2,
             &[segment(4, "2026-06-28T10:05:00.000Z", "second")],
@@ -743,7 +844,7 @@ mod tests {
         let conv = new_session(&conn, "general");
 
         let p = plan(&conn, conv);
-        let (doc_id, appended) =
+        let (doc_id, appended, _) =
             commit_session_index(&mut conn, &p, &[], 6, "2026-06-28T10:10:00.000Z").unwrap();
         assert_eq!(doc_id, None, "no document born for a trivial-only sweep");
         assert_eq!(appended, 0);
@@ -795,7 +896,7 @@ mod tests {
         let mut conn = open_db(dir.path());
         let conv = new_session(&conn, "general");
         let p = plan(&conn, conv);
-        let (doc_id, _) = commit_session_index(
+        let (doc_id, _, _) = commit_session_index(
             &mut conn,
             &p,
             &[segment(2, "2026-06-28T10:00:01.000Z", "hi")],
@@ -815,7 +916,7 @@ mod tests {
         let mut conn = open_db(dir.path());
         let conv = new_project_session(&conn, "Atlas - PM");
         let p = plan(&conn, conv);
-        let (doc_id, _) = commit_session_index(
+        let (doc_id, _, _) = commit_session_index(
             &mut conn,
             &p,
             &[segment(2, "2026-06-28T10:00:01.000Z", "hi")],
@@ -842,7 +943,7 @@ mod tests {
         set_reviewed: bool,
     ) -> (Option<String>, bool) {
         let p = plan(conn, conv);
-        let (doc_id, _) = commit_session_index(
+        let (doc_id, _, _) = commit_session_index(
             conn,
             &p,
             &[segment(2, "2026-06-28T10:00:01.000Z", "first")],
@@ -1017,7 +1118,7 @@ mod tests {
             "**You:** hi\n\n**PM:** hello",
         )];
         let p = plan(&conn, conv);
-        let (doc_id, _) =
+        let (doc_id, _, _) =
             commit_session_index(&mut conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
         let doc_id = doc_id.expect("a substantive sweep births the document");
 
@@ -1125,7 +1226,7 @@ mod tests {
                 "**You:** hi\n\n**PM:** hello",
             )];
             let p = plan(conn, conv);
-            let (doc_id, _) =
+            let (doc_id, _, _) =
                 commit_session_index(conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
             (conv, doc_id.unwrap())
         };

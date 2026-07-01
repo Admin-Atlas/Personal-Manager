@@ -189,6 +189,29 @@ pub struct AppState {
     pub prefs_busy: AtomicBool,
 }
 
+/// Single-flight guard with RAII release. [`BusyGuard::acquire`] returns `Some` if it flipped the flag
+/// `false → true` (this caller won the single-flight), or `None` if another pass already holds it. The flag
+/// resets to `false` when the guard drops — crucially including an unwinding panic, unlike a trailing
+/// `store(false)`. A background task (title / summary / prefs / index sweep) that panics mid-op therefore
+/// can't leave its subsystem's flag stuck `true`, which would otherwise silently wedge that feature (its
+/// eager nudge AND its scheduler both short-circuit on the flag) until the app restarts.
+pub(crate) struct BusyGuard<'a>(&'a AtomicBool);
+
+impl<'a> BusyGuard<'a> {
+    pub(crate) fn acquire(flag: &'a AtomicBool) -> Option<Self> {
+        use std::sync::atomic::Ordering::SeqCst;
+        flag.compare_exchange(false, true, SeqCst, SeqCst)
+            .ok()
+            .map(|_| BusyGuard(flag))
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl AppState {
     /// Mark the user as active right now — bumped on a chat send and on ingest, so the idle chat-indexer
     /// backs off while work is happening.

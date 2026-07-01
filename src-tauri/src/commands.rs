@@ -834,8 +834,10 @@ pub fn rename_conversation(
 /// `chat_sessions` row, and — if the chat was ever indexed — its `documents` row + chunks + vector/FTS
 /// mirrors and its vault Markdown file. A never-indexed chat (no recorded turn-pair) just loses its
 /// conversation + messages. Preferences the chat produced are intentionally kept — they're user-facing
-/// typed records the user may have confirmed in Teach, with their own lifecycle. Grab the vault lock
-/// before the DB lock (the order `record_turn_pair` uses) so the two never nest the other way.
+/// typed records the user may have confirmed in Teach, with their own lifecycle. `markdown_io` clones the
+/// vault dir + cipher and drops the vault lock before returning, so the vault and DB locks are never held
+/// at once; calling it before `conn()` is a consistency convention (the order `record_turn_pair` follows),
+/// not a deadlock-avoidance nesting order.
 #[tauri::command]
 pub fn delete_conversation(state: State<'_, AppState>, conversation_id: i64) -> Result<()> {
     let (vault_dir, _cipher) = state.markdown_io()?;
@@ -941,53 +943,80 @@ pub async fn send_message(
             .optional()?;
         let (document_id, summary_cursor, summary) = session.unwrap_or((None, None, None));
 
-        let history = match summary_cursor {
-            // Recency window: everything past the summary cursor, chronological (includes the user turn
-            // just inserted). The summary covers ≤ cursor, so nothing is both summarised and re-sent.
-            Some(floor) => {
-                let mut stmt = conn.prepare(
-                    "SELECT role, content FROM messages \
-                     WHERE conversation_id = ?1 AND id > ?2 ORDER BY id",
-                )?;
-                let rows = stmt
-                    .query_map(params![conversation_id, floor], |row| {
-                        Ok(openrouter::ChatMessage {
-                            role: row.get(0)?,
-                            content: row.get(1)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
-            }
-            // Pre-summary fallback: the newest N by id, back into chronological order, so a long chat
-            // can't grow every request before its summary exists.
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT role, content FROM \
+        // Returns the verbatim history to replay AND the effective dedup floor (the id below which this
+        // chat's own turns may fall back into RAG). In the summary regime that floor is normally the
+        // summary cursor, but is raised if we have to cap the window (see below).
+        let (history, window_floor): (Vec<openrouter::ChatMessage>, Option<i64>) =
+            match summary_cursor {
+                // Recency window: the newest N past the summary cursor, back into chronological order. The
+                // summary covers ≤ cursor, so nothing is both summarised and re-sent. We CAP it (like the
+                // fallback) because the summariser is best-effort/async: if it stalls, the un-summarised tail
+                // (id > cursor) would otherwise grow without bound and be re-sent in full every turn — the exact
+                // unbounded conversation-cost this card exists to prevent.
+                Some(floor) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, role, content FROM \
+                         (SELECT id, role, content FROM messages \
+                          WHERE conversation_id = ?1 AND id > ?2 ORDER BY id DESC LIMIT ?3) \
+                     ORDER BY id",
+                    )?;
+                    let rows = stmt
+                        .query_map(
+                            params![conversation_id, floor, MAX_HISTORY_MESSAGES as i64],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    openrouter::ChatMessage {
+                                        role: row.get(1)?,
+                                        content: row.get(2)?,
+                                    },
+                                ))
+                            },
+                        )?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    // When the tail is longer than the cap (summariser stalled), we drop the OLDEST past-cursor
+                    // pairs from the verbatim replay. Those pairs aren't in the summary (which covers ≤ cursor),
+                    // so raise the dedup floor to the oldest turn we actually send — anything older than the sent
+                    // window then stays retrievable via RAG instead of vanishing. Un-capped, the oldest sent id
+                    // is cursor+1, so this collapses to the cursor and behaviour is unchanged.
+                    let effective_floor = rows
+                        .first()
+                        .map(|(id, _)| (*id - 1).max(floor))
+                        .unwrap_or(floor);
+                    (
+                        rows.into_iter().map(|(_, m)| m).collect(),
+                        Some(effective_floor),
+                    )
+                }
+                // Pre-summary fallback: the newest N by id, back into chronological order, so a long chat
+                // can't grow every request before its summary exists. No self-dedup in this regime.
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT role, content FROM \
                          (SELECT id, role, content FROM messages WHERE conversation_id = ?1 \
                           ORDER BY id DESC LIMIT ?2) \
                      ORDER BY id",
-                )?;
-                let rows = stmt
-                    .query_map(
-                        params![conversation_id, MAX_HISTORY_MESSAGES as i64],
-                        |row| {
-                            Ok(openrouter::ChatMessage {
-                                role: row.get(0)?,
-                                content: row.get(1)?,
-                            })
-                        },
-                    )?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
-            }
-        };
+                    )?;
+                    let rows = stmt
+                        .query_map(
+                            params![conversation_id, MAX_HISTORY_MESSAGES as i64],
+                            |row| {
+                                Ok(openrouter::ChatMessage {
+                                    role: row.get(0)?,
+                                    content: row.get(1)?,
+                                })
+                            },
+                        )?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    (rows, None)
+                }
+            };
 
         // Dedup self-retrieval (card C): only in the summary regime, exclude this chat's own in-window
         // turns (everything past the cursor — already verbatim above) from its retrieval. We tie this to
         // the cursor so the window floor is exact and older in-session turns (covered by the summary) stay
         // retrievable; a not-yet-summarised chat keeps today's behaviour (no dedup).
-        let exclude_chat = match (document_id, summary_cursor) {
+        let exclude_chat = match (document_id, window_floor) {
             (Some(doc), Some(floor)) => Some((doc, floor)),
             _ => None,
         };
@@ -1028,21 +1057,19 @@ pub async fn send_message(
 
     let mut messages = Vec::with_capacity(history.len() + 4);
     // The STABLE prefix goes first and is what we cache-mark (card 7C): the learned profile (the user's
-    // habits, spec §4.5), then the agenda, then the rolling summary of the conversation's older arc. These
-    // change rarely (the summary only when it extends, ~every few turns), so a `cache_through` breakpoint
-    // on the LAST of them lets providers bill the whole prefix at cache-read rates turn after turn.
+    // habits, spec §4.5), then the rolling summary of the conversation's older arc. These change rarely
+    // (the summary only when it extends, ~every few turns), so a `cache_through` breakpoint on the LAST of
+    // them lets providers bill the whole prefix at cache-read rates turn after turn.
+    //
+    // The agenda is deliberately NOT in this cached block: `agenda_preamble` embeds the current wall-clock
+    // time (minute precision), so it changes on essentially every turn and, sitting before the breakpoint,
+    // would invalidate the whole cached prefix each turn (cache_read ≈ 0). It therefore rides AFTER the
+    // breakpoint with the other per-turn context.
     let mut cache_through: Option<usize> = None;
     if let Some(profile) = &profile {
         messages.push(openrouter::ChatMessage {
             role: "system".into(),
             content: profile.clone(),
-        });
-        cache_through = Some(messages.len() - 1);
-    }
-    if let Some(agenda) = &agenda {
-        messages.push(openrouter::ChatMessage {
-            role: "system".into(),
-            content: agenda.clone(),
         });
         cache_through = Some(messages.len() - 1);
     }
@@ -1056,8 +1083,14 @@ pub async fn send_message(
         });
         cache_through = Some(messages.len() - 1);
     }
-    // The grounding sources change every turn, so they sit AFTER the cache breakpoint (uncached), then the
-    // verbatim recency window.
+    // Everything below changes every turn, so it sits AFTER the cache breakpoint (uncached): the upcoming
+    // agenda (wall-clock-relative), the retrieval grounding, then the verbatim recency window.
+    if let Some(agenda) = &agenda {
+        messages.push(openrouter::ChatMessage {
+            role: "system".into(),
+            content: agenda.clone(),
+        });
+    }
     if !retrieved.is_empty() {
         messages.push(openrouter::ChatMessage {
             role: "system".into(),
@@ -1165,7 +1198,7 @@ pub async fn send_message(
 
 /// The chat context-usage meter + alert state (card 7D). `percent`/`context_window`/`used_tokens` are
 /// `None` when unknown (a custom model with no catalogued window, or no reply measured yet) ⇒ the UI shows
-/// "unknown" and never alerts. `regime` is "summary" once a rolling summary exists, else "window".
+/// "unknown" and never alerts.
 #[derive(Serialize)]
 pub struct ContextStatus {
     pub model: String,
@@ -1175,7 +1208,6 @@ pub struct ContextStatus {
     /// Whether usage has crossed the alert fraction — decided in Rust (the one source of truth) so the UI
     /// just renders. Always false when `percent` is unknown.
     pub alerting: bool,
-    pub regime: String,
     pub compress: context_budget::CompressDecision,
     pub upgrade: Vec<context_budget::ModelOption>,
 }
@@ -1189,13 +1221,27 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
     let state = app.state::<AppState>();
     let conn = state.conn()?;
 
-    // The model the next turn will actually use (the primary of the chat role).
-    let model = effective_models(&conn, CHAT_MODELS_KEY, CHAT_AUTO_SWITCH_KEY)?
+    // The model the meter reports on: the one that actually SERVED the last reply. With chat auto-switch on
+    // a fallback may have answered while the primary is unchanged — and `last_prompt_tokens` (the numerator)
+    // was measured for THAT model, so the window (denominator) must come from the same model, or the
+    // percentage divides usage by the wrong window. Fall back to the primary (next-turn model) before any
+    // reply has been measured.
+    let primary = effective_models(&conn, CHAT_MODELS_KEY, CHAT_AUTO_SWITCH_KEY)?
         .into_iter()
         .next()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let served: Option<String> = conn
+        .query_row(
+            "SELECT model FROM messages \
+             WHERE conversation_id = ?1 AND role = 'assistant' AND model IS NOT NULL \
+             ORDER BY id DESC LIMIT 1",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let model = served.unwrap_or(primary);
 
-    // The selected model's window + the catalogue (latest refresh batch), from the daily price/context fetch.
+    // The reported model's window + the catalogue (latest refresh batch), from the daily price/context fetch.
     let catalogue = cached_catalogue(&conn)?;
     let context_window = catalogue
         .iter()
@@ -1215,10 +1261,6 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
     let (summary, cursor, used_tokens) = session.unwrap_or((None, None, None));
 
     let uncovered_pairs = chat::completed_turn_pairs_after(&conn, conversation_id, cursor)?.len();
-    let summary_present = summary
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty());
     let summary_tokens_est = summary
         .as_deref()
         .map(context_budget::est_tokens)
@@ -1250,7 +1292,6 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
         used_tokens,
         percent,
         alerting: context_budget::is_alerting(percent),
-        regime: if summary_present { "summary" } else { "window" }.to_string(),
         compress,
         upgrade,
     })

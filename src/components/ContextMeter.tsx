@@ -202,9 +202,9 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
                         // The host re-reads settings; refresh once the switch has landed.
                         setTimeout(refresh, 0);
                       }}
-                      title={`${m.name} · ${formatTokens(m.context_length)} context`}
+                      title={`${m.name || m.id} · ${formatTokens(m.context_length)} context`}
                     >
-                      Switch to {m.name} ({formatTokens(m.context_length)})
+                      Switch to {m.name || m.id} ({formatTokens(m.context_length)})
                     </Button>
                   ))}
                 </div>
