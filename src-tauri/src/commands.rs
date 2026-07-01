@@ -1028,21 +1028,19 @@ pub async fn send_message(
 
     let mut messages = Vec::with_capacity(history.len() + 4);
     // The STABLE prefix goes first and is what we cache-mark (card 7C): the learned profile (the user's
-    // habits, spec §4.5), then the agenda, then the rolling summary of the conversation's older arc. These
-    // change rarely (the summary only when it extends, ~every few turns), so a `cache_through` breakpoint
-    // on the LAST of them lets providers bill the whole prefix at cache-read rates turn after turn.
+    // habits, spec §4.5), then the rolling summary of the conversation's older arc. These change rarely
+    // (the summary only when it extends, ~every few turns), so a `cache_through` breakpoint on the LAST of
+    // them lets providers bill the whole prefix at cache-read rates turn after turn.
+    //
+    // The agenda is deliberately NOT in this cached block: `agenda_preamble` embeds the current wall-clock
+    // time (minute precision), so it changes on essentially every turn and, sitting before the breakpoint,
+    // would invalidate the whole cached prefix each turn (cache_read ≈ 0). It therefore rides AFTER the
+    // breakpoint with the other per-turn context.
     let mut cache_through: Option<usize> = None;
     if let Some(profile) = &profile {
         messages.push(openrouter::ChatMessage {
             role: "system".into(),
             content: profile.clone(),
-        });
-        cache_through = Some(messages.len() - 1);
-    }
-    if let Some(agenda) = &agenda {
-        messages.push(openrouter::ChatMessage {
-            role: "system".into(),
-            content: agenda.clone(),
         });
         cache_through = Some(messages.len() - 1);
     }
@@ -1056,8 +1054,14 @@ pub async fn send_message(
         });
         cache_through = Some(messages.len() - 1);
     }
-    // The grounding sources change every turn, so they sit AFTER the cache breakpoint (uncached), then the
-    // verbatim recency window.
+    // Everything below changes every turn, so it sits AFTER the cache breakpoint (uncached): the upcoming
+    // agenda (wall-clock-relative), the retrieval grounding, then the verbatim recency window.
+    if let Some(agenda) = &agenda {
+        messages.push(openrouter::ChatMessage {
+            role: "system".into(),
+            content: agenda.clone(),
+        });
+    }
     if !retrieved.is_empty() {
         messages.push(openrouter::ChatMessage {
             role: "system".into(),
