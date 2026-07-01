@@ -48,6 +48,9 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
   const [savedK, setSavedK] = useState<number | null>(null);
   const [k, setK] = useState(6);
   const [explain, setExplain] = useState<DevRetrievalExplain | null>(null);
+  // The query the current `explain` was actually run with — passed to the diagnostic so it never reasons
+  // about a query the displayed rows didn't come from (the user may edit the box after Explain without re-running).
+  const [explainedQuery, setExplainedQuery] = useState("");
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [committing, setCommitting] = useState(false);
@@ -71,14 +74,19 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
       const text = q.trim();
       if (!text) {
         setExplain(null);
+        setExplainedQuery("");
         return;
       }
       setRunning(true);
       setErr(null);
       retrievalExplain(text, project, depth)
-        .then(setExplain)
+        .then((res) => {
+          setExplain(res);
+          setExplainedQuery(text);
+        })
         .catch((e) => {
           setExplain(null);
+          setExplainedQuery("");
           setErr(String(e));
         })
         .finally(() => setRunning(false));
@@ -133,11 +141,13 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
     setDiagnosing(true);
     setDiagErr(null);
     setAdvice(null);
-    retrievalDiagnose(s, queryRef.current.trim(), explain)
+    // Use the query the explain actually ran with, NOT the live box (which may have been edited since),
+    // so the model reasons about the same query/rows pair it's shown.
+    retrievalDiagnose(s, explainedQuery, explain)
       .then(setAdvice)
       .catch((e) => setDiagErr(String(e)))
       .finally(() => setDiagnosing(false));
-  }, [symptom, explain]);
+  }, [symptom, explain, explainedQuery]);
 
   if (!teachVisible) return null;
 
