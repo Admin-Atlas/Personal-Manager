@@ -27,6 +27,16 @@ const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3";
 /// How far ahead to mirror events (and the agenda horizon). Resolves the spec §11
 /// "how far ahead" question; the louder "Due soon" cutoff is narrower (below).
 pub const AGENDA_DAYS: i64 = 21;
+/// The unified calendar VIEW (card 8) mirrors a far wider band than the 21-day agenda
+/// horizon — the full previous month through a year ahead — so Month/Week/Year navigation
+/// renders and pages without a per-view fetch. Anchored to `start of month` so paging back
+/// one month always lands on fully-mirrored data. Deliberately separate from [`AGENDA_DAYS`]:
+/// chat, briefing, and the focus agenda keep their narrow forward horizon.
+const MIRROR_BACK: &str = "-1 month";
+const MIRROR_FWD: &str = "+13 months";
+/// Page-follow backstop for the paginated Google fetch (250 events/page × 100 ≈ 25k — far above
+/// any real personal calendar over the mirror band, but bounds a hostile or runaway response).
+const MAX_PAGES: usize = 100;
 /// Settings keys (plain key/value — no schema needed).
 const SELECTED_KEY: &str = "google_calendar_ids";
 const LAST_SYNC_KEY: &str = "google_last_sync";
@@ -113,18 +123,43 @@ pub async fn fetch_events(
     time_min: &str,
     time_max: &str,
 ) -> Result<Vec<CalendarEvent>> {
-    let mut url = reqwest::Url::parse(CALENDAR_API).map_err(|e| Error::Other(e.to_string()))?;
-    url.path_segments_mut()
+    let mut base = reqwest::Url::parse(CALENDAR_API).map_err(|e| Error::Other(e.to_string()))?;
+    base.path_segments_mut()
         .map_err(|_| Error::Other("invalid calendar API base".into()))?
         .extend(["calendars", remote_id, "events"]);
-    url.query_pairs_mut()
+    base.query_pairs_mut()
         .append_pair("singleEvents", "true")
         .append_pair("orderBy", "startTime")
         .append_pair("timeMin", time_min)
         .append_pair("timeMax", time_max)
         .append_pair("maxResults", "250");
-    let value = google::authorized_get(token_key, url.as_str()).await?;
-    Ok(parse_events(mirror_calendar_id, &value))
+
+    // Follow `nextPageToken` so the wide mirror band isn't silently truncated at one page — over a
+    // year a single daily-recurring series alone exceeds 250 expanded instances. `singleEvents` +
+    // `orderBy=startTime` keep the pages start-ordered, so appending preserves order.
+    let mut out = Vec::new();
+    let mut page_token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        if pages >= MAX_PAGES {
+            break;
+        }
+        pages += 1;
+        let mut url = base.clone();
+        if let Some(tok) = &page_token {
+            url.query_pairs_mut().append_pair("pageToken", tok);
+        }
+        let value = google::authorized_get(token_key, url.as_str()).await?;
+        out.extend(parse_events(mirror_calendar_id, &value));
+        page_token = value
+            .get("nextPageToken")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if page_token.is_none() {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 // --- calendar feeds (.ics — the no-OAuth path) ---
@@ -229,10 +264,16 @@ pub fn remove_feed(conn: &Connection, id: &str) -> Result<()> {
     remove_source(conn, id)
 }
 
-/// Fetch + parse one feed's events (network; no DB lock held — rule #4). `tz` is the
-/// user's zone, used to anchor floating/all-day ICS times (the feed itself carries no
-/// viewer zone), resolved by the caller before the await.
-pub async fn sync_feed(feed: &IcsFeed, tz: chrono_tz::Tz) -> Result<Vec<CalendarEvent>> {
+/// Fetch + parse one feed's events within `[time_min, time_max]` (RFC3339, as produced by
+/// [`time_window`]; network, no DB lock held — rule #4). `tz` is the user's zone, used to anchor
+/// floating/all-day ICS times (the feed itself carries no viewer zone), resolved by the caller
+/// before the await.
+pub async fn sync_feed(
+    feed: &IcsFeed,
+    time_min: &str,
+    time_max: &str,
+    tz: chrono_tz::Tz,
+) -> Result<Vec<CalendarEvent>> {
     // Re-validate at fetch time: a feed stored before this guard existed — or one
     // whose host now resolves to a private address — must not be fetched.
     validate_feed_url(&feed.url)?;
@@ -273,7 +314,25 @@ pub async fn sync_feed(feed: &IcsFeed, tz: chrono_tz::Tz) -> Result<Vec<Calendar
         )));
     }
     let text = read_capped(resp, MAX_FEED_BYTES).await?;
-    Ok(ics::parse_feed(&text, &feed.id, AGENDA_DAYS, tz))
+    let (win_start, win_end) = parse_window(time_min, time_max)?;
+    Ok(ics::parse_feed_within(
+        &text, &feed.id, win_start, win_end, tz,
+    ))
+}
+
+/// Parse the RFC3339 `[time_min, time_max]` bounds from [`time_window`] into absolute instants for
+/// the ICS path, which filters expanded occurrences by instant rather than by an API query param
+/// (so every provider mirrors the exact same band).
+fn parse_window(
+    time_min: &str,
+    time_max: &str,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let at = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .map_err(|e| Error::Other(format!("bad calendar window bound {s:?}: {e}")))
+    };
+    Ok((at(time_min)?, at(time_max)?))
 }
 
 /// Validate a feed URL: it must be `https` and must not point at a private,
@@ -486,12 +545,15 @@ pub fn set_last_sync(conn: &Connection) -> Result<()> {
     db::set_setting(conn, LAST_SYNC_KEY, &now)
 }
 
-/// The `[timeMin, timeMax]` RFC3339 window for a sync (now → now + `AGENDA_DAYS`).
+/// The `[timeMin, timeMax]` RFC3339 window a sync mirrors: the start of last month through the
+/// start of the month 13 months out (≈ a full previous month + a year ahead). Anchored to
+/// `start of month` so paging the Month/Week/Year view back one month lands on fully-mirrored data.
+/// This is the *mirror* band, deliberately wider than the [`AGENDA_DAYS`] focus/chat horizon.
 pub fn time_window(conn: &Connection) -> Result<(String, String)> {
-    let modifier = format!("+{AGENDA_DAYS} days");
     conn.query_row(
-        "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now',?1)",
-        params![modifier],
+        "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now','start of month',?1), \
+                strftime('%Y-%m-%dT%H:%M:%SZ','now','start of month',?2)",
+        params![MIRROR_BACK, MIRROR_FWD],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
     .map_err(Error::from)
@@ -974,6 +1036,35 @@ pub fn list_upcoming(conn: &Connection, days: i64) -> Result<Vec<CalendarEvent>>
         .collect())
 }
 
+/// Every mirrored event, for the unified calendar VIEW (card 8): the whole synced band — the
+/// previous month included — so the Month/Week/Year grids render and page without a per-view
+/// fetch. Ordered by start. Contrast [`list_upcoming`], the narrow forward agenda for the focus
+/// view. Read-only; the client filters to the visible range and by locally-hidden calendars.
+pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid \
+         FROM calendar_events \
+         ORDER BY start",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let all_day: i64 = r.get(7)?;
+        Ok(CalendarEvent {
+            id: r.get(0)?,
+            calendar_id: r.get(1)?,
+            summary: r.get(2)?,
+            description: r.get(3)?,
+            location: r.get(4)?,
+            start: r.get(5)?,
+            end: r.get(6)?,
+            all_day: all_day != 0,
+            html_link: r.get(8)?,
+            uid: r.get(9)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
+}
+
 /// A compact agenda preamble for chat, or `None` when there's nothing upcoming.
 /// Framed as untrusted DATA so the model never treats an event title as a command.
 pub fn agenda_preamble(conn: &Connection, days: i64, tz: chrono_tz::Tz) -> Result<Option<String>> {
@@ -1065,6 +1156,16 @@ mod tests {
             clip(&long, MAX_SUMMARY_CHARS).chars().count(),
             MAX_SUMMARY_CHARS
         );
+    }
+
+    #[test]
+    fn parse_window_round_trips_rfc3339_bounds_to_utc() {
+        let (start, end) = parse_window("2026-06-01T00:00:00Z", "2027-08-01T00:00:00Z").unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-06-01T00:00:00+00:00");
+        assert_eq!(end.to_rfc3339(), "2027-08-01T00:00:00+00:00");
+        assert!(end > start);
+        // A malformed bound is an error, not a silent empty window.
+        assert!(parse_window("not-a-time", "2027-08-01T00:00:00Z").is_err());
     }
 
     #[test]

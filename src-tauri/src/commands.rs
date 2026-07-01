@@ -2554,6 +2554,11 @@ pub struct CalendarOverview {
     pub calendars: Vec<calendar::Calendar>,
     pub last_sync: Option<String>,
     pub window_days: i64,
+    /// The mirrored band `[start, end]` (RFC3339, from [`calendar::time_window`]) — so the unified
+    /// view can tell when the user has paged past the synced range and show an "outside synced
+    /// range" hint rather than a misleadingly-empty grid.
+    pub mirror_start: String,
+    pub mirror_end: String,
 }
 
 /// The unified calendar state across every provider. Runs the one-time legacy Google migration first
@@ -2563,6 +2568,7 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
     let _ = migrate_legacy_google_calendar(&app).await;
     let state = app.state::<AppState>();
     let conn = state.conn()?;
+    let (mirror_start, mirror_end) = calendar::time_window(&conn)?;
     Ok(CalendarOverview {
         google_client_configured: google::has_client()?,
         microsoft_client_configured: microsoft::has_client()?,
@@ -2570,6 +2576,8 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
         calendars: calendar::list_calendars(&conn)?,
         last_sync: calendar::last_sync(&conn)?,
         window_days: calendar::AGENDA_DAYS,
+        mirror_start,
+        mirror_end,
     })
 }
 
@@ -2743,14 +2751,14 @@ pub async fn add_ics_feed(
 ) -> Result<()> {
     let provider = provider.unwrap_or_else(|| "other".to_string());
     let feed = calendar::build_feed(&label, &url, &provider)?;
-    // Resolve the user's zone (for floating/all-day ICS times) under a short lock, then drop it
-    // before the network sync (rule #4).
-    let tz = {
+    // Resolve the user's zone (for floating/all-day ICS times) and the mirror window under a short
+    // lock, then drop it before the network sync (rule #4).
+    let (tz, (time_min, time_max)) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        resolve_zone(&conn)
+        (resolve_zone(&conn), calendar::time_window(&conn)?)
     };
-    let events = calendar::sync_feed(&feed, tz).await?;
+    let events = calendar::sync_feed(&feed, &time_min, &time_max, tz).await?;
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     calendar::save_new_feed(&feed)?;
@@ -2852,7 +2860,7 @@ async fn sync_one_calendar(
                     cal.source_id
                 ))
             })?;
-            calendar::sync_feed(feed, tz).await?
+            calendar::sync_feed(feed, time_min, time_max, tz).await?
         }
     };
     let n = events.len();
@@ -2936,6 +2944,15 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         return Err(e);
     }
     Ok(total)
+}
+
+/// Every mirrored event across the widened window — the read backing the unified calendar view
+/// (card 8). The focus view keeps the narrow forward agenda ([`list_calendar_events`]); this returns
+/// the whole band (previous month included) and the client filters to the visible range.
+#[tauri::command]
+pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
+    let conn = state.conn()?;
+    calendar::list_all_events(&conn)
 }
 
 /// The upcoming events in the mirror, for the focus-view agenda.

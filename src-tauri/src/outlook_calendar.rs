@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::{microsoft, secrets};
 
 /// How many events to request per page, and the page-follow guard (a backstop, not a coverage cap —
-/// the 21-day window keeps any real calendar far under this).
+/// even the wide ~13-month mirror band keeps any real calendar far under 250 × 100 events).
 const PAGE_SIZE: usize = 250;
 const MAX_PAGES: usize = 100;
 /// The field projection for one event — only what the mirror needs.
