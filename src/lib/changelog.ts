@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.51.0-alpha",
+    date: "2026-07-01",
+    highlights: [
+      "Each project now keeps its own chat history. Open a project and its past conversations sit above its documents in the sidebar — click any one to pick it back up. Drag the divider to give history or documents more room; that split is remembered everywhere, even on another computer.",
+      "Starting fresh is one click (or one word): the “+ New chat” button — or just typing /new (or /done) — tucks the current conversation into history and opens a clean one, without losing anything.",
+      "Reopen a project chat that's been quiet for more than a day and PM gently offers to start a new one, so a fresh train of thought doesn't get tacked onto yesterday's.",
+    ],
+  },
+  {
     version: "2.50.0-alpha",
     date: "2026-06-29",
     highlights: [

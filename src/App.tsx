@@ -28,6 +28,7 @@ import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { useChatStream } from "./lib/useChatStream";
+import { isNewChatTrigger } from "./lib/chatSession";
 import { useUpdater } from "./lib/useUpdater";
 import { useDevMode } from "./lib/capabilities";
 import { useTheme } from "./theme";
@@ -334,6 +335,12 @@ export default function App() {
   }
 
   async function handleSend(text: string) {
+    // Power-user parity with "+ New": /new · /done starts a fresh chat instead of sending, so the
+    // trigger never reaches the model or the vault (board card 7E).
+    if (isNewChatTrigger(text)) {
+      newConversation();
+      return;
+    }
     let convId = activeId;
     if (convId == null) {
       try {
