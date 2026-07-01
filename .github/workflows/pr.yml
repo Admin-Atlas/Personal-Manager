@@ -55,8 +55,11 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         # @stable is a moving branch ref, not a version tag; pinned to its tip with
-        # an explicit toolchain so the SHA pin still selects stable.
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust)
+        # an explicit toolchain so the SHA pin still selects stable. dtolnay force-pushes
+        # `stable` to advance the action, which orphans our (vetted, immutable) pin, so
+        # zizmor's impostor-commit audit flags it — ignored below. The pinned SHA was the
+        # legitimate stable tip when vetted; an immutable pin beats tracking a moving ref.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust) # zizmor: ignore[impostor-commit]
         with:
           toolchain: stable
           components: rustfmt, clippy
