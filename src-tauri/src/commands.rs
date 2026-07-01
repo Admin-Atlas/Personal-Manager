@@ -941,53 +941,80 @@ pub async fn send_message(
             .optional()?;
         let (document_id, summary_cursor, summary) = session.unwrap_or((None, None, None));
 
-        let history = match summary_cursor {
-            // Recency window: everything past the summary cursor, chronological (includes the user turn
-            // just inserted). The summary covers ≤ cursor, so nothing is both summarised and re-sent.
-            Some(floor) => {
-                let mut stmt = conn.prepare(
-                    "SELECT role, content FROM messages \
-                     WHERE conversation_id = ?1 AND id > ?2 ORDER BY id",
-                )?;
-                let rows = stmt
-                    .query_map(params![conversation_id, floor], |row| {
-                        Ok(openrouter::ChatMessage {
-                            role: row.get(0)?,
-                            content: row.get(1)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
-            }
-            // Pre-summary fallback: the newest N by id, back into chronological order, so a long chat
-            // can't grow every request before its summary exists.
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT role, content FROM \
+        // Returns the verbatim history to replay AND the effective dedup floor (the id below which this
+        // chat's own turns may fall back into RAG). In the summary regime that floor is normally the
+        // summary cursor, but is raised if we have to cap the window (see below).
+        let (history, window_floor): (Vec<openrouter::ChatMessage>, Option<i64>) =
+            match summary_cursor {
+                // Recency window: the newest N past the summary cursor, back into chronological order. The
+                // summary covers ≤ cursor, so nothing is both summarised and re-sent. We CAP it (like the
+                // fallback) because the summariser is best-effort/async: if it stalls, the un-summarised tail
+                // (id > cursor) would otherwise grow without bound and be re-sent in full every turn — the exact
+                // unbounded conversation-cost this card exists to prevent.
+                Some(floor) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, role, content FROM \
+                         (SELECT id, role, content FROM messages \
+                          WHERE conversation_id = ?1 AND id > ?2 ORDER BY id DESC LIMIT ?3) \
+                     ORDER BY id",
+                    )?;
+                    let rows = stmt
+                        .query_map(
+                            params![conversation_id, floor, MAX_HISTORY_MESSAGES as i64],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    openrouter::ChatMessage {
+                                        role: row.get(1)?,
+                                        content: row.get(2)?,
+                                    },
+                                ))
+                            },
+                        )?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    // When the tail is longer than the cap (summariser stalled), we drop the OLDEST past-cursor
+                    // pairs from the verbatim replay. Those pairs aren't in the summary (which covers ≤ cursor),
+                    // so raise the dedup floor to the oldest turn we actually send — anything older than the sent
+                    // window then stays retrievable via RAG instead of vanishing. Un-capped, the oldest sent id
+                    // is cursor+1, so this collapses to the cursor and behaviour is unchanged.
+                    let effective_floor = rows
+                        .first()
+                        .map(|(id, _)| (*id - 1).max(floor))
+                        .unwrap_or(floor);
+                    (
+                        rows.into_iter().map(|(_, m)| m).collect(),
+                        Some(effective_floor),
+                    )
+                }
+                // Pre-summary fallback: the newest N by id, back into chronological order, so a long chat
+                // can't grow every request before its summary exists. No self-dedup in this regime.
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT role, content FROM \
                          (SELECT id, role, content FROM messages WHERE conversation_id = ?1 \
                           ORDER BY id DESC LIMIT ?2) \
                      ORDER BY id",
-                )?;
-                let rows = stmt
-                    .query_map(
-                        params![conversation_id, MAX_HISTORY_MESSAGES as i64],
-                        |row| {
-                            Ok(openrouter::ChatMessage {
-                                role: row.get(0)?,
-                                content: row.get(1)?,
-                            })
-                        },
-                    )?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
-            }
-        };
+                    )?;
+                    let rows = stmt
+                        .query_map(
+                            params![conversation_id, MAX_HISTORY_MESSAGES as i64],
+                            |row| {
+                                Ok(openrouter::ChatMessage {
+                                    role: row.get(0)?,
+                                    content: row.get(1)?,
+                                })
+                            },
+                        )?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    (rows, None)
+                }
+            };
 
         // Dedup self-retrieval (card C): only in the summary regime, exclude this chat's own in-window
         // turns (everything past the cursor — already verbatim above) from its retrieval. We tie this to
         // the cursor so the window floor is exact and older in-session turns (covered by the summary) stay
         // retrievable; a not-yet-summarised chat keeps today's behaviour (no dedup).
-        let exclude_chat = match (document_id, summary_cursor) {
+        let exclude_chat = match (document_id, window_floor) {
             (Some(doc), Some(floor)) => Some((doc, floor)),
             _ => None,
         };
