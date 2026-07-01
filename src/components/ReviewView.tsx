@@ -9,6 +9,7 @@ import { useDepth } from "../theme";
 import { Button, Card, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { TagEditor } from "./TagEditor";
+import { ChatBadge } from "./ChatBadge";
 import { rankImportance } from "../lib/importance";
 
 interface Props {
@@ -311,8 +312,14 @@ function ReviewRow({
   return (
     <li>
       <Card className="p-4" data-help="review-row">
-        <div className="truncate font-head text-sm font-medium text-ink" title={doc.title}>
-          {doc.title}
+        <div className="flex items-center gap-2">
+          <div
+            className="min-w-0 flex-1 truncate font-head text-sm font-medium text-ink"
+            title={doc.title}
+          >
+            {doc.title}
+          </div>
+          {doc.source_type === "chat" && <ChatBadge />}
         </div>
         {proposal?.reasoning ? (
           <p className="mt-1 text-xs text-ink3">{proposal.reasoning}</p>

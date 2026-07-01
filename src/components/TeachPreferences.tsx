@@ -204,8 +204,11 @@ function PreferenceRow({
   onEdit: () => void;
   onDelete: () => void;
 }) {
-  // A migrated/inferred record the user hasn't vouched for yet — offer a one-click confirm.
-  const unconfirmed = pref.source === "inferred" && !pref.user_confirmed;
+  // A suggestion the user hasn't vouched for yet — offer a one-click confirm. Both migrated/inferred
+  // records and ones PM noticed you state in chat (source "chat", card 7F) surface this way; a chat
+  // one gets its own origin label so it's clear where the suggestion came from.
+  const fromChat = pref.source === "chat";
+  const unconfirmed = (pref.source === "inferred" || fromChat) && !pref.user_confirmed;
   const { devMode } = useDevMode();
 
   return (
@@ -218,9 +221,13 @@ function PreferenceRow({
             {unconfirmed && (
               <span
                 className="rounded-[var(--radius-sm)] border border-border px-1.5 py-0.5 text-ink4"
-                title="PM carried this over from your earlier profile — keep it if it's right."
+                title={
+                  fromChat
+                    ? "PM noticed you state this in chat — keep it if it's right."
+                    : "PM carried this over from your earlier profile — keep it if it's right."
+                }
               >
-                Suggested
+                {fromChat ? "Suggested from chat" : "Suggested"}
               </span>
             )}
             {showPower && (
