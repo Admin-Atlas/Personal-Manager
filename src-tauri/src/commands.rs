@@ -1453,13 +1453,30 @@ pub fn sidecar_status(state: State<'_, AppState>) -> SidecarStatus {
     state.sidecar.status()
 }
 
+/// Progress for the macOS interpreter download (broadcast on `python://install`).
+/// Like the t-SNE/OCR downloads it has no file count, so `fraction` (0.0..=1.0,
+/// monotonic) renders as a percentage bar. Only ever fires on macOS when no system
+/// Python was found; every other platform / setup goes straight to the venv build.
+#[derive(Clone, Serialize)]
+pub struct PythonInstallEvent {
+    fraction: f32,
+}
+
 /// Provision the managed venv if needed (slow on first run). Run off the async
-/// runtime so the UI stays responsive.
+/// runtime so the UI stays responsive. On macOS, if no interpreter is found and PM
+/// downloads one, its byte progress streams over `python://install`.
 #[tauri::command]
 pub async fn ensure_sidecar(app: AppHandle) -> Result<()> {
-    tokio::task::spawn_blocking(move || app.state::<AppState>().sidecar.ensure_installed())
-        .await
-        .map_err(|e| Error::Other(format!("setup task panicked: {e}")))?
+    let progress_app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.state::<AppState>()
+            .sidecar
+            .ensure_installed_with_progress(move |fraction| {
+                let _ = progress_app.emit("python://install", PythonInstallEvent { fraction });
+            })
+    })
+    .await
+    .map_err(|e| Error::Other(format!("setup task panicked: {e}")))?
 }
 
 /// Ingest files/folders: convert → chunk → embed → index. Progress streams over

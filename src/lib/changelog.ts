@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.63.0-alpha",
+    date: "2026-07-02",
+    highlights: [
+      "Setting up on a Mac is now truly one-click. If your Mac doesn’t already have a recent Python, PM downloads a private copy just for itself the first time you set up the document engine — no Terminal, no Homebrew, no “install Python first”. You’ll see a progress bar while it downloads, and it only happens once. (Windows already ships with everything built in; nothing changes there.)",
+    ],
+  },
+  {
     version: "2.62.0-alpha",
     date: "2026-07-02",
     highlights: [

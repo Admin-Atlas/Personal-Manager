@@ -155,6 +155,15 @@ impl SidecarPaths {
     fn models_dir(&self) -> Option<PathBuf> {
         self.venv_dir.parent().map(|p| p.join("models"))
     }
+
+    /// Where a runtime-downloaded macOS interpreter is unpacked — a sibling of the
+    /// venv under `runtime/`, so it lives inside PM's data dir and uninstalls with
+    /// it. macOS-only fallback (see [`crate::python_fetch`]); Windows/Linux never
+    /// populate this, so the method is legitimately unused there.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn downloaded_python_dir(&self) -> Option<PathBuf> {
+        self.venv_dir.parent().map(|p| p.join("python-standalone"))
+    }
 }
 
 /// Status reported to the UI so first-run setup is visible.
@@ -185,6 +194,11 @@ pub enum SidecarErrorKind {
     PythonTooOld,
     /// No usable Python interpreter could be found at all.
     PythonMissing,
+    /// macOS only: no suitable interpreter was found, so PM tried to download a
+    /// standalone one into its data dir — and that download (or its verification /
+    /// unpack) failed. Distinct from [`PythonMissing`] because the fix is different
+    /// (check the network / a firewall blocking GitHub, not "install Python").
+    PythonDownloadFailed,
     /// `pip install` failed — network, PyPI, or a dependency problem.
     PipFailed,
     /// The bundled sidecar files (script / requirements) are missing.
@@ -260,6 +274,19 @@ impl SidecarManager {
     /// pinned requirements. Idempotent and cheap once the `.ready` marker matches
     /// the current `requirements.txt`. Blocking and slow on first run.
     pub fn ensure_installed(&self) -> Result<()> {
+        self.ensure_installed_with_progress(|_| {})
+    }
+
+    /// Same as [`ensure_installed`], but reports a `0.0..=1.0` fraction while the
+    /// macOS interpreter download runs (the one slow, byte-countable phase of
+    /// first-run setup). Only the first-run-setup command passes a real callback;
+    /// every other caller (ingest, the chat-index sweep, …) uses the no-op
+    /// [`ensure_installed`]. A dedicated method — rather than a parameter bolted
+    /// onto the shared one — keeps those many call sites untouched, mirroring how
+    /// `install_optional_tsne` is its own method.
+    ///
+    /// [`ensure_installed`]: SidecarManager::ensure_installed
+    pub fn ensure_installed_with_progress(&self, on_progress: impl FnMut(f32)) -> Result<()> {
         if self.is_ready_marker_current()? {
             self.set_status(SidecarStatus::Ready);
             return Ok(());
@@ -274,7 +301,7 @@ impl SidecarManager {
         }
 
         self.set_status(SidecarStatus::Installing);
-        match self.provision() {
+        match self.provision(on_progress) {
             Ok(()) => {
                 self.set_status(SidecarStatus::Ready);
                 Ok(())
@@ -292,7 +319,7 @@ impl SidecarManager {
         }
     }
 
-    fn provision(&self) -> std::result::Result<(), ProvisionError> {
+    fn provision(&self, on_progress: impl FnMut(f32)) -> std::result::Result<(), ProvisionError> {
         let requirements = self.paths.requirements();
         if !requirements.exists() {
             return Err(ProvisionError {
@@ -305,8 +332,9 @@ impl SidecarManager {
         }
 
         // A base interpreter that meets MIN_PYTHON (the bundled one on Windows
-        // release builds, else the best system Python — see resolve_base_python).
-        let base = self.resolve_base_python()?;
+        // release builds, else the best system Python — see resolve_base_python;
+        // on macOS, a downloaded standalone interpreter if none is found).
+        let base = self.resolve_base_python(on_progress)?;
 
         if let Some(parent) = self.paths.venv_dir.parent() {
             std::fs::create_dir_all(parent).map_err(unknown)?;
@@ -375,11 +403,16 @@ impl SidecarManager {
 
     /// Pick a base interpreter that satisfies [`MIN_PYTHON`]: the bundled one
     /// (Windows release) if present and new enough, else the best system Python
-    /// found by [`probe_base_candidates`]. The bundled interpreter is
-    /// version-checked too, so a mis-fetched bundle can't silently build an old
-    /// venv. Distinguishes "found nothing" from "found only too-old" so the UI
-    /// can show the right guide.
-    fn resolve_base_python(&self) -> std::result::Result<PathBuf, ProvisionError> {
+    /// found by [`probe_base_candidates`], else — on macOS, when nothing suitable
+    /// is on the machine — a standalone interpreter downloaded into the data dir
+    /// ([`crate::python_fetch`]). The bundled interpreter is version-checked too,
+    /// so a mis-fetched bundle can't silently build an old venv. Distinguishes
+    /// "found nothing" from "found only too-old" so the UI can show the right guide.
+    /// `on_progress` reports the download's byte fraction (macOS fallback only).
+    fn resolve_base_python(
+        &self,
+        #[allow(unused_variables, unused_mut)] mut on_progress: impl FnMut(f32),
+    ) -> std::result::Result<PathBuf, ProvisionError> {
         if let Some(p) = self.paths.bundled_python() {
             // The app ships this interpreter, so we commit to it — but first make
             // sure it can actually start. A packaging defect that flattened the
@@ -392,8 +425,58 @@ impl SidecarManager {
                 return Ok(p);
             }
         }
-        match probe_base_candidates() {
-            BaseProbe::Found(p) => Ok(p),
+
+        // Probe exactly once; an early return keeps the download strictly behind a
+        // failed probe.
+        let probe = probe_base_candidates();
+        if let BaseProbe::Found(p) = probe {
+            return Ok(p);
+        }
+
+        // macOS: no interpreter on the machine → download the pinned standalone one
+        // into the data dir. Strictly gated to macOS, so Windows/Linux behaviour and
+        // error messages are provably unchanged. The downloaded interpreter is
+        // version-checked (same defence the bundled one gets) before we trust it.
+        #[cfg(target_os = "macos")]
+        if let Some(dest) = self.paths.downloaded_python_dir() {
+            match crate::python_fetch::fetch_macos_python(&dest, &mut on_progress) {
+                Ok(p) if detect_python_version(&p).is_some_and(meets_min) => return Ok(p),
+                Ok(p) => {
+                    // Downloaded but doesn't report a usable version — a bad pin. The
+                    // SHA-256 check already passed, so this is our mistake, not the
+                    // user's; surface it as a download failure rather than "install
+                    // Python yourself".
+                    return Err(ProvisionError {
+                        kind: SidecarErrorKind::PythonDownloadFailed,
+                        source: Error::Other(format!(
+                            "PM downloaded a Python interpreter to {} but it did not report a \
+                             usable version (3.10+). This is a problem with PM's build, not your \
+                             computer.",
+                            p.display()
+                        )),
+                    });
+                }
+                Err(fetch_err) => {
+                    // Fold the download's real cause onto the original probe outcome so
+                    // the message reflects both ("none found, and the auto-download
+                    // failed because …").
+                    let base = match probe {
+                        BaseProbe::TooOld => too_old_message(),
+                        _ => missing_message(),
+                    };
+                    return Err(ProvisionError {
+                        kind: SidecarErrorKind::PythonDownloadFailed,
+                        source: Error::Other(format!(
+                            "{base}\n\nPM also tried to download a Python interpreter \
+                             automatically, but that failed: {fetch_err}"
+                        )),
+                    });
+                }
+            }
+        }
+
+        match probe {
+            BaseProbe::Found(_) => unreachable!("handled by the early return above"),
             BaseProbe::TooOld => Err(ProvisionError {
                 kind: SidecarErrorKind::PythonTooOld,
                 source: Error::Other(too_old_message()),

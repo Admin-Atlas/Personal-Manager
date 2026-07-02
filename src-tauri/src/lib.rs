@@ -35,6 +35,7 @@ mod paths;
 mod photos;
 mod preferences;
 mod projects;
+mod python_fetch;
 mod recommend;
 mod registry;
 mod retrieval;

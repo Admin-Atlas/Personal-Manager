@@ -5,9 +5,11 @@
 // Kept out of the component so the wording lives in one place, like help.ts /
 // changelog.ts. The backend tags each failure with a `SidecarErrorKind`
 // (src-tauri/src/sidecar.rs); `guideFor` turns that — plus the OS — into a short,
-// actionable guide. Because the backend now finds modern Pythons automatically
-// and rebuilds a stale venv, the macOS steps are just "install Python, then
-// Retry" — no Terminal, PM_PYTHON, or manual venv deletion.
+// actionable guide. Because the backend now finds modern Pythons automatically,
+// downloads one on macOS if none is found, and rebuilds a stale venv, first-run
+// setup on macOS is fully automatic — no Terminal, PM_PYTHON, or manual venv
+// deletion. The manual `brew install` steps only appear if the auto-download
+// itself fails (`python_download_failed`).
 
 import type { SidecarErrorKind } from "./types";
 
@@ -31,10 +33,9 @@ export function guideFor(mode: SetupGuideMode, isMac: boolean): SetupGuide {
         ? {
             title: "Set up the document engine",
             summary:
-              "PM converts and indexes your documents on your device using a small Python engine. Setting it up is a one-time step that needs Python 3.10 or newer.",
+              "PM converts and indexes your documents on your device using a small Python engine. Setting it up is a one-time step.",
             steps: [
-              "Make sure Python 3.10 or newer is installed — run `brew install python@3.12`, or download it from python.org and run the installer.",
-              "Click “Set it up now”. PM finds your Python automatically and builds the engine — this can take a minute on the first run.",
+              "Click “Set it up now”. PM finds a suitable Python automatically — and if there isn’t one, it downloads a private copy just for PM. The first run can take a minute (a little longer if it has to download), and nothing leaves your device beyond that one download.",
             ],
           }
         : {
@@ -72,6 +73,21 @@ export function guideFor(mode: SetupGuideMode, isMac: boolean): SetupGuide {
             ],
           };
     }
+
+    case "python_download_failed":
+      // macOS only: no Python was found, so PM tried to download its own copy and
+      // that download (or its verification) failed — almost always a network issue.
+      return {
+        title: "PM couldn't download Python",
+        summary:
+          "PM didn't find Python on this Mac, so it tried to download a private copy — but the download didn't finish. That's almost always a network problem, or a firewall/proxy blocking the download.",
+        steps: [
+          "Check your internet connection.",
+          "A VPN, proxy, or strict firewall can block the download (it comes from GitHub). Allow access or pause it, then click Retry.",
+          "Prefer to install Python yourself? Run `brew install python@3.12`, or download it from python.org — then click Retry and PM will find it (no download needed).",
+          "Still stuck? Open Technical details below to see exactly what PM reported.",
+        ],
+      };
 
     case "pip_failed":
       return {

@@ -102,10 +102,16 @@ For a full tour of the architecture and the rules for working in this repo, see
   `python3`/`python`, and common macOS locations (Homebrew, python.org) — so even a
   Finder-launched app finds one off its stripped PATH. It also rebuilds the venv if that
   interpreter is older than 3.10. Set `PM_PYTHON` only for an unusual setup. (Packaged
-  **Windows** release builds **bundle** a standalone interpreter — `npm run tauri build`
-  fetches it via [`scripts/fetch-python.mjs`](scripts/fetch-python.mjs) — so end users
-  need no Python install. macOS bundling is deferred behind signing, so macOS users install
-  Python 3.10+ themselves; PM then finds it.)
+  **Windows** release builds **bundle** a standalone interpreter at build time —
+  `npm run tauri build` fetches it via [`scripts/fetch-python.mjs`](scripts/fetch-python.mjs)
+  — so end users need no Python install. On **macOS**, packaged apps instead **download** a
+  pinned standalone interpreter into PM's data directory on first run **only if** no suitable
+  Python is found — so macOS end users need no manual install either. The two use different
+  mechanisms for different reasons: `python-build-standalone` has no universal2 build and
+  build-time bundling into the signed `.app` is gated on the Apple-signing pipeline, whereas a
+  runtime download picks the right per-arch build and isn't gated on signing — see
+  [`docs/MACOS-SIGNING.md`](docs/MACOS-SIGNING.md). Development from source still needs Python
+  3.10+ on your machine on every platform.)
 - **Tauri OS prerequisites:** see <https://tauri.app/start/prerequisites/>
   - Windows: Microsoft C++ Build Tools + WebView2 (preinstalled on Win 11)
   - macOS: Xcode Command Line Tools

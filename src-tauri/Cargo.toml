@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "2.62.0-alpha"
+version = "2.63.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -70,7 +70,8 @@ chrono-tz = "0.10"
 rrule = "0.14"
 
 # OpenRouter streaming chat client. rustls keeps TLS independent of SQLCipher's crypto.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# `blocking` is used by python_fetch (macOS interpreter download) from inside spawn_blocking.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3"
 tauri-plugin-single-instance = "2"

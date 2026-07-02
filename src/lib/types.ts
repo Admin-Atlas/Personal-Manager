@@ -668,6 +668,12 @@ export interface TsneInstallEvent {
   fraction: number;
 }
 
+/** Progress for the macOS interpreter download (0..1, monotonic). Only fires on macOS when no system
+ *  Python was found and PM downloads a standalone one; rendered as a percentage like the t-SNE download. */
+export interface PythonInstallEvent {
+  fraction: number;
+}
+
 /** Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed. */
 export interface OcrStatus {
   installed: boolean;
@@ -757,6 +763,7 @@ export interface DailyBriefing {
 export type SidecarErrorKind =
   | "python_too_old"
   | "python_missing"
+  | "python_download_failed"
   | "pip_failed"
   | "requirements_missing"
   | "packaging_bug"
