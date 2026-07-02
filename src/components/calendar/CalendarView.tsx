@@ -3,9 +3,11 @@
 
 // The unified, read-only multi-calendar aggregator tab (card 8). Reads the widened mirror
 // (listAllCalendarEvents) plus the account/calendar registry (calendarOverview), themes entirely
-// from the global tokens, and colours each source from the categorical source palette. This PR adds
-// the grid bodies (Day / Week time-grid, Month, Year) alongside the Agenda from PR1; the shared chrome
-// drives per-view navigation. Terminal's mono treatments land in the next PR. Nothing here writes back.
+// from the global tokens, and colours each source from the categorical source palette. Slate/Editorial
+// render the pixel grids (Day/Week time-grid, Month, Year) + Agenda; Terminal forks to a mono, flat set
+// (a CLI status strip + agenda/tables, never a pixel grid) enumerated explicitly per view so nothing
+// falls through to the wrong body. A neutral hint flags paging past the synced band; each view fades up
+// on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. Nothing here writes back.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { calendarOverview, listAllCalendarEvents, syncCalendar } from "../../lib/ipc";
@@ -29,6 +31,10 @@ import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
 import { YearView } from "./views/YearView";
+import { TerminalChrome } from "./terminal/TerminalChrome";
+import { TerminalAgenda } from "./terminal/TerminalAgenda";
+import { TerminalMonthTable } from "./terminal/TerminalMonthTable";
+import { TerminalYearTable } from "./terminal/TerminalYearTable";
 
 // The view switcher's order + the default for a fresh install. readView() clamps a persisted value to
 // this set, so a value from a newer/older build never lands on a missing view.
@@ -73,6 +79,33 @@ function viewLabel(view: CalendarViewMode, cur: Date): string {
       return String(cur.getFullYear());
     default: // month, agenda
       return cur.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  }
+}
+
+/** The visible date window for a view, used only to flag paging past the synced band. `end` is
+ *  exclusive. Agenda is anchored/open-ended, so its window is just the anchor day — the hint then
+ *  fires only when the anchor itself sits outside the mirror, not for a distant future event. */
+function visibleRange(view: CalendarViewMode, cur: Date): { start: Date; end: Date } {
+  const day0 = startOfDay(cur);
+  switch (view) {
+    case "day":
+      return { start: day0, end: addDays(day0, 1) };
+    case "week": {
+      const monday = startOfWeek(cur);
+      return { start: monday, end: addDays(monday, 7) };
+    }
+    case "month":
+      return {
+        start: new Date(cur.getFullYear(), cur.getMonth(), 1),
+        end: new Date(cur.getFullYear(), cur.getMonth() + 1, 1),
+      };
+    case "year":
+      return {
+        start: new Date(cur.getFullYear(), 0, 1),
+        end: new Date(cur.getFullYear() + 1, 0, 1),
+      };
+    default: // agenda
+      return { start: day0, end: addDays(day0, 1) };
   }
 }
 
@@ -176,6 +209,27 @@ export function CalendarView() {
     [onViewChange],
   );
 
+  // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today. Ignored while a
+  // field is focused or a modifier is held (so app shortcuts and text entry are untouched).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        onPrev();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        onNext();
+      } else if (e.key === "t" || e.key === "T") {
+        onToday();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onPrev, onNext, onToday]);
+
   const colorOf = useMemo(() => {
     const ids = overview?.calendars.map((c) => c.id) ?? [];
     const map = sourceColors(ids, system, accent);
@@ -197,6 +251,20 @@ export function CalendarView() {
   }, [view, cursor]);
 
   const label = viewLabel(view, cursor);
+  const isTerminal = system === "terminal";
+
+  // "Outside the synced range" hint: fires when the visible window falls before mirror_start or after
+  // mirror_end (the mirror is a fixed −1…+13-month band, so paging far enough leaves it). Neutral, not
+  // an error — the band is by design. Today/now logic elsewhere never assumes today is inside the band.
+  const rangeHint = useMemo(() => {
+    if (!overview) return null;
+    const ms = new Date(overview.mirror_start);
+    const me = new Date(overview.mirror_end);
+    if (Number.isNaN(ms.getTime()) || Number.isNaN(me.getTime())) return null;
+    const { start, end } = visibleRange(view, cursor);
+    if (start.getTime() >= ms.getTime() && end.getTime() <= me.getTime()) return null;
+    return `Outside the synced range — only ${formatDateLocal(ms)} – ${formatDateLocal(me)} is mirrored.`;
+  }, [overview, view, cursor]);
 
   if (loading && !overview) {
     return (
@@ -208,6 +276,45 @@ export function CalendarView() {
   }
 
   const hasCalendars = (overview?.calendars.length ?? 0) > 0;
+
+  // The active body for the current System + view. Terminal forks to the mono set and never mounts the
+  // pixel TimeGridView; both branches enumerate all five views so none falls through to the wrong body.
+  const renderBody = () => {
+    if (isTerminal) {
+      switch (view) {
+        case "month":
+          return <TerminalMonthTable cursor={cursor} events={visibleEvents} colorOf={colorOf} />;
+        case "year":
+          return (
+            <TerminalYearTable
+              cursor={cursor}
+              events={visibleEvents}
+              onSelectDay={onSelectYearDay}
+            />
+          );
+        case "day":
+        case "week":
+          return <TerminalAgenda events={visibleEvents} colorOf={colorOf} days={gridDays} />;
+        case "agenda":
+        default:
+          return <TerminalAgenda events={visibleEvents} colorOf={colorOf} fromDay={cursor} />;
+      }
+    }
+    switch (view) {
+      case "agenda":
+        return <AgendaView events={visibleEvents} fromDay={cursor} colorOf={colorOf} />;
+      case "month":
+        return <MonthView cursor={cursor} events={visibleEvents} colorOf={colorOf} />;
+      case "year":
+        return <YearView cursor={cursor} events={visibleEvents} onSelectDay={onSelectYearDay} />;
+      case "day":
+      case "week":
+      default:
+        return (
+          <TimeGridView days={gridDays} events={visibleEvents} colorOf={colorOf} range={range} />
+        );
+    }
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
@@ -233,12 +340,20 @@ export function CalendarView() {
         lastSync={overview?.last_sync ?? null}
       />
 
+      {isTerminal && <TerminalChrome view={view} label={label} count={visibleEvents.length} />}
+
       {error && (
         <div
           className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
           style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
         >
           {error}
+        </div>
+      )}
+
+      {rangeHint && (
+        <div className="border-b border-rule bg-panel px-4 py-1.5 text-center font-mono text-xs text-ink4">
+          {rangeHint}
         </div>
       )}
 
@@ -250,14 +365,16 @@ export function CalendarView() {
             here read-only.
           </p>
         </div>
-      ) : view === "agenda" ? (
-        <AgendaView events={visibleEvents} fromDay={cursor} colorOf={colorOf} />
-      ) : view === "month" ? (
-        <MonthView cursor={cursor} events={visibleEvents} colorOf={colorOf} />
-      ) : view === "year" ? (
-        <YearView cursor={cursor} events={visibleEvents} onSelectDay={onSelectYearDay} />
       ) : (
-        <TimeGridView days={gridDays} events={visibleEvents} colorOf={colorOf} range={range} />
+        // key={view} restarts the 0.25s fade-up on every switch; under prefers-reduced-motion the
+        // keyframe name doesn't resolve, so this is a no-op (the motion lives in index.css, not JS).
+        <div
+          key={view}
+          className="flex min-h-0 flex-1 flex-col"
+          style={{ animation: "pm-fade-up 0.25s ease-out" }}
+        >
+          {renderBody()}
+        </div>
       )}
     </div>
   );

@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.60.0-alpha",
+    date: "2026-07-02",
+    highlights: [
+      "The Calendar now speaks Terminal. Switch PM to the Terminal look and every view — Month, Week, Day, Year, and Agenda — turns into a crisp monospace layout: a “~/pm ❯ cal” status line, square day markers, and green kept strictly for today. (Week and Day read as a tidy day-by-day agenda rather than a pixel grid, which suits the mono style.)",
+      "Small touches everywhere else, too. Page through time from the keyboard — ← and → step by period and “t” jumps back to today — each view fades in gently as you switch (and holds still if you’ve asked for reduced motion), and PM now tells you when you’ve paged past the stretch of time it keeps synced.",
+    ],
+  },
+  {
     version: "2.59.0-alpha",
     date: "2026-07-02",
     highlights: [
