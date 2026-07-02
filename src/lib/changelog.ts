@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.67.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "New: back up to Google Drive too, alongside Proton Drive. In Settings → Backup you can now grant PM permission to save its encrypted backups to your own Google Drive — a one-time approval in your browser that only lets PM manage its own “Personal Manager Backups” folder, never the rest of your Drive. Your automatic-backup schedule is now shared: pick a frequency once and turn on each destination (Proton, Google, or both) you want it to reach — every scheduled run fans out to all of them, and each keeps its own last-N history (older backups move to Google Drive’s Trash, so nothing is truly deleted). You can save to Google Drive on demand and restore any backup from it, exactly like Proton.",
+    ],
+  },
+  {
     version: "2.66.0-alpha",
     date: "2026-07-02",
     highlights: [

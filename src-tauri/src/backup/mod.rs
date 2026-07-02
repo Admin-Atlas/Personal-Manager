@@ -20,12 +20,17 @@
 //! derived before any decryption, but it is bound to the payload as AAD (`blake3` of
 //! the header JSON) so it can't be swapped or downgraded without failing auth.
 //!
-//! PR1 ships the local archive + restore core (this module + the local commands). The
-//! Proton Drive push/pull and scheduling layers land on top in later PRs.
+//! The compress→encrypt core produces a destination-agnostic archive on disk; where it goes
+//! afterwards is a [`destination::BackupDestination`] — today Proton Drive (via its CLI) or
+//! Google Drive (via the Drive v3 REST API). Naming/validation/retention selection is shared
+//! (`naming`), so both destinations name and trim archives identically.
 
 pub mod bundle;
+pub mod destination;
 pub mod format;
+pub mod gdrive;
 pub mod manifest;
+pub mod naming;
 pub mod pack;
 pub mod proton;
 pub mod restore;

@@ -11,7 +11,9 @@ use std::sync::atomic::Ordering;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::backup::{self, BackupEvent, BackupKind, BackupPhase, BackupReport};
+use crate::backup::{
+    self, destination::BackupDestination, BackupEvent, BackupKind, BackupPhase, BackupReport,
+};
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::error::{Error, Result};
 use crate::google;
@@ -6120,20 +6122,30 @@ fn require_proton_cli() -> Result<std::path::PathBuf> {
 }
 
 /// The automatic-backup schedule shown in Settings. `passphrase_stored` reflects the keychain
-/// opt-in (a non-`off` frequency requires it); `last_backup_at` is RFC3339 or null.
+/// opt-in (a non-`off` frequency requires it); `last_backup_at` is RFC3339 or null. The one cadence
+/// fans out to every enabled + ready destination: `proton_enabled` (default on) and `gdrive_enabled`
+/// (opt-in, requires a granted `gdrive_account`).
 #[derive(Serialize)]
 pub struct BackupSchedule {
     pub frequency: String,
     pub retention_n: u32,
     pub passphrase_stored: bool,
     pub last_backup_at: Option<String>,
+    /// Whether scheduled runs push to Proton Drive (defaults on — preserves prior behavior).
+    pub proton_enabled: bool,
+    /// Whether scheduled runs push to Google Drive (opt-in).
+    pub gdrive_enabled: bool,
+    /// The Google account chosen for backup (email), or null if none is set up.
+    pub gdrive_account: Option<String>,
 }
 
-/// Read the current automatic-backup schedule (cadence + retention + opt-in state + last run).
+/// Read the current automatic-backup schedule (cadence + retention + opt-in state + last run +
+/// per-destination enable flags).
 #[tauri::command]
 pub fn get_backup_schedule(state: State<'_, AppState>) -> Result<BackupSchedule> {
     use crate::backup::schedule::{
-        BACKUP_FREQUENCY_KEY, BACKUP_RETENTION_KEY, DEFAULT_RETENTION_N, LAST_BACKUP_AT_KEY,
+        setting_bool, BACKUP_FREQUENCY_KEY, BACKUP_GDRIVE_ACCOUNT_KEY, BACKUP_GDRIVE_ENABLED_KEY,
+        BACKUP_PROTON_ENABLED_KEY, BACKUP_RETENTION_KEY, DEFAULT_RETENTION_N, LAST_BACKUP_AT_KEY,
     };
     let conn = state.conn()?;
     Ok(BackupSchedule {
@@ -6144,6 +6156,10 @@ pub fn get_backup_schedule(state: State<'_, AppState>) -> Result<BackupSchedule>
             .unwrap_or(DEFAULT_RETENTION_N),
         passphrase_stored: secrets::get_backup_passphrase()?.is_some(),
         last_backup_at: crate::db::get_setting(&conn, LAST_BACKUP_AT_KEY)?,
+        proton_enabled: setting_bool(&conn, BACKUP_PROTON_ENABLED_KEY, true),
+        gdrive_enabled: setting_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, false),
+        gdrive_account: crate::db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)?
+            .filter(|s| !s.is_empty()),
     })
 }
 
@@ -6220,21 +6236,33 @@ pub async fn proton_status() -> Result<crate::backup::proton::ProtonConnStatus> 
 
 /// List PM's encrypted archives already on Proton Drive (newest first), for the restore picker.
 #[tauri::command]
-pub async fn list_proton_backups() -> Result<Vec<crate::backup::proton::ProtonBackupEntry>> {
+pub async fn list_proton_backups() -> Result<Vec<crate::backup::naming::BackupEntry>> {
     tokio::task::spawn_blocking(|| crate::backup::proton::list_archives(&require_proton_cli()?))
         .await
         .map_err(|e| Error::Other(format!("list task panicked: {e}")))?
 }
 
-/// Shared core: snapshot the DB under the lock, then — off the lock — pack a `.pmbackup` and
-/// upload it to Proton Drive via the CLI, emitting the detached `backup://progress` events.
-/// Reused by the manual `backup_to_proton` command and the scheduler
-/// ([`crate::backup::schedule`]); single-flight via the `backup_busy` guard.
-pub(crate) async fn run_proton_backup(
+/// Shared core: snapshot the DB under the lock, then — off the lock — pack ONE `.pmbackup` and push
+/// the same blob to every destination in `targets`, emitting the detached `backup://progress`
+/// events. `retention` (when `Some(n)`) trims each destination to keep-last-N after its upload.
+/// Reused by the manual `backup_to_proton` / `backup_to_gdrive` commands (one target, no retention)
+/// and the scheduler ([`crate::backup::schedule`], the enabled set + retention). Single-flight via
+/// the `backup_busy` guard.
+///
+/// For a SINGLE target this is byte-for-byte the prior single-destination behavior: the Upload
+/// phase brackets `0.0 → 1.0`, `last_backup_at` is stamped on success, a failure emits `Failed`.
+/// With several targets, `last_backup_at` is stamped (and `Finished` emitted) if ANY succeeded;
+/// per-destination failures are logged, and a total failure emits `Failed` + errors so the
+/// scheduler stays due and retries.
+pub(crate) async fn run_backup(
     app: &AppHandle,
     passphrase: String,
-    cli: std::path::PathBuf,
+    targets: Vec<BackupDestination>,
+    retention: Option<u32>,
 ) -> Result<String> {
+    if targets.is_empty() {
+        return Err(Error::Other("no backup destination selected".into()));
+    }
     // `app` is borrowed (not owned) so the `State` we derive from it borrows *through* the
     // reference — holding it across the `.await` below is fine, whereas an owned `app` would make
     // this future self-referential.
@@ -6250,9 +6278,7 @@ pub(crate) async fn run_proton_backup(
         },
     );
 
-    let tmp = tempfile::Builder::new()
-        .prefix("pm-backup-proton-")
-        .tempdir()?;
+    let tmp = tempfile::Builder::new().prefix("pm-backup-").tempdir()?;
     let snapshot = tmp.path().join("pm.sqlite");
     {
         let conn = state.conn()?;
@@ -6272,7 +6298,7 @@ pub(crate) async fn run_proton_backup(
     let db_key = vault::current_db_key(&meta)?
         .ok_or_else(|| Error::Other("unlock the vault before backing it up".into()))?;
     let now = chrono::Utc::now();
-    let archive_name = crate::backup::proton::archive_name(
+    let archive_name = crate::backup::naming::archive_name(
         &meta.vault_id,
         &now.format("%Y%m%dT%H%M%SZ").to_string(),
     );
@@ -6288,68 +6314,121 @@ pub(crate) async fn run_proton_backup(
     };
     let vault_id = meta.vault_id.clone();
 
+    // Pack ONCE (blocking) — the destination-agnostic archive is written to `archive_path`.
     let app2 = app.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let archive_path2 = archive_path.clone();
+    let pack_result = tokio::task::spawn_blocking(move || {
         let st = app2.state::<AppState>();
         let report = |phase, fraction| {
             emit_backup_progress(&app2, BackupEvent::Phase { phase, fraction });
         };
         backup::pack::pack(
             inputs,
-            &archive_path,
+            &archive_path2,
             &passphrase,
             report,
             &st.backup_cancel,
-        )?;
-        // The CLI's upload has no byte-progress in --json mode; bracket it 0→1 on Upload.
-        report(BackupPhase::Upload, 0.0);
-        crate::backup::proton::upload_archive(&cli, &archive_path)?;
-        report(BackupPhase::Upload, 1.0);
-        Ok::<(), Error>(())
+        )
     })
     .await
     .map_err(|e| Error::Other(format!("backup task panicked: {e}")))?;
+
+    if let Err(e) = pack_result {
+        drop(tmp);
+        let msg = if state.backup_cancel.load(Ordering::SeqCst) {
+            "Backup cancelled.".to_string()
+        } else {
+            e.to_string()
+        };
+        emit_backup_progress(
+            app,
+            BackupEvent::Failed {
+                message: msg.clone(),
+            },
+        );
+        return Err(Error::Other(msg));
+    }
+
+    // Fan out: push the SAME blob to each target, then (optionally) trim it. Upload progress
+    // brackets each destination's slice of 0.0..=1.0 (so a single target reads exactly 0→1).
+    let n = targets.len();
+    let prefix = crate::backup::naming::archive_prefix(&vault_id);
+    let mut any_ok = false;
+    let mut failures: Vec<String> = Vec::new();
+    for (i, dest) in targets.iter().enumerate() {
+        emit_backup_progress(
+            app,
+            BackupEvent::Phase {
+                phase: BackupPhase::Upload,
+                fraction: i as f32 / n as f32,
+            },
+        );
+        match dest.upload(&archive_path, &archive_name).await {
+            Ok(()) => {
+                any_ok = true;
+                emit_backup_progress(
+                    app,
+                    BackupEvent::Phase {
+                        phase: BackupPhase::Upload,
+                        fraction: (i + 1) as f32 / n as f32,
+                    },
+                );
+                if let Some(keep_n) = retention {
+                    match dest.apply_retention(keep_n as usize, &prefix).await {
+                        Ok(t) if t > 0 => {
+                            eprintln!("backup: trimmed {t} old archive(s) on {}", dest.label())
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("backup: retention on {} failed: {e}", dest.label()),
+                    }
+                }
+            }
+            Err(e) => failures.push(format!("{}: {e}", dest.label())),
+        }
+    }
     drop(tmp);
 
-    match result {
-        Ok(()) => {
-            // Stamp last-run for BOTH manual and scheduled backups, so the cadence clock advances
-            // (a manual backup "counts") and Settings reflects it. Best-effort — a vault that
-            // locked during the upload just leaves the stamp for next time.
-            if let Ok(conn) = state.conn() {
-                let _ = crate::db::set_setting(
-                    &conn,
-                    crate::backup::schedule::LAST_BACKUP_AT_KEY,
-                    &now.to_rfc3339(),
-                );
-            }
-            emit_backup_progress(
-                app,
-                BackupEvent::Finished {
-                    report: BackupReport {
-                        kind: BackupKind::Backup,
-                        vault_id: Some(vault_id.clone()),
-                        target_dir: None,
-                        created_at: None,
-                    },
-                },
+    if any_ok {
+        // Stamp last-run for BOTH manual and scheduled backups, so the cadence clock advances (a
+        // manual backup "counts") and Settings reflects it. Best-effort — a vault that locked
+        // during the upload just leaves the stamp for next time.
+        if let Ok(conn) = state.conn() {
+            let _ = crate::db::set_setting(
+                &conn,
+                crate::backup::schedule::LAST_BACKUP_AT_KEY,
+                &now.to_rfc3339(),
             );
-            Ok(vault_id)
         }
-        Err(e) => {
-            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
-                "Backup cancelled.".to_string()
-            } else {
-                e.to_string()
-            };
-            emit_backup_progress(
-                app,
-                BackupEvent::Failed {
-                    message: msg.clone(),
+        if !failures.is_empty() {
+            eprintln!("backup: some destinations failed: {}", failures.join("; "));
+        }
+        emit_backup_progress(
+            app,
+            BackupEvent::Finished {
+                report: BackupReport {
+                    kind: BackupKind::Backup,
+                    vault_id: Some(vault_id.clone()),
+                    target_dir: None,
+                    created_at: None,
                 },
-            );
-            Err(Error::Other(msg))
-        }
+            },
+        );
+        Ok(vault_id)
+    } else {
+        let msg = if state.backup_cancel.load(Ordering::SeqCst) {
+            "Backup cancelled.".to_string()
+        } else if failures.is_empty() {
+            "Backup failed.".to_string()
+        } else {
+            failures.join("; ")
+        };
+        emit_backup_progress(
+            app,
+            BackupEvent::Failed {
+                message: msg.clone(),
+            },
+        );
+        Err(Error::Other(msg))
     }
 }
 
@@ -6361,7 +6440,14 @@ pub async fn backup_to_proton(app: AppHandle, passphrase: String) -> Result<()> 
         return Err(Error::Other("a backup passphrase is required".into()));
     }
     let cli = require_proton_cli()?;
-    run_proton_backup(&app, passphrase, cli).await.map(|_| ())
+    run_backup(
+        &app,
+        passphrase,
+        vec![BackupDestination::Proton { cli }],
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Download an archive from Proton Drive and restore it into a fresh, validated folder (the
@@ -6432,8 +6518,19 @@ pub async fn restore_from_proton(
         }
     };
 
-    // Stash the restored key IN MEMORY only; `switch_to_vault` promotes it to the keychain on
-    // commit (same guard as `restore_local_backup` — a restore never touches the live vault).
+    Ok(finalize_remote_restore(&app, &state, outcome))
+}
+
+/// Finish a remote (Proton / Google Drive) restore: stash the restored key IN MEMORY only
+/// (`switch_to_vault` promotes it to the keychain on commit — a restore never touches the live
+/// vault), build + park the summary so a remounted Backup panel can re-offer "switch to it", and
+/// emit the detached `Finished` event. Shared by `restore_from_proton` and `restore_from_gdrive`,
+/// which differ only in how they pull the archive down.
+fn finalize_remote_restore(
+    app: &AppHandle,
+    state: &AppState,
+    outcome: crate::backup::restore::RestoreOutcome,
+) -> RestoreSummary {
     let target_dir = outcome.target_dir.to_string_lossy().to_string();
     if let Ok(mut pending) = state.pending_restore_keys.lock() {
         pending.insert(target_dir.clone(), outcome.db_key_hex);
@@ -6446,13 +6543,11 @@ pub async fn restore_from_proton(
         created_at: outcome.created_at.clone(),
         target_dir,
     };
-    // Park the summary so a remounted Backup panel can re-offer "switch to it" (see the twin in
-    // `restore_local_backup`).
     if let Ok(mut snap) = state.backup_state.lock() {
         snap.pending_restore = Some(summary.clone());
     }
     emit_backup_progress(
-        &app,
+        app,
         BackupEvent::Finished {
             report: BackupReport {
                 kind: BackupKind::Restore,
@@ -6462,7 +6557,280 @@ pub async fn restore_from_proton(
             },
         },
     );
-    Ok(summary)
+    summary
+}
+
+// --- Google Drive backup destination (drive.file re-consent + push/pull/list) --------------------
+
+/// The Google Drive backup destination's status for the Settings UI: which account is set up, and
+/// whether it has the `drive.file` write grant yet (a fresh re-consent is required — the connector
+/// scopes are read-only). `accounts` is the list of connected Drive accounts for the "which
+/// account?" picker on first grant.
+#[derive(Serialize)]
+pub struct GdriveBackupStatus {
+    pub account: Option<String>,
+    pub has_write_scope: bool,
+    pub enabled: bool,
+    pub accounts: Vec<crate::drive::DriveAccount>,
+}
+
+/// Read the Google Drive backup status from an open connection (shared by the status command and
+/// the connect flow, which re-reads after recording the account).
+fn read_gdrive_status(conn: &Connection) -> Result<GdriveBackupStatus> {
+    use crate::backup::schedule::{
+        setting_bool, BACKUP_GDRIVE_ACCOUNT_KEY, BACKUP_GDRIVE_ENABLED_KEY,
+    };
+    let account =
+        crate::db::get_setting(conn, BACKUP_GDRIVE_ACCOUNT_KEY)?.filter(|s| !s.is_empty());
+    let has_write_scope = match &account {
+        Some(email) => google::token_has_scope(
+            &crate::drive::account_token_key(email),
+            google::DRIVE_FILE_SCOPE,
+        )?,
+        None => false,
+    };
+    Ok(GdriveBackupStatus {
+        account,
+        has_write_scope,
+        enabled: setting_bool(conn, BACKUP_GDRIVE_ENABLED_KEY, false),
+        accounts: crate::drive::list_accounts(conn)?,
+    })
+}
+
+/// Whether a Google account is set up for backup, has the write grant, and is enabled (+ the list
+/// of connected Drive accounts for the picker).
+#[tauri::command]
+pub fn backup_gdrive_status(state: State<'_, AppState>) -> Result<GdriveBackupStatus> {
+    let conn = state.conn()?;
+    read_gdrive_status(&conn)
+}
+
+/// Grant Google Drive backup access: run a fresh OAuth consent for the `drive.file` WRITE scope
+/// (the connector scopes are read-only), learn the account it grants, and save the token under that
+/// account's existing Drive key — `include_granted_scopes` UNIONS `drive.file` with any existing
+/// `drive.readonly` there, so the read connector keeps working. Records the account and enables
+/// Google backups. Also works as a first-connect when no Google account exists yet. If `email` is
+/// given, the signed-in account must match it (so the picker's choice is honored).
+#[tauri::command]
+pub async fn backup_gdrive_connect(
+    app: AppHandle,
+    email: Option<String>,
+) -> Result<GdriveBackupStatus> {
+    use crate::backup::schedule::{BACKUP_GDRIVE_ACCOUNT_KEY, BACKUP_GDRIVE_ENABLED_KEY};
+    // Opens the browser; unions the write scope with any existing read grant on the chosen account.
+    let token = google::run_consent(google::DRIVE_FILE_SCOPE, "Google Drive backup").await?;
+    let (learned_email, _name) = crate::drive::about_user(&token).await?;
+    if let Some(expected) = &email {
+        if !expected.eq_ignore_ascii_case(&learned_email) {
+            return Err(Error::Other(format!(
+                "You chose {expected} for backup but signed in as {learned_email}. \
+                 Pick the same account."
+            )));
+        }
+    }
+    google::save_token(&crate::drive::account_token_key(&learned_email), &token)?;
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    crate::db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, &learned_email)?;
+    crate::db::set_setting(&conn, BACKUP_GDRIVE_ENABLED_KEY, "true")?;
+    read_gdrive_status(&conn)
+}
+
+/// Stop backing up to Google Drive: disable it and forget the chosen account. The OAuth token is
+/// deleted ONLY if the account isn't also a read connector (otherwise the connector still needs it
+/// — the unioned scope can't be narrowed without a full re-consent, so we leave it in place).
+#[tauri::command]
+pub fn backup_gdrive_disconnect(state: State<'_, AppState>) -> Result<()> {
+    use crate::backup::schedule::{BACKUP_GDRIVE_ACCOUNT_KEY, BACKUP_GDRIVE_ENABLED_KEY};
+    let conn = state.conn()?;
+    let account =
+        crate::db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)?.filter(|s| !s.is_empty());
+    crate::db::set_setting(&conn, BACKUP_GDRIVE_ENABLED_KEY, "false")?;
+    crate::db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, "")?;
+    if let Some(email) = account {
+        let is_read_connector = crate::drive::list_accounts(&conn)?
+            .iter()
+            .any(|a| a.email.eq_ignore_ascii_case(&email));
+        if !is_read_connector {
+            secrets::clear_google_token_for(&crate::drive::account_token_key(&email))?;
+        }
+    }
+    Ok(())
+}
+
+/// The keychain token key for the Google account set up for backup, or a friendly error if none is.
+/// Reads the DB and drops the lock before the caller awaits (rule #4).
+fn gdrive_backup_token_key(app: &AppHandle) -> Result<String> {
+    use crate::backup::schedule::BACKUP_GDRIVE_ACCOUNT_KEY;
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    let email = crate::db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)?
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::Other(
+                "No Google account is set up for backup. Grant access in Settings → Backup.".into(),
+            )
+        })?;
+    Ok(crate::drive::account_token_key(&email))
+}
+
+/// List PM's encrypted archives already on Google Drive (newest first), for the restore picker.
+#[tauri::command]
+pub async fn list_gdrive_backups(
+    app: AppHandle,
+) -> Result<Vec<crate::backup::naming::BackupEntry>> {
+    let token_key = gdrive_backup_token_key(&app)?;
+    BackupDestination::GoogleDrive { token_key }.list().await
+}
+
+/// Create an encrypted archive and push it to Google Drive (the account set up for backup). Same
+/// portable format + detached progress as the Proton path.
+#[tauri::command]
+pub async fn backup_to_gdrive(app: AppHandle, passphrase: String) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(Error::Other("a backup passphrase is required".into()));
+    }
+    let token_key = gdrive_backup_token_key(&app)?;
+    run_backup(
+        &app,
+        passphrase,
+        vec![BackupDestination::GoogleDrive { token_key }],
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Download an archive from Google Drive (by name) and restore it into a fresh, validated folder
+/// (the live vault is untouched until the user switches, exactly like the Proton/local restores).
+#[tauri::command]
+pub async fn restore_from_gdrive(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    passphrase: String,
+) -> Result<RestoreSummary> {
+    if passphrase.is_empty() {
+        return Err(Error::Other("the backup passphrase is required".into()));
+    }
+    let token_key = gdrive_backup_token_key(&app)?;
+    let _busy = BusyGuard::acquire(&state.backup_busy)
+        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
+    state.backup_cancel.store(false, Ordering::SeqCst);
+    emit_backup_progress(
+        &app,
+        BackupEvent::Phase {
+            phase: BackupPhase::Download,
+            fraction: 0.0,
+        },
+    );
+
+    let data_dir = paths::data_dir(&app)?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let target = data_dir
+        .join("restored-vaults")
+        .join(format!("restore-{ts}"));
+
+    // Pull the archive into a scratch dir (async — the Drive download is native async) that
+    // outlives the blocking restore below.
+    let dl = tempfile::Builder::new()
+        .prefix("pm-restore-gdrive-")
+        .tempdir()?;
+    if let Err(e) = (BackupDestination::GoogleDrive { token_key })
+        .download(&name, dl.path())
+        .await
+    {
+        let msg = e.to_string();
+        emit_backup_progress(
+            &app,
+            BackupEvent::Failed {
+                message: msg.clone(),
+            },
+        );
+        return Err(Error::Other(msg));
+    }
+    emit_backup_progress(
+        &app,
+        BackupEvent::Phase {
+            phase: BackupPhase::Download,
+            fraction: 1.0,
+        },
+    );
+
+    let app2 = app.clone();
+    let target2 = target.clone();
+    let local = dl.path().join(&name);
+    let result = tokio::task::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+        let report = |phase, fraction| {
+            emit_backup_progress(&app2, BackupEvent::Phase { phase, fraction });
+        };
+        backup::restore::restore(&local, &passphrase, &target2, report, &st.backup_cancel)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("restore task panicked: {e}")))?;
+    drop(dl);
+
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
+                "Restore cancelled.".to_string()
+            } else {
+                e.to_string()
+            };
+            emit_backup_progress(
+                &app,
+                BackupEvent::Failed {
+                    message: msg.clone(),
+                },
+            );
+            return Err(Error::Other(msg));
+        }
+    };
+    Ok(finalize_remote_restore(&app, &state, outcome))
+}
+
+/// Enable/disable each backup destination for scheduled runs. Enabling Google Drive requires a
+/// granted account (mirrors the passphrase guard on the schedule) so the scheduler never sees
+/// "gdrive enabled" with nothing to back up to.
+#[tauri::command]
+pub fn set_backup_destinations(
+    state: State<'_, AppState>,
+    proton_enabled: bool,
+    gdrive_enabled: bool,
+) -> Result<()> {
+    use crate::backup::schedule::{
+        BACKUP_GDRIVE_ACCOUNT_KEY, BACKUP_GDRIVE_ENABLED_KEY, BACKUP_PROTON_ENABLED_KEY,
+    };
+    let conn = state.conn()?;
+    if gdrive_enabled {
+        let granted = match crate::db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)?
+            .filter(|s| !s.is_empty())
+        {
+            Some(email) => google::token_has_scope(
+                &crate::drive::account_token_key(&email),
+                google::DRIVE_FILE_SCOPE,
+            )?,
+            None => false,
+        };
+        if !granted {
+            return Err(Error::Other(
+                "Grant Google Drive backup access before enabling it.".into(),
+            ));
+        }
+    }
+    crate::db::set_setting(
+        &conn,
+        BACKUP_PROTON_ENABLED_KEY,
+        if proton_enabled { "true" } else { "false" },
+    )?;
+    crate::db::set_setting(
+        &conn,
+        BACKUP_GDRIVE_ENABLED_KEY,
+        if gdrive_enabled { "true" } else { "false" },
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

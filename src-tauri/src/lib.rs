@@ -791,8 +791,9 @@ pub fn run() {
             commands::open_data_folder,
             commands::export_all_data,
             commands::export_plaintext_markdown,
-            // Encrypted portable backup. Local `.pmbackup` (PR1) + Proton Drive detection (PR2);
-            // Proton push/pull + scheduling land next.
+            // Encrypted portable backup: local `.pmbackup` archive/restore, plus two off-machine
+            // destinations that share the compress→encrypt core and the one schedule — Proton Drive
+            // (via its CLI) and Google Drive (via the Drive v3 REST API).
             commands::create_local_backup,
             commands::restore_local_backup,
             commands::switch_to_vault,
@@ -809,6 +810,13 @@ pub fn run() {
             commands::set_backup_schedule,
             commands::set_backup_passphrase,
             commands::forget_backup_passphrase,
+            commands::set_backup_destinations,
+            commands::backup_gdrive_status,
+            commands::backup_gdrive_connect,
+            commands::backup_gdrive_disconnect,
+            commands::list_gdrive_backups,
+            commands::backup_to_gdrive,
+            commands::restore_from_gdrive,
             // Developer mode (issue #78) — read-only inspection. Always registered (the
             // commands are harmless reads); only the UI is gated by the runtime `devMode`.
             commands_dev::dev_system_info,
