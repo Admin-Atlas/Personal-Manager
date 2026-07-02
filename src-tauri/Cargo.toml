@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "2.63.0-alpha"
+version = "2.64.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -34,6 +34,10 @@ tempfile = "3"
 # Bundle the data folder (store snapshot + Markdown vault) into one .zip for the
 # "Export all data" button. default-features off keeps it to deflate (no bzip2/zstd/aes).
 zip = { version = "4", default-features = false, features = ["deflate"] }
+# Encrypted backup (Proton Drive / user cloud): the portable `.pmbackup` archive is
+# zstd-compressed at level 19 (cold storage — ratio over speed) before the passphrase
+# encryption layer. Streaming Encoder/Decoder keeps peak memory flat over a large DB.
+zstd = "0.13"
 
 # Encrypted store (SQLCipher / AES-256) + vectors (sqlite-vec) + keyword (FTS5),
 # all in one bundled, vendored connection — no system SQLite needed.
@@ -57,7 +61,11 @@ base64 = "0.22"
 # uuid mints the stable per-vault id that keys the per-profile keychain cache.
 argon2 = "0.5"
 blake3 = "1"
-chacha20poly1305 = "0.10"
+# `stream` enables the aead::stream STREAM construction (EncryptorBE32/DecryptorBE32),
+# used by the encrypted-backup archive to seal the compressed payload in 1 MiB chunks
+# with a per-chunk counter + last-block flag — nonce-reuse-free, and truncation/reorder
+# of the archive is cryptographically detectable on restore.
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
 uuid = { version = "1", features = ["v4"] }
 # Open the system browser for the OAuth consent screen (handles per-OS URL quirks).
 open = "5"

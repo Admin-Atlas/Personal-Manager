@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 mod applock;
+mod backup;
 mod briefing;
 mod calendar;
 mod chat;
@@ -141,6 +142,22 @@ pub struct OneDriveSyncState {
     pub last_report: Option<onedrive::OneDriveSyncReport>,
 }
 
+/// A snapshot of the currently-running backup or restore (if any), shared so the Backup
+/// settings UI can reflect progress no matter which view is mounted — the same detached
+/// model as the Drive sync. Empty / `running:false` when nothing is in flight.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct BackupState {
+    pub running: bool,
+    /// The current phase (snapshot/pack/upload/download/restore/validate), or `None` when idle.
+    pub phase: Option<backup::BackupPhase>,
+    /// Monotonic `0.0..=1.0` progress within the current phase.
+    pub fraction: f32,
+    /// The most recent finished op's report, so a user returning to Settings still sees the outcome.
+    pub last_report: Option<backup::BackupReport>,
+    /// The most recent failure message (cleared when a new op starts).
+    pub last_error: Option<String>,
+}
+
 pub struct AppState {
     /// The open store, or `None` when the vault is locked — a passphrase/shareable
     /// vault on a profile that hasn't unlocked it yet. Reach it via [`AppState::conn`],
@@ -188,6 +205,20 @@ pub struct AppState {
     /// Single-flight guard shared by the chat-preference eager nudge and the launch catch-up
     /// (`chat_prefs`), so a per-conversation extraction and a full reconcile never overlap.
     pub prefs_busy: AtomicBool,
+    /// Snapshot of the currently-running encrypted backup / restore, so the Backup settings UI can
+    /// resume showing progress after the user navigates away and back (the sibling of `drive_sync`).
+    pub backup_state: Mutex<BackupState>,
+    /// Cooperative stop flag for the running backup/restore. `stop_backup` sets it; the pack/restore
+    /// loop checks it between reads and aborts. Reset at the start of each op.
+    pub backup_cancel: AtomicBool,
+    /// Single-flight guard so a manual backup, a manual restore, and (later) a scheduled backup can
+    /// never overlap and contend for the DB snapshot / archive file.
+    pub backup_busy: AtomicBool,
+    /// Keys recovered by a restore, held in memory (never the keychain) keyed by the restored
+    /// folder, until the user explicitly switches to that vault. Deferring the keychain write to the
+    /// switch keeps a restore-you-never-switch-to from clobbering the LIVE vault's cached key. Dropped
+    /// (and zeroized) on exit; a restore not switched-to in this session is simply re-done.
+    pub pending_restore_keys: Mutex<std::collections::HashMap<String, secret::Secret>>,
 }
 
 /// Single-flight guard with RAII release. [`BusyGuard::acquire`] returns `Some` if it flipped the flag
@@ -552,6 +583,10 @@ pub fn run() {
                 summary_busy: AtomicBool::new(false),
                 title_busy: AtomicBool::new(false),
                 prefs_busy: AtomicBool::new(false),
+                backup_state: Mutex::new(BackupState::default()),
+                backup_cancel: AtomicBool::new(false),
+                backup_busy: AtomicBool::new(false),
+                pending_restore_keys: Mutex::new(std::collections::HashMap::new()),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -743,6 +778,12 @@ pub fn run() {
             commands::open_data_folder,
             commands::export_all_data,
             commands::export_plaintext_markdown,
+            // Encrypted portable backup (local file, PR1). Proton push/pull + scheduling land later.
+            commands::create_local_backup,
+            commands::restore_local_backup,
+            commands::switch_to_vault,
+            commands::backup_status,
+            commands::stop_backup,
             // Developer mode (issue #78) — read-only inspection. Always registered (the
             // commands are harmless reads); only the UI is gated by the runtime `devMode`.
             commands_dev::dev_system_info,

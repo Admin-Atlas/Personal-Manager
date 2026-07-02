@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::backup::{self, BackupEvent, BackupKind, BackupPhase, BackupReport};
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::error::{Error, Result};
 use crate::google;
@@ -24,7 +25,7 @@ use crate::sidecar::SidecarStatus;
 use crate::{
     applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, context_budget, cost, db,
     drive, entities, index_only, lock_session, microsoft, onedrive, openrouter, outlook_calendar,
-    paths, preferences, recommend, secrets, vault, AppState, VaultRuntime,
+    paths, preferences, recommend, secrets, vault, AppState, BusyGuard, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -708,6 +709,14 @@ pub fn forget_vault_passphrase(app: AppHandle) -> Result<()> {
     let resolved = vault::resolve(&app)?;
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    // Only a passphrase vault has a passphrase to forget. Clearing the cache for a DEVICE
+    // vault would be wrong: a restored/relocated device vault keeps its only key there, so
+    // dropping it would leave the vault unopenable (it can't fall back to a passphrase).
+    if meta.key_mode != vault::KeyMode::Passphrase {
+        return Err(Error::Other(
+            "this vault has no passphrase to forget".into(),
+        ));
+    }
     secrets::clear_cached_vault_key(&meta.vault_id)?;
     Ok(())
 }
@@ -5762,6 +5771,311 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
         }
     }
     Ok(())
+}
+
+// --- encrypted portable backup (local `.pmbackup`; Proton push/pull + scheduling land later) ---
+
+/// Update the shared backup snapshot and broadcast a `backup://progress` event globally
+/// (detached from the view that started the op, like the Drive sync). The snapshot lets
+/// the Backup settings UI restore an in-flight op after navigating away.
+fn emit_backup_progress(app: &AppHandle, ev: BackupEvent) {
+    let state = app.state::<AppState>();
+    if let Ok(mut snap) = state.backup_state.lock() {
+        match &ev {
+            BackupEvent::Phase { phase, fraction } => {
+                snap.running = true;
+                snap.phase = Some(*phase);
+                snap.fraction = *fraction;
+                snap.last_error = None;
+            }
+            BackupEvent::Finished { report } => {
+                snap.running = false;
+                snap.phase = None;
+                snap.fraction = 1.0;
+                snap.last_report = Some(report.clone());
+            }
+            BackupEvent::Failed { message } => {
+                snap.running = false;
+                snap.phase = None;
+                snap.last_error = Some(message.clone());
+            }
+        }
+    }
+    let _ = app.emit("backup://progress", ev);
+}
+
+/// A restore's frontend-safe summary — deliberately WITHOUT the embedded DB key (which
+/// stays in Rust and is seeded straight into this device's keychain).
+#[derive(Serialize)]
+pub struct RestoreSummary {
+    pub vault_id: String,
+    pub key_mode: String,
+    pub markdown_encryption: String,
+    pub app_version: String,
+    pub created_at: String,
+    /// Absolute path of the restored (not-yet-active) vault, for a follow-up "switch".
+    pub target_dir: String,
+}
+
+/// Create an encrypted, portable `.pmbackup` at `dest_path`, protected by `passphrase`.
+/// The live DB is snapshotted with `VACUUM INTO` under the lock (folding WAL, preserving
+/// SQLCipher), then — off the lock, in a blocking task — the snapshot + Markdown vault +
+/// metadata are streamed through zstd and a chunked XChaCha20-Poly1305 STREAM. The
+/// archive embeds the DB key inside its encrypted layer, so it restores on any machine
+/// that has the passphrase (unlike `export_all_data`, which is same-machine only).
+#[tauri::command]
+pub async fn create_local_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dest_path: String,
+    passphrase: String,
+) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(Error::Other("a backup passphrase is required".into()));
+    }
+    let _busy = BusyGuard::acquire(&state.backup_busy)
+        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
+    state.backup_cancel.store(false, Ordering::SeqCst);
+    emit_backup_progress(
+        &app,
+        BackupEvent::Phase {
+            phase: BackupPhase::Snapshot,
+            fraction: 0.0,
+        },
+    );
+
+    // Consistent, encrypted DB snapshot under the lock; drop the guard before the slow work.
+    let tmp = tempfile::Builder::new()
+        .prefix("pm-backup-snap-")
+        .tempdir()?;
+    let snapshot = tmp.path().join("pm.sqlite");
+    {
+        let conn = state.conn()?;
+        vault::migrate::vacuum_into(&conn, &snapshot)?;
+    }
+    emit_backup_progress(
+        &app,
+        BackupEvent::Phase {
+            phase: BackupPhase::Snapshot,
+            fraction: 1.0,
+        },
+    );
+
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata to back up".into()))?;
+    let db_key = vault::current_db_key(&meta)?
+        .ok_or_else(|| Error::Other("unlock the vault before backing it up".into()))?;
+    let inputs = backup::pack::PackInputs {
+        vault_root: resolved.vault_root.clone(),
+        db_snapshot: snapshot,
+        markdown_dir: resolved.markdown_dir.clone(),
+        meta: meta.clone(),
+        db_key_hex: db_key,
+        app_version: app.package_info().version.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let vault_id = meta.vault_id.clone();
+    let dest = std::path::PathBuf::from(dest_path);
+
+    let app2 = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+        let report = |phase, fraction| {
+            emit_backup_progress(&app2, BackupEvent::Phase { phase, fraction });
+        };
+        backup::pack::pack(inputs, &dest, &passphrase, report, &st.backup_cancel)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("backup task panicked: {e}")))?;
+    // The snapshot tempdir stayed alive through the task above; release it now.
+    drop(tmp);
+
+    match result {
+        Ok(()) => {
+            emit_backup_progress(
+                &app,
+                BackupEvent::Finished {
+                    report: BackupReport {
+                        kind: BackupKind::Backup,
+                        vault_id: Some(vault_id),
+                        target_dir: None,
+                        created_at: None,
+                    },
+                },
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
+                "Backup cancelled.".to_string()
+            } else {
+                e.to_string()
+            };
+            emit_backup_progress(
+                &app,
+                BackupEvent::Failed {
+                    message: msg.clone(),
+                },
+            );
+            Err(Error::Other(msg))
+        }
+    }
+}
+
+/// Restore a `.pmbackup` into a fresh folder under the data dir. Validated end-to-end
+/// (the DB opens with the embedded key and passes an integrity check) before anything is
+/// promoted, so a wrong passphrase or a corrupt archive never touches the live vault. On
+/// success the restored vault's key is seeded into this device's keychain; the returned
+/// summary lets the UI offer "switch to it now" (see [`switch_to_vault`]).
+#[tauri::command]
+pub async fn restore_local_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    src_path: String,
+    passphrase: String,
+) -> Result<RestoreSummary> {
+    if passphrase.is_empty() {
+        return Err(Error::Other("the backup passphrase is required".into()));
+    }
+    let _busy = BusyGuard::acquire(&state.backup_busy)
+        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
+    state.backup_cancel.store(false, Ordering::SeqCst);
+    emit_backup_progress(
+        &app,
+        BackupEvent::Phase {
+            phase: BackupPhase::Restore,
+            fraction: 0.0,
+        },
+    );
+
+    let src = std::path::PathBuf::from(src_path);
+    let data_dir = paths::data_dir(&app)?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let target = data_dir
+        .join("restored-vaults")
+        .join(format!("restore-{ts}"));
+
+    let app2 = app.clone();
+    let target2 = target.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+        let report = |phase, fraction| {
+            emit_backup_progress(&app2, BackupEvent::Phase { phase, fraction });
+        };
+        backup::restore::restore(&src, &passphrase, &target2, report, &st.backup_cancel)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("restore task panicked: {e}")))?;
+
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
+                "Restore cancelled.".to_string()
+            } else {
+                e.to_string()
+            };
+            emit_backup_progress(
+                &app,
+                BackupEvent::Failed {
+                    message: msg.clone(),
+                },
+            );
+            return Err(Error::Other(msg));
+        }
+    };
+
+    // Stash the restored vault's key IN MEMORY (never the keychain yet), keyed by the
+    // restored folder. `switch_to_vault` promotes it into the keychain only when the user
+    // commits — so a restore the user inspects but never switches to can't overwrite the
+    // LIVE vault's cached key (which would brick it if the archive held an older key).
+    let target_dir = outcome.target_dir.to_string_lossy().to_string();
+    if let Ok(mut pending) = state.pending_restore_keys.lock() {
+        pending.insert(target_dir.clone(), outcome.db_key_hex);
+    }
+
+    let summary = RestoreSummary {
+        vault_id: outcome.vault_id.clone(),
+        key_mode: outcome.key_mode,
+        markdown_encryption: outcome.markdown_encryption,
+        app_version: outcome.app_version,
+        created_at: outcome.created_at.clone(),
+        target_dir,
+    };
+    emit_backup_progress(
+        &app,
+        BackupEvent::Finished {
+            report: BackupReport {
+                kind: BackupKind::Restore,
+                vault_id: Some(outcome.vault_id),
+                target_dir: Some(summary.target_dir.clone()),
+                created_at: Some(outcome.created_at),
+            },
+        },
+    );
+    Ok(summary)
+}
+
+/// Point this profile at a restored (or otherwise relocated) vault folder and open it.
+/// This is the deliberate commit point of a restore: it promotes the key stashed in memory
+/// by `restore_local_backup` into this device's keychain (`vault_key::<id>`), then opens.
+/// Unlike `open_existing_vault`, this works for a device-source vault too — no passphrase is
+/// needed because the restore recovered the key.
+#[tauri::command]
+pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: String) -> Result<()> {
+    let root = std::path::PathBuf::from(&folder);
+    let meta = vault::load_meta(&root)?
+        .ok_or_else(|| Error::Other("no PM vault found in that folder".into()))?;
+    // If this folder was just restored, promote its stashed key into the keychain NOW (the
+    // user is committing to it), so `open_at_boot` below can open it. Removing it from the
+    // pending map also means it isn't seeded twice.
+    let pending = state
+        .pending_restore_keys
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&folder));
+    if let Some(key) = pending {
+        secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
+    }
+    let resolved = vault::ResolvedVault {
+        db_path: root.join("pm.sqlite"),
+        markdown_dir: root.join("vault"),
+        vault_root: root.clone(),
+    };
+    let (conn, master) = vault::open_at_boot(&resolved, &meta)?.ok_or_else(|| {
+        Error::Other(
+            "this vault's key isn't available on this device; restore it from a backup first"
+                .into(),
+        )
+    })?;
+    let runtime = VaultRuntime::build(&resolved, &meta, &master);
+    // Point this profile here, then install the new session — `open_session` swaps `db`
+    // + `vault` together and drops the old connection, so there's no locked-in-between
+    // window (mirrors `open_existing_vault`). The next launch reads the pointer directly.
+    let data_dir = paths::data_dir(&app)?;
+    vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
+    state.open_session(conn, runtime)?;
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// The current backup/restore snapshot (empty / `running:false` when idle), so the
+/// Backup settings UI can resume showing progress after the user leaves and returns.
+#[tauri::command]
+pub fn backup_status(state: State<'_, AppState>) -> Result<crate::BackupState> {
+    state
+        .backup_state
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|_| Error::Other("backup state lock poisoned".into()))
+}
+
+/// Cooperatively cancel the running backup/restore (checked between reads). A no-op when
+/// nothing is running.
+#[tauri::command]
+pub fn stop_backup(state: State<'_, AppState>) {
+    state.backup_cancel.store(true, Ordering::SeqCst);
 }
 
 #[cfg(test)]

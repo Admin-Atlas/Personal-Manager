@@ -571,6 +571,46 @@ export type DriveSyncEvent =
   | { type: "item"; processed: number; total: number; name: string }
   | { type: "finished"; report: DriveSyncReport };
 
+// --- Encrypted backup (Proton Drive / user cloud) — PR1 local `.pmbackup` archive + restore ---
+
+/** Which stage a backup/restore is in (mirrors the Rust `BackupPhase`). */
+export type BackupPhase = "snapshot" | "pack" | "upload" | "download" | "restore" | "validate";
+
+/** The outcome of a finished backup/restore, kept in the snapshot so the UI still shows it on return. */
+export interface BackupReport {
+  kind: "backup" | "restore";
+  vault_id: string | null;
+  /** Where a restore materialized the vault (absolute path) — for a follow-up "switch". Null for a backup. */
+  target_dir: string | null;
+  /** The archive's creation timestamp (RFC3339), surfaced on restore. */
+  created_at: string | null;
+}
+
+/** Snapshot of an in-flight backup/restore, so the UI resumes progress after navigating away. */
+export interface BackupState {
+  running: boolean;
+  phase: BackupPhase | null;
+  fraction: number;
+  last_report: BackupReport | null;
+  last_error: string | null;
+}
+
+/** Streamed backup/restore progress (mapped onto the shared IngestProgress bar in percent mode). */
+export type BackupEvent =
+  | { type: "phase"; phase: BackupPhase; fraction: number }
+  | { type: "finished"; report: BackupReport }
+  | { type: "failed"; message: string };
+
+/** A restore's frontend-safe summary (no embedded key) — lets the UI offer "switch to it now". */
+export interface RestoreSummary {
+  vault_id: string;
+  key_mode: string;
+  markdown_encryption: string;
+  app_version: string;
+  created_at: string;
+  target_dir: string;
+}
+
 // --- Personal Assistant: Microsoft OneDrive connector (board card 4B, spec §8.1) ---
 // A near-mirror of the Google Drive types above. One personal drive per account (no shared drives),
 // indexed whole (delta cursor) or folder-scoped.
