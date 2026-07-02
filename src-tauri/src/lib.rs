@@ -778,12 +778,20 @@ pub fn run() {
             commands::open_data_folder,
             commands::export_all_data,
             commands::export_plaintext_markdown,
-            // Encrypted portable backup (local file, PR1). Proton push/pull + scheduling land later.
+            // Encrypted portable backup. Local `.pmbackup` (PR1) + Proton Drive detection (PR2);
+            // Proton push/pull + scheduling land next.
             commands::create_local_backup,
             commands::restore_local_backup,
             commands::switch_to_vault,
             commands::backup_status,
             commands::stop_backup,
+            commands::proton_cli_status,
+            commands::proton_connect,
+            commands::proton_disconnect,
+            commands::proton_status,
+            commands::list_proton_backups,
+            commands::backup_to_proton,
+            commands::restore_from_proton,
             // Developer mode (issue #78) — read-only inspection. Always registered (the
             // commands are harmless reads); only the UI is gated by the runtime `devMode`.
             commands_dev::dev_system_info,

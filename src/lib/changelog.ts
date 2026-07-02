@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.65.0-alpha",
+    date: "2026-07-02",
+    highlights: [
+      "New: back up straight to your own Proton Drive. If you have Proton’s official Drive command-line tool installed, the Settings → Backup tab can now connect to your Proton account (sign-in happens in your browser — PM never sees your Proton password) and push the same encrypted, restore-anywhere backup to a “Personal Manager Backups” folder in your Drive. You can see what’s already backed up there and restore any of them right from PM. Don’t have the tool? PM detects that and links you to the official download — it never bundles or downloads it for you. (Automatic, scheduled backups are coming next.)",
+    ],
+  },
+  {
     version: "2.64.0-alpha",
     date: "2026-07-02",
     highlights: [

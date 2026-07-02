@@ -27,6 +27,7 @@ pub mod bundle;
 pub mod format;
 pub mod manifest;
 pub mod pack;
+pub mod proton;
 pub mod restore;
 
 use std::io::{self, Read};
