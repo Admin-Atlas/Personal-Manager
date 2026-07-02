@@ -822,6 +822,9 @@ mod tests {
              ALTER TABLE documents DROP COLUMN source_modified_at; \
              ALTER TABLE documents DROP COLUMN source_content_hash; \
              ALTER TABLE documents DROP COLUMN stored_summary; \
+             ALTER TABLE documents DROP COLUMN source_parent_folder_id; \
+             ALTER TABLE documents DROP COLUMN source_parent_folder_name; \
+             ALTER TABLE documents DROP COLUMN source_account; \
              DROP INDEX IF EXISTS idx_documents_entity; \
              DROP TABLE entity_aliases; \
              DROP TABLE entities; \
@@ -964,6 +967,9 @@ mod tests {
              ALTER TABLE documents DROP COLUMN source_modified_at; \
              ALTER TABLE documents DROP COLUMN source_content_hash; \
              ALTER TABLE documents DROP COLUMN stored_summary; \
+             ALTER TABLE documents DROP COLUMN source_parent_folder_id; \
+             ALTER TABLE documents DROP COLUMN source_parent_folder_name; \
+             ALTER TABLE documents DROP COLUMN source_account; \
              ALTER TABLE entities DROP COLUMN confidence; \
              ALTER TABLE entities DROP COLUMN user_confirmed; \
              ALTER TABLE usage_log DROP COLUMN cost_usd; \

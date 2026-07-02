@@ -868,14 +868,25 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
     // genuinely new project — "Unsorted" and any reviewed canonical already exist). On a rebuild
     // this is what reassigns `entity_id` from the frontmatter name (the ids are an index detail).
     let entity_id = crate::entities::resolve_project(tx, &meta.project, true)?;
+    // `source_account` is the owning account promoted out of `source_id`'s inline
+    // `gdrive:<email>:<fileId>` encoding into its own filterable column, derived here at the single
+    // insert seam so every insert path (fresh sync + Rebuild-from-manifest) fills it identically and it
+    // self-heals whenever the row is re-created. NULL where the id carries no account (vault,
+    // shared-drive, OneDrive, chat); `source_id` itself is left untouched.
+    let source_account = meta
+        .source
+        .source_id
+        .as_deref()
+        .and_then(crate::drive::account_of);
     tx.execute(
         "INSERT INTO documents \
          (source_path, vault_path, title, content_hash, ext, byte_size, created_at, ingested_at, \
           project, tags, importance, reviewed, last_activity, entity_id, \
           source_type, source_state, source_id, external_ref, source_modified_at, \
-          source_content_hash, stored_summary) \
+          source_content_hash, stored_summary, \
+          source_parent_folder_id, source_parent_folder_name, source_account) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             meta.source_path,
             meta.vault_path,
@@ -898,6 +909,9 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
             meta.source.source_modified_at,
             meta.source.source_content_hash,
             meta.source.stored_summary,
+            meta.source.source_parent_folder_id,
+            meta.source.source_parent_folder_name,
+            source_account,
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -1642,6 +1656,10 @@ pub(crate) struct SourceMeta {
     pub source_modified_at: Option<String>,
     pub source_content_hash: Option<String>,
     pub stored_summary: Option<String>,
+    /// The source folder this item was found in (Drive today) — sorting-review context only, never
+    /// chunked or embedded. `None` for vault imports and any source without a folder concept.
+    pub source_parent_folder_id: Option<String>,
+    pub source_parent_folder_name: Option<String>,
 }
 
 impl Default for SourceMeta {
@@ -1654,6 +1672,8 @@ impl Default for SourceMeta {
             source_modified_at: None,
             source_content_hash: None,
             stored_summary: None,
+            source_parent_folder_id: None,
+            source_parent_folder_name: None,
         }
     }
 }

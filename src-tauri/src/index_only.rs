@@ -314,6 +314,10 @@ pub struct PointerInput {
     pub source_modified_at: Option<String>,
     pub source_content_hash: Option<String>,
     pub body: String,
+    /// The source folder this item was found in (Drive today), for sorting-review context only. Rides
+    /// alongside the body but is never chunked or embedded. `None` for sources with no folder concept.
+    pub source_parent_folder_id: Option<String>,
+    pub source_parent_folder_name: Option<String>,
 }
 
 /// Length (chars) of the offline summary kept for an index-only item — short enough to stay a
@@ -403,6 +407,8 @@ pub fn register_pointer(
             source_modified_at: input.source_modified_at,
             source_content_hash: input.source_content_hash,
             stored_summary: Some(summarize(body)),
+            source_parent_folder_id: input.source_parent_folder_id,
+            source_parent_folder_name: input.source_parent_folder_name,
         },
     };
     let document = embed_and_index(state, gateway, body, &meta)?;
@@ -484,6 +490,10 @@ fn restore_item(state: &AppState, gateway: &ModelGateway<'_>, item: &ManifestIte
             source_modified_at: item.source_modified_at.clone(),
             source_content_hash: item.source_content_hash.clone(),
             stored_summary: item.stored_summary.clone(),
+            // The portable manifest doesn't carry the parent folder, so a Rebuild-from-manifest can't
+            // restore it — the folder tag re-populates on the next Drive refresh (no backfill here).
+            source_parent_folder_id: None,
+            source_parent_folder_name: None,
         },
     };
     embed_and_index(state, gateway, &summary, &meta)?;
