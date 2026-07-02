@@ -156,6 +156,13 @@ pub struct BackupState {
     pub last_report: Option<backup::BackupReport>,
     /// The most recent failure message (cleared when a new op starts).
     pub last_error: Option<String>,
+    /// The still-switchable restored vault, if any — the display companion to
+    /// `pending_restore_keys` (which holds the actual key). Set when a restore stages a vault,
+    /// cleared when the user switches to it. Carries NO key, only the summary the UI already got
+    /// back from the restore command, so the Backup panel can re-offer "switch to it" after being
+    /// closed and reopened. In-memory like the key map: it survives a UI remount but not an app
+    /// restart (matching that a restore not switched-to in a session is simply re-done).
+    pub pending_restore: Option<commands::RestoreSummary>,
 }
 
 pub struct AppState {

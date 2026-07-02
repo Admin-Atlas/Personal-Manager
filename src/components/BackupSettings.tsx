@@ -175,6 +175,10 @@ export function BackupSettings() {
         setPhase(s.phase);
         setFraction(s.fraction);
         if (s.last_error) setError(s.last_error);
+        // Re-offer the "switch to the restored vault" button after the panel was closed and
+        // reopened: the backend still holds the staged restore (key + summary) for this session,
+        // so we don't make the user redo the whole restore just because the UI unmounted.
+        if (s.pending_restore) setRestored(s.pending_restore);
       })
       .catch(() => {});
     const un = onBackupProgress((e) => {

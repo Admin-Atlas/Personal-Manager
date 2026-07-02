@@ -593,6 +593,9 @@ export interface BackupState {
   fraction: number;
   last_report: BackupReport | null;
   last_error: string | null;
+  /** A restored vault still waiting to be switched to, so the Backup panel can re-offer the
+   *  "switch to it" button after being closed and reopened (null when nothing is staged). */
+  pending_restore: RestoreSummary | null;
 }
 
 /** Streamed backup/restore progress (mapped onto the shared IngestProgress bar in percent mode). */

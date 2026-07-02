@@ -5805,8 +5805,9 @@ fn emit_backup_progress(app: &AppHandle, ev: BackupEvent) {
 }
 
 /// A restore's frontend-safe summary — deliberately WITHOUT the embedded DB key (which
-/// stays in Rust and is seeded straight into this device's keychain).
-#[derive(Serialize)]
+/// stays in Rust and is seeded straight into this device's keychain). `Clone` so it can also
+/// be parked in [`BackupState::pending_restore`] and re-served to a remounted UI.
+#[derive(Clone, Serialize)]
 pub struct RestoreSummary {
     pub vault_id: String,
     pub key_mode: String,
@@ -6003,6 +6004,11 @@ pub async fn restore_local_backup(
         created_at: outcome.created_at.clone(),
         target_dir,
     };
+    // Park the summary so a remounted Backup panel can re-offer "switch to it" without a re-restore
+    // (the key above already survives the remount; this is just the display companion).
+    if let Ok(mut snap) = state.backup_state.lock() {
+        snap.pending_restore = Some(summary.clone());
+    }
     emit_backup_progress(
         &app,
         BackupEvent::Finished {
@@ -6057,6 +6063,11 @@ pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: Strin
     vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
     state.open_session(conn, runtime)?;
     lock_session::engage(&app)?;
+    // Committed: drop the staged-restore banner so a reopened Backup panel doesn't offer to
+    // "switch" to the vault that's now already active.
+    if let Ok(mut snap) = state.backup_state.lock() {
+        snap.pending_restore = None;
+    }
     Ok(())
 }
 
@@ -6435,6 +6446,11 @@ pub async fn restore_from_proton(
         created_at: outcome.created_at.clone(),
         target_dir,
     };
+    // Park the summary so a remounted Backup panel can re-offer "switch to it" (see the twin in
+    // `restore_local_backup`).
+    if let Ok(mut snap) = state.backup_state.lock() {
+        snap.pending_restore = Some(summary.clone());
+    }
     emit_backup_progress(
         &app,
         BackupEvent::Finished {
