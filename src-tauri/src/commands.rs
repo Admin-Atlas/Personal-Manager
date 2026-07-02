@@ -2621,6 +2621,9 @@ async fn do_connect_google_calendar(
         .ok_or_else(|| {
             Error::Other("Google didn't return a primary calendar to identify the account.".into())
         })?;
+    // Normalise the account identity (trim + lowercase) so a reconnect that returns a
+    // differently-cased address updates the same source/token instead of duplicating it.
+    let email = email.trim().to_lowercase();
     let account = calendar::google_account_id(&email);
     if let Some((id, secret)) = &own {
         secrets::set_google_client_for_account(&email, id, secret)?;
@@ -2653,9 +2656,12 @@ pub async fn connect_google_calendar_account(
 #[tauri::command]
 pub fn disconnect_google_calendar_account(state: State<'_, AppState>, email: String) -> Result<()> {
     let conn = state.conn()?;
+    // Clear the OAuth token FIRST and propagate a real failure (a locked keychain): dropping the DB
+    // source before an un-clearable token would orphan the token with no source left to re-clear it.
+    // `secrets::delete` treats a missing entry as success, so a returned Err is a genuine failure.
+    secrets::clear_google_token_for(&google_calendar_token_key(&email))?;
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
-    secrets::clear_google_token_for(&google_calendar_token_key(&email)).ok();
-    secrets::clear_google_client_for_account(&email).ok();
+    secrets::clear_google_client_for_account(&email).ok(); // per-AP client; absent for shared-client accounts
     Ok(())
 }
 
@@ -2666,6 +2672,13 @@ pub fn disconnect_google_calendar_account(state: State<'_, AppState>, email: Str
 /// Idempotent + best-effort: a no-op once migrated, with no legacy token, or if the fetch fails (it
 /// retries next time). Never holds the DB lock across the fetch (rule #4).
 async fn migrate_legacy_google_calendar(app: &AppHandle) -> Result<()> {
+    // Attempt the (network) fetch at most once per process: `calendar_overview` — a cheap read that
+    // fires on every tab-mount/refresh — also calls this, and without the gate a transient fetch
+    // failure would re-hit Google on every overview. The cheap keychain/DB checks below still run
+    // each time; only the fetch is gated. `sync_calendar` also calls this, so a first-run failure
+    // still retries on the next sync (and on the next app start).
+    static FETCH_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     if secrets::get_google_token_for(secrets::GOOGLE_TOKEN_CALENDAR)?.is_none() {
         return Ok(());
     }
@@ -2677,6 +2690,9 @@ async fn migrate_legacy_google_calendar(app: &AppHandle) -> Result<()> {
             secrets::clear_google_token_for(secrets::GOOGLE_TOKEN_CALENDAR).ok();
             return Ok(());
         }
+    }
+    if FETCH_TRIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
     }
     let raw = calendar::fetch_calendar_list(secrets::GOOGLE_TOKEN_CALENDAR).await?;
     let Some(email) = raw.iter().find(|c| c.primary).map(|c| c.id.clone()) else {
@@ -2708,6 +2724,9 @@ async fn migrate_legacy_google_calendar(app: &AppHandle) -> Result<()> {
 pub async fn connect_outlook_calendar(app: AppHandle) -> Result<calendar::CalendarAccount> {
     let token = microsoft::run_consent(microsoft::CALENDAR_SCOPE, "Outlook Calendar").await?;
     let (email, name) = outlook_calendar::me_account(&token).await?;
+    // Normalise the account identity so a differently-cased reconnect doesn't duplicate the account
+    // (Graph's `mail`/`userPrincipalName` casing can vary); keep `name` for the human-readable label.
+    let email = email.trim().to_lowercase();
     let token_key = outlook_calendar::account_token_key(&email);
     microsoft::save_token(&token_key, &token)?;
     let raw = outlook_calendar::list_calendars(&token_key).await?;
@@ -2726,8 +2745,10 @@ pub async fn connect_outlook_calendar(app: AppHandle) -> Result<calendar::Calend
 #[tauri::command]
 pub fn disconnect_outlook_calendar(state: State<'_, AppState>, email: String) -> Result<()> {
     let conn = state.conn()?;
+    // Clear the token first and propagate a real failure, then drop the source (see the Google
+    // sibling): removing the DB row before an un-clearable token would orphan the token.
+    secrets::clear_microsoft_token_for(&outlook_calendar::account_token_key(&email))?;
     calendar::remove_source(&conn, &outlook_calendar::account_id(&email))?;
-    secrets::clear_microsoft_token_for(&outlook_calendar::account_token_key(&email)).ok();
     Ok(())
 }
 
@@ -2798,6 +2819,9 @@ pub fn clear_google_client(state: State<'_, AppState>) -> Result<()> {
         calendar::remove_source(&conn, &acc.id)?;
         if let Some(email) = acc.email {
             secrets::clear_google_token_for(&google_calendar_token_key(&email)).ok();
+            // Also drop any per-account (Advanced-Protection) client secret, else it's orphaned in
+            // the keychain with no UI path to remove it and a later reconnect reuses the stale creds.
+            secrets::clear_google_client_for_account(&email).ok();
         }
     }
     secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
@@ -2924,14 +2948,22 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        // Reconcile deselected/removed calendars. A source that failed *this* round keeps its
-        // last-good events (standard cache behaviour) rather than being blanked.
-        calendar::prune_unselected(&conn, &active)?;
+        // Reconcile deselected/removed calendars against the CURRENT selection, not the phase-1
+        // snapshot — a calendar the user un-ticked/disconnected during the unlocked fetch is then
+        // pruned this round instead of lingering until the next sync.
+        let active_now: Vec<String> = calendar::selected_calendars(&conn)?
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        calendar::prune_unselected(&conn, &active_now)?;
+        // A source with ANY failed calendar this round is 'unreachable' — check failures FIRST, so
+        // a partially-failed account (some calendars ok, some not) isn't stamped a clean 'ok' and
+        // hidden from the Connectors warning. A source that failed keeps its last-good events.
         for acc in calendar::list_sources(&conn, None)? {
-            if ok_sources.contains(&acc.id) {
-                calendar::set_source_synced(&conn, &acc.id)?;
-            } else if failed_sources.contains(&acc.id) {
+            if failed_sources.contains(&acc.id) {
                 calendar::set_source_state(&conn, &acc.id, "unreachable")?;
+            } else if ok_sources.contains(&acc.id) {
+                calendar::set_source_synced(&conn, &acc.id)?;
             }
         }
         // Only stamp a clean global sync when every selected source refreshed.

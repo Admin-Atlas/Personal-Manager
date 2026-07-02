@@ -141,9 +141,6 @@ pub async fn fetch_events(
     let mut page_token: Option<String> = None;
     let mut pages = 0;
     loop {
-        if pages >= MAX_PAGES {
-            break;
-        }
         pages += 1;
         let mut url = base.clone();
         if let Some(tok) = &page_token {
@@ -156,6 +153,16 @@ pub async fn fetch_events(
             .and_then(|v| v.as_str())
             .map(str::to_string);
         if page_token.is_none() {
+            break;
+        }
+        // Runaway guard (~25k events/calendar). If we stop here with a page token still
+        // pending, the mirror is being truncated — log it rather than silently
+        // overwriting with a partial set (no realistic personal calendar hits this).
+        if pages >= MAX_PAGES {
+            eprintln!(
+                "calendar: '{mirror_calendar_id}' hit the {MAX_PAGES}-page fetch cap with more \
+                 pages pending; its mirror may be truncated this sync"
+            );
             break;
         }
     }
@@ -997,11 +1004,15 @@ pub fn clear_all_events(conn: &Connection) -> Result<()> {
 /// day delta to each start computed in SQL. Unparseable dates are excluded.
 pub fn upcoming_events(conn: &Connection, days: i64, limit: usize) -> Result<Vec<UpcomingEvent>> {
     let horizon = format!("+{days} days");
+    // An all-day event with no explicit end has a date-only `start`; `julianday` reads that as
+    // 00:00 UTC, so a plain `COALESCE(end, start) >= now` would drop it the instant UTC passes
+    // midnight — while it's still "today". Treat a no-end all-day event as ending start-of-next-day.
     let mut stmt = conn.prepare(
         "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
                 julianday(start) - julianday('now') AS days_until \
          FROM calendar_events \
-         WHERE julianday(COALESCE(end, start)) >= julianday('now') \
+         WHERE julianday(COALESCE(end, CASE WHEN all_day = 1 THEN datetime(start, '+1 day') ELSE start END)) \
+                 >= julianday('now') \
            AND julianday(start) <= julianday('now', ?1) \
          ORDER BY start \
          LIMIT ?2",
@@ -1024,8 +1035,20 @@ pub fn upcoming_events(conn: &Connection, days: i64, limit: usize) -> Result<Vec
             days_until: r.get(10)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Error::from)
+    let collected = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)?;
+    // Dedup the same physical event mirrored on two overlapping calendars (same iCal UID),
+    // keeping the soonest copy — otherwise the focus agenda, chat preamble, and project name-match
+    // all see it twice. A null/empty UID can't be correlated, so those pass through untouched.
+    let mut seen = std::collections::HashSet::new();
+    Ok(collected
+        .into_iter()
+        .filter(|u| match &u.event.uid {
+            Some(uid) if !uid.is_empty() => seen.insert(uid.clone()),
+            _ => true,
+        })
+        .collect())
 }
 
 /// The agenda for the focus view (plain event list, capped for display).
