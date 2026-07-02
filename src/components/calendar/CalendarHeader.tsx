@@ -7,7 +7,7 @@
 
 import type { Calendar, CalendarAccount } from "../../lib/types";
 import type { CalendarRange, CalendarViewMode } from "../../lib/calendarPrefs";
-import { useDepth } from "../../theme";
+import { useDepth, useTheme } from "../../theme";
 import { Button, SegmentedControl, type SegOption } from "../ui";
 import { CalendarsDropdown } from "./CalendarsDropdown";
 import { MiniCalendarPopover } from "./MiniCalendarPopover";
@@ -81,8 +81,11 @@ export function CalendarHeader({
   lastSync,
 }: Props) {
   const { showMeta } = useDepth();
+  const { system } = useTheme();
   const synced = syncLabel(lastSync);
-  const showRange = view === "week" || view === "day";
+  // The Work/Day/24h scale only drives the pixel time-grid (Slate/Editorial). Terminal renders
+  // Week/Day as a mono agenda with no vertical scale, so the control has nothing to act on there.
+  const showRange = (view === "week" || view === "day") && system !== "terminal";
 
   const viewOptions: SegOption<CalendarViewMode>[] = availableViews.map((v) => ({
     value: v,

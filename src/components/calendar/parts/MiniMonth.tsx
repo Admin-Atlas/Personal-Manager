@@ -35,6 +35,8 @@ interface Props {
   /** Multi-day spans → thin pills behind the run. */
   spans?: MiniSpan[];
   showWeekdays?: boolean;
+  /** Day-marker shape: round discs (Slate/Editorial) or square chips (Terminal). */
+  shape?: "circle" | "square";
 }
 
 const CELL = 20;
@@ -49,7 +51,11 @@ export function MiniMonth({
   hasEvent,
   spans,
   showWeekdays,
+  shape = "circle",
 }: Props) {
+  // Only the day-number markers swap to squares in Terminal; the multi-day pills stay rounded
+  // (the handoff draws them with rounded ends on the first/last day across every System).
+  const round = shape === "square" ? "rounded-[var(--radius-sm)]" : "rounded-full";
   const { weeks, weekdayLabels } = useMemo(() => {
     const first = new Date(year, month, 1);
     const lead = (first.getDay() + 6) % 7;
@@ -124,7 +130,8 @@ export function MiniMonth({
               const numberEl = (
                 <span
                   className={cn(
-                    "relative flex h-5 w-5 items-center justify-center rounded-full font-mono text-[10px]",
+                    "relative flex h-5 w-5 items-center justify-center font-mono text-[10px]",
+                    round,
                     isToday && "bg-accent font-medium text-accent-ink",
                     isSelected && "border border-accent text-accent-text",
                     !isToday && !isSelected && (inMonth ? "text-ink3" : "text-faint"),
@@ -144,7 +151,7 @@ export function MiniMonth({
                     <button
                       type="button"
                       onClick={() => onSelectDay(date)}
-                      className="flex items-center justify-center rounded-full hover:bg-surface"
+                      className={cn("flex items-center justify-center hover:bg-surface", round)}
                       aria-label={date.toDateString()}
                     >
                       {numberEl}
