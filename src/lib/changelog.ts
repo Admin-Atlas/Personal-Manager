@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.61.0-alpha",
+    date: "2026-07-02",
+    highlights: [
+      "Calendar polish and a thorough reliability pass. The Day scale now opens on your daytime hours and fills the pane (and still scrolls to the small hours), the 24-hour scale no longer leaves a sea of empty space, and the Year view scales to fill the window in every look. Multi-day events read as a proper bar, and the settings pop-up no longer shows the “now” line through it.",
+      "Fewer events quietly go missing. Daily repeating events from an iCal subscription now show for the whole year (not just the first ~12 months), an event that’s still running from earlier stays on today’s agenda, a busy month shows a “+N more” instead of dropping overlapping multi-day events, and the same event synced from two calendars appears once. Outlook repeating events now show every occurrence, and all-day events no longer disappear halfway through their own day.",
+      "Steadier under the hood. Recurring events land on the right time across daylight-saving changes and whatever machine synced them, a calendar that partly fails to sync is flagged rather than shown as fine, and disconnecting an account reliably clears its saved sign-in. The clock line and “today” now advance on their own.",
+    ],
+  },
+  {
     version: "2.60.0-alpha",
     date: "2026-07-02",
     highlights: [

@@ -33,15 +33,25 @@ export function formatDateLocal(d: Date): string {
 }
 
 /**
+ * A local `Date`'s clock time as locale `HH:MM`. Empty string for an invalid date. Shared by the
+ * calendar views (time-grid, month chips, both agendas) so the one clock format never drifts.
+ */
+export function formatClock(d: Date): string {
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+/** {@link formatClock} from an ISO/date string; empty string if unparseable. */
+export function formatClockIso(iso: string): string {
+  return formatClock(new Date(iso));
+}
+
+/**
  * Format an ISO timestamp as the same DD-MM(-YYYY) date plus a locale time
  * (hour:minute). Leaves an unparseable value as-is.
  */
 export function formatDateTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  const time = d.toLocaleTimeString(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-  return `${formatDate(iso)} ${time}`;
+  return `${formatDate(iso)} ${formatClock(d)}`;
 }

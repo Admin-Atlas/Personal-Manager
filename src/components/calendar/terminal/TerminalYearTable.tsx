@@ -17,6 +17,7 @@ import {
 } from "../../../lib/calendar-layout";
 import { cn } from "../../ui";
 import { MiniMonth, type MiniSpan } from "../parts/MiniMonth";
+import { COL_GAP_PX, ROW_GAP_PX, useYearGridLayout } from "../parts/useYearGridLayout";
 
 interface Props {
   cursor: Date;
@@ -30,6 +31,7 @@ const MONTHS = Array.from({ length: 12 }, (_, i) => i);
 export function TerminalYearTable({ cursor, events, onSelectDay }: Props) {
   const year = cursor.getFullYear();
   const today = new Date();
+  const { containerRef, cols, rows, cellPx, rowMinPx } = useYearGridLayout(MONTHS.length);
 
   const { singleDays, spans } = useMemo(() => {
     const singleDays = new Set<string>();
@@ -50,10 +52,19 @@ export function TerminalYearTable({ cursor, events, onSelectDay }: Props) {
   const currentMonth = today.getFullYear() === year ? today.getMonth() : -1;
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto p-4 font-mono">
-      <div className="grid grid-cols-2 gap-x-6 gap-y-4 md:grid-cols-3 lg:grid-cols-4">
+    <div ref={containerRef} className="min-h-0 flex-1 overflow-y-auto p-4 font-mono">
+      <div
+        className="grid"
+        style={{
+          minHeight: "100%",
+          gridTemplateColumns: `repeat(${cols}, 1fr)`,
+          gridTemplateRows: `repeat(${rows}, minmax(${rowMinPx}px, 1fr))`,
+          columnGap: `${COL_GAP_PX}px`,
+          rowGap: `${ROW_GAP_PX}px`,
+        }}
+      >
         {MONTHS.map((m) => (
-          <div key={m}>
+          <div key={m} className="flex h-full flex-col justify-center overflow-hidden">
             <div
               className={cn(
                 "mb-1 flex items-baseline gap-2 text-sm lowercase",
@@ -72,6 +83,7 @@ export function TerminalYearTable({ cursor, events, onSelectDay }: Props) {
               spans={spans}
               showWeekdays
               shape="square"
+              cellPx={cellPx}
             />
           </div>
         ))}

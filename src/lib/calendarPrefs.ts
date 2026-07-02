@@ -18,9 +18,11 @@ export const CALENDAR_VIEW_MODES: readonly CalendarViewMode[] = [
   "agenda",
 ];
 
-/** The time-grid vertical scale (Week/Day only): the visible hour band + row height.
- *  `work` = a tall business-hours grid, `day` = the everyday whole-day grid, `full` = a compact
- *  all-24h grid. Maps to a px-per-hour + a scroll-to-hour in TimeGridView. */
+/** The time-grid vertical scale (Week/Day only): the visible hour band + row height. The grid always
+ *  spans a scrollable full 24h — `work` opens tall and scrolled to 08:00 (business hours), `day`
+ *  opens framed on 08:00–20:00 with rows stretched to fill the body exactly (a daytime-only *default
+ *  view*, not a hard clip — scroll reaches the rest), `full` stretches all 24h to fill the body with
+ *  no scroll needed. Maps to a px-per-hour + a fill window in TimeGridView. */
 export type CalendarRange = "work" | "day" | "full";
 
 export const CALENDAR_RANGES: readonly CalendarRange[] = ["work", "day", "full"];

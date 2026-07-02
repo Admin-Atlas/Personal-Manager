@@ -48,6 +48,7 @@ export function CalendarsDropdown({ accounts, calendars, hidden, onToggle, color
   return (
     <Popover
       align="right"
+      ariaLabel="Calendars to show"
       panelClassName="max-h-80 overflow-y-auto"
       trigger={({ open, toggle }) => (
         <Button

@@ -17,6 +17,7 @@ import {
   startOfDay,
   type BandInput,
 } from "../../../lib/calendar-layout";
+import { formatDateLocal } from "../../../lib/format";
 import { cn } from "../../ui";
 
 export interface MiniSpan {
@@ -37,9 +38,12 @@ interface Props {
   showWeekdays?: boolean;
   /** Day-marker shape: round discs (Slate/Editorial) or square chips (Terminal). */
   shape?: "circle" | "square";
+  /** Row height + day-badge size in px. Defaults to the compact size used by the header popover;
+   *  the Year view passes a larger, container-fitted value so it isn't stuck at popover scale. */
+  cellPx?: number;
 }
 
-const CELL = 20;
+const DEFAULT_CELL = 20;
 const MAX_SPAN_LANES = 2;
 
 export function MiniMonth({
@@ -52,7 +56,12 @@ export function MiniMonth({
   spans,
   showWeekdays,
   shape = "circle",
+  cellPx = DEFAULT_CELL,
 }: Props) {
+  const CELL = cellPx;
+  const badgePx = CELL;
+  const fontPx = Math.max(10, Math.round(CELL * 0.42));
+  const spanPx = Math.max(6, Math.round(CELL * 0.6));
   // Only the day-number markers swap to squares in Terminal; the multi-day pills stay rounded
   // (the handoff draws them with rounded ends on the first/last day across every System).
   const round = shape === "square" ? "rounded-[var(--radius-sm)]" : "rounded-full";
@@ -99,7 +108,11 @@ export function MiniMonth({
       {showWeekdays && (
         <div className="grid grid-cols-7">
           {weekdayLabels.map((w, i) => (
-            <div key={i} className="text-center font-mono text-[9px] text-faint">
+            <div
+              key={i}
+              className="text-center font-mono text-faint"
+              style={{ fontSize: `${Math.max(9, Math.round(CELL * 0.35))}px` }}
+            >
               {w}
             </div>
           ))}
@@ -113,11 +126,12 @@ export function MiniMonth({
               <div
                 key={bi}
                 aria-hidden
-                className="pointer-events-none absolute top-1/2 h-[6px] -translate-y-1/2 rounded-full"
+                className="pointer-events-none absolute top-1/2 -translate-y-1/2 rounded-full"
                 style={{
                   left: `${(b.startIdx / 7) * 100}%`,
                   width: `${((b.endIdx - b.startIdx + 1) / 7) * 100}%`,
-                  background: "color-mix(in oklab, var(--ink) 12%, transparent)",
+                  height: `${spanPx}px`,
+                  background: "color-mix(in oklab, var(--ink) 14%, transparent)",
                 }}
               />
             ))}
@@ -130,17 +144,20 @@ export function MiniMonth({
               const numberEl = (
                 <span
                   className={cn(
-                    "relative flex h-5 w-5 items-center justify-center font-mono text-[10px]",
+                    "relative flex items-center justify-center font-mono",
                     round,
                     isToday && "bg-accent font-medium text-accent-ink",
                     isSelected && "border border-accent text-accent-text",
                     !isToday && !isSelected && (inMonth ? "text-ink3" : "text-faint"),
                   )}
-                  style={
-                    marked
-                      ? { background: "color-mix(in oklab, var(--ink) 14%, transparent)" }
-                      : undefined
-                  }
+                  style={{
+                    height: `${badgePx}px`,
+                    width: `${badgePx}px`,
+                    fontSize: `${fontPx}px`,
+                    background: marked
+                      ? "color-mix(in oklab, var(--ink) 14%, transparent)"
+                      : undefined,
+                  }}
                 >
                   {date.getDate()}
                 </span>
@@ -152,7 +169,9 @@ export function MiniMonth({
                       type="button"
                       onClick={() => onSelectDay(date)}
                       className={cn("flex items-center justify-center hover:bg-surface", round)}
-                      aria-label={date.toDateString()}
+                      aria-label={`${date.toLocaleDateString(undefined, {
+                        weekday: "long",
+                      })} ${formatDateLocal(date)}`}
                     >
                       {numberEl}
                     </button>

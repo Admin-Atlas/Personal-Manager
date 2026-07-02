@@ -7,22 +7,17 @@
 
 import { useMemo } from "react";
 import type { CalendarEvent } from "../../../lib/types";
-import { formatDateLocal } from "../../../lib/format";
-import { dayKey, eventDaySpan, startOfDay } from "../../../lib/calendar-layout";
+import { formatClockIso, formatDateLocal } from "../../../lib/format";
+import { dayKey, groupEventsFromDay, startOfDay } from "../../../lib/calendar-layout";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
 
 interface Props {
   /** Already filtered to visible (non-hidden) calendars. */
   events: CalendarEvent[];
-  /** Show events whose local start day is on/after this day. */
+  /** Show events on/after this day — including a multi-day event still running through it. */
   fromDay: Date;
   colorOf: (calendarId: string) => string;
-}
-
-interface DayGroup {
-  day: Date;
-  items: CalendarEvent[];
 }
 
 function weekdayShort(d: Date): string {
@@ -31,39 +26,13 @@ function weekdayShort(d: Date): string {
 
 /** An event's clock time for the agenda row: the local start time, or "all-day". */
 function eventTime(ev: CalendarEvent): string {
-  if (ev.all_day) return "all-day";
-  const d = new Date(ev.start);
-  if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return ev.all_day ? "all-day" : formatClockIso(ev.start);
 }
 
 export function AgendaView({ events, fromDay, colorOf }: Props) {
   const { showMeta, showPower } = useDepth();
 
-  const groups = useMemo<DayGroup[]>(() => {
-    const fromMs = startOfDay(fromDay).getTime();
-    const byDay = new Map<string, DayGroup>();
-    for (const ev of events) {
-      const span = eventDaySpan(ev);
-      if (!span || span.startDay.getTime() < fromMs) continue; // started before the anchor
-      const key = dayKey(span.startDay);
-      const g = byDay.get(key);
-      if (g) g.items.push(ev);
-      else byDay.set(key, { day: span.startDay, items: [ev] });
-    }
-    const ordered = [...byDay.values()].sort((a, b) => a.day.getTime() - b.day.getTime());
-    for (const g of ordered) {
-      // All-day first, then by start instant (ISO strings sort chronologically).
-      g.items.sort((a, b) =>
-        a.all_day !== b.all_day
-          ? a.all_day
-            ? -1
-            : 1
-          : String(a.start).localeCompare(String(b.start)),
-      );
-    }
-    return ordered;
-  }, [events, fromDay]);
+  const groups = useMemo(() => groupEventsFromDay(events, fromDay), [events, fromDay]);
 
   if (groups.length === 0) {
     return (

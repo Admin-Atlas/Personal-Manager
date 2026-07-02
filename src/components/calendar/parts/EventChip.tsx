@@ -18,12 +18,13 @@ interface Props {
 export function EventChip({ summary, color, timeLabel, showTime }: Props) {
   return (
     <div
-      className="flex items-center gap-1 overflow-hidden rounded-[3px] border-l-[2px] px-1 py-px text-[11px] leading-tight"
+      className="flex items-center gap-1 overflow-hidden rounded-[var(--radius-sm)] border-l-[2px] px-1 py-px text-[11px] leading-tight"
       style={{
         background: `color-mix(in oklab, ${color} 16%, transparent)`,
         borderLeftColor: color,
       }}
       title={summary}
+      aria-label={[timeLabel, summary].filter(Boolean).join(", ")}
     >
       {showTime && timeLabel && (
         <span className="shrink-0 font-mono text-[9px] text-ink4">{timeLabel}</span>

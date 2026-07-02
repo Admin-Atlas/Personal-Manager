@@ -30,7 +30,7 @@ const PAGE_SIZE: usize = 250;
 const MAX_PAGES: usize = 100;
 /// The field projection for one event — only what the mirror needs.
 const SELECT_EVENT: &str =
-    "subject,bodyPreview,location,start,end,isAllDay,isCancelled,webLink,iCalUId";
+    "id,subject,bodyPreview,location,start,end,isAllDay,isCancelled,webLink,iCalUId";
 
 // --- identity / namespacing ----------------------------------------------------------------------
 
@@ -85,11 +85,15 @@ pub async fn fetch_events(
     time_min: &str,
     time_max: &str,
 ) -> Result<Vec<CalendarEvent>> {
-    let mut url = reqwest::Url::parse(&format!(
-        "{}/me/calendars/{remote_id}/calendarView",
-        microsoft::GRAPH_API
-    ))
-    .map_err(|e| Error::Other(e.to_string()))?;
+    // Build the path via `path_segments_mut` (not string interpolation): a Graph calendar id is an
+    // opaque, often base64url token that can contain `/`, which spliced into the path raw would
+    // become extra segments and 404 the request — silently dropping a non-default calendar. Mirrors
+    // the Google sibling in `crate::calendar::fetch_events`.
+    let mut url =
+        reqwest::Url::parse(microsoft::GRAPH_API).map_err(|e| Error::Other(e.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|_| Error::Other("invalid Graph API base".into()))?
+        .extend(["me", "calendars", remote_id, "calendarView"]);
     url.query_pairs_mut()
         .append_pair("startDateTime", time_min)
         .append_pair("endDateTime", time_max)
@@ -190,16 +194,22 @@ fn parse_event(mirror_calendar_id: &str, e: &Value) -> Option<CalendarEvent> {
         .and_then(|s| s.get("dateTime"))
         .and_then(Value::as_str)
         .and_then(|dt| graph_datetime_to_iso(dt, all_day));
-    // The iCalUId is the durable cross-provider anchor; the synthetic mirror id stays
-    // `<calendar>:<uid-or-fallback>` (unique within the calendar).
+    // The iCalUId is the durable cross-provider anchor and lives in `uid`. The mirror id, though,
+    // must key on Graph's PER-INSTANCE `id`: `calendarView` pre-expands a recurring series into
+    // instances that all SHARE one iCalUId, so using the UID as the suffix would make every
+    // occurrence collide on `<calendar>:<uid>` and `INSERT OR REPLACE` collapse the series to a
+    // single mirror row. Fall back to the UID, then the start, only when Graph omits the id.
     let uid = e
         .get("iCalUId")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let id_suffix = uid
-        .clone()
-        .or_else(|| e.get("id").and_then(Value::as_str).map(str::to_string))
+    let id_suffix = e
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| uid.clone())
         .unwrap_or_else(|| start.clone());
     Some(CalendarEvent {
         id: format!("{mirror_calendar_id}:{id_suffix}"),
@@ -337,5 +347,36 @@ mod tests {
         assert!(allday.all_day);
         assert_eq!(allday.start, "2026-06-28");
         assert_eq!(allday.end.as_deref(), Some("2026-06-29"));
+    }
+
+    #[test]
+    fn recurring_instances_sharing_one_ical_uid_get_distinct_mirror_ids() {
+        // calendarView pre-expands a series: every instance shares one iCalUId but has a unique
+        // per-instance `id`. Keying the mirror id on the instance id keeps them distinct — keying
+        // on the UID would collapse the whole series to one row via INSERT OR REPLACE.
+        let v = serde_json::json!({
+            "value": [
+                {
+                    "id": "INST-A", "subject": "Weekly", "iCalUId": "SERIES-UID",
+                    "start": {"dateTime": "2026-06-01T09:00:00.0000000", "timeZone": "UTC"},
+                    "end": {"dateTime": "2026-06-01T09:30:00.0000000", "timeZone": "UTC"},
+                    "isAllDay": false
+                },
+                {
+                    "id": "INST-B", "subject": "Weekly", "iCalUId": "SERIES-UID",
+                    "start": {"dateTime": "2026-06-08T09:00:00.0000000", "timeZone": "UTC"},
+                    "end": {"dateTime": "2026-06-08T09:30:00.0000000", "timeZone": "UTC"},
+                    "isAllDay": false
+                }
+            ]
+        });
+        let (events, _) = parse_events("outlook:a@b.com:AAA", &v);
+        assert_eq!(events.len(), 2);
+        assert_ne!(events[0].id, events[1].id, "instances must not collide");
+        assert_eq!(events[0].id, "outlook:a@b.com:AAA:INST-A");
+        assert_eq!(events[1].id, "outlook:a@b.com:AAA:INST-B");
+        // Both keep the shared UID for cross-provider dedup.
+        assert_eq!(events[0].uid.as_deref(), Some("SERIES-UID"));
+        assert_eq!(events[1].uid.as_deref(), Some("SERIES-UID"));
     }
 }

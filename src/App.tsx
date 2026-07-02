@@ -632,7 +632,7 @@ export default function App() {
           )}
 
           {showSettings && (
-            <div className="absolute inset-0 z-10" style={{ background: "rgba(8,6,4,0.5)" }}>
+            <div className="absolute inset-0 z-50" style={{ background: "rgba(8,6,4,0.5)" }}>
               <SettingsView
                 onboarding={false}
                 onClose={() => {
@@ -648,7 +648,7 @@ export default function App() {
           )}
 
           {showWhatsNew && (
-            <div className="absolute inset-0 z-20" style={{ background: "rgba(8,6,4,0.5)" }}>
+            <div className="absolute inset-0 z-50" style={{ background: "rgba(8,6,4,0.5)" }}>
               <WhatsNew onClose={closeWhatsNew} currentVersion={appVersion} />
             </div>
           )}

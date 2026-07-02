@@ -7,22 +7,12 @@
 // chips lose their fill for a flat source-coloured left tick. Green (the accent) is reserved for
 // today's number chip only — every source colour comes from the categorical palette, never the accent.
 
-import { useMemo } from "react";
 import type { CalendarEvent } from "../../../lib/types";
-import {
-  addDays,
-  clampSpanToRange,
-  dayDiff,
-  dayKey,
-  eventDaySpan,
-  isMultiDay,
-  packBands,
-  parseLocal,
-  startOfDay,
-  type BandInput,
-} from "../../../lib/calendar-layout";
+import { dayKey } from "../../../lib/calendar-layout";
+import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
+import { useMonthGrid } from "../parts/useMonthGrid";
 
 interface Props {
   /** A date within the month to render. */
@@ -35,125 +25,13 @@ interface Props {
 const BAND_H = 16;
 const NUM_H = 22;
 const CELL_PAD = 4; // matches the cells' py-1, so the row-relative band overlay clears the number row
-const MAX_BAND_LANES = 3;
 const MAX_DOTS = 5;
-
-function hhmm(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-}
-
-interface DayCell {
-  date: Date;
-  inMonth: boolean;
-  isToday: boolean;
-  chips: CalendarEvent[];
-}
-
-interface BandBar {
-  ev: CalendarEvent;
-  startIdx: number;
-  endIdx: number;
-  lane: number;
-  continuesLeft: boolean;
-  continuesRight: boolean;
-}
-
-interface WeekRow {
-  cells: DayCell[];
-  bands: BandBar[];
-  laneCount: number;
-}
 
 export function TerminalMonthTable({ cursor, events, colorOf }: Props) {
   const { minimal, showMeta, showPower } = useDepth();
   const maxChips = showPower ? 4 : 3;
 
-  const { weeks, weekdayLabels } = useMemo(() => {
-    const year = cursor.getFullYear();
-    const month = cursor.getMonth();
-    const first = new Date(year, month, 1);
-    const lead = (first.getDay() + 6) % 7; // Monday-first offset
-    const gridStart = addDays(startOfDay(first), -lead);
-    const daysInMonth = new Date(year, month + 1, 0).getDate();
-    const rows = Math.ceil((lead + daysInMonth) / 7);
-    const todayKey = dayKey(startOfDay(new Date()));
-
-    // Bucket single-day events by local start day; band (multi-day) events handled per week below.
-    const chipsByDay = new Map<string, CalendarEvent[]>();
-    const bandEvents: CalendarEvent[] = [];
-    for (const ev of events) {
-      if (isMultiDay(ev)) {
-        bandEvents.push(ev);
-        continue;
-      }
-      const start = parseLocal(ev.start, ev.all_day);
-      if (!start) continue;
-      const key = dayKey(startOfDay(start));
-      const list = chipsByDay.get(key);
-      if (list) list.push(ev);
-      else chipsByDay.set(key, [ev]);
-    }
-    for (const list of chipsByDay.values()) {
-      list.sort((a, b) =>
-        a.all_day !== b.all_day
-          ? a.all_day
-            ? -1
-            : 1
-          : String(a.start).localeCompare(String(b.start)),
-      );
-    }
-
-    const weeks: WeekRow[] = [];
-    for (let r = 0; r < rows; r++) {
-      const weekStart = addDays(gridStart, r * 7);
-      const cells: DayCell[] = Array.from({ length: 7 }, (_, i) => {
-        const date = addDays(weekStart, i);
-        return {
-          date,
-          inMonth: date.getMonth() === month,
-          isToday: dayKey(date) === todayKey,
-          chips: chipsByDay.get(dayKey(date)) ?? [],
-        };
-      });
-
-      const inputs: BandInput[] = [];
-      const meta = new Map<string, { ev: CalendarEvent; left: boolean; right: boolean }>();
-      for (const ev of bandEvents) {
-        const span = eventDaySpan(ev);
-        if (!span) continue;
-        const clamped = clampSpanToRange(
-          dayDiff(weekStart, span.startDay),
-          dayDiff(weekStart, span.endDay),
-          6,
-        );
-        if (!clamped) continue;
-        inputs.push({ id: ev.id, startDay: clamped.startDay, endDay: clamped.endDay });
-        meta.set(ev.id, { ev, left: clamped.continuesLeft, right: clamped.continuesRight });
-      }
-      const { bands, laneCount } = packBands(inputs);
-      const bars: BandBar[] = bands
-        .filter((b) => b.lane < MAX_BAND_LANES)
-        .map((b) => {
-          const m = meta.get(b.id)!;
-          return {
-            ev: m.ev,
-            startIdx: b.startDay,
-            endIdx: b.endDay,
-            lane: b.lane,
-            continuesLeft: m.left,
-            continuesRight: m.right,
-          };
-        });
-      weeks.push({ cells, bands: bars, laneCount: Math.min(laneCount, MAX_BAND_LANES) });
-    }
-
-    const weekdayLabels = Array.from({ length: 7 }, (_, i) =>
-      addDays(gridStart, i).toLocaleDateString(undefined, { weekday: "short" }),
-    );
-    return { weeks, weekdayLabels };
-  }, [cursor, events]);
+  const { weeks, weekdayLabels } = useMonthGrid(cursor, events);
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col font-mono">
@@ -177,7 +55,8 @@ export function TerminalMonthTable({ cursor, events, colorOf }: Props) {
             className="relative grid min-h-0 flex-1 grid-cols-7 border-b border-rule last:border-b-0"
           >
             {week.cells.map((cell) => {
-              const hiddenCount = cell.chips.length - maxChips;
+              const hiddenCount = Math.max(0, cell.chips.length - maxChips) + cell.hiddenBands;
+              const dotsHidden = Math.max(0, cell.chips.length - MAX_DOTS) + cell.hiddenBands;
               return (
                 <div
                   key={dayKey(cell.date)}
@@ -218,10 +97,8 @@ export function TerminalMonthTable({ cursor, events, colorOf }: Props) {
                           style={{ backgroundColor: colorOf(ev.calendar_id) }}
                         />
                       ))}
-                      {cell.chips.length > MAX_DOTS && (
-                        <span className="text-[9px] text-ink4">
-                          +{cell.chips.length - MAX_DOTS}
-                        </span>
+                      {dotsHidden > 0 && (
+                        <span className="text-[9px] text-ink4">+{dotsHidden}</span>
                       )}
                     </div>
                   ) : (
@@ -233,8 +110,10 @@ export function TerminalMonthTable({ cursor, events, colorOf }: Props) {
                           style={{ borderLeftColor: colorOf(ev.calendar_id) }}
                           title={ev.summary}
                         >
-                          {showMeta && !ev.all_day && hhmm(ev.start) && (
-                            <span className="shrink-0 text-[9px] text-ink4">{hhmm(ev.start)}</span>
+                          {showMeta && !ev.all_day && formatClockIso(ev.start) && (
+                            <span className="shrink-0 text-[9px] text-ink4">
+                              {formatClockIso(ev.start)}
+                            </span>
                           )}
                           <span className="truncate text-ink">{ev.summary}</span>
                         </div>

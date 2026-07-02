@@ -59,6 +59,7 @@ export function MiniCalendarPopover({ label, cursor, onPick }: Props) {
   return (
     <Popover
       align="left"
+      ariaLabel="Jump to a date"
       trigger={({ open, toggle }) => (
         <button
           type="button"

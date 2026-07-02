@@ -210,11 +210,21 @@ async fn authorized_send(token_key: &str, url: &str) -> Result<reqwest::Response
         .await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         let token = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
-        return Ok(http()?
+        let retried = http()?
             .get(url)
             .bearer_auth(token.access_token.expose())
             .send()
-            .await?);
+            .await?;
+        // A refresh that succeeds but whose new access token is still rejected (revoked grant /
+        // scope downgrade) would otherwise surface a raw provider 401 body. Map it to a clear
+        // "reconnect" message instead.
+        if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(Error::Other(
+                "Your Google session has expired — reconnect the account in Settings → Connectors."
+                    .into(),
+            ));
+        }
+        return Ok(retried);
     }
     Ok(resp)
 }
