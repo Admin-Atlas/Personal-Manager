@@ -5805,8 +5805,9 @@ fn emit_backup_progress(app: &AppHandle, ev: BackupEvent) {
 }
 
 /// A restore's frontend-safe summary — deliberately WITHOUT the embedded DB key (which
-/// stays in Rust and is seeded straight into this device's keychain).
-#[derive(Serialize)]
+/// stays in Rust and is seeded straight into this device's keychain). `Clone` so it can also
+/// be parked in [`BackupState::pending_restore`] and re-served to a remounted UI.
+#[derive(Clone, Serialize)]
 pub struct RestoreSummary {
     pub vault_id: String,
     pub key_mode: String,
@@ -6003,6 +6004,11 @@ pub async fn restore_local_backup(
         created_at: outcome.created_at.clone(),
         target_dir,
     };
+    // Park the summary so a remounted Backup panel can re-offer "switch to it" without a re-restore
+    // (the key above already survives the remount; this is just the display companion).
+    if let Ok(mut snap) = state.backup_state.lock() {
+        snap.pending_restore = Some(summary.clone());
+    }
     emit_backup_progress(
         &app,
         BackupEvent::Finished {
@@ -6057,6 +6063,11 @@ pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: Strin
     vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
     state.open_session(conn, runtime)?;
     lock_session::engage(&app)?;
+    // Committed: drop the staged-restore banner so a reopened Backup panel doesn't offer to
+    // "switch" to the vault that's now already active.
+    if let Ok(mut snap) = state.backup_state.lock() {
+        snap.pending_restore = None;
+    }
     Ok(())
 }
 
@@ -6108,6 +6119,79 @@ fn require_proton_cli() -> Result<std::path::PathBuf> {
         .ok_or_else(|| Error::Other("the Proton Drive CLI is not installed".into()))
 }
 
+/// The automatic-backup schedule shown in Settings. `passphrase_stored` reflects the keychain
+/// opt-in (a non-`off` frequency requires it); `last_backup_at` is RFC3339 or null.
+#[derive(Serialize)]
+pub struct BackupSchedule {
+    pub frequency: String,
+    pub retention_n: u32,
+    pub passphrase_stored: bool,
+    pub last_backup_at: Option<String>,
+}
+
+/// Read the current automatic-backup schedule (cadence + retention + opt-in state + last run).
+#[tauri::command]
+pub fn get_backup_schedule(state: State<'_, AppState>) -> Result<BackupSchedule> {
+    use crate::backup::schedule::{
+        BACKUP_FREQUENCY_KEY, BACKUP_RETENTION_KEY, DEFAULT_RETENTION_N, LAST_BACKUP_AT_KEY,
+    };
+    let conn = state.conn()?;
+    Ok(BackupSchedule {
+        frequency: crate::db::get_setting(&conn, BACKUP_FREQUENCY_KEY)?
+            .unwrap_or_else(|| "off".into()),
+        retention_n: crate::db::get_setting(&conn, BACKUP_RETENTION_KEY)?
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_RETENTION_N),
+        passphrase_stored: secrets::get_backup_passphrase()?.is_some(),
+        last_backup_at: crate::db::get_setting(&conn, LAST_BACKUP_AT_KEY)?,
+    })
+}
+
+/// Set the automatic-backup cadence + retention. A non-`off` cadence requires a stored passphrase
+/// (unattended runs can't prompt), so this refuses to enable automation until one is saved.
+#[tauri::command]
+pub fn set_backup_schedule(
+    state: State<'_, AppState>,
+    frequency: String,
+    retention_n: u32,
+) -> Result<()> {
+    use crate::backup::schedule::{Frequency, BACKUP_FREQUENCY_KEY, BACKUP_RETENTION_KEY};
+    let freq = Frequency::from_setting(&frequency);
+    if freq != Frequency::Off && secrets::get_backup_passphrase()?.is_none() {
+        return Err(Error::Other(
+            "save a backup passphrase before turning on automatic backups".into(),
+        ));
+    }
+    let retention_n = retention_n.max(1);
+    let conn = state.conn()?;
+    crate::db::set_setting(&conn, BACKUP_FREQUENCY_KEY, freq.as_setting())?;
+    crate::db::set_setting(&conn, BACKUP_RETENTION_KEY, &retention_n.to_string())?;
+    Ok(())
+}
+
+/// Store the backup passphrase in the OS keychain for unattended (scheduled) backups. Explicit
+/// opt-in — manual backups never read this.
+#[tauri::command]
+pub fn set_backup_passphrase(passphrase: String) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(Error::Other("a backup passphrase is required".into()));
+    }
+    secrets::set_backup_passphrase(&passphrase)
+}
+
+/// Forget the stored backup passphrase and turn automatic backups off (they can't run without it).
+#[tauri::command]
+pub fn forget_backup_passphrase(state: State<'_, AppState>) -> Result<()> {
+    use crate::backup::schedule::{Frequency, BACKUP_FREQUENCY_KEY};
+    // Turn automation OFF first, THEN drop the passphrase — so a failure between the two can never
+    // leave "cadence != off" with no stored passphrase (the state the scheduler must never see).
+    {
+        let conn = state.conn()?;
+        crate::db::set_setting(&conn, BACKUP_FREQUENCY_KEY, Frequency::Off.as_setting())?;
+    }
+    secrets::delete_backup_passphrase()
+}
+
 /// Sign in to Proton Drive — opens the browser and blocks until the flow completes. The
 /// session is stored and owned by the CLI (OS secret store); PM never sees Proton credentials.
 #[tauri::command]
@@ -6142,25 +6226,24 @@ pub async fn list_proton_backups() -> Result<Vec<crate::backup::proton::ProtonBa
         .map_err(|e| Error::Other(format!("list task panicked: {e}")))?
 }
 
-/// Create an encrypted archive and push it to Proton Drive. Snapshots the DB under the lock,
-/// then — off the lock — packs to a temp `.pmbackup` and uploads it via the CLI. Same portable
-/// format as a local backup (restorable anywhere with the passphrase); the temp file never
-/// leaves the machine unencrypted and is discarded after upload.
-#[tauri::command]
-pub async fn backup_to_proton(
-    app: AppHandle,
-    state: State<'_, AppState>,
+/// Shared core: snapshot the DB under the lock, then — off the lock — pack a `.pmbackup` and
+/// upload it to Proton Drive via the CLI, emitting the detached `backup://progress` events.
+/// Reused by the manual `backup_to_proton` command and the scheduler
+/// ([`crate::backup::schedule`]); single-flight via the `backup_busy` guard.
+pub(crate) async fn run_proton_backup(
+    app: &AppHandle,
     passphrase: String,
-) -> Result<()> {
-    if passphrase.is_empty() {
-        return Err(Error::Other("a backup passphrase is required".into()));
-    }
-    let cli = require_proton_cli()?;
+    cli: std::path::PathBuf,
+) -> Result<String> {
+    // `app` is borrowed (not owned) so the `State` we derive from it borrows *through* the
+    // reference — holding it across the `.await` below is fine, whereas an owned `app` would make
+    // this future self-referential.
+    let state = app.state::<AppState>();
     let _busy = BusyGuard::acquire(&state.backup_busy)
         .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
     state.backup_cancel.store(false, Ordering::SeqCst);
     emit_backup_progress(
-        &app,
+        app,
         BackupEvent::Phase {
             phase: BackupPhase::Snapshot,
             fraction: 0.0,
@@ -6176,21 +6259,23 @@ pub async fn backup_to_proton(
         vault::migrate::vacuum_into(&conn, &snapshot)?;
     }
     emit_backup_progress(
-        &app,
+        app,
         BackupEvent::Phase {
             phase: BackupPhase::Snapshot,
             fraction: 1.0,
         },
     );
 
-    let resolved = vault::resolve(&app)?;
+    let resolved = vault::resolve(app)?;
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata to back up".into()))?;
     let db_key = vault::current_db_key(&meta)?
         .ok_or_else(|| Error::Other("unlock the vault before backing it up".into()))?;
     let now = chrono::Utc::now();
-    let archive_name =
-        crate::backup::proton::archive_name(&now.format("%Y%m%dT%H%M%SZ").to_string());
+    let archive_name = crate::backup::proton::archive_name(
+        &meta.vault_id,
+        &now.format("%Y%m%dT%H%M%SZ").to_string(),
+    );
     let archive_path = tmp.path().join(&archive_name);
     let inputs = backup::pack::PackInputs {
         vault_root: resolved.vault_root.clone(),
@@ -6228,18 +6313,28 @@ pub async fn backup_to_proton(
 
     match result {
         Ok(()) => {
+            // Stamp last-run for BOTH manual and scheduled backups, so the cadence clock advances
+            // (a manual backup "counts") and Settings reflects it. Best-effort — a vault that
+            // locked during the upload just leaves the stamp for next time.
+            if let Ok(conn) = state.conn() {
+                let _ = crate::db::set_setting(
+                    &conn,
+                    crate::backup::schedule::LAST_BACKUP_AT_KEY,
+                    &now.to_rfc3339(),
+                );
+            }
             emit_backup_progress(
-                &app,
+                app,
                 BackupEvent::Finished {
                     report: BackupReport {
                         kind: BackupKind::Backup,
-                        vault_id: Some(vault_id),
+                        vault_id: Some(vault_id.clone()),
                         target_dir: None,
                         created_at: None,
                     },
                 },
             );
-            Ok(())
+            Ok(vault_id)
         }
         Err(e) => {
             let msg = if state.backup_cancel.load(Ordering::SeqCst) {
@@ -6248,7 +6343,7 @@ pub async fn backup_to_proton(
                 e.to_string()
             };
             emit_backup_progress(
-                &app,
+                app,
                 BackupEvent::Failed {
                     message: msg.clone(),
                 },
@@ -6256,6 +6351,17 @@ pub async fn backup_to_proton(
             Err(Error::Other(msg))
         }
     }
+}
+
+/// Create an encrypted archive and push it to Proton Drive. Same portable format as a local
+/// backup; the temp file never leaves the machine unencrypted and is discarded after upload.
+#[tauri::command]
+pub async fn backup_to_proton(app: AppHandle, passphrase: String) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(Error::Other("a backup passphrase is required".into()));
+    }
+    let cli = require_proton_cli()?;
+    run_proton_backup(&app, passphrase, cli).await.map(|_| ())
 }
 
 /// Download an archive from Proton Drive and restore it into a fresh, validated folder (the
@@ -6340,6 +6446,11 @@ pub async fn restore_from_proton(
         created_at: outcome.created_at.clone(),
         target_dir,
     };
+    // Park the summary so a remounted Backup panel can re-offer "switch to it" (see the twin in
+    // `restore_local_backup`).
+    if let Ok(mut snap) = state.backup_state.lock() {
+        snap.pending_restore = Some(summary.clone());
+    }
     emit_backup_progress(
         &app,
         BackupEvent::Finished {

@@ -593,6 +593,9 @@ export interface BackupState {
   fraction: number;
   last_report: BackupReport | null;
   last_error: string | null;
+  /** A restored vault still waiting to be switched to, so the Backup panel can re-offer the
+   *  "switch to it" button after being closed and reopened (null when nothing is staged). */
+  pending_restore: RestoreSummary | null;
 }
 
 /** Streamed backup/restore progress (mapped onto the shared IngestProgress bar in percent mode). */
@@ -634,6 +637,16 @@ export interface ProtonBackupEntry {
   name: string;
   /** Cleartext size in bytes, when reported. */
   size: number | null;
+}
+
+/** Automatic-backup schedule: cadence + keep-last-N retention + the keychain opt-in state.
+ *  A non-`off` cadence requires `passphrase_stored` (unattended runs can't prompt). */
+export interface BackupSchedule {
+  frequency: "off" | "daily" | "weekly" | "monthly";
+  retention_n: number;
+  passphrase_stored: boolean;
+  /** When the last automatic backup completed (RFC3339), or null. */
+  last_backup_at: string | null;
 }
 
 // --- Personal Assistant: Microsoft OneDrive connector (board card 4B, spec §8.1) ---

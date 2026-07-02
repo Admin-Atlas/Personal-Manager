@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.66.0-alpha",
+    date: "2026-07-02",
+    highlights: [
+      "New: automatic backups to Proton Drive, on a schedule. In Settings → Backup you can now set PM to back up to your Proton Drive every day, week, or month — no clicking required. Choose how many backups to keep (older ones move to your Proton Trash, so nothing is ever truly deleted). Because scheduled backups run unattended, PM stores your backup passphrase in your operating system’s keychain — this is an explicit opt-in, and you can turn it off (and forget the passphrase) any time. Automatic backups only run when your vault is unlocked, you’re not in the middle of something, and Proton Drive is connected.",
+    ],
+  },
+  {
     version: "2.65.0-alpha",
     date: "2026-07-02",
     highlights: [

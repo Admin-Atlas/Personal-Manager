@@ -29,6 +29,7 @@ pub mod manifest;
 pub mod pack;
 pub mod proton;
 pub mod restore;
+pub mod schedule;
 
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};

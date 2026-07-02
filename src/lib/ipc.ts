@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppLockStatus,
   BackupEvent,
+  BackupSchedule,
   BackupState,
   CalendarAccount,
   CalendarEvent,
@@ -840,3 +841,18 @@ export const backupToProton = (passphrase: string) =>
  *  with a summary. The live vault is untouched until you {@link switchToVault} to it. */
 export const restoreFromProton = (name: string, passphrase: string) =>
   invoke<RestoreSummary>("restore_from_proton", { name, passphrase });
+
+/** The current automatic-backup schedule (cadence + retention + keychain opt-in + last run). */
+export const getBackupSchedule = () => invoke<BackupSchedule>("get_backup_schedule");
+
+/** Set the automatic-backup cadence + keep-last-N retention. A non-`off` cadence requires a
+ *  stored passphrase first ({@link setBackupPassphrase}) or the command rejects. */
+export const setBackupSchedule = (frequency: string, retentionN: number) =>
+  invoke<void>("set_backup_schedule", { frequency, retentionN });
+
+/** Store the backup passphrase in the OS keychain for unattended (scheduled) backups (opt-in). */
+export const setBackupPassphrase = (passphrase: string) =>
+  invoke<void>("set_backup_passphrase", { passphrase });
+
+/** Forget the stored backup passphrase and turn automatic backups off. */
+export const forgetBackupPassphrase = () => invoke<void>("forget_backup_passphrase");

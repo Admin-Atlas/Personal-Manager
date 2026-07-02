@@ -323,10 +323,22 @@ fn check_transfer(stdout: &str) -> Result<()> {
 
 // --- Pure helpers (naming / validation) ---------------------------------------------
 
-/// The archive file name for a backup taken at `stamp` — a compact, filesystem- and
-/// URL-safe UTC stamp (`YYYYMMDDTHHMMSSZ`) so names sort chronologically for retention.
-pub(crate) fn archive_name(stamp: &str) -> String {
-    format!("pm-backup-{stamp}{ARCHIVE_EXT}")
+/// This vault's stable archive-name prefix, so retention only ever considers archives THIS vault
+/// created — never another device/vault sharing the same Proton account + folder. The vault id is
+/// reduced to `[A-Za-z0-9]` so it is a safe path segment.
+pub(crate) fn archive_prefix(vault_id: &str) -> String {
+    let id: String = vault_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("pm-backup-{id}-")
+}
+
+/// The archive file name for a backup of `vault_id` taken at `stamp` (a compact, filesystem- and
+/// URL-safe UTC stamp `YYYYMMDDTHHMMSSZ`). Carries the vault id so archives are attributable and
+/// retention is per-vault; the trailing stamp keeps same-vault names chronologically sortable.
+pub(crate) fn archive_name(vault_id: &str, stamp: &str) -> String {
+    format!("{}{stamp}{ARCHIVE_EXT}", archive_prefix(vault_id))
 }
 
 /// Whether `name` is a safe bare archive file name to interpolate into a remote/local path:
@@ -375,19 +387,101 @@ pub(crate) fn connection(cli: &Path) -> ProtonConnStatus {
     }
 }
 
-/// Sign in — runs `auth login`, which opens the browser and blocks until the flow completes
-/// (or the CLI gives up). The session is stored by the OS secret store, owned by the CLI. On
-/// failure we deliberately DISCARD the CLI's output and return a generic message: `auth login`
-/// prints the browser sign-in URL (which can carry a one-time token) to stdout, and we must not
-/// surface that in a UI-visible error string.
+/// Extract the first `https://…` token from a line of CLI output, stopping at the first
+/// whitespace or control byte (so a trailing ANSI reset or newline is excluded) and trimming
+/// trailing punctuation. `auth login` prints the sign-in URL in its output; PM opens it.
+fn first_https_url(line: &str) -> Option<String> {
+    let start = line.find("https://")?;
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c.is_control())
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['"', '\'', ')', ']', '>', '.', ',']);
+    (url.len() > "https://".len()).then(|| url.to_string())
+}
+
+/// Open the first sign-in URL seen across the CLI's streams, exactly once. `open::that` launches
+/// the user's default browser — the same approach the Google/Microsoft OAuth flows use.
+fn open_url_once(line: &str, opened: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    if opened.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(url) = first_https_url(line) {
+        if opened
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let _ = open::that(&url); // best-effort; the browser is the user's own
+        }
+    }
+}
+
+/// Drain a child stream line-by-line (lossy UTF-8, so odd bytes never stall it), opening the
+/// sign-in URL the instant it appears. Draining fully also stops a filled pipe from deadlocking
+/// the `wait()` in [`connect`].
+fn scan_for_url<R: std::io::Read>(reader: R, opened: &std::sync::atomic::AtomicBool) {
+    use std::io::{BufRead, BufReader};
+    let mut r = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => open_url_once(&String::from_utf8_lossy(&buf), opened),
+        }
+    }
+}
+
+/// Sign in — runs `auth login`. The CLI prints the browser sign-in URL to its output and then
+/// blocks on the loopback OAuth callback ("Sign in in your browser. Keep the terminal open."),
+/// but spawned head-less (no console / non-TTY) it won't launch a browser itself — so PM reads
+/// the URL off the stream and opens it, the same way the Google/Microsoft flows do. The session
+/// is stored by the OS secret store, owned by the CLI. On any failure we DISCARD the CLI's output
+/// and return a generic message: that output carries a one-time-token URL that must never land in
+/// a UI-visible error string.
 pub(crate) fn connect(cli: &Path) -> Result<()> {
-    run_proton(cli, &["auth", "login"])
-        .map(|_| ())
-        .map_err(|_| {
-            Error::Other(
-                "Proton Drive sign-in didn't complete — please try connecting again.".into(),
-            )
-        })
+    use std::process::Stdio;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let mut cmd = Command::new(cli);
+    cmd.args(["auth", "login"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    no_window(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::Other(format!("could not run the Proton Drive CLI: {e}")))?;
+
+    let opened = Arc::new(AtomicBool::new(false));
+
+    // The URL can surface on either stream; scan stderr on a side thread (also draining it so a
+    // full pipe can't deadlock the wait) and stdout here. Open-once is shared via the flag.
+    let stderr = child.stderr.take();
+    let opened_err = Arc::clone(&opened);
+    let stderr_thread = std::thread::spawn(move || {
+        if let Some(e) = stderr {
+            scan_for_url(e, &opened_err);
+        }
+    });
+    if let Some(out) = child.stdout.take() {
+        scan_for_url(out, &opened);
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| Error::Other(format!("could not run the Proton Drive CLI: {e}")))?;
+    let _ = stderr_thread.join();
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            "Proton Drive sign-in didn't complete — please try connecting again.".into(),
+        ))
+    }
 }
 
 /// Sign out — `auth logout`. Being already signed out is a successful end state, not an error
@@ -491,6 +585,53 @@ pub(crate) fn list_archives(cli: &Path) -> Result<Vec<ProtonBackupEntry>> {
     parse_backup_listing(&out)
 }
 
+// --- Retention (keep last N, trash oldest) ------------------------------------------
+
+/// Which archive names to trash to keep only the newest `keep_n`. Pure + testable: names end in a
+/// `<UTC-stamp>.pmbackup` suffix, so a reverse lexical sort is reverse-chronological, and
+/// everything past the first `keep_n` is stale. `keep_n` is clamped to `>= 1` HERE too (not only
+/// in the caller) so this can never, on its own, select every archive for deletion.
+fn select_for_deletion(names: &[String], keep_n: usize) -> Vec<String> {
+    let keep_n = keep_n.max(1);
+    let mut sorted = names.to_vec();
+    sorted.sort_by(|a, b| b.cmp(a)); // newest (lexically greatest) first
+    sorted.into_iter().skip(keep_n).collect()
+}
+
+/// Move the given archives (by bare name) to Proton Trash — recoverable, never a hard delete.
+/// One `filesystem trash` call with every path. No-op on an empty list.
+fn trash_archives(cli: &Path, names: &[String]) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<String> = names
+        .iter()
+        .map(|n| format!("{REMOTE_BACKUP_DIR}/{n}"))
+        .collect();
+    let mut args = vec!["filesystem", "trash"];
+    args.extend(paths.iter().map(String::as_str));
+    args.push("--json");
+    run_proton(cli, &args).map(|_| ())
+}
+
+/// Keep-last-N retention **for one vault**: list PM's archives, keep the newest `keep_n` whose
+/// name carries `prefix` (this vault's — see [`archive_prefix`]), and trash the rest to Proton
+/// Trash (recoverable). Scoping by `prefix` means it NEVER touches another vault's/device's
+/// archives sharing the folder, and NEVER a non-PM file; the extra `valid_archive_name` filter is
+/// belt-and-braces so a hostile listing entry can't splice a path into the trash call. Returns how
+/// many were trashed. Used after a successful scheduled backup.
+pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result<usize> {
+    let names: Vec<String> = list_archives(cli)?
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n.starts_with(prefix) && valid_archive_name(n))
+        .collect();
+    let doomed = select_for_deletion(&names, keep_n);
+    let count = doomed.len();
+    trash_archives(cli, &doomed)?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +716,53 @@ mod tests {
     }
 
     #[test]
+    fn extracts_sign_in_url() {
+        assert_eq!(
+            first_https_url("Sign in in your browser: https://account.proton.me/authorize?x=1"),
+            Some("https://account.proton.me/authorize?x=1".to_string())
+        );
+        // A trailing ANSI reset and surrounding text are excluded; only the first URL is taken.
+        assert_eq!(
+            first_https_url("\u{1b}[36mhttps://drive.proton.me/login\u{1b}[0m keep terminal open"),
+            Some("https://drive.proton.me/login".to_string())
+        );
+        assert_eq!(first_https_url("no url on this line"), None);
+    }
+
+    #[test]
+    fn retention_keeps_newest_n_and_never_wipes_all() {
+        let names = vec![
+            "pm-backup-20260101T000000Z.pmbackup".to_string(),
+            "pm-backup-20260303T000000Z.pmbackup".to_string(),
+            "pm-backup-20260202T000000Z.pmbackup".to_string(),
+        ];
+        // Keep the 2 newest → only the oldest (Jan) is trashed.
+        assert_eq!(
+            select_for_deletion(&names, 2),
+            vec!["pm-backup-20260101T000000Z.pmbackup".to_string()]
+        );
+        // keep_n >= count → nothing trashed.
+        assert!(select_for_deletion(&names, 3).is_empty());
+        assert!(select_for_deletion(&names, 9).is_empty());
+        // keep 1 → the two oldest go; the newest (Mar) is retained.
+        let doomed = select_for_deletion(&names, 1);
+        assert_eq!(doomed.len(), 2);
+        assert!(!doomed.contains(&"pm-backup-20260303T000000Z.pmbackup".to_string()));
+        // keep_n == 0 is clamped to 1 — never a total wipe.
+        assert_eq!(select_for_deletion(&names, 0).len(), 2);
+    }
+
+    #[test]
+    fn archive_prefix_is_per_vault_and_sanitized() {
+        assert_eq!(archive_prefix("abc-123"), "pm-backup-abc123-");
+        let name = archive_name("vaultA", "20260101T000000Z");
+        assert_eq!(name, "pm-backup-vaultA-20260101T000000Z.pmbackup");
+        assert!(name.starts_with(&archive_prefix("vaultA")));
+        assert!(!name.starts_with(&archive_prefix("vaultB")));
+        assert!(valid_archive_name(&name));
+    }
+
+    #[test]
     fn already_exists_matches_only_the_conflict_signature() {
         assert!(is_already_exists("Node with same name exists"));
         assert!(is_already_exists(
@@ -591,8 +779,8 @@ mod tests {
 
     #[test]
     fn archive_name_is_sortable_and_valid() {
-        let name = archive_name("20260702T161659Z");
-        assert_eq!(name, "pm-backup-20260702T161659Z.pmbackup");
+        let name = archive_name("v", "20260702T161659Z");
+        assert_eq!(name, "pm-backup-v-20260702T161659Z.pmbackup");
         assert!(valid_archive_name(&name));
     }
 
