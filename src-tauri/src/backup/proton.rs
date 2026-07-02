@@ -387,19 +387,101 @@ pub(crate) fn connection(cli: &Path) -> ProtonConnStatus {
     }
 }
 
-/// Sign in — runs `auth login`, which opens the browser and blocks until the flow completes
-/// (or the CLI gives up). The session is stored by the OS secret store, owned by the CLI. On
-/// failure we deliberately DISCARD the CLI's output and return a generic message: `auth login`
-/// prints the browser sign-in URL (which can carry a one-time token) to stdout, and we must not
-/// surface that in a UI-visible error string.
+/// Extract the first `https://…` token from a line of CLI output, stopping at the first
+/// whitespace or control byte (so a trailing ANSI reset or newline is excluded) and trimming
+/// trailing punctuation. `auth login` prints the sign-in URL in its output; PM opens it.
+fn first_https_url(line: &str) -> Option<String> {
+    let start = line.find("https://")?;
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c.is_control())
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['"', '\'', ')', ']', '>', '.', ',']);
+    (url.len() > "https://".len()).then(|| url.to_string())
+}
+
+/// Open the first sign-in URL seen across the CLI's streams, exactly once. `open::that` launches
+/// the user's default browser — the same approach the Google/Microsoft OAuth flows use.
+fn open_url_once(line: &str, opened: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    if opened.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(url) = first_https_url(line) {
+        if opened
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let _ = open::that(&url); // best-effort; the browser is the user's own
+        }
+    }
+}
+
+/// Drain a child stream line-by-line (lossy UTF-8, so odd bytes never stall it), opening the
+/// sign-in URL the instant it appears. Draining fully also stops a filled pipe from deadlocking
+/// the `wait()` in [`connect`].
+fn scan_for_url<R: std::io::Read>(reader: R, opened: &std::sync::atomic::AtomicBool) {
+    use std::io::{BufRead, BufReader};
+    let mut r = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => open_url_once(&String::from_utf8_lossy(&buf), opened),
+        }
+    }
+}
+
+/// Sign in — runs `auth login`. The CLI prints the browser sign-in URL to its output and then
+/// blocks on the loopback OAuth callback ("Sign in in your browser. Keep the terminal open."),
+/// but spawned head-less (no console / non-TTY) it won't launch a browser itself — so PM reads
+/// the URL off the stream and opens it, the same way the Google/Microsoft flows do. The session
+/// is stored by the OS secret store, owned by the CLI. On any failure we DISCARD the CLI's output
+/// and return a generic message: that output carries a one-time-token URL that must never land in
+/// a UI-visible error string.
 pub(crate) fn connect(cli: &Path) -> Result<()> {
-    run_proton(cli, &["auth", "login"])
-        .map(|_| ())
-        .map_err(|_| {
-            Error::Other(
-                "Proton Drive sign-in didn't complete — please try connecting again.".into(),
-            )
-        })
+    use std::process::Stdio;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let mut cmd = Command::new(cli);
+    cmd.args(["auth", "login"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    no_window(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::Other(format!("could not run the Proton Drive CLI: {e}")))?;
+
+    let opened = Arc::new(AtomicBool::new(false));
+
+    // The URL can surface on either stream; scan stderr on a side thread (also draining it so a
+    // full pipe can't deadlock the wait) and stdout here. Open-once is shared via the flag.
+    let stderr = child.stderr.take();
+    let opened_err = Arc::clone(&opened);
+    let stderr_thread = std::thread::spawn(move || {
+        if let Some(e) = stderr {
+            scan_for_url(e, &opened_err);
+        }
+    });
+    if let Some(out) = child.stdout.take() {
+        scan_for_url(out, &opened);
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| Error::Other(format!("could not run the Proton Drive CLI: {e}")))?;
+    let _ = stderr_thread.join();
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            "Proton Drive sign-in didn't complete — please try connecting again.".into(),
+        ))
+    }
 }
 
 /// Sign out — `auth logout`. Being already signed out is a successful end state, not an error
@@ -631,6 +713,20 @@ mod tests {
         assert!(!looks_not_logged_in(
             "Sign in in your browser. Keep the terminal open."
         ));
+    }
+
+    #[test]
+    fn extracts_sign_in_url() {
+        assert_eq!(
+            first_https_url("Sign in in your browser: https://account.proton.me/authorize?x=1"),
+            Some("https://account.proton.me/authorize?x=1".to_string())
+        );
+        // A trailing ANSI reset and surrounding text are excluded; only the first URL is taken.
+        assert_eq!(
+            first_https_url("\u{1b}[36mhttps://drive.proton.me/login\u{1b}[0m keep terminal open"),
+            Some("https://drive.proton.me/login".to_string())
+        );
+        assert_eq!(first_https_url("no url on this line"), None);
     }
 
     #[test]
