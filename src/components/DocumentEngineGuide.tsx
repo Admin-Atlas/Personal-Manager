@@ -11,9 +11,12 @@
 // inside PM is incomplete (a defect on our side, not the user's environment), so
 // the primary action becomes "report it" rather than "retry" or "fix your setup".
 
+import { useEffect, useState } from "react";
 import { Button, Card, Collapsible, Modal } from "./ui";
+import { IngestProgress } from "./IngestProgress";
 import { useDepth } from "../theme";
 import type { SidecarStatus } from "../lib/types";
+import { onPythonInstall } from "../lib/ipc";
 import { CHANGELOG } from "../lib/changelog";
 import { guideFor, IS_MAC, type SetupGuideMode } from "../lib/setupGuide";
 
@@ -69,6 +72,27 @@ function buildReportUrl(detail: string | null): string {
 
 export function DocumentEngineGuide({ open, onClose, status, busy, onRetry }: Props) {
   const { showPower } = useDepth();
+
+  // macOS only: when no Python is found, setup downloads one and streams byte
+  // progress over `python://install`. Show a percentage bar while that runs; it
+  // never fires on Windows/Linux (or on a Mac that already has Python), so the bar
+  // simply never appears there. Reset when a fresh setup starts.
+  const [downloadFrac, setDownloadFrac] = useState(0);
+  useEffect(() => {
+    if (busy) setDownloadFrac(0);
+  }, [busy]);
+  useEffect(() => {
+    let cancelled = false;
+    const un = onPythonInstall((e) => {
+      if (!cancelled) setDownloadFrac(e.fraction);
+    });
+    return () => {
+      cancelled = true;
+      void un.then((fn) => fn());
+    };
+  }, []);
+  const showDownload = busy && downloadFrac > 0 && downloadFrac < 1;
+
   const isError = status?.state === "error";
   const kind = status?.state === "error" ? status.kind : null;
   const isPackagingBug = kind === "packaging_bug";
@@ -110,6 +134,16 @@ export function DocumentEngineGuide({ open, onClose, status, busy, onRetry }: Pr
             ))}
           </ol>
         </Card>
+
+        {showDownload && (
+          <IngestProgress
+            mode="percent"
+            processed={Math.round(downloadFrac * 100)}
+            total={100}
+            label="Downloading Python"
+            className="mt-4"
+          />
+        )}
 
         {rawMessage && (
           <div className="mt-4">

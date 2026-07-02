@@ -47,6 +47,7 @@ import type {
   Preference,
   Milestone,
   ProjectOverview,
+  PythonInstallEvent,
   ProjectProposalEvent,
   ProjectSize,
   ReviewDecision,
@@ -751,6 +752,11 @@ export const onTsneInstall = (handler: (e: TsneInstallEvent) => void): Promise<U
 /** Subscribe to the optional OCR download's progress (fires from whichever view triggered it). */
 export const onOcrInstall = (handler: (e: OcrInstallEvent) => void): Promise<UnlistenFn> =>
   listen<OcrInstallEvent>("ocr://install", (e) => handler(e.payload));
+
+/** Subscribe to the macOS interpreter download's progress (fires during first-run setup when PM has
+ *  to download Python because none was found on the machine). */
+export const onPythonInstall = (handler: (e: PythonInstallEvent) => void): Promise<UnlistenFn> =>
+  listen<PythonInstallEvent>("python://install", (e) => handler(e.payload));
 
 /** Open an index-only document's source in the system browser (its Drive link). */
 export const openExternalRef = (docId: number) => invoke<void>("open_external_ref", { docId });
