@@ -4,19 +4,25 @@
 // Settings → Backup. This surface owns the whole encrypted-backup feature (deliberately NOT in
 // Connectors — a backup is a push-out snapshot, not an index-only source). The tab reads as a
 // guided flow: (1) choose the passphrase that locks every backup, optionally remembering it on the
-// device for unattended runs; (2) save a backup now — to this computer or to Proton Drive; restore
-// from a file or from Proton; and once Proton is connected, schedule automatic backups. A status
-// summary up top shows where things stand on every launch.
+// device for unattended runs; (2) save a backup now — to this computer, Proton Drive, or Google
+// Drive; restore from a file or either cloud; and (3) schedule automatic backups on one cadence
+// that fans out to every destination you turn on. A status summary up top shows where things stand
+// on every launch.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 
 import {
+  backupGdriveConnect,
+  backupGdriveDisconnect,
+  backupGdriveStatus,
   backupStatus,
+  backupToGdrive,
   backupToProton,
   createLocalBackup,
   forgetBackupPassphrase,
   getBackupSchedule,
+  listGdriveBackups,
   listProtonBackups,
   onBackupProgress,
   openUrl,
@@ -24,17 +30,20 @@ import {
   protonConnect,
   protonDisconnect,
   protonStatus,
+  restoreFromGdrive,
   restoreFromProton,
   restoreLocalBackup,
+  setBackupDestinations,
   setBackupPassphrase,
   setBackupSchedule,
   stopBackup,
   switchToVault,
 } from "../lib/ipc";
 import type {
+  BackupEntry,
   BackupPhase,
   BackupSchedule,
-  ProtonBackupEntry,
+  GdriveBackupStatus,
   ProtonCliStatus,
   ProtonConnStatus,
   RestoreSummary,
@@ -100,11 +109,22 @@ export function BackupSettings() {
   // session status once installed; `protonBackups` = archives already on Drive.
   const [proton, setProton] = useState<ProtonCliStatus | null>(null);
   const [conn, setConn] = useState<ProtonConnStatus | null>(null);
-  const [protonBackups, setProtonBackups] = useState<ProtonBackupEntry[] | null>(null);
+  const [protonBackups, setProtonBackups] = useState<BackupEntry[] | null>(null);
   const [protonBusy, setProtonBusy] = useState(false);
   const [protonRestoreName, setProtonRestoreName] = useState<string | null>(null);
   const [protonRestorePass, setProtonRestorePass] = useState("");
   const [protonListError, setProtonListError] = useState<string | null>(null);
+
+  // Google Drive destination (Drive v3 REST). `gdrive` = null while checking; once loaded,
+  // `has_write_scope` gates the whole panel (a drive.file re-consent is required — connector
+  // scopes are read-only). `gdriveBackups` = archives already on Drive.
+  const [gdrive, setGdrive] = useState<GdriveBackupStatus | null>(null);
+  const [gdriveBackups, setGdriveBackups] = useState<BackupEntry[] | null>(null);
+  const [gdriveBusy, setGdriveBusy] = useState(false);
+  const [gdriveRestoreName, setGdriveRestoreName] = useState<string | null>(null);
+  const [gdriveRestorePass, setGdriveRestorePass] = useState("");
+  const [gdriveListError, setGdriveListError] = useState<string | null>(null);
+  const [gdriveAccountChoice, setGdriveAccountChoice] = useState("");
 
   // Automatic-backup schedule + status. Loaded on mount (it only needs an unlocked vault, not
   // Proton), so the status summary and passphrase state are known before you connect. Drafts are
@@ -157,9 +177,30 @@ export function BackupSettings() {
     }
   }, []);
 
+  // Google Drive status is independent of Proton/schedule, so load it on its own.
+  const refreshGdrive = useCallback(async () => {
+    const s = await backupGdriveStatus().catch(() => null);
+    setGdrive(s);
+    if (s?.has_write_scope) {
+      try {
+        setGdriveBackups(await listGdriveBackups());
+        setGdriveListError(null);
+      } catch (e) {
+        setGdriveBackups(null);
+        setGdriveListError(String(e));
+      }
+    } else {
+      setGdriveBackups(null);
+      setGdriveListError(null);
+    }
+  }, []);
+
   useEffect(() => {
     void refreshProton();
   }, [refreshProton]);
+  useEffect(() => {
+    void refreshGdrive();
+  }, [refreshGdrive]);
   useEffect(() => {
     void refreshSchedule();
   }, [refreshSchedule]);
@@ -204,13 +245,19 @@ export function BackupSettings() {
   }, []);
 
   const backupValid = pass.length >= 8 && pass === confirm && !running;
-  // A single "any op in flight" gate so Proton connect/disconnect and backup/restore are mutually
+  // A single "any op in flight" gate so connect/disconnect and backup/restore are mutually
   // exclusive in the UI — e.g. Disconnect must be disabled during an upload it would kill.
-  const busy = running || protonBusy;
+  const busy = running || protonBusy || gdriveBusy;
   const st = strength(pass);
   const passphraseStored = schedule?.passphrase_stored ?? false;
   const protonConnected = !!(proton?.installed && conn?.connected);
+  const gdriveGranted = !!gdrive?.has_write_scope;
   const showStatus = !!schedule && (schedule.frequency !== "off" || !!schedule.last_backup_at);
+  // The destinations a scheduled run would push to, for the status summary line.
+  const enabledDestinations = [
+    schedule?.proton_enabled ? "Proton Drive" : null,
+    schedule?.gdrive_enabled ? "Google Drive" : null,
+  ].filter(Boolean) as string[];
 
   async function doRememberPass() {
     if (!backupValid) return;
@@ -379,6 +426,91 @@ export function BackupSettings() {
     }
   }
 
+  async function doGdriveConnect(email?: string) {
+    setError(null);
+    setMessage(null);
+    setGdriveBusy(true);
+    try {
+      await backupGdriveConnect(email); // opens the browser; resolves once consent completes
+      await refreshGdrive();
+      await refreshSchedule();
+      setMessage("Google Drive is set up for backup.");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setGdriveBusy(false);
+    }
+  }
+
+  async function doGdriveDisconnect() {
+    setError(null);
+    setGdriveBusy(true);
+    try {
+      await backupGdriveDisconnect();
+      await refreshGdrive();
+      await refreshSchedule();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setGdriveBusy(false);
+    }
+  }
+
+  async function doGdriveBackup() {
+    setError(null);
+    setMessage(null);
+    try {
+      setRunning(true);
+      await backupToGdrive(pass);
+      setMessage(
+        "Backup uploaded to Google Drive. Keep your passphrase safe — you need it to restore.",
+      );
+      await refreshGdrive();
+      await refreshSchedule(); // a manual backup stamps "last backup" too
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function doGdriveRestore() {
+    if (!gdriveRestoreName || gdriveRestorePass.length === 0) return;
+    setError(null);
+    setMessage(null);
+    setRestored(null);
+    try {
+      setRunning(true);
+      const summary = await restoreFromGdrive(gdriveRestoreName, gdriveRestorePass);
+      setRestored(summary);
+      setGdriveRestorePass("");
+      setGdriveRestoreName(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  // Toggle a destination on/off for scheduled runs (saved immediately). Enabling Google requires a
+  // granted account; the backend rejects otherwise, so the toggle is disabled until it's granted.
+  async function doToggleDestination(which: "proton" | "gdrive", next: boolean) {
+    if (!schedule) return;
+    setMessage(null);
+    setScheduleSaveError(null);
+    setSavingSchedule(true);
+    try {
+      const protonEnabled = which === "proton" ? next : schedule.proton_enabled;
+      const gdriveEnabled = which === "gdrive" ? next : schedule.gdrive_enabled;
+      await setBackupDestinations(protonEnabled, gdriveEnabled);
+      await refreshSchedule();
+    } catch (e) {
+      setScheduleSaveError(String(e));
+    } finally {
+      setSavingSchedule(false);
+    }
+  }
+
   async function doSaveSchedule() {
     setMessage(null);
     setScheduleSaveError(null);
@@ -418,7 +550,9 @@ export function BackupSettings() {
               <dd className="text-right">
                 {schedule.frequency === "off"
                   ? "Off"
-                  : `${FREQ_LABEL[schedule.frequency]} → Proton Drive`}
+                  : `${FREQ_LABEL[schedule.frequency]} → ${
+                      enabledDestinations.length ? enabledDestinations.join(", ") : "no destination"
+                    }`}
               </dd>
             </div>
             {schedule.frequency !== "off" && (
@@ -547,12 +681,13 @@ export function BackupSettings() {
               Save to this computer…
             </Button>
             {protonConnected && (
-              <Button
-                variant="secondary"
-                onClick={doProtonBackup}
-                disabled={!backupValid || protonBusy}
-              >
+              <Button variant="secondary" onClick={doProtonBackup} disabled={!backupValid || busy}>
                 Save to Proton Drive…
+              </Button>
+            )}
+            {gdriveGranted && (
+              <Button variant="secondary" onClick={doGdriveBackup} disabled={!backupValid || busy}>
+                Save to Google Drive…
               </Button>
             )}
           </div>
@@ -561,9 +696,9 @@ export function BackupSettings() {
               Enter a matching passphrase (8+ characters) above to enable these buttons.
             </p>
           )}
-          {backupValid && !protonConnected && (
+          {backupValid && !protonConnected && !gdriveGranted && (
             <p className="text-xs text-ink4">
-              Connect Proton Drive below to also save backups off-machine.
+              Connect Proton Drive or Google Drive below to also save backups off-machine.
             </p>
           )}
         </div>
@@ -749,90 +884,265 @@ export function BackupSettings() {
                 </div>
               </div>
             )}
+          </div>
+        )}
+      </div>
 
-            {/* --- Automatic backups (schedule + retention; passphrase remembered above) --- */}
-            <div className="border-t border-border pt-3">
-              <p className="font-mono text-xs uppercase tracking-wide text-ink3">
-                Automatic backups
-              </p>
-              <p className="mt-1 text-xs text-ink4">
-                PM backs up your current vault to Proton Drive on a schedule, using the passphrase
-                you remembered above.
-              </p>
-              {scheduleError ? (
+      {/* --- Google Drive (off-machine destination via the Drive API — already connected, so this
+          only grants the one extra write permission and reflects status; no install flow) --- */}
+      <div className="mt-6">
+        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+          Google Drive
+        </label>
+        <p className="mt-1 text-xs text-ink4">
+          Keep your encrypted backups on your own Google Drive. They&rsquo;re already encrypted
+          before they leave your computer; PM only ever touches its own &ldquo;Personal Manager
+          Backups&rdquo; folder (the <span className="font-mono">drive.file</span> permission),
+          never the rest of your Drive.
+        </p>
+
+        {gdrive === null ? (
+          <p className="mt-2 text-xs text-ink4">Checking your Google Drive connection&hellip;</p>
+        ) : !gdriveGranted ? (
+          <div className="mt-2 flex max-w-sm flex-col gap-2">
+            <p className="text-xs text-ink4">
+              Grant PM permission to save backups to your Google Drive — a one-time approval in your
+              browser. It only lets PM manage the backups it creates.
+            </p>
+            {gdrive.accounts.length > 0 && (
+              <label className="flex items-center justify-between gap-2 text-xs text-ink3">
+                <span>Account</span>
+                <select
+                  className="min-w-0 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
+                  value={gdriveAccountChoice || gdrive.accounts[0]?.email || ""}
+                  onChange={(e) => setGdriveAccountChoice(e.currentTarget.value)}
+                  disabled={busy}
+                >
+                  {gdrive.accounts.map((a) => (
+                    <option key={a.email} value={a.email}>
+                      {a.email}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <div>
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  void doGdriveConnect(
+                    gdrive.accounts.length > 0
+                      ? gdriveAccountChoice || gdrive.accounts[0]?.email
+                      : undefined,
+                  )
+                }
+                disabled={busy}
+              >
+                {gdriveBusy ? "Granting… finish in your browser" : "Grant backup access…"}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-2 flex max-w-sm flex-col gap-3">
+            <div className="flex items-center justify-between gap-2 rounded-[var(--radius-sm)] border border-border2 bg-surface p-3">
+              <div className="min-w-0">
+                <p className="text-sm text-st-quick">Connected</p>
+                {gdrive.account && (
+                  <p className="truncate text-xs text-ink4" title={gdrive.account}>
+                    {gdrive.account}
+                  </p>
+                )}
+              </div>
+              <Button variant="tertiary" onClick={doGdriveDisconnect} disabled={busy}>
+                Disconnect
+              </Button>
+            </div>
+            <p className="text-xs text-ink4">
+              Enter a passphrase under &ldquo;Backup passphrase&rdquo; above, then choose{" "}
+              <span className="font-medium">Save to Google Drive</span> — or set up automatic
+              backups below.
+            </p>
+
+            <div>
+              <p className="font-mono text-xs uppercase tracking-wide text-ink3">On Google Drive</p>
+              {gdriveListError ? (
                 <div className="mt-1 flex items-center gap-2">
-                  <span className="text-xs text-st-due">Couldn&rsquo;t load the schedule.</span>
-                  <Button variant="tertiary" onClick={() => void refreshSchedule()} disabled={busy}>
+                  <span className="text-xs text-st-due">Couldn&rsquo;t load your backups.</span>
+                  <Button variant="tertiary" onClick={() => void refreshGdrive()} disabled={busy}>
                     Retry
                   </Button>
                 </div>
-              ) : schedule === null ? (
+              ) : gdriveBackups === null ? (
                 <p className="mt-1 text-xs text-ink4">Loading&hellip;</p>
+              ) : gdriveBackups.length === 0 ? (
+                <p className="mt-1 text-xs text-ink4">No backups yet.</p>
               ) : (
-                <div className="mt-2 flex flex-col gap-2">
-                  <label className="flex items-center justify-between gap-2 text-xs text-ink3">
-                    <span>Frequency</span>
-                    <select
-                      className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
-                      value={freqDraft}
-                      onChange={(e) =>
-                        setFreqDraft(e.currentTarget.value as BackupSchedule["frequency"])
-                      }
-                      disabled={savingSchedule || busy}
-                    >
-                      <option value="off">Off</option>
-                      <option value="daily">Daily</option>
-                      <option value="weekly">Weekly</option>
-                      <option value="monthly">Monthly</option>
-                    </select>
-                  </label>
-
-                  {freqDraft !== "off" && (
-                    <label className="flex items-center justify-between gap-2 text-xs text-ink3">
-                      <span>Keep last</span>
-                      <input
-                        type="number"
-                        min={1}
-                        max={100}
-                        className="w-20 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
-                        value={retentionDraft}
-                        onChange={(e) => setRetentionDraft(e.currentTarget.value)}
-                        disabled={savingSchedule || busy}
-                      />
-                    </label>
-                  )}
-
-                  {freqDraft !== "off" && !passphraseStored && (
-                    <p className="text-xs text-st-due">
-                      Remember your backup passphrase above (under &ldquo;Backup passphrase&rdquo;)
-                      to turn on automatic backups.
-                    </p>
-                  )}
-
-                  <div>
-                    <Button
-                      variant="secondary"
-                      onClick={doSaveSchedule}
-                      disabled={
-                        savingSchedule || busy || (freqDraft !== "off" && !passphraseStored)
-                      }
-                    >
-                      {savingSchedule ? "Saving…" : "Save schedule"}
-                    </Button>
-                  </div>
-
-                  {scheduleSaveError && (
-                    <p className="break-words text-xs text-st-due">{scheduleSaveError}</p>
-                  )}
-
-                  {schedule.last_backup_at && (
-                    <p className="text-xs text-ink4">
-                      Last automatic backup: {formatDateTime(schedule.last_backup_at)}
-                    </p>
-                  )}
-                </div>
+                <ul className="mt-1 flex flex-col gap-1">
+                  {gdriveBackups.map((b) => (
+                    <li key={b.name} className="flex items-center justify-between gap-2 text-xs">
+                      <span className="min-w-0 truncate text-ink3" title={b.name}>
+                        {b.name}
+                      </span>
+                      <Button
+                        variant="tertiary"
+                        onClick={() => {
+                          setGdriveRestoreName(b.name);
+                          setGdriveRestorePass("");
+                          setRestored(null);
+                        }}
+                        disabled={busy}
+                      >
+                        Restore
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
               )}
             </div>
+
+            {gdriveRestoreName && (
+              <div className="flex flex-col gap-2 rounded-[var(--radius-sm)] border border-border2 bg-surface p-3">
+                <p className="text-xs text-ink4">
+                  Restore <span className="break-all font-medium">{gdriveRestoreName}</span> — enter
+                  its passphrase. It unpacks into a new folder; your current vault is untouched
+                  until you switch.
+                </p>
+                <Input
+                  type="password"
+                  autoComplete="off"
+                  placeholder="Backup passphrase"
+                  value={gdriveRestorePass}
+                  onChange={(e) => setGdriveRestorePass(e.currentTarget.value)}
+                />
+                <div className="flex gap-2">
+                  <Button
+                    variant="primary"
+                    onClick={doGdriveRestore}
+                    disabled={busy || gdriveRestorePass.length === 0}
+                  >
+                    Restore&hellip;
+                  </Button>
+                  <Button
+                    variant="tertiary"
+                    onClick={() => {
+                      setGdriveRestoreName(null);
+                      setGdriveRestorePass("");
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* --- Automatic backups — one schedule fans out to every destination you turn on --- */}
+      <div className="mt-6 border-t border-border pt-4">
+        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+          Automatic backups
+        </label>
+        <p className="mt-1 text-xs text-ink4">
+          PM backs up your current vault on a schedule, using the passphrase you remembered above,
+          to whichever destinations you turn on here.
+        </p>
+        {scheduleError ? (
+          <div className="mt-2 flex items-center gap-2">
+            <span className="text-xs text-st-due">Couldn&rsquo;t load the schedule.</span>
+            <Button variant="tertiary" onClick={() => void refreshSchedule()} disabled={busy}>
+              Retry
+            </Button>
+          </div>
+        ) : schedule === null ? (
+          <p className="mt-2 text-xs text-ink4">Loading&hellip;</p>
+        ) : (
+          <div className="mt-2 flex max-w-sm flex-col gap-3">
+            <div className="flex flex-col gap-2">
+              <label className="flex items-center gap-2 text-xs text-ink3">
+                <input
+                  type="checkbox"
+                  checked={schedule.proton_enabled}
+                  onChange={(e) => void doToggleDestination("proton", e.currentTarget.checked)}
+                  disabled={savingSchedule || busy}
+                />
+                <span>Back up to Proton Drive</span>
+                {!protonConnected && <span className="text-ink4">(connect above to use)</span>}
+              </label>
+              <label className="flex items-center gap-2 text-xs text-ink3">
+                <input
+                  type="checkbox"
+                  checked={schedule.gdrive_enabled}
+                  onChange={(e) => void doToggleDestination("gdrive", e.currentTarget.checked)}
+                  disabled={savingSchedule || busy || !gdriveGranted}
+                />
+                <span>Back up to Google Drive</span>
+                {!gdriveGranted && <span className="text-ink4">(grant access above to use)</span>}
+              </label>
+            </div>
+
+            <label className="flex items-center justify-between gap-2 text-xs text-ink3">
+              <span>Frequency</span>
+              <select
+                className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
+                value={freqDraft}
+                onChange={(e) => setFreqDraft(e.currentTarget.value as BackupSchedule["frequency"])}
+                disabled={savingSchedule || busy}
+              >
+                <option value="off">Off</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </label>
+
+            {freqDraft !== "off" && (
+              <label className="flex items-center justify-between gap-2 text-xs text-ink3">
+                <span>Keep last</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  className="w-20 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
+                  value={retentionDraft}
+                  onChange={(e) => setRetentionDraft(e.currentTarget.value)}
+                  disabled={savingSchedule || busy}
+                />
+              </label>
+            )}
+
+            {freqDraft !== "off" && !passphraseStored && (
+              <p className="text-xs text-st-due">
+                Remember your backup passphrase above (under &ldquo;Backup passphrase&rdquo;) to
+                turn on automatic backups.
+              </p>
+            )}
+
+            {freqDraft !== "off" && passphraseStored && enabledDestinations.length === 0 && (
+              <p className="text-xs text-st-due">
+                Turn on at least one destination above for scheduled backups to run.
+              </p>
+            )}
+
+            <div>
+              <Button
+                variant="secondary"
+                onClick={doSaveSchedule}
+                disabled={savingSchedule || busy || (freqDraft !== "off" && !passphraseStored)}
+              >
+                {savingSchedule ? "Saving…" : "Save schedule"}
+              </Button>
+            </div>
+
+            {scheduleSaveError && (
+              <p className="break-words text-xs text-st-due">{scheduleSaveError}</p>
+            )}
+
+            {schedule.last_backup_at && (
+              <p className="text-xs text-ink4">
+                Last automatic backup: {formatDateTime(schedule.last_backup_at)}
+              </p>
+            )}
           </div>
         )}
       </div>

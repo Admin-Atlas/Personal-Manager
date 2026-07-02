@@ -23,6 +23,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use super::naming::{self, BackupEntry, ARCHIVE_EXT};
 use crate::error::{Error, Result};
 
 /// Official download page for the Proton Drive CLI (per-OS pre-built binaries). The Backup
@@ -37,8 +38,6 @@ const REMOTE_ROOT: &str = "/my-files";
 const BACKUP_FOLDER_NAME: &str = "Personal Manager Backups";
 /// `"/my-files/Personal Manager Backups"` — the remote directory archives are pushed to.
 const REMOTE_BACKUP_DIR: &str = "/my-files/Personal Manager Backups";
-/// Archive extension, also the retention/listing filter (only PM's own files are touched).
-const ARCHIVE_EXT: &str = ".pmbackup";
 
 /// Message PM raises (and the UI shows) when the CLI reports no active session. Detected via
 /// [`looks_not_logged_in`] so `proton_status` can report "not connected" rather than erroring.
@@ -261,15 +260,7 @@ fn parse_nodes(stdout: &str) -> Result<Vec<RemoteNode>> {
         .map_err(|e| Error::Other(format!("could not parse Proton Drive listing: {e}")))
 }
 
-/// A backup archive found in the remote folder — surfaced to the UI's restore list.
-#[derive(Serialize)]
-pub struct ProtonBackupEntry {
-    pub name: String,
-    /// Cleartext size in bytes, when the CLI reported it.
-    pub size: Option<u64>,
-}
-
-fn node_to_entry(n: &RemoteNode) -> Option<ProtonBackupEntry> {
+fn node_to_entry(n: &RemoteNode) -> Option<BackupEntry> {
     if !n.is_file() {
         return None;
     }
@@ -277,7 +268,7 @@ fn node_to_entry(n: &RemoteNode) -> Option<ProtonBackupEntry> {
     if !name.ends_with(ARCHIVE_EXT) {
         return None;
     }
-    Some(ProtonBackupEntry {
+    Some(BackupEntry {
         name: name.to_string(),
         size: n.claimed_size(),
     })
@@ -285,8 +276,8 @@ fn node_to_entry(n: &RemoteNode) -> Option<ProtonBackupEntry> {
 
 /// Filter a `list --json` payload down to PM's archives, newest first. Names are
 /// `pm-backup-<UTC-stamp>.pmbackup`, so a reverse lexical sort is reverse-chronological.
-fn parse_backup_listing(stdout: &str) -> Result<Vec<ProtonBackupEntry>> {
-    let mut entries: Vec<ProtonBackupEntry> = parse_nodes(stdout)?
+fn parse_backup_listing(stdout: &str) -> Result<Vec<BackupEntry>> {
+    let mut entries: Vec<BackupEntry> = parse_nodes(stdout)?
         .iter()
         .filter_map(node_to_entry)
         .collect();
@@ -319,38 +310,6 @@ fn check_transfer(stdout: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-// --- Pure helpers (naming / validation) ---------------------------------------------
-
-/// This vault's stable archive-name prefix, so retention only ever considers archives THIS vault
-/// created — never another device/vault sharing the same Proton account + folder. The vault id is
-/// reduced to `[A-Za-z0-9]` so it is a safe path segment.
-pub(crate) fn archive_prefix(vault_id: &str) -> String {
-    let id: String = vault_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
-    format!("pm-backup-{id}-")
-}
-
-/// The archive file name for a backup of `vault_id` taken at `stamp` (a compact, filesystem- and
-/// URL-safe UTC stamp `YYYYMMDDTHHMMSSZ`). Carries the vault id so archives are attributable and
-/// retention is per-vault; the trailing stamp keeps same-vault names chronologically sortable.
-pub(crate) fn archive_name(vault_id: &str, stamp: &str) -> String {
-    format!("{}{stamp}{ARCHIVE_EXT}", archive_prefix(vault_id))
-}
-
-/// Whether `name` is a safe bare archive file name to interpolate into a remote/local path:
-/// non-empty, no path separators or traversal, and our own extension. Guards the name the UI
-/// hands back to `restore_from_proton` before it's spliced into a CLI path argument.
-fn valid_archive_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.ends_with(ARCHIVE_EXT)
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains("..")
-        && !name.contains('\0')
 }
 
 // --- Operations ----------------------------------------------------------------------
@@ -557,7 +516,7 @@ pub(crate) fn upload_archive(cli: &Path, local: &Path) -> Result<()> {
 
 /// Download one archive (by bare name) into `dest_dir`. The CLI writes it as `dest_dir/<name>`.
 pub(crate) fn download_archive(cli: &Path, name: &str, dest_dir: &Path) -> Result<()> {
-    if !valid_archive_name(name) {
+    if !naming::valid_archive_name(name) {
         return Err(Error::Other("invalid backup name".into()));
     }
     let remote = format!("{REMOTE_BACKUP_DIR}/{name}");
@@ -579,24 +538,13 @@ pub(crate) fn download_archive(cli: &Path, name: &str, dest_dir: &Path) -> Resul
 
 /// List PM's archives in the remote folder (folder ensured first, so a first-time user gets an
 /// empty list rather than an error), newest first.
-pub(crate) fn list_archives(cli: &Path) -> Result<Vec<ProtonBackupEntry>> {
+pub(crate) fn list_archives(cli: &Path) -> Result<Vec<BackupEntry>> {
     ensure_backup_folder(cli)?;
     let out = run_proton(cli, &["filesystem", "list", REMOTE_BACKUP_DIR, "--json"])?;
     parse_backup_listing(&out)
 }
 
 // --- Retention (keep last N, trash oldest) ------------------------------------------
-
-/// Which archive names to trash to keep only the newest `keep_n`. Pure + testable: names end in a
-/// `<UTC-stamp>.pmbackup` suffix, so a reverse lexical sort is reverse-chronological, and
-/// everything past the first `keep_n` is stale. `keep_n` is clamped to `>= 1` HERE too (not only
-/// in the caller) so this can never, on its own, select every archive for deletion.
-fn select_for_deletion(names: &[String], keep_n: usize) -> Vec<String> {
-    let keep_n = keep_n.max(1);
-    let mut sorted = names.to_vec();
-    sorted.sort_by(|a, b| b.cmp(a)); // newest (lexically greatest) first
-    sorted.into_iter().skip(keep_n).collect()
-}
 
 /// Move the given archives (by bare name) to Proton Trash — recoverable, never a hard delete.
 /// One `filesystem trash` call with every path. No-op on an empty list.
@@ -624,9 +572,9 @@ pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result
     let names: Vec<String> = list_archives(cli)?
         .into_iter()
         .map(|e| e.name)
-        .filter(|n| n.starts_with(prefix) && valid_archive_name(n))
+        .filter(|n| n.starts_with(prefix) && naming::valid_archive_name(n))
         .collect();
-    let doomed = select_for_deletion(&names, keep_n);
+    let doomed = naming::select_for_deletion(&names, keep_n);
     let count = doomed.len();
     trash_archives(cli, &doomed)?;
     Ok(count)
@@ -730,39 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn retention_keeps_newest_n_and_never_wipes_all() {
-        let names = vec![
-            "pm-backup-20260101T000000Z.pmbackup".to_string(),
-            "pm-backup-20260303T000000Z.pmbackup".to_string(),
-            "pm-backup-20260202T000000Z.pmbackup".to_string(),
-        ];
-        // Keep the 2 newest → only the oldest (Jan) is trashed.
-        assert_eq!(
-            select_for_deletion(&names, 2),
-            vec!["pm-backup-20260101T000000Z.pmbackup".to_string()]
-        );
-        // keep_n >= count → nothing trashed.
-        assert!(select_for_deletion(&names, 3).is_empty());
-        assert!(select_for_deletion(&names, 9).is_empty());
-        // keep 1 → the two oldest go; the newest (Mar) is retained.
-        let doomed = select_for_deletion(&names, 1);
-        assert_eq!(doomed.len(), 2);
-        assert!(!doomed.contains(&"pm-backup-20260303T000000Z.pmbackup".to_string()));
-        // keep_n == 0 is clamped to 1 — never a total wipe.
-        assert_eq!(select_for_deletion(&names, 0).len(), 2);
-    }
-
-    #[test]
-    fn archive_prefix_is_per_vault_and_sanitized() {
-        assert_eq!(archive_prefix("abc-123"), "pm-backup-abc123-");
-        let name = archive_name("vaultA", "20260101T000000Z");
-        assert_eq!(name, "pm-backup-vaultA-20260101T000000Z.pmbackup");
-        assert!(name.starts_with(&archive_prefix("vaultA")));
-        assert!(!name.starts_with(&archive_prefix("vaultB")));
-        assert!(valid_archive_name(&name));
-    }
-
-    #[test]
     fn already_exists_matches_only_the_conflict_signature() {
         assert!(is_already_exists("Node with same name exists"));
         assert!(is_already_exists(
@@ -775,24 +690,6 @@ mod tests {
         // Must NOT swallow an unrelated "does not exist" failure.
         assert!(!is_already_exists("parent /my-files does not exist"));
         assert!(!is_already_exists("network error"));
-    }
-
-    #[test]
-    fn archive_name_is_sortable_and_valid() {
-        let name = archive_name("v", "20260702T161659Z");
-        assert_eq!(name, "pm-backup-v-20260702T161659Z.pmbackup");
-        assert!(valid_archive_name(&name));
-    }
-
-    #[test]
-    fn valid_archive_name_rejects_paths_and_traversal() {
-        assert!(!valid_archive_name(""));
-        assert!(!valid_archive_name("notes.txt"));
-        assert!(!valid_archive_name("../secret.pmbackup"));
-        assert!(!valid_archive_name("a/b.pmbackup"));
-        assert!(!valid_archive_name("a\\b.pmbackup"));
-        assert!(!valid_archive_name("x\0.pmbackup"));
-        assert!(valid_archive_name("pm-backup-20260101T000000Z.pmbackup"));
     }
 
     #[test]

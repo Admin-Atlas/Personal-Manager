@@ -5,6 +5,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppLockStatus,
+  BackupEntry,
   BackupEvent,
   BackupSchedule,
   BackupState,
@@ -53,7 +54,7 @@ import type {
   PythonInstallEvent,
   ProjectProposalEvent,
   ProjectSize,
-  ProtonBackupEntry,
+  GdriveBackupStatus,
   ProtonCliStatus,
   ProtonConnStatus,
   ReviewDecision,
@@ -830,7 +831,7 @@ export const protonConnect = () => invoke<void>("proton_connect");
 export const protonDisconnect = () => invoke<void>("proton_disconnect");
 
 /** List PM's encrypted archives already on Proton Drive (newest first). */
-export const listProtonBackups = () => invoke<ProtonBackupEntry[]>("list_proton_backups");
+export const listProtonBackups = () => invoke<BackupEntry[]>("list_proton_backups");
 
 /** Pack an encrypted archive and push it to Proton Drive. Detached; progress on
  *  `backup://progress` ({@link onBackupProgress}). */
@@ -856,3 +857,35 @@ export const setBackupPassphrase = (passphrase: string) =>
 
 /** Forget the stored backup passphrase and turn automatic backups off. */
 export const forgetBackupPassphrase = () => invoke<void>("forget_backup_passphrase");
+
+/** Enable/disable each backup destination for scheduled runs. Enabling Google Drive requires a
+ *  granted account (or the command rejects), mirroring the passphrase guard on the schedule. */
+export const setBackupDestinations = (protonEnabled: boolean, gdriveEnabled: boolean) =>
+  invoke<void>("set_backup_destinations", { protonEnabled, gdriveEnabled });
+
+/** The Google Drive backup status: which account is set up, whether it has the drive.file write
+ *  grant, whether it's enabled, and the connected accounts (for the first-grant picker). */
+export const backupGdriveStatus = () => invoke<GdriveBackupStatus>("backup_gdrive_status");
+
+/** Grant Google Drive backup access — runs an OAuth re-consent for the drive.file WRITE scope
+ *  (connector scopes are read-only). Opens the browser; resolves with the updated status. Pass
+ *  `email` to require signing in as a specific already-connected account. */
+export const backupGdriveConnect = (email?: string) =>
+  invoke<GdriveBackupStatus>("backup_gdrive_connect", { email: email ?? null });
+
+/** Stop backing up to Google Drive (disable + forget the account; the token is kept if the account
+ *  is also a read connector). */
+export const backupGdriveDisconnect = () => invoke<void>("backup_gdrive_disconnect");
+
+/** List PM's encrypted archives already on Google Drive (newest first). */
+export const listGdriveBackups = () => invoke<BackupEntry[]>("list_gdrive_backups");
+
+/** Pack an encrypted archive and push it to Google Drive. Detached; progress on
+ *  `backup://progress` ({@link onBackupProgress}). */
+export const backupToGdrive = (passphrase: string) =>
+  invoke<void>("backup_to_gdrive", { passphrase });
+
+/** Download an archive from Google Drive (by name) and restore it into a fresh folder; resolves
+ *  with a summary. The live vault is untouched until you {@link switchToVault} to it. */
+export const restoreFromGdrive = (name: string, passphrase: string) =>
+  invoke<RestoreSummary>("restore_from_gdrive", { name, passphrase });

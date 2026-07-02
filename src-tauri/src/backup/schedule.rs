@@ -1,17 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Automatic (scheduled) encrypted backups to Proton Drive — the last layer of the backup
-//! feature. A background scheduler (modelled on [`crate::chat_summary::spawn_summary_scheduler`])
-//! runs a backup when one is *due* per the user's cadence, then trims old archives to the
-//! keep-last-N retention setting.
+//! Automatic (scheduled) encrypted backups — the last layer of the backup feature. A background
+//! scheduler (modelled on [`crate::chat_summary::spawn_summary_scheduler`]) runs a backup when one
+//! is *due* per the user's cadence, fanning the one archive out to every **enabled + ready**
+//! destination (Proton Drive and/or Google Drive), then trims each to the keep-last-N setting.
 //!
 //! Everything here is gated so it never surprises the user or fights foreground work:
 //! it runs only when the vault is **unlocked**, the user is **idle**, no **sync** is active, no
-//! backup/restore is already **busy**, a backup is **due**, the Proton CLI is **installed +
-//! connected**, and the user has **opted in** by storing a backup passphrase (unattended runs
-//! can't prompt — see [`crate::secrets::set_backup_passphrase`]). Any gate failing just skips
-//! this pass; the next tick tries again.
+//! backup/restore is already **busy**, a backup is **due**, the user has **opted in** by storing a
+//! backup passphrase (unattended runs can't prompt — see [`crate::secrets::set_backup_passphrase`]),
+//! and at least one destination is **enabled + ready** (Proton installed + connected, or a Google
+//! account with the `drive.file` grant). Any gate failing just skips this pass; the next tick tries
+//! again.
 //!
 //! The two schedule knobs live in the encrypted `settings` table (non-secret): the cadence and
 //! the retention count. `last_backup_at` is stamped after each success so `backup_due` is honest
@@ -23,16 +24,34 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tauri::{AppHandle, Manager};
 
+use crate::backup::destination::BackupDestination;
 use crate::{db, secrets, AppState};
 
 /// Cadence setting key (`off` | `daily` | `weekly` | `monthly`).
 pub const BACKUP_FREQUENCY_KEY: &str = "backup_frequency";
 /// Keep-last-N retention setting key (a positive integer, as text).
 pub const BACKUP_RETENTION_KEY: &str = "backup_retention_n";
-/// When the last successful (manual or scheduled) Proton backup completed (RFC3339).
+/// When the last successful (manual or scheduled) backup completed (RFC3339). Shared across
+/// destinations — it records "the last time at least one destination succeeded".
 pub const LAST_BACKUP_AT_KEY: &str = "last_backup_at";
 /// Default archives to keep if the user never set a number.
 pub const DEFAULT_RETENTION_N: u32 = 5;
+
+/// Per-destination enable flags for scheduled runs (`"true"`/`"false"`). Proton defaults ON (absent
+/// ⇒ true) so existing scheduled behavior is unchanged on upgrade; Google Drive is opt-in (absent ⇒
+/// false). `BACKUP_GDRIVE_ACCOUNT_KEY` holds the email of the Google account chosen for backup.
+pub const BACKUP_PROTON_ENABLED_KEY: &str = "backup_proton_enabled";
+pub const BACKUP_GDRIVE_ENABLED_KEY: &str = "backup_gdrive_enabled";
+pub const BACKUP_GDRIVE_ACCOUNT_KEY: &str = "backup_gdrive_account";
+
+/// Read a boolean setting: `"true"` → true, any other present value → false, absent (or a read
+/// error) → `default`.
+pub fn setting_bool(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
+    match db::get_setting(conn, key) {
+        Ok(Some(v)) => v == "true",
+        _ => default,
+    }
+}
 
 /// Launch catch-up: wait up to `LAUNCH_WAIT_TICKS × LAUNCH_WAIT_SECS` (~5 min) for the vault to
 /// unlock, then run one due-check.
@@ -105,7 +124,7 @@ fn unlocked(app: &AppHandle) -> bool {
 /// Whether all "run a backup now" gates are met: vault open, user idle past `threshold`, no sync
 /// running, and nothing already backing up/restoring. Shared by BOTH the launch catch-up and the
 /// idle loop, so an overdue backup never packs + uploads while a sync is active or the user is
-/// mid-task. (`backup_busy` is also re-checked by the `BusyGuard` inside `run_proton_backup`.)
+/// mid-task. (`backup_busy` is also re-checked by the `BusyGuard` inside `run_backup`.)
 fn ready_to_backup(app: &AppHandle, threshold: Duration) -> bool {
     let state = app.state::<AppState>();
     // Bind `open` first: `state.conn()` returns a guard borrowing the block-local `state`.
@@ -186,49 +205,67 @@ async fn maybe_run_scheduled_backup(app: &AppHandle) {
     let Some(passphrase) = secrets::get_backup_passphrase().ok().flatten() else {
         return; // not opted in — unattended backup can't prompt
     };
-    let Some(cli) = crate::backup::proton::locate_proton_cli() else {
-        return; // CLI uninstalled
+
+    // 3) Read the per-destination enable flags + the chosen Google account under the lock.
+    let (proton_enabled, gdrive_enabled, gdrive_account) = {
+        let state = app.state::<crate::AppState>();
+        let Ok(conn) = state.conn() else {
+            return;
+        };
+        (
+            setting_bool(&conn, BACKUP_PROTON_ENABLED_KEY, true),
+            setting_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, false),
+            db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty()),
+        )
     };
 
-    // 3) Confirm the session is live BEFORE the expensive pack, so an offline machine doesn't
-    //    pack a full archive just to fail at upload.
-    let cli_probe = cli.clone();
-    let connected = tokio::task::spawn_blocking(move || {
-        crate::backup::proton::connection(&cli_probe).connected
-    })
-    .await
-    .unwrap_or(false);
-    if !connected {
-        return;
+    // 4) Build the enabled + READY destination set. Ready = reachable without the expensive pack:
+    //    Proton must be installed + a live session; Google must have a chosen account whose token
+    //    carries the drive.file grant (a local keychain check — the upload fails cleanly and is
+    //    simply not stamped if the grant was revoked). Skipping the pack when nothing is ready
+    //    keeps an offline/unconfigured machine from packing a full archive just to fail.
+    let mut targets: Vec<BackupDestination> = Vec::new();
+    if proton_enabled {
+        if let Some(cli) = crate::backup::proton::locate_proton_cli() {
+            let cli_probe = cli.clone();
+            let connected = tokio::task::spawn_blocking(move || {
+                crate::backup::proton::connection(&cli_probe).connected
+            })
+            .await
+            .unwrap_or(false);
+            if connected {
+                targets.push(BackupDestination::Proton { cli });
+            }
+        }
+    }
+    if gdrive_enabled {
+        if let Some(email) = gdrive_account {
+            let token_key = crate::drive::account_token_key(&email);
+            if crate::google::token_has_scope(&token_key, crate::google::DRIVE_FILE_SCOPE)
+                .unwrap_or(false)
+            {
+                targets.push(BackupDestination::GoogleDrive { token_key });
+            }
+        }
+    }
+    if targets.is_empty() {
+        return; // nothing ready this pass — try again next tick
     }
 
-    // 4) Run the shared backup routine (snapshot + pack + upload + progress events). It stamps
-    //    `last_backup_at` itself on success and returns this vault's id (for scoped retention).
-    let vault_id =
-        match crate::commands::run_proton_backup(app, passphrase.expose().to_string(), cli.clone())
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!("scheduled backup skipped: {e}");
-                return;
-            }
-        };
-
-    // 5) Trim old archives to keep-last-N (best-effort) — scoped to THIS vault's prefix, so it
-    //    never touches another device/vault backing up to the same Proton folder.
-    let prefix = crate::backup::proton::archive_prefix(&vault_id);
-    let cli_ret = cli;
-    match tokio::task::spawn_blocking(move || {
-        crate::backup::proton::apply_retention(&cli_ret, retention_n as usize, &prefix)
-    })
+    // 5) Run the shared backup routine (snapshot + pack ONCE + fan out + per-destination retention +
+    //    progress events). It stamps `last_backup_at` itself when at least one destination succeeds.
+    if let Err(e) = crate::commands::run_backup(
+        app,
+        passphrase.expose().to_string(),
+        targets,
+        Some(retention_n),
+    )
     .await
     {
-        Ok(Ok(trashed)) if trashed > 0 => {
-            eprintln!("scheduled backup: trimmed {trashed} old archive(s) to Proton Trash");
-        }
-        Ok(Err(e)) => eprintln!("scheduled backup: retention failed: {e}"),
-        _ => {}
+        eprintln!("scheduled backup skipped: {e}");
     }
 }
 

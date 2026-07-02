@@ -26,6 +26,13 @@ pub const CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar.reado
 /// `drive.readonly` (not `drive.metadata.readonly`) because index-only ingestion needs each
 /// file's body to embed it.
 pub const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
+/// The ONLY Google **write** scope PM ever requests — least-privilege, granted just for
+/// encrypted backup. `drive.file` can create and manage only files/folders the app itself
+/// created (PM's "Personal Manager Backups" folder and its `.pmbackup` archives); it can never
+/// touch the user's other Drive content. Requested via a dedicated re-consent (the connector
+/// scopes are read-only), which UNIONS it with any existing `drive.readonly` grant on the account
+/// because `build_auth_url` sets `include_granted_scopes=true`.
+pub const DRIVE_FILE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 /// The keychain key for the Calendar service's token — passed into the per-service token
 /// helpers below (the connector-generic flow takes a key so Drive accounts get their own).
 pub const CALENDAR_TOKEN_KEY: &str = secrets::GOOGLE_TOKEN_CALENDAR;
@@ -346,6 +353,46 @@ fn load_token(token_key: &str) -> Result<Token> {
 pub fn save_token(token_key: &str, token: &Token) -> Result<()> {
     let json = serde_json::to_string(token).map_err(|e| Error::Other(e.to_string()))?;
     secrets::set_google_token_for(token_key, &json)
+}
+
+/// A currently-valid bearer access token for `token_key`, refreshing proactively if it's within
+/// 60s of expiry (and re-persisting the refreshed blob). Public so callers that build their OWN
+/// requests — the backup uploader's Drive POST/PUT/PATCH — can authorize them; the private
+/// [`authorized_send`] is GET-only. Callers should still handle a reactive 401 via [`refresh_now`].
+pub async fn valid_access_token(token_key: &str) -> Result<Secret> {
+    let (client_id, client_secret) = client_creds_for_key(token_key)?;
+    let mut token = load_token(token_key)?;
+    if token.expiry <= now_unix() + 60 {
+        token = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
+    }
+    Ok(token.access_token.clone())
+}
+
+/// Force a token refresh for `token_key` and return the new bearer — the backstop for a token
+/// revoked or expired early (a 401 on a request built with [`valid_access_token`]). Re-persists
+/// the refreshed blob, exactly like the GET path's reactive refresh.
+pub async fn refresh_now(token_key: &str) -> Result<Secret> {
+    let (client_id, client_secret) = client_creds_for_key(token_key)?;
+    let token = load_token(token_key)?;
+    let refreshed = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
+    Ok(refreshed.access_token.clone())
+}
+
+/// Whether the stored token for `token_key` already carries `scope` in its granted set. Lets the
+/// backup layer tell — from the keychain, no network — whether an account has the `drive.file`
+/// write grant yet (so the scheduler skips a Drive push whose grant was never given or was
+/// revoked). A missing token or missing `scope` field reads as "no".
+pub fn token_has_scope(token_key: &str, scope: &str) -> Result<bool> {
+    let Some(raw) = secrets::get_google_token_for(token_key)? else {
+        return Ok(false);
+    };
+    let token: Token = serde_json::from_str(raw.expose())
+        .map_err(|e| Error::Other(format!("stored Google token unreadable: {e}")))?;
+    Ok(token
+        .scope
+        .as_deref()
+        .map(|s| s.split(' ').any(|granted| granted == scope))
+        .unwrap_or(false))
 }
 
 // --- PKCE + auth URL ---

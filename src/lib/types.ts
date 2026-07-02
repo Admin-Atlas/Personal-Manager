@@ -632,21 +632,50 @@ export interface ProtonConnStatus {
   error: string | null;
 }
 
-/** One of PM's encrypted archives already on Proton Drive (for the restore picker). */
-export interface ProtonBackupEntry {
+/** One of PM's encrypted archives already at a backup destination (Proton or Google Drive), for
+ *  the restore picker. Both destinations use the same archive naming, so this shape is shared. */
+export interface BackupEntry {
   name: string;
   /** Cleartext size in bytes, when reported. */
   size: number | null;
 }
 
-/** Automatic-backup schedule: cadence + keep-last-N retention + the keychain opt-in state.
- *  A non-`off` cadence requires `passphrase_stored` (unattended runs can't prompt). */
+/** Automatic-backup schedule: one cadence + keep-last-N retention + the keychain opt-in state,
+ *  fanned out to every enabled destination. A non-`off` cadence requires `passphrase_stored`
+ *  (unattended runs can't prompt); Google backups additionally require a granted `gdrive_account`. */
 export interface BackupSchedule {
   frequency: "off" | "daily" | "weekly" | "monthly";
   retention_n: number;
   passphrase_stored: boolean;
   /** When the last automatic backup completed (RFC3339), or null. */
   last_backup_at: string | null;
+  /** Whether scheduled runs push to Proton Drive (defaults on). */
+  proton_enabled: boolean;
+  /** Whether scheduled runs push to Google Drive (opt-in). */
+  gdrive_enabled: boolean;
+  /** The Google account (email) chosen for backup, or null if none is set up. */
+  gdrive_account: string | null;
+}
+
+/** A connected Google Drive account (mirrors the Rust `DriveAccount`) — for the backup account
+ *  picker on first grant. */
+export interface DriveBackupAccount {
+  id: string;
+  email: string;
+  label: string;
+  last_synced_at: string | null;
+  state: string;
+  indexed: number;
+}
+
+/** The Google Drive backup destination's status: which account is set up, whether it has the
+ *  `drive.file` write grant yet (a re-consent is required — connector scopes are read-only),
+ *  whether it's enabled, and the connected accounts to choose from on first grant. */
+export interface GdriveBackupStatus {
+  account: string | null;
+  has_write_scope: boolean;
+  enabled: boolean;
+  accounts: DriveBackupAccount[];
 }
 
 // --- Personal Assistant: Microsoft OneDrive connector (board card 4B, spec §8.1) ---
