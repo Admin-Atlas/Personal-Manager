@@ -10,11 +10,14 @@ import { cn } from "./cn";
 
 export type ButtonVariant = "primary" | "secondary" | "tertiary";
 
+// Hover/active are gated to :enabled so a disabled button never reacts to the pointer — combined
+// with the base disabled:opacity-40 it reads as unmistakably inert, not merely dimmed.
 const VARIANT: Record<ButtonVariant, string> = {
   primary:
-    "bg-accent text-accent-ink font-semibold hover:brightness-105 active:brightness-95 disabled:bg-surface disabled:text-faint",
-  secondary: "bg-transparent text-ink2 border border-border2 hover:bg-surface disabled:text-faint",
-  tertiary: "bg-transparent text-ink4 hover:text-ink2 disabled:text-faint",
+    "bg-accent text-accent-ink font-semibold enabled:hover:brightness-105 enabled:active:brightness-95 disabled:bg-surface disabled:text-faint",
+  secondary:
+    "bg-transparent text-ink2 border border-border2 enabled:hover:bg-surface disabled:text-faint",
+  tertiary: "bg-transparent text-ink4 enabled:hover:text-ink2 disabled:text-faint",
 };
 
 export interface ButtonProps extends ComponentPropsWithRef<"button"> {
