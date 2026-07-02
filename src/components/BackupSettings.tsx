@@ -14,6 +14,8 @@ import {
   backupStatus,
   backupToProton,
   createLocalBackup,
+  forgetBackupPassphrase,
+  getBackupSchedule,
   listProtonBackups,
   onBackupProgress,
   openUrl,
@@ -23,11 +25,14 @@ import {
   protonStatus,
   restoreFromProton,
   restoreLocalBackup,
+  setBackupPassphrase,
+  setBackupSchedule,
   stopBackup,
   switchToVault,
 } from "../lib/ipc";
 import type {
   BackupPhase,
+  BackupSchedule,
   ProtonBackupEntry,
   ProtonCliStatus,
   ProtonConnStatus,
@@ -92,6 +97,17 @@ export function BackupSettings() {
   const [protonRestorePass, setProtonRestorePass] = useState("");
   const [protonListError, setProtonListError] = useState<string | null>(null);
 
+  // Automatic-backup schedule (loaded once connected). Drafts are the editable form values;
+  // `retentionDraft` is a string so the number field can be cleared/retyped freely.
+  const [schedule, setSchedule] = useState<BackupSchedule | null>(null);
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
+  const [scheduleSaveError, setScheduleSaveError] = useState<string | null>(null);
+  const [freqDraft, setFreqDraft] = useState<BackupSchedule["frequency"]>("off");
+  const [retentionDraft, setRetentionDraft] = useState("5");
+  const [autoPass, setAutoPass] = useState("");
+  const [autoPassConfirm, setAutoPassConfirm] = useState("");
+  const [savingSchedule, setSavingSchedule] = useState(false);
+
   const refreshProton = useCallback(async () => {
     const s = await protonCliStatus().catch(() => null);
     setProton(s);
@@ -112,9 +128,22 @@ export function BackupSettings() {
         setProtonBackups(null);
         setProtonListError(String(e));
       }
+      try {
+        const sch = await getBackupSchedule();
+        setSchedule(sch);
+        setScheduleError(null);
+        setFreqDraft(sch.frequency);
+        setRetentionDraft(String(sch.retention_n));
+      } catch (e) {
+        // A keychain/DB hiccup must not leave the panel stuck on "Loading…" forever.
+        setSchedule(null);
+        setScheduleError(String(e));
+      }
     } else {
       setProtonBackups(null);
       setProtonListError(null);
+      setSchedule(null);
+      setScheduleError(null);
     }
   }, []);
   useEffect(() => {
@@ -294,6 +323,51 @@ export function BackupSettings() {
       setError(String(e));
     } finally {
       setRunning(false);
+    }
+  }
+
+  async function doSaveSchedule() {
+    setMessage(null);
+    setScheduleSaveError(null);
+    setSavingSchedule(true);
+    try {
+      // Turning automation on needs a stored passphrase (unattended runs can't prompt).
+      const needsPass = freqDraft !== "off" && !schedule?.passphrase_stored;
+      if (needsPass) {
+        if (autoPass.length < 8 || autoPass !== autoPassConfirm) {
+          throw new Error(
+            "Enter a matching passphrase (8+ characters) to enable automatic backups.",
+          );
+        }
+        await setBackupPassphrase(autoPass);
+      }
+      // Round + clamp the free-typed retention so the backend's u32 never sees a non-integer.
+      const retentionN = Math.max(1, Math.min(100, Math.round(Number(retentionDraft) || 5)));
+      await setBackupSchedule(freqDraft, retentionN);
+      setAutoPass("");
+      setAutoPassConfirm("");
+      setMessage(
+        freqDraft === "off" ? "Automatic backups turned off." : "Automatic backup schedule saved.",
+      );
+      await refreshProton();
+    } catch (e) {
+      setScheduleSaveError(String(e));
+    } finally {
+      setSavingSchedule(false);
+    }
+  }
+
+  async function doForgetAutoPass() {
+    setMessage(null);
+    setScheduleSaveError(null);
+    setSavingSchedule(true);
+    try {
+      await forgetBackupPassphrase();
+      await refreshProton();
+    } catch (e) {
+      setScheduleSaveError(String(e));
+    } finally {
+      setSavingSchedule(false);
     }
   }
 
@@ -566,6 +640,113 @@ export function BackupSettings() {
                 </div>
               </div>
             )}
+
+            {/* --- Automatic backups (schedule + retention + unattended passphrase) --- */}
+            <div className="border-t border-border pt-3">
+              <p className="font-mono text-xs uppercase tracking-wide text-ink3">
+                Automatic backups
+              </p>
+              {scheduleError ? (
+                <div className="mt-1 flex items-center gap-2">
+                  <span className="text-xs text-st-due">Couldn&rsquo;t load the schedule.</span>
+                  <Button variant="tertiary" onClick={() => void refreshProton()} disabled={busy}>
+                    Retry
+                  </Button>
+                </div>
+              ) : schedule === null ? (
+                <p className="mt-1 text-xs text-ink4">Loading&hellip;</p>
+              ) : (
+                <div className="mt-2 flex flex-col gap-2">
+                  <label className="flex items-center justify-between gap-2 text-xs text-ink3">
+                    <span>Frequency</span>
+                    <select
+                      className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
+                      value={freqDraft}
+                      onChange={(e) =>
+                        setFreqDraft(e.currentTarget.value as BackupSchedule["frequency"])
+                      }
+                      disabled={savingSchedule || busy}
+                    >
+                      <option value="off">Off</option>
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                      <option value="monthly">Monthly</option>
+                    </select>
+                  </label>
+
+                  {freqDraft !== "off" && (
+                    <label className="flex items-center justify-between gap-2 text-xs text-ink3">
+                      <span>Keep last</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        className="w-20 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
+                        value={retentionDraft}
+                        onChange={(e) => setRetentionDraft(e.currentTarget.value)}
+                        disabled={savingSchedule || busy}
+                      />
+                    </label>
+                  )}
+
+                  {freqDraft !== "off" && !schedule.passphrase_stored && (
+                    <div className="flex flex-col gap-2">
+                      <p className="text-xs text-ink4">
+                        Automatic backups run unattended, so PM stores your backup passphrase in
+                        your OS keychain. Use the same one you&rsquo;d use to restore.
+                      </p>
+                      <Input
+                        type="password"
+                        autoComplete="new-password"
+                        placeholder="Backup passphrase"
+                        value={autoPass}
+                        onChange={(e) => setAutoPass(e.currentTarget.value)}
+                      />
+                      <Input
+                        type="password"
+                        autoComplete="new-password"
+                        placeholder="Confirm passphrase"
+                        value={autoPassConfirm}
+                        onChange={(e) => setAutoPassConfirm(e.currentTarget.value)}
+                      />
+                    </div>
+                  )}
+
+                  {schedule.passphrase_stored && (
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="text-st-quick">Passphrase saved in your keychain</span>
+                      <Button
+                        variant="tertiary"
+                        onClick={doForgetAutoPass}
+                        disabled={savingSchedule || busy}
+                      >
+                        Forget
+                      </Button>
+                    </div>
+                  )}
+
+                  <div>
+                    <Button
+                      variant="secondary"
+                      onClick={doSaveSchedule}
+                      disabled={savingSchedule || busy}
+                    >
+                      {savingSchedule ? "Saving…" : "Save schedule"}
+                    </Button>
+                  </div>
+
+                  {scheduleSaveError && (
+                    <p className="break-words text-xs text-st-due">{scheduleSaveError}</p>
+                  )}
+
+                  {schedule.last_backup_at && (
+                    <p className="text-xs text-ink4">
+                      Last automatic backup: {formatDateTime(schedule.last_backup_at)}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

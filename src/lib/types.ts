@@ -636,6 +636,16 @@ export interface ProtonBackupEntry {
   size: number | null;
 }
 
+/** Automatic-backup schedule: cadence + keep-last-N retention + the keychain opt-in state.
+ *  A non-`off` cadence requires `passphrase_stored` (unattended runs can't prompt). */
+export interface BackupSchedule {
+  frequency: "off" | "daily" | "weekly" | "monthly";
+  retention_n: number;
+  passphrase_stored: boolean;
+  /** When the last automatic backup completed (RFC3339), or null. */
+  last_backup_at: string | null;
+}
+
 // --- Personal Assistant: Microsoft OneDrive connector (board card 4B, spec §8.1) ---
 // A near-mirror of the Google Drive types above. One personal drive per account (no shared drives),
 // indexed whole (delta cursor) or folder-scoped.

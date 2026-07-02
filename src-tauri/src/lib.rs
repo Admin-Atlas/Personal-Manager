@@ -623,6 +623,12 @@ pub fn run() {
             // the catch-up net for sessions whose nudge never ran (no key at the time, app closed first).
             chat_summary::spawn_summary_scheduler(handle.clone());
 
+            // Automatic encrypted backups to Proton Drive (backup epic PR3): a launch catch-up +
+            // idle backstop that backs up when due per the user's cadence and trims old archives.
+            // Gated on unlocked + idle + Proton connected + an opted-in stored passphrase; a no-op
+            // for everyone who hasn't turned it on.
+            backup::schedule::spawn_backup_scheduler(handle.clone());
+
             // Give each conversation a real 5-7 word title (board card 7E) once it has a few turns: a launch
             // pass titles any session that crossed the threshold while the app was closed (the eager
             // per-conversation nudge fires from `send_message`). Background, best-effort, single model call.
@@ -792,6 +798,10 @@ pub fn run() {
             commands::list_proton_backups,
             commands::backup_to_proton,
             commands::restore_from_proton,
+            commands::get_backup_schedule,
+            commands::set_backup_schedule,
+            commands::set_backup_passphrase,
+            commands::forget_backup_passphrase,
             // Developer mode (issue #78) — read-only inspection. Always registered (the
             // commands are harmless reads); only the UI is gated by the runtime `devMode`.
             commands_dev::dev_system_info,

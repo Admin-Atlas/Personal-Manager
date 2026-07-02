@@ -22,6 +22,12 @@ const OPENROUTER_KEY: &str = "openrouter_api_key";
 /// OpenRouter spend is interactive chat vs background processing (Step 4).
 const OPENROUTER_BACKGROUND_KEY: &str = "openrouter_background_key";
 const DB_KEY: &str = "db_encryption_key";
+/// The backup passphrase, stored ONLY when the user opts in to automatic (scheduled) backups —
+/// unattended runs can't prompt for it. Same keychain trust as [`DB_KEY`]: it is the sole secret
+/// protecting the `.pmbackup` archives, so opting in makes the backups' confidentiality depend on
+/// the OS keychain. Each archive still derives a fresh Argon2id salt, so reuse is safe. Manual
+/// backups never touch this — they always prompt.
+const BACKUP_PASSPHRASE: &str = "backup_passphrase";
 /// Google OAuth (Step 6): the user's BYO "Desktop app" client (id + secret) and the
 /// resulting token blob. No Google secret ships in the repo (rule #1) — the user
 /// supplies their own client; everything lives only in the keychain.
@@ -69,6 +75,21 @@ fn delete(name: &str) -> Result<()> {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(Error::from(e)),
     }
+}
+
+/// The stored backup passphrase for unattended (scheduled) backups, if the user opted in.
+pub fn get_backup_passphrase() -> Result<Option<Secret>> {
+    Ok(get(BACKUP_PASSPHRASE)?.map(Secret::from))
+}
+
+/// Store the backup passphrase for unattended backups (explicit opt-in only).
+pub fn set_backup_passphrase(value: &str) -> Result<()> {
+    set(BACKUP_PASSPHRASE, value)
+}
+
+/// Forget the stored backup passphrase; absent is success (so "turn off" is idempotent).
+pub fn delete_backup_passphrase() -> Result<()> {
+    delete(BACKUP_PASSPHRASE)
 }
 
 pub fn get_openrouter_key() -> Result<Option<Secret>> {

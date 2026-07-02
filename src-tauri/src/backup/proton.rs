@@ -323,10 +323,22 @@ fn check_transfer(stdout: &str) -> Result<()> {
 
 // --- Pure helpers (naming / validation) ---------------------------------------------
 
-/// The archive file name for a backup taken at `stamp` — a compact, filesystem- and
-/// URL-safe UTC stamp (`YYYYMMDDTHHMMSSZ`) so names sort chronologically for retention.
-pub(crate) fn archive_name(stamp: &str) -> String {
-    format!("pm-backup-{stamp}{ARCHIVE_EXT}")
+/// This vault's stable archive-name prefix, so retention only ever considers archives THIS vault
+/// created — never another device/vault sharing the same Proton account + folder. The vault id is
+/// reduced to `[A-Za-z0-9]` so it is a safe path segment.
+pub(crate) fn archive_prefix(vault_id: &str) -> String {
+    let id: String = vault_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("pm-backup-{id}-")
+}
+
+/// The archive file name for a backup of `vault_id` taken at `stamp` (a compact, filesystem- and
+/// URL-safe UTC stamp `YYYYMMDDTHHMMSSZ`). Carries the vault id so archives are attributable and
+/// retention is per-vault; the trailing stamp keeps same-vault names chronologically sortable.
+pub(crate) fn archive_name(vault_id: &str, stamp: &str) -> String {
+    format!("{}{stamp}{ARCHIVE_EXT}", archive_prefix(vault_id))
 }
 
 /// Whether `name` is a safe bare archive file name to interpolate into a remote/local path:
@@ -491,6 +503,53 @@ pub(crate) fn list_archives(cli: &Path) -> Result<Vec<ProtonBackupEntry>> {
     parse_backup_listing(&out)
 }
 
+// --- Retention (keep last N, trash oldest) ------------------------------------------
+
+/// Which archive names to trash to keep only the newest `keep_n`. Pure + testable: names end in a
+/// `<UTC-stamp>.pmbackup` suffix, so a reverse lexical sort is reverse-chronological, and
+/// everything past the first `keep_n` is stale. `keep_n` is clamped to `>= 1` HERE too (not only
+/// in the caller) so this can never, on its own, select every archive for deletion.
+fn select_for_deletion(names: &[String], keep_n: usize) -> Vec<String> {
+    let keep_n = keep_n.max(1);
+    let mut sorted = names.to_vec();
+    sorted.sort_by(|a, b| b.cmp(a)); // newest (lexically greatest) first
+    sorted.into_iter().skip(keep_n).collect()
+}
+
+/// Move the given archives (by bare name) to Proton Trash — recoverable, never a hard delete.
+/// One `filesystem trash` call with every path. No-op on an empty list.
+fn trash_archives(cli: &Path, names: &[String]) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<String> = names
+        .iter()
+        .map(|n| format!("{REMOTE_BACKUP_DIR}/{n}"))
+        .collect();
+    let mut args = vec!["filesystem", "trash"];
+    args.extend(paths.iter().map(String::as_str));
+    args.push("--json");
+    run_proton(cli, &args).map(|_| ())
+}
+
+/// Keep-last-N retention **for one vault**: list PM's archives, keep the newest `keep_n` whose
+/// name carries `prefix` (this vault's — see [`archive_prefix`]), and trash the rest to Proton
+/// Trash (recoverable). Scoping by `prefix` means it NEVER touches another vault's/device's
+/// archives sharing the folder, and NEVER a non-PM file; the extra `valid_archive_name` filter is
+/// belt-and-braces so a hostile listing entry can't splice a path into the trash call. Returns how
+/// many were trashed. Used after a successful scheduled backup.
+pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result<usize> {
+    let names: Vec<String> = list_archives(cli)?
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n.starts_with(prefix) && valid_archive_name(n))
+        .collect();
+    let doomed = select_for_deletion(&names, keep_n);
+    let count = doomed.len();
+    trash_archives(cli, &doomed)?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +634,39 @@ mod tests {
     }
 
     #[test]
+    fn retention_keeps_newest_n_and_never_wipes_all() {
+        let names = vec![
+            "pm-backup-20260101T000000Z.pmbackup".to_string(),
+            "pm-backup-20260303T000000Z.pmbackup".to_string(),
+            "pm-backup-20260202T000000Z.pmbackup".to_string(),
+        ];
+        // Keep the 2 newest → only the oldest (Jan) is trashed.
+        assert_eq!(
+            select_for_deletion(&names, 2),
+            vec!["pm-backup-20260101T000000Z.pmbackup".to_string()]
+        );
+        // keep_n >= count → nothing trashed.
+        assert!(select_for_deletion(&names, 3).is_empty());
+        assert!(select_for_deletion(&names, 9).is_empty());
+        // keep 1 → the two oldest go; the newest (Mar) is retained.
+        let doomed = select_for_deletion(&names, 1);
+        assert_eq!(doomed.len(), 2);
+        assert!(!doomed.contains(&"pm-backup-20260303T000000Z.pmbackup".to_string()));
+        // keep_n == 0 is clamped to 1 — never a total wipe.
+        assert_eq!(select_for_deletion(&names, 0).len(), 2);
+    }
+
+    #[test]
+    fn archive_prefix_is_per_vault_and_sanitized() {
+        assert_eq!(archive_prefix("abc-123"), "pm-backup-abc123-");
+        let name = archive_name("vaultA", "20260101T000000Z");
+        assert_eq!(name, "pm-backup-vaultA-20260101T000000Z.pmbackup");
+        assert!(name.starts_with(&archive_prefix("vaultA")));
+        assert!(!name.starts_with(&archive_prefix("vaultB")));
+        assert!(valid_archive_name(&name));
+    }
+
+    #[test]
     fn already_exists_matches_only_the_conflict_signature() {
         assert!(is_already_exists("Node with same name exists"));
         assert!(is_already_exists(
@@ -591,8 +683,8 @@ mod tests {
 
     #[test]
     fn archive_name_is_sortable_and_valid() {
-        let name = archive_name("20260702T161659Z");
-        assert_eq!(name, "pm-backup-20260702T161659Z.pmbackup");
+        let name = archive_name("v", "20260702T161659Z");
+        assert_eq!(name, "pm-backup-v-20260702T161659Z.pmbackup");
         assert!(valid_archive_name(&name));
     }
 
