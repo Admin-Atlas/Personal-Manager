@@ -358,6 +358,11 @@ impl DriveItem {
             source_modified_at: self.modified_time.clone(),
             source_content_hash: self.content_hash(),
             body,
+            // OneDrive parent-folder parity is a deferred follow-up: Graph exposes the parent via
+            // `parentReference` (id + path), a different shape from Drive's `parents[]`, so it stays
+            // out of this PR. Files sync exactly as before, untagged.
+            source_parent_folder_id: None,
+            source_parent_folder_name: None,
         }
     }
 }

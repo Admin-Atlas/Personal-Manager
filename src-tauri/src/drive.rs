@@ -41,8 +41,10 @@ const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
 /// Runaway guard on pagination (≈200k files) — a backstop against a never-clearing page token, not a
 /// coverage cap; if it ever trips we log it (we do not silently drop the rest).
 const MAX_PAGES: usize = 1000;
-/// The field projection for a Drive file — kept tight (only what the connector needs).
-const FILE_FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum,trashed,webViewLink";
+/// The field projection for a Drive file — kept tight (only what the connector needs). `parents` is
+/// requested explicitly (Drive API v3 returns nothing not named here) so a synced file can be tagged
+/// with the folder it was found in; a file usually has one parent, and we keep only the first.
+const FILE_FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum,trashed,webViewLink,parents";
 /// Drive's folder MIME type (folders are containers we walk, never files we index).
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
@@ -625,6 +627,10 @@ pub struct DriveFile {
     pub md5: Option<String>,
     pub trashed: bool,
     pub web_view_link: Option<String>,
+    /// The id of the folder this file was found in (Drive's first `parents` entry) — resolved to a
+    /// human-readable name at sync time and snapshotted onto the document as sorting-review context.
+    /// `None` when Drive reports no parent (e.g. a shared-drive root item) or the field was absent.
+    pub parent_id: Option<String>,
 }
 
 impl DriveFile {
@@ -635,8 +641,16 @@ impl DriveFile {
         self.md5.clone().or_else(|| self.modified_time.clone())
     }
 
-    /// A `PointerInput` for the foundation, given the freshly-fetched body.
-    pub fn pointer(&self, source_id: String, body: String) -> index_only::PointerInput {
+    /// A `PointerInput` for the foundation, given the freshly-fetched body and this file's
+    /// already-resolved parent-folder name (the caller resolves `parent_id` → name once per sync run;
+    /// see [`fetch_folder_name`]). The folder id/name ride on the pointer purely as review context and
+    /// never touch the chunker/embedder.
+    pub fn pointer(
+        &self,
+        source_id: String,
+        body: String,
+        folder_name: Option<String>,
+    ) -> index_only::PointerInput {
         index_only::PointerInput {
             source_id,
             title: self.name.clone(),
@@ -644,6 +658,8 @@ impl DriveFile {
             source_modified_at: self.modified_time.clone(),
             source_content_hash: self.content_hash(),
             body,
+            source_parent_folder_id: self.parent_id.clone(),
+            source_parent_folder_name: folder_name,
         }
     }
 }
@@ -749,6 +765,13 @@ fn parse_file(v: &Value) -> Option<DriveFile> {
         trashed: v.get("trashed").and_then(Value::as_bool).unwrap_or(false),
         web_view_link: v
             .get("webViewLink")
+            .and_then(Value::as_str)
+            .map(String::from),
+        // A file can technically have several parents; the first is the folder we tag it with.
+        parent_id: v
+            .get("parents")
+            .and_then(Value::as_array)
+            .and_then(|ps| ps.first())
             .and_then(Value::as_str)
             .map(String::from),
     })
@@ -1220,6 +1243,19 @@ pub async fn fetch_file(token_key: &str, file_id: &str) -> Result<DriveFile> {
     parse_file(&v).ok_or_else(|| Error::Other("Drive returned no file for that id.".into()))
 }
 
+/// Resolve a folder id to its display name — the label a synced file is tagged with. A folder is just
+/// a file in Drive, so this projects only `name`. Best-effort: `None` if the folder can't be reached
+/// (deleted, out of scope, or the id was never resolvable), since folder context is a soft review hint
+/// and must never fail a sync. `supportsAllDrives` so a shared-drive folder resolves too. Callers
+/// cache by id per sync run so each unique folder is fetched at most once.
+pub async fn fetch_folder_name(token_key: &str, folder_id: &str) -> Option<String> {
+    let url = format!("{DRIVE_API}/files/{folder_id}?fields=name&supportsAllDrives=true");
+    google::authorized_get(token_key, &url)
+        .await
+        .ok()
+        .and_then(|v| v.get("name").and_then(Value::as_str).map(String::from))
+}
+
 /// True if a Drive API error is the "page token expired" 410 — the signal to discard the cursor and
 /// re-baseline with a full `files.list`.
 pub fn is_cursor_expired(err: &Error) -> bool {
@@ -1366,6 +1402,7 @@ mod tests {
             md5: md5.map(String::from),
             trashed: false,
             web_view_link: Some(format!("https://drive/{id}")),
+            parent_id: None,
         }
     }
 
@@ -1592,7 +1629,7 @@ mod tests {
         let files = serde_json::json!({
             "nextPageToken": "PAGE2",
             "files": [
-                {"id": "f1", "name": "A.pdf", "mimeType": "application/pdf", "md5Checksum": "h1", "modifiedTime": "2026-06-26T00:00:00Z", "webViewLink": "https://drive/f1"},
+                {"id": "f1", "name": "A.pdf", "mimeType": "application/pdf", "md5Checksum": "h1", "modifiedTime": "2026-06-26T00:00:00Z", "webViewLink": "https://drive/f1", "parents": ["FOLDER1"]},
                 {"id": "f2", "name": "Notes", "mimeType": "application/vnd.google-apps.document", "modifiedTime": "2026-06-26T01:00:00Z"}
             ]
         });
@@ -1601,6 +1638,9 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].md5.as_deref(), Some("h1"));
         assert!(parsed[1].md5.is_none());
+        // The folder a file sits in is read from Drive's first `parents` entry; absent → None.
+        assert_eq!(parsed[0].parent_id.as_deref(), Some("FOLDER1"));
+        assert!(parsed[1].parent_id.is_none());
 
         let changes = serde_json::json!({
             "newStartPageToken": "TOK9",

@@ -1557,6 +1557,9 @@ pub async fn dev_apply_change_event(
                         source_modified_at: Some(now.clone()),
                         source_content_hash: Some(new_hash),
                         body,
+                        // Dev affordance (pasted body) — no source folder to tag with.
+                        source_parent_folder_id: None,
+                        source_parent_folder_name: None,
                     }),
                 )
             }
@@ -1578,6 +1581,9 @@ pub async fn dev_apply_change_event(
                         source_modified_at: Some(now.clone()),
                         source_content_hash: Some(new_hash),
                         body,
+                        // Dev affordance (pasted body) — no source folder to tag with.
+                        source_parent_folder_id: None,
+                        source_parent_folder_name: None,
                     }),
                 )
             }
@@ -1747,6 +1753,25 @@ pub fn review_queue(state: State<'_, AppState>) -> Result<Vec<Document>> {
     ingest::review_queue(&conn)
 }
 
+/// Append a document's Drive parent-folder as one plain-text line to the global filing profile — the
+/// preamble seam `review::propose` already reads (§4.5), so folder context arrives with no new
+/// parameter and no numeric prior. Returns the (owned) per-document profile: the folder line appended
+/// under any existing profile, the line alone when there is no profile, or the profile unchanged when
+/// there is no folder. A blank folder/profile is treated as absent.
+fn profile_with_folder(profile: Option<&str>, folder: Option<&str>) -> Option<String> {
+    let base = profile.map(str::trim).filter(|p| !p.is_empty());
+    let folder_line = folder
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|f| format!("This file was found in Drive folder '{f}'."));
+    match (base, folder_line) {
+        (Some(p), Some(line)) => Some(format!("{p}\n{line}")),
+        (Some(p), None) => Some(p.to_string()),
+        (None, Some(line)) => Some(line),
+        (None, None) => None,
+    }
+}
+
 /// Propose project/tags/importance for the unreviewed documents, on demand (so a
 /// big folder import doesn't auto-fire model calls). Proposals stream back over
 /// `on_event`; they're transient — the user confirms them via `commit_review`.
@@ -1775,6 +1800,9 @@ pub async fn propose_metadata(
         id: i64,
         title: String,
         body: String,
+        /// The Drive folder this document was found in, if any — folded into the per-document profile
+        /// preamble as one plain-text line (NULL for non-Drive and pre-v29 rows).
+        folder: Option<String>,
     }
 
     // Gather the documents + existing projects + learned profile under a short
@@ -1792,7 +1820,8 @@ pub async fn propose_metadata(
         let projects = entities::canonical_project_names(&conn)?;
         let pending = {
             let base_sql = "SELECT d.id, d.title, \
-                    COALESCE((SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), '') \
+                    COALESCE((SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), ''), \
+                    d.source_parent_folder_name \
              FROM documents d WHERE d.reviewed = 0";
 
             let pending_sql = if let Some(ids) = document_ids.as_ref() {
@@ -1815,6 +1844,7 @@ pub async fn propose_metadata(
                         id: r.get(0)?,
                         title: r.get(1)?,
                         body: r.get(2)?,
+                        folder: r.get(3)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -1824,6 +1854,7 @@ pub async fn propose_metadata(
                         id: r.get(0)?,
                         title: r.get(1)?,
                         body: r.get(2)?,
+                        folder: r.get(3)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -1835,13 +1866,18 @@ pub async fn propose_metadata(
     let mut proposed = 0;
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
     for p in pending {
+        // Fold this document's Drive folder into its own copy of the profile preamble — the same
+        // plain-text seam that carries the Learning-You preferences. `propose` is called once per
+        // document, so a folder line can never leak into another document's prompt; the folder BIASES
+        // the proposal but never pre-assigns a project (the LLM proposal stays the review checkpoint).
+        let doc_profile = profile_with_folder(profile.as_deref(), p.folder.as_deref());
         let (mut proposal, usage_info) = review::propose(
             api_key.expose(),
             &models,
             &p.title,
             &p.body,
             &projects,
-            profile.as_deref(),
+            doc_profile.as_deref(),
         )
         .await;
         if let Some((usage, served)) = usage_info {
@@ -3120,6 +3156,24 @@ pub async fn list_drive_folders(
     drive::list_folders(&drive::account_token_key(&email), &drive_id, &parent_id).await
 }
 
+/// Resolve a Drive folder id to its display name for sorting-review context, memoising by id across a
+/// whole sync pass (folder ids are globally unique in Drive) so tagging many files in one folder costs
+/// a single lookup. Best-effort: an unreachable folder yields `None` and the file still indexes,
+/// untagged. This is the only folder-name lookup path — `list_drive_folders` is a lazy picker tree,
+/// not an id→name cache, so there is nothing to reuse.
+async fn resolve_folder_name(
+    token_key: &str,
+    folder_id: &str,
+    cache: &mut std::collections::HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(hit) = cache.get(folder_id) {
+        return hit.clone();
+    }
+    let name = drive::fetch_folder_name(token_key, folder_id).await;
+    cache.insert(folder_id.to_string(), name.clone());
+    name
+}
+
 /// One account's indexing scope (My Drive on/off + opted-in shared drives and their folders).
 #[tauri::command]
 pub fn get_drive_scope(state: State<'_, AppState>, email: String) -> Result<drive::DriveScope> {
@@ -3729,6 +3783,10 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
     // Set if the user pressed Stop. Already-applied items stay committed; we stop early and skip the
     // interrupted account's cursor advance, so the next sync re-checks it.
     let mut cancelled = false;
+    // Parent-folder names resolved once per unique folder id for the whole pass (see
+    // [`resolve_folder_name`]) — snapshotted onto each newly-synced document as review context.
+    let mut folder_names: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
 
     'accounts: for w in &work {
         // Stop requested (before this account, or after finishing the previous one)? Halt — keeping
@@ -3819,8 +3877,14 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                     }
                     None => Ok(None),
                 };
+                // Snapshot the parent-folder name (cached per pass) alongside the body — plain review
+                // context for the sorting proposal, resolved off the file's first `parents` entry.
+                let folder_name = match file.and_then(|f| f.parent_id.as_deref()) {
+                    Some(pid) => resolve_folder_name(&w.token_key, pid, &mut folder_names).await,
+                    None => None,
+                };
                 match body {
-                    Ok(Some(text)) => file.map(|f| f.pointer(source_id.clone(), text)),
+                    Ok(Some(text)) => file.map(|f| f.pointer(source_id.clone(), text, folder_name)),
                     Ok(None) => {
                         processed += 1;
                         skipped += 1;
@@ -5694,6 +5758,33 @@ mod tests {
         assert!(open_external_url("javascript:alert(1)").is_err());
         assert!(open_external_url("not a url").is_err());
         // The http/https success path is deliberately not exercised (it would launch a browser).
+    }
+
+    #[test]
+    fn profile_with_folder_appends_folder_as_a_plain_line() {
+        // Folder line appends under an existing profile (the Learning-You preamble seam).
+        assert_eq!(
+            profile_with_folder(Some("Files like the user does."), Some("Taxes 2025")).as_deref(),
+            Some("Files like the user does.\nThis file was found in Drive folder 'Taxes 2025'."),
+        );
+        // No profile yet → the folder line stands alone as the whole preamble.
+        assert_eq!(
+            profile_with_folder(None, Some("Taxes 2025")).as_deref(),
+            Some("This file was found in Drive folder 'Taxes 2025'."),
+        );
+        // No folder → the profile is passed through untouched.
+        assert_eq!(
+            profile_with_folder(Some("Keep it."), None).as_deref(),
+            Some("Keep it."),
+        );
+        // Nothing on either side, and blank/whitespace on either side, collapse to None (no empty line).
+        assert_eq!(profile_with_folder(None, None), None);
+        assert_eq!(profile_with_folder(Some("  "), Some("  ")), None);
+        assert_eq!(
+            profile_with_folder(None, Some("  ")),
+            None,
+            "a blank folder adds no line",
+        );
     }
 
     /// A throwaway encrypted store (also exercises the migration-in-transaction

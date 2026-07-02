@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.62.0-alpha",
+    date: "2026-07-02",
+    highlights: [
+      "Filing suggestions now take a hint from your Drive folders. When PM proposes a project for a file synced from Google Drive, it quietly considers the folder the file was found in — so a document sitting in your “Taxes 2025” folder is more likely to be suggested under the right project. It’s only ever a hint: every document still passes through your review before anything is filed, and the folder name never changes how the file is searched.",
+    ],
+  },
+  {
     version: "2.61.0-alpha",
     date: "2026-07-02",
     highlights: [

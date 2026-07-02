@@ -797,6 +797,26 @@ const MIGRATIONS: &[&str] = &[
     PRAGMA writable_schema = OFF;
     ALTER TABLE chat_sessions ADD COLUMN prefs_covers_up_to_turn_id INTEGER;
     "#,
+    // v29: Drive parent-folder tag + normalized source account (Stage-3 Drive folder text-bias, plus
+    // the Part-B source_account follow-up). Three additive, nullable columns on `documents` — no data
+    // moved, no CHECK relaxed, so plain `ADD COLUMN` suffices:
+    //   * `source_parent_folder_id` / `source_parent_folder_name` — the Drive folder a synced file was
+    //     found in, snapshotted at ingest time. The name is fed as PLAIN TEXT into the sorting-review
+    //     profile preamble (the same seam that already carries the Learning-You preferences) to BIAS —
+    //     never pre-assign — the model's project proposal; the LLM proposal stays the review checkpoint.
+    //     Never reaches the chunker/embedder. NULL for every non-Drive source and for rows ingested
+    //     before this migration (no backfill — a later Drive refresh re-populates them on re-ingest).
+    //   * `source_account` — the owning account promoted out of `source_id`'s inline
+    //     `gdrive:<email>:<fileId>` encoding into a first-class, filterable column. Derived at insert
+    //     time from `source_id` via `drive::account_of`, so it self-heals on a Rebuild; NULL where the
+    //     id carries no account (vault, shared-drive, OneDrive, chat). `source_id` is left byte-for-byte
+    //     unchanged — this is a derived convenience column alongside it, not a replacement. Existing
+    //     rows stay NULL until a dedicated backfill pass (out of scope here).
+    r#"
+    ALTER TABLE documents ADD COLUMN source_parent_folder_id TEXT;
+    ALTER TABLE documents ADD COLUMN source_parent_folder_name TEXT;
+    ALTER TABLE documents ADD COLUMN source_account TEXT;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -846,7 +866,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 28,
+            version, 29,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -854,7 +874,8 @@ mod tests {
              photo ingestion table is v22; chat ingestion foundation is v23; \
              chat per-chunk provenance + timestamp is v24; rolling chat summary is v25; \
              last-turn prompt size for the context meter is v26; chat title provenance is v27; \
-             chat preference source + extraction cursor is v28)"
+             chat preference source + extraction cursor is v28; \
+             Drive parent-folder tag + normalized source_account is v29)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
