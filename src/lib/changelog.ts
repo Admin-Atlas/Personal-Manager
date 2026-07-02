@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.64.0-alpha",
+    date: "2026-07-02",
+    highlights: [
+      "New: encrypted backups you can actually restore anywhere. A new Settings → Backup tab saves your whole vault — notes, database, and settings — as a single, compressed, password-protected file. Unlike “Export all data” (which only opens on this computer), a backup is self-contained: move it to another machine, enter your passphrase, and restore. Restoring is safe by design — it unpacks and verifies everything into a new folder first, so your current vault is never touched until you choose to switch to the restored one. Keep your backup passphrase somewhere safe: there’s no way to recover a backup without it. (Backing up straight to Proton Drive, and on a schedule, is coming next.)",
+    ],
+  },
+  {
     version: "2.63.0-alpha",
     date: "2026-07-02",
     highlights: [

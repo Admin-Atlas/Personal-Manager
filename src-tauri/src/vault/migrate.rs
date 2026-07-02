@@ -169,8 +169,9 @@ fn copy_file_verified(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Recursively copy `src` into `dst`, verifying each file's length (see
-/// [`copy_file_verified`]). A missing source directory is treated as empty.
-fn copy_tree_verified(src: &Path, dst: &Path) -> Result<()> {
+/// [`copy_file_verified`]). A missing source directory is treated as empty. Shared with the
+/// backup restore path as the cross-volume fallback when a staging rename can't apply.
+pub(crate) fn copy_tree_verified(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     if !src.exists() {
         return Ok(());
@@ -228,23 +229,23 @@ fn restore_vault_from_backup(backup: &Path, from_root: &Path) -> Result<()> {
 // --- orchestration ----------------------------------------------------------------
 
 /// Take a consistent SQLCipher snapshot of the open store into `dest` (which must not
-/// exist), preserving encryption and folding in the WAL. Mirrors the export path.
-fn vacuum_into(conn: &rusqlite::Connection, dest: &Path) -> Result<()> {
+/// exist), preserving encryption and folding in the WAL. Shared by migration, the local
+/// export, and the encrypted backup so the single-quote escaping lives in exactly one place.
+pub(crate) fn vacuum_into(conn: &rusqlite::Connection, dest: &Path) -> Result<()> {
     // VACUUM INTO takes a literal path, not a bound parameter; escape any single quote.
     let escaped = dest.to_string_lossy().replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
     Ok(())
 }
 
-/// The current SQLCipher key (64-hex) for a vault: the device keychain key, or this
-/// profile's cached key for a passphrase vault (which must be unlocked).
+/// The current SQLCipher key (64-hex) for a vault. Delegates to the shared resolver
+/// [`super::current_db_key`] so a restored/relocated DEVICE vault — whose real key lives
+/// in the per-vault keychain cache, not this machine's global device key — is migrated
+/// with the key its DB is actually encrypted under (mirrors `open_at_boot`). A passphrase
+/// vault that hasn't been unlocked yields the "must be unlocked" error, as before.
 fn current_key_hex(meta: &VaultMeta) -> Result<Secret> {
-    match meta.key_mode {
-        KeyMode::Device => secrets::get_or_create_db_key(),
-        KeyMode::Passphrase => secrets::get_cached_vault_key(&meta.vault_id)?.ok_or_else(|| {
-            Error::Other("the vault must be unlocked before it can be migrated".into())
-        }),
-    }
+    super::current_db_key(meta)?
+        .ok_or_else(|| Error::Other("the vault must be unlocked before it can be migrated".into()))
 }
 
 /// Resolve a plan to the new SQLCipher key (64-hex) and the new metadata, preserving the

@@ -33,6 +33,7 @@ import {
   setVaultEmbedder,
 } from "../lib/ipc";
 import { useHelp } from "../lib/help";
+import { BackupSettings } from "./BackupSettings";
 import { ConnectorsSettings } from "./ConnectorsSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
@@ -54,7 +55,15 @@ interface Props {
 }
 
 /** The non-onboarding Settings tabs (left rail). Onboarding stays a single untabbed scroll. */
-type SettingsTab = "general" | "ai" | "search" | "connectors" | "data" | "storage" | "developer";
+type SettingsTab =
+  | "general"
+  | "ai"
+  | "search"
+  | "connectors"
+  | "data"
+  | "backup"
+  | "storage"
+  | "developer";
 
 const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },
@@ -62,6 +71,7 @@ const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: "search", label: "Search" },
   { id: "connectors", label: "Connectors" },
   { id: "data", label: "Data & Security" },
+  { id: "backup", label: "Backup" },
   { id: "storage", label: "Storage" },
   { id: "developer", label: "Developer" },
 ];
@@ -1256,6 +1266,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                 </div>
               </>
             )}
+
+            {tab === "backup" && <BackupSettings />}
 
             {tab === "storage" && (
               <StorageSettings onNavigate={(t) => selectTab(t as SettingsTab)} />

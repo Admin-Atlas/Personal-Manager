@@ -5,6 +5,8 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppLockStatus,
+  BackupEvent,
+  BackupState,
   CalendarAccount,
   CalendarEvent,
   CalendarOverview,
@@ -52,6 +54,7 @@ import type {
   ProjectSize,
   ReviewDecision,
   ReviewEvent,
+  RestoreSummary,
   RetrievedChunk,
   SemanticLayout,
   Settings,
@@ -781,3 +784,30 @@ export const openDataFolder = () => invoke<void>("open_data_folder");
 /** Bundle the data folder into a single .zip at `destPath` (store snapshot + vault;
  *  the regenerable runtime/ is excluded). The store stays encrypted in the archive. */
 export const exportAllData = (destPath: string) => invoke<void>("export_all_data", { destPath });
+
+// --- Encrypted backup (Proton Drive / user cloud) — PR1 local `.pmbackup` archive + restore ---
+
+/** Create an encrypted, portable `.pmbackup` at `destPath`, protected by `passphrase`. Runs detached;
+ *  progress arrives via the global `backup://progress` event (subscribe with {@link onBackupProgress}).
+ *  Unlike the .zip export, this embeds the DB key inside the encrypted layer, so it restores anywhere. */
+export const createLocalBackup = (destPath: string, passphrase: string) =>
+  invoke<void>("create_local_backup", { destPath, passphrase });
+
+/** Restore a `.pmbackup` into a fresh folder (validated before anything is promoted). Resolves with a
+ *  summary; the live vault is untouched until you {@link switchToVault} to the restored one. */
+export const restoreLocalBackup = (srcPath: string, passphrase: string) =>
+  invoke<RestoreSummary>("restore_local_backup", { srcPath, passphrase });
+
+/** Point this profile at a restored vault folder and open it (uses the key seeded during restore). */
+export const switchToVault = (folder: string) => invoke<void>("switch_to_vault", { folder });
+
+/** The current backup/restore snapshot — restores the progress UI on return + shows the last result. */
+export const backupStatus = () => invoke<BackupState>("backup_status");
+
+/** Ask the running backup/restore to stop. A backup's partial output is discarded; a restore leaves the
+ *  live vault untouched. */
+export const stopBackup = () => invoke<void>("stop_backup");
+
+/** Subscribe to global backup/restore progress (fires regardless of which view started it). */
+export const onBackupProgress = (handler: (e: BackupEvent) => void): Promise<UnlistenFn> =>
+  listen<BackupEvent>("backup://progress", (e) => handler(e.payload));

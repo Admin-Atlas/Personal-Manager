@@ -554,22 +554,39 @@ pub fn open_with_passphrase(
     Ok((conn, key))
 }
 
-/// Decide how to open a vault at boot from its metadata. Device vaults open with the
-/// keychain key (today's path). Passphrase vaults open only if this profile has the
-/// derived key cached; otherwise return `None` so the store stays locked and the UI
-/// prompts for the passphrase. On success also returns the resolved 32-byte master, from
-/// which the caller builds the session runtime (the Markdown cipher *and* the always-on
-/// rules cipher are both subkeys of it).
+/// The 64-hex DB key this profile should open a vault with, or `None` if the vault is a
+/// passphrase vault this profile hasn't unlocked yet (so it stays locked, pending a
+/// passphrase prompt). The per-vault keychain cache (`vault_key::<vault_id>`) is
+/// consulted FIRST for both key modes: a **restored or relocated** vault seeds its own
+/// (source) key there, and its master must be reused exactly — the DB key *is* the
+/// master, and the Markdown / rules / manifest ciphers are all subkeys of it, so a
+/// device vault opened here must never fall back to this machine's global device key.
+/// A normal local device vault has no such cache entry and takes the global key, exactly
+/// as before (backward compatible).
+pub fn current_db_key(meta: &VaultMeta) -> Result<Option<Secret>> {
+    Ok(
+        match (
+            meta.key_mode,
+            secrets::get_cached_vault_key(&meta.vault_id)?,
+        ) {
+            (_, Some(cached)) => Some(cached),
+            (KeyMode::Device, None) => Some(secrets::get_or_create_db_key()?),
+            (KeyMode::Passphrase, None) => None,
+        },
+    )
+}
+
+/// Decide how to open a vault at boot from its metadata, via [`current_db_key`]. On
+/// success also returns the resolved 32-byte master, from which the caller builds the
+/// session runtime (the Markdown cipher *and* the always-on rules cipher are both
+/// subkeys of it).
 pub fn open_at_boot(
     resolved: &ResolvedVault,
     meta: &VaultMeta,
 ) -> Result<Option<(Connection, Zeroizing<[u8; KEY_LEN]>)>> {
-    let key = match meta.key_mode {
-        KeyMode::Device => secrets::get_or_create_db_key()?,
-        KeyMode::Passphrase => match secrets::get_cached_vault_key(&meta.vault_id)? {
-            Some(cached) => cached,
-            None => return Ok(None),
-        },
+    let key = match current_db_key(meta)? {
+        Some(key) => key,
+        None => return Ok(None),
     };
     let conn = db::open(&resolved.db_path, key.expose())?;
     let master = master_from_db_key_hex(key.expose())?;
