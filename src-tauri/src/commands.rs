@@ -6078,6 +6078,282 @@ pub fn stop_backup(state: State<'_, AppState>) {
     state.backup_cancel.store(true, Ordering::SeqCst);
 }
 
+/// Whether the official `proton-drive` CLI is installed (for backing up to Proton Drive).
+/// PM does not bundle or download the CLI — when it's missing, the UI links the user to
+/// `install_url` to install the official signed build themselves (the locate-then-guide
+/// model). `path` is the resolved executable when found.
+#[derive(Serialize)]
+pub struct ProtonCliStatus {
+    pub installed: bool,
+    pub path: Option<String>,
+    pub install_url: String,
+}
+
+/// Probe for an installed Proton Drive CLI (PATH + well-known per-OS install dirs). Cheap
+/// (a few `stat`s, no process spawn), so the Backup UI can call it on mount.
+#[tauri::command]
+pub fn proton_cli_status() -> ProtonCliStatus {
+    let located = crate::backup::proton::locate_proton_cli();
+    ProtonCliStatus {
+        installed: located.is_some(),
+        path: located.map(|p| p.to_string_lossy().into_owned()),
+        install_url: crate::backup::proton::INSTALL_URL.to_string(),
+    }
+}
+
+/// Resolve the installed CLI or return a friendly "not installed" error (shared by every
+/// Proton command below).
+fn require_proton_cli() -> Result<std::path::PathBuf> {
+    crate::backup::proton::locate_proton_cli()
+        .ok_or_else(|| Error::Other("the Proton Drive CLI is not installed".into()))
+}
+
+/// Sign in to Proton Drive — opens the browser and blocks until the flow completes. The
+/// session is stored and owned by the CLI (OS secret store); PM never sees Proton credentials.
+#[tauri::command]
+pub async fn proton_connect() -> Result<()> {
+    tokio::task::spawn_blocking(|| crate::backup::proton::connect(&require_proton_cli()?))
+        .await
+        .map_err(|e| Error::Other(format!("connect task panicked: {e}")))?
+}
+
+/// Sign out of Proton Drive (`auth logout`).
+#[tauri::command]
+pub async fn proton_disconnect() -> Result<()> {
+    tokio::task::spawn_blocking(|| crate::backup::proton::disconnect(&require_proton_cli()?))
+        .await
+        .map_err(|e| Error::Other(format!("disconnect task panicked: {e}")))?
+}
+
+/// Whether the CLI has an active Proton session (+ the account email if available). A clean
+/// "not signed in" is reported as `connected: false`, not an error.
+#[tauri::command]
+pub async fn proton_status() -> Result<crate::backup::proton::ProtonConnStatus> {
+    tokio::task::spawn_blocking(|| Ok(crate::backup::proton::connection(&require_proton_cli()?)))
+        .await
+        .map_err(|e| Error::Other(format!("status task panicked: {e}")))?
+}
+
+/// List PM's encrypted archives already on Proton Drive (newest first), for the restore picker.
+#[tauri::command]
+pub async fn list_proton_backups() -> Result<Vec<crate::backup::proton::ProtonBackupEntry>> {
+    tokio::task::spawn_blocking(|| crate::backup::proton::list_archives(&require_proton_cli()?))
+        .await
+        .map_err(|e| Error::Other(format!("list task panicked: {e}")))?
+}
+
+/// Create an encrypted archive and push it to Proton Drive. Snapshots the DB under the lock,
+/// then — off the lock — packs to a temp `.pmbackup` and uploads it via the CLI. Same portable
+/// format as a local backup (restorable anywhere with the passphrase); the temp file never
+/// leaves the machine unencrypted and is discarded after upload.
+#[tauri::command]
+pub async fn backup_to_proton(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    passphrase: String,
+) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(Error::Other("a backup passphrase is required".into()));
+    }
+    let cli = require_proton_cli()?;
+    let _busy = BusyGuard::acquire(&state.backup_busy)
+        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
+    state.backup_cancel.store(false, Ordering::SeqCst);
+    emit_backup_progress(
+        &app,
+        BackupEvent::Phase {
+            phase: BackupPhase::Snapshot,
+            fraction: 0.0,
+        },
+    );
+
+    let tmp = tempfile::Builder::new()
+        .prefix("pm-backup-proton-")
+        .tempdir()?;
+    let snapshot = tmp.path().join("pm.sqlite");
+    {
+        let conn = state.conn()?;
+        vault::migrate::vacuum_into(&conn, &snapshot)?;
+    }
+    emit_backup_progress(
+        &app,
+        BackupEvent::Phase {
+            phase: BackupPhase::Snapshot,
+            fraction: 1.0,
+        },
+    );
+
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata to back up".into()))?;
+    let db_key = vault::current_db_key(&meta)?
+        .ok_or_else(|| Error::Other("unlock the vault before backing it up".into()))?;
+    let now = chrono::Utc::now();
+    let archive_name =
+        crate::backup::proton::archive_name(&now.format("%Y%m%dT%H%M%SZ").to_string());
+    let archive_path = tmp.path().join(&archive_name);
+    let inputs = backup::pack::PackInputs {
+        vault_root: resolved.vault_root.clone(),
+        db_snapshot: snapshot,
+        markdown_dir: resolved.markdown_dir.clone(),
+        meta: meta.clone(),
+        db_key_hex: db_key,
+        app_version: app.package_info().version.to_string(),
+        created_at: now.to_rfc3339(),
+    };
+    let vault_id = meta.vault_id.clone();
+
+    let app2 = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+        let report = |phase, fraction| {
+            emit_backup_progress(&app2, BackupEvent::Phase { phase, fraction });
+        };
+        backup::pack::pack(
+            inputs,
+            &archive_path,
+            &passphrase,
+            report,
+            &st.backup_cancel,
+        )?;
+        // The CLI's upload has no byte-progress in --json mode; bracket it 0→1 on Upload.
+        report(BackupPhase::Upload, 0.0);
+        crate::backup::proton::upload_archive(&cli, &archive_path)?;
+        report(BackupPhase::Upload, 1.0);
+        Ok::<(), Error>(())
+    })
+    .await
+    .map_err(|e| Error::Other(format!("backup task panicked: {e}")))?;
+    drop(tmp);
+
+    match result {
+        Ok(()) => {
+            emit_backup_progress(
+                &app,
+                BackupEvent::Finished {
+                    report: BackupReport {
+                        kind: BackupKind::Backup,
+                        vault_id: Some(vault_id),
+                        target_dir: None,
+                        created_at: None,
+                    },
+                },
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
+                "Backup cancelled.".to_string()
+            } else {
+                e.to_string()
+            };
+            emit_backup_progress(
+                &app,
+                BackupEvent::Failed {
+                    message: msg.clone(),
+                },
+            );
+            Err(Error::Other(msg))
+        }
+    }
+}
+
+/// Download an archive from Proton Drive and restore it into a fresh, validated folder (the
+/// live vault is untouched until the user switches, exactly like a local restore). `name` is a
+/// bare archive file name from `list_proton_backups`.
+#[tauri::command]
+pub async fn restore_from_proton(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    passphrase: String,
+) -> Result<RestoreSummary> {
+    if passphrase.is_empty() {
+        return Err(Error::Other("the backup passphrase is required".into()));
+    }
+    let cli = require_proton_cli()?;
+    let _busy = BusyGuard::acquire(&state.backup_busy)
+        .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
+    state.backup_cancel.store(false, Ordering::SeqCst);
+    emit_backup_progress(
+        &app,
+        BackupEvent::Phase {
+            phase: BackupPhase::Download,
+            fraction: 0.0,
+        },
+    );
+
+    let data_dir = paths::data_dir(&app)?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let target = data_dir
+        .join("restored-vaults")
+        .join(format!("restore-{ts}"));
+
+    let app2 = app.clone();
+    let target2 = target.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+        let report = |phase, fraction| {
+            emit_backup_progress(&app2, BackupEvent::Phase { phase, fraction });
+        };
+        // Pull the archive into a scratch dir that outlives the restore (dropped at return).
+        let dl = tempfile::Builder::new()
+            .prefix("pm-restore-proton-")
+            .tempdir()?;
+        crate::backup::proton::download_archive(&cli, &name, dl.path())?;
+        report(BackupPhase::Download, 1.0);
+        let local = dl.path().join(&name);
+        backup::restore::restore(&local, &passphrase, &target2, report, &st.backup_cancel)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("restore task panicked: {e}")))?;
+
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
+                "Restore cancelled.".to_string()
+            } else {
+                e.to_string()
+            };
+            emit_backup_progress(
+                &app,
+                BackupEvent::Failed {
+                    message: msg.clone(),
+                },
+            );
+            return Err(Error::Other(msg));
+        }
+    };
+
+    // Stash the restored key IN MEMORY only; `switch_to_vault` promotes it to the keychain on
+    // commit (same guard as `restore_local_backup` — a restore never touches the live vault).
+    let target_dir = outcome.target_dir.to_string_lossy().to_string();
+    if let Ok(mut pending) = state.pending_restore_keys.lock() {
+        pending.insert(target_dir.clone(), outcome.db_key_hex);
+    }
+    let summary = RestoreSummary {
+        vault_id: outcome.vault_id.clone(),
+        key_mode: outcome.key_mode,
+        markdown_encryption: outcome.markdown_encryption,
+        app_version: outcome.app_version,
+        created_at: outcome.created_at.clone(),
+        target_dir,
+    };
+    emit_backup_progress(
+        &app,
+        BackupEvent::Finished {
+            report: BackupReport {
+                kind: BackupKind::Restore,
+                vault_id: Some(outcome.vault_id),
+                target_dir: Some(summary.target_dir.clone()),
+                created_at: Some(outcome.created_at),
+            },
+        },
+    );
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

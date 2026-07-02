@@ -52,6 +52,9 @@ import type {
   PythonInstallEvent,
   ProjectProposalEvent,
   ProjectSize,
+  ProtonBackupEntry,
+  ProtonCliStatus,
+  ProtonConnStatus,
   ReviewDecision,
   ReviewEvent,
   RestoreSummary,
@@ -811,3 +814,29 @@ export const stopBackup = () => invoke<void>("stop_backup");
 /** Subscribe to global backup/restore progress (fires regardless of which view started it). */
 export const onBackupProgress = (handler: (e: BackupEvent) => void): Promise<UnlistenFn> =>
   listen<BackupEvent>("backup://progress", (e) => handler(e.payload));
+
+/** Whether the official `proton-drive` CLI is installed (for backing up to Proton Drive). When it
+ *  isn't, the Backup UI links `install_url` — PM does not download the CLI itself. */
+export const protonCliStatus = () => invoke<ProtonCliStatus>("proton_cli_status");
+
+/** Whether the CLI has an active Proton session (+ the account email if available). */
+export const protonStatus = () => invoke<ProtonConnStatus>("proton_status");
+
+/** Sign in to Proton Drive — opens the browser and resolves once the flow completes. */
+export const protonConnect = () => invoke<void>("proton_connect");
+
+/** Sign out of Proton Drive. */
+export const protonDisconnect = () => invoke<void>("proton_disconnect");
+
+/** List PM's encrypted archives already on Proton Drive (newest first). */
+export const listProtonBackups = () => invoke<ProtonBackupEntry[]>("list_proton_backups");
+
+/** Pack an encrypted archive and push it to Proton Drive. Detached; progress on
+ *  `backup://progress` ({@link onBackupProgress}). */
+export const backupToProton = (passphrase: string) =>
+  invoke<void>("backup_to_proton", { passphrase });
+
+/** Download an archive from Proton Drive (by name) and restore it into a fresh folder; resolves
+ *  with a summary. The live vault is untouched until you {@link switchToVault} to it. */
+export const restoreFromProton = (name: string, passphrase: string) =>
+  invoke<RestoreSummary>("restore_from_proton", { name, passphrase });

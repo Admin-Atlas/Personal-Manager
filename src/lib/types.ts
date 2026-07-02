@@ -611,6 +611,31 @@ export interface RestoreSummary {
   target_dir: string;
 }
 
+/** Whether the official `proton-drive` CLI is installed (for backing up to Proton Drive). PM
+ *  does not bundle it; when `installed` is false the UI links `install_url` to install it. */
+export interface ProtonCliStatus {
+  installed: boolean;
+  /** Resolved executable path when found, else null. */
+  path: string | null;
+  install_url: string;
+}
+
+/** Whether the installed CLI has an active Proton session. A clean "not signed in" is
+ *  `connected: false` with no `error`; `error` is a real failure (network / CLI crash). */
+export interface ProtonConnStatus {
+  connected: boolean;
+  /** The signed-in account email, when the CLI surfaced it. */
+  account: string | null;
+  error: string | null;
+}
+
+/** One of PM's encrypted archives already on Proton Drive (for the restore picker). */
+export interface ProtonBackupEntry {
+  name: string;
+  /** Cleartext size in bytes, when reported. */
+  size: number | null;
+}
+
 // --- Personal Assistant: Microsoft OneDrive connector (board card 4B, spec §8.1) ---
 // A near-mirror of the Google Drive types above. One personal drive per account (no shared drives),
 // indexed whole (delta cursor) or folder-scoped.
