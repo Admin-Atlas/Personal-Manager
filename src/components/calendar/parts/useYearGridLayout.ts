@@ -21,6 +21,9 @@ export interface YearGridLayout {
   cols: number;
   rows: number;
   cellPx: number;
+  /** The minimum height one month row needs (title + weekday + 6 week rows). The grid uses this as
+   *  each row's `minmax(rowMinPx, 1fr)` floor so a tight window scrolls rather than clipping a week. */
+  rowMinPx: number;
 }
 
 /** Picks a column count from the measured width, then a day-cell px that fills the resulting rows
@@ -50,6 +53,8 @@ export function useYearGridLayout(monthCount: number): YearGridLayout {
           Math.min(MAX_CELL_PX, Math.floor((rowBudget - TITLE_PX - WEEKDAY_PX) / 6)),
         )
       : MIN_CELL_PX;
+  // Six week rows plus the two header rows — the real height a month needs at this cell size.
+  const rowMinPx = TITLE_PX + WEEKDAY_PX + 6 * cellPx;
 
-  return { containerRef, cols, rows, cellPx };
+  return { containerRef, cols, rows, cellPx, rowMinPx };
 }

@@ -98,12 +98,13 @@ export function AllDayBand({ events, days, colorOf, gutterPx, showLabel }: Props
                 height: `${LANE_H - 2}px`,
                 background: `color-mix(in oklab, ${color} 22%, transparent)`,
                 borderLeft: b.continuesLeft ? undefined : `3px solid ${color}`,
-                borderTopLeftRadius: b.continuesLeft ? 0 : 4,
-                borderBottomLeftRadius: b.continuesLeft ? 0 : 4,
-                borderTopRightRadius: b.continuesRight ? 0 : 4,
-                borderBottomRightRadius: b.continuesRight ? 0 : 4,
+                borderTopLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
+                borderBottomLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
+                borderTopRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
+                borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
               }}
               title={b.ev.summary}
+              aria-label={b.ev.summary}
             >
               <span className="truncate font-head text-ink">
                 {b.continuesLeft ? "‹ " : ""}

@@ -17,6 +17,7 @@ import {
   startOfDay,
   type BandInput,
 } from "../../../lib/calendar-layout";
+import { formatDateLocal } from "../../../lib/format";
 import { cn } from "../../ui";
 
 export interface MiniSpan {
@@ -168,7 +169,9 @@ export function MiniMonth({
                       type="button"
                       onClick={() => onSelectDay(date)}
                       className={cn("flex items-center justify-center hover:bg-surface", round)}
-                      aria-label={date.toDateString()}
+                      aria-label={`${date.toLocaleDateString(undefined, {
+                        weekday: "long",
+                      })} ${formatDateLocal(date)}`}
                     >
                       {numberEl}
                     </button>

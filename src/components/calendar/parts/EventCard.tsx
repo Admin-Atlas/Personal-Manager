@@ -53,11 +53,15 @@ export function EventCard({
   const withTime = showTime && heightPx >= TIME_MIN_H;
   const withLoc = showLocation && !!location && heightPx >= LOC_MIN_H;
 
+  // A full accessible name (summary + time + place) even when the card is too short to show the meta.
+  const ariaLabel = [summary, timeLabel, location].filter(Boolean).join(", ");
+
   return (
     <div
-      className="absolute overflow-hidden rounded-[6px] border border-border border-l-[3px] bg-surface px-1.5 py-0.5"
+      className="absolute overflow-hidden rounded-[var(--radius-sm)] border border-border border-l-[3px] bg-surface px-1.5 py-0.5"
       style={style}
       title={summary}
+      aria-label={ariaLabel}
     >
       <div className="truncate font-head text-[11px] font-medium leading-tight text-ink">
         {summary}

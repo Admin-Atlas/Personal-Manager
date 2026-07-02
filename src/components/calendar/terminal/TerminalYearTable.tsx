@@ -31,7 +31,7 @@ const MONTHS = Array.from({ length: 12 }, (_, i) => i);
 export function TerminalYearTable({ cursor, events, onSelectDay }: Props) {
   const year = cursor.getFullYear();
   const today = new Date();
-  const { containerRef, cols, rows, cellPx } = useYearGridLayout(MONTHS.length);
+  const { containerRef, cols, rows, cellPx, rowMinPx } = useYearGridLayout(MONTHS.length);
 
   const { singleDays, spans } = useMemo(() => {
     const singleDays = new Set<string>();
@@ -56,9 +56,9 @@ export function TerminalYearTable({ cursor, events, onSelectDay }: Props) {
       <div
         className="grid"
         style={{
-          height: "100%",
+          minHeight: "100%",
           gridTemplateColumns: `repeat(${cols}, 1fr)`,
-          gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
+          gridTemplateRows: `repeat(${rows}, minmax(${rowMinPx}px, 1fr))`,
           columnGap: `${COL_GAP_PX}px`,
           rowGap: `${ROW_GAP_PX}px`,
         }}

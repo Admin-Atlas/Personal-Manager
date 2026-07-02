@@ -21,6 +21,7 @@ import {
   startOfDay,
   type TimedInput,
 } from "../../../lib/calendar-layout";
+import { formatClock } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
 import { EventCard } from "../parts/EventCard";
@@ -49,14 +50,12 @@ const GEOM: Record<CalendarRange, { rowH: number; scrollHour: number; windowHour
   full: { rowH: 20, scrollHour: 0, windowHours: 24 },
 };
 
-function hhmm(d: Date): string {
-  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-}
-
+// Position/size are kept as minute values so lane packing is independent of rowH — the pixel
+// multiply happens at render, so a resize (which only changes rowH) never re-runs the packing memo.
 interface CardGeom {
   ev: CalendarEvent;
-  topPx: number;
-  heightPx: number;
+  startMin: number;
+  durMin: number;
   leftPct: number;
   widthPct: number;
   timeLabel: string;
@@ -120,18 +119,18 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
       });
       const placed = assignColumns(inputs);
       const laneOf = new Map(placed.map((p) => [p.id, p]));
-      const cards: CardGeom[] = dayEvents.map((ev) => {
-        const input = inputs.find((i) => i.id === ev.id)!;
+      // `inputs[i]` is built from `dayEvents[i]` in the same order, so index straight in — no O(n²)
+      // id scan to recover the row we're already on.
+      const cards: CardGeom[] = dayEvents.map((ev, i) => {
+        const input = inputs[i];
         const info = laneOf.get(ev.id) ?? { lane: 0, lanes: 1 };
-        const durMin = Math.max(input.endMin - input.startMin, 1);
-        const start = parseLocal(ev.start, false)!;
         return {
           ev,
-          topPx: (input.startMin / 60) * rowH,
-          heightPx: Math.max((durMin / 60) * rowH - 3, 14),
+          startMin: input.startMin,
+          durMin: Math.max(input.endMin - input.startMin, 1),
           leftPct: (info.lane / info.lanes) * 100,
           widthPct: 100 / info.lanes,
-          timeLabel: hhmm(start),
+          timeLabel: formatClock(parseLocal(ev.start, false)!),
         };
       });
       // Total events touching the day (timed + bands overlapping), for the Power count line.
@@ -148,15 +147,23 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
       }
       return { day, isToday: key === todayKey, count, cards };
     });
-  }, [days, events, bandEvents, rowH]);
+    // No rowH dependency: the memo is pure minute-space, so resizing the pane (which only changes
+    // rowH) doesn't re-run lane packing — the pixel multiply happens at render.
+  }, [days, events, bandEvents]);
 
-  // Auto-scroll the body to the range's window start on mount and whenever the range or visible week
-  // changes — the spec's "scroll to the working window" behaviour.
+  // Auto-scroll to the range's window start ONCE per range/week (after the body is measured), not on
+  // every resize — a resize only changes rowH, and re-running this would yank a scrolled-away user
+  // back to the window start.
   const firstDayMs = days[0]?.getTime() ?? 0;
+  const scrollKey = `${range}:${firstDayMs}`;
+  const scrolledKeyRef = useRef<string | null>(null);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = scrollHour * rowH;
-  }, [scrollHour, rowH, firstDayMs]);
+    if (!el || bodyHeight === 0) return;
+    if (scrolledKeyRef.current === scrollKey) return;
+    el.scrollTop = scrollHour * rowH;
+    scrolledKeyRef.current = scrollKey;
+  }, [scrollKey, scrollHour, rowH, bodyHeight]);
 
   const nowMin = minutesFromLocalMidnight(new Date());
   const hourLines = `repeating-linear-gradient(to bottom, var(--rule) 0, var(--rule) 1px, transparent 1px, transparent ${rowH}px)`;
@@ -227,8 +234,8 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
                   color={colorOf(card.ev.calendar_id)}
                   timeLabel={card.timeLabel}
                   location={card.ev.location}
-                  topPx={card.topPx}
-                  heightPx={card.heightPx}
+                  topPx={(card.startMin / 60) * rowH}
+                  heightPx={Math.max((card.durMin / 60) * rowH - 3, 14)}
                   leftPct={card.leftPct}
                   widthPct={card.widthPct}
                   showTime={!minimal}

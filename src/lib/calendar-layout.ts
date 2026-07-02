@@ -88,12 +88,54 @@ export function eventDaySpan(ev: CalendarEvent): DaySpan | null {
       if (ev.all_day) {
         const lastInclusive = addDays(startOfDay(end), -1);
         endDay = lastInclusive.getTime() >= startDay.getTime() ? lastInclusive : startDay;
+      } else if (minutesFromLocalMidnight(end) === 0 && end.getTime() > start.getTime()) {
+        // A timed event ending exactly at 00:00 the next day (a normal provider way to say "…until
+        // midnight") occupies up to the previous day, not into that next day — mirror the all-day
+        // exclusive-end rule so it isn't misclassified as a 2-day band. Floored at the start day.
+        const lastInclusive = addDays(startOfDay(end), -1);
+        endDay = lastInclusive.getTime() >= startDay.getTime() ? lastInclusive : startDay;
       } else {
         endDay = startOfDay(end);
       }
     }
   }
   return { startDay, endDay };
+}
+
+/** Ordering for a day's event list: all-day events first, then by start instant (ISO strings sort
+ *  chronologically). Shared by the month grids and both agendas so the sort never drifts. */
+export function compareEventsForDay(a: CalendarEvent, b: CalendarEvent): number {
+  if (a.all_day !== b.all_day) return a.all_day ? -1 : 1;
+  return String(a.start).localeCompare(String(b.start));
+}
+
+/** A day and the events that appear on it. */
+export interface DayGroup {
+  day: Date;
+  items: CalendarEvent[];
+}
+
+/** Group events for an open-ended agenda from `fromDay` forward, one bucket per day (empty days
+ *  omitted), groups and items sorted. An in-progress multi-day event whose run started BEFORE the
+ *  anchor but still reaches it is kept and bucketed under `fromDay` (not silently dropped). */
+export function groupEventsFromDay(events: CalendarEvent[], fromDay: Date): DayGroup[] {
+  const fromMs = startOfDay(fromDay).getTime();
+  const byDay = new Map<string, DayGroup>();
+  for (const ev of events) {
+    const span = eventDaySpan(ev);
+    if (!span) continue;
+    // Keep the event unless the WHOLE thing ended before the anchor. Bucket it under the later of
+    // its start day and the anchor, so a still-running multi-day event surfaces on the anchor day.
+    if (span.endDay.getTime() < fromMs) continue;
+    const bucket = startOfDay(new Date(Math.max(span.startDay.getTime(), fromMs)));
+    const key = dayKey(bucket);
+    const g = byDay.get(key);
+    if (g) g.items.push(ev);
+    else byDay.set(key, { day: bucket, items: [ev] });
+  }
+  const ordered = [...byDay.values()].sort((a, b) => a.day.getTime() - b.day.getTime());
+  for (const g of ordered) g.items.sort(compareEventsForDay);
+  return ordered;
 }
 
 /** True when an event covers more than one local day (a multi-day all-day event, or a timed event

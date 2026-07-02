@@ -9,8 +9,14 @@
 
 import { useMemo } from "react";
 import type { CalendarEvent } from "../../../lib/types";
-import { formatDateLocal } from "../../../lib/format";
-import { dayKey, eventDaySpan, startOfDay } from "../../../lib/calendar-layout";
+import { formatClock, formatDateLocal } from "../../../lib/format";
+import {
+  compareEventsForDay,
+  dayKey,
+  eventDaySpan,
+  groupEventsFromDay,
+  startOfDay,
+} from "../../../lib/calendar-layout";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
 
@@ -33,13 +39,6 @@ function weekdayShort(d: Date): string {
   return d.toLocaleDateString(undefined, { weekday: "short" });
 }
 
-/** All-day first, then by start instant (ISO strings sort chronologically). */
-function sortItems(items: CalendarEvent[]): void {
-  items.sort((a, b) =>
-    a.all_day !== b.all_day ? (a.all_day ? -1 : 1) : String(a.start).localeCompare(String(b.start)),
-  );
-}
-
 /** The row's time cell for `ev` on `day`: `all-day`, a continuation arrow for a multi-day event whose
  *  run started earlier, or the local `HH:MM` on its start day. */
 function rowTime(ev: CalendarEvent, day: Date): string {
@@ -47,11 +46,12 @@ function rowTime(ev: CalendarEvent, day: Date): string {
   const start = new Date(ev.start);
   if (Number.isNaN(start.getTime())) return "";
   if (dayKey(startOfDay(start)) !== dayKey(day)) return "→";
-  return start.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return formatClock(start);
 }
 
 export function TerminalAgenda({ events, colorOf, days, fromDay }: Props) {
   const { showPower } = useDepth();
+  const bounded = !!(days && days.length > 0);
 
   const rows = useMemo<DayRow[]>(() => {
     if (days && days.length > 0) {
@@ -62,28 +62,18 @@ export function TerminalAgenda({ events, colorOf, days, fromDay }: Props) {
           const span = eventDaySpan(ev);
           return span && span.startDay.getTime() <= dayMs && dayMs <= span.endDay.getTime();
         });
-        sortItems(items);
+        items.sort(compareEventsForDay);
         return { day, items };
       });
     }
-    // Open-ended agenda: group by local start day from the anchor forward, empty days omitted.
-    const fromMs = startOfDay(fromDay ?? new Date()).getTime();
-    const byDay = new Map<string, DayRow>();
-    for (const ev of events) {
-      const span = eventDaySpan(ev);
-      if (!span || span.startDay.getTime() < fromMs) continue;
-      const key = dayKey(span.startDay);
-      const g = byDay.get(key);
-      if (g) g.items.push(ev);
-      else byDay.set(key, { day: span.startDay, items: [ev] });
-    }
-    const ordered = [...byDay.values()].sort((a, b) => a.day.getTime() - b.day.getTime());
-    for (const g of ordered) sortItems(g.items);
-    return ordered;
+    // Open-ended agenda: shared grouping (keeps an in-progress multi-day event on the anchor day).
+    return groupEventsFromDay(events, fromDay ?? new Date());
   }, [events, days, fromDay]);
 
+  // In a bounded (Week/Day) view every day is listed with a `·` skeleton for empty ones, so a
+  // fully-empty week must still render its grid — only the open-ended agenda collapses to the panel.
   const hasAny = rows.some((r) => r.items.length > 0);
-  if (!hasAny) {
+  if (!bounded && !hasAny) {
     return (
       <div className="flex flex-1 items-center justify-center p-8 font-mono">
         <p className="text-sm text-ink4">No events in view.</p>

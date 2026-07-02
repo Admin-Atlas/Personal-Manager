@@ -31,7 +31,7 @@ const MONTHS = Array.from({ length: 12 }, (_, i) => i);
 export function YearView({ cursor, events, onSelectDay }: Props) {
   const year = cursor.getFullYear();
   const today = new Date();
-  const { containerRef, cols, rows, cellPx } = useYearGridLayout(MONTHS.length);
+  const { containerRef, cols, rows, cellPx, rowMinPx } = useYearGridLayout(MONTHS.length);
 
   const { singleDays, spans } = useMemo(() => {
     const singleDays = new Set<string>();
@@ -56,12 +56,12 @@ export function YearView({ cursor, events, onSelectDay }: Props) {
       <div
         className="grid"
         style={{
-          height: "100%",
+          // Fill the pane when months fit (rows stretch to 1fr), but never below the height a month
+          // actually needs — so a short window scrolls via the parent's overflow-y-auto instead of
+          // clipping the first/last week row.
+          minHeight: "100%",
           gridTemplateColumns: `repeat(${cols}, 1fr)`,
-          // minmax(0, 1fr) lets a row shrink below its content's natural size instead of growing the
-          // grid past the container (a slightly-off cellPx estimate then clips a hair off one month's
-          // last week row via the per-cell overflow-hidden below, rather than forcing an outer scrollbar).
-          gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
+          gridTemplateRows: `repeat(${rows}, minmax(${rowMinPx}px, 1fr))`,
           columnGap: `${COL_GAP_PX}px`,
           rowGap: `${ROW_GAP_PX}px`,
         }}

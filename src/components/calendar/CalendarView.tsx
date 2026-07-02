@@ -23,9 +23,10 @@ import {
   type CalendarViewMode,
 } from "../../lib/calendarPrefs";
 import { formatDateLocal } from "../../lib/format";
-import { addDays, startOfDay } from "../../lib/calendar-layout";
+import { addDays, dayKey, eventDaySpan, startOfDay } from "../../lib/calendar-layout";
 import { sourceColors, useTheme } from "../../theme";
 import { Skeleton } from "../ui";
+import { useNowTick } from "./parts/useNowTick";
 import { CalendarHeader } from "./CalendarHeader";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
@@ -120,7 +121,12 @@ export function CalendarView() {
   const [loading, setLoading] = useState(cachedOverview === null);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [eventsFailed, setEventsFailed] = useState(false);
   const aliveRef = useRef(true);
+  // Monotonic token so an older in-flight events read (e.g. a focus refresh) can't overwrite a newer
+  // one that resolved first.
+  const eventsSeqRef = useRef(0);
+  const now = useNowTick();
 
   useEffect(() => {
     aliveRef.current = true;
@@ -130,13 +136,19 @@ export function CalendarView() {
   }, []);
 
   const loadEvents = useCallback(async () => {
+    const seq = ++eventsSeqRef.current;
     try {
       const evts = await listAllCalendarEvents();
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || seq !== eventsSeqRef.current) return;
       setEvents(evts);
       cachedEvents = evts;
+      setEventsFailed(false);
     } catch {
-      // Keep the last-good events; a read failure is transient.
+      // Keep the last-good events; a read failure is transient. Flag it only when we have nothing to
+      // show, so the empty grid isn't mistaken for "no events".
+      if (aliveRef.current && seq === eventsSeqRef.current && cachedEvents.length === 0) {
+        setEventsFailed(true);
+      }
     }
   }, []);
 
@@ -158,7 +170,13 @@ export function CalendarView() {
   useEffect(() => {
     void loadOverview();
     void loadEvents();
-    const onFocus = () => void loadEvents();
+    // Re-read the WHOLE mirror on focus — both events and the overview. The background poll can have
+    // shifted the synced band, added a calendar, or changed the last-sync time while we were away, so
+    // refreshing events alone would leave the range hint, source colours, and "synced" label stale.
+    const onFocus = () => {
+      void loadEvents();
+      void loadOverview();
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [loadOverview, loadEvents]);
@@ -236,10 +254,22 @@ export function CalendarView() {
     return (calendarId: string) => map.get(calendarId) ?? "var(--ink4)";
   }, [overview, system, accent]);
 
-  const visibleEvents = useMemo(
-    () => events.filter((e) => !hidden.has(e.calendar_id)),
-    [events, hidden],
-  );
+  const visibleEvents = useMemo(() => {
+    // Filter to visible calendars, THEN dedup the same physical event mirrored on two of them (same
+    // iCal UID), keeping the first visible copy — otherwise it renders twice in the grid/agenda. Done
+    // after the hide filter so hiding one calendar still shows the copy on the calendar left visible.
+    const seen = new Set<string>();
+    const out: CalendarEvent[] = [];
+    for (const e of events) {
+      if (hidden.has(e.calendar_id)) continue;
+      if (e.uid) {
+        if (seen.has(e.uid)) continue;
+        seen.add(e.uid);
+      }
+      out.push(e);
+    }
+    return out;
+  }, [events, hidden]);
 
   const gridDays = useMemo<Date[]>(() => {
     if (view === "day") return [startOfDay(cursor)];
@@ -261,10 +291,38 @@ export function CalendarView() {
     const ms = new Date(overview.mirror_start);
     const me = new Date(overview.mirror_end);
     if (Number.isNaN(ms.getTime()) || Number.isNaN(me.getTime())) return null;
+    // Compare on LOCAL calendar days, not raw instants: the band bounds are UTC-ish while the visible
+    // window is built from local midnights, so a sub-day tz offset at a band edge would otherwise trip
+    // the hint on a month whose every displayed day is actually in-band. `end` is exclusive → last
+    // visible day is end−1.
     const { start, end } = visibleRange(view, cursor);
-    if (start.getTime() >= ms.getTime() && end.getTime() <= me.getTime()) return null;
+    const bandStart = startOfDay(ms).getTime();
+    const bandEnd = startOfDay(me).getTime();
+    const firstVisible = startOfDay(start).getTime();
+    const lastVisible = startOfDay(addDays(end, -1)).getTime();
+    if (firstVisible >= bandStart && lastVisible <= bandEnd) return null;
     return `Outside the synced range — only ${formatDateLocal(ms)} – ${formatDateLocal(me)} is mirrored.`;
   }, [overview, view, cursor]);
+
+  // The count the Terminal chrome strip shows at Power depth. For the bounded grids it's the events
+  // touching the visible period (so it matches what's on screen, not the whole −1..+13-month mirror);
+  // for the open-ended agenda it's everything from the anchor day forward.
+  const chromeCount = useMemo(() => {
+    if (view === "agenda") {
+      const fromMs = startOfDay(cursor).getTime();
+      return visibleEvents.filter((e) => {
+        const span = eventDaySpan(e);
+        return span && span.endDay.getTime() >= fromMs;
+      }).length;
+    }
+    const { start, end } = visibleRange(view, cursor);
+    const startMs = start.getTime();
+    const endMs = end.getTime(); // exclusive
+    return visibleEvents.filter((e) => {
+      const span = eventDaySpan(e);
+      return span && span.startDay.getTime() < endMs && span.endDay.getTime() >= startMs;
+    }).length;
+  }, [visibleEvents, view, cursor]);
 
   if (loading && !overview) {
     return (
@@ -340,7 +398,7 @@ export function CalendarView() {
         lastSync={overview?.last_sync ?? null}
       />
 
-      {isTerminal && <TerminalChrome view={view} label={label} count={visibleEvents.length} />}
+      {isTerminal && <TerminalChrome view={view} label={label} count={chromeCount} />}
 
       {error && (
         <div
@@ -348,6 +406,12 @@ export function CalendarView() {
           style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
         >
           {error}
+        </div>
+      )}
+
+      {eventsFailed && !error && (
+        <div className="border-b border-rule bg-panel px-4 py-1.5 text-center font-mono text-xs text-ink4">
+          Couldn't load events — try Refresh.
         </div>
       )}
 
@@ -366,10 +430,12 @@ export function CalendarView() {
           </p>
         </div>
       ) : (
-        // key={view} restarts the 0.25s fade-up on every switch; under prefers-reduced-motion the
-        // keyframe name doesn't resolve, so this is a no-op (the motion lives in index.css, not JS).
+        // key restarts the 0.25s fade-up on view switch; under prefers-reduced-motion the keyframe
+        // name doesn't resolve, so this is a no-op (the motion lives in index.css, not JS). The day
+        // component of the key (from the minute tick) remounts the body when the date rolls over at
+        // midnight, so every view's "today" highlight advances without an interaction.
         <div
-          key={view}
+          key={`${view}:${dayKey(startOfDay(now))}`}
           className="flex min-h-0 flex-1 flex-col"
           style={{ animation: "pm-fade-up 0.25s ease-out" }}
         >
