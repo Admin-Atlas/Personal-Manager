@@ -460,6 +460,13 @@ export function BackupSettings() {
               </Button>
             )}
           </div>
+          {/* Both actions need a valid passphrase — say so, so a disabled button never looks
+              like a dead one. */}
+          {!backupValid && !running && (
+            <p className="text-xs text-ink4">
+              Enter a passphrase above (8+ characters, matching) to save or upload a backup.
+            </p>
+          )}
         </div>
       </div>
 
