@@ -12,6 +12,8 @@
 //! UTC with `chrono`/`chrono-tz`, and expand recurrences with the `rrule` crate,
 //! bounded to the agenda window so a years-old weekly meeting doesn't blow up.
 
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz as ChronoTz;
 
@@ -33,12 +35,35 @@ pub fn parse_feed_within(
     tz: ChronoTz,
 ) -> Vec<CalendarEvent> {
     let lines = unfold(text);
+    let blocks: Vec<Vec<String>> = vevents(&lines).into_iter().take(MAX_VEVENTS).collect();
+
+    // A VEVENT carrying RECURRENCE-ID is a per-instance override (moved or cancelled)
+    // of the series with the same UID (RFC 5545 §3.8.4.4). Collect those overridden
+    // instants keyed by UID so the master's RRULE expansion skips them — otherwise a
+    // cancelled instance still shows and a moved one renders twice (its new slot plus
+    // the master's original slot). The override VEVENT itself still renders normally
+    // (or, if STATUS:CANCELLED, drops out in `expand_vevent`).
+    let mut overrides: HashMap<String, HashSet<i64>> = HashMap::new();
+    for block in &blocks {
+        let Some((params, value)) = find_prop(block, "RECURRENCE-ID") else {
+            continue;
+        };
+        let uid = find(block, "UID").unwrap_or("").to_string();
+        let all_day = param(params, "VALUE") == Some("DATE")
+            || (!value.contains('T') && value.trim().len() == 8);
+        if let Some(inst) = parse_any(value, param(params, "TZID"), all_day, tz) {
+            overrides.entry(uid).or_default().insert(inst.timestamp());
+        }
+    }
+
     let mut out = Vec::new();
-    for block in vevents(&lines).into_iter().take(MAX_VEVENTS) {
+    for block in &blocks {
         if out.len() >= MAX_EVENTS {
             break;
         }
-        out.extend(expand_vevent(&block, feed_id, win_start, win_end, tz));
+        out.extend(expand_vevent(
+            block, feed_id, win_start, win_end, tz, &overrides,
+        ));
     }
     out.truncate(MAX_EVENTS);
     out
@@ -89,6 +114,7 @@ fn expand_vevent(
     win_start: DateTime<Utc>,
     win_end: DateTime<Utc>,
     tz: ChronoTz,
+    overrides: &HashMap<String, HashSet<i64>>,
 ) -> Vec<CalendarEvent> {
     if find(block, "STATUS") == Some("CANCELLED") {
         return Vec::new();
@@ -114,17 +140,31 @@ fn expand_vevent(
     let Some(start_anchor) = parse_any(start_val, param(start_params, "TZID"), all_day, tz) else {
         return Vec::new();
     };
+    // Duration comes from DTEND if present, else the mutually-exclusive DURATION
+    // property (RFC 5545 §3.8.2 — common in CalDAV/recurring exports). Without the
+    // DURATION fallback such events would render as zero-length points and, worse, a
+    // long DURATION-only event predating the window would be wrongly excluded below.
     let end_anchor =
         find_prop(block, "DTEND").and_then(|(p, v)| parse_any(v, param(p, "TZID"), all_day, tz));
-    let dur = end_anchor.map(|e| e - start_anchor);
+    let dur = end_anchor
+        .map(|e| e - start_anchor)
+        .or_else(|| find(block, "DURATION").and_then(parse_duration));
+    let effective_end = end_anchor
+        .or_else(|| dur.map(|d| start_anchor + d))
+        .unwrap_or(start_anchor);
 
-    let starts: Vec<DateTime<Utc>> = if block.iter().any(|l| l.starts_with("RRULE")) {
-        expand_rrule(block, win_start, win_end)
-    } else if start_anchor <= win_end && end_anchor.unwrap_or(start_anchor) >= win_start {
+    let mut starts: Vec<DateTime<Utc>> = if block.iter().any(|l| l.starts_with("RRULE")) {
+        expand_rrule(block, win_start, win_end, tz)
+    } else if start_anchor <= win_end && effective_end >= win_start {
         vec![start_anchor]
     } else {
         Vec::new()
     };
+
+    // Drop occurrences the series' own RECURRENCE-ID overrides have moved/cancelled.
+    if let Some(skip) = overrides.get(&uid) {
+        starts.retain(|s| !skip.contains(&s.timestamp()));
+    }
 
     starts
         .into_iter()
@@ -145,23 +185,69 @@ fn expand_vevent(
 }
 
 /// Expand an `RRULE` to its UTC occurrence-starts within the window. Feeds the
-/// original DTSTART/RRULE/EXDATE/RDATE lines straight to `rrule` so it resolves the
-/// timezone itself; a parse failure degrades to "no occurrences" rather than erroring.
+/// DTSTART/RRULE/EXDATE/RDATE lines to `rrule` so it resolves the timezone and DST
+/// itself; a floating DTSTART is first pinned to the user's zone so it doesn't fall
+/// back to the machine's. A parse failure retries with the DTSTART pinned to its
+/// resolved UTC instant (so a DST-ambiguous DTSTART doesn't drop the whole series),
+/// and only then degrades to "no occurrences".
 fn expand_rrule(
     block: &[String],
     win_start: DateTime<Utc>,
     win_end: DateTime<Utc>,
+    tz: ChronoTz,
 ) -> Vec<DateTime<Utc>> {
-    // Guard against a pathological recurrence: a sub-daily FREQ (SECONDLY/MINUTELY/
-    // HOURLY) with a far-past DTSTART and no COUNT/UNTIL forces the iterator to walk
-    // millions of pre-window occurrences before reaching the agenda window — a CPU
-    // hang on sync from one crafted feed line (`.all(366)` caps results, not the
-    // walk). Such rules are meaningless in a day-level agenda, so skip them.
-    if has_sub_daily_freq(block) {
+    // Only expand a day-or-coarser FREQ. Sub-daily frequencies (SECONDLY/MINUTELY/
+    // HOURLY) — or an unrecognisable rule — force the iterator to walk a huge number
+    // of pre-window occurrences before reaching the agenda window (a CPU hang on sync
+    // from one crafted feed line; `.all(..)` caps results, not the walk), and are
+    // meaningless in a day-level agenda. Allowlist, not denylist, so an unknown or
+    // future sub-daily pattern is refused rather than risked.
+    if !rrule_freq_is_expandable(block) {
         return Vec::new();
     }
 
-    let spec = block
+    let spec = build_rrule_spec(block, tz);
+    let set = match spec.parse::<rrule::RRuleSet>() {
+        Ok(set) => set,
+        Err(_) => match rrule_spec_utc_fallback(block, tz).and_then(|s| s.parse().ok()) {
+            Some(set) => set,
+            None => return Vec::new(),
+        },
+    };
+
+    let after = win_start.with_timezone(&rrule::Tz::UTC);
+    let before = win_end.with_timezone(&rrule::Tz::UTC);
+    // Cap returned occurrences by the window span with generous headroom for a daily
+    // (or multi-time daily) series, bounded well under MAX_EVENTS. The old fixed 366
+    // silently dropped ~2 months of any daily series in the −1..+13-month mirror.
+    let window_days = (win_end - win_start).num_days().max(1);
+    let limit = window_days.saturating_mul(24).clamp(366, u16::MAX as i64) as u16;
+    set.after(after)
+        .before(before)
+        .all(limit)
+        .dates
+        .into_iter()
+        .map(|d| d.with_timezone(&Utc))
+        .collect()
+}
+
+/// True only if the block's `RRULE` uses a day-or-coarser FREQ (DAILY/WEEKLY/MONTHLY/
+/// YEARLY). See `expand_rrule` for why this is an allowlist.
+fn rrule_freq_is_expandable(block: &[String]) -> bool {
+    block.iter().any(|l| {
+        let u = l.to_ascii_uppercase();
+        u.starts_with("RRULE")
+            && ["FREQ=DAILY", "FREQ=WEEKLY", "FREQ=MONTHLY", "FREQ=YEARLY"]
+                .iter()
+                .any(|f| u.contains(f))
+    })
+}
+
+/// The DTSTART/RRULE/EXDATE/RDATE lines joined for `rrule`, pinning a *floating*
+/// DTSTART (timed, no `Z`, no `TZID`) to the user's zone so `rrule` resolves it like
+/// `parse_any` does — not in the machine's local zone.
+fn build_rrule_spec(block: &[String], tz: ChronoTz) -> String {
+    block
         .iter()
         .filter(|l| {
             l.starts_with("DTSTART")
@@ -169,33 +255,108 @@ fn expand_rrule(
                 || l.starts_with("EXDATE")
                 || l.starts_with("RDATE")
         })
-        .cloned()
+        .map(|l| pin_floating_dtstart(l, tz))
         .collect::<Vec<_>>()
-        .join("\n");
-
-    let Ok(set) = spec.parse::<rrule::RRuleSet>() else {
-        return Vec::new();
-    };
-    let after = win_start.with_timezone(&rrule::Tz::UTC);
-    let before = win_end.with_timezone(&rrule::Tz::UTC);
-    set.after(after)
-        .before(before)
-        .all(366)
-        .dates
-        .into_iter()
-        .map(|d| d.with_timezone(&Utc))
-        .collect()
+        .join("\n")
 }
 
-/// True if the block's `RRULE` uses a sub-daily frequency — see `expand_rrule`.
-fn has_sub_daily_freq(block: &[String]) -> bool {
-    block.iter().any(|l| {
-        let u = l.to_ascii_uppercase();
-        u.starts_with("RRULE")
-            && ["FREQ=SECONDLY", "FREQ=MINUTELY", "FREQ=HOURLY"]
-                .iter()
-                .any(|f| u.contains(f))
-    })
+/// If `line` is a floating (timed, no `Z`, no `TZID`) DTSTART, add `;TZID=<user zone>`;
+/// otherwise return it unchanged.
+fn pin_floating_dtstart(line: &str, tz: ChronoTz) -> String {
+    if !line.starts_with("DTSTART") {
+        return line.to_string();
+    }
+    let Some(colon) = line.find(':') else {
+        return line.to_string();
+    };
+    let (head, value) = (&line[..colon], &line[colon + 1..]);
+    let is_timed = value.contains('T');
+    let has_z = value.trim_end().ends_with('Z');
+    let has_tzid = head.to_ascii_uppercase().contains("TZID=");
+    if is_timed && !has_z && !has_tzid {
+        format!("{head};TZID={}:{value}", tz.name())
+    } else {
+        line.to_string()
+    }
+}
+
+/// A fallback spec whose DTSTART is pinned to its resolved UTC instant, for the rare
+/// DTSTART that lands in a DST gap and makes the primary parse fail. Loses cross-DST
+/// wall-clock stability but keeps the series instead of dropping it entirely.
+fn rrule_spec_utc_fallback(block: &[String], tz: ChronoTz) -> Option<String> {
+    let (params, value) = find_prop(block, "DTSTART")?;
+    let all_day =
+        param(params, "VALUE") == Some("DATE") || (!value.contains('T') && value.trim().len() == 8);
+    let anchor = parse_any(value, param(params, "TZID"), all_day, tz)?;
+    let dtstart = if all_day {
+        format!(
+            "DTSTART;VALUE=DATE:{}",
+            anchor.with_timezone(&tz).format("%Y%m%d")
+        )
+    } else {
+        format!("DTSTART:{}", anchor.format("%Y%m%dT%H%M%SZ"))
+    };
+    let rest = block
+        .iter()
+        .filter(|l| l.starts_with("RRULE") || l.starts_with("EXDATE") || l.starts_with("RDATE"))
+        .cloned();
+    Some(
+        std::iter::once(dtstart)
+            .chain(rest)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Parse an RFC 5545 DURATION value (`P1DT2H`, `-PT30M`, `P2W`) to a `chrono::Duration`.
+fn parse_duration(value: &str) -> Option<Duration> {
+    let v = value.trim();
+    let (sign, rest) = match v.strip_prefix('-') {
+        Some(r) => (-1i64, r),
+        None => (1, v.strip_prefix('+').unwrap_or(v)),
+    };
+    let rest = rest.strip_prefix('P')?;
+    let mut secs: i64 = 0;
+    let mut num = String::new();
+    let mut in_time = false;
+    let mut saw_any = false;
+    for c in rest.chars() {
+        match c {
+            'T' => in_time = true,
+            '0'..='9' => num.push(c),
+            'W' => {
+                secs += num.parse::<i64>().ok()? * 7 * 86_400;
+                num.clear();
+                saw_any = true;
+            }
+            'D' => {
+                secs += num.parse::<i64>().ok()? * 86_400;
+                num.clear();
+                saw_any = true;
+            }
+            'H' if in_time => {
+                secs += num.parse::<i64>().ok()? * 3_600;
+                num.clear();
+                saw_any = true;
+            }
+            'M' if in_time => {
+                secs += num.parse::<i64>().ok()? * 60;
+                num.clear();
+                saw_any = true;
+            }
+            'S' if in_time => {
+                secs += num.parse::<i64>().ok()?;
+                num.clear();
+                saw_any = true;
+            }
+            _ => return None,
+        }
+    }
+    // Trailing digits with no unit, or a bare `P`, are malformed.
+    if !num.is_empty() || !saw_any {
+        return None;
+    }
+    Some(Duration::seconds(sign * secs))
 }
 
 // Builds a CalendarEvent from its already-parsed parts; the many fields are the
@@ -273,18 +434,26 @@ fn parse_any(
     }
     let naive = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?;
     match tzid.and_then(|t| t.parse::<ChronoTz>().ok()) {
-        Some(explicit) => explicit
-            .from_local_datetime(&naive)
-            .earliest()
-            .map(|d| d.with_timezone(&Utc)),
+        Some(explicit) => resolve_local(explicit, naive),
         // Floating time (no TZID, no Z): RFC 5545 says interpret it in the viewer's
         // zone — use the user's chosen IANA zone (not the machine's), so the event
         // lands on the same instant no matter which machine syncs the feed.
-        None => tz
-            .from_local_datetime(&naive)
-            .earliest()
-            .map(|d| d.with_timezone(&Utc)),
+        None => resolve_local(tz, naive),
     }
+}
+
+/// Resolve a naive local datetime in `zone` to a UTC instant, tolerating a DST
+/// spring-forward gap: a local time inside the skipped hour has no instant
+/// (`LocalResult::None`), so nudge forward past the gap rather than dropping the event
+/// (a 1-hour shift covers essentially every zone). A fall-back (ambiguous) time takes
+/// the earliest of the two candidates.
+fn resolve_local(zone: ChronoTz, naive: NaiveDateTime) -> Option<DateTime<Utc>> {
+    if let Some(dt) = zone.from_local_datetime(&naive).earliest() {
+        return Some(dt.with_timezone(&Utc));
+    }
+    zone.from_local_datetime(&(naive + Duration::hours(1)))
+        .earliest()
+        .map(|d| d.with_timezone(&Utc))
 }
 
 /// The value of property `name`, ignoring its parameters.
@@ -445,5 +614,95 @@ mod tests {
         let events = parse_feed_within(feed, "f", s, e, chrono_tz::America::Havana);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].start, "2026-03-08");
+    }
+
+    #[test]
+    fn daily_recurrence_is_not_truncated_across_a_14_month_mirror() {
+        // Regression for the `.all(366)` cap: a daily series over a −1..+13-month
+        // window (~425 days) must yield every in-window day, not stop at 366.
+        let feed = "BEGIN:VEVENT\nUID:daily\nSUMMARY:Standup\n\
+                    DTSTART:20260101T090000Z\nDTEND:20260101T091500Z\n\
+                    RRULE:FREQ=DAILY\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2027, 2, 1, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        // Days in [2026-01-01, 2027-02-01): 365 (2026) + 31 (Jan 2027) = 396.
+        assert_eq!(events.len(), 396);
+        assert!(events.len() > 366, "must exceed the old fixed cap");
+    }
+
+    #[test]
+    fn floating_recurrence_resolves_in_user_zone_not_machine() {
+        // A floating (no Z, no TZID) recurring DTSTART must expand in the user's zone,
+        // matching the non-recurring floating path. 09:00 floating in Asia/Tokyo (+09)
+        // is 00:00 UTC, so each weekly occurrence is a UTC midnight.
+        let feed = "BEGIN:VEVENT\nUID:fl\nSUMMARY:Sync\n\
+                    DTSTART:20260601T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, chrono_tz::Asia::Tokyo);
+        assert!(!events.is_empty());
+        assert_eq!(events[0].start, "2026-06-01T00:00:00Z");
+    }
+
+    #[test]
+    fn recurrence_id_cancellation_removes_only_that_instance() {
+        // A weekly series with one instance cancelled via a RECURRENCE-ID override:
+        // that Monday drops out, the rest survive.
+        let feed = "BEGIN:VEVENT\nUID:s1\nSUMMARY:Weekly\n\
+                    DTSTART:20260601T100000Z\nDTEND:20260601T103000Z\n\
+                    RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:s1\nRECURRENCE-ID:20260608T100000Z\n\
+                    STATUS:CANCELLED\nDTSTART:20260608T100000Z\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        // Mondays Jun 1,8,15,22,29 minus the cancelled Jun 8 → 4.
+        assert_eq!(events.len(), 4);
+        assert!(!events.iter().any(|ev| ev.start == "2026-06-08T10:00:00Z"));
+    }
+
+    #[test]
+    fn recurrence_id_reschedule_is_not_duplicated() {
+        // A moved instance (override DTSTART differs from RECURRENCE-ID) renders once
+        // at its new time, not twice.
+        let feed = "BEGIN:VEVENT\nUID:s2\nSUMMARY:Weekly\n\
+                    DTSTART:20260601T100000Z\nDTEND:20260601T103000Z\n\
+                    RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\
+                    BEGIN:VEVENT\nUID:s2\nRECURRENCE-ID:20260608T100000Z\n\
+                    SUMMARY:Weekly (moved)\nDTSTART:20260608T140000Z\n\
+                    DTEND:20260608T143000Z\nEND:VEVENT";
+        let s = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        // 5 Mondays, but Jun 8 10:00 replaced by Jun 8 14:00 → still 5 total.
+        assert_eq!(events.len(), 5);
+        assert!(!events.iter().any(|ev| ev.start == "2026-06-08T10:00:00Z"));
+        assert!(events.iter().any(|ev| ev.start == "2026-06-08T14:00:00Z"));
+    }
+
+    #[test]
+    fn duration_property_supplies_the_end_time() {
+        // DTSTART + DURATION (no DTEND) must yield a real end, not a zero-length point.
+        let feed = "BEGIN:VEVENT\nUID:dur\nSUMMARY:Workshop\n\
+                    DTSTART:20260615T090000Z\nDURATION:PT2H30M\nEND:VEVENT";
+        let (s, e) = window();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].start, "2026-06-15T09:00:00Z");
+        assert_eq!(events[0].end.as_deref(), Some("2026-06-15T11:30:00Z"));
+    }
+
+    #[test]
+    fn parses_duration_forms() {
+        assert_eq!(parse_duration("PT1H"), Some(Duration::hours(1)));
+        assert_eq!(parse_duration("P2W"), Some(Duration::weeks(2)));
+        assert_eq!(
+            parse_duration("P1DT2H30M"),
+            Some(Duration::minutes(24 * 60 + 150))
+        );
+        assert_eq!(parse_duration("-PT30M"), Some(Duration::minutes(-30)));
+        assert_eq!(parse_duration("P"), None);
+        assert_eq!(parse_duration("PT1X"), None);
     }
 }
