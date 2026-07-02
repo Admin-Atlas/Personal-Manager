@@ -227,7 +227,7 @@ export function CommandPalette({
 
   return (
     <div
-      className="absolute inset-0 z-30 flex justify-center pt-[12vh]"
+      className="absolute inset-0 z-50 flex justify-center pt-[12vh]"
       style={{ background: "rgba(8,6,4,0.5)" }}
       onMouseDown={onClose}
     >

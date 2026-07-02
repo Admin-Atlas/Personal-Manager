@@ -8,7 +8,7 @@
 // timed events crossing midnight are already multi-day, so they lift too. Today's column gets an
 // accent-soft tint and the now-line. Every colour is a token or the passed source colour — no hex.
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
 import type { CalendarRange } from "../../../lib/calendarPrefs";
 import {
@@ -39,11 +39,14 @@ interface Props {
 const GUTTER_PX = 54;
 const HOURS = 24;
 
-// Vertical scale + where the body scrolls to on mount, per range.
-const GEOM: Record<CalendarRange, { rowH: number; scrollHour: number }> = {
-  work: { rowH: 52, scrollHour: 8 },
-  day: { rowH: 36, scrollHour: 6 },
-  full: { rowH: 20, scrollHour: 0 },
+// Vertical scale per range, plus the hour window each is framed on. The grid always spans the full
+// 24h (nothing is ever un-scrollable-to) — `scrollHour` positions the body on mount, and
+// `windowHours` is how many of those hours should fill the body exactly (stretching rowH beyond the
+// preset when the body's taller than a fixed-size grid would need, so there's no dead space below).
+const GEOM: Record<CalendarRange, { rowH: number; scrollHour: number; windowHours: number }> = {
+  work: { rowH: 52, scrollHour: 8, windowHours: 24 },
+  day: { rowH: 36, scrollHour: 8, windowHours: 12 },
+  full: { rowH: 20, scrollHour: 0, windowHours: 24 },
 };
 
 function hhmm(d: Date): string {
@@ -68,8 +71,27 @@ interface DayColumn {
 
 export function TimeGridView({ days, events, colorOf, range }: Props) {
   const { minimal, showPower } = useDepth();
-  const { rowH, scrollHour } = GEOM[range];
+  const { rowH: presetRowH, scrollHour, windowHours } = GEOM[range];
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [bodyHeight, setBodyHeight] = useState(0);
+
+  // The body's visible height, independent of content — the flex layout sizes it, not the grid.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const h = entries[0]?.contentRect.height;
+      if (h != null) setBodyHeight(h);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Stretch rows so the range's window (not necessarily the full 24h) fills the body exactly —
+  // never shrink below the preset, so `work`'s tall business-hours grid still needs a scroll as
+  // designed. The grid itself always spans the full 24h; scrolling reaches whatever's outside the
+  // window (e.g. `day`'s 08–20 default framing).
+  const rowH = bodyHeight > 0 ? Math.max(presetRowH, bodyHeight / windowHours) : presetRowH;
 
   const bandEvents = useMemo(() => events.filter((e) => e.all_day || isMultiDay(e)), [events]);
 
