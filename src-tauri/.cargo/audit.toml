@@ -17,4 +17,10 @@ ignore = [
     "RUSTSEC-2025-0075", # unic-* unmaintained
     "RUSTSEC-2025-0080", # unic-* unmaintained
     "RUSTSEC-2025-0100", # unic-* unmaintained
+    # quick-xml <0.41 DoS pair — reached ONLY via plist (tauri parsing PM's own
+    # bundle Info.plist), never untrusted/remote XML, so unreachable here. No fix
+    # reachable: plist 1.9.0 (pinned by tauri 2.11.3) requires quick-xml ^0.39.2;
+    # the patch is quick-xml >=0.41.0, blocked until plist upstream bumps it.
+    "RUSTSEC-2026-0194", # quick-xml quadratic duplicate-attr check (untrusted XML only)
+    "RUSTSEC-2026-0195", # quick-xml NsReader unbounded namespace alloc (untrusted XML only)
 ]
