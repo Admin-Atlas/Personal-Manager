@@ -6,17 +6,24 @@
 // indicator. Meta (sync time) is gated by depth; the layout never forks.
 
 import type { Calendar, CalendarAccount } from "../../lib/types";
-import type { CalendarViewMode } from "../../lib/calendarPrefs";
+import type { CalendarRange, CalendarViewMode } from "../../lib/calendarPrefs";
 import { useDepth } from "../../theme";
 import { Button, SegmentedControl, type SegOption } from "../ui";
 import { CalendarsDropdown } from "./CalendarsDropdown";
+import { MiniCalendarPopover } from "./MiniCalendarPopover";
 
 interface Props {
   view: CalendarViewMode;
   availableViews: readonly CalendarViewMode[];
   onViewChange: (v: CalendarViewMode) => void;
+  /** Time-grid vertical scale (Week/Day only). */
+  range: CalendarRange;
+  onRangeChange: (r: CalendarRange) => void;
   /** The current period label (e.g. "July 2026") shown between the nav arrows. */
   label: string;
+  /** The anchor day, for the mini-calendar picker. */
+  cursor: Date;
+  onPickDate: (d: Date) => void;
   onPrev: () => void;
   onNext: () => void;
   onToday: () => void;
@@ -38,6 +45,12 @@ const VIEW_LABEL: Record<CalendarViewMode, string> = {
   agenda: "Agenda",
 };
 
+const RANGE_OPTIONS: SegOption<CalendarRange>[] = [
+  { value: "work", label: "Work" },
+  { value: "day", label: "Day" },
+  { value: "full", label: "24h" },
+];
+
 /** Local clock time of the last successful sync, or null. */
 function syncLabel(iso: string | null): string | null {
   if (!iso) return null;
@@ -50,7 +63,11 @@ export function CalendarHeader({
   view,
   availableViews,
   onViewChange,
+  range,
+  onRangeChange,
   label,
+  cursor,
+  onPickDate,
   onPrev,
   onNext,
   onToday,
@@ -65,6 +82,7 @@ export function CalendarHeader({
 }: Props) {
   const { showMeta } = useDepth();
   const synced = syncLabel(lastSync);
+  const showRange = view === "week" || view === "day";
 
   const viewOptions: SegOption<CalendarViewMode>[] = availableViews.map((v) => ({
     value: v,
@@ -85,9 +103,12 @@ export function CalendarHeader({
         </Button>
       </div>
 
-      <span className="font-head text-sm text-ink">{label}</span>
+      <MiniCalendarPopover label={label} cursor={cursor} onPick={onPickDate} />
 
       <div className="ml-auto flex flex-wrap items-center gap-3">
+        {showRange && (
+          <SegmentedControl options={RANGE_OPTIONS} value={range} onChange={onRangeChange} />
+        )}
         {viewOptions.length > 1 && (
           <SegmentedControl options={viewOptions} value={view} onChange={onViewChange} />
         )}

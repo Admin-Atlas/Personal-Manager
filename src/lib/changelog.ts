@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.59.0-alpha",
+    date: "2026-07-02",
+    highlights: [
+      "The Calendar grows into a real calendar. Alongside Agenda, there are now Month, Week, Day, and Year views — switch between them from the header, and page through time with the arrows or by picking a date straight off the pop-up mini-calendar.",
+      "Week and Day show a proper time grid: events sit at their real hours, side by side when they overlap, with a live “now” line on today and an all-day strip up top. Choose how tall the grid runs — business hours, the whole day, or a compact 24-hour view.",
+      "Month lays out your weeks with multi-day events flowing across as bands and the rest as tidy per-day chips (they shrink to coloured dots when you keep things minimal). Year gives you all twelve months at a glance — click any day to dive in. Every view stays colour-coded by source and themed to match the rest of PM.",
+    ],
+  },
+  {
     version: "2.58.0-alpha",
     date: "2026-07-01",
     highlights: [
