@@ -1609,7 +1609,7 @@ pub fn write_document_truth(
     vault_root: &Path,
     manifest_cipher: &crate::index_only::ManifestCipher,
 ) -> Result<(std::path::PathBuf, Vec<u8>)> {
-    match truth_source(tx, doc_id)? {
+    let written = match truth_source(tx, doc_id)? {
         TruthSource::VaultFrontmatter => rewrite_vault_metadata(
             tx,
             vault,
@@ -1620,7 +1620,7 @@ pub fn write_document_truth(
             importance,
             reviewed,
             last_activity,
-        ),
+        )?,
         TruthSource::IndexManifest => rewrite_manifest_metadata(
             tx,
             vault_root,
@@ -1631,8 +1631,23 @@ pub fn write_document_truth(
             importance,
             reviewed,
             last_activity,
-        ),
+        )?,
+    };
+
+    // Stage-3 activity log: filing a document INTO a real project is per-project engagement, and this
+    // seam is the single choke-point every user-initiated organize edit passes through (Rebuild and
+    // chat-document birth insert their rows directly, bypassing it). "Unsorted" is the pre-triage
+    // bucket, not a project the user chose, so it doesn't count. Best-effort, inside the caller's tx.
+    if project != "Unsorted" {
+        crate::project_activity::record(
+            tx,
+            project,
+            crate::project_activity::Kind::Ingest,
+            Some(doc_id),
+        );
     }
+
+    Ok(written)
 }
 
 /// Reconstruct a photo's satellite record from parsed front-matter fields + body, or `None` if this
@@ -2670,6 +2685,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row_project, "Project X");
+    }
+
+    /// Filing a document INTO a real project appends one `kind='ingest'` activity observation keyed
+    /// to that project (source_ref = the document id); filing into the pre-triage `Unsorted` bucket
+    /// appends nothing. `write_document_truth` is the single organize choke-point, so this locks the
+    /// per-project engagement signal (Stage-3 activity log).
+    #[test]
+    fn write_document_truth_logs_activity_only_for_a_real_project() {
+        use crate::index_only::ManifestCipher;
+        let (dir, mut conn, _vault_id, index_id) = store_with_one_of_each();
+        let cipher = ManifestCipher::from_master("vault-test", &[9u8; 32]);
+        let vault_dir = dir.path().join("vault");
+        let markdown = crate::vault::MarkdownCipher::plaintext("vault-test");
+
+        let file = |conn: &mut Connection, project: &str| {
+            let tx = conn.transaction().unwrap();
+            write_document_truth(
+                &tx,
+                &vault_dir,
+                &markdown,
+                index_id,
+                project,
+                &[],
+                None,
+                true,
+                "2026-06-26T00:00:00Z",
+                dir.path(),
+                &cipher,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        };
+
+        // File into a real project → exactly one 'ingest' observation, keyed by name, ref = doc id.
+        file(&mut conn, "Project X");
+        let rows: Vec<(String, String, Option<i64>)> = {
+            let mut s = conn
+                .prepare("SELECT project, kind, source_ref FROM project_activity")
+                .unwrap();
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![(
+                "Project X".to_string(),
+                "ingest".to_string(),
+                Some(index_id)
+            )]
+        );
+
+        // Re-file into the pre-triage bucket → no new observation (Unsorted isn't a chosen project).
+        file(&mut conn, "Unsorted");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project_activity", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "filing into Unsorted logs nothing");
     }
 
     #[test]

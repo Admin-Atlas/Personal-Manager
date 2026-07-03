@@ -28,6 +28,11 @@ use rusqlite::{params, Connection};
 pub enum Kind {
     /// A message sent in a project-scoped chat.
     Chat,
+    /// A document filed into a real project (assigned at organize time — NOT raw byte ingest,
+    /// where a document is always `Unsorted` and hasn't been attributed to a project yet).
+    Ingest,
+    /// A milestone added, edited, re-linked, marked, deleted, or reordered on a project.
+    Milestone,
 }
 
 impl Kind {
@@ -35,6 +40,8 @@ impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Chat => "chat",
+            Kind::Ingest => "ingest",
+            Kind::Milestone => "milestone",
         }
     }
 }

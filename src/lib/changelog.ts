@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.73.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "Groundwork (cont.): the same quiet activity signal now also notices when you file a document into a project or change a project's milestones. Still nothing new on screen — it's building the history that will power smarter surfacing (which projects are “hot” right now) in a later update.",
+    ],
+  },
+  {
     version: "2.72.0-alpha",
     date: "2026-07-03",
     highlights: [
