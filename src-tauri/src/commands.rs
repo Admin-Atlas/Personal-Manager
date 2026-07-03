@@ -2626,6 +2626,13 @@ pub fn set_milestone_event(
 pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Result<()> {
     let conn = state.conn()?;
     milestones::set_state(&conn, id, met)?;
+    // Un-marking a milestone done is the "I made a mistake" undo: clear any flag the user asserted done
+    // on it, so the next briefing refresh's detection can surface the deadline again. A completion vouched
+    // done is otherwise a protected record the re-scan can't re-open. Ticking it done needs no such step —
+    // detection prunes the now-met milestone's active flag on its own.
+    if !met {
+        flags::reopen_milestone(&conn, id)?;
+    }
     touch_milestone_project(&conn, id)?;
     Ok(())
 }

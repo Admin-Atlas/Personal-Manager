@@ -642,6 +642,21 @@ pub fn assert_done(
     Ok((flag, milestone_id))
 }
 
+/// Re-open a milestone's flags when the user UN-marks it done (ticks it back to `unmet`) — the "I made a
+/// mistake" undo. A flag asserted done is a protected `resolved` + `user_confirmed` record, so neither the
+/// idempotent upsert (its `WHERE state='active'` guard no-ops on a resolved row) nor the detection prune
+/// (which only clears unconfirmed flags) can ever re-open it on their own — that protection is exactly
+/// what stops a daily re-scan from undoing a genuine completion. Deleting the resolved tombstone here lets
+/// the next detection pass re-propose a fresh `active` flag IFF the milestone is still within a flag
+/// window: a mistakenly-completed deadline reappears in the briefing, while a far-off one correctly stays
+/// quiet. Scoped to this milestone's own anchor; returns how many tombstones were cleared.
+pub fn reopen_milestone(conn: &Connection, milestone_id: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM flags WHERE anchor_kind = ?1 AND anchor = ?2 AND state = 'resolved'",
+        params![ANCHOR_MILESTONE, milestone_id.to_string()],
+    )?)
+}
+
 /// The default lead time (in whole days) a flag type fires ahead of its anchored date, used
 /// when a flag carries no explicit `threshold`. Pure — detection reads it to decide when a
 /// flag should appear; `happening-today` and `overdue` are day-of/after, so their lead is 0.
@@ -1508,5 +1523,55 @@ mod tests {
         .unwrap();
         let (_cf, cal_touched) = assert_done(&conn, cid, None, None).unwrap();
         assert_eq!(cal_touched, None, "calendar flags are not written through");
+    }
+
+    /// The mistake-undo: un-ticking a milestone clears the asserted-done tombstone, so the next detection
+    /// pass surfaces the deadline again. Without this, a flag the user vouched done is a permanent
+    /// gravestone the re-scan can't re-open.
+    #[test]
+    fn reopen_milestone_clears_the_tombstone_so_detection_can_resurface() {
+        let (_dir, conn) = open_test_db();
+        let mid = milestones::add(&conn, "PM v1", "beta", Some("2026-07-06".into()), None).unwrap();
+        let d = || DraftFlag {
+            anchor_kind: ANCHOR_MILESTONE.into(),
+            anchor: mid.to_string(),
+            r#type: TYPE_DEADLINE_APPROACHING.into(),
+            threshold: None,
+            artifact_ptr: None,
+            artifact_url: None,
+        };
+        let fid = upsert_active(&conn, &d()).unwrap();
+
+        // User asserts it done → flag resolved, milestone met, gone from the briefing.
+        assert_done(&conn, fid, None, None).unwrap();
+        assert!(
+            list_active(&conn, None).unwrap().is_empty(),
+            "asserted done → out of the active set"
+        );
+
+        // A re-detection can NOT bring it back while the resolved tombstone stands: the upsert no-ops on
+        // a resolved row and the prune only touches unconfirmed flags.
+        upsert_active(&conn, &d()).unwrap();
+        assert!(
+            list_active(&conn, None).unwrap().is_empty(),
+            "still hidden — a vouched completion is protected from the re-scan"
+        );
+
+        // Un-ticking clears the tombstone; the next detection upsert then re-creates a fresh active flag.
+        assert_eq!(
+            reopen_milestone(&conn, mid).unwrap(),
+            1,
+            "tombstone removed"
+        );
+        let reborn = upsert_active(&conn, &d()).unwrap();
+        assert_eq!(
+            get(&conn, reborn).unwrap().unwrap().state,
+            STATE_ACTIVE,
+            "the deadline is flagged again after the undo"
+        );
+        assert_ne!(
+            reborn, fid,
+            "a fresh row — the old tombstone was deleted, not revived"
+        );
     }
 }

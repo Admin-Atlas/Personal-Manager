@@ -123,6 +123,15 @@ function readSort(): Sort {
 let cachedProjects: ProjectOverview[] | null = null;
 let cachedEvents: CalendarEvent[] = [];
 let cachedBriefing: DailyBriefing | null = null;
+// The focus box's in-progress text and any staged suggestion (a pending confirm / a note) must outlive a
+// tab switch too — the whole view unmounts, so component-local state would be dropped. Same lifetime as
+// the loads above: remembered until the app reloads, so a suggestion you haven't acted on is still there
+// when you come back.
+let cachedFocusBox: { text: string; pending: FocusRoute | null; note: string | null } = {
+  text: "",
+  pending: null,
+  note: null,
+};
 
 export function FocusView({ onOpenProject, onAsk }: Props) {
   const [projects, setProjects] = useState<ProjectOverview[]>(() => cachedProjects ?? []);
@@ -696,12 +705,19 @@ function FocusBox({
   onOpenProject: (project: string) => void;
   onResolved: () => void;
 }) {
-  const [text, setText] = useState("");
+  // Seed from the module cache so a suggestion survives leaving and returning to the tab (see
+  // cachedFocusBox). `busy` is transient and deliberately not cached.
+  const [text, setText] = useState(cachedFocusBox.text);
   const [busy, setBusy] = useState(false);
   // A proposed write awaiting the user's one-tap confirm. Resolve/prefer are the only writes, and both
   // pass through here — so a flag only leaves the set on an explicit vouch (HITL-confirm, decision 5).
-  const [pending, setPending] = useState<FocusRoute | null>(null);
-  const [note, setNote] = useState<string | null>(null);
+  const [pending, setPending] = useState<FocusRoute | null>(cachedFocusBox.pending);
+  const [note, setNote] = useState<string | null>(cachedFocusBox.note);
+
+  // Mirror the staged suggestion into the module cache on every change, so it's restored on remount.
+  useEffect(() => {
+    cachedFocusBox = { text, pending, note };
+  }, [text, pending, note]);
 
   async function submit() {
     const trimmed = text.trim();
