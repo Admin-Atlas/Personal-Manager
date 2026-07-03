@@ -55,6 +55,30 @@ export function makeByteToChar(body: string): (byteOffset: number) => number {
   };
 }
 
+/**
+ * Whether the stored leaf offsets plausibly index THIS body — a guard for index-only documents, whose
+ * offsets are computed against the live body fetched at index time. In the steady state that body
+ * matches what we fetch now, but after a rebuild-from-manifest an index-only item is re-embedded from
+ * its ~500-char summary, so the offsets index a fragment far shorter than the freshly fetched full
+ * body (or, on a summary fallback, far longer than the summary shown). Either way they don't line up.
+ * The leaves tile the body, so the largest end offset should sit near the body's own byte length; if
+ * it's wildly off, the offsets belong to a different string and the overlay would be misleading. Vault
+ * documents always pass (their body IS the exact string the splitter chunked).
+ */
+export function offsetsAlignToBody(body: string, leaves: ChunkSpan[]): boolean {
+  let bodyBytes = 0;
+  for (const ch of body) bodyBytes += utf8Len(ch.codePointAt(0)!);
+  if (bodyBytes === 0) return false;
+  let maxEnd = 0;
+  for (const c of leaves) {
+    if (c.kind === "leaf" && c.end_offset != null) maxEnd = Math.max(maxEnd, c.end_offset);
+  }
+  if (maxEnd === 0) return false;
+  // The last leaf should end near the body's end: not far short of it (summary-length offsets over a
+  // full body) and not past it (full-body offsets over a summary fallback).
+  return maxEnd >= bodyBytes * 0.5 && maxEnd <= bodyBytes * 1.05;
+}
+
 /** One rendered segment: a leaf chunk's source text plus the grouping needed to shade it by parent. */
 export interface ChunkSegment {
   chunkId: number;

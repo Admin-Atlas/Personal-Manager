@@ -23,6 +23,7 @@ import { MilestoneList } from "./MilestoneList";
 import { TagEditor } from "./TagEditor";
 import { ChatBadge } from "./ChatBadge";
 import { rankImportance } from "../lib/importance";
+import { useReader } from "../lib/reader";
 import { useDepth, useTheme } from "../theme";
 
 const PROJECT_LIST_ID = "focus-projects";
@@ -63,6 +64,9 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
   const { teachVisible } = useTheme();
   // Existing project names for the power-depth project datalist (re-file autocomplete).
   const [projectNames, setProjectNames] = useState<string[]>([]);
+  // Clicking a file opens the shared document reader onto it (mounted at app scope), so a user can
+  // read a project's document without hunting for it in the Documents tab.
+  const { openReader, current: readerDoc } = useReader();
   // How the Files panel is ordered. Name A→Z by default; clicking a key again reverses it.
   const [sort, setSort] = useState<FileSort>({ key: "name", dir: "asc" });
   // The right panel's width is a fraction of the window (drag the left edge to resize, stays
@@ -216,10 +220,13 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
             <li
               key={d.id}
               data-doc-id={d.id}
-              className={`rounded-[var(--radius-sm)] px-2 py-1.5 transition-colors hover:bg-surface ${
+              onClick={() => openReader(d)}
+              className={`cursor-pointer rounded-[var(--radius-sm)] px-2 py-1.5 transition-colors hover:bg-surface ${
                 flashId === d.id
                   ? "bg-surface ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]"
-                  : ""
+                  : readerDoc?.id === d.id
+                    ? "bg-accent-soft"
+                    : ""
               }`}
             >
               <div className="flex min-w-0 items-center gap-1.5">
@@ -234,7 +241,8 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
               {teachVisible ? (
                 // Manual triage, same controls as the Review tab. Everyone gets the importance
                 // toggle; power depth also gets project (re-file) + tags, like a Review row.
-                <div className="mt-1.5 flex flex-col gap-1.5">
+                // Stop clicks here from bubbling to the row's open-reader handler.
+                <div className="mt-1.5 flex flex-col gap-1.5" onClick={(e) => e.stopPropagation()}>
                   {showPower && (
                     <label className="flex items-center gap-1.5 text-xs text-ink4">
                       <span className="shrink-0">Project</span>

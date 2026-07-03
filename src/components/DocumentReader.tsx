@@ -3,17 +3,25 @@
 
 import { type CSSProperties, useEffect, useMemo, useState } from "react";
 import type { ChunkSpan, Document, ImageData } from "../lib/types";
-import { documentChunkSpans, openSource, readDocumentBody, readDocumentImage } from "../lib/ipc";
+import {
+  documentChunkSpans,
+  fetchIndexOnlyBody,
+  openSource,
+  readDocumentBody,
+  readDocumentImage,
+} from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
-import { segmentByLeaves, shadeBuckets } from "../lib/chunkOverlay";
+import { offsetsAlignToBody, segmentByLeaves, shadeBuckets } from "../lib/chunkOverlay";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 
 // The document reader: a read-only, docked view onto already-indexed state. It dispatches on
-// `source_type` (a new type later = a new case), renders local Markdown through the app's single
-// sanitizing boundary, and — for power users — paints the splitter's chunk boundaries over the body.
-// It never mutates the store: no editing, no re-chunking, no boundary editing.
+// `source_type` (a new type later = a new case), renders content through the app's single sanitizing
+// Markdown boundary, and — for power users — paints the splitter's chunk boundaries over the body.
+// It never mutates the store: no editing, no re-chunking, no boundary editing. Mounted once at app
+// scope (see lib/reader.tsx) and opened from the Documents tab, a project's file list, or a chat
+// citation.
 
 // The live source types the reader can render. Anything else falls to a graceful placeholder rather than
 // raw bytes or a broken view.
@@ -40,6 +48,11 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
   const { devMode } = useDevMode();
 
   const [body, setBody] = useState<string | null>(null);
+  // Whether `body` is the full text the chunk offsets index into. True for local docs and for an
+  // index-only doc whose live body we fetched; false when we fell back to the offline summary.
+  const [bodyFull, setBodyFull] = useState(false);
+  // Set when an index-only full-text fetch failed and we're showing the offline summary instead.
+  const [indexOnlyFallback, setIndexOnlyFallback] = useState<string | null>(null);
   const [image, setImage] = useState<ImageData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -53,6 +66,8 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
   useEffect(() => {
     let cancelled = false;
     setBody(null);
+    setBodyFull(false);
+    setIndexOnlyFallback(null);
     setImage(null);
     setError(null);
     setShowChunks(false);
@@ -70,8 +85,31 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
           }
           // No saved original — fall through to the OCR/synthetic Markdown body.
         }
+        if (isIndexOnly) {
+          // An index-only body is never stored offline — fetch the full live copy so it reads like any
+          // other document (and so its chunk offsets line up). If the source can't be reached (offline,
+          // removed, or access expired), fall back to the ~500-char summary PM keeps offline.
+          try {
+            const full = await fetchIndexOnlyBody(doc.id);
+            if (!cancelled) {
+              setBody(full);
+              setBodyFull(true);
+            }
+          } catch (e) {
+            const summary = await readDocumentBody(doc.id).catch(() => "");
+            if (!cancelled) {
+              setBody(summary);
+              setBodyFull(false);
+              setIndexOnlyFallback(String(e));
+            }
+          }
+          return;
+        }
         const text = await readDocumentBody(doc.id);
-        if (!cancelled) setBody(text);
+        if (!cancelled) {
+          setBody(text);
+          setBodyFull(true);
+        }
       } catch (e) {
         if (!cancelled) setError(String(e));
       } finally {
@@ -81,7 +119,7 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [doc.id, doc.source_type, known]);
+  }, [doc.id, doc.source_type, known, isIndexOnly]);
 
   // Esc closes the reader (matches the app's other dismissible surfaces).
   useEffect(() => {
@@ -92,9 +130,9 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // The overlay only applies to Markdown-rendered docs — never over an image, never for index-only
-  // (whose "body" is the offline summary, not chunk-aligned).
-  const renderedAsMarkdown = body != null && image == null && !isIndexOnly;
+  // The overlay only applies where the body is the full text the offsets index — never over an image,
+  // and never over an index-only summary fallback (whose text the offsets don't align to).
+  const renderedAsMarkdown = body != null && image == null && (!isIndexOnly || bodyFull);
   const canOverlay = renderedAsMarkdown && showPower;
 
   async function toggleChunks() {
@@ -157,24 +195,70 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
             className="max-w-full rounded-[var(--radius-sm)]"
           />
         ) : isIndexOnly ? (
-          <IndexOnlyBody doc={doc} summary={body ?? ""} />
+          <IndexOnlyBody
+            doc={doc}
+            body={body ?? ""}
+            full={bodyFull}
+            fallbackReason={indexOnlyFallback}
+            showChunks={showChunks}
+            spans={spans}
+            stale={stale}
+            raw={devMode}
+          />
         ) : body != null ? (
-          showChunks && spans ? (
-            <>
-              {stale && <StaleNote />}
-              <ChunkOverlayView body={body} spans={spans} raw={devMode} />
-            </>
-          ) : (
-            <Markdown>{body}</Markdown>
-          )
+          <BodyView body={body} showChunks={showChunks} spans={spans} stale={stale} raw={devMode} />
         ) : null}
       </div>
     </aside>
   );
 }
 
-/** Index-only reader: the offline summary plus the one affordance to reach the real source. */
-function IndexOnlyBody({ doc, summary }: { doc: Document; summary: string }) {
+/** A rendered document body, optionally overlaid with the splitter's chunk boundaries. */
+function BodyView({
+  body,
+  showChunks,
+  spans,
+  stale,
+  raw,
+}: {
+  body: string;
+  showChunks: boolean;
+  spans: ChunkSpan[] | null;
+  stale: boolean;
+  raw: boolean;
+}) {
+  if (showChunks && spans) {
+    return (
+      <>
+        {stale && <StaleNote />}
+        <ChunkOverlayView body={body} spans={spans} raw={raw} />
+      </>
+    );
+  }
+  return <Markdown>{body}</Markdown>;
+}
+
+/** Index-only reader: the live-fetched full body when the source is reachable (so it reads like any
+ *  local document), otherwise the offline summary — always with one button to open the real source. */
+function IndexOnlyBody({
+  doc,
+  body,
+  full,
+  fallbackReason,
+  showChunks,
+  spans,
+  stale,
+  raw,
+}: {
+  doc: Document;
+  body: string;
+  full: boolean;
+  fallbackReason: string | null;
+  showChunks: boolean;
+  spans: ChunkSpan[] | null;
+  stale: boolean;
+  raw: boolean;
+}) {
   const isLocal = doc.source_id?.startsWith("local:") ?? false;
   return (
     <div>
@@ -187,17 +271,24 @@ function IndexOnlyBody({ doc, summary }: { doc: Document; summary: string }) {
           {isLocal ? "Reveal in file manager" : "Open source"}
         </button>
       )}
-      {summary ? (
+      {full ? (
         <div className="mt-3">
-          <Markdown>{summary}</Markdown>
+          <BodyView body={body} showChunks={showChunks} spans={spans} stale={stale} raw={raw} />
         </div>
       ) : (
-        <p className="mt-3 text-sm text-ink4">No offline summary is stored for this item.</p>
+        <>
+          <p className="mt-3 text-xs text-ink4">
+            {fallbackReason
+              ? "PM couldn't fetch the full text right now — the source may be offline, removed, or need re-authorising. Showing the summary it keeps offline."
+              : "No offline summary is stored for this item."}
+          </p>
+          {body && (
+            <div className="mt-2">
+              <Markdown>{body}</Markdown>
+            </div>
+          )}
+        </>
       )}
-      <p className="mt-3 text-xs text-ink4">
-        This item is indexed but its full text isn't stored offline — open the source to read it, or
-        use "Show full text" in the list to fetch it live.
-      </p>
     </div>
   );
 }
@@ -213,8 +304,26 @@ function ChunkOverlayView({
   spans: ChunkSpan[];
   raw: boolean;
 }) {
-  const segments = useMemo(() => segmentByLeaves(body, spans), [body, spans]);
+  const aligned = useMemo(() => offsetsAlignToBody(body, spans), [body, spans]);
+  const segments = useMemo(
+    () => (aligned ? segmentByLeaves(body, spans) : []),
+    [body, spans, aligned],
+  );
   const shades = useMemo(() => shadeBuckets(segments), [segments]);
+
+  // The stored offsets don't index this exact body (an index-only item re-embedded from its summary):
+  // render it plainly rather than paint boundaries in the wrong places.
+  if (!aligned) {
+    return (
+      <>
+        <div className="mb-3 rounded-[var(--radius-sm)] border border-border2 bg-surface px-3 py-2 text-xs text-ink3">
+          Chunk boundaries aren&apos;t available for this fetched copy — re-index this source to see
+          them.
+        </div>
+        <Markdown>{body}</Markdown>
+      </>
+    );
+  }
 
   if (segments.length === 0) {
     return <p className="text-sm text-ink4">No chunk spans to display for this document.</p>;
