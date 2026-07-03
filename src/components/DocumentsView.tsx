@@ -8,12 +8,10 @@ import {
   devApplyChangeEvent,
   devDocumentChunks,
   ensureSidecar,
-  fetchIndexOnlyBody,
   ingestPaths,
   installOptionalOcr,
   listDocuments,
   onOcrInstall,
-  openExternalRef,
   optionalOcrStatus,
   promoteIndexOnly,
   rebuildIndex,
@@ -29,6 +27,7 @@ import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { IngestProgress } from "./IngestProgress";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
+import { useReader } from "../lib/reader";
 
 type ItemStatus = "working" | "done" | "skipped" | "failed";
 interface ProgressItem {
@@ -108,31 +107,14 @@ export function DocumentsView({ onReviewClick }: Props) {
   const showHarness = isDevBuild && devMode;
   const [chunksFor, setChunksFor] = useState<number | null>(null);
   const [chunkPage, setChunkPage] = useState<DevTablePage | null>(null);
-  // Index-only "show full text": an index-only document's body is never stored — fetch it live from
-  // the source (Drive) on demand and show it inline.
-  const [bodyFor, setBodyFor] = useState<number | null>(null);
-  const [bodyText, setBodyText] = useState<string | null>(null);
-  const [bodyError, setBodyError] = useState<string | null>(null);
   // "Import fully" (promote): pull a Drive Sheet's full grid and index it locally, flipping it off
   // index-only. Tracks the in-flight doc id so its row shows progress + disables the button.
   const [promoting, setPromoting] = useState<number | null>(null);
-
-  async function toggleBody(docId: number) {
-    if (bodyFor === docId) {
-      setBodyFor(null);
-      setBodyText(null);
-      setBodyError(null);
-      return;
-    }
-    setBodyFor(docId);
-    setBodyText(null);
-    setBodyError(null);
-    try {
-      setBodyText(await fetchIndexOnlyBody(docId));
-    } catch (e) {
-      setBodyError(String(e));
-    }
-  }
+  // The document reader (docked right panel), mounted once at app scope. Clicking a row opens it onto
+  // that document — a read-only view onto existing state (rendered body + optional chunk overlay).
+  // For an index-only item the reader now fetches the full live body itself, so there's no separate
+  // "show full text" here anymore.
+  const { openReader, current: readerDoc } = useReader();
 
   // Promote a Drive Sheet (index-only) to a full local spreadsheet import. Fetches the whole grid,
   // indexes it locally, and reloads so the row reflects its new source type.
@@ -142,11 +124,6 @@ export function DocumentsView({ onReviewClick }: Props) {
     setError(null);
     try {
       await promoteIndexOnly(docId);
-      if (bodyFor === docId) {
-        setBodyFor(null);
-        setBodyText(null);
-        setBodyError(null);
-      }
       await refresh();
     } catch (e) {
       setError(String(e));
@@ -782,7 +759,12 @@ export function DocumentsView({ onReviewClick }: Props) {
                 <tbody>
                   {sortedDocuments.map((doc) => (
                     <Fragment key={doc.id}>
-                      <tr className="border-b border-rule">
+                      <tr
+                        onClick={() => openReader(doc)}
+                        className={`cursor-pointer border-b border-rule hover:bg-surface ${
+                          readerDoc?.id === doc.id ? "bg-accent-soft" : ""
+                        }`}
+                      >
                         <td className="py-2 pr-3">
                           <div className="flex items-center gap-2">
                             <div className="truncate text-ink" title={doc.title}>
@@ -791,32 +773,20 @@ export function DocumentsView({ onReviewClick }: Props) {
                             {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
                           </div>
                           {doc.source_type === "index_only" ? (
+                            // Row-level buttons stop propagation so they don't also open the reader.
+                            // Reading the full text and opening the source both live in the reader now
+                            // (click the row); only "Import fully" stays here as a one-off action.
                             <div className="mt-0.5 flex items-center gap-3 text-xs">
-                              {doc.external_ref && (
-                                <button
-                                  type="button"
-                                  onClick={() => void openExternalRef(doc.id)}
-                                  className="text-accent-text hover:brightness-110"
-                                >
-                                  Open in Drive
-                                </button>
-                              )}
-                              {doc.source_state !== "source_missing" && (
-                                <button
-                                  type="button"
-                                  onClick={() => void toggleBody(doc.id)}
-                                  className="text-accent-text hover:brightness-110"
-                                >
-                                  {bodyFor === doc.id ? "Hide text" : "Show full text"}
-                                </button>
-                              )}
                               {/* A Google Sheet (its webViewLink points at /spreadsheets/) can be
                                   imported fully — pulled grid-and-all into a local spreadsheet. */}
                               {doc.source_state !== "source_missing" &&
                                 doc.external_ref?.includes("/spreadsheets/") && (
                                   <button
                                     type="button"
-                                    onClick={() => void promote(doc.id)}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void promote(doc.id);
+                                    }}
                                     disabled={promoting != null}
                                     className="text-accent-text hover:brightness-110 disabled:opacity-50"
                                     title="Download the whole spreadsheet and index it locally"
@@ -850,7 +820,10 @@ export function DocumentsView({ onReviewClick }: Props) {
                           {devMode ? (
                             <button
                               type="button"
-                              onClick={() => toggleChunks(doc.id)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void toggleChunks(doc.id);
+                              }}
                               className="font-mono text-ink3 underline decoration-dotted underline-offset-2 hover:text-ink"
                               title="Inspect this document's chunk breakdown"
                             >
@@ -866,24 +839,6 @@ export function DocumentsView({ onReviewClick }: Props) {
                           </td>
                         )}
                       </tr>
-                      {/* Index-only "show full text": the live-fetched body, expanded under its row. */}
-                      {bodyFor === doc.id && (
-                        <tr>
-                          <td colSpan={showPower ? 5 : 4} className="pb-3">
-                            <div className="rounded-[var(--radius-sm)] border border-border bg-surface p-3">
-                              {bodyError ? (
-                                <p className="text-xs text-st-due">{bodyError}</p>
-                              ) : bodyText == null ? (
-                                <p className="text-xs text-ink4">Fetching from the source…</p>
-                              ) : (
-                                <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words font-sans text-xs text-ink3">
-                                  {bodyText}
-                                </pre>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      )}
                       {/* Dev-mode chunk breakdown, expanded directly under its document (read-only). */}
                       {devMode && chunksFor === doc.id && (
                         <tr>

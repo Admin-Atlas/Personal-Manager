@@ -1,7 +1,7 @@
 {
   "name": "pm",
   "private": true,
-  "version": "2.82.0-alpha",
+  "version": "2.83.0-alpha",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "scripts": {
@@ -23,7 +23,11 @@
     "d3-force": "^3.0.0",
     "d3-quadtree": "^3.0.1",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "rehype-external-links": "^3.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

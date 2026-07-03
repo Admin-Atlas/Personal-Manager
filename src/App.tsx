@@ -29,6 +29,7 @@ import { VaultUnlock } from "./components/VaultUnlock";
 import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
+import { ReaderProvider } from "./lib/reader";
 import { useChatStream } from "./lib/useChatStream";
 import { useProjectChat } from "./lib/useProjectChat";
 import { isNewChatTrigger } from "./lib/chatSession";
@@ -548,169 +549,173 @@ export default function App() {
 
   return (
     <HelpContext.Provider value={{ enabled: helpMode, setEnabled: updateHelpMode }}>
-      <div className={`flex h-full flex-col bg-bg text-ink ${helpMode ? "help-mode" : ""}`}>
-        <UpdateBanner update={update} />
-        <div className="relative flex flex-1 overflow-hidden">
-          <Sidebar
-            view={view}
-            onNavigate={setView}
-            conversations={inProject ? projectChat.conversations : conversations}
-            activeId={inProject ? projectChat.convId : activeId}
-            reviewCount={reviewCount}
-            onSelect={
-              inProject
-                ? projectChat.openConversation
-                : (id) => {
-                    setView("chat");
-                    selectConversation(id);
-                  }
-            }
-            onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
-            onMove={inProject ? projectChat.moveConversation : handleMoveConversation}
-            onNew={
-              inProject
-                ? projectChat.newChat
-                : () => {
-                    setView("chat");
-                    newConversation();
-                  }
-            }
-            onOpenSettings={() => setShowSettings(true)}
-            onOpenWhatsNew={() => setShowWhatsNew(true)}
-            onOpenPalette={() => setShowPalette(true)}
-            chatModel={settings?.chat_models[0] ?? null}
-            backgroundModel={settings?.background_models[0] ?? null}
-            chatFallbacks={
-              settings?.chat_auto_switch ? Math.max(0, settings.chat_models.length - 1) : 0
-            }
-            backgroundFallbacks={
-              settings?.background_auto_switch
-                ? Math.max(0, settings.background_models.length - 1)
-                : 0
-            }
-          />
-
-          {view === "focus" ? (
-            <main className="flex h-full flex-1 flex-col">
-              <FocusView onOpenProject={openProject} onAsk={askInChat} />
-            </main>
-          ) : view === "project" && selectedProject ? (
-            <main className="flex h-full flex-1 flex-col">
-              <ProjectView
-                project={selectedProject}
-                chat={projectChat}
-                focusDocId={selectedDocId}
-                onOpenChatCitation={openChatCitation}
-                onBack={() => setView("focus")}
-              />
-            </main>
-          ) : view === "calendar" ? (
-            <main className="flex h-full flex-1 flex-col">
-              <CalendarView />
-            </main>
-          ) : view === "documents" ? (
-            <main className="flex h-full flex-1 flex-col">
-              {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
-              <DocumentsView onReviewClick={teachVisible ? () => setView("review") : undefined} />
-            </main>
-          ) : view === "review" ? (
-            <main className="flex h-full flex-1 flex-col">
-              <ReviewView onChanged={refreshReviewCount} />
-            </main>
-          ) : view === "teach" ? (
-            <main className="flex h-full flex-1 flex-col">
-              <TeachView />
-            </main>
-          ) : view === "graph" ? (
-            <main className="flex h-full flex-1 flex-col">
-              <GraphView onOpenProject={openProject} />
-            </main>
-          ) : view === "pinboard" ? (
-            <main className="flex h-full flex-1 flex-col">
-              <PinboardView />
-            </main>
-          ) : view === "dev" ? (
-            <main className="flex h-full flex-1 flex-col">
-              <DevView />
-            </main>
-          ) : (
-            <main className="flex h-full flex-1 flex-col">
-              {chat.error && (
-                <div
-                  className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
-                  style={{
-                    background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                  }}
-                >
-                  {chat.error}
-                </div>
-              )}
-              {activeConv && (
-                <div className="flex items-center border-b border-rule px-4 py-2">
-                  <ConversationTitle
-                    conversationId={activeConv.id}
-                    title={activeConv.title}
-                    onRenamed={(title) =>
-                      setConversations((prev) =>
-                        prev.map((c) => (c.id === activeConv.id ? { ...c, title } : c)),
-                      )
-                    }
-                  />
-                </div>
-              )}
-              <ChatView
-                messages={chat.messages}
-                streaming={chat.streaming}
-                onOpenChatCitation={openChatCitation}
-                focusTurn={focusTurn}
-              />
-              <ContextMeter
-                conversationId={activeId}
-                refreshKey={chat.messages.length}
-                onUpgrade={handleUpgrade}
-              />
-              <RetrievalExplainPanel messages={chat.messages} />
-              <Composer disabled={chat.sending} onSend={handleSend} />
-            </main>
-          )}
-
-          {showSettings && (
-            <div className="absolute inset-0 z-50" style={{ background: "rgba(8,6,4,0.5)" }}>
-              <SettingsView
-                onboarding={false}
-                onClose={() => {
-                  setShowSettings(false);
-                  refreshSettings();
-                }}
-                onOpenDev={() => {
-                  setShowSettings(false);
-                  setView("dev");
-                }}
-              />
-            </div>
-          )}
-
-          {showWhatsNew && (
-            <div className="absolute inset-0 z-50" style={{ background: "rgba(8,6,4,0.5)" }}>
-              <WhatsNew onClose={closeWhatsNew} currentVersion={appVersion} />
-            </div>
-          )}
-
-          {showPalette && (
-            <CommandPalette
-              onClose={() => setShowPalette(false)}
-              onOpenProject={openProject}
-              onOpenConversation={(id) => {
-                setView("chat");
-                selectConversation(id);
-              }}
+      {/* The document reader mounts once here so any surface — Documents, a project's file list, a
+          chat citation — can open it via useReader(). Closes itself when the top-level view changes. */}
+      <ReaderProvider view={view}>
+        <div className={`flex h-full flex-col bg-bg text-ink ${helpMode ? "help-mode" : ""}`}>
+          <UpdateBanner update={update} />
+          <div className="relative flex flex-1 overflow-hidden">
+            <Sidebar
+              view={view}
               onNavigate={setView}
+              conversations={inProject ? projectChat.conversations : conversations}
+              activeId={inProject ? projectChat.convId : activeId}
+              reviewCount={reviewCount}
+              onSelect={
+                inProject
+                  ? projectChat.openConversation
+                  : (id) => {
+                      setView("chat");
+                      selectConversation(id);
+                    }
+              }
+              onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
+              onMove={inProject ? projectChat.moveConversation : handleMoveConversation}
+              onNew={
+                inProject
+                  ? projectChat.newChat
+                  : () => {
+                      setView("chat");
+                      newConversation();
+                    }
+              }
               onOpenSettings={() => setShowSettings(true)}
+              onOpenWhatsNew={() => setShowWhatsNew(true)}
+              onOpenPalette={() => setShowPalette(true)}
+              chatModel={settings?.chat_models[0] ?? null}
+              backgroundModel={settings?.background_models[0] ?? null}
+              chatFallbacks={
+                settings?.chat_auto_switch ? Math.max(0, settings.chat_models.length - 1) : 0
+              }
+              backgroundFallbacks={
+                settings?.background_auto_switch
+                  ? Math.max(0, settings.background_models.length - 1)
+                  : 0
+              }
             />
-          )}
+
+            {view === "focus" ? (
+              <main className="flex h-full flex-1 flex-col">
+                <FocusView onOpenProject={openProject} onAsk={askInChat} />
+              </main>
+            ) : view === "project" && selectedProject ? (
+              <main className="flex h-full flex-1 flex-col">
+                <ProjectView
+                  project={selectedProject}
+                  chat={projectChat}
+                  focusDocId={selectedDocId}
+                  onOpenChatCitation={openChatCitation}
+                  onBack={() => setView("focus")}
+                />
+              </main>
+            ) : view === "calendar" ? (
+              <main className="flex h-full flex-1 flex-col">
+                <CalendarView />
+              </main>
+            ) : view === "documents" ? (
+              <main className="flex h-full flex-1 flex-col">
+                {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
+                <DocumentsView onReviewClick={teachVisible ? () => setView("review") : undefined} />
+              </main>
+            ) : view === "review" ? (
+              <main className="flex h-full flex-1 flex-col">
+                <ReviewView onChanged={refreshReviewCount} />
+              </main>
+            ) : view === "teach" ? (
+              <main className="flex h-full flex-1 flex-col">
+                <TeachView />
+              </main>
+            ) : view === "graph" ? (
+              <main className="flex h-full flex-1 flex-col">
+                <GraphView onOpenProject={openProject} />
+              </main>
+            ) : view === "pinboard" ? (
+              <main className="flex h-full flex-1 flex-col">
+                <PinboardView />
+              </main>
+            ) : view === "dev" ? (
+              <main className="flex h-full flex-1 flex-col">
+                <DevView />
+              </main>
+            ) : (
+              <main className="flex h-full flex-1 flex-col">
+                {chat.error && (
+                  <div
+                    className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
+                    style={{
+                      background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+                    }}
+                  >
+                    {chat.error}
+                  </div>
+                )}
+                {activeConv && (
+                  <div className="flex items-center border-b border-rule px-4 py-2">
+                    <ConversationTitle
+                      conversationId={activeConv.id}
+                      title={activeConv.title}
+                      onRenamed={(title) =>
+                        setConversations((prev) =>
+                          prev.map((c) => (c.id === activeConv.id ? { ...c, title } : c)),
+                        )
+                      }
+                    />
+                  </div>
+                )}
+                <ChatView
+                  messages={chat.messages}
+                  streaming={chat.streaming}
+                  onOpenChatCitation={openChatCitation}
+                  focusTurn={focusTurn}
+                />
+                <ContextMeter
+                  conversationId={activeId}
+                  refreshKey={chat.messages.length}
+                  onUpgrade={handleUpgrade}
+                />
+                <RetrievalExplainPanel messages={chat.messages} />
+                <Composer disabled={chat.sending} onSend={handleSend} />
+              </main>
+            )}
+
+            {showSettings && (
+              <div className="absolute inset-0 z-50" style={{ background: "rgba(8,6,4,0.5)" }}>
+                <SettingsView
+                  onboarding={false}
+                  onClose={() => {
+                    setShowSettings(false);
+                    refreshSettings();
+                  }}
+                  onOpenDev={() => {
+                    setShowSettings(false);
+                    setView("dev");
+                  }}
+                />
+              </div>
+            )}
+
+            {showWhatsNew && (
+              <div className="absolute inset-0 z-50" style={{ background: "rgba(8,6,4,0.5)" }}>
+                <WhatsNew onClose={closeWhatsNew} currentVersion={appVersion} />
+              </div>
+            )}
+
+            {showPalette && (
+              <CommandPalette
+                onClose={() => setShowPalette(false)}
+                onOpenProject={openProject}
+                onOpenConversation={(id) => {
+                  setView("chat");
+                  selectConversation(id);
+                }}
+                onNavigate={setView}
+                onOpenSettings={() => setShowSettings(true)}
+              />
+            )}
+          </div>
+          <HelpOverlay />
         </div>
-        <HelpOverlay />
-      </div>
+      </ReaderProvider>
     </HelpContext.Provider>
   );
 }

@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.83.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "You can now read your documents right inside PM. Click any item in the Documents list — or a file in a project, or a source a chat answer cites — and it opens in a reading panel beside it, without hunting for it first. Your notes, spreadsheets and saved conversations render cleanly with headings, lists and tables, and a photo shows its original image (or, if you didn't save the image, the text PM read from it). For an item you keep in Google Drive, OneDrive or a folder on your own computer, the reader now fetches and shows the full text (falling back to the offline summary if the source can't be reached), plus one button to open the original at its source — opening the web link, or revealing the file in your file manager. The old “Open in Drive” link and the separate “Show full text” button have both folded into this panel. Drag the panel's left edge to widen it up to half the window, and it now sits below the title bar so the window's own controls stay within reach.",
+      "Sources are now clickable everywhere they appear. When a chat answer lists the documents it drew from — in the main chat or a project's own chat — click one to open it in the reader and see exactly what PM was working from, then close it and carry on.",
+      "For power users: turn the density up to Power and the reader gains a “Show chunks” view that paints the exact boundaries PM used to split a document for search, shading each chunk as its own band so you can see how a file was divided from top to bottom (for anything with full text, including your cloud and folder items). It's read-only, and (in developer mode) can show the raw source with the same boundaries. Nothing is re-indexed or changed by looking.",
+    ],
+  },
+  {
     version: "2.82.0-alpha",
     date: "2026-07-03",
     highlights: [

@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { Citation, Message } from "../lib/types";
 import { useDepth } from "../theme";
+import { useReader } from "../lib/reader";
 import { formatDate } from "../lib/format";
 
 interface Props {
@@ -104,6 +105,9 @@ function Sources({
   flash: number | null;
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
 }) {
+  // A document citation opens the shared reader onto that document (mounted at app scope), so the user
+  // can see what the answer drew from without leaving the conversation.
+  const { openReaderById } = useReader();
   return (
     <div className="flex justify-start" data-help="chat-sources">
       <div className="max-w-[80%] text-xs text-ink4">
@@ -111,7 +115,7 @@ function Sources({
         <ol className="mt-1 flex flex-col gap-0.5">
           {citations.map((c, i) => {
             // A chat citation reads "from [chat], DATE" and opens the archived conversation at the
-            // cited turn; a document citation stays a plain "[n] title" source (card 7E PR3).
+            // cited turn; a document citation opens that document in the reader (card 7E PR3).
             const chatLink = c.is_chat && c.conversation_id != null && onOpenChatCitation;
             return (
               <li
@@ -136,7 +140,13 @@ function Sources({
                     {c.dated ? `, ${formatDate(c.dated)}` : ""}
                   </button>
                 ) : (
-                  c.title
+                  <button
+                    type="button"
+                    onClick={() => openReaderById(c.document_id)}
+                    className="border-0 bg-transparent p-0 text-left align-baseline text-accent-text underline decoration-dotted underline-offset-2 transition hover:brightness-110 motion-reduce:transition-none"
+                  >
+                    {c.title}
+                  </button>
                 )}
               </li>
             );
