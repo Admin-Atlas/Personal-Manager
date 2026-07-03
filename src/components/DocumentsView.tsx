@@ -15,6 +15,7 @@ import {
   onOcrInstall,
   openExternalRef,
   optionalOcrStatus,
+  promoteIndexOnly,
   rebuildIndex,
   sidecarStatus,
   vaultStatus,
@@ -112,6 +113,9 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [bodyFor, setBodyFor] = useState<number | null>(null);
   const [bodyText, setBodyText] = useState<string | null>(null);
   const [bodyError, setBodyError] = useState<string | null>(null);
+  // "Import fully" (promote): pull a Drive Sheet's full grid and index it locally, flipping it off
+  // index-only. Tracks the in-flight doc id so its row shows progress + disables the button.
+  const [promoting, setPromoting] = useState<number | null>(null);
 
   async function toggleBody(docId: number) {
     if (bodyFor === docId) {
@@ -127,6 +131,27 @@ export function DocumentsView({ onReviewClick }: Props) {
       setBodyText(await fetchIndexOnlyBody(docId));
     } catch (e) {
       setBodyError(String(e));
+    }
+  }
+
+  // Promote a Drive Sheet (index-only) to a full local spreadsheet import. Fetches the whole grid,
+  // indexes it locally, and reloads so the row reflects its new source type.
+  async function promote(docId: number) {
+    if (promoting != null) return;
+    setPromoting(docId);
+    setError(null);
+    try {
+      await promoteIndexOnly(docId);
+      if (bodyFor === docId) {
+        setBodyFor(null);
+        setBodyText(null);
+        setBodyError(null);
+      }
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPromoting(null);
     }
   }
 
@@ -785,6 +810,20 @@ export function DocumentsView({ onReviewClick }: Props) {
                                   {bodyFor === doc.id ? "Hide text" : "Show full text"}
                                 </button>
                               )}
+                              {/* A Google Sheet (its webViewLink points at /spreadsheets/) can be
+                                  imported fully — pulled grid-and-all into a local spreadsheet. */}
+                              {doc.source_state !== "source_missing" &&
+                                doc.external_ref?.includes("/spreadsheets/") && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void promote(doc.id)}
+                                    disabled={promoting != null}
+                                    className="text-accent-text hover:brightness-110 disabled:opacity-50"
+                                    title="Download the whole spreadsheet and index it locally"
+                                  >
+                                    {promoting === doc.id ? "Importing…" : "Import fully"}
+                                  </button>
+                                )}
                             </div>
                           ) : (
                             doc.source_path && (

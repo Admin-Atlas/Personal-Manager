@@ -40,6 +40,18 @@ const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
 const SHEETS_API: &str = "https://sheets.googleapis.com/v4/spreadsheets";
 /// The Google-native Sheet MIME type (routed to the metadata-only path, not a full-grid CSV export).
 const SHEET_MIME: &str = "application/vnd.google-apps.spreadsheet";
+/// The export MIME for pulling a Google Sheet's FULL grid as an `.xlsx` workbook — every tab
+/// preserved with its cell types. Used ONLY by the "import fully" promote flow ([`export_sheet_xlsx`]);
+/// the index-only sync never fetches the grid. `.xlsx` (not CSV) so a multi-tab workbook survives in
+/// one file, which the local spreadsheet processor then parses tab-by-tab.
+const SHEET_EXPORT_XLSX_MIME: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+/// Whether a Drive MIME type is a Google Sheet — the promote flow gate (only a Sheet has a full grid
+/// to import). `SHEET_MIME` is module-private, so this is the public predicate the command uses.
+pub fn is_sheet(mime: &str) -> bool {
+    mime == SHEET_MIME
+}
 /// Cap on a single fetched/exported file body (25 MiB) so one huge file can't balloon memory; an
 /// over-cap file is skipped with a surfaced note rather than indexed.
 const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
@@ -447,10 +459,18 @@ pub fn forget_all_accounts(conn: &Connection) -> Result<()> {
 
 /// The persisted state of a Drive item, in the shape the foundation's reducer needs (or `None` if the
 /// source id has never been seen).
+///
+/// Matches on `source_id` ALONE — deliberately NOT restricted to `source_type = 'index_only'` — so a
+/// document that was **promoted to a full local import** (["import fully"](crate::ingest::promote_spreadsheet),
+/// which flips its `source_type` off `index_only` but keeps the Drive `source_id` as a claim marker) is
+/// still seen as the item's current state. That makes the sync reducer treat the promoted file as
+/// present-and-reachable: an `Add` re-fires as a `Noop` (never re-ingesting a second, index-only copy)
+/// instead of an `IngestNew`. Only index-only and promoted-Drive docs ever carry a `gdrive:` id, so
+/// widening the match can't pull in an unrelated row.
 pub fn read_item_state(conn: &Connection, source_id: &str) -> Result<Option<ItemState>> {
     conn.query_row(
         "SELECT source_modified_at, source_content_hash, source_state \
-         FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
+         FROM documents WHERE source_id = ?1",
         params![source_id],
         |r| {
             Ok((
@@ -1265,6 +1285,29 @@ pub async fn fetch_file(token_key: &str, file_id: &str) -> Result<DriveFile> {
     parse_file(&v).ok_or_else(|| Error::Other("Drive returned no file for that id.".into()))
 }
 
+/// Export a Google Sheet's FULL grid as an `.xlsx` workbook to a temp file, for the "import fully"
+/// promote flow — the ONE place the whole grid is fetched (the index-only sync only ever pulls
+/// metadata). The temp file keeps an `.xlsx` extension so the local spreadsheet processor picks the
+/// right (openpyxl) parser; the caller removes it after ingest. Capped at [`MAX_FILE_BYTES`], but
+/// Google's `export` endpoint itself refuses sheets over ~10 MB, so a very large sheet surfaces a
+/// clear error here rather than importing a partial grid.
+pub async fn export_sheet_xlsx(token_key: &str, file: &DriveFile) -> Result<PathBuf> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/files/{}/export", file.id))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("mimeType", SHEET_EXPORT_XLSX_MIME)
+        .append_pair("supportsAllDrives", "true");
+    let bytes = google::authorized_get_bytes(token_key, url.as_str(), MAX_FILE_BYTES).await?;
+    if bytes.is_empty() {
+        return Err(Error::Other(
+            "Google returned an empty export for this spreadsheet.".into(),
+        ));
+    }
+    // Force an `.xlsx` name (the Sheet's own name has no extension) so `stage_temp` tags the temp file
+    // correctly for the extension-routed sidecar parser.
+    stage_temp("export.xlsx", &bytes)
+}
+
 /// Resolve a folder id to its display name — the label a synced file is tagged with. A folder is just
 /// a file in Drive, so this projects only `name`. Best-effort: `None` if the folder can't be reached
 /// (deleted, out of scope, or the id was never resolvable), since folder context is a soft review hint
@@ -1599,6 +1642,39 @@ mod tests {
         assert!(sid.starts_with("gdrive:a@b.com:"));
         assert_eq!(account_of(&sid).as_deref(), Some("a@b.com"));
         assert_eq!(account_of("not-a-drive-id"), None);
+    }
+
+    #[test]
+    fn is_sheet_matches_only_the_sheet_mime() {
+        assert!(is_sheet("application/vnd.google-apps.spreadsheet"));
+        assert!(!is_sheet("application/vnd.google-apps.document"));
+        assert!(!is_sheet("text/csv"));
+    }
+
+    #[test]
+    fn read_item_state_claims_a_promoted_row() {
+        // A promoted Sheet keeps its `gdrive:` source_id under source_type='spreadsheet'. read_item_state
+        // must still see it (it matches on source_id alone) so the sync treats the still-present source as
+        // already-imported and no-ops instead of re-ingesting an index-only duplicate.
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), key).unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type, source_id, \
+                    source_state, source_content_hash) \
+             VALUES ('v.md','Budget','h1','spreadsheet','gdrive:a@b.com:F1','ok','hash1')",
+            [],
+        )
+        .unwrap();
+        let st = read_item_state(&conn, "gdrive:a@b.com:F1")
+            .unwrap()
+            .expect("a promoted row is still a known item");
+        assert_eq!(st.source_content_hash.as_deref(), Some("hash1"));
+        assert_eq!(st.source_state, SourceState::Ok);
+        // An unknown id is still None.
+        assert!(read_item_state(&conn, "gdrive:a@b.com:NOPE")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

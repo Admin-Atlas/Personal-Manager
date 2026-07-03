@@ -318,6 +318,8 @@ fn ingest_one(
         reviewed: false,
         photo: None,
         spreadsheet: None,
+        source_id: None,
+        external_ref: None,
     };
     cipher.write_to(
         &vault.join(&vault_name),
@@ -468,6 +470,8 @@ fn ingest_photo(
         reviewed: false,
         photo: Some(&photo),
         spreadsheet: None,
+        source_id: None,
+        external_ref: None,
     };
     cipher.write_to(&vault.join(&vault_name), &render_markdown(&front, &body))?;
 
@@ -555,6 +559,8 @@ fn ingest_spreadsheet(
         reviewed: false,
         photo: None,
         spreadsheet: Some(&record),
+        source_id: None,
+        external_ref: None,
     };
     cipher.write_to(&vault.join(&vault_name), &render_markdown(&front, &body))?;
 
@@ -576,6 +582,223 @@ fn ingest_spreadsheet(
     };
     let document = index_document(state, &meta, &chunks, &embeddings, None, Some(&record))?;
     Ok(Outcome::Indexed(document))
+}
+
+/// Promote an index-only document to a **full local spreadsheet import** — the "import fully" flow. The
+/// caller (the promote command) has already exported the source's full grid to `path` (an `.xlsx`
+/// staged from Drive). This parses it values-only, shapes the synthetic sheet body exactly like a fresh
+/// [`ingest_spreadsheet`], and then transforms the document **in place** (same `doc_id`): its chunks are
+/// swapped from the index-only summary to the real leaves, a `spreadsheets` satellite row is added, and
+/// `source_type` flips `index_only` → `spreadsheet`. The user's classification (project / tags /
+/// importance / reviewed / entity link) is preserved, and the vault Markdown becomes the source of truth
+/// (so it rebuilds from disk, and the truth-writer now routes to front-matter, not the manifest).
+///
+/// Two ghost-prevention invariants make this safe against re-duplication:
+/// 1. The document **keeps its `source_id`** (+ `external_ref` + pointer hashes) as a *claim marker* —
+///    round-tripped through the vault front-matter so it survives a Rebuild — so the connector sync sees
+///    the still-present source as already-imported ([`crate::drive::read_item_state`]) and no-ops.
+/// 2. The source is **stripped from the encrypted manifest** ([`crate::index_only::forget_source`]) so
+///    `merged_manifest`'s DB-∪-file union can't resurrect it as an index-only pointer.
+#[allow(clippy::too_many_arguments)]
+pub fn promote_spreadsheet(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    vault_root: &Path,
+    manifest_cipher: &crate::index_only::ManifestCipher,
+    doc_id: i64,
+    path: &Path,
+    ext: Option<&str>,
+) -> Result<Document> {
+    // 1. Read the existing row's identity + classification (short lock). Promotion is only valid on an
+    //    index-only document that still carries a source pointer.
+    #[allow(clippy::type_complexity)]
+    let (
+        source_id,
+        external_ref,
+        project,
+        tags,
+        importance,
+        reviewed,
+        title,
+        created_at,
+        now,
+    ): (
+        String,
+        Option<String>,
+        String,
+        Vec<String>,
+        Option<String>,
+        bool,
+        String,
+        Option<String>,
+        String,
+    ) = {
+        let conn = state.conn()?;
+        let (source_type, source_id, external_ref, project, tags_json, importance, reviewed, title, created_at): (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT source_type, source_id, external_ref, project, tags, importance, reviewed, \
+                    title, created_at \
+             FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            },
+        )?;
+        if source_type != SOURCE_TYPE_INDEX_ONLY {
+            return Err(Error::Other(
+                "This document is already imported locally.".into(),
+            ));
+        }
+        let source_id = source_id.ok_or_else(|| {
+            Error::Other("This indexed item has no source pointer to import from.".into())
+        })?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        let now = iso_now(&conn)?;
+        (
+            source_id,
+            external_ref,
+            project,
+            tags,
+            importance,
+            reviewed != 0,
+            title,
+            created_at,
+            now,
+        )
+    };
+
+    // 2. Parse the exported grid values-only (sidecar; no lock) and shape the synthetic sheet body — the
+    //    exact same shaping a locally-dropped spreadsheet gets.
+    let sheets = state.sidecar.analyze_spreadsheet(path, ext.unwrap_or(""))?;
+    let Some((body, record)) = spreadsheets::to_markdown(&sheets) else {
+        return Err(Error::Other(
+            "This spreadsheet has no readable rows to import.".into(),
+        ));
+    };
+    let content_hash = hex_digest(body.as_bytes());
+    let byte_size = std::fs::metadata(path).map(|m| m.len() as i64).ok();
+
+    // 3. Don't import content that already exists as another local document (e.g. the same file was also
+    //    dropped in by hand) — that would violate the `content_hash` UNIQUE constraint at commit anyway.
+    {
+        let conn = state.conn()?;
+        let clashes: bool = conn
+            .query_row(
+                "SELECT 1 FROM documents WHERE content_hash = ?1 AND id != ?2",
+                params![content_hash, doc_id],
+                |_| Ok(()),
+            )
+            .optional_exists()?;
+        if clashes {
+            return Err(Error::Other(
+                "This spreadsheet is already imported locally.".into(),
+            ));
+        }
+    }
+
+    // 4. Chunk + embed the full body off the lock, like a fresh ingest.
+    let chunks = split_document(gateway, &body, &title, &content_hash)?;
+    let texts = leaf_embed_texts(&chunks);
+    let embeddings = gateway.embed_documents(&texts)?;
+    check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
+
+    // 5. Write the vault truth BEFORE the swap, carrying the preserved classification + the connector
+    //    pointer (so a Rebuild reproduces the promoted document, claim included).
+    let created = created_at.as_deref().unwrap_or(now.as_str());
+    let vault_name = cipher.on_disk_name(&vault_filename(&title, &content_hash));
+    let front = Frontmatter {
+        title: &title,
+        source_path: "",
+        ext,
+        content_hash: &content_hash,
+        created_at: created,
+        ingested_at: &now,
+        project: &project,
+        tags: &tags,
+        importance: importance.as_deref(),
+        last_activity: &now,
+        reviewed,
+        photo: None,
+        spreadsheet: Some(&record),
+        source_id: Some(&source_id),
+        external_ref: external_ref.as_deref(),
+    };
+    let vault_file = vault.join(&vault_name);
+    cipher.write_to(&vault_file, &render_markdown(&front, &body))?;
+
+    // 6. Flip the row in place (same doc_id → keeps classification, entity link, and any citations): swap
+    //    the index-only summary chunk for the real leaves, add the satellite row, and clear the
+    //    index-only-only columns — but KEEP `source_id`/`external_ref` (the claim marker) and set the
+    //    state to a reachable, fully-stored spreadsheet.
+    let swap = (|| -> Result<()> {
+        let mut conn = state.conn()?;
+        let tx = conn.transaction()?;
+        replace_chunks(&tx, doc_id, &chunks, &embeddings, false, None)?;
+        tx.execute(
+            "INSERT INTO spreadsheets (document_id, sheet_count, total_rows, chunked_rows) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                doc_id,
+                record.sheet_count,
+                record.total_rows,
+                record.chunked_rows
+            ],
+        )?;
+        tx.execute(
+            "UPDATE documents SET source_type = ?2, source_state = ?3, vault_path = ?4, \
+                    content_hash = ?5, ext = ?6, byte_size = ?7, source_path = NULL, \
+                    stored_summary = NULL, source_parent_folder_id = NULL, \
+                    source_parent_folder_name = NULL, ingested_at = ?8, last_activity = ?8 \
+             WHERE id = ?1",
+            params![
+                doc_id,
+                SOURCE_TYPE_SPREADSHEET,
+                SOURCE_STATE_OK,
+                vault_name,
+                content_hash,
+                ext,
+                byte_size,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(e) = swap {
+        // The DB swap rolled back with its transaction; remove the vault file written in step 5 so a
+        // failed promote leaves no orphan.
+        let _ = std::fs::remove_file(&vault_file);
+        return Err(e);
+    }
+
+    // 7. Strip the promoted source from the encrypted manifest so it can't be resurrected as an
+    //    index-only ghost. AFTER the commit — the DB mirror already excludes it, so even a racing sync's
+    //    `write_synced` can only re-add it from the file, which this then removes.
+    crate::index_only::forget_source(vault_root, manifest_cipher, &source_id)?;
+
+    let conn = state.conn()?;
+    load_document(&conn, doc_id)
 }
 
 /// Copy a photo's original bytes into `vault/photos/<hash>.<ext>` following the vault cipher (so an
@@ -809,7 +1032,15 @@ fn rebuild_one(
         source: if photo.is_some() {
             SourceMeta::photo()
         } else if spreadsheet.is_some() {
-            SourceMeta::spreadsheet()
+            // A promoted spreadsheet round-trips its connector claim: restore the `source_id` (so the
+            // next sync recognises the still-present source as already-imported instead of re-indexing a
+            // duplicate) + its `external_ref` (the Drive link). A locally-ingested spreadsheet has
+            // neither front-matter line, so both stay `None` — indistinguishable from before.
+            SourceMeta {
+                source_id: fields.get("source_id").cloned(),
+                external_ref: fields.get("external_ref").cloned(),
+                ..SourceMeta::spreadsheet()
+            }
         } else {
             SourceMeta::default()
         },
@@ -1526,6 +1757,11 @@ fn rewrite_vault_metadata(
         reviewed,
         photo: photo.as_ref(),
         spreadsheet: spreadsheet.as_ref(),
+        // Preserve a promoted document's remote pointer across an organisation edit, so filing it into a
+        // project doesn't strip the `source_id`/`external_ref` a later Rebuild needs (a plain vault
+        // document has neither line → both `None`, unchanged behaviour).
+        source_id: fields.get("source_id").map(String::as_str),
+        external_ref: fields.get("external_ref").map(String::as_str),
     };
     cipher.write_to(&file, &render_markdown(&front, body))?;
 
@@ -1625,6 +1861,12 @@ struct Frontmatter<'a> {
     /// Present only for a spreadsheet: appends `source_type: spreadsheet` + the satellite counts so a
     /// Rebuild reconstructs the `spreadsheets` row. Mutually exclusive with `photo`; `None` otherwise.
     spreadsheet: Option<&'a SpreadsheetRecord>,
+    /// The remote source id + link a **promoted** index-only document keeps, so the claim survives a
+    /// Rebuild: without it the rebuilt row would drop the `source_id` and the next connector sync would
+    /// re-index the (still-present) source as a duplicate index-only pointer. `None` for every ordinary
+    /// vault ingest (a local file has no remote pointer). Only the spreadsheet arm reads them back today.
+    source_id: Option<&'a str>,
+    external_ref: Option<&'a str>,
 }
 
 /// Render YAML front-matter + body. `tags` is written flow-style on one line
@@ -1645,7 +1887,7 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
          importance: {}\n\
          last_activity: {}\n\
          reviewed: {}\n\
-         {}{}---\n\n{}\n",
+         {}{}{}---\n\n{}\n",
         yaml_quote(f.title),
         yaml_quote(f.source_path),
         f.ext.unwrap_or(""),
@@ -1657,12 +1899,27 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
         importance,
         f.last_activity,
         f.reviewed,
+        render_source_pointer(f.source_id, f.external_ref),
         f.photo.map(render_photo_block).unwrap_or_default(),
         f.spreadsheet
             .map(render_spreadsheet_block)
             .unwrap_or_default(),
         body,
     )
+}
+
+/// The remote-pointer front-matter lines a promoted index-only document carries (`source_id` +
+/// `external_ref`), emitted only when set. Kept out of the source-type blocks so it composes with any
+/// of them; `rebuild_one` reads them back to restore the connector claim (see [`Frontmatter::source_id`]).
+fn render_source_pointer(source_id: Option<&str>, external_ref: Option<&str>) -> String {
+    let mut s = String::new();
+    if let Some(id) = source_id {
+        s.push_str(&format!("source_id: {}\n", yaml_quote(id)));
+    }
+    if let Some(r) = external_ref {
+        s.push_str(&format!("external_ref: {}\n", yaml_quote(r)));
+    }
+    s
 }
 
 /// The photo-specific front-matter lines (only present for a photo). `source_type: photo` is the
@@ -2433,6 +2690,8 @@ mod tests {
             reviewed: true,
             photo: None,
             spreadsheet: None,
+            source_id: None,
+            external_ref: None,
         };
         let rendered = render_markdown(&front, "Body text here.");
         let (fields, body) = parse_frontmatter(&rendered).unwrap();
@@ -2485,6 +2744,8 @@ mod tests {
             reviewed: false,
             photo: Some(&rec),
             spreadsheet: None,
+            source_id: None,
+            external_ref: None,
         };
         let rendered = render_markdown(&front, &body);
         let (fields, parsed_body) = parse_frontmatter(&rendered).unwrap();
@@ -2511,6 +2772,8 @@ mod tests {
                 reviewed: false,
                 photo: None,
                 spreadsheet: None,
+                source_id: None,
+                external_ref: None,
             },
             "just text",
         );
@@ -2543,6 +2806,8 @@ mod tests {
             reviewed: false,
             photo: None,
             spreadsheet: Some(&rec),
+            source_id: None,
+            external_ref: None,
         };
         let rendered = render_markdown(&front, "## Sheet: Budget\n\n### Overview\n\ntext\n");
         let (fields, _) = parse_frontmatter(&rendered).unwrap();
@@ -2574,11 +2839,75 @@ mod tests {
                 reviewed: false,
                 photo: None,
                 spreadsheet: None,
+                source_id: None,
+                external_ref: None,
             },
             "just text",
         );
         let (pf, _) = parse_frontmatter(&plain).unwrap();
         assert!(spreadsheet_from_fields(&pf).is_none());
+    }
+
+    #[test]
+    fn promoted_spreadsheet_frontmatter_round_trips_the_connector_claim() {
+        // A promoted Sheet must keep its `source_id` (+ Drive link) through the vault front-matter, so a
+        // Rebuild reconstructs the claim and the next sync recognises the still-present source instead of
+        // re-indexing it as an index-only duplicate.
+        let rec = SpreadsheetRecord {
+            sheet_count: 2,
+            total_rows: 30,
+            chunked_rows: 30,
+        };
+        let front = Frontmatter {
+            title: "Budget",
+            source_path: "",
+            ext: Some("xlsx"),
+            content_hash: "abc",
+            created_at: "2026-07-01",
+            ingested_at: "2026-07-03T00:00:00.000Z",
+            project: "Finances",
+            tags: &[],
+            importance: None,
+            last_activity: "2026-07-03T00:00:00.000Z",
+            reviewed: true,
+            photo: None,
+            spreadsheet: Some(&rec),
+            source_id: Some("gdrive:a@b.com:F1"),
+            external_ref: Some("https://docs.google.com/spreadsheets/d/F1/edit"),
+        };
+        let rendered = render_markdown(&front, "## Sheet: S\n\n### Overview\n\ntext\n");
+        let (fields, _) = parse_frontmatter(&rendered).unwrap();
+
+        // The spreadsheet marker still round-trips, and the connector claim survives for the rebuild arm.
+        assert_eq!(
+            fields.get("source_type").map(String::as_str),
+            Some("spreadsheet")
+        );
+        assert_eq!(
+            fields.get("source_id").map(String::as_str),
+            Some("gdrive:a@b.com:F1")
+        );
+        assert_eq!(
+            fields.get("external_ref").map(String::as_str),
+            Some("https://docs.google.com/spreadsheets/d/F1/edit")
+        );
+
+        // A locally-ingested spreadsheet writes NEITHER claim line (so it stays a pure local document).
+        // Done before the `rec`-consuming assert below, since this still borrows `front` (hence `rec`).
+        let local = render_markdown(
+            &Frontmatter {
+                source_id: None,
+                external_ref: None,
+                ..front
+            },
+            "## Sheet: S\n",
+        );
+        assert!(!local.contains("source_id:"));
+        assert!(!local.contains("external_ref:"));
+
+        // The counts round-trip too (the claim lines don't disturb the satellite block). Last, because it
+        // moves `rec`.
+        assert_eq!(spreadsheet_from_fields(&fields), Some(rec));
     }
 
     #[test]
@@ -2638,6 +2967,8 @@ mod tests {
             reviewed: false,
             photo: None,
             spreadsheet: None,
+            source_id: None,
+            external_ref: None,
         };
         let rendered = render_markdown(&front, "x");
         let (fields, _) = parse_frontmatter(&rendered).unwrap();
@@ -2670,6 +3001,8 @@ mod tests {
             reviewed: false,
             photo: None,
             spreadsheet: None,
+            source_id: None,
+            external_ref: None,
         };
         let original = render_markdown(&front, "body");
         std::fs::write(vault.join("doc.md"), &original).unwrap();
@@ -2745,6 +3078,8 @@ mod tests {
             reviewed: false,
             photo: None,
             spreadsheet: None,
+            source_id: None,
+            external_ref: None,
         };
         let rendered = render_markdown(&front, "body");
         let (fields, _) = parse_frontmatter(&rendered).unwrap();

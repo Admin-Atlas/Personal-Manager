@@ -4159,6 +4159,95 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
     }
 }
 
+/// Promote an index-only Google Sheet to a **full local spreadsheet import** — the "import fully"
+/// action. Fetches the Sheet's FULL grid (exported as an `.xlsx` workbook, every tab preserved), routes
+/// it through the local spreadsheet processor, and transforms the document IN PLACE (same id, keeps its
+/// classification): `source_type` flips `index_only` → `spreadsheet`, the synthetic sheet body becomes
+/// vault-stored Markdown, and the source is stripped from the index-only manifest so it can't be
+/// resurrected (see [`ingest::promote_spreadsheet`]). Only Google Sheets are promotable today — other
+/// index-only sources (Docs, PDFs) have no grid to import this way. Returns the updated document.
+#[tauri::command]
+pub async fn promote_index_only(app: AppHandle, doc_id: i64) -> Result<Document> {
+    let (source_type, source_id, source_state): (String, Option<String>, String) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        conn.query_row(
+            "SELECT source_type, source_id, source_state FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+    };
+    if source_type != "index_only" {
+        return Err(Error::Other(
+            "This document is already imported locally.".into(),
+        ));
+    }
+    if source_state == "source_missing" {
+        return Err(Error::Other(
+            "This file was removed at the source, so it can't be imported.".into(),
+        ));
+    }
+    let source_id = source_id
+        .ok_or_else(|| Error::Other("This indexed item has no source pointer to import.".into()))?;
+
+    let state = app.state::<AppState>();
+    state.sidecar.ensure_installed()?;
+    // The provider file id is the segment after the last `:` (Drive/Graph ids carry none), mirroring
+    // `fetch_index_only_body`.
+    let item_id = source_id
+        .rsplit_once(':')
+        .map(|(_, id)| id.to_string())
+        .ok_or_else(|| Error::Other("Malformed source id.".into()))?;
+
+    // Only Google Drive Sheets are promotable today. Resolve an account that can reach the file (My
+    // Drive names its account; a shared-drive id resolves an owner) off the lock before the fetch.
+    let token_key = {
+        let conn = state.conn()?;
+        drive::token_key_for_source(&conn, &source_id)?
+    }
+    .ok_or_else(|| {
+        Error::Other("Importing fully is only supported for Google Drive sources right now.".into())
+    })?;
+
+    let file = drive::fetch_file(&token_key, &item_id).await?;
+    if !drive::is_sheet(&file.mime_type) {
+        return Err(Error::Other(
+            "Only Google Sheets can be imported fully right now.".into(),
+        ));
+    }
+    // Pull the FULL grid as an `.xlsx` workbook to a temp file — the ONE place the whole grid is
+    // fetched. Then hand off to the blocking ingest transform, cleaning the temp file up after.
+    let path = drive::export_sheet_xlsx(&token_key, &file).await?;
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        let build = || -> Result<Document> {
+            let (vault, cipher) = state.markdown_io()?;
+            let (vault_root, manifest_cipher) = state.manifest_io()?;
+            let gateway = {
+                let conn = state.conn()?;
+                state.gateway(&conn)?
+            };
+            ingest::promote_spreadsheet(
+                state.inner(),
+                &gateway,
+                &vault,
+                &cipher,
+                &vault_root,
+                &manifest_cipher,
+                doc_id,
+                &path,
+                Some("xlsx"),
+            )
+        };
+        let out = build();
+        let _ = std::fs::remove_file(&path);
+        out
+    })
+    .await
+    .map_err(|e| Error::Other(format!("import task panicked: {e}")))?
+}
+
 /// Open a URL in the system browser, but ONLY if it's http/https — never a `file:`, app, or custom
 /// scheme, so a stray or injected href can't launch a local handler (the inputs are app constants and
 /// Drive-supplied links, treated as untrusted — rule #6).
