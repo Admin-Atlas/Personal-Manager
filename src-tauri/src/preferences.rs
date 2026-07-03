@@ -582,30 +582,53 @@ struct RawPref {
     value: Option<String>,
 }
 
-/// Validate one raw record into a [`DraftPreference`], or `None` if it has no usable value. Scope is
-/// coerced into the CHECK domain (unknown ⇒ global); a context scope keeps its condition; a project
-/// scope keeps the project NAME for the caller to resolve. `allow_project` is false for blob
-/// distillation (no entity to resolve against).
+/// Validate one raw record into a [`DraftPreference`], or `None` if it has no usable value. A thin
+/// adapter over [`draft_from_fields`] (the shared normaliser), so the model-JSON path and the focus
+/// router agree on preference shape.
 fn validate_raw(raw: RawPref, allow_project: bool) -> Option<DraftPreference> {
-    let value = raw
-        .value
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())?;
+    draft_from_fields(
+        raw.scope.as_deref(),
+        raw.project.as_deref(),
+        raw.condition.as_deref(),
+        raw.value.as_deref().unwrap_or_default(),
+        allow_project,
+    )
+}
+
+/// Build a validated draft preference from already-extracted fields — the shared normaliser behind both
+/// the model-JSON path ([`validate_raw`]) and the polymorphic focus router ([`crate::flags::parse_route`],
+/// which extracts these fields in its own classification call, so it doesn't re-parse via
+/// [`parse_statement`]). `value` is required (empty ⇒ `None`); `scope` is coerced into the CHECK domain;
+/// a project scope keeps the project NAME for the caller to resolve to an entity; a context scope keeps
+/// its condition. When `allow_project` is false a `project` scope collapses to `global` (the blob
+/// distillation has no entity to resolve against).
+pub fn draft_from_fields(
+    scope: Option<&str>,
+    project: Option<&str>,
+    condition: Option<&str>,
+    value: &str,
+    allow_project: bool,
+) -> Option<DraftPreference> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
     let value: String = value.chars().take(MAX_VALUE_CHARS).collect();
-    let scope = match raw.scope.as_deref().map(str::trim) {
+    let scope = match scope.map(str::trim) {
         Some(SCOPE_PROJECT) if allow_project => SCOPE_PROJECT,
         Some(SCOPE_CONTEXT) => SCOPE_CONTEXT,
         _ => SCOPE_GLOBAL,
     };
     let condition = if scope == SCOPE_CONTEXT {
-        clean_opt(raw.condition.as_deref(), MAX_CONDITION_CHARS)
+        clean_opt(condition, MAX_CONDITION_CHARS)
     } else {
         None
     };
     let project_name = if scope == SCOPE_PROJECT {
-        raw.project
-            .map(|p| p.trim().to_string())
+        project
+            .map(str::trim)
             .filter(|p| !p.is_empty())
+            .map(str::to_string)
     } else {
         None
     };

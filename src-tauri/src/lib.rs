@@ -805,6 +805,7 @@ pub fn run() {
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::resolve_flag,
+            commands::route_focus_input,
             commands::cost_summary,
             commands::refresh_pricing,
             commands::model_recommendations,

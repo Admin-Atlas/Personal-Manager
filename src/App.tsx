@@ -445,6 +445,27 @@ export default function App() {
     }
   }
 
+  // Route a question typed in the focus box (board card 9) to a fresh general chat and send it — that
+  // chat is grounded in the same structured flags, so "am I ready for tomorrow?" answers from them.
+  // Creates the conversation explicitly (not via handleSend) so it can never append to a stale active
+  // conversation still in this closure's state.
+  async function askInChat(text: string) {
+    setView("chat");
+    try {
+      const created = await createConversation();
+      setActiveId(created.id);
+      setConversations((prev) => [created, ...prev]);
+      chat.clearTransient();
+      chat.setMessages([]);
+      await chat.send(created.id, text);
+      const [msgs, convs] = await Promise.all([getMessages(created.id), listConversations()]);
+      setConversations(convs);
+      if (activeIdRef.current === created.id) chat.setMessages(msgs);
+    } catch (e) {
+      chat.setError(String(e));
+    }
+  }
+
   // Switch the chat to a larger-context model (the context meter's Upgrade option, card 7D). Promote the
   // chosen model to primary, keep the others as auto-switch fallbacks, then re-read settings so the picker
   // and sidebar tag reflect it.
@@ -564,7 +585,7 @@ export default function App() {
 
           {view === "focus" ? (
             <main className="flex h-full flex-1 flex-col">
-              <FocusView onOpenProject={openProject} />
+              <FocusView onOpenProject={openProject} onAsk={askInChat} />
             </main>
           ) : view === "project" && selectedProject ? (
             <main className="flex h-full flex-1 flex-col">

@@ -4,12 +4,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   addMilestone,
+  addPreference,
   calendarOverview,
   getDailyBriefing,
   listCalendarEvents,
   listProjectOverviews,
   proposeProjectMetadata,
   refreshDailyBriefing,
+  resolveFlag,
+  routeFocusInput,
   setProjectMetadata,
   syncCalendar,
 } from "../lib/ipc";
@@ -17,6 +20,7 @@ import { MilestoneList } from "./MilestoneList";
 import type {
   CalendarEvent,
   DailyBriefing,
+  FocusRoute,
   Importance,
   ProjectOverview,
   ProjectProposal,
@@ -25,12 +29,14 @@ import type {
 } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { rankImportance } from "../lib/importance";
-import { Button, Card, Select, Skeleton, StatusBadge } from "./ui";
+import { Button, Card, Input, Skeleton, StatusBadge, Select } from "./ui";
 import { useDepth } from "../theme";
 
 interface Props {
   /** Open the per-project scoped view. */
   onOpenProject: (project: string) => void;
+  /** Route a question typed in the focus box to a fresh, flag-grounded general chat (board card 9). */
+  onAsk: (text: string) => void;
 }
 
 /** Surface the most action-worthy first, mirroring the backend status precedence. */
@@ -117,8 +123,17 @@ function readSort(): Sort {
 let cachedProjects: ProjectOverview[] | null = null;
 let cachedEvents: CalendarEvent[] = [];
 let cachedBriefing: DailyBriefing | null = null;
+// The focus box's in-progress text and any staged suggestion (a pending confirm / a note) must outlive a
+// tab switch too — the whole view unmounts, so component-local state would be dropped. Same lifetime as
+// the loads above: remembered until the app reloads, so a suggestion you haven't acted on is still there
+// when you come back.
+let cachedFocusBox: { text: string; pending: FocusRoute | null; note: string | null } = {
+  text: "",
+  pending: null,
+  note: null,
+};
 
-export function FocusView({ onOpenProject }: Props) {
+export function FocusView({ onOpenProject, onAsk }: Props) {
   const [projects, setProjects] = useState<ProjectOverview[]>(() => cachedProjects ?? []);
   // Skeleton only on the genuine first load of the session; revisits seed from cache.
   const [loading, setLoading] = useState(cachedProjects === null);
@@ -176,6 +191,13 @@ export function FocusView({ onOpenProject }: Props) {
     } finally {
       if (aliveRef.current) setBriefingBusy(false);
     }
+  }
+
+  // After a flag is asserted done in the focus box: regenerate the briefing (the resolved flag drops
+  // out) AND reload the project overviews — a milestone-anchored flag also ticks its milestone `met`
+  // on the backend, which changes that project's governing status, so the cards must re-derive.
+  async function onFlagResolved() {
+    await Promise.all([regenerateBriefing(), refresh()]);
   }
 
   // Load the stored briefing, and silently regenerate it when stale (older than the
@@ -280,6 +302,9 @@ export function FocusView({ onOpenProject }: Props) {
             </div>
           )}
           <Briefing briefing={briefing} busy={briefingBusy} onRefresh={regenerateBriefing} />
+          {!loading && projects.length > 0 && (
+            <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
+          )}
           {events.length > 0 && <Agenda events={events} />}
           {loading ? (
             <ul className="flex flex-col gap-2">
@@ -663,6 +688,185 @@ function Briefing({
         <p className="mt-2 text-xs text-ink4">Updated {formatDate(briefing.updated_at)}</p>
       )}
     </Card>
+  );
+}
+
+/** The polymorphic focus box (board card 9, decisions 6–7). One typed line is classified by a
+ *  background router and placed: mark a visible flag done (a deliberate user assertion — confirmed here
+ *  before it commits, so nothing is ever crossed off without a vouch), capture a durable preference,
+ *  ask a flag-grounded question (routed to a fresh chat), or edit a project. No pre-scoping click —
+ *  natural language picks the target from the visible flag set. */
+function FocusBox({
+  onAsk,
+  onOpenProject,
+  onResolved,
+}: {
+  onAsk: (text: string) => void;
+  onOpenProject: (project: string) => void;
+  onResolved: () => void;
+}) {
+  // Seed from the module cache so a suggestion survives leaving and returning to the tab (see
+  // cachedFocusBox). `busy` is transient and deliberately not cached.
+  const [text, setText] = useState(cachedFocusBox.text);
+  const [busy, setBusy] = useState(false);
+  // A proposed write awaiting the user's one-tap confirm. Resolve/prefer are the only writes, and both
+  // pass through here — so a flag only leaves the set on an explicit vouch (HITL-confirm, decision 5).
+  const [pending, setPending] = useState<FocusRoute | null>(cachedFocusBox.pending);
+  const [note, setNote] = useState<string | null>(cachedFocusBox.note);
+
+  // Mirror the staged suggestion into the module cache on every change, so it's restored on remount.
+  useEffect(() => {
+    cachedFocusBox = { text, pending, note };
+  }, [text, pending, note]);
+
+  async function submit() {
+    const trimmed = text.trim();
+    if (!trimmed || busy) return;
+    setBusy(true);
+    setNote(null);
+    setPending(null);
+    try {
+      const route = await routeFocusInput(trimmed);
+      switch (route.kind) {
+        case "resolve":
+        case "prefer":
+          setPending(route); // stage it — the confirm strip below commits it
+          break;
+        case "ask":
+          onAsk(route.text); // navigates to a fresh, flag-grounded chat
+          setText("");
+          break;
+        case "edit":
+          if (route.project) {
+            onOpenProject(route.project); // navigates to the project's view
+            setText("");
+          } else {
+            setNote("Open the project to edit its milestones.");
+          }
+          break;
+        case "unclear":
+          setNote("Not sure what to do with that — try rephrasing, or ask it as a question.");
+          break;
+      }
+    } catch (e) {
+      setNote(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmPending() {
+    if (!pending) return;
+    setBusy(true);
+    try {
+      if (pending.kind === "resolve") {
+        await resolveFlag(pending.flag_id);
+        setNote(`Marked done: ${pending.label}`);
+        onResolved(); // regenerate the briefing so the resolved flag drops out of it
+      } else if (pending.kind === "prefer") {
+        const { scope, entity_id, condition, value } = pending.draft;
+        await addPreference(scope, entity_id, condition, value);
+        setNote("Saved — PM will keep that in mind.");
+      }
+      setPending(null);
+      setText("");
+    } catch (e) {
+      setNote(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card className="mb-5 px-4 py-3" data-help="focus-box">
+      <div className="flex items-center gap-2">
+        <Input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void submit();
+            }
+          }}
+          disabled={busy}
+          placeholder="Mark something done, set a reminder preference, or ask…"
+          data-help="focus-box-input"
+        />
+        <Button variant="secondary" onClick={submit} disabled={busy || !text.trim()}>
+          {busy ? "…" : "Go"}
+        </Button>
+      </div>
+
+      {pending?.kind === "resolve" && (
+        <ConfirmRow
+          prompt={
+            <>
+              Mark <span className="font-medium text-ink2">{pending.label}</span> as done?
+            </>
+          }
+          confirmLabel="Mark done"
+          onConfirm={confirmPending}
+          onCancel={() => setPending(null)}
+          busy={busy}
+        />
+      )}
+      {pending?.kind === "prefer" && (
+        <ConfirmRow
+          prompt={
+            <>
+              Remember: <span className="font-medium text-ink2">“{pending.draft.value}”</span>
+              {pending.draft.project_name ? ` · for ${pending.draft.project_name}` : ""}
+              {pending.draft.condition ? ` · when ${pending.draft.condition}` : ""}
+            </>
+          }
+          confirmLabel="Save"
+          onConfirm={confirmPending}
+          onCancel={() => setPending(null)}
+          busy={busy}
+        />
+      )}
+      {note && !pending && <p className="mt-2 text-xs text-ink4">{note}</p>}
+    </Card>
+  );
+}
+
+/** A one-tap confirm strip for a proposed write (resolve/prefer) staged by the focus box. */
+function ConfirmRow({
+  prompt,
+  confirmLabel,
+  onConfirm,
+  onCancel,
+  busy,
+}: {
+  prompt: React.ReactNode;
+  confirmLabel: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  busy: boolean;
+}) {
+  return (
+    <div className="mt-2 flex items-center justify-between gap-3 text-sm text-ink3">
+      <span className="min-w-0">{prompt}</span>
+      <span className="flex shrink-0 gap-2">
+        <Button
+          variant="primary"
+          onClick={onConfirm}
+          disabled={busy}
+          className="px-2 py-0.5 text-xs"
+        >
+          {confirmLabel}
+        </Button>
+        <Button
+          variant="tertiary"
+          onClick={onCancel}
+          disabled={busy}
+          className="px-2 py-0.5 text-xs"
+        >
+          Cancel
+        </Button>
+      </span>
+    </div>
   );
 }
 

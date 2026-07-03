@@ -898,6 +898,16 @@ export interface Flag {
   resolved_at: string | null;
 }
 
+/** Where the polymorphic focus box routes one line the user typed (board card 9, decisions 6–7): a
+ *  background classifier places it, then the frontend acts (resolve/prefer, on the user's confirm — both
+ *  are writes) or navigates (ask/edit). Mirrors `FocusRoute` in src-tauri/src/flags.rs, tagged by `kind`. */
+export type FocusRoute =
+  | { kind: "resolve"; flag_id: number; label: string }
+  | { kind: "prefer"; draft: DraftPreference }
+  | { kind: "ask"; text: string }
+  | { kind: "edit"; project: string | null }
+  | { kind: "unclear" };
+
 /** Machine-readable cause of a setup failure, so the UI can show a tailored
  *  troubleshooting guide. Mirrors `SidecarErrorKind` in src-tauri/src/sidecar.rs. */
 export type SidecarErrorKind =
