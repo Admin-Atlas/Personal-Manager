@@ -2504,6 +2504,7 @@ pub async fn propose_project_metadata(
 fn touch_milestone_project(conn: &Connection, id: i64) -> Result<()> {
     if let Some(project) = milestones::project_of(conn, id)? {
         projects::touch(conn, &project)?;
+        project_activity::record(conn, &project, project_activity::Kind::Milestone, Some(id));
     }
     Ok(())
 }
@@ -2533,6 +2534,7 @@ pub fn add_milestone(
     let conn = state.conn()?;
     let id = milestones::add(&conn, project, &label, due_date, event_uid)?;
     projects::touch(&conn, project)?;
+    project_activity::record(&conn, project, project_activity::Kind::Milestone, Some(id));
     Ok(id)
 }
 
@@ -2584,6 +2586,9 @@ pub fn delete_milestone(state: State<'_, AppState>, id: i64) -> Result<()> {
     milestones::remove(&conn, id)?;
     if let Some(project) = project {
         projects::touch(&conn, &project)?;
+        // The row is gone, but `source_ref` is a plain pointer (not an FK), so the deleted
+        // milestone's id is still a valid historical reference for the observation.
+        project_activity::record(&conn, &project, project_activity::Kind::Milestone, Some(id));
     }
     Ok(())
 }
@@ -2599,6 +2604,8 @@ pub fn reorder_milestones(
     let project = project.trim();
     milestones::reorder(&conn, project, &ordered_ids)?;
     projects::touch(&conn, project)?;
+    // A bulk reorder has no single milestone id, so the observation is project-level (source_ref None).
+    project_activity::record(&conn, project, project_activity::Kind::Milestone, None);
     Ok(())
 }
 
@@ -7050,5 +7057,33 @@ mod tests {
 
         // And the grand total is the sum of the known rows (0.0605 + 0.02), not blank.
         assert!((total_cost(&rows).unwrap() - 0.0805).abs() < 1e-9);
+    }
+
+    /// The shared milestone-recency helper (used by update / set_event / set_state) appends a
+    /// `kind='milestone'` activity observation for the owning project, ref = the milestone id
+    /// (Stage-3 activity log). The direct-touch commands (add / delete / reorder) emit the same way.
+    #[test]
+    fn touch_milestone_project_logs_a_milestone_observation() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // Adding a milestone also mints its project, giving us a real id to touch.
+        let id = crate::milestones::add(&conn, "Atlas", "pitch", Some("2026-07-01".into()), None)
+            .unwrap();
+
+        touch_milestone_project(&conn, id).unwrap();
+
+        let (project, kind, source_ref): (String, String, Option<i64>) = conn
+            .query_row(
+                "SELECT project, kind, source_ref FROM project_activity",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (project.as_str(), kind.as_str(), source_ref),
+            ("Atlas", "milestone", Some(id))
+        );
     }
 }
