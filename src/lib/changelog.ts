@@ -24,6 +24,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     highlights: [
       "There's now a box right under your daily briefing where you can just say what you mean, in plain words. Tell it something's handled (“the deck is done”) and PM marks that item off for you; tell it how you'd like to be nudged (“stop reminding me so early”) and it remembers that as a lasting preference; or ask a question and it opens a chat to answer — no menus, no clicking the right item first. Anything that would cross something off asks you to confirm first, so nothing disappears by accident.",
       "Chat now shares the same “what needs your attention” layer as your briefing. Ask “am I ready for tomorrow?” or “what's pressing this week?” and it answers from your actual flagged deadlines, events and prep — and a project's own chat sees just that project's items. This wraps up the groundwork from the last few updates: one honest, shared picture of what matters, that the briefing, chat and that new box all read from.",
+      "Marking a deadline done from your briefing now also ticks it off inside the project — before, the two could disagree, with the briefing showing it handled while the project still listed it as pending. They're the same fact now, so the project's status updates to match in one step.",
     ],
   },
   {

@@ -5303,7 +5303,7 @@ pub fn resolve_flag(
 ) -> Result<flags::Flag> {
     let conn = state.conn()?;
     // The artifact's current open URL is display-only (it moves on rename, whereas source_id is the
-    // rename-survives identity). Looked up here, then handed to `resolve` purely as stored state.
+    // rename-survives identity). Looked up here, then handed to `assert_done` purely as stored state.
     let artifact_url: Option<String> = match artifact_source_id.as_deref() {
         Some(sid) => conn
             .query_row(
@@ -5315,14 +5315,21 @@ pub fn resolve_flag(
             .flatten(),
         None => None,
     };
-    flags::resolve(
+    // Assert the flag done AND write the "done" through to its milestone in one transaction — a
+    // milestone-anchored flag and its milestone are one fact (card 9 centralisation), so this keeps the
+    // project view, the governing status and future detection in step with the briefing. `assert_done`
+    // returns the milestone it ticked (if any), so we bump that project's activity like a direct
+    // milestone edit does.
+    let (flag, milestone_id) = flags::assert_done(
         &conn,
         flag_id,
-        flags::SOURCE_ASSERTION,
         artifact_source_id.as_deref(),
         artifact_url.as_deref(),
     )?;
-    flags::get(&conn, flag_id)?.ok_or_else(|| Error::Other("Flag not found.".into()))
+    if let Some(mid) = milestone_id {
+        touch_milestone_project(&conn, mid)?;
+    }
+    Ok(flag)
 }
 
 /// Classify one line the user typed in the polymorphic focus box (card 9, decisions 6–7) and route it:

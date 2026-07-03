@@ -42,6 +42,12 @@
 //! `happening-today` on the same anchor, so the briefing says "you're prepared — file's here" instead
 //! of dropping the line (decision 3, [`list_resolved`] feeding [`crate::briefing`]).
 //!
+//! A milestone-anchored flag and the milestone it hangs off are the SAME fact, so an assertion is
+//! *centralised*, not just recorded here: [`assert_done`] resolves the flag AND marks its
+//! [`crate::milestones`] row `met` in one transaction, so the project view, the governing-status
+//! derivation and future [`detect`] never disagree with the briefing (a calendar anchor is left
+//! alone — resolving a `prepare-ahead` means "ready", not that the event happened).
+//!
 //! **Chat grounding + the polymorphic focus box (PR4):** the same active flag set is the SHARED
 //! context provider (decision 8) — [`chat_preamble`] renders it as untrusted-DATA grounding for general
 //! chat (the global set) and project chat (that project's milestone flags only), so "am I ready for
@@ -599,6 +605,41 @@ pub fn resolve(
         params![id, source, is_assertion, artifact_ptr, artifact_url],
     )?;
     Ok(())
+}
+
+/// Assert a flag done — the user-vouch entry point behind the `resolve_flag` command — and CENTRALISE
+/// the underlying fact in one transaction. A milestone-anchored `deadline-approaching`/`overdue` flag
+/// and the milestone it hangs off are the *same* truth: crossing the flag off also marks that milestone
+/// `met` ([`milestones::set_state`]), so the project view, the governing-status derivation
+/// ([`milestones::governing`]) and future [`detect`] all agree with the briefing — one source of truth,
+/// never two that silently drift. A calendar-anchored flag is deliberately NOT written through:
+/// resolving a `prepare-ahead` means "I'm ready", not "the event happened" (decision 3), so the event
+/// keeps its own lifecycle.
+///
+/// Returns the resolved [`Flag`] plus the milestone id it wrote through to (`None` for a calendar flag
+/// or an unparseable/stale anchor), so the command layer can bump that project's activity exactly as a
+/// direct milestone edit does. Errors only when the flag id is unknown (the resolve matched no row).
+pub fn assert_done(
+    conn: &Connection,
+    id: i64,
+    artifact_ptr: Option<&str>,
+    artifact_url: Option<&str>,
+) -> Result<(Flag, Option<i64>)> {
+    let tx = conn.unchecked_transaction()?;
+    resolve(&tx, id, SOURCE_ASSERTION, artifact_ptr, artifact_url)?;
+    let flag = get(&tx, id)?.ok_or_else(|| crate::error::Error::Other("Flag not found.".into()))?;
+    // A milestone-anchored flag's `anchor` IS a `project_milestones.id` — write the "done" through so
+    // the milestone truth and the flag never disagree. A stale/unparseable anchor simply writes nothing.
+    let milestone_id = if flag.anchor_kind == ANCHOR_MILESTONE {
+        flag.anchor.parse::<i64>().ok()
+    } else {
+        None
+    };
+    if let Some(mid) = milestone_id {
+        milestones::set_state(&tx, mid, true)?;
+    }
+    tx.commit()?;
+    Ok((flag, milestone_id))
 }
 
 /// The default lead time (in whole days) a flag type fires ahead of its anchored date, used
@@ -1406,5 +1447,66 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(describe_active(&conn, TODAY, Tz::UTC).unwrap().is_empty());
+    }
+
+    /// Centralisation: asserting a milestone-anchored flag done doesn't just drop it from the briefing —
+    /// it marks the underlying milestone `met`, so the project view + status derivation agree. A
+    /// calendar-anchored flag is never written through (it has no milestone to tick).
+    #[test]
+    fn assert_done_ticks_the_anchored_milestone_and_leaves_calendar_flags_alone() {
+        let (_dir, conn) = open_test_db();
+        let mid = milestones::add(&conn, "PM v1", "beta", Some("2026-07-06".into()), None).unwrap();
+        let fid = upsert_active(
+            &conn,
+            &DraftFlag {
+                anchor_kind: ANCHOR_MILESTONE.into(),
+                anchor: mid.to_string(),
+                r#type: TYPE_DEADLINE_APPROACHING.into(),
+                threshold: None,
+                artifact_ptr: None,
+                artifact_url: None,
+            },
+        )
+        .unwrap();
+
+        // The milestone starts unmet, so it governs the project's status.
+        let before = milestones::list_for_project(&conn, "PM v1", TODAY).unwrap();
+        assert!(!before.iter().find(|m| m.id == mid).unwrap().is_met());
+
+        let (flag, touched) = assert_done(&conn, fid, None, None).unwrap();
+        assert_eq!(flag.state, STATE_RESOLVED, "flag leaves the active set");
+        assert!(flag.user_confirmed, "recorded as a user vouch");
+        assert_eq!(
+            touched,
+            Some(mid),
+            "the ticked milestone id is returned for the project-activity bump"
+        );
+
+        // The underlying milestone is now met — the single source of truth the project view reads.
+        let after = milestones::list_for_project(&conn, "PM v1", TODAY).unwrap();
+        assert!(
+            after.iter().find(|m| m.id == mid).unwrap().is_met(),
+            "the project milestone is ticked off, not just the briefing flag"
+        );
+        assert!(
+            milestones::governing(&after, TODAY).is_none(),
+            "a met milestone no longer governs the project's status"
+        );
+
+        // A calendar-anchored flag has no milestone to write through to.
+        let cid = upsert_active(
+            &conn,
+            &DraftFlag {
+                anchor_kind: ANCHOR_CALENDAR.into(),
+                anchor: "uid-x".into(),
+                r#type: TYPE_HAPPENING_TODAY.into(),
+                threshold: None,
+                artifact_ptr: None,
+                artifact_url: None,
+            },
+        )
+        .unwrap();
+        let (_cf, cal_touched) = assert_done(&conn, cid, None, None).unwrap();
+        assert_eq!(cal_touched, None, "calendar flags are not written through");
     }
 }

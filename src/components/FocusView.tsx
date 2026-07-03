@@ -184,6 +184,13 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     }
   }
 
+  // After a flag is asserted done in the focus box: regenerate the briefing (the resolved flag drops
+  // out) AND reload the project overviews — a milestone-anchored flag also ticks its milestone `met`
+  // on the backend, which changes that project's governing status, so the cards must re-derive.
+  async function onFlagResolved() {
+    await Promise.all([regenerateBriefing(), refresh()]);
+  }
+
   // Load the stored briefing, and silently regenerate it when stale (older than the
   // freshness window) so it refreshes ~once a day on open, not on every mount.
   async function loadBriefing() {
@@ -287,7 +294,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
           )}
           <Briefing briefing={briefing} busy={briefingBusy} onRefresh={regenerateBriefing} />
           {!loading && projects.length > 0 && (
-            <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={regenerateBriefing} />
+            <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
           )}
           {events.length > 0 && <Agenda events={events} />}
           {loading ? (
