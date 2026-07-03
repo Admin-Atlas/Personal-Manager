@@ -32,6 +32,7 @@ import type {
   DriveSyncEvent,
   DriveSyncState,
   Entity,
+  Flag,
   IcsFeedInfo,
   Importance,
   IngestEvent,
@@ -790,6 +791,13 @@ export const getDailyBriefing = () => invoke<DailyBriefing>("get_daily_briefing"
 
 /** Regenerate the briefing from the current focus-view state; returns the new one. */
 export const refreshDailyBriefing = () => invoke<DailyBriefing>("refresh_daily_briefing");
+
+/** Mark a structured flag done (board card 9) — a deliberate user assertion that outranks detection,
+ *  removing it from the rendered set. Optionally names the satisfying artifact by its
+ *  `documents.source_id` so a happening-today on the same anchor can show "you're prepared, file's
+ *  here". Returns the resolved flag. */
+export const resolveFlag = (flagId: number, artifactSourceId?: string) =>
+  invoke<Flag>("resolve_flag", { flagId, artifactSourceId });
 
 // --- Data folder: reveal + export ---
 
