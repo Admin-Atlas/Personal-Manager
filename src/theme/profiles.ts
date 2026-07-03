@@ -210,7 +210,7 @@ export const MONO_RAMP: Record<Mode, Record<Role, number>> = {
     border: 0.3,
     border2: 0.36,
     rule: 0.258,
-    ink: 1.0, // white text
+    ink: 0.94, // soft off-white (~#ECECEC), NOT pure white — avoids halation/glare on the dark bg
     ink2: 0.86,
     ink3: 0.66,
     ink4: 0.555,

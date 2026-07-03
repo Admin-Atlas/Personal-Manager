@@ -38,10 +38,12 @@ export function themeVars(system: System, mode: Mode, accent: string): ThemeVars
     });
     if (mode === "dark") {
       v["--bg"] = EIGENGRAU;
-      v["--accent"] = "#ffffff";
-      v["--accent-text"] = "#ffffff";
+      // A soft off-white (~#F2F2F2), not pure white — sits a touch above --ink so accents still
+      // read as "white" and pop, without the harsh glare/halation of #fff on the dark bg.
+      v["--accent"] = "oklch(0.965 0 0)";
+      v["--accent-text"] = "oklch(0.965 0 0)";
       v["--accent-ink"] = EIGENGRAU; // dark text on the white accent fill
-      v["--accent-soft"] = "rgba(255,255,255,0.12)";
+      v["--accent-soft"] = "rgba(255,255,255,0.1)";
     } else {
       v["--accent"] = "oklch(0.2 0 0)";
       v["--accent-text"] = "oklch(0.2 0 0)";
