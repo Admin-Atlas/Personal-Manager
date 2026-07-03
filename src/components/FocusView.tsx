@@ -75,6 +75,12 @@ function deadlineKey(p: ProjectOverview): string {
   return (p.governing_milestone?.due_date ?? p.calendar_event?.start ?? "9999-12-31").slice(0, 10);
 }
 
+/** The priority tag a project shows: the manual override, falling back to the computed
+ *  structural auto-importance (the "Auto" value) when no override is set. */
+function effectiveImportance(p: ProjectOverview): Importance {
+  return p.importance ?? p.auto_importance;
+}
+
 /** Ascending comparison for one sort key (the ↑/↓ toggle applies the direction outside). */
 function ascCompare(a: ProjectOverview, b: ProjectOverview, key: SortKey): number {
   switch (key) {
@@ -83,7 +89,7 @@ function ascCompare(a: ProjectOverview, b: ProjectOverview, key: SortKey): numbe
     case "deadline":
       return deadlineKey(a).localeCompare(deadlineKey(b));
     case "importance":
-      return rankImportance(a.importance) - rankImportance(b.importance);
+      return rankImportance(effectiveImportance(a)) - rankImportance(effectiveImportance(b));
     case "size":
       return (SIZE_RANK[a.size ?? ""] ?? 0) - (SIZE_RANK[b.size ?? ""] ?? 0);
     case "recent":
@@ -401,8 +407,11 @@ function ProjectCard({
                 <span>
                   {project.doc_count} doc{project.doc_count === 1 ? "" : "s"}
                 </span>
-                {project.importance && (
-                  <span className="capitalize">{project.importance} priority</span>
+                {effectiveImportance(project) && (
+                  <span className="capitalize">
+                    {effectiveImportance(project)} priority
+                    {!project.importance && project.auto_importance ? " (auto)" : ""}
+                  </span>
                 )}
                 {project.size && <span>{project.size}</span>}
                 {project.governing_milestone?.due_date && (
@@ -550,6 +559,12 @@ function MetaEditor({
             <option value="medium">medium</option>
             <option value="low">low</option>
           </Select>
+          {importance === null && project.auto_importance && (
+            <p className="mt-1 text-xs text-ink4">
+              Auto currently resolves to:{" "}
+              <span className="capitalize">{project.auto_importance}</span>
+            </p>
+          )}
         </Field>
         <Field label="Blocked by">
           <ProjectSelect value={blockedBy} options={otherProjects} onChange={setBlockedBy} />
