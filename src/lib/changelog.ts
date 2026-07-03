@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.74.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "Under the hood: the quiet activity signal now tidies itself — older entries are compacted into small daily summaries once a day while the app is idle, so it stays lean and never grows without bound. Nothing to see; it just keeps house.",
+    ],
+  },
+  {
     version: "2.73.0-alpha",
     date: "2026-07-03",
     highlights: [

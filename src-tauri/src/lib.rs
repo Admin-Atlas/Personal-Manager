@@ -638,6 +638,11 @@ pub fn run() {
             // for everyone who hasn't turned it on.
             backup::schedule::spawn_backup_scheduler(handle.clone());
 
+            // Compact the project activity log daily and prune its raw window (Stage-3 heat log):
+            // once a day, when unlocked + idle, roll raw events older than the recent window into
+            // per-day counts and delete them. A no-op until there are old events; nothing reads it yet.
+            project_activity::spawn_rollup_scheduler(handle.clone());
+
             // Give each conversation a real 5-7 word title (board card 7E) once it has a few turns: a launch
             // pass titles any session that crossed the threshold while the app was closed (the eager
             // per-conversation nudge fires from `send_message`). Background, best-effort, single model call.

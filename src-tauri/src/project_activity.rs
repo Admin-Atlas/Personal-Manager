@@ -15,10 +15,19 @@
 //! still logs: [`record`] lazily ensures the parent `projects` row (mirroring
 //! `milestones::add`), so a name is all that's required.
 //!
-//! Retention (raw rows compacted into per-day counts after a recent window, then pruned)
-//! lands alongside the rollup job; this module currently just appends.
+//! Retention is baked in (so the log never grows unbounded like `usage_log`): raw rows are kept
+//! for a recent window ([`RAW_WINDOW_DAYS`]), then compacted into per-(project, day, kind) counts
+//! in `project_activity_daily` and pruned by [`run_rollup`], which [`spawn_rollup_scheduler`]
+//! drives about once a day when the vault is unlocked and the user is idle.
 
+use std::time::Duration;
+
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{params, Connection};
+use tauri::{AppHandle, Manager};
+
+use crate::error::Result;
+use crate::{db, AppState};
 
 /// The engagement discriminator, at call-site granularity. A closed enum so call sites can't
 /// typo the stored string, and so the `CHECK (kind IN (...))` constraint on `project_activity`
@@ -65,6 +74,101 @@ pub fn record(conn: &Connection, project: &str, kind: Kind, source_ref: Option<i
         "INSERT INTO project_activity(project, kind, source_ref) VALUES (?1, ?2, ?3)",
         params![project, kind.as_str(), source_ref],
     );
+}
+
+// --- retention / rollup ----------------------------------------------------------------------
+
+/// Raw events younger than this stay in `project_activity`; older ones are compacted into
+/// `project_activity_daily` and pruned. A placeholder window (~30d) that comfortably exceeds any
+/// day-scale heat half-life a Stage-4 scorer will use — a const, not a user setting, this stage.
+pub const RAW_WINDOW_DAYS: i64 = 30;
+
+const SECS_PER_DAY: i64 = 86_400;
+
+/// Compact every raw event older than the recent window into per-(project, day, kind) counts, then
+/// prune the rolled raw rows — both in ONE transaction, so a crash between them rolls the whole
+/// thing back (never a double count). Idempotent + re-run safe: rolled rows are deleted, so a
+/// re-run finds nothing to add. The upsert is ADDITIVE (`count + excluded.count`) because a day
+/// straddling the moving cutoff is rolled across two passes — the later pass adds the remainder.
+pub fn run_rollup(conn: &Connection, now_unix: i64) -> Result<()> {
+    let cutoff = now_unix - RAW_WINDOW_DAYS * SECS_PER_DAY;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO project_activity_daily(project, day, kind, count) \
+         SELECT project, occurred_at / 86400 AS day, kind, COUNT(*) \
+           FROM project_activity \
+          WHERE occurred_at < ?1 \
+          GROUP BY project, day, kind \
+         ON CONFLICT(project, day, kind) DO UPDATE SET count = count + excluded.count",
+        params![cutoff],
+    )?;
+    tx.execute(
+        "DELETE FROM project_activity WHERE occurred_at < ?1",
+        params![cutoff],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+// --- scheduler (mirrors backup::schedule) ----------------------------------------------------
+
+/// RFC3339 timestamp of the last successful rollup; stamped on success so the daily cadence is
+/// honest across restarts (mirrors `backup::schedule::LAST_BACKUP_AT_KEY`).
+pub const LAST_ROLLUP_AT_KEY: &str = "last_activity_rollup_at";
+
+/// Hourly backstop tick; the rollup is tiny, but the cadence it enforces is daily.
+const TICK_SECS: u64 = 3_600;
+/// Only roll up once the user has been idle this long — politeness; the job is cheap.
+const IDLE_THRESHOLD_SECS: u64 = 60;
+/// Roll up at most once a day.
+const ROLLUP_INTERVAL_HOURS: i64 = 24;
+
+/// Whether a rollup is due now: never run, or the daily interval has elapsed. Pure, so the cadence
+/// is unit-tested without a clock (mirrors `backup_due`).
+fn rollup_due(last_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last_at {
+        None => true,
+        Some(last) => {
+            now.signed_duration_since(last) >= ChronoDuration::hours(ROLLUP_INTERVAL_HOURS)
+        }
+    }
+}
+
+/// Idle-gated daily maintenance: compact the activity log's raw window into daily counts and prune
+/// it. Spawned once from `setup` alongside the other background schedulers; mirrors
+/// `backup::schedule::spawn_backup_scheduler` but far cheaper, so it needs no launch catch-up and
+/// only a light idle gate. A no-op until there are events older than the window.
+pub fn spawn_rollup_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let threshold = Duration::from_secs(IDLE_THRESHOLD_SECS);
+        loop {
+            tokio::time::sleep(Duration::from_secs(TICK_SECS)).await;
+
+            // Gate on idle/sync first (no lock), then take the DB guard. Everything below is
+            // synchronous, so the guard is never held across an `.await` (repo rule #4).
+            let state = app.state::<AppState>();
+            if state.idle_for() < threshold || state.sync_active() {
+                continue;
+            }
+            let Ok(conn) = state.conn() else { continue };
+
+            let last_at = db::get_setting(&conn, LAST_ROLLUP_AT_KEY)
+                .ok()
+                .flatten()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&Utc));
+            let now = Utc::now();
+            if !rollup_due(last_at, now) {
+                continue;
+            }
+            match run_rollup(&conn, now.timestamp()) {
+                Ok(()) => {
+                    let _ = db::set_setting(&conn, LAST_ROLLUP_AT_KEY, &now.to_rfc3339());
+                }
+                Err(e) => eprintln!("activity rollup skipped: {e}"),
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -152,5 +256,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 0, "ON DELETE CASCADE removed the activity rows");
+    }
+
+    // --- rollup / retention ---
+
+    const DAY: i64 = 86_400;
+
+    fn seed_event(conn: &Connection, project: &str, kind: &str, occurred_at: i64) {
+        conn.execute(
+            "INSERT INTO projects(name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+            params![project],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_activity(project, kind, occurred_at) VALUES (?1, ?2, ?3)",
+            params![project, kind, occurred_at],
+        )
+        .unwrap();
+    }
+
+    fn daily(conn: &Connection) -> Vec<(String, i64, String, i64)> {
+        let mut s = conn
+            .prepare(
+                "SELECT project, day, kind, count FROM project_activity_daily ORDER BY day, kind",
+            )
+            .unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Events older than the raw window roll up into per-(project, day, kind) counts — where `day`
+    /// is the UTC unix-day (`occurred_at / 86400`) — and the raw rows are pruned; recent events stay.
+    #[test]
+    fn run_rollup_compacts_old_events_and_keeps_recent_ones() {
+        let (_dir, conn) = store();
+        let now = 100 * DAY; // cutoff = day 70
+                             // Old (rolled): 2 chat + 1 ingest on day 10, 1 chat on day 11 — all Atlas.
+        seed_event(&conn, "Atlas", "chat", 10 * DAY);
+        seed_event(&conn, "Atlas", "chat", 10 * DAY + 5);
+        seed_event(&conn, "Atlas", "ingest", 10 * DAY + 9);
+        seed_event(&conn, "Atlas", "chat", 11 * DAY);
+        // Recent (kept): a chat on day 90.
+        seed_event(&conn, "Atlas", "chat", 90 * DAY);
+
+        run_rollup(&conn, now).unwrap();
+
+        assert_eq!(
+            daily(&conn),
+            vec![
+                ("Atlas".to_string(), 10, "chat".to_string(), 2),
+                ("Atlas".to_string(), 10, "ingest".to_string(), 1),
+                ("Atlas".to_string(), 11, "chat".to_string(), 1),
+            ]
+        );
+        // Only the recent (day-90) raw row survives.
+        let raw: Vec<i64> = {
+            let mut s = conn
+                .prepare("SELECT occurred_at FROM project_activity")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(raw, vec![90 * DAY]);
+    }
+
+    /// A second pass is a no-op (rolled rows are deleted), and a later batch for the same
+    /// (project, day, kind) ADDS to the existing daily count (the straddle case).
+    #[test]
+    fn run_rollup_is_idempotent_and_additive() {
+        let (_dir, conn) = store();
+        let now = 100 * DAY;
+        seed_event(&conn, "Atlas", "chat", 10 * DAY);
+        seed_event(&conn, "Atlas", "chat", 10 * DAY + 1);
+
+        run_rollup(&conn, now).unwrap();
+        run_rollup(&conn, now).unwrap(); // idempotent — nothing new to roll
+        assert_eq!(
+            daily(&conn),
+            vec![("Atlas".to_string(), 10, "chat".to_string(), 2)]
+        );
+
+        // A later batch for the same bucket accumulates rather than replacing.
+        seed_event(&conn, "Atlas", "chat", 10 * DAY + 2);
+        seed_event(&conn, "Atlas", "chat", 10 * DAY + 3);
+        seed_event(&conn, "Atlas", "chat", 10 * DAY + 4);
+        run_rollup(&conn, now).unwrap();
+        assert_eq!(
+            daily(&conn),
+            vec![("Atlas".to_string(), 10, "chat".to_string(), 5)]
+        );
+    }
+
+    /// The daily cadence gate: never-run is due; inside 24h is not; past 24h is.
+    #[test]
+    fn rollup_due_respects_the_daily_interval() {
+        let now = DateTime::parse_from_rfc3339("2026-07-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(rollup_due(None, now), "never run → due");
+        assert!(
+            !rollup_due(Some(now - ChronoDuration::hours(23)), now),
+            "within a day → not due"
+        );
+        assert!(
+            rollup_due(Some(now - ChronoDuration::hours(25)), now),
+            "past a day → due"
+        );
     }
 }
