@@ -33,6 +33,7 @@ import type {
   DriveSyncState,
   Entity,
   Flag,
+  FocusRoute,
   IcsFeedInfo,
   Importance,
   IngestEvent,
@@ -798,6 +799,11 @@ export const refreshDailyBriefing = () => invoke<DailyBriefing>("refresh_daily_b
  *  here". Returns the resolved flag. */
 export const resolveFlag = (flagId: number, artifactSourceId?: string) =>
   invoke<Flag>("resolve_flag", { flagId, artifactSourceId });
+
+/** Classify one line typed in the focus box (board card 9) and route it — mark a visible flag done,
+ *  capture a durable preference, ask a flag-grounded question, or edit a project. One background
+ *  classification call over the visible flags; the frontend acts on the returned route. */
+export const routeFocusInput = (text: string) => invoke<FocusRoute>("route_focus_input", { text });
 
 // --- Data folder: reveal + export ---
 

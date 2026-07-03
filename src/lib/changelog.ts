@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.79.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "There's now a box right under your daily briefing where you can just say what you mean, in plain words. Tell it something's handled (“the deck is done”) and PM marks that item off for you; tell it how you'd like to be nudged (“stop reminding me so early”) and it remembers that as a lasting preference; or ask a question and it opens a chat to answer — no menus, no clicking the right item first. Anything that would cross something off asks you to confirm first, so nothing disappears by accident.",
+      "Chat now shares the same “what needs your attention” layer as your briefing. Ask “am I ready for tomorrow?” or “what's pressing this week?” and it answers from your actual flagged deadlines, events and prep — and a project's own chat sees just that project's items. This wraps up the groundwork from the last few updates: one honest, shared picture of what matters, that the briefing, chat and that new box all read from.",
+    ],
+  },
+  {
     version: "2.78.0-alpha",
     date: "2026-07-03",
     highlights: [

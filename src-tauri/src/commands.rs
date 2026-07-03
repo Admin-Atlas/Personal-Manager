@@ -933,7 +933,7 @@ pub async fn send_message(
     // Save the user turn and gather history + models + the learned profile + the
     // conversation's project scope. Scope the lock so the guard is dropped before
     // the network await below.
-    let (history, models, profile, scope, agenda, summary, exclude_chat) = {
+    let (history, models, profile, scope, agenda, flag_ctx, summary, exclude_chat) = {
         let conn = state.conn()?;
 
         let prior: i64 = conn.query_row(
@@ -1084,19 +1084,28 @@ pub async fn send_message(
             None => None,
         });
         let profile = preferences::preferences_preamble(&conn, pref_ctx)?;
+        let zone = resolve_zone(&conn);
         // Give a global (unscoped) chat the user's upcoming agenda so it can answer
         // "what's on at 3pm?" (Step 6). A project-scoped chat stays on its documents.
         let agenda = if scope.is_none() {
-            calendar::agenda_preamble(&conn, 7, resolve_zone(&conn))?
+            calendar::agenda_preamble(&conn, 7, zone)?
         } else {
             None
         };
+        // The structured flag layer as shared grounding (card 9, decision 8): a project chat sees only
+        // its own milestone flags; a general chat sees the whole active set. Same untrusted-DATA framing
+        // as the agenda. Best-effort — grounding is additive context, so a hiccup omits it rather than
+        // failing the user's message.
+        let flag_ctx =
+            flags::chat_preamble(&conn, scope.as_deref(), &clock::today_sql_in(zone), zone)
+                .unwrap_or(None);
         (
             history,
             models,
             profile,
             scope,
             agenda,
+            flag_ctx,
             summary,
             exclude_chat,
         )
@@ -1143,6 +1152,15 @@ pub async fn send_message(
         messages.push(openrouter::ChatMessage {
             role: "system".into(),
             content: agenda.clone(),
+        });
+    }
+    // The flag grounding rides here too (after the cache breakpoint): it can change mid-session — the
+    // focus box or a re-detection may resolve a flag — so keeping it uncached means the next turn always
+    // reflects the current set rather than a cached stale one.
+    if let Some(flag_ctx) = &flag_ctx {
+        messages.push(openrouter::ChatMessage {
+            role: "system".into(),
+            content: flag_ctx.clone(),
         });
     }
     if !retrieved.is_empty() {
@@ -5305,6 +5323,79 @@ pub fn resolve_flag(
         artifact_url.as_deref(),
     )?;
     flags::get(&conn, flag_id)?.ok_or_else(|| Error::Other("Flag not found.".into()))
+}
+
+/// Classify one line the user typed in the polymorphic focus box (card 9, decisions 6–7) and route it:
+/// mark a visible flag done, capture a durable preference, ask a (flag-grounded) question, or edit a
+/// project. ONE background classification call over the CLOSED candidate set of active flags; the
+/// frontend then acts on the returned route — `resolve`/`prefer` on the user's confirm (those are
+/// writes), `ask`/`edit` navigate. This command itself never writes flag/preference state; a `prefer`
+/// route only carries the draft the confirm step stores. The user's line is their own request, but the
+/// ingested titles in the candidate list stay DATA (rule #6). Background key, no DB lock across the
+/// await (rule #4). Returns [`flags::FocusRoute::Unclear`] for blank input or an unreadable reply.
+#[tauri::command]
+pub async fn route_focus_input(app: AppHandle, text: String) -> Result<flags::FocusRoute> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Ok(flags::FocusRoute::Unclear);
+    }
+    let (models, candidates, project_names) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
+        let zone = resolve_zone(&conn);
+        let today = clock::today_sql_in(zone);
+        let candidates = flags::describe_active(&conn, &today, zone)?;
+        let project_names = entities::canonical_project_names(&conn)?;
+        (models, candidates, project_names)
+    };
+    let api_key = secrets::get_background_or_primary_key()?
+        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+
+    let messages = flags::render_route_request(&text, &candidates, &project_names);
+    let completion = openrouter::complete(api_key.expose(), &models, &messages, false).await?;
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        log_usage(
+            &conn,
+            "background",
+            completion
+                .model
+                .as_deref()
+                .or_else(|| models.first().map(String::as_str)),
+            &completion.usage,
+        );
+    }
+    let route = flags::parse_route(&completion.text, &candidates, &text);
+
+    // Resolve the entity for a project-scoped preference draft (read-only — never invent an entity the
+    // user hasn't confirmed; a name that doesn't resolve falls back to a global preference, exactly like
+    // `parse_preference_statement`). Other routes pass straight through.
+    if let flags::FocusRoute::Prefer { draft } = &route {
+        if draft.scope == preferences::SCOPE_PROJECT {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            let resolved = draft
+                .project_name
+                .as_deref()
+                .and_then(|n| entities::resolve_project(&conn, n, false).ok().flatten());
+            let mut draft = draft.clone();
+            match resolved {
+                Some(id) => {
+                    draft.entity_id = Some(id);
+                    draft.project_name = Some(entities::canonical_name(&conn, id)?);
+                }
+                None => {
+                    draft.scope = preferences::SCOPE_GLOBAL.to_string();
+                    draft.entity_id = None;
+                    draft.project_name = None;
+                }
+            }
+            return Ok(flags::FocusRoute::Prefer { draft });
+        }
+    }
+    Ok(route)
 }
 
 // --- cost logger (spec §11.2 / §17.1) ---
