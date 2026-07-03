@@ -5388,31 +5388,55 @@ pub fn document_chunk_spans(state: State<'_, AppState>, doc_id: i64) -> Result<V
     Ok(rows)
 }
 
-/// The decrypted original image for a `photo` document that was copied into the vault (the opt-in), as
-/// base64 + mime. `None` when no original was saved — the reader then falls back to the OCR body.
+/// The original image for a `photo` document, as base64 + mime, for the reader to display. Prefers the
+/// encrypted copy in the vault when the user opted to save one; otherwise falls back to the original
+/// file where PM referenced it on disk (photos are referenced-in-place by default — no vault copy). Only
+/// `None` when neither is available — no saved copy and the original has moved/been deleted (e.g. a
+/// screenshot in a temp folder that was since cleaned up) — in which case the reader shows the OCR body.
 #[tauri::command]
 pub fn read_document_image(state: State<'_, AppState>, doc_id: i64) -> Result<Option<ImageData>> {
     use base64::Engine;
-    let vault_rel: Option<String> = {
+    let row: Option<(Option<String>, Option<String>, i64)> = {
         let conn = state.conn()?;
         conn.query_row(
-            "SELECT vault_path FROM photos WHERE document_id = ?1 AND saved_to_vault = 1",
+            "SELECT vault_path, source_path, saved_to_vault FROM photos WHERE document_id = ?1",
             params![doc_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?
-        .flatten()
     };
-    let Some(rel) = vault_rel else {
+    let Some((vault_path, source_path, saved)) = row else {
         return Ok(None);
     };
-    let (vault, cipher) = state.markdown_io()?;
-    let bytes = cipher.read_bytes(&vault.join(&rel))?;
-    let mime = image_mime(&vault::MarkdownCipher::logical_name(&rel));
-    Ok(Some(ImageData {
-        base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-        mime,
-    }))
+
+    // Preferred: the encrypted vault copy the user chose to keep.
+    if saved == 1 {
+        if let Some(rel) = vault_path {
+            let (vault, cipher) = state.markdown_io()?;
+            let bytes = cipher.read_bytes(&vault.join(&rel))?;
+            let mime = image_mime(&vault::MarkdownCipher::logical_name(&rel));
+            return Ok(Some(ImageData {
+                base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                mime,
+            }));
+        }
+    }
+
+    // Fallback: read the original from the path PM recorded at import. It's the user's own file, read
+    // straight from disk (never encrypted — the vault copy is the only encrypted one); a missing/moved
+    // original falls through to `None` and the reader's OCR body.
+    if let Some(path) = source_path {
+        let p = std::path::Path::new(&path);
+        if p.is_file() {
+            if let Ok(bytes) = std::fs::read(p) {
+                return Ok(Some(ImageData {
+                    base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    mime: image_mime(&path),
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Best-effort image MIME from a filename extension, for the reader's `data:` URL.
