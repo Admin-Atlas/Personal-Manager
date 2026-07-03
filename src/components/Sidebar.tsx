@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState } from "react";
+import { useEffect, useId, useState } from "react";
 import type { Conversation } from "../lib/types";
+import { listProjects } from "../lib/ipc";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme } from "../theme";
-import { ConfirmDialog, NavItem } from "./ui";
+import { Button, ConfirmDialog, Modal, NavItem, Select } from "./ui";
 
 export type View =
   | "focus"
@@ -32,6 +33,9 @@ interface Props {
   onSelect: (id: number) => void;
   /** Delete a conversation for good (card 7G) — the parent owns the mutation + list refresh. */
   onDelete: (id: number) => void;
+  /** Move a conversation into a project, or back to global with `null` (card B). The parent owns the
+   *  mutation + list refresh (and, in a project pane, resetting if the open chat leaves the project). */
+  onMove: (id: number, project: string | null) => void;
   onNew: () => void;
   onOpenSettings: () => void;
   onOpenWhatsNew: () => void;
@@ -52,6 +56,7 @@ export function Sidebar({
   reviewCount,
   onSelect,
   onDelete,
+  onMove,
   onNew,
   onOpenSettings,
   onOpenWhatsNew,
@@ -72,6 +77,10 @@ export function Sidebar({
   // hover trash and the confirm modal stay a local concern; the actual purge is `onDelete` (App owns
   // the mutation + list refresh + reselecting after the active chat is deleted).
   const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null);
+  // The conversation whose "move to project" picker is open (null = none). Like the delete flow, the
+  // row's hover control and the picker modal stay local; the actual reassignment is `onMove` (the parent
+  // owns the mutation + list refresh).
+  const [pendingMove, setPendingMove] = useState<Conversation | null>(null);
   return (
     <aside className="flex h-full w-64 flex-col border-r border-border bg-panel">
       <div className="flex items-center justify-between px-4 py-3">
@@ -177,26 +186,37 @@ export function Sidebar({
               <p className="px-2 py-2 text-xs text-faint">No conversations yet.</p>
             )}
             {conversations.map((c) => (
-              // The trash sits OUTSIDE the NavItem (itself a <button>) — a button can't nest a button.
-              // It's a hover-revealed sibling overlaid on the row's right edge; `pr-8` on the NavItem
-              // keeps a long title from sliding under it.
+              // The row controls sit OUTSIDE the NavItem (itself a <button>) — a button can't nest a
+              // button. They're hover-revealed siblings overlaid on the row's right edge; `pr-14` on
+              // the NavItem keeps a long title from sliding under them.
               <div key={c.id} className="group relative">
                 <NavItem
                   active={c.id === activeId}
                   onClick={() => onSelect(c.id)}
-                  className="mb-1 pr-8"
+                  className="mb-1 pr-14"
                 >
                   <span title={c.title}>{c.title}</span>
                 </NavItem>
-                <button
-                  type="button"
-                  onClick={() => setPendingDelete(c)}
-                  title="Delete chat"
-                  aria-label={`Delete conversation “${c.title}”`}
-                  className="absolute right-1 top-1/2 -translate-y-1/2 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
-                >
-                  <span aria-hidden="true">🗑</span>
-                </button>
+                <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setPendingMove(c)}
+                    title="Move to a project"
+                    aria-label={`Move conversation “${c.title}” to a project`}
+                    className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+                  >
+                    <span aria-hidden="true">📁</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPendingDelete(c)}
+                    title="Delete chat"
+                    aria-label={`Delete conversation “${c.title}”`}
+                    className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
+                  >
+                    <span aria-hidden="true">🗑</span>
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -222,6 +242,18 @@ export function Sidebar({
           </p>
         )}
       </ConfirmDialog>
+
+      {pendingMove && (
+        <MoveConversationDialog
+          conversation={pendingMove}
+          onClose={() => setPendingMove(null)}
+          onMove={(project) => {
+            const id = pendingMove.id;
+            setPendingMove(null);
+            onMove(id, project);
+          }}
+        />
+      )}
 
       <div className="border-t border-border p-2">
         <button
@@ -276,6 +308,85 @@ function ModelRow({ role, id, fallbacks }: { role: string; id: string | null; fa
 function shortModel(id: string): string {
   const slash = id.indexOf("/");
   return slash >= 0 ? id.slice(slash + 1) : id;
+}
+
+/** The "move a chat into a project (or back to global)" picker (card B, chat transfer). Fetches the
+ *  project list lazily on open, defaults the selection to the chat's current home, and only enables
+ *  Move when the target actually changes. The reassignment itself is the parent's `onMove`. */
+function MoveConversationDialog({
+  conversation,
+  onClose,
+  onMove,
+}: {
+  conversation: Conversation;
+  onClose: () => void;
+  onMove: (project: string | null) => void;
+}) {
+  const titleId = useId();
+  // null = still loading the project list; [] = loaded, none exist yet.
+  const [projects, setProjects] = useState<string[] | null>(null);
+  const current = conversation.project ?? "";
+  const [target, setTarget] = useState(current);
+
+  useEffect(() => {
+    let alive = true;
+    listProjects()
+      .then((p) => alive && setProjects(p))
+      .catch(() => alive && setProjects([]));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Always offer the chat's own project even if `list_projects` doesn't surface it (e.g. a project with
+  // no ingested docs yet), so the current home is representable and "unchanged" is detectable.
+  const options =
+    projects == null
+      ? []
+      : current !== "" && !projects.includes(current)
+        ? [current, ...projects]
+        : projects;
+
+  return (
+    <Modal open onClose={onClose} labelledBy={titleId} widthClassName="max-w-md">
+      <div className="p-5">
+        <h2 id={titleId} className="font-head text-base font-semibold text-ink">
+          Move conversation
+        </h2>
+        <p className="mt-2 text-sm leading-relaxed text-ink3">
+          Choose where “{conversation.title}” lives. A project chat searches only that project’s
+          files; a global chat searches everything. Past messages stay put — only where it’s filed
+          changes.
+        </p>
+        <Select
+          className="mt-4 w-full"
+          value={target}
+          onChange={(e) => setTarget(e.target.value)}
+          disabled={projects == null}
+          aria-label="Destination project"
+        >
+          <option value="">No project (global)</option>
+          {options.map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </Select>
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="tertiary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => onMove(target === "" ? null : target)}
+            disabled={projects == null || target === current}
+          >
+            Move
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
 }
 
 /** The pill count shown on a nav row (e.g. pending reviews); renders nothing at zero. */

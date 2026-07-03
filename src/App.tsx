@@ -52,6 +52,7 @@ import {
   resumeOneDriveSync,
   reviewQueue,
   setChatModels,
+  setConversationProject,
   setHelpMode,
   startSemanticLayout,
   syncCalendar,
@@ -396,6 +397,19 @@ export default function App() {
     await refreshConversations();
   }
 
+  // Move a global-list conversation into a project (or back to global). The global list shows every
+  // chat regardless of scope, so the moved row simply re-labels and stays put — a refresh is enough,
+  // and the on-screen chat (if it's the one moved) re-scopes its retrieval on its next send. Card B.
+  async function handleMoveConversation(id: number, project: string | null) {
+    try {
+      await setConversationProject(id, project);
+    } catch (e) {
+      chat.setError(String(e));
+      return;
+    }
+    await refreshConversations();
+  }
+
   async function handleSend(text: string) {
     // Power-user parity with "+ New": /new · /done starts a fresh chat instead of sending, so the
     // trigger never reaches the model or the vault (board card 7E).
@@ -524,6 +538,7 @@ export default function App() {
                   }
             }
             onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
+            onMove={inProject ? projectChat.moveConversation : handleMoveConversation}
             onNew={
               inProject
                 ? projectChat.newChat

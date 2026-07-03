@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.75.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "New: move a chat into a project — or back to global. Hover any conversation in the sidebar and use the new 📁 button to file it under a project (its search then narrows to that project's files) or send it back to global (searches everything). Past messages stay put; only where the chat lives changes, and it takes effect on your next message.",
+    ],
+  },
+  {
     version: "2.74.0-alpha",
     date: "2026-07-03",
     highlights: [

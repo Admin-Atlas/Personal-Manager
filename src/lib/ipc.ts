@@ -283,6 +283,11 @@ export const getMessages = (conversationId: number) =>
 export const renameConversation = (conversationId: number, title: string) =>
   invoke<string>("rename_conversation", { conversationId, title });
 
+/** Move a conversation into a project, or back to global with `null` (board card B). The scope follows
+ *  the new home on the next send — retrieval re-narrows and future activity re-keys automatically. */
+export const setConversationProject = (conversationId: number, project: string | null) =>
+  invoke<void>("set_conversation_project", { conversationId, project });
+
 /** Delete a conversation and everything it produced (board card 7G): its messages, its session, and —
  *  if the chat was indexed — its document, chunks/vectors/FTS rows and vault file. Preferences it
  *  produced are kept. Irreversible. */
