@@ -35,6 +35,7 @@ mod outlook_calendar;
 mod paths;
 mod photos;
 mod preferences;
+mod project_activity;
 mod projects;
 mod python_fetch;
 mod recommend;

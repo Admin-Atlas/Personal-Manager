@@ -854,6 +854,46 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_spreadsheets_document ON spreadsheets(document_id);
     "#,
+    // v31: the Project Activity Log (board card: Project Activity Log / heat emit hook). An
+    // append-only, name-keyed, EMIT-ONLY engagement record: every meaningful engagement with a project
+    // — a message in its scoped chat, a document filed INTO it, a milestone edit — appends one
+    // `project_activity` row. NOTHING reads this yet; a future Stage-4 heat scorer maps `kind` → weight
+    // at READ time, which is why rows are OBSERVATIONS with NO weight/score column (so the log stays
+    // decision-free if scoring later changes).
+    //
+    // Keyed on `projects(name)` — the identity every project surface already uses (`last_touched`,
+    // `project_milestones.project_name`, `conversations.project`, calendar title-matching); `entity_id`
+    // is the minority convention (nullable, NULL until a doc resolves it). ON DELETE CASCADE mirrors
+    // `project_milestones` (v20) so dropping a project cleans up its log; NO ON UPDATE — `projects.name`
+    // is never renamed (rename lives on `entities.canonical_name` + a `documents.project` cache rewrite).
+    // The emit helper upserts a bare `projects` row first, so a never-triaged (entity_id NULL) project
+    // still logs — every project has a name.
+    //
+    // Retention is baked in (avoids the `usage_log` unbounded trap): raw rows are kept for a recent
+    // window (~30d) then compacted by the rollup job into per-(project,day,kind) counts in
+    // `project_activity_daily` (raw rows pruned; the tiny daily rollups kept long-term). `occurred_at` is
+    // unix SECONDS (integer, matching the retrieval age convention) so day-bucketing is a plain integer
+    // divide (`occurred_at / 86400`, UTC). Additive only (rule #3) — older stores start with two empty
+    // tables. `source_ref` is a free-form back-pointer (doc / conversation / milestone id), NOT an FK, so
+    // a later-deleted target leaves the historical observation intact.
+    r#"
+    CREATE TABLE project_activity (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project     TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+        kind        TEXT NOT NULL CHECK (kind IN ('chat','ingest','milestone')),
+        occurred_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),  -- unix seconds UTC
+        source_ref  INTEGER                                                            -- related row id (doc/convo/milestone); NULL = none, NOT an FK
+    );
+    CREATE INDEX idx_project_activity_project_time ON project_activity(project, occurred_at);
+
+    CREATE TABLE project_activity_daily (
+        project TEXT    NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+        day     INTEGER NOT NULL,                                                       -- unix-day = occurred_at / 86400 (UTC)
+        kind    TEXT    NOT NULL CHECK (kind IN ('chat','ingest','milestone')),
+        count   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (project, day, kind)
+    );
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -903,7 +943,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 30,
+            version, 31,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -913,7 +953,7 @@ mod tests {
              last-turn prompt size for the context meter is v26; chat title provenance is v27; \
              chat preference source + extraction cursor is v28; \
              Drive parent-folder tag + normalized source_account is v29; \
-             spreadsheet ingestion table is v30)"
+             spreadsheet ingestion table is v30; project activity log is v31)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
