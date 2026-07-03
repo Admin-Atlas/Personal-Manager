@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.70.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "New: Google Sheets from your connected Drive are now indexed the smart way — a lightweight pointer with the spreadsheet's tab names and column headers plus a link to open it in Drive, instead of dumping the whole grid into search. Sheets stay findable and their link always works. To enable the richer tab/header details on a Google account you connected earlier, use the new “Reconnect for Sheets” button in Settings → Connectors (a quick re-approval in your browser that adds read-only Sheets access) — until then those sheets are indexed by name only. Want a sheet's actual contents searchable? Importing it fully is coming next.",
+    ],
+  },
+  {
     version: "2.69.0-alpha",
     date: "2026-07-03",
     highlights: [

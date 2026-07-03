@@ -494,6 +494,9 @@ export interface DriveAccount {
   state: "ok" | "unreachable" | "error";
   /** How many index-only documents this account currently has. */
   indexed: number;
+  /** Whether this account granted the read-only Sheets scope. `false` for accounts connected before
+   *  Sheets support — their Google Sheets index by name only until the user reconnects. */
+  has_sheets_scope: boolean;
 }
 
 /** The Drive connector's state for Settings. */

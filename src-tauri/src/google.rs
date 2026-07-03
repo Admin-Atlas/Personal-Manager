@@ -26,6 +26,13 @@ pub const CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar.reado
 /// `drive.readonly` (not `drive.metadata.readonly`) because index-only ingestion needs each
 /// file's body to embed it.
 pub const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
+/// Read-only Sheets scope — requested ALONGSIDE `drive.readonly` when connecting a Drive account, so
+/// PM can read a Google Sheet's tab names + header row via the Sheets API for the metadata-only Sheets
+/// index (never the full grid). Because a refresh token cannot broaden its grant, adding this scope
+/// means every EXISTING Drive account must re-consent to gain it; PM detects who needs it — offline,
+/// no network — with [`token_has_scope`] and surfaces a per-account "Reconnect for Sheets" prompt.
+/// `build_auth_url`'s `include_granted_scopes=true` unions it onto the account's existing Drive grant.
+pub const SHEETS_SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets.readonly";
 /// The ONLY Google **write** scope PM ever requests — least-privilege, granted just for
 /// encrypted backup. `drive.file` can create and manage only files/folders the app itself
 /// created (PM's "Personal Manager Backups" folder and its `.pmbackup` archives); it can never
