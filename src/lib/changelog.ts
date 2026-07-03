@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.69.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "New: spreadsheets are indexed properly now. Drop in an .xlsx, .xls, or .csv and PM reads it as a spreadsheet — not as one giant table mangled into search — with an overview of each sheet (its columns, their types, the row count, and any date range) plus each row indexed on its own with the column names folded in, so a search finds the exact row and still knows what every value means. Small sheets stay together as one entry; very large sheets are indexed up to a sensible limit (the overview always tells you the true total). Multi-sheet workbooks are handled sheet by sheet. Nothing to turn on — it just happens on ingest.",
+    ],
+  },
+  {
     version: "2.68.0-alpha",
     date: "2026-07-03",
     highlights: [

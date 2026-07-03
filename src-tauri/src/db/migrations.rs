@@ -817,6 +817,43 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE documents ADD COLUMN source_parent_folder_name TEXT;
     ALTER TABLE documents ADD COLUMN source_account TEXT;
     "#,
+    // v30: spreadsheet ingestion (board card: Spreadsheet Processing). `.xlsx/.xls/.csv` become a
+    // dedicated ingest path that BYPASSES MarkItDown; a spreadsheet lands as a `documents` row with
+    // `source_type='spreadsheet'` (so the existing split/embed/FTS/vector/retrieval/Map/citation/
+    // rebuild/deletion machinery works unchanged) PLUS a row in the NEW `spreadsheets` satellite table.
+    //
+    // Two additive parts (rule #3 — no data moved, no column dropped):
+    //   * Relax the `documents.source_type` CHECK to admit 'spreadsheet'. SQLite can't ALTER a column
+    //     CHECK in place, so we reuse the v22/v23 `writable_schema` text-patch (it edits the stored
+    //     CREATE TABLE text only; `run` then bumps the schema cookie so this connection reparses the new
+    //     constraint). The value list `'vault','index_only','photo','chat'` appears exactly once — in
+    //     this CHECK — and only on `documents`.
+    //   * `spreadsheets` (NEW) is the thin satellite holding the spreadsheet-specific truth a document
+    //     doesn't have: `sheet_count`/`total_rows` and `chunked_rows` (rows actually indexed after the
+    //     sidecar's per-sheet row cap — `chunked_rows < total_rows` records a truncation). These
+    //     round-trip via the vault frontmatter, so a Rebuild's `DELETE FROM documents` teardown (which
+    //     cascades this row away) reconstructs it from the `.md` without re-parsing the original file.
+    //     `structured_data_summary` is RESERVED for later column-type/aggregate enrichment — always NULL
+    //     on insert, no writer this card — exactly mirroring `photos.visual_description`'s current state,
+    //     so that future card ships with zero schema change.
+    r#"
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master
+       SET sql = replace(sql, '''vault'',''index_only'',''photo'',''chat''', '''vault'',''index_only'',''photo'',''chat'',''spreadsheet''')
+     WHERE type = 'table' AND name = 'documents';
+    PRAGMA writable_schema = OFF;
+
+    CREATE TABLE spreadsheets (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id             INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        sheet_count             INTEGER,
+        total_rows              INTEGER,
+        chunked_rows            INTEGER,
+        structured_data_summary TEXT,
+        created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_spreadsheets_document ON spreadsheets(document_id);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -866,7 +903,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 29,
+            version, 30,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -875,7 +912,8 @@ mod tests {
              chat per-chunk provenance + timestamp is v24; rolling chat summary is v25; \
              last-turn prompt size for the context meter is v26; chat title provenance is v27; \
              chat preference source + extraction cursor is v28; \
-             Drive parent-folder tag + normalized source_account is v29)"
+             Drive parent-folder tag + normalized source_account is v29; \
+             spreadsheet ingestion table is v30)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

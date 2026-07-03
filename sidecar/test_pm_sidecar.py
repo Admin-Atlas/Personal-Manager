@@ -215,5 +215,98 @@ class AnalyzeImageTest(unittest.TestCase):
         self.assertIsNone(out["capture_date"])
 
 
+class SpreadsheetTest(unittest.TestCase):
+    """The dedicated spreadsheet processor that bypasses MarkItDown. The type heuristic and the CSV
+    path are pure/stdlib, so they run in CI; the .xlsx/.xls readers need openpyxl/xlrd and are
+    skipped where those aren't installed (they never download anything)."""
+
+    def test_infer_column_type_heuristic(self):
+        self.assertEqual(S.infer_column_type(["1", "2", "3"]), "int")
+        self.assertEqual(S.infer_column_type(["1.5", "2", "3"]), "float")  # mixed numeric → float
+        self.assertEqual(S.infer_column_type(["2026-01-02", "2026-03-04"]), "date")
+        self.assertEqual(S.infer_column_type(["true", "no", "Yes"]), "bool")
+        self.assertEqual(
+            S.infer_column_type(["Atlas", "42", "2026-01-01"]), "string"
+        )  # heterogeneous
+        self.assertEqual(S.infer_column_type(["", "  ", None]), "empty")
+
+    def test_inspect_columns_is_decoupled_schema(self):
+        headers = ["Project", "Amount", "Due"]
+        rows = [["Atlas", "1200", "2026-03-01"], ["Beacon", "800", "2026-04-15"]]
+        cols = S.inspect_columns(headers, rows)
+        self.assertEqual([c["name"] for c in cols], ["Project", "Amount", "Due"])
+        self.assertEqual([c["inferred_type"] for c in cols], ["string", "int", "date"])
+
+    def test_analyze_csv_metadata_and_rows(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/budget.csv"
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("Project,Amount,Due\nAtlas,1200,2026-03-01\nBeacon,800,2026-04-15\n")
+            out = S.do_analyze_spreadsheet({"path": path, "ext": "csv"})
+        self.assertEqual(len(out["sheets"]), 1)
+        sheet = out["sheets"][0]
+        self.assertEqual(sheet["name"], "budget")  # CSV sheet is named after the file
+        self.assertEqual(sheet["headers"], ["Project", "Amount", "Due"])
+        self.assertEqual(sheet["row_count"], 2)
+        self.assertEqual(sheet["inferred_types"], ["string", "int", "date"])
+        self.assertEqual(sheet["date_range"], ["2026-03-01", "2026-04-15"])
+        self.assertFalse(sheet["truncated"])
+        self.assertEqual(sheet["rows"][0], ["Atlas", "1200", "2026-03-01"])
+
+    def test_row_cap_truncates_but_reports_true_total(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/big.csv"
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("Name,N\n")
+                for i in range(5):
+                    fh.write(f"row{i},{i}\n")
+            with mock.patch.object(S, "SPREADSHEET_ROW_CAP", 3):
+                out = S.do_analyze_spreadsheet({"path": path, "ext": "csv"})
+        sheet = out["sheets"][0]
+        self.assertEqual(sheet["row_count"], 5)  # TRUE total, not the cap
+        self.assertEqual(len(sheet["rows"]), 3)  # capped
+        self.assertTrue(sheet["truncated"])
+
+    def test_semicolon_delimiter_is_sniffed(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/semi.csv"
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("A;B\n1;2\n3;4\n")
+            out = S.do_analyze_spreadsheet({"path": path, "ext": "csv"})
+        sheet = out["sheets"][0]
+        self.assertEqual(sheet["headers"], ["A", "B"])
+        self.assertEqual(sheet["rows"], [["1", "2"], ["3", "4"]])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("openpyxl") is not None,
+        "openpyxl not installed (.xlsx reading is a local-only check)",
+    )
+    def test_analyze_xlsx_multi_sheet(self):
+        import tempfile
+
+        from openpyxl import Workbook
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/book.xlsx"
+            wb = Workbook()
+            ws1 = wb.active
+            ws1.title = "Budget"
+            ws1.append(["Project", "Amount"])
+            ws1.append(["Atlas", 1200])
+            ws2 = wb.create_sheet("Team")
+            ws2.append(["Name"])
+            ws2.append(["Ramit"])
+            wb.save(path)
+            out = S.do_analyze_spreadsheet({"path": path, "ext": "xlsx"})
+        self.assertEqual([s["name"] for s in out["sheets"]], ["Budget", "Team"])
+        self.assertEqual(out["sheets"][0]["inferred_types"], ["string", "int"])
+
+
 if __name__ == "__main__":
     unittest.main()

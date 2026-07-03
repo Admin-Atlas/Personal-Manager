@@ -23,6 +23,19 @@
 # already ships (it pulls no runtime of its own) and downloads its small ONNX models
 # on first use; the extra image deps (opencv/shapely/pyclipper) and pillow-heif ship
 # binary wheels for both the bundled 3.12 release interpreter and dev 3.14.
+#
+#   openpyxl / xlrd — spreadsheet parsing for the dedicated .xlsx/.xls/.csv ingest
+#     path (board card: Spreadsheet Processing). Those extensions BYPASS MarkItDown
+#     now — routed to the sidecar's `analyze_spreadsheet`, which reads values-only
+#     with openpyxl (.xlsx) / xlrd (.xls) and stdlib `csv` (.csv). Both were already
+#     present TRANSITIVELY via markitdown[xlsx,xls]; since MarkItDown is no longer
+#     invoked for spreadsheets we pin them explicitly as first-class deps rather than
+#     leaning on that transitivity. Both are pure-Python (no compiler), so they add no
+#     build burden and co-resolve cleanly on the bundled 3.12 and dev 3.14. NO pandas:
+#     column types come from a lightweight try-parse heuristic in the sidecar, so
+#     pandas' (unreliable, on messy CSVs) dtype inference buys nothing for real weight.
 markitdown[pdf,docx,pptx,xlsx,xls,outlook]==0.1.6
 fastembed==0.8.0
 faster-whisper==1.2.1
+openpyxl==3.1.5
+xlrd==2.0.1

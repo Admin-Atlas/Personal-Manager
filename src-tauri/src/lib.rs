@@ -47,6 +47,7 @@ mod secret;
 mod secrets;
 mod sidecar;
 mod splitter;
+mod spreadsheets;
 mod vault;
 
 use std::ops::{Deref, DerefMut};
