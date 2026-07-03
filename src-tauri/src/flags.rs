@@ -24,16 +24,29 @@
 //! once it passes. A CROSS-instance PREFERENCE ("stop nagging me two hours out") is durable
 //! and lives in [`crate::preferences`], never here. The two are never co-mingled.
 //!
-//! **PR1 scope (this file):** the schema, the typed vocabulary, and the CRUD seam — nothing
-//! detects, renders, or resolves yet. Detection (a pure reducer over calendar + milestones)
-//! arrives with the briefing rewrite; the assertion/HITL rules and chat grounding follow.
-//! Until a consumer wires in, this public surface is exercised only by the unit tests below
-//! — hence the `#[allow(dead_code)]` on the module declaration in `lib.rs`.
+//! **Detection (PR2):** [`detect`] is a PURE reducer — given the focus-view projects and the
+//! upcoming calendar, it proposes the flag set the current state implies (deadline-approaching /
+//! overdue per unmet milestone; happening-today / prepare-ahead per calendar event series).
+//! [`detect_and_store`] runs it and RECONCILES the stored set: it upserts every proposed flag and
+//! prunes any detection-owned active flag the state no longer implies (a passed event, a met or
+//! slipped milestone) — resolved flags are protected state and never touched. Because the briefing
+//! path and the [`spawn_flag_detection_scheduler`] backstop both derive from the same deterministic
+//! reducer, they converge on the same set and never fight. The briefing then renders that active
+//! set (see [`crate::briefing`]); assertion/HITL and chat grounding follow in later PRs.
 
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use tauri::{AppHandle, Manager};
 
+use crate::calendar::{self, CalendarEvent};
 use crate::error::Result;
+use crate::milestones;
+use crate::projects::{self, ProjectOverview};
+use crate::{clock, db, AppState};
 
 // Which identity space a flag's `anchor` string lives in.
 pub const ANCHOR_CALENDAR: &str = "calendar";
@@ -45,12 +58,19 @@ pub const TYPE_DEADLINE_APPROACHING: &str = "deadline-approaching";
 pub const TYPE_HAPPENING_TODAY: &str = "happening-today";
 pub const TYPE_OVERDUE: &str = "overdue";
 
-// Lifecycle.
+// Lifecycle + provenance. Detection/reconcile query these states as SQL literals; the Rust-side
+// constants (and the `SOURCE_*` pair) are the assertion/resolution vocabulary the manual "done"
+// flow (PR3) compares against, so they're exercised only by unit tests until then — hence the
+// scoped `#[allow(dead_code)]`.
+#[allow(dead_code)] // consumed by assertion/resolution (PR3)
 pub const STATE_ACTIVE: &str = "active";
+#[allow(dead_code)] // consumed by assertion/resolution (PR3)
 pub const STATE_RESOLVED: &str = "resolved";
 
 // Which path CLOSED a flag (NULL while active). On conflict, assertion outranks detection.
+#[allow(dead_code)] // consumed by assertion/resolution (PR3)
 pub const SOURCE_DETECTION: &str = "detection";
+#[allow(dead_code)] // consumed by assertion/resolution (PR3)
 pub const SOURCE_ASSERTION: &str = "assertion";
 
 /// A flag as stored, and as the briefing/chat layer will read it. `type` is a Rust keyword,
@@ -113,7 +133,9 @@ fn row_to_flag(r: &rusqlite::Row) -> rusqlite::Result<Flag> {
     })
 }
 
-/// One flag by id, or `None` if the id is unknown.
+/// One flag by id, or `None` if the id is unknown. Used by the resolution flow (PR3) and the
+/// tests; not yet reached from lib code, so it's allowed to be "dead" until then.
+#[allow(dead_code)]
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Flag>> {
     Ok(conn
         .query_row(
@@ -188,6 +210,8 @@ pub fn upsert_active(conn: &Connection, f: &DraftFlag) -> Result<i64> {
 /// is machine-derived (`user_confirmed = 0`) and — per the HITL-confirm-before-suppress rule —
 /// must be confirmed before it is allowed to cross anything off (that gate lives in the
 /// resolution PR). Passing `artifact_ptr = None` keeps whatever pointer detection already found.
+/// The `resolve_flag` command (PR3) is its first lib consumer; until then only the tests call it.
+#[allow(dead_code)]
 pub fn resolve(conn: &Connection, id: i64, source: &str, artifact_ptr: Option<&str>) -> Result<()> {
     let user_confirmed = i64::from(source == SOURCE_ASSERTION);
     conn.execute(
@@ -212,6 +236,263 @@ pub fn default_threshold_days(flag_type: &str) -> f64 {
         TYPE_HAPPENING_TODAY | TYPE_OVERDUE => 0.0,
         _ => 0.0,
     }
+}
+
+// --- detection (pure reducer + reconciling executor + backstop scheduler) --------------------
+
+/// How far ahead the calendar half of detection fetches events. It matches the briefing agenda
+/// window; [`detect`] itself filters to each type's own lead (`prepare-ahead` within its 3-day
+/// default, `happening-today` on the day), so a wider fetch just means a few events the reducer
+/// then ignores. Kept in step with `briefing::BRIEFING_AGENDA_DAYS` by value.
+const DETECT_EVENT_WINDOW_DAYS: i64 = 7;
+
+/// The outcome of a pure detection pass: the flags the current state implies, plus how many
+/// calendar events were skipped for having no iCal `uid` (no stable anchor to hang a flag on).
+/// The skip count is surfaced, never silently swallowed — a caller logs it (no silent cap).
+#[derive(Debug, Default)]
+pub struct Detection {
+    pub drafts: Vec<DraftFlag>,
+    pub skipped_no_uid: usize,
+}
+
+/// Derive the flag set the current state implies — PURE, so it unit-tests without a DB or clock
+/// (mirroring [`crate::projects::derive_status`] / [`crate::milestones::governing`]). Two families:
+///
+/// - **Milestone-anchored** (`deadline-approaching` / `overdue`), one per UNMET dated milestone:
+///   `overdue` once its date is past, else `deadline-approaching` within the type's default lead.
+///   Each milestone is its own anchor (its stable id), so resolving one never touches another.
+/// - **Calendar-anchored** (`happening-today` / `prepare-ahead`), one per event SERIES: recurrences
+///   share a `uid`, so each `uid` is collapsed to its soonest instance and classified once (a daily
+///   standup is one flag, not one per day). An event with no `uid` can't be stably anchored, so it
+///   is counted in `skipped_no_uid` and dropped rather than anchored on a volatile row id.
+///
+/// Detection only ever proposes `active` drafts (it never resolves). Artifact matching (a confident
+/// prep-doc → `artifact_ptr`) is a later refinement, so drafts carry no pointer yet. The returned
+/// drafts are sorted for a deterministic order (the stored set keys on `(anchor,type)` regardless).
+pub fn detect(projects: &[ProjectOverview], events: &[CalendarEvent], today: &str) -> Detection {
+    let mut out = Detection::default();
+
+    // Milestone-anchored: one flag per unmet, dated milestone inside its lead window.
+    for p in projects {
+        for m in &p.milestones {
+            if m.is_met() {
+                continue;
+            }
+            let Some(due) = m.due_date.as_deref() else {
+                continue;
+            };
+            let Some(days) = milestones::days_until(today, due) else {
+                continue; // unparseable date → not flaggable, never silently "due"
+            };
+            let flag_type = if days < 0.0 {
+                TYPE_OVERDUE
+            } else if days <= default_threshold_days(TYPE_DEADLINE_APPROACHING) {
+                TYPE_DEADLINE_APPROACHING
+            } else {
+                continue; // still comfortably ahead — no flag yet
+            };
+            out.drafts
+                .push(draft_flag(ANCHOR_MILESTONE, &m.id.to_string(), flag_type));
+        }
+    }
+
+    // Calendar-anchored: collapse each uid to its soonest upcoming instance, then classify once.
+    let mut soonest: HashMap<&str, f64> = HashMap::new();
+    for e in events {
+        let Some(uid) = e.uid.as_deref() else {
+            out.skipped_no_uid += 1;
+            continue;
+        };
+        let Some(days) = milestones::days_until(today, &e.start) else {
+            continue;
+        };
+        soonest
+            .entry(uid)
+            .and_modify(|cur| {
+                if days < *cur {
+                    *cur = days;
+                }
+            })
+            .or_insert(days);
+    }
+    for (uid, days) in soonest {
+        let flag_type = if days <= 0.0 {
+            TYPE_HAPPENING_TODAY
+        } else if days <= default_threshold_days(TYPE_PREPARE_AHEAD) {
+            TYPE_PREPARE_AHEAD
+        } else {
+            continue; // beyond the prepare-ahead lead — still just an agenda item
+        };
+        out.drafts.push(draft_flag(ANCHOR_CALENDAR, uid, flag_type));
+    }
+
+    out.drafts.sort_by(|a, b| {
+        (&a.anchor_kind, &a.r#type, &a.anchor).cmp(&(&b.anchor_kind, &b.r#type, &b.anchor))
+    });
+    out
+}
+
+/// A detection-proposed draft: an `active` flag with no artifact pointer yet.
+fn draft_flag(anchor_kind: &str, anchor: &str, flag_type: &str) -> DraftFlag {
+    DraftFlag {
+        anchor_kind: anchor_kind.into(),
+        anchor: anchor.into(),
+        r#type: flag_type.into(),
+        threshold: None,
+        artifact_ptr: None,
+        artifact_url: None,
+    }
+}
+
+/// What a detection run reports for the log line: how many flags are active afterward, how many
+/// stale detection flags were pruned, and how many calendar events had no anchor.
+#[derive(Debug, Default)]
+pub struct DetectionSummary {
+    pub active: usize,
+    pub pruned: usize,
+    pub skipped_no_uid: usize,
+}
+
+/// Run detection over ALREADY-FETCHED inputs and reconcile the stored flag set to it, in one
+/// transaction. The briefing path uses this (it already holds `projects` + `events`), so the
+/// rendered briefing joins against the exact same snapshot detection saw.
+///
+/// **Reconcile, not just insert.** After upserting every drafted flag, any *detection-owned* active
+/// flag whose `(anchor_kind, anchor, type)` was NOT re-proposed this pass is deleted — its condition
+/// no longer holds (the event passed, the milestone was met or slipped, the deadline flipped to
+/// `overdue` under a new key). This is what a time-based `gc_expired` stood for, generalised: a
+/// passed or withdrawn anchor simply stops being re-emitted. RESOLVED flags (any source) are never
+/// touched — resolution is durable state downstream flags read (decision 3), not something a rescan
+/// may undo (decision 1). The prune is scoped to `state='active' AND user_confirmed=0`, so a
+/// user-vouched or resolved flag is always protected.
+pub fn detect_and_store(
+    conn: &Connection,
+    projects: &[ProjectOverview],
+    events: &[CalendarEvent],
+    today: &str,
+) -> Result<DetectionSummary> {
+    let det = detect(projects, events, today);
+    let emitted: HashSet<(String, String, String)> = det
+        .drafts
+        .iter()
+        .map(|d| (d.anchor_kind.clone(), d.anchor.clone(), d.r#type.clone()))
+        .collect();
+
+    let tx = conn.unchecked_transaction()?;
+    for d in &det.drafts {
+        upsert_active(&tx, d)?;
+    }
+    // Collect the detection-owned active flags the current state no longer implies (stmt is scoped
+    // so it's dropped before the delete loop reborrows `tx`).
+    let stale: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, anchor_kind, anchor, type FROM flags \
+             WHERE state = 'active' AND user_confirmed = 0",
+        )?;
+        let rows: Vec<(i64, (String, String, String))> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    (
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .filter(|(_, key)| !emitted.contains(key))
+            .map(|(id, _)| id)
+            .collect()
+    };
+    for id in &stale {
+        tx.execute("DELETE FROM flags WHERE id = ?1", params![id])?;
+    }
+    tx.commit()?;
+
+    Ok(DetectionSummary {
+        active: list_active(conn, None)?.len(),
+        pruned: stale.len(),
+        skipped_no_uid: det.skipped_no_uid,
+    })
+}
+
+/// Fetch the focus-view inputs, then [`detect_and_store`] — the entry the background scheduler uses
+/// (it has nothing pre-fetched). The briefing path calls `detect_and_store` directly with the
+/// inputs it already holds. Both fetch the same event window and share the same reducer, so they
+/// agree on the flag set.
+pub fn run_detection(conn: &Connection, today: &str) -> Result<DetectionSummary> {
+    let projects = projects::list_overviews(conn, today)?;
+    let events = calendar::list_upcoming(conn, DETECT_EVENT_WINDOW_DAYS)?;
+    detect_and_store(conn, &projects, &events, today)
+}
+
+/// RFC3339 timestamp of the last flag-detection pass; stamped on success so the cadence survives
+/// restarts (mirrors [`crate::project_activity::LAST_ROLLUP_AT_KEY`]).
+pub const LAST_FLAG_SCAN_AT_KEY: &str = "last_flag_scan_at";
+
+/// Backstop tick; detection also runs synchronously on every briefing refresh, so this only has to
+/// catch the app being left open past a day boundary (a `deadline-approaching` should become
+/// `overdue`) without a refresh in between.
+const TICK_SECS: u64 = 3_600;
+/// Only scan once the user has been idle this long — politeness; the pass is cheap.
+const IDLE_THRESHOLD_SECS: u64 = 60;
+/// Re-scan at most this often from the backstop.
+const SCAN_INTERVAL_HOURS: i64 = 6;
+
+/// Whether a backstop scan is due: never run, or the interval has elapsed. Pure (unit-tested
+/// without a clock), mirroring [`crate::project_activity`]'s `rollup_due`.
+fn scan_due(last_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last_at {
+        None => true,
+        Some(last) => now.signed_duration_since(last) >= ChronoDuration::hours(SCAN_INTERVAL_HOURS),
+    }
+}
+
+/// Idle-gated backstop that keeps the flag set current even when the briefing isn't refreshed for a
+/// while. Spawned once from `setup` alongside the other schedulers; gated on unlocked + idle +
+/// not-mid-sync (so it never reconciles against a half-synced calendar mirror), and — like every
+/// scheduler here — never holds the DB guard across an `.await` (repo rule #4).
+pub fn spawn_flag_detection_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let threshold = Duration::from_secs(IDLE_THRESHOLD_SECS);
+        loop {
+            tokio::time::sleep(Duration::from_secs(TICK_SECS)).await;
+
+            // Gate on idle/sync first (no lock), then take the DB guard. Everything below is
+            // synchronous, so the guard is never held across an `.await` (repo rule #4).
+            let state = app.state::<AppState>();
+            if state.idle_for() < threshold || state.sync_active() {
+                continue;
+            }
+            let Ok(conn) = state.conn() else { continue };
+
+            let last_at = db::get_setting(&conn, LAST_FLAG_SCAN_AT_KEY)
+                .ok()
+                .flatten()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&Utc));
+            let now = Utc::now();
+            if !scan_due(last_at, now) {
+                continue;
+            }
+            let zone = crate::commands::resolve_zone(&conn);
+            let today = clock::today_sql_in(zone);
+            match run_detection(&conn, &today) {
+                Ok(s) => {
+                    if s.skipped_no_uid > 0 {
+                        eprintln!(
+                            "flag detection: {} active, {} pruned, {} calendar event(s) skipped (no uid)",
+                            s.active, s.pruned, s.skipped_no_uid
+                        );
+                    }
+                    let _ = db::set_setting(&conn, LAST_FLAG_SCAN_AT_KEY, &now.to_rfc3339());
+                }
+                Err(e) => eprintln!("flag detection skipped: {e}"),
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -340,5 +621,176 @@ mod tests {
         assert_eq!(default_threshold_days(TYPE_PREPARE_AHEAD), 3.0);
         assert_eq!(default_threshold_days(TYPE_HAPPENING_TODAY), 0.0);
         assert_eq!(default_threshold_days(TYPE_OVERDUE), 0.0);
+    }
+
+    // --- detection ---
+
+    use crate::calendar::CalendarEvent;
+    use crate::milestones::Milestone;
+    use crate::projects::{ProjectOverview, ProjectStatus};
+
+    const TODAY: &str = "2026-07-03";
+
+    fn ms(id: i64, due: Option<&str>, met: bool) -> Milestone {
+        Milestone {
+            id,
+            project_name: "Atlas".into(),
+            label: format!("m{id}"),
+            due_date: due.map(|s| s.into()),
+            event_uid: None,
+            calendar_linked: false,
+            event_missing: false,
+            state: Some(if met { "met" } else { "unmet" }.into()),
+            sort_order: id,
+        }
+    }
+
+    fn overview(milestones: Vec<Milestone>) -> ProjectOverview {
+        ProjectOverview {
+            name: "Atlas".into(),
+            status: ProjectStatus::OnTrack,
+            doc_count: 1,
+            last_activity: None,
+            deadline: None,
+            size: None,
+            blocked_by: None,
+            parent: None,
+            importance: None,
+            auto_importance: None,
+            calendar_event: None,
+            milestones,
+            governing_milestone: None,
+        }
+    }
+
+    fn cal_event(uid: Option<&str>, start: &str) -> CalendarEvent {
+        CalendarEvent {
+            id: format!("c:{start}"),
+            calendar_id: "c".into(),
+            summary: "Standup".into(),
+            description: None,
+            location: None,
+            start: start.into(),
+            end: None,
+            all_day: false,
+            html_link: None,
+            uid: uid.map(|s| s.into()),
+        }
+    }
+
+    /// Milestones anchor deadline/overdue flags; calendar events anchor today/prepare-ahead. A
+    /// milestone comfortably ahead, a met one, and a date-less one produce no flag.
+    #[test]
+    fn detect_maps_milestones_and_calendar_to_the_right_types() {
+        let projects = vec![overview(vec![
+            ms(10, Some("2026-06-20"), false), // 13 days past -> overdue
+            ms(11, Some("2026-07-06"), false), // +3 -> deadline-approaching
+            ms(12, Some("2026-09-01"), false), // far off -> no flag
+            ms(13, Some("2026-07-04"), true),  // met -> no flag
+            ms(14, None, false),               // date-less -> no flag
+        ])];
+        let events = vec![
+            cal_event(Some("uid-today"), "2026-07-03T15:00:00Z"), // today
+            cal_event(Some("uid-prep"), "2026-07-05T09:00:00Z"),  // +2 -> prepare-ahead
+            cal_event(Some("uid-far"), "2026-07-30T09:00:00Z"),   // beyond lead -> no flag
+        ];
+
+        let det = detect(&projects, &events, TODAY);
+        let got: Vec<(&str, &str, &str)> = det
+            .drafts
+            .iter()
+            .map(|d| (d.anchor_kind.as_str(), d.anchor.as_str(), d.r#type.as_str()))
+            .collect();
+
+        assert!(got.contains(&(ANCHOR_MILESTONE, "10", TYPE_OVERDUE)));
+        assert!(got.contains(&(ANCHOR_MILESTONE, "11", TYPE_DEADLINE_APPROACHING)));
+        assert!(got.contains(&(ANCHOR_CALENDAR, "uid-today", TYPE_HAPPENING_TODAY)));
+        assert!(got.contains(&(ANCHOR_CALENDAR, "uid-prep", TYPE_PREPARE_AHEAD)));
+        assert_eq!(
+            got.len(),
+            4,
+            "comfortably-ahead / met / date-less / far events don't flag"
+        );
+        assert_eq!(det.skipped_no_uid, 0);
+    }
+
+    /// A calendar event with no iCal uid can't be anchored — it's counted, not silently dropped,
+    /// and a recurring series (one uid, many instances) collapses to a single flag on its soonest.
+    #[test]
+    fn detect_skips_uidless_events_and_dedupes_a_series() {
+        let events = vec![
+            cal_event(None, "2026-07-03T15:00:00Z"),
+            cal_event(None, "2026-07-04T15:00:00Z"),
+            cal_event(Some("uid-daily"), "2026-07-05T09:00:00Z"), // +2 prepare-ahead
+            cal_event(Some("uid-daily"), "2026-07-03T09:00:00Z"), // today — soonest instance wins
+        ];
+        let det = detect(&[], &events, TODAY);
+        assert_eq!(det.skipped_no_uid, 2, "both uid-less events counted");
+        assert_eq!(det.drafts.len(), 1, "series collapses to one flag");
+        assert_eq!(
+            det.drafts[0].r#type, TYPE_HAPPENING_TODAY,
+            "classified on the soonest instance"
+        );
+    }
+
+    /// The executor reconciles: flags whose condition no longer holds are pruned, while a RESOLVED
+    /// flag survives untouched even though detection would still propose it.
+    #[test]
+    fn detect_and_store_reconciles_and_preserves_resolved() {
+        let (_dir, conn) = open_test_db();
+
+        // First pass: two overdue milestones + one today event → three active flags.
+        let p1 = overview(vec![
+            ms(10, Some("2026-06-01"), false),
+            ms(11, Some("2026-06-02"), false),
+        ]);
+        let e1 = vec![cal_event(Some("uid-a"), "2026-07-03T09:00:00Z")];
+        let s1 = detect_and_store(&conn, &[p1], &e1, TODAY).unwrap();
+        assert_eq!(s1.active, 3);
+        assert_eq!(s1.pruned, 0);
+
+        // The user asserts milestone 10's flag done.
+        let m10 = list_active(&conn, Some(ANCHOR_MILESTONE))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.anchor == "10")
+            .unwrap();
+        resolve(&conn, m10.id, SOURCE_ASSERTION, None).unwrap();
+
+        // Second pass: milestone 11 is now met (drops out) and the event is gone. Milestone 10 is
+        // still unmet+overdue, so detection re-proposes it — but it's resolved, so it stays resolved.
+        let p2 = overview(vec![
+            ms(10, Some("2026-06-01"), false),
+            ms(11, Some("2026-06-02"), true),
+        ]);
+        let s2 = detect_and_store(&conn, &[p2], &[], TODAY).unwrap();
+        assert_eq!(s2.pruned, 2, "met milestone + vanished event pruned");
+        assert_eq!(
+            s2.active, 0,
+            "nothing active — 11 & event gone, 10 is resolved"
+        );
+
+        let f10 = get(&conn, m10.id).unwrap().unwrap();
+        assert_eq!(
+            f10.state, STATE_RESOLVED,
+            "a resolved flag is never reconciled away"
+        );
+        assert!(f10.user_confirmed);
+    }
+
+    #[test]
+    fn scan_due_respects_the_interval() {
+        let now = DateTime::parse_from_rfc3339("2026-07-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(scan_due(None, now), "never run → due");
+        assert!(
+            !scan_due(Some(now - ChronoDuration::hours(1)), now),
+            "within interval → not due"
+        );
+        assert!(
+            scan_due(Some(now - ChronoDuration::hours(7)), now),
+            "past interval → due"
+        );
     }
 }

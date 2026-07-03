@@ -27,8 +27,9 @@ use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
     applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, context_budget, cost, db,
-    drive, entities, index_only, lock_session, microsoft, onedrive, openrouter, outlook_calendar,
-    paths, preferences, recommend, secrets, vault, AppState, BusyGuard, VaultRuntime,
+    drive, entities, flags, index_only, lock_session, microsoft, onedrive, openrouter,
+    outlook_calendar, paths, preferences, recommend, secrets, vault, AppState, BusyGuard,
+    VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -5228,7 +5229,15 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         let today = clock::today_sql_in(zone);
         let projects = projects::list_overviews(&conn, &today)?;
         let events = calendar::list_upcoming(&conn, briefing::BRIEFING_AGENDA_DAYS)?;
-        let snapshot = briefing::build_snapshot(&projects, &events, &now, zone);
+        // Evaluate the structured flag layer BEFORE rendering (card 9): reconcile the stored flag
+        // set to the current projects + calendar, then render the ACTIVE (unresolved) flags as the
+        // briefing's facts. Best-effort — a detection hiccup must never fail the briefing, so a
+        // failure just leaves the prior flag set in place and briefs from it.
+        if let Err(e) = flags::detect_and_store(&conn, &projects, &events, &today) {
+            eprintln!("flag detection skipped during briefing refresh: {e}");
+        }
+        let active = flags::list_active(&conn, None)?;
+        let snapshot = briefing::build_flag_snapshot(&active, &projects, &events, &now, zone);
         // The briefing is the whole-picture view, so global + context preferences shape its voice.
         let profile = preferences::preferences_preamble(&conn, preferences::PrefContext::global())?;
         (snapshot, profile, models)
@@ -5705,7 +5714,7 @@ fn iso_now(state: &AppState) -> Result<String> {
 /// (no IANA name, DST-unstable), so the canonical zone is supplied by the frontend
 /// (`Intl`) and stored; UTC is the stable default matching every `strftime('now')`.
 /// Infallible by design (worst case UTC) so call sites stay one-liners.
-fn resolve_zone(conn: &Connection) -> chrono_tz::Tz {
+pub(crate) fn resolve_zone(conn: &Connection) -> chrono_tz::Tz {
     use std::str::FromStr;
     db::get_setting(conn, TIME_ZONE_KEY)
         .ok()
