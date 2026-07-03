@@ -20,11 +20,9 @@ mod db;
 mod drive;
 mod entities;
 mod error;
-// The structured flag layer (board card 9). PR1 lands the schema, typed vocabulary, and CRUD
-// seam; the consumers (detection + briefing render, then assertion/resolution, then chat
-// grounding) arrive in the following PRs — so the public surface is exercised only by the
-// module's own unit tests for now.
-#[allow(dead_code)]
+// The structured flag layer (board card 9): detection (a pure reducer over milestones + calendar)
+// populates first-class flag records, the briefing renders the active set, and a backstop
+// scheduler keeps them current. Assertion/resolution and chat grounding arrive in the following PRs.
 mod flags;
 mod google;
 mod ics;
@@ -648,6 +646,13 @@ pub fn run() {
             // once a day, when unlocked + idle, roll raw events older than the recent window into
             // per-day counts and delete them. A no-op until there are old events; nothing reads it yet.
             project_activity::spawn_rollup_scheduler(handle.clone());
+
+            // Keep the structured flag layer current (board card 9): a backstop that re-evaluates
+            // the proactive flags (deadline-approaching → overdue, today's events, prepare-ahead)
+            // when the app is left open past a day boundary without a briefing refresh. Detection
+            // also runs synchronously on every briefing refresh; gated on unlocked + idle + not
+            // mid-sync, and a no-op until there are milestones/events in the near window.
+            flags::spawn_flag_detection_scheduler(handle.clone());
 
             // Give each conversation a real 5-7 word title (board card 7E) once it has a few turns: a launch
             // pass titles any session that crossed the threshold while the app was closed (the eager

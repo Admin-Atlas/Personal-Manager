@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.77.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "Your daily briefing now stands on a real “what needs your attention” layer: PM works out the pressing items first — an overdue or approaching milestone deadline, an event happening today, something to prepare for in the next few days — and the briefing describes those, instead of the model free-associating over your projects each morning. It stays honest across the day too, so an approaching deadline quietly becomes “overdue” once it passes, and refreshing the briefing won't reshuffle the facts underneath it.",
+    ],
+  },
+  {
     version: "2.76.0-alpha",
     date: "2026-07-03",
     highlights: [
