@@ -6,6 +6,7 @@
 export {
   SYSTEMS,
   MODES,
+  MODE_PREFS,
   DEPTHS,
   ROLES,
   STATUS_KEYS,
@@ -14,14 +15,26 @@ export {
   PROFILES,
   ACCENTS,
   STATUS,
+  MONO_ACCENT,
+  MONO_RAMP,
+  EIGENGRAU,
 } from "./profiles";
-export type { System, Mode, Depth, Role, StatusKey, Fonts } from "./profiles";
+export type { System, Mode, ModePref, Depth, Role, StatusKey, Fonts } from "./profiles";
 
 export { oklabLCH, hexA } from "./oklab";
 export type { OkLCH } from "./oklab";
 
 export { themeVars, applyTheme } from "./tokens";
 export type { ThemeVars } from "./tokens";
+
+export { resolveMode, prefersDark } from "./resolveMode";
+export type { ModeResolution, ModeSource } from "./resolveMode";
+
+export { sunTimes, isDaytime, nextTransition } from "./solar";
+export type { SunTimes } from "./solar";
+
+export { coordsForTimezone, deviceCoords, parseCoords, formatCoords } from "./timezones";
+export type { Coords } from "./timezones";
 
 export { ThemeProvider, useTheme } from "./ThemeContext";
 export type { ThemeState } from "./ThemeContext";

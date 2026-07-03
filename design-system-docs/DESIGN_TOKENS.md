@@ -63,12 +63,26 @@ hairlines; `border2` = stronger border / control outline; `rule` = faint row div
 
 ```
 editorial:  #d2825b  #c96f4c  #cda44e  #8f9a5b  #c789a4  #6f8bbf
-slate:      #5b8cff  #5bb5c0  #9b8cf0  #5fd6a0  #e0a86a  #ff93b4
+slate:      mono     #5b8cff  #5bb5c0  #9b8cf0  #5fd6a0  #e0a86a  #ff93b4
 terminal:   #9ece6a  #e0af68  #7dcfff  #bb9af7  #f7768e  #7fe0b0
 ```
 
 The first entry is each System's default accent. Switching System resets the accent to that
 System's default unless the user has chosen one for it.
+
+### Monochrome accent (`mono` / Eigengrau) — Slate only, the app default
+
+`mono` is a **sentinel, not a hex**: it selects a monochrome treatment instead of a hue, and is
+Slate's default accent (so a fresh install is Eigengrau). `themeVars` special-cases it:
+
+- **Neutral ramp** → the chroma-0 `MONO_RAMP` (a straight greyscale; **no** accent hue tints the
+  cosmetics), *not* the §2 slate ramp. `--bg` is pinned to the exact **Eigengrau `#16161D`** in dark.
+- **Accent-derived tokens** → dark: `--accent`/`--accent-text` = white, `--accent-ink` = Eigengrau,
+  `--accent-soft` = `rgba(255,255,255,.12)`. light: near-black text/accents on paper.
+- **Feature colours are unaffected** — the §4 semantic status set and the map palette
+  (`graphPalette.ts`) still render in colour; only cosmetic hue is removed.
+
+`sourcePalette` always drops `mono` (it's not a colour), so calendar source hues are never affected.
 
 ### Accent-derived tokens
 Given the active accent's OKLab `{ L, C, H }`:
@@ -162,6 +176,23 @@ function themeVars(system, mode, accent) {
   return v; // spread onto a root element's style, or emit as a :root rule
 }
 ```
+
+> The recipe above is the **coloured** path only. The shipped `themeVars` adds the `mono` branch
+> from §3 (chroma-0 ramp, white/near-black accents, Eigengrau `--bg`).
+
+### `mode` is *resolved* before it reaches `themeVars`
+
+`themeVars` always receives a concrete `dark | light`. What the user actually picks is a **Mode
+preference** — `light | dark | system | auto` — which a resolver (`resolveMode.ts`) collapses to that
+concrete value before styling. This is the single place four options become two; everything
+downstream still only ever sees `dark | light`.
+
+- `system` → the OS `prefers-color-scheme` (kept live via a media-query listener).
+- `auto` → sunrise/sunset at the user's location, computed **offline** (`solar.ts`) from
+  timezone-derived coordinates (`timezones.ts`) or a manual `lat, lon` override; re-resolved at each
+  transition and whenever the app regains focus. With no location it degrades to `system`.
+
+The preference (not the resolved value) is what's persisted in localStorage + the appearance blob.
 
 ---
 
