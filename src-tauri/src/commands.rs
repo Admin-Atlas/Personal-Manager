@@ -27,7 +27,7 @@ use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
     applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, context_budget, cost, db,
-    drive, entities, flags, index_only, lock_session, microsoft, onedrive, openrouter,
+    drive, entities, flags, index_only, localfolder, lock_session, microsoft, onedrive, openrouter,
     outlook_calendar, paths, preferences, recommend, secrets, vault, AppState, BusyGuard,
     VaultRuntime,
 };
@@ -4176,17 +4176,679 @@ fn apply_drive_actions(
     )
 }
 
+// ===== Local-folder indexing (board card 6) =====
+//
+// A third index-only source (siblings: Drive, OneDrive), reading from the filesystem. This first card
+// reconciles a tracked folder on demand — the live `notify` watcher is the next card. The engine
+// mirrors `drive_sync_core`: detached + single-flight + crash-resumable, broadcasting progress on
+// `local://sync` (the same `counted`/`item`/`finished` shape) so the UI reuses `IngestProgress`. All
+// change SEMANTICS are the shared foundation's (`index_only::react`/`apply_actions`); this only
+// supplies DETECTION (walk + mtime→hash) and the on-disk body fetch.
+
+/// Settings key marking a local-folder sync started but not cleanly finished (the crash-resume marker,
+/// sibling of [`DRIVE_SYNC_PENDING_KEY`]).
+const LOCAL_SYNC_PENDING_KEY: &str = "local_sync_pending";
+
+/// Apply `f` to the local-folder sync snapshot, best-effort (a poisoned lock is skipped).
+fn with_local_snap(app: &AppHandle, f: impl FnOnce(&mut crate::LocalFolderSyncState)) {
+    let state = app.state::<AppState>();
+    // Bind the guard to a named local before `if let` so the lock `Result` temporary (which borrows
+    // `state`) drops before `state` does — the E0597 pitfall the Drive snapshot helper documents.
+    let guard = state.local_sync.lock();
+    if let Ok(mut snap) = guard {
+        f(&mut snap);
+    }
+}
+
+/// Update the snapshot + broadcast a `local://sync` progress event globally (see [`emit_drive_progress`]).
+fn emit_local_progress(app: &AppHandle, ev: localfolder::LocalSyncEvent) {
+    with_local_snap(app, |snap| match &ev {
+        localfolder::LocalSyncEvent::Counted { total } => {
+            snap.total = Some(*total);
+            snap.processed = 0;
+        }
+        localfolder::LocalSyncEvent::Item {
+            processed, total, ..
+        } => {
+            snap.processed = *processed;
+            snap.total = Some(*total);
+        }
+        localfolder::LocalSyncEvent::Finished { report } => {
+            snap.last_report = Some(report.clone());
+        }
+    });
+    let _ = app.emit("local://sync", ev);
+}
+
+/// True if the running local-folder sync has been asked to stop.
+fn local_sync_cancelled(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .local_sync_cancel
+        .load(Ordering::SeqCst)
+}
+
+/// Record a local file that couldn't be indexed, up to the shared report cap.
+fn record_local_issue(
+    issues: &mut Vec<localfolder::LocalSyncIssue>,
+    truncated: &mut bool,
+    name: &str,
+    reason: &str,
+) {
+    if issues.len() < MAX_REPORT_ISSUES {
+        issues.push(localfolder::LocalSyncIssue {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        });
+    } else {
+        *truncated = true;
+    }
+}
+
+/// Register a local folder to index (the path comes from the frontend's native folder picker). Returns
+/// the folder's stable key; the UI then triggers a sync. Idempotent — re-adding reactivates the row.
+#[tauri::command]
+pub fn add_local_folder(app: AppHandle, path: String) -> Result<String> {
+    let root = std::path::PathBuf::from(&path);
+    if !root.is_dir() {
+        return Err(Error::Other("That path isn't a folder we can read.".into()));
+    }
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    localfolder::add_folder(&conn, &root)
+}
+
+/// Stop tracking a local folder: its items stay findable (flagged `unreachable`), the registry row drops.
+#[tauri::command]
+pub fn remove_local_folder(app: AppHandle, key: String) -> Result<()> {
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    localfolder::remove_folder(&conn, &key)
+}
+
+/// Every tracked local folder (path, state, indexed count, present?), for the Settings list.
+#[tauri::command]
+pub fn list_local_folders(state: State<'_, AppState>) -> Result<Vec<localfolder::LocalFolder>> {
+    let conn = state.conn()?;
+    localfolder::list_folders(&conn)
+}
+
+/// The currently-running local-folder sync snapshot, so the UI resumes progress after navigating away.
+#[tauri::command]
+pub fn local_folder_sync_status(state: State<'_, AppState>) -> Result<crate::LocalFolderSyncState> {
+    state
+        .local_sync
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|_| Error::Other("local sync state poisoned".into()))
+}
+
+/// Ask the running local-folder sync to stop after the current file (already-indexed files are kept).
+#[tauri::command]
+pub fn stop_local_folder_sync(state: State<'_, AppState>) -> Result<()> {
+    state.local_sync_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Sync one tracked folder (or every folder when `folder` is `None`) — the "Sync now" command.
+#[tauri::command]
+pub async fn sync_local_folder(app: AppHandle, folder: Option<String>) -> Result<usize> {
+    local_sync_core(&app, folder).await
+}
+
+/// Resume a local-folder sync a previous session started but didn't finish (closed/crashed mid-index).
+/// Called once on launch; returns whether a resume was kicked off. Already-indexed files were persisted
+/// as they went, so a resumed pass only does the work that was left.
+#[tauri::command]
+pub fn resume_local_folder_sync(app: AppHandle) -> Result<bool> {
+    let marker: Option<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, LOCAL_SYNC_PENDING_KEY)?
+    };
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    let running = app
+        .state::<AppState>()
+        .local_sync
+        .lock()
+        .map(|s| s.running)
+        .unwrap_or(false);
+    if running {
+        return Ok(false);
+    }
+    let folder: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = local_sync_core(&app2, folder).await;
+    });
+    Ok(true)
+}
+
+/// The sync engine behind [`sync_local_folder`] and [`resume_local_folder_sync`]. Single-flight (a
+/// request arriving mid-sync folds into one follow-up all-folders pass), detached (progress via the
+/// global `local://sync` event + [`crate::LocalFolderSyncState`]), and crash-resumable (a marker
+/// persisted while running, cleared on the clean exit). Returns the number of items touched.
+async fn local_sync_core(app: &AppHandle, folder: Option<String>) -> Result<usize> {
+    // Claim the single-flight slot, or fold this request into a follow-up pass if one is running.
+    {
+        let state = app.state::<AppState>();
+        let mut snap = state
+            .local_sync
+            .lock()
+            .map_err(|_| Error::Other("local sync state poisoned".into()))?;
+        if snap.running {
+            snap.rerun = true;
+            return Ok(0);
+        }
+        *snap = crate::LocalFolderSyncState {
+            running: true,
+            folder: folder.clone(),
+            ..Default::default()
+        };
+    }
+    // Fresh stop flag; persist a crash-resume marker (cleared on the clean exit below).
+    {
+        let state = app.state::<AppState>();
+        state.local_sync_cancel.store(false, Ordering::SeqCst);
+        let conn = state.conn();
+        if let Ok(conn) = conn {
+            let marker = serde_json::to_string(&folder).unwrap_or_else(|_| "null".to_string());
+            let _ = db::set_setting(&conn, LOCAL_SYNC_PENDING_KEY, &marker);
+        }
+    }
+
+    let mut pass_folder = folder;
+    let mut result;
+    loop {
+        result = run_local_sync(app, pass_folder).await;
+        let stopped = local_sync_cancelled(app);
+        let again = {
+            let state = app.state::<AppState>();
+            let mut snap = state
+                .local_sync
+                .lock()
+                .map_err(|_| Error::Other("local sync state poisoned".into()))?;
+            if snap.rerun && !stopped {
+                snap.rerun = false;
+                snap.processed = 0;
+                snap.total = None;
+                snap.folder = None;
+                true
+            } else {
+                snap.running = false;
+                false
+            }
+        };
+        if !again {
+            break;
+        }
+        pass_folder = None;
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn();
+        if let Ok(conn) = conn {
+            let _ = db::delete_setting(&conn, LOCAL_SYNC_PENDING_KEY);
+        }
+    }
+    result
+}
+
+/// One folder's gathered work: the walk result + the known-item set, or a `missing` root to fan out.
+struct FolderWork {
+    key: String,
+    root: std::path::PathBuf,
+    files: Vec<localfolder::LocalFile>,
+    known: std::collections::HashMap<String, localfolder::KnownItem>,
+    missing: bool,
+}
+
+/// One sync pass: walk each folder off the lock, then reconcile it against the known set. Split out so
+/// [`local_sync_core`] can run it again (the follow-up sweep) and own the running/marker lifecycle.
+async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize> {
+    // The sidecar converts each file's body to Markdown — ensure it once up front.
+    {
+        let state = app.state::<AppState>();
+        state.sidecar.ensure_installed()?;
+    }
+
+    let keys: Vec<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        match folder {
+            Some(k) => vec![k],
+            None => localfolder::folder_keys(&conn)?,
+        }
+    };
+
+    // Phase 1 — gather. Read each folder's root + known set (short locks), then walk off the lock (the
+    // walk stats + opens files for their OS id, so it must not hold the DB).
+    let mut work: Vec<FolderWork> = Vec::new();
+    for key in keys {
+        let root = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            localfolder::folder_root(&conn, &key)?
+        };
+        let Some(root) = root else {
+            continue; // the registry row was removed mid-run
+        };
+        let known = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            localfolder::known_items(&conn, &key)?
+        };
+        if !root.is_dir() {
+            work.push(FolderWork {
+                key,
+                root,
+                files: Vec::new(),
+                known,
+                missing: true,
+            });
+            continue;
+        }
+        let root2 = root.clone();
+        let files = tokio::task::spawn_blocking(move || localfolder::walk(&root2))
+            .await
+            .map_err(|e| Error::Other(format!("local walk task panicked: {e}")))?;
+        work.push(FolderWork {
+            key,
+            root,
+            files,
+            known,
+            missing: false,
+        });
+    }
+
+    // Total = present files + known-but-absent (deletions); a missing folder is one fan-out step.
+    let total: usize = work
+        .iter()
+        .map(|w| {
+            if w.missing {
+                return 1;
+            }
+            let present: std::collections::HashSet<&String> =
+                w.files.iter().map(|f| &f.source_id).collect();
+            let deletions = w.known.keys().filter(|k| !present.contains(k)).count();
+            w.files.len() + deletions
+        })
+        .sum();
+    emit_local_progress(app, localfolder::LocalSyncEvent::Counted { total });
+
+    // Phase 2 — reconcile.
+    let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0usize, 0, 0, 0, 0);
+    let mut processed = 0usize;
+    let mut issues: Vec<localfolder::LocalSyncIssue> = Vec::new();
+    let mut issues_truncated = false;
+    let mut cancelled = false;
+    let mut last_err: Option<Error> = None;
+
+    'folders: for w in &work {
+        if local_sync_cancelled(app) {
+            cancelled = true;
+            break 'folders;
+        }
+
+        // Unreadable root → fan every item of this folder out to `unreachable` (never a mass deletion).
+        if w.missing {
+            let actions = index_only::react(
+                index_only::ChangeEvent::SourceFailure {
+                    source: localfolder::folder_source_id(&w.key),
+                },
+                None,
+            );
+            apply_local_actions_off_lock(app, actions, None).await?;
+            {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                localfolder::set_state(&conn, &w.key, "unreachable")?;
+            }
+            processed += 1;
+            emit_local_progress(
+                app,
+                localfolder::LocalSyncEvent::Item {
+                    processed,
+                    total,
+                    name: w.root.to_string_lossy().to_string(),
+                },
+            );
+            continue;
+        }
+
+        let present: std::collections::HashSet<String> =
+            w.files.iter().map(|f| f.source_id.clone()).collect();
+
+        // Present files: came-back → rename → mtime→hash content, each via the reducer.
+        for f in &w.files {
+            if local_sync_cancelled(app) {
+                cancelled = true;
+                break 'folders;
+            }
+            let name = f.rel_path.clone();
+            let path_str = f.abs_path.to_string_lossy().to_string();
+
+            // Current mtime (formatted like ingest) + this item's persisted state.
+            let current_iso = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                ingest::iso_from_mtime(&conn, &f.abs_path).ok()
+            };
+            let known = w.known.get(&f.source_id).cloned();
+            let plan = localfolder::plan_file(known.as_ref(), &path_str, current_iso.as_deref());
+            let cur_state = known.as_ref().map(|k| k.to_item_state(&f.source_id));
+
+            // It came back (was missing/unreachable) → mark reachable before anything else.
+            if plan.came_back {
+                let actions = index_only::react(
+                    index_only::ChangeEvent::Add {
+                        source_id: f.source_id.clone(),
+                        modified_at: current_iso.clone(),
+                    },
+                    cur_state.as_ref(),
+                );
+                apply_local_actions_off_lock(app, actions, None).await?;
+            }
+            // It moved (same OS id, new path) → update the stored ref, keeping classification.
+            if let Some(newref) = &plan.renamed_to {
+                let actions = index_only::react(
+                    index_only::ChangeEvent::Rename {
+                        source_id: f.source_id.clone(),
+                        new_external_ref: Some(newref.clone()),
+                    },
+                    cur_state.as_ref(),
+                );
+                apply_local_actions_off_lock(app, actions, None).await?;
+            }
+            // Content: the mtime moved (or the file is new) → hash → Add / ReEmbed / touch.
+            if plan.content_maybe_changed {
+                let path = f.abs_path.clone();
+                let hashed = tokio::task::spawn_blocking(move || {
+                    std::fs::read(&path).map(|b| ingest::hex_digest(&b))
+                })
+                .await
+                .map_err(|e| Error::Other(format!("local hash task panicked: {e}")))?;
+                let hash = match hashed {
+                    Ok(h) => h,
+                    Err(e) => {
+                        processed += 1;
+                        failed += 1;
+                        record_local_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            &format!("Couldn't read the file: {e}"),
+                        );
+                        last_err = Some(Error::Io(e));
+                        emit_local_progress(
+                            app,
+                            localfolder::LocalSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let event = if known.is_none() {
+                    index_only::ChangeEvent::Add {
+                        source_id: f.source_id.clone(),
+                        modified_at: current_iso.clone(),
+                    }
+                } else {
+                    index_only::ChangeEvent::Update {
+                        source_id: f.source_id.clone(),
+                        modified_at: current_iso.clone(),
+                        new_content_hash: Some(hash.clone()),
+                    }
+                };
+                let actions = index_only::react(event, cur_state.as_ref());
+                let category = action_category(&actions);
+                let needs_body = actions.iter().any(|a| {
+                    matches!(
+                        a,
+                        index_only::Action::IngestNew { .. } | index_only::Action::ReEmbed { .. }
+                    )
+                });
+                if needs_body {
+                    match build_local_pointer(app, f, &hash, current_iso.clone()).await {
+                        Ok(Some(input)) => {
+                            apply_local_actions_off_lock(app, actions, Some(input)).await?;
+                            match category {
+                                DriveActionKind::Indexed => indexed += 1,
+                                DriveActionKind::Updated => updated += 1,
+                                _ => skipped += 1,
+                            }
+                        }
+                        Ok(None) => {
+                            processed += 1;
+                            skipped += 1;
+                            record_local_issue(
+                                &mut issues,
+                                &mut issues_truncated,
+                                &name,
+                                "No extractable text (unsupported or empty file)",
+                            );
+                            emit_local_progress(
+                                app,
+                                localfolder::LocalSyncEvent::Item {
+                                    processed,
+                                    total,
+                                    name,
+                                },
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            processed += 1;
+                            failed += 1;
+                            record_local_issue(
+                                &mut issues,
+                                &mut issues_truncated,
+                                &name,
+                                &format!("Couldn't read the file: {e}"),
+                            );
+                            last_err = Some(e);
+                            emit_local_progress(
+                                app,
+                                localfolder::LocalSyncEvent::Item {
+                                    processed,
+                                    total,
+                                    name,
+                                },
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    // Same hash — a touch, not an edit. Advance the stored mtime so the next sync
+                    // doesn't re-hash it.
+                    let state = app.state::<AppState>();
+                    let conn = state.conn()?;
+                    localfolder::touch_modified_at(&conn, &f.source_id, current_iso.as_deref())?;
+                }
+            }
+
+            processed += 1;
+            emit_local_progress(
+                app,
+                localfolder::LocalSyncEvent::Item {
+                    processed,
+                    total,
+                    name,
+                },
+            );
+
+            // Gentle mode: breathe between files (re-read the setting each item, off any await).
+            let pause_ms = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                db::indexing_pause_ms(&conn)
+            };
+            if pause_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            }
+        }
+
+        // Deletions: known items no longer present → soft `source_missing` (kept findable).
+        for (source_id, item) in &w.known {
+            if present.contains(source_id) {
+                continue;
+            }
+            if local_sync_cancelled(app) {
+                cancelled = true;
+                break 'folders;
+            }
+            let cur_state = item.to_item_state(source_id);
+            let actions = index_only::react(
+                index_only::ChangeEvent::Delete {
+                    source_id: source_id.clone(),
+                },
+                Some(&cur_state),
+            );
+            apply_local_actions_off_lock(app, actions, None).await?;
+            removed += 1;
+            processed += 1;
+            emit_local_progress(
+                app,
+                localfolder::LocalSyncEvent::Item {
+                    processed,
+                    total,
+                    name: source_id.clone(),
+                },
+            );
+        }
+
+        // Stamp the healthy pass.
+        {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            localfolder::finalize_sync(&conn, &w.key)?;
+        }
+    }
+
+    let report = localfolder::LocalSyncReport {
+        indexed,
+        updated,
+        removed,
+        skipped,
+        failed,
+        cancelled,
+        issues,
+        issues_truncated,
+    };
+    emit_local_progress(app, localfolder::LocalSyncEvent::Finished { report });
+
+    if !cancelled {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(indexed + updated + removed)
+}
+
+/// Read + convert a local file's body via the sidecar (off the DB lock), returning the foundation's
+/// [`index_only::PointerInput`] — the external ref is the absolute path, the parent folder rides along
+/// as review context. `Ok(None)` when the file renders to no indexable text (kept findable by title).
+async fn build_local_pointer(
+    app: &AppHandle,
+    file: &localfolder::LocalFile,
+    hash: &str,
+    modified_at: Option<String>,
+) -> Result<Option<index_only::PointerInput>> {
+    let path = file.abs_path.clone();
+    let app2 = app.clone();
+    let converted = tokio::task::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        state.sidecar.convert(&path)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("local convert task panicked: {e}")))?;
+    let (markdown, title) = converted?;
+    let markdown = markdown.trim().to_string();
+    if markdown.is_empty() {
+        return Ok(None);
+    }
+    let title = if title.trim().is_empty() {
+        file.abs_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file.rel_path.clone())
+    } else {
+        title
+    };
+    let parent = file.abs_path.parent();
+    Ok(Some(index_only::PointerInput {
+        source_id: file.source_id.clone(),
+        title,
+        external_ref: Some(file.abs_path.to_string_lossy().to_string()),
+        source_modified_at: modified_at,
+        source_content_hash: Some(hash.to_string()),
+        body: markdown,
+        source_parent_folder_id: parent.map(|p| p.to_string_lossy().to_string()),
+        source_parent_folder_name: parent
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string()),
+    }))
+}
+
+/// Run a reducer's actions against the store + manifest on a blocking thread (the index-only executor
+/// embeds via the sidecar). The local sibling of [`apply_drive_actions`].
+fn apply_local_actions(
+    app: &AppHandle,
+    actions: &[index_only::Action],
+    fetched: Option<index_only::PointerInput>,
+) -> Result<()> {
+    let state = app.state::<AppState>();
+    let (vault_root, cipher) = state.manifest_io()?;
+    let gateway = {
+        let conn = state.conn()?;
+        state
+            .gateway(&conn)?
+            .with_embed_batch(db::indexing_embed_batch(&conn))
+    };
+    index_only::apply_actions(
+        state.inner(),
+        &gateway,
+        &vault_root,
+        &cipher,
+        actions,
+        fetched.as_ref(),
+    )
+}
+
+/// [`apply_local_actions`] on a blocking thread, awaited — so the async driver never runs the sidecar
+/// on the runtime.
+async fn apply_local_actions_off_lock(
+    app: &AppHandle,
+    actions: Vec<index_only::Action>,
+    fetched: Option<index_only::PointerInput>,
+) -> Result<()> {
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || apply_local_actions(&app2, &actions, fetched))
+        .await
+        .map_err(|e| Error::Other(format!("local apply task panicked: {e}")))?
+}
+
 /// Fetch an index-only document's full body live from its source (Drive), for the "show full text"
 /// affordance. The body is never stored — only the short summary lives offline.
 #[tauri::command]
 pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String> {
-    let (source_type, source_id, source_state): (String, Option<String>, String) = {
+    let (source_type, source_id, source_state, external_ref): (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         conn.query_row(
-            "SELECT source_type, source_id, source_state FROM documents WHERE id = ?1",
+            "SELECT source_type, source_id, source_state, external_ref FROM documents WHERE id = ?1",
             params![doc_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?
     };
     if source_type != "index_only" {
@@ -4206,11 +4868,34 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
     // (Drive fileIds and Graph itemIds both carry no `:`).
     let state = app.state::<AppState>();
     state.sidecar.ensure_installed()?;
+    let no_text = || Error::Other("This file has no extractable text to show.".into());
+    // Local folder: the body is on disk at the stored path (its `external_ref`). Read + convert it live,
+    // exactly like a fresh index — nothing is stored.
+    if source_id.starts_with("local:") {
+        let path = external_ref
+            .ok_or_else(|| Error::Other("This indexed file has no stored path.".into()))?;
+        let path = std::path::PathBuf::from(&path);
+        if !path.is_file() {
+            return Err(Error::Other(
+                "This file is no longer at its saved location.".into(),
+            ));
+        }
+        let app2 = app.clone();
+        let (markdown, _title) =
+            tokio::task::spawn_blocking(move || app2.state::<AppState>().sidecar.convert(&path))
+                .await
+                .map_err(|e| Error::Other(format!("local convert task panicked: {e}")))??;
+        let markdown = markdown.trim().to_string();
+        return if markdown.is_empty() {
+            Err(no_text())
+        } else {
+            Ok(markdown)
+        };
+    }
     let item_id = source_id
         .rsplit_once(':')
         .map(|(_, id)| id.to_string())
         .ok_or_else(|| Error::Other("Malformed source id.".into()))?;
-    let no_text = || Error::Other("This file has no extractable text to show.".into());
     // Drive: a My Drive id names its account directly; a shared-drive id is account-independent, so
     // resolve an account that can reach it (owner first) from the access table. Read off the lock
     // before the fetch (rule #4).

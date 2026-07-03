@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.80.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "Groundwork: PM can now index a folder on your own computer — the same way it already does for Google Drive and OneDrive, so what's inside your files turns up in search without copying anything into PM. This first step builds the engine: it walks a folder you point it at, notices what's new, changed, moved or deleted (a rename keeps a file's place and its project and tags, rather than reading as a brand-new file), and opens each file only to index it — never keeping a copy. Nothing on screen yet; the button to add a folder, and live watching as files change, land in the next updates.",
+    ],
+  },
+  {
     version: "2.79.0-alpha",
     date: "2026-07-03",
     highlights: [

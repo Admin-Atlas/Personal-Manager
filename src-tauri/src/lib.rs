@@ -29,6 +29,10 @@ mod ics;
 mod index_only;
 mod ingest;
 mod layout;
+// Local-folder indexing (board card 6): a third index-only source on the shared foundation, reading
+// from the filesystem. This first PR reconciles a tracked folder on demand (a filtered walk +
+// mtime→hash diff); the live `notify` watcher is the next card.
+mod localfolder;
 mod lock_session;
 mod microsoft;
 mod milestones;
@@ -148,6 +152,22 @@ pub struct OneDriveSyncState {
     pub last_report: Option<onedrive::OneDriveSyncReport>,
 }
 
+/// A snapshot of the local-folder sync that's currently running (if any) — the filesystem sibling of
+/// [`DriveSyncState`]. Its own field/channel so the connectors run and report independently.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct LocalFolderSyncState {
+    pub running: bool,
+    pub processed: usize,
+    pub total: Option<usize>,
+    /// The folder key being synced, or `None` for an all-folders pass.
+    pub folder: Option<String>,
+    /// Internal single-flight flag (a sync requested while one was running). Not exposed to the UI.
+    #[serde(skip)]
+    pub rerun: bool,
+    /// The most recent finished sync's report, so a user returning after a sync still sees the result.
+    pub last_report: Option<localfolder::LocalSyncReport>,
+}
+
 /// A snapshot of the currently-running backup or restore (if any), shared so the Backup
 /// settings UI can reflect progress no matter which view is mounted — the same detached
 /// model as the Drive sync. Empty / `running:false` when nothing is in flight.
@@ -201,6 +221,10 @@ pub struct AppState {
     pub onedrive_sync: Mutex<OneDriveSyncState>,
     /// Cooperative stop flag for the running OneDrive sync (the sibling of `drive_sync_cancel`).
     pub onedrive_sync_cancel: AtomicBool,
+    /// Snapshot of the currently-running local-folder sync (the filesystem sibling of `drive_sync`).
+    pub local_sync: Mutex<LocalFolderSyncState>,
+    /// Cooperative stop flag for the running local-folder sync (the sibling of `drive_sync_cancel`).
+    pub local_sync_cancel: AtomicBool,
     /// Snapshot of the semantic-map layout precompute (single-flight; running/method/last-error), so
     /// the Map can show progress and a second request folds into the running one. See `layout`.
     pub layout_job: Mutex<layout::LayoutJobState>,
@@ -590,6 +614,8 @@ pub fn run() {
                 drive_sync_cancel: AtomicBool::new(false),
                 onedrive_sync: Mutex::new(OneDriveSyncState::default()),
                 onedrive_sync_cancel: AtomicBool::new(false),
+                local_sync: Mutex::new(LocalFolderSyncState::default()),
+                local_sync_cancel: AtomicBool::new(false),
                 layout_job: Mutex::new(layout::LayoutJobState::default()),
                 last_user_activity: Mutex::new(Instant::now()),
                 chat_index_busy: AtomicBool::new(false),
@@ -788,6 +814,13 @@ pub fn run() {
             commands::list_onedrive_folders,
             commands::get_onedrive_scope,
             commands::set_onedrive_scope,
+            commands::add_local_folder,
+            commands::remove_local_folder,
+            commands::list_local_folders,
+            commands::sync_local_folder,
+            commands::local_folder_sync_status,
+            commands::stop_local_folder_sync,
+            commands::resume_local_folder_sync,
             commands::fetch_index_only_body,
             commands::promote_index_only,
             layout::semantic_layout,
