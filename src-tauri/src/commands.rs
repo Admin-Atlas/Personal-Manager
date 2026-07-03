@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::google;
 use crate::ingest::{self, Document, IngestEvent};
 use crate::milestones::{self, Milestone};
+use crate::project_activity;
 use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::retrieval_diag;
@@ -931,9 +932,16 @@ pub async fn send_message(
         }
 
         // A message in a project-scoped chat counts as engaging with that project, so bump its
-        // activity date (no-op for an unscoped chat — `touch` ignores a blank/absent name).
+        // activity date (no-op for an unscoped chat — `touch` ignores a blank/absent name) and append
+        // one activity observation (Stage-3 heat log; global chats have no scope, so they don't emit).
         if let Some(project) = scope.as_deref() {
             projects::touch(&conn, project)?;
+            project_activity::record(
+                &conn,
+                project,
+                project_activity::Kind::Chat,
+                Some(conversation_id),
+            );
         }
 
         let models = effective_models(&conn, CHAT_MODELS_KEY, CHAT_AUTO_SWITCH_KEY)?;

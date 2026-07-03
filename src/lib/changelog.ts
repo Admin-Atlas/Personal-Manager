@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.72.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "Groundwork: PM now quietly notes which projects you're actively working in — a message in a project's chat counts as engaging with it. Nothing changes on screen yet; this is the memory that will power smarter surfacing (which projects are “hot” right now) in a later update.",
+    ],
+  },
+  {
     version: "2.71.0-alpha",
     date: "2026-07-03",
     highlights: [
