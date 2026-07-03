@@ -800,6 +800,7 @@ mod tests {
              ALTER TABLE chunks DROP COLUMN chunk_at; \
              DROP TABLE chat_sessions; \
              DROP TABLE photos; \
+             DROP TABLE spreadsheets; \
              DROP TABLE project_milestones; \
              ALTER TABLE projects DROP COLUMN last_touched; \
              ALTER TABLE projects DROP COLUMN importance; \
@@ -945,6 +946,7 @@ mod tests {
              ALTER TABLE chunks DROP COLUMN chunk_at; \
              DROP TABLE chat_sessions; \
              DROP TABLE photos; \
+             DROP TABLE spreadsheets; \
              DROP TABLE project_milestones; \
              ALTER TABLE projects DROP COLUMN last_touched; \
              ALTER TABLE projects DROP COLUMN importance; \

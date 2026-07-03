@@ -14,7 +14,7 @@ converts, embeds, scores, transcribes, and analyses images, nothing else.
 Chunking, hashing, prefixes, the vault, and the database all live in Rust.
 
 Protocol: newline-delimited JSON over stdio. One request per line, where method is one of
-ping, convert, embed, count_tokens, rerank, transcribe, reduce, analyze_image:
+ping, convert, embed, count_tokens, rerank, transcribe, reduce, analyze_image, analyze_spreadsheet:
 
     {"id": <int>, "method": <name>, "params": {...}}
 
@@ -475,6 +475,263 @@ def do_analyze_image(params):
     }
 
 
+# ---- spreadsheet ingestion (dedicated processor; bypasses MarkItDown) --------
+#
+# .xlsx/.xls/.csv are routed here by Rust instead of through MarkItDown, which would
+# flatten them into one Markdown pipe table the generic chunker then slices badly
+# (rows lose their header context). We read VALUES ONLY — no formula evaluation, no
+# styling — and hand Rust a per-sheet structure it shapes into a metadata chunk plus
+# self-describing row chunks. Column types come from a lightweight try-parse heuristic
+# (`infer_column_type`), deliberately NOT pandas dtype inference, which is unreliable
+# on messy real-world CSVs. Cells are stringified for output so the Rust side receives
+# plain text and never sees a Python type.
+
+# Upper bound on rows returned PER SHEET. A sheet with more rows is truncated to this
+# many (its `row_count` still reports the TRUE total and `truncated` is set), so a
+# 200k-row sheet can't explode into 200k row chunks + embeddings. Tunable; composes
+# with — does not replace — the byte-size cap Rust already enforces on a fetched body.
+SPREADSHEET_ROW_CAP = 5000
+
+# How many non-empty values per column the type heuristic samples — enough to be
+# confident without scanning a whole column.
+_TYPE_SAMPLE = 50
+
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d-%m-%Y",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+)
+
+
+def _parse_date(value):
+    """A `datetime.date` if `value` is a date/datetime or a string in a common format, else None.
+    Shared by column-type inference and the sheet's date range."""
+    import datetime
+
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        for fmt in _DATE_FORMATS:
+            try:
+                return datetime.datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _cell_type(value):
+    """Classify one cell into 'int' | 'float' | 'date' | 'bool' | 'string', or None when empty.
+    Native types from openpyxl/xlrd (int/float/datetime/bool) are honoured directly; a string (all
+    a CSV yields) is try-parsed. Empty/None returns None so it never sways the column's type."""
+    import datetime
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return "date"
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.lower() in ("true", "false", "yes", "no"):
+        return "bool"
+    try:
+        int(s)
+        return "int"
+    except ValueError:
+        pass
+    try:
+        float(s)
+        return "float"
+    except ValueError:
+        pass
+    if _parse_date(s) is not None:
+        return "date"
+    return "string"
+
+
+def infer_column_type(values):
+    """The dominant inferred type over a column's non-empty values — 'int' | 'float' | 'date' |
+    'bool' | 'string' | 'empty'. Standalone and pure: it takes raw cell values and returns a label
+    with NO coupling to how chunks are emitted, so a later card can reuse it to detect Status/Date-
+    like columns for a different purpose. A numeric column mixing ints and floats reads as 'float';
+    a genuinely heterogeneous column reads as 'string' (the safe catch-all)."""
+    seen = set()
+    for v in values:
+        t = _cell_type(v)
+        if t is not None:
+            seen.add(t)
+    if not seen:
+        return "empty"
+    if len(seen) == 1:
+        return next(iter(seen))
+    if seen <= {"int", "float"}:
+        return "float"
+    return "string"
+
+
+def inspect_columns(headers, rows):
+    """A standalone schema descriptor for a sheet: one {name, inferred_type} per column, inferred
+    from a sample of each column's values. Decoupled from chunk emission (that lives in Rust), so
+    this is the single reusable place column names + types are derived — a later card reuses it."""
+    columns = []
+    for i, name in enumerate(headers):
+        sample = []
+        for row in rows:
+            if i < len(row) and row[i] is not None and str(row[i]).strip():
+                sample.append(row[i])
+                if len(sample) >= _TYPE_SAMPLE:
+                    break
+        columns.append({"name": clean_text(name), "inferred_type": infer_column_type(sample)})
+    return columns
+
+
+def _date_range(rows, columns):
+    """[min, max] 'YYYY-MM-DD' over the first date-typed column, or None if no column is a date."""
+    idx = next((i for i, c in enumerate(columns) if c["inferred_type"] == "date"), None)
+    if idx is None:
+        return None
+    dates = []
+    for row in rows:
+        if idx < len(row):
+            d = _parse_date(row[idx])
+            if d is not None:
+                dates.append(d)
+    if not dates:
+        return None
+    return [min(dates).isoformat(), max(dates).isoformat()]
+
+
+def _build_sheet(name, rows_iter):
+    """Consume one sheet's rows (lazily — the caller keeps the file/workbook open): the first row is
+    the header, the rest are data. Keeps up to SPREADSHEET_ROW_CAP data rows but counts the TRUE
+    total, so a huge sheet reports honestly and is flagged `truncated`. Returns the per-sheet dict
+    Rust consumes, or None for an empty sheet (no header row)."""
+    it = iter(rows_iter)
+    try:
+        header_row = next(it)
+    except StopIteration:
+        return None
+    headers = [clean_text("" if c is None else str(c)) for c in header_row]
+
+    kept = []  # native cell rows (capped) — inferred on before stringifying, for accurate types
+    total = 0
+    for row in it:
+        total += 1
+        if len(kept) < SPREADSHEET_ROW_CAP:
+            kept.append(list(row))
+
+    columns = inspect_columns(headers, kept)
+    date_range = _date_range(kept, columns)
+    str_rows = [[("" if c is None else clean_text(str(c))) for c in row] for row in kept]
+    return {
+        "name": clean_text(name),
+        "headers": headers,
+        "row_count": total,
+        "inferred_types": [c["inferred_type"] for c in columns],
+        "date_range": date_range,
+        "rows": str_rows,
+        "truncated": total > len(kept),
+    }
+
+
+def _sheets_from_csv(path):
+    """A CSV is a single sheet named after the file; delimiter is sniffed (falls back to comma)."""
+    import csv
+    import os
+
+    fh = open(path, "r", encoding="utf-8-sig", newline="")
+    try:
+        sample = fh.read(65536)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        name = os.path.splitext(os.path.basename(path))[0]
+        sheet = _build_sheet(name, csv.reader(fh, dialect))
+        return [sheet] if sheet else []
+    finally:
+        fh.close()
+
+
+def _sheets_from_xlsx(path):
+    """Every worksheet in an .xlsx/.xlsm. `data_only=True` returns cached VALUES (never formulas);
+    `read_only=True` streams rows so a large workbook stays memory-bounded."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        out = []
+        for ws in wb.worksheets:
+            sheet = _build_sheet(ws.title, ws.iter_rows(values_only=True))
+            if sheet:
+                out.append(sheet)
+        return out
+    finally:
+        wb.close()
+
+
+def _sheets_from_xls(path):
+    """Every sheet in a legacy .xls via xlrd. Date cells are Excel serial numbers, so convert the
+    ones xlrd flags as dates back to datetimes (values only — no formula/style extraction)."""
+    import xlrd
+
+    book = xlrd.open_workbook(path)
+    out = []
+    for sh in book.sheets():
+
+        def _rows(sh=sh, book=book):
+            for r in range(sh.nrows):
+                cells = []
+                for c in range(sh.ncols):
+                    val = sh.cell_value(r, c)
+                    if sh.cell_type(r, c) == xlrd.XL_CELL_DATE:
+                        try:
+                            val = xlrd.xldate_as_datetime(val, book.datemode)
+                        except Exception:
+                            pass
+                    cells.append(val)
+                yield cells
+
+        sheet = _build_sheet(sh.name, _rows())
+        if sheet:
+            out.append(sheet)
+    return out
+
+
+def do_analyze_spreadsheet(params):
+    """Parse a spreadsheet (.xlsx/.xls/.csv) into per-sheet structure for the dedicated ingest path,
+    bypassing MarkItDown. Reads VALUES ONLY — no formula evaluation, no styling. Each sheet reports
+    its headers, TRUE row_count, per-column inferred types, an optional date range, and up to
+    SPREADSHEET_ROW_CAP stringified rows (`truncated` set when the sheet had more). Rust shapes
+    these into a metadata chunk + self-describing row chunks. Cell text is untrusted data — cleaned,
+    never executed."""
+    path = params["path"]
+    ext = (params.get("ext") or "").lower().lstrip(".")
+    if ext in ("xlsx", "xlsm"):
+        sheets = _sheets_from_xlsx(path)
+    elif ext == "xls":
+        sheets = _sheets_from_xls(path)
+    elif ext == "csv":
+        sheets = _sheets_from_csv(path)
+    else:
+        raise ValueError(f"unsupported spreadsheet extension: {ext!r}")
+    return {"sheets": sheets, "row_cap": SPREADSHEET_ROW_CAP}
+
+
 def _pca(x, k):
     """Project mean-centred rows `x` (n, d) onto their top-`k` principal axes via SVD.
 
@@ -567,6 +824,7 @@ HANDLERS = {
     "transcribe": do_transcribe,
     "reduce": do_reduce,
     "analyze_image": do_analyze_image,
+    "analyze_spreadsheet": do_analyze_spreadsheet,
 }
 
 

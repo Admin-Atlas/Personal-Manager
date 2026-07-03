@@ -718,6 +718,28 @@ impl SidecarManager {
         })
     }
 
+    /// Parse a spreadsheet (`.xlsx`/`.xls`/`.csv`) into per-sheet structure for the dedicated ingest
+    /// path, bypassing MarkItDown. Values only — no formula evaluation, no styling. Each sheet reports
+    /// its headers, TRUE row count, per-column inferred types, an optional date range, and up to the
+    /// sidecar's row cap of stringified rows (flagged `truncated` when it had more). `ext` selects the
+    /// reader (openpyxl / xlrd / stdlib csv). Blocking, like every sidecar call; cell text is untrusted
+    /// data — indexed, never executed.
+    pub fn analyze_spreadsheet(
+        &self,
+        path: &Path,
+        ext: &str,
+    ) -> Result<Vec<crate::spreadsheets::SheetData>> {
+        let result = self.request(
+            "analyze_spreadsheet",
+            json!({ "path": path.to_string_lossy(), "ext": ext }),
+        )?;
+        serde_json::from_value(result["sheets"].clone()).map_err(|e| {
+            Error::Other(format!(
+                "sidecar analyze_spreadsheet: bad sheets payload: {e}"
+            ))
+        })
+    }
+
     /// Project per-document vectors to 2-D for the semantic memory map. `method` is `"pca"` (the
     /// numpy-only default) or `"tsne"` (only requested when the optional component is installed; the
     /// sidecar falls back to PCA if it isn't, so this always returns a usable layout). Returns the

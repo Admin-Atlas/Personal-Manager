@@ -25,14 +25,17 @@ use crate::photos::{self, PhotoRecord, PhotoSourceType};
 use crate::registry::{self, ModelEntry};
 use crate::retrieval_config::RetrievalConfig;
 use crate::splitter::{self, ChunkKind, SplitMeta, Splitter};
+use crate::spreadsheets::{self, SpreadsheetRecord};
 use crate::vault::MarkdownCipher;
 use crate::AppState;
 
 /// Extensions MarkItDown handles well. Anything else is skipped (still findable
-/// on disk, just not ingested). Lower-case, no dot.
+/// on disk, just not ingested). Lower-case, no dot. Spreadsheet types (`xlsx`/`xls`/`csv`) are
+/// DELIBERATELY absent — they route to [`ingest_spreadsheet`] instead (a dedicated processor that
+/// bypasses MarkItDown), the same way `PHOTO_EXTS` routes images to the photo pipeline.
 const SUPPORTED: &[&str] = &[
-    "pdf", "docx", "pptx", "xlsx", "doc", "ppt", "xls", "html", "htm", "csv", "json", "xml", "txt",
-    "md", "markdown", "rtf", "epub", "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp",
+    "pdf", "docx", "pptx", "doc", "ppt", "html", "htm", "json", "xml", "txt", "md", "markdown",
+    "rtf", "epub", "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp",
 ];
 
 /// Image extensions routed to the dedicated photo pipeline ([`ingest_photo`]) instead of the
@@ -40,6 +43,12 @@ const SUPPORTED: &[&str] = &[
 /// Deliberately the spec's set; gif/bmp/tiff stay on the (no-op) document path. `heic` is here but
 /// NOT in `SUPPORTED`, so a HEIC only ingests via this branch.
 const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic"];
+
+/// Spreadsheet extensions routed to the dedicated spreadsheet processor ([`ingest_spreadsheet`])
+/// instead of MarkItDown — the sidecar parses them values-only into a metadata chunk + self-describing
+/// row chunks (see [`crate::spreadsheets`]). Like `PHOTO_EXTS`, these are NOT in `SUPPORTED`, so a
+/// spreadsheet only ingests via this branch and can never fall back to a MarkItDown pipe-table dump.
+const SPREADSHEET_EXTS: &[&str] = &["xlsx", "xls", "csv"];
 
 /// Per-run ingest options threaded from the command. `copy_photos_to_vault` is the drag-drop opt-in
 /// to save an original image into `vault/photos/` (default off).
@@ -243,6 +252,11 @@ fn ingest_one(
     if matches!(&ext, Some(e) if PHOTO_EXTS.contains(&e.as_str())) {
         return ingest_photo(state, gateway, vault, cipher, path, ext.as_deref(), opts);
     }
+    // Spreadsheets go through the dedicated processor (values-only parse + a `spreadsheets` row + the
+    // synthetic sheet body), not MarkItDown — same bypass shape as photos.
+    if matches!(&ext, Some(e) if SPREADSHEET_EXTS.contains(&e.as_str())) {
+        return ingest_spreadsheet(state, gateway, vault, cipher, path, ext.as_deref());
+    }
     match &ext {
         Some(e) if SUPPORTED.contains(&e.as_str()) => {}
         _ => return Ok(Outcome::Skipped("unsupported file type".into())),
@@ -303,6 +317,7 @@ fn ingest_one(
         last_activity: &ingested_at,
         reviewed: false,
         photo: None,
+        spreadsheet: None,
     };
     cipher.write_to(
         &vault.join(&vault_name),
@@ -325,7 +340,7 @@ fn ingest_one(
         reviewed: false,
         source: SourceMeta::default(),
     };
-    let document = index_document(state, &meta, &chunks, &embeddings, None)?;
+    let document = index_document(state, &meta, &chunks, &embeddings, None, None)?;
     Ok(Outcome::Indexed(document))
 }
 
@@ -452,6 +467,7 @@ fn ingest_photo(
         last_activity: &ingested_at,
         reviewed: false,
         photo: Some(&photo),
+        spreadsheet: None,
     };
     cipher.write_to(&vault.join(&vault_name), &render_markdown(&front, &body))?;
 
@@ -471,7 +487,94 @@ fn ingest_photo(
         reviewed: false,
         source: SourceMeta::photo(),
     };
-    let document = index_document(state, &meta, &chunks, &embeddings, Some(&photo))?;
+    let document = index_document(state, &meta, &chunks, &embeddings, Some(&photo), None)?;
+    Ok(Outcome::Indexed(document))
+}
+
+/// Ingest one spreadsheet: parse it values-only via the sidecar, shape it into a synthetic Markdown
+/// body (a metadata chunk + self-describing row chunks per sheet — [`crate::spreadsheets`]), then the
+/// SAME chunk/embed/index pipeline as a document — bypassing MarkItDown, exactly as [`ingest_photo`]
+/// bypasses it for images. The synthetic body is the vault truth, so a Rebuild reconstructs the
+/// spreadsheet (and its `spreadsheets` satellite row, via the frontmatter block) without re-parsing the
+/// original file. `content_hash` is the hash of the synthetic body, so an edited re-drop re-ingests.
+fn ingest_spreadsheet(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    path: &Path,
+    ext: Option<&str>,
+) -> Result<Outcome> {
+    // Parse values-only in the sidecar (no DB lock held), then shape to Markdown Rust-side.
+    let sheets = state.sidecar.analyze_spreadsheet(path, ext.unwrap_or(""))?;
+    let Some((body, record)) = spreadsheets::to_markdown(&sheets) else {
+        return Ok(Outcome::Skipped("no extractable rows".into()));
+    };
+
+    let title = pick_title("", path);
+    let content_hash = hex_digest(body.as_bytes());
+    let byte_size = std::fs::metadata(path).map(|m| m.len() as i64).ok();
+
+    // Dedupe + timestamps in one short lock; release before embedding.
+    let (created_at, ingested_at) = {
+        let conn = state.conn()?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM documents WHERE content_hash = ?1",
+                params![content_hash],
+                |_| Ok(()),
+            )
+            .optional_exists()?;
+        if exists {
+            return Ok(Outcome::Skipped("already ingested".into()));
+        }
+        let created_at = iso_from_mtime(&conn, path)?;
+        let ingested_at = iso_now(&conn)?;
+        (created_at, ingested_at)
+    };
+
+    let chunks = split_document(gateway, &body, &title, &content_hash)?;
+    let texts = leaf_embed_texts(&chunks);
+    let embeddings = gateway.embed_documents(&texts)?;
+    check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
+
+    // Write the vault truth (frontmatter + synthetic body) before indexing, like a document. The
+    // spreadsheet block carries the satellite counts so a Rebuild reconstructs the `spreadsheets` row.
+    let vault_name = cipher.on_disk_name(&vault_filename(&title, &content_hash));
+    let front = Frontmatter {
+        title: &title,
+        source_path: &path.to_string_lossy(),
+        ext,
+        content_hash: &content_hash,
+        created_at: &created_at,
+        ingested_at: &ingested_at,
+        project: "Unsorted",
+        tags: &[],
+        importance: None,
+        last_activity: &ingested_at,
+        reviewed: false,
+        photo: None,
+        spreadsheet: Some(&record),
+    };
+    cipher.write_to(&vault.join(&vault_name), &render_markdown(&front, &body))?;
+
+    let meta = DocMeta {
+        source_path: Some(path.to_string_lossy().into()),
+        vault_path: vault_name,
+        title,
+        content_hash,
+        ext: ext.map(str::to_string),
+        byte_size,
+        created_at: Some(created_at),
+        last_activity: Some(ingested_at.clone()),
+        ingested_at,
+        project: "Unsorted".into(),
+        tags: Vec::new(),
+        importance: None,
+        reviewed: false,
+        source: SourceMeta::spreadsheet(),
+    };
+    let document = index_document(state, &meta, &chunks, &embeddings, None, Some(&record))?;
     Ok(Outcome::Indexed(document))
 }
 
@@ -669,8 +772,10 @@ fn rebuild_one(
         }
     };
     // A photo round-trips its satellite row from the front-matter photo block (OCR is never re-run —
-    // the text is already in the vault body).
+    // the text is already in the vault body); a spreadsheet likewise round-trips its counts, so a
+    // Rebuild reconstructs the `spreadsheets` row without re-parsing the original file.
     let photo = photo_from_fields(&fields, &content_hash, body);
+    let spreadsheet = spreadsheet_from_fields(&fields);
 
     // Organisation metadata round-trips from the vault so a rebuild reproduces
     // the organised store (spec §3 acceptance). Missing fields fall back to the
@@ -703,11 +808,20 @@ fn rebuild_one(
         ingested_at,
         source: if photo.is_some() {
             SourceMeta::photo()
+        } else if spreadsheet.is_some() {
+            SourceMeta::spreadsheet()
         } else {
             SourceMeta::default()
         },
     };
-    index_document(state, &meta, &chunks, &embeddings, photo.as_ref())
+    index_document(
+        state,
+        &meta,
+        &chunks,
+        &embeddings,
+        photo.as_ref(),
+        spreadsheet.as_ref(),
+    )
 }
 
 /// Does this vault file carry a chat session (`source_type: chat`)? Cheap front-matter peek so the rebuild
@@ -811,6 +925,7 @@ pub(crate) fn index_document(
     chunks: &[splitter::Chunk],
     embeddings: &[Vec<f32>],
     photo: Option<&PhotoRecord>,
+    spreadsheet: Option<&SpreadsheetRecord>,
 ) -> Result<Document> {
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
@@ -840,6 +955,18 @@ pub(crate) fn index_document(
                 p.lat,
                 p.lon,
             ],
+        )?;
+    }
+
+    // A spreadsheet carries an extra satellite row (its sheet/row counts + the truncation record),
+    // written in the SAME transaction so a document and its spreadsheet row are always consistent.
+    // `structured_data_summary` is left to its NULL default — reserved for later column-type/aggregate
+    // enrichment, with no writer this card (parallel to `photos.visual_description`).
+    if let Some(sp) = spreadsheet {
+        tx.execute(
+            "INSERT INTO spreadsheets (document_id, sheet_count, total_rows, chunked_rows) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![doc_id, sp.sheet_count, sp.total_rows, sp.chunked_rows],
         )?;
     }
 
@@ -1316,6 +1443,28 @@ fn photo_from_fields(
     })
 }
 
+/// Reconstruct a spreadsheet's satellite record from parsed front-matter fields, or `None` if this
+/// isn't a spreadsheet document. Shared by the rebuild walk and the metadata-edit rewrite so both
+/// preserve the block identically. Missing counts default to 0, so a hand-edited file still rebuilds.
+fn spreadsheet_from_fields(
+    fields: &std::collections::HashMap<String, String>,
+) -> Option<SpreadsheetRecord> {
+    if fields.get("source_type").map(String::as_str) != Some(SOURCE_TYPE_SPREADSHEET) {
+        return None;
+    }
+    let count = |k: &str| {
+        fields
+            .get(k)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    Some(SpreadsheetRecord {
+        sheet_count: count("spreadsheet_sheet_count"),
+        total_rows: count("spreadsheet_total_rows"),
+        chunked_rows: count("spreadsheet_chunked_rows"),
+    })
+}
+
 /// Rewrite a document's organisation metadata in place, *inside a caller-owned
 /// transaction*: update the vault file's front-matter (preserving the body) and
 /// the `documents` row. No re-chunk / re-embed — the body and `content_hash` are
@@ -1352,10 +1501,11 @@ fn rewrite_vault_metadata(
     let (fields, body) = parse_frontmatter(&decoded)
         .ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
 
-    // Preserve a photo's block across an organisation edit, so a later Rebuild still reconstructs its
-    // `photos` row (a plain document has none → `None`, unchanged behaviour).
+    // Preserve a photo's or spreadsheet's block across an organisation edit, so a later Rebuild still
+    // reconstructs its satellite row (a plain document has neither → `None`, unchanged behaviour).
     let content_hash = fields.get("content_hash").map(String::as_str).unwrap_or("");
     let photo = photo_from_fields(&fields, content_hash, body);
+    let spreadsheet = spreadsheet_from_fields(&fields);
     let front = Frontmatter {
         title: fields
             .get("title")
@@ -1375,6 +1525,7 @@ fn rewrite_vault_metadata(
         last_activity,
         reviewed,
         photo: photo.as_ref(),
+        spreadsheet: spreadsheet.as_ref(),
     };
     cipher.write_to(&file, &render_markdown(&front, body))?;
 
@@ -1471,6 +1622,9 @@ struct Frontmatter<'a> {
     /// Present only for a photo: appends `source_type: photo` + the photo-specific fields so a
     /// Rebuild reconstructs the `photos` satellite row from the vault. `None` for a plain document.
     photo: Option<&'a PhotoRecord>,
+    /// Present only for a spreadsheet: appends `source_type: spreadsheet` + the satellite counts so a
+    /// Rebuild reconstructs the `spreadsheets` row. Mutually exclusive with `photo`; `None` otherwise.
+    spreadsheet: Option<&'a SpreadsheetRecord>,
 }
 
 /// Render YAML front-matter + body. `tags` is written flow-style on one line
@@ -1491,7 +1645,7 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
          importance: {}\n\
          last_activity: {}\n\
          reviewed: {}\n\
-         {}---\n\n{}\n",
+         {}{}---\n\n{}\n",
         yaml_quote(f.title),
         yaml_quote(f.source_path),
         f.ext.unwrap_or(""),
@@ -1504,6 +1658,9 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
         f.last_activity,
         f.reviewed,
         f.photo.map(render_photo_block).unwrap_or_default(),
+        f.spreadsheet
+            .map(render_spreadsheet_block)
+            .unwrap_or_default(),
         body,
     )
 }
@@ -1533,6 +1690,20 @@ fn render_photo_block(p: &PhotoRecord) -> String {
         s.push_str(&format!("photo_lat: {lat:.6}\nphoto_lon: {lon:.6}\n"));
     }
     s
+}
+
+/// The spreadsheet-specific front-matter lines (only present for a spreadsheet). `source_type:
+/// spreadsheet` is the marker `spreadsheet_from_fields` keys on; the counts round-trip the
+/// `spreadsheets` satellite row so a Rebuild reconstructs it without re-parsing the file. The flat
+/// parser reads each line back as a field with zero parser changes.
+fn render_spreadsheet_block(sp: &SpreadsheetRecord) -> String {
+    format!(
+        "source_type: spreadsheet\n\
+         spreadsheet_sheet_count: {}\n\
+         spreadsheet_total_rows: {}\n\
+         spreadsheet_chunked_rows: {}\n",
+        sp.sheet_count, sp.total_rows, sp.chunked_rows,
+    )
 }
 
 /// Serialize a list of strings as a YAML flow sequence on one line.
@@ -1631,6 +1802,11 @@ pub(crate) const SOURCE_TYPE_PHOTO: &str = "photo";
 /// disk and the deletion cascade covers it; the `chat_sessions` satellite carries its chat-specific
 /// truth (scope + the index/summary cursors).
 pub(crate) const SOURCE_TYPE_CHAT: &str = "chat";
+/// `documents.source_type` for a spreadsheet (board card: Spreadsheet Processing). Like a vault
+/// document its body lives in a Markdown file (the synthetic sheet body), so it rebuilds from disk and
+/// the deletion cascade covers it; the `spreadsheets` satellite row carries its sheet/row counts (and a
+/// reserved `structured_data_summary`).
+pub(crate) const SOURCE_TYPE_SPREADSHEET: &str = "spreadsheet";
 /// `documents.source_state` for a reachable source (the default for every document).
 pub(crate) const SOURCE_STATE_OK: &str = "ok";
 /// `documents.source_state` for an index-only item whose source was deleted: a soft state — the
@@ -1687,6 +1863,15 @@ impl SourceMeta {
     fn photo() -> Self {
         Self {
             source_type: SOURCE_TYPE_PHOTO.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Source metadata for a spreadsheet: a fully-stored, reachable document discriminated as
+    /// `'spreadsheet'` (its synthetic sheet body lives in a Markdown vault file).
+    fn spreadsheet() -> Self {
+        Self {
+            source_type: SOURCE_TYPE_SPREADSHEET.into(),
             ..Self::default()
         }
     }
@@ -2247,6 +2432,7 @@ mod tests {
             last_activity: "2026-06-17T00:00:00.000Z",
             reviewed: true,
             photo: None,
+            spreadsheet: None,
         };
         let rendered = render_markdown(&front, "Body text here.");
         let (fields, body) = parse_frontmatter(&rendered).unwrap();
@@ -2298,6 +2484,7 @@ mod tests {
             last_activity: "2026-06-28T00:00:00.000Z",
             reviewed: false,
             photo: Some(&rec),
+            spreadsheet: None,
         };
         let rendered = render_markdown(&front, &body);
         let (fields, parsed_body) = parse_frontmatter(&rendered).unwrap();
@@ -2323,11 +2510,75 @@ mod tests {
                 last_activity: "",
                 reviewed: false,
                 photo: None,
+                spreadsheet: None,
             },
             "just text",
         );
         let (pf, pb) = parse_frontmatter(&plain).unwrap();
         assert!(photo_from_fields(&pf, "h", pb).is_none());
+    }
+
+    #[test]
+    fn spreadsheet_frontmatter_round_trips_for_rebuild() {
+        // The rebuild-determinism guarantee for spreadsheets: the front-matter block must reconstruct
+        // the SAME `spreadsheets` satellite record on a Rebuild — without re-parsing the original file
+        // (the synthetic sheet body is already in the vault). The truncation record (chunked < total)
+        // must survive too.
+        let rec = SpreadsheetRecord {
+            sheet_count: 3,
+            total_rows: 5000,
+            chunked_rows: 4200,
+        };
+        let front = Frontmatter {
+            title: "budget",
+            source_path: "/x/budget.xlsx",
+            ext: Some("xlsx"),
+            content_hash: "abc123",
+            created_at: "2026-07-01",
+            ingested_at: "2026-07-01T00:00:00.000Z",
+            project: "Unsorted",
+            tags: &[],
+            importance: None,
+            last_activity: "2026-07-01T00:00:00.000Z",
+            reviewed: false,
+            photo: None,
+            spreadsheet: Some(&rec),
+        };
+        let rendered = render_markdown(&front, "## Sheet: Budget\n\n### Overview\n\ntext\n");
+        let (fields, _) = parse_frontmatter(&rendered).unwrap();
+
+        // The marker drives rebuild's source_type='spreadsheet' branch.
+        assert_eq!(
+            fields.get("source_type").map(String::as_str),
+            Some("spreadsheet")
+        );
+        assert_eq!(
+            spreadsheet_from_fields(&fields),
+            Some(rec),
+            "the spreadsheets record round-trips exactly"
+        );
+
+        // A plain document carries no block → no record (unchanged behaviour).
+        let plain = render_markdown(
+            &Frontmatter {
+                title: "Doc",
+                source_path: "",
+                ext: None,
+                content_hash: "h",
+                created_at: "",
+                ingested_at: "",
+                project: "Unsorted",
+                tags: &[],
+                importance: None,
+                last_activity: "",
+                reviewed: false,
+                photo: None,
+                spreadsheet: None,
+            },
+            "just text",
+        );
+        let (pf, _) = parse_frontmatter(&plain).unwrap();
+        assert!(spreadsheet_from_fields(&pf).is_none());
     }
 
     #[test]
@@ -2386,6 +2637,7 @@ mod tests {
             last_activity: "",
             reviewed: false,
             photo: None,
+            spreadsheet: None,
         };
         let rendered = render_markdown(&front, "x");
         let (fields, _) = parse_frontmatter(&rendered).unwrap();
@@ -2417,6 +2669,7 @@ mod tests {
             last_activity: "",
             reviewed: false,
             photo: None,
+            spreadsheet: None,
         };
         let original = render_markdown(&front, "body");
         std::fs::write(vault.join("doc.md"), &original).unwrap();
@@ -2491,6 +2744,7 @@ mod tests {
             last_activity: "",
             reviewed: false,
             photo: None,
+            spreadsheet: None,
         };
         let rendered = render_markdown(&front, "body");
         let (fields, _) = parse_frontmatter(&rendered).unwrap();
