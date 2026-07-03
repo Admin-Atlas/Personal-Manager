@@ -714,6 +714,11 @@ export const setOneDriveScope = (email: string, scope: OneDriveScope) =>
 export const fetchIndexOnlyBody = (docId: number) =>
   invoke<string>("fetch_index_only_body", { docId });
 
+/** Promote an index-only Google Sheet to a full local spreadsheet import ("import fully"): pull the
+ *  whole grid, index it locally, and flip the document off index-only. Returns the updated document. */
+export const promoteIndexOnly = (docId: number) =>
+  invoke<Document>("promote_index_only", { docId });
+
 // ---- Semantic memory map (UMAP/t-SNE) ----
 
 /** The cached semantic layout — coordinates by meaning, plus whether a recompute is in flight. Always

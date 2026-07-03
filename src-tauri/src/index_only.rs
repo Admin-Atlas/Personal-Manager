@@ -221,6 +221,27 @@ pub fn write_synced(
     write_manifest(vault_root, cipher, &manifest)
 }
 
+/// Drop one source from the encrypted manifest — the "promote to full import" strip. Once a document
+/// is materialised as a full local import ([`crate::ingest::promote_spreadsheet`]) its `source_type` is
+/// no longer `index_only`, so [`mirror_items`] stops emitting it; but the file still lists it, and
+/// [`merged_manifest`]'s DB-∪-file union would resurrect it as a ghost on the next [`write_synced`]. So
+/// the promote path calls this to remove it from the file DIRECTLY — a surgical read-modify-write, NOT
+/// `write_synced` (which would re-merge it straight back). Idempotent: a missing manifest, or a source
+/// already absent, is a clean no-op. The DB row is deliberately left untouched — it IS the promoted
+/// document now. Call this AFTER the promote's DB transaction commits, so the mirror already excludes
+/// the id and no racing sync can re-add it.
+pub fn forget_source(vault_root: &Path, cipher: &ManifestCipher, source_id: &str) -> Result<()> {
+    let Some(mut manifest) = read_manifest(vault_root, cipher)? else {
+        return Ok(());
+    };
+    let before = manifest.items.len();
+    manifest.items.retain(|it| it.source_id != source_id);
+    if manifest.items.len() != before {
+        write_manifest(vault_root, cipher, &manifest)?;
+    }
+    Ok(())
+}
+
 /// Apply the portable classification in `manifest` onto the matching index-only rows (the file is the
 /// source of truth for classification), re-resolving each item's `entity_id` from its canonical name
 /// through the rules mirror. Rows present in the file but absent from the DB are left untouched —
@@ -376,6 +397,23 @@ pub fn register_pointer(
         return Err(Error::Other(
             "an index-only source has no extractable text".into(),
         ));
+    }
+    // If this source was already promoted to a full local import, a non-index-only document owns its
+    // id — never re-ingest a second, index-only copy. `read_item_state`'s widened match already turns
+    // the usual sync re-observation into a `Noop`; this closes the tiny gather-then-apply window where
+    // a promote lands mid-sync, from any caller that still reaches `IngestNew`.
+    {
+        let conn = state.conn()?;
+        if let Some(existing) = conn
+            .query_row(
+                "SELECT id FROM documents WHERE source_id = ?1 AND source_type != ?2",
+                params![input.source_id, ingest::SOURCE_TYPE_INDEX_ONLY],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            return ingest::load_document(&conn, existing);
+        }
     }
     let now = {
         let conn = state.conn()?;
@@ -739,6 +777,29 @@ fn reembed_item(
     let body = input.body.trim();
     if body.is_empty() {
         return Err(Error::Other("re-embed received an empty body".into()));
+    }
+    // If this source was promoted to a full local import, it is no longer index-only. Do NOT re-embed
+    // (that would clobber the imported content with an index-only summary). Just advance its tracked
+    // pointer so the next sync sees no change — the local copy is the user's snapshot; they re-import
+    // to pull a fresh version. Checked before the (expensive) split/embed below.
+    {
+        let conn = state.conn()?;
+        let is_index_only = conn
+            .query_row(
+                "SELECT 1 FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
+                params![source_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_index_only {
+            conn.execute(
+                "UPDATE documents SET source_content_hash = ?2, source_modified_at = ?3 \
+                 WHERE source_id = ?1",
+                params![source_id, new_content_hash, input.source_modified_at],
+            )?;
+            return Ok(());
+        }
     }
     let content_hash = pointer_content_hash(source_id, body);
     let chunks = ingest::split_document(gateway, body, &input.title, &content_hash)?;
@@ -1237,6 +1298,45 @@ mod tests {
             ids.contains(&"s2"),
             "the awaiting-Rebuild file item is preserved, not dropped"
         );
+    }
+
+    #[test]
+    fn forget_source_strips_only_the_promoted_item() {
+        // The promote-to-full strip: the named source leaves the manifest, every other item stays, and
+        // it is NOT re-merged (a surgical file edit, unlike `write_synced`). This is what stops a
+        // promoted document from being resurrected as an index-only ghost.
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("keep:1", "A"), item("drop:2", "B")],
+            },
+        )
+        .unwrap();
+
+        forget_source(dir.path(), &cipher, "drop:2").unwrap();
+        let ids: Vec<String> = read_manifest(dir.path(), &cipher)
+            .unwrap()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|i| i.source_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["keep:1".to_string()],
+            "only the promoted id is gone"
+        );
+
+        // Idempotent: forgetting an absent source, or forgetting on a vault with no manifest at all, is a
+        // clean no-op (never creates or errors on an empty manifest).
+        forget_source(dir.path(), &cipher, "drop:2").unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        forget_source(empty.path(), &cipher, "anything").unwrap();
+        assert!(read_manifest(empty.path(), &cipher).unwrap().is_none());
     }
 
     // --- executor state transitions (no embedder needed) ---

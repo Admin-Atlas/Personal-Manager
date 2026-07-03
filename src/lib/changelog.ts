@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.71.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "New: “Import fully” for indexed Google Sheets. When a Sheet from your Drive is indexed by pointer only, its row in Documents now has an Import fully button — click it and PM downloads the whole spreadsheet (every tab), reads it as a proper local spreadsheet, and makes all of its cells searchable, keeping wherever you'd already filed it. The original stays linked in Drive, and PM won't re-add it as a duplicate on later syncs.",
+    ],
+  },
+  {
     version: "2.70.0-alpha",
     date: "2026-07-03",
     highlights: [

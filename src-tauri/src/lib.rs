@@ -771,6 +771,7 @@ pub fn run() {
             commands::get_onedrive_scope,
             commands::set_onedrive_scope,
             commands::fetch_index_only_body,
+            commands::promote_index_only,
             layout::semantic_layout,
             layout::start_semantic_layout,
             layout::prioritise_semantic_layout,
