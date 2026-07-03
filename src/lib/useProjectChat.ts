@@ -7,6 +7,7 @@ import {
   deleteConversation as apiDeleteConversation,
   getMessages,
   listConversations,
+  setConversationProject,
 } from "./ipc";
 import { useChatStream } from "./useChatStream";
 import { isNewChatTrigger } from "./chatSession";
@@ -108,6 +109,23 @@ export function useProjectChat(project: string | null) {
     [chat, newChat, refreshConversations],
   );
 
+  /** Move a chat out of (or between) projects from this project's sidebar (card B). When the target
+   *  differs from this open project, the chat leaves this list — so if it was the one on screen, reset
+   *  to a fresh pane. A refresh re-applies the project filter either way. Irreversible only in scope. */
+  const moveConversation = useCallback(
+    async (id: number, target: string | null) => {
+      try {
+        await setConversationProject(id, target);
+      } catch (e) {
+        chat.setError(String(e));
+        return;
+      }
+      if (target !== project && convIdRef.current === id) newChat();
+      refreshConversations();
+    },
+    [project, chat, newChat, refreshConversations],
+  );
+
   const handleSend = useCallback(
     async (text: string) => {
       // /new · /done starts a fresh chat instead of sending — never reaches the model or the vault.
@@ -156,6 +174,7 @@ export function useProjectChat(project: string | null) {
     openConversation,
     newChat,
     deleteConversation,
+    moveConversation,
     handleSend,
     refreshConversations,
   };

@@ -842,6 +842,40 @@ pub fn rename_conversation(
     Ok(title)
 }
 
+/// Move a conversation into a project — or back to global (`project = None`) — after it's been created
+/// (board card B, chat transfer). `create_conversation` sets the scope once at birth; this is the only
+/// reassignment path. Scope follows the new home automatically on the next send: `send_message` reads
+/// `conversations.project` live, so retrieval re-narrows and the Stage-3 activity emit re-keys to the new
+/// project without any transfer-time write. Purely future-looking — no historical re-attribution, and a
+/// blank/whitespace name normalises to global (mirrors `create_conversation`). Not an FK today; the UI
+/// only ever passes an existing project name or `None`.
+#[tauri::command]
+pub fn set_conversation_project(
+    state: State<'_, AppState>,
+    conversation_id: i64,
+    project: Option<String>,
+) -> Result<()> {
+    let conn = state.conn()?;
+    set_conversation_project_inner(&conn, conversation_id, project)
+}
+
+/// The store-facing half of `set_conversation_project`, split out so it's unit-testable without a live
+/// `AppState`. Normalises a blank/whitespace name to global (`NULL`), mirroring `create_conversation`.
+fn set_conversation_project_inner(
+    conn: &Connection,
+    conversation_id: i64,
+    project: Option<String>,
+) -> Result<()> {
+    let project = project
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    conn.execute(
+        "UPDATE conversations SET project = ?1 WHERE id = ?2",
+        params![project, conversation_id],
+    )?;
+    Ok(())
+}
+
 /// Delete a chat conversation and everything it produced (board card 7G): its `messages`, its
 /// `chat_sessions` row, and — if the chat was ever indexed — its `documents` row + chunks + vector/FTS
 /// mirrors and its vault Markdown file. A never-indexed chat (no recorded turn-pair) just loses its
@@ -7085,5 +7119,36 @@ mod tests {
             (project.as_str(), kind.as_str(), source_ref),
             ("Atlas", "milestone", Some(id))
         );
+    }
+
+    /// Chat transfer (card B): moving a conversation rewrites `conversations.project`, and a
+    /// blank/whitespace target normalises to global (`NULL`) — the same rule `create_conversation` uses.
+    #[test]
+    fn set_conversation_project_moves_between_a_project_and_global() {
+        let (_dir, conn) = temp_db();
+        conn.execute("INSERT INTO conversations(project) VALUES (NULL)", [])
+            .unwrap();
+        let id = conn.last_insert_rowid();
+        let project_of = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT project FROM conversations WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Global → a project.
+        set_conversation_project_inner(&conn, id, Some("Atlas".into())).unwrap();
+        assert_eq!(project_of(&conn).as_deref(), Some("Atlas"));
+
+        // A project → back to global.
+        set_conversation_project_inner(&conn, id, None).unwrap();
+        assert_eq!(project_of(&conn), None);
+
+        // A blank/whitespace target is global, never a project literally named "  ".
+        set_conversation_project_inner(&conn, id, Some("Atlas".into())).unwrap();
+        set_conversation_project_inner(&conn, id, Some("   ".into())).unwrap();
+        assert_eq!(project_of(&conn), None);
     }
 }
