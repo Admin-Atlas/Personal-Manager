@@ -20,6 +20,12 @@ mod db;
 mod drive;
 mod entities;
 mod error;
+// The structured flag layer (board card 9). PR1 lands the schema, typed vocabulary, and CRUD
+// seam; the consumers (detection + briefing render, then assertion/resolution, then chat
+// grounding) arrive in the following PRs — so the public surface is exercised only by the
+// module's own unit tests for now.
+#[allow(dead_code)]
+mod flags;
 mod google;
 mod ics;
 mod index_only;
