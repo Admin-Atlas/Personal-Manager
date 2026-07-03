@@ -13,6 +13,7 @@ import type {
   CalendarEvent,
   CalendarOverview,
   ChatEvent,
+  ChunkSpan,
   CompressResult,
   CompressSnapshot,
   ContextStatus,
@@ -35,6 +36,7 @@ import type {
   Flag,
   FocusRoute,
   IcsFeedInfo,
+  ImageData,
   Importance,
   IngestEvent,
   LanguageOptions,
@@ -817,8 +819,22 @@ export const onOcrInstall = (handler: (e: OcrInstallEvent) => void): Promise<Unl
 export const onPythonInstall = (handler: (e: PythonInstallEvent) => void): Promise<UnlistenFn> =>
   listen<PythonInstallEvent>("python://install", (e) => handler(e.payload));
 
-/** Open an index-only document's source in the system browser (its Drive link). */
-export const openExternalRef = (docId: number) => invoke<void>("open_external_ref", { docId });
+/** Open a document's source: an index-only web link (Drive/OneDrive) opens in the system browser; a
+ *  local-folder file path is revealed-and-selected in the OS file manager. Supersedes `open_external_ref`. */
+export const openSource = (docId: number) => invoke<void>("open_source", { docId });
+
+/** The reader's body text: a local document's on-disk Markdown body (front-matter stripped, byte-exact to
+ *  what the splitter chunked), or an index-only pointer's offline summary. */
+export const readDocumentBody = (docId: number) => invoke<string>("read_document_body", { docId });
+
+/** The document's chunk spans (leaves + parents, ordered) — the chunk-boundary overlay's data. */
+export const documentChunkSpans = (docId: number) =>
+  invoke<ChunkSpan[]>("document_chunk_spans", { docId });
+
+/** The decrypted original image for a photo saved into the vault, as base64 + mime; `null` when none was
+ *  saved (the reader then falls back to the OCR body). */
+export const readDocumentImage = (docId: number) =>
+  invoke<ImageData | null>("read_document_image", { docId });
 
 /** Open an arbitrary http(s) URL in the system browser. Used by the app-wide external-link handler
  *  (the webview can't open `target="_blank"` itself); the backend guards the scheme to http/https. */

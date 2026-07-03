@@ -428,6 +428,22 @@ impl MarkdownCipher {
         Ok(std::fs::read(path)?)
     }
 
+    /// Read + decrypt a file's bytes from disk (the byte analogue of [`read`](Self::read), the byte
+    /// counterpart to [`write_bytes_to`](Self::write_bytes_to)): an encrypted container is decrypted to
+    /// its plaintext bytes; anything else is returned as-is. Used to serve an opt-in saved photo original
+    /// back to the reader regardless of the vault's cipher policy.
+    pub fn read_bytes(&self, path: &Path) -> Result<Vec<u8>> {
+        let bytes = std::fs::read(path)?;
+        if crypto::is_encrypted(&bytes) {
+            let key = self.subkey.as_ref().ok_or_else(|| {
+                Error::Other("this vault file is encrypted but no Markdown key is loaded".into())
+            })?;
+            crypto::decrypt(&bytes, key, &self.vault_id, &Self::aad_stem(path))
+        } else {
+            Ok(bytes)
+        }
+    }
+
     /// Encode Markdown text for writing to `path`, by policy: encrypted into a container
     /// (AAD-bound to the path's logical name) when encryption is on, else bytes as-is.
     pub fn encode_for(&self, path: &Path, content: &str) -> Result<Vec<u8>> {

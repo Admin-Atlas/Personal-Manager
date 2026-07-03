@@ -13,7 +13,6 @@ import {
   installOptionalOcr,
   listDocuments,
   onOcrInstall,
-  openExternalRef,
   optionalOcrStatus,
   promoteIndexOnly,
   rebuildIndex,
@@ -29,6 +28,7 @@ import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { IngestProgress } from "./IngestProgress";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
+import { DocumentReader } from "./DocumentReader";
 
 type ItemStatus = "working" | "done" | "skipped" | "failed";
 interface ProgressItem {
@@ -116,6 +116,9 @@ export function DocumentsView({ onReviewClick }: Props) {
   // "Import fully" (promote): pull a Drive Sheet's full grid and index it locally, flipping it off
   // index-only. Tracks the in-flight doc id so its row shows progress + disables the button.
   const [promoting, setPromoting] = useState<number | null>(null);
+  // The document reader (docked right panel). Clicking a row opens it onto that document; it's a
+  // read-only view onto existing state (rendered body + optional chunk-boundary overlay).
+  const [readerDoc, setReaderDoc] = useState<Document | null>(null);
 
   async function toggleBody(docId: number) {
     if (bodyFor === docId) {
@@ -782,7 +785,12 @@ export function DocumentsView({ onReviewClick }: Props) {
                 <tbody>
                   {sortedDocuments.map((doc) => (
                     <Fragment key={doc.id}>
-                      <tr className="border-b border-rule">
+                      <tr
+                        onClick={() => setReaderDoc(doc)}
+                        className={`cursor-pointer border-b border-rule hover:bg-surface ${
+                          readerDoc?.id === doc.id ? "bg-accent-soft" : ""
+                        }`}
+                      >
                         <td className="py-2 pr-3">
                           <div className="flex items-center gap-2">
                             <div className="truncate text-ink" title={doc.title}>
@@ -791,20 +799,17 @@ export function DocumentsView({ onReviewClick }: Props) {
                             {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
                           </div>
                           {doc.source_type === "index_only" ? (
+                            // Row-level buttons stop propagation so they don't also open the reader.
+                            // "Open in Drive" moved into the reader ("Open source"); "Show full text"
+                            // (live fetch) and "Import fully" stay here.
                             <div className="mt-0.5 flex items-center gap-3 text-xs">
-                              {doc.external_ref && (
-                                <button
-                                  type="button"
-                                  onClick={() => void openExternalRef(doc.id)}
-                                  className="text-accent-text hover:brightness-110"
-                                >
-                                  Open in Drive
-                                </button>
-                              )}
                               {doc.source_state !== "source_missing" && (
                                 <button
                                   type="button"
-                                  onClick={() => void toggleBody(doc.id)}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void toggleBody(doc.id);
+                                  }}
                                   className="text-accent-text hover:brightness-110"
                                 >
                                   {bodyFor === doc.id ? "Hide text" : "Show full text"}
@@ -816,7 +821,10 @@ export function DocumentsView({ onReviewClick }: Props) {
                                 doc.external_ref?.includes("/spreadsheets/") && (
                                   <button
                                     type="button"
-                                    onClick={() => void promote(doc.id)}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void promote(doc.id);
+                                    }}
                                     disabled={promoting != null}
                                     className="text-accent-text hover:brightness-110 disabled:opacity-50"
                                     title="Download the whole spreadsheet and index it locally"
@@ -850,7 +858,10 @@ export function DocumentsView({ onReviewClick }: Props) {
                           {devMode ? (
                             <button
                               type="button"
-                              onClick={() => toggleChunks(doc.id)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void toggleChunks(doc.id);
+                              }}
                               className="font-mono text-ink3 underline decoration-dotted underline-offset-2 hover:text-ink"
                               title="Inspect this document's chunk breakdown"
                             >
@@ -947,6 +958,10 @@ export function DocumentsView({ onReviewClick }: Props) {
         busy={busy}
         onRetry={doSetup}
       />
+
+      {readerDoc && (
+        <DocumentReader doc={readerDoc} stale={rebuildNeeded} onClose={() => setReaderDoc(null)} />
+      )}
     </div>
   );
 }

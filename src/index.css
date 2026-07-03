@@ -93,6 +93,126 @@ body {
   font-family: var(--ui);
 }
 
+/* The Markdown render surface (src/lib/markdown.tsx) — the one sanitized renderer for ingested content.
+ * Every element binds to a design token (never a hex literal); there is no typography plugin. */
+.pm-markdown {
+  color: var(--ink2);
+  font-size: 0.875rem;
+  line-height: 1.6;
+  word-break: break-word;
+}
+.pm-markdown > :first-child {
+  margin-top: 0;
+}
+.pm-markdown > :last-child {
+  margin-bottom: 0;
+}
+.pm-markdown h1,
+.pm-markdown h2,
+.pm-markdown h3,
+.pm-markdown h4 {
+  font-family: var(--head);
+  color: var(--ink);
+  line-height: 1.3;
+  margin: 1rem 0 0.5rem;
+}
+.pm-markdown h1 {
+  font-size: 1.25rem;
+}
+.pm-markdown h2 {
+  font-size: 1.125rem;
+}
+.pm-markdown h3 {
+  font-size: 1rem;
+}
+.pm-markdown h4 {
+  font-size: 0.875rem;
+  color: var(--ink2);
+}
+.pm-markdown p {
+  margin: 0.5rem 0;
+}
+.pm-markdown a {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.pm-markdown ul,
+.pm-markdown ol {
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+}
+.pm-markdown ul {
+  list-style: disc;
+}
+.pm-markdown ol {
+  list-style: decimal;
+}
+.pm-markdown li {
+  margin: 0.125rem 0;
+}
+.pm-markdown strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.pm-markdown em {
+  font-style: italic;
+}
+.pm-markdown blockquote {
+  margin: 0.5rem 0;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border2);
+  color: var(--ink3);
+  font-style: italic;
+}
+.pm-markdown hr {
+  margin: 0.75rem 0;
+  border: 0;
+  border-top: 1px solid var(--rule);
+}
+.pm-markdown code {
+  font-family: var(--mono);
+  font-size: 0.8em;
+  background: var(--surface);
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+}
+.pm-markdown pre {
+  margin: 0.5rem 0;
+  padding: 0.75rem;
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+}
+.pm-markdown pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.75rem;
+}
+.pm-markdown img {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  margin: 0.5rem 0;
+}
+.pm-markdown table {
+  display: block;
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+  overflow-x: auto;
+}
+.pm-markdown th,
+.pm-markdown td {
+  border-bottom: 1px solid var(--rule);
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+.pm-markdown th {
+  color: var(--ink3);
+  font-weight: 600;
+}
+
 /* Motion primitives — skeleton shimmer, typewriter caret, spinner, view fade-up.
  * Defined only when the user hasn't requested reduced motion; under
  * prefers-reduced-motion the animation-name doesn't resolve, so elements rest in their

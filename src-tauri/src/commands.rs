@@ -5309,9 +5309,196 @@ pub fn open_url(url: String) -> Result<()> {
     open_external_url(&url)
 }
 
-/// Open an index-only document's source in the system browser (its Drive `webViewLink`).
+// --- Document reader (Documents tab): read-only views onto already-indexed state ---
+//
+// The reader renders a document's on-disk body and, for power users, paints the chunk boundaries the
+// splitter placed. These commands are the first consumers of the write-only `chunks.start_offset`/
+// `end_offset` byte columns. They read and decrypt through the same `MarkdownCipher` the ingest path
+// uses, so what the reader shows is byte-identical to what was chunked. Nothing here mutates the store.
+
+/// A document's chunk span — one row of the boundary overlay, and the first reader of the offset columns.
+/// Leaves (`kind = "leaf"`) are the embedded units; `parent_id` groups sibling leaves under their parent.
+/// Offsets are BYTE offsets into the document body (see [`read_document_body`]); they are `None` for chunk
+/// kinds that predate the offset columns (e.g. chat turns).
+#[derive(Serialize)]
+pub struct ChunkSpan {
+    pub id: i64,
+    pub ordinal: i64,
+    pub parent_id: Option<i64>,
+    pub kind: String,
+    pub start_offset: Option<i64>,
+    pub end_offset: Option<i64>,
+}
+
+/// A decrypted image handed to the webview as base64 + mime (for a `data:` URL). The asset protocol is
+/// off and an opt-in saved original follows the vault cipher (possibly ciphertext), so image bytes come
+/// back through a command rather than a file URL — the same base64 hop `transcribe_audio` uses.
+#[derive(Serialize)]
+pub struct ImageData {
+    pub base64: String,
+    pub mime: String,
+}
+
+/// The text the reader renders: a locally-stored document's on-disk Markdown **body** (front-matter
+/// stripped), or an index-only pointer's offline `stored_summary` (its body is not held locally). The
+/// body is returned byte-for-byte as `parse_frontmatter` yields it — the exact string the splitter
+/// chunked — so the overlay's stored byte offsets map onto it without drift. Do NOT normalize newlines.
 #[tauri::command]
-pub fn open_external_ref(state: State<'_, AppState>, doc_id: i64) -> Result<()> {
+pub fn read_document_body(state: State<'_, AppState>, doc_id: i64) -> Result<String> {
+    let (source_type, vault_path, stored_summary): (String, String, Option<String>) = {
+        let conn = state.conn()?;
+        conn.query_row(
+            "SELECT source_type, vault_path, stored_summary FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+    };
+    if source_type == "index_only" {
+        // No local body — the reader shows the offline summary alongside an "Open source" affordance.
+        return Ok(stored_summary.unwrap_or_default());
+    }
+    let (vault, cipher) = state.markdown_io()?;
+    let raw = cipher.read(&vault.join(&vault_path))?;
+    let (_fields, body) = ingest::parse_frontmatter(&raw)
+        .ok_or_else(|| Error::Other("this document's vault file is missing front-matter".into()))?;
+    Ok(body.to_string())
+}
+
+/// The chunk spans for a document, ordered by `ordinal` — the boundary overlay's data. Includes both
+/// leaves and their parents (the frontend uses leaves for spans and `parent_id` for the grouping shade).
+#[tauri::command]
+pub fn document_chunk_spans(state: State<'_, AppState>, doc_id: i64) -> Result<Vec<ChunkSpan>> {
+    let conn = state.conn()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, ordinal, parent_id, kind, start_offset, end_offset \
+         FROM chunks WHERE document_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = stmt
+        .query_map(params![doc_id], |r| {
+            Ok(ChunkSpan {
+                id: r.get(0)?,
+                ordinal: r.get(1)?,
+                parent_id: r.get(2)?,
+                kind: r.get(3)?,
+                start_offset: r.get(4)?,
+                end_offset: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The decrypted original image for a `photo` document that was copied into the vault (the opt-in), as
+/// base64 + mime. `None` when no original was saved — the reader then falls back to the OCR body.
+#[tauri::command]
+pub fn read_document_image(state: State<'_, AppState>, doc_id: i64) -> Result<Option<ImageData>> {
+    use base64::Engine;
+    let vault_rel: Option<String> = {
+        let conn = state.conn()?;
+        conn.query_row(
+            "SELECT vault_path FROM photos WHERE document_id = ?1 AND saved_to_vault = 1",
+            params![doc_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten()
+    };
+    let Some(rel) = vault_rel else {
+        return Ok(None);
+    };
+    let (vault, cipher) = state.markdown_io()?;
+    let bytes = cipher.read_bytes(&vault.join(&rel))?;
+    let mime = image_mime(&vault::MarkdownCipher::logical_name(&rel));
+    Ok(Some(ImageData {
+        base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        mime,
+    }))
+}
+
+/// Best-effort image MIME from a filename extension, for the reader's `data:` URL.
+fn image_mime(name: &str) -> String {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "tif" | "tiff" => "image/tiff",
+        "heic" | "heif" => "image/heic",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Whether a stored `external_ref` is a web link (opened in the browser) or a local path (revealed in the
+/// OS file manager). Split out as a pure function so the dispatch is unit-testable without a DB/State.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceRefKind {
+    Web,
+    LocalPath,
+}
+
+fn classify_source_ref(external_ref: &str) -> SourceRefKind {
+    if external_ref.starts_with("http://") || external_ref.starts_with("https://") {
+        SourceRefKind::Web
+    } else {
+        SourceRefKind::LocalPath
+    }
+}
+
+/// Reveal a local file in the OS file manager, SELECTING it (not opening it — that would launch the
+/// file's default app). The path is validated to exist and passed as a single non-shell argument, so a
+/// stored path can't inject further arguments. Local-only; the http(s) guard covers web links elsewhere.
+fn reveal_in_file_manager(path: &str) -> Result<()> {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return Err(Error::Other(
+            "This file is no longer at its saved location.".into(),
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", p.display()))
+            .spawn()
+            .map_err(|e| Error::Other(format!("Couldn't open the file manager: {e}")))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(p)
+            .spawn()
+            .map_err(|e| Error::Other(format!("Couldn't open Finder: {e}")))?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No portable "select the file" on Linux; open the containing folder instead.
+        let dir = p.parent().unwrap_or(p);
+        open::that(dir)
+            .map_err(|e| Error::Other(format!("Couldn't open the file manager: {e}")))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err(Error::Other(
+        "Revealing files isn't supported on this platform.".into(),
+    ))
+}
+
+/// Open a document's source. An index-only web link (Drive/OneDrive `webViewLink`) opens in the system
+/// browser through the http(s) guard; a local-folder file path is revealed-and-selected in the OS file
+/// manager. Web links never reach the file-manager reveal and local paths never reach `open::that`.
+/// Supersedes the old `open_external_ref` (which was http(s)-only).
+#[tauri::command]
+pub fn open_source(state: State<'_, AppState>, doc_id: i64) -> Result<()> {
     let external_ref: Option<String> = {
         let conn = state.conn()?;
         conn.query_row(
@@ -5320,8 +5507,42 @@ pub fn open_external_ref(state: State<'_, AppState>, doc_id: i64) -> Result<()> 
             |r| r.get(0),
         )?
     };
-    let url = external_ref.ok_or_else(|| Error::Other("This item has no source link.".into()))?;
-    open_external_url(&url)
+    let refr = external_ref.ok_or_else(|| Error::Other("This item has no source link.".into()))?;
+    match classify_source_ref(&refr) {
+        SourceRefKind::Web => open_external_url(&refr),
+        SourceRefKind::LocalPath => reveal_in_file_manager(&refr),
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::{classify_source_ref, SourceRefKind};
+
+    #[test]
+    fn classify_source_ref_splits_web_from_local() {
+        assert_eq!(
+            classify_source_ref("https://drive.google.com/file/d/abc/view"),
+            SourceRefKind::Web
+        );
+        assert_eq!(
+            classify_source_ref("http://example.com/x"),
+            SourceRefKind::Web
+        );
+        // A Windows drive path must NOT be mistaken for a URL scheme ("C:" is not http/https).
+        assert_eq!(
+            classify_source_ref("C:\\Users\\me\\notes\\report.md"),
+            SourceRefKind::LocalPath
+        );
+        assert_eq!(
+            classify_source_ref("/home/me/notes/report.md"),
+            SourceRefKind::LocalPath
+        );
+        // A non-web scheme is treated as a local path (revealed), never handed to the browser opener.
+        assert_eq!(
+            classify_source_ref("file:///home/me/x"),
+            SourceRefKind::LocalPath
+        );
+    }
 }
 
 // --- Microsoft OneDrive (index-only connector, board card 4B) ---

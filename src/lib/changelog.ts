@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.83.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "You can now read your documents right inside PM. Click any item in the Documents list and it opens in a reading panel beside the list — your notes, spreadsheets and saved conversations render cleanly with headings, lists and tables, and a photo shows its original image (or, if you didn't save the image, the text PM read from it). For an item you keep in Google Drive, OneDrive or a folder on your own computer, the reader shows the summary PM holds offline plus one button to open the original at its source — opening the web link, or revealing the file in your file manager. The old “Open in Drive” link has moved into this panel; “Show full text” still fetches the live copy from the list as before.",
+      "For power users: turn the density up to Power and the reader gains a “Show chunks” view that paints the exact boundaries PM used to split a document for search — so you can see how a file was divided. It's read-only, and (in developer mode) can show the raw source with the same boundaries. Nothing is re-indexed or changed by looking.",
+    ],
+  },
+  {
     version: "2.82.0-alpha",
     date: "2026-07-03",
     highlights: [

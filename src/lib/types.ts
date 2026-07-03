@@ -259,9 +259,11 @@ export interface Document {
   /**
    * "vault" — a fully-stored document (its body lives in the Markdown vault); "index_only" — a
    * pointer we index but don't hold (body fetched live, only a summary readable offline); "chat" — a
-   * conversation, born as a document on first index and backed by a Markdown vault file (epic 7).
+   * conversation, born as a document on first index and backed by a Markdown vault file (epic 7);
+   * "photo" — an image (OCR + EXIF, synthetic Markdown body); "spreadsheet" — a workbook rendered to a
+   * synthetic Markdown body. All non-index_only types resolve to an on-disk Markdown body for the reader.
    */
-  source_type: "vault" | "index_only" | "chat";
+  source_type: "vault" | "index_only" | "chat" | "photo" | "spreadsheet";
   /**
    * Reachability of an index-only item's source. "ok" normally; "source_missing" (deleted at the
    * source, kept findable) and "unreachable" (expired auth / offline drive) are set by the
@@ -272,6 +274,28 @@ export interface Document {
   external_ref: string | null;
   /** The stable source id for an index-only item (`null` for a vault document). */
   source_id: string | null;
+}
+
+/**
+ * One chunk's span in a document, for the reader's chunk-boundary overlay. `start_offset`/`end_offset`
+ * are BYTE offsets into the document body (see `readDocumentBody`); they are `null` for chunk kinds that
+ * predate the offset columns (chat turns). Leaves (`kind === "leaf"`) are the embedded units; `parent_id`
+ * groups sibling leaves under a structural parent (parents are never embedded).
+ */
+export interface ChunkSpan {
+  id: number;
+  ordinal: number;
+  parent_id: number | null;
+  kind: string;
+  start_offset: number | null;
+  end_offset: number | null;
+}
+
+/** A decrypted image served to the reader as base64 + mime, for a `data:` URL (the asset protocol is off
+ *  and a vault-saved original may be ciphertext). */
+export interface ImageData {
+  base64: string;
+  mime: string;
 }
 
 /** The AI's proposed organisation for a document, shown in the Review view. */
