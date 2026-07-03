@@ -21,15 +21,19 @@
 //! filesystem that gives no stable id we fall back to a path digest; there a move degrades to a soft
 //! delete + re-add, which the reducer keeps non-destructive.
 //!
-//! **This first card is reconcile-on-demand.** A "Sync now" walks the folder and diffs it against the
+//! **Two ways in, one reconcile.** A "Sync now" walks the folder and diffs it against the
 //! known-healthy set: a new file → `Add`, a touched file → mtime→hash → `Update`, a vanished file →
 //! soft `Delete`, a moved file (same OS id, new path) → `Rename`, an unreadable root → `SourceFailure`
-//! (→ `unreachable`, never a mass deletion). The live `notify` watcher is the next card and reuses
-//! every decision here.
+//! (→ `unreachable`, never a mass deletion). The live `notify` watcher ([`classify_event`] →
+//! [`FsChange`], routed through [`folder_of`]) reduces a debounced filesystem event to the SAME
+//! per-file decision — a save re-embeds within seconds without a full walk — and the watch set is kept
+//! in step with the registry by [`diff_watch_set`]. Both paths converge on the shared `react`/
+//! `apply_actions` semantics; nothing here duplicates them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use notify::event::{EventKind, ModifyKind, RenameMode};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
@@ -284,6 +288,112 @@ pub fn plan_file(
     }
 }
 
+// --- live watcher: reduce a debounced fs event to a per-file change (pure) ----
+
+/// A filesystem change already reduced from a debounced [`notify`] event to what the reconcile acts
+/// on. `Upsert` covers both a create and a modify (the reconcile decides Add vs re-embed vs touch from
+/// the file's persisted state); a `Renamed` carries both endpoints so the processor can repoint the
+/// item by its stable OS id (upsert `to`, then a remove of `from` that no-ops when the id was
+/// preserved, or soft-deletes the orphan when the file was only path-keyed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FsChange {
+    Upsert(PathBuf),
+    Removed(PathBuf),
+    Renamed { from: PathBuf, to: PathBuf },
+}
+
+/// Reduce one debounced notify event (its kind + paths) to zero or more [`FsChange`]s. **PURE** over
+/// notify's own types, so the create/modify/delete/rename mapping is unit-testable without touching a
+/// real filesystem. Access-only events and empty-path events reduce to nothing. An ambiguous kind
+/// (a bare `Any`/`Other`, or a one-sided rename we can't place) degrades to an `Upsert`, which the
+/// reconcile self-heals — a vanished path there simply finds nothing to index and the next sweep
+/// catches the deletion.
+pub fn classify_event(kind: &EventKind, paths: &[PathBuf]) -> Vec<FsChange> {
+    match kind {
+        EventKind::Create(_) => paths.iter().cloned().map(FsChange::Upsert).collect(),
+        // The debouncer stitches a rename into one `Both` event carrying [from, to].
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if paths.len() >= 2 => {
+            vec![FsChange::Renamed {
+                from: paths[0].clone(),
+                to: paths[1].clone(),
+            }]
+        }
+        // A half-rename that couldn't be paired: the `From` side is gone, the `To` side arrived.
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            paths.iter().cloned().map(FsChange::Removed).collect()
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            paths.iter().cloned().map(FsChange::Upsert).collect()
+        }
+        // Any other modify (data, metadata, an unplaceable name change) → re-check the path.
+        EventKind::Modify(_) => paths.iter().cloned().map(FsChange::Upsert).collect(),
+        EventKind::Remove(_) => paths.iter().cloned().map(FsChange::Removed).collect(),
+        EventKind::Access(_) => Vec::new(),
+        // A bare Any/Other with a path: treat conservatively as "something here changed".
+        _ => paths.iter().cloned().map(FsChange::Upsert).collect(),
+    }
+}
+
+/// Which tracked folder a filesystem path belongs to: the watched root that is a prefix of `path`,
+/// longest match winning so a nested tracked folder claims its own files. Pure; returns the matching
+/// `(key, root)`. A path under no watched root (a stray event) yields `None`.
+pub fn folder_of(path: &Path, roots: &[(String, PathBuf)]) -> Option<(String, PathBuf)> {
+    roots
+        .iter()
+        .filter(|(_, root)| path.starts_with(root))
+        .max_by_key(|(_, root)| root.components().count())
+        .cloned()
+}
+
+/// One tracked folder as the watcher's set-management sees it: its key, root, and whether the root is
+/// currently a readable directory (an unmounted/deleted root reads `present = false`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchTarget {
+    pub key: String,
+    pub root: PathBuf,
+    pub present: bool,
+}
+
+/// How the live watch set should change to match the registry. Pure so the churn logic is testable
+/// without a real watcher: which roots to start watching, which to stop, and which tracked folders
+/// have just gone absent (so the driver can fan their items out to `unreachable`).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WatchDiff {
+    pub to_watch: Vec<WatchTarget>,
+    pub to_unwatch: Vec<PathBuf>,
+    /// Keys still registered but whose root is no longer present, while we were watching them — an
+    /// unmount/removal to reconcile to `unreachable` (never a mass deletion).
+    pub gone_absent: Vec<String>,
+}
+
+/// Diff the currently-watched folders (key → root) against the registry. A present, un-watched folder
+/// is started; a folder that left the registry, or whose root vanished while watched, is stopped; a
+/// still-registered folder whose root vanished under us is also reported as `gone_absent` so its items
+/// go unreachable. Watching a root is what later triggers its catch-up sync (see the driver), so this
+/// stays purely about the watch set.
+pub fn diff_watch_set(watched: &HashMap<String, PathBuf>, registry: &[WatchTarget]) -> WatchDiff {
+    let registered: HashMap<&String, &WatchTarget> = registry.iter().map(|t| (&t.key, t)).collect();
+    let mut diff = WatchDiff::default();
+    for t in registry {
+        if t.present && !watched.contains_key(&t.key) {
+            diff.to_watch.push(t.clone());
+        }
+    }
+    for (key, root) in watched {
+        match registered.get(key) {
+            // Left the registry entirely (removed) → stop watching it.
+            None => diff.to_unwatch.push(root.clone()),
+            // Still registered but its root vanished under us → stop + flag it unreachable.
+            Some(t) if !t.present => {
+                diff.to_unwatch.push(root.clone());
+                diff.gone_absent.push(key.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    diff
+}
+
 // --- registry (the connector_sources row per tracked folder) ---------------
 
 /// A tracked local folder as the Settings UI lists it.
@@ -446,6 +556,80 @@ pub fn known_items(conn: &Connection, key: &str) -> Result<HashMap<String, Known
         })?
         .collect::<std::result::Result<HashMap<_, _>, _>>()?;
     Ok(rows)
+}
+
+/// The persisted state of a single already-indexed item, keyed by its source id — the watcher's
+/// per-event lookup (the on-demand walk loads the whole set up front instead). `None` = never indexed.
+pub fn known_item(conn: &Connection, source_id: &str) -> Result<Option<KnownItem>> {
+    conn.query_row(
+        "SELECT external_ref, source_modified_at, source_content_hash, source_state \
+         FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
+        params![source_id],
+        |r| {
+            Ok(KnownItem {
+                external_ref: r.get(0)?,
+                modified_at: r.get(1)?,
+                content_hash: r.get(2)?,
+                source_state: r.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Find the indexed item a now-vanished path belonged to, by its stored `external_ref` (the absolute
+/// path). A deletion event can't re-derive the OS file id from a path that no longer exists, so the
+/// watcher resolves the item this way instead. Scoped to the folder's id prefix so two folders can't
+/// cross-match. Returns the item's source id + persisted state, or `None` if it was never indexed.
+pub fn source_id_for_ref(
+    conn: &Connection,
+    key: &str,
+    abs_path: &str,
+) -> Result<Option<(String, KnownItem)>> {
+    let id = folder_source_id(key);
+    conn.query_row(
+        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state \
+         FROM documents \
+         WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%' AND external_ref = ?2",
+        params![id, abs_path],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                KnownItem {
+                    external_ref: r.get(1)?,
+                    modified_at: r.get(2)?,
+                    content_hash: r.get(3)?,
+                    source_state: r.get(4)?,
+                },
+            ))
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Every tracked folder as a lean [`WatchTarget`] (key, root, present) for the live watcher's set
+/// management — no per-folder document count, unlike [`list_folders`], since the watcher polls this.
+pub fn watch_targets(conn: &Connection) -> Result<Vec<WatchTarget>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, folder_ids FROM connector_sources \
+         WHERE provider = ?1 AND service = ?2 ORDER BY created_at",
+    )?;
+    let rows = stmt
+        .query_map(params![PROVIDER, SERVICE], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, path)| {
+            let key = id.strip_prefix("local:").unwrap_or(&id).to_string();
+            let root = PathBuf::from(path.unwrap_or_default());
+            let present = root.is_dir();
+            WatchTarget { key, root, present }
+        })
+        .collect())
 }
 
 /// Record a file's new mtime without re-embedding — used when the mtime moved but the content hash
@@ -633,5 +817,148 @@ mod tests {
         assert!(walk(root)
             .iter()
             .all(|f| f.source_id.starts_with(&format!("local:{key}:"))));
+    }
+
+    // --- live-watcher event translation (pure) ---
+
+    use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind};
+
+    #[test]
+    fn classify_maps_create_modify_and_delete_to_a_per_file_change() {
+        let p = PathBuf::from("/root/a.md");
+        // A create and any modify both re-check the path (Add vs re-embed is the reconcile's call).
+        assert_eq!(
+            classify_event(
+                &EventKind::Create(CreateKind::File),
+                std::slice::from_ref(&p)
+            ),
+            vec![FsChange::Upsert(p.clone())]
+        );
+        assert_eq!(
+            classify_event(
+                &EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                std::slice::from_ref(&p)
+            ),
+            vec![FsChange::Upsert(p.clone())]
+        );
+        assert_eq!(
+            classify_event(
+                &EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+                std::slice::from_ref(&p)
+            ),
+            vec![FsChange::Upsert(p.clone())]
+        );
+        // A delete → a removal the processor soft-resolves by external ref.
+        assert_eq!(
+            classify_event(
+                &EventKind::Remove(RemoveKind::File),
+                std::slice::from_ref(&p)
+            ),
+            vec![FsChange::Removed(p.clone())]
+        );
+        // Access events carry no change.
+        assert_eq!(
+            classify_event(
+                &EventKind::Access(notify::event::AccessKind::Read),
+                std::slice::from_ref(&p)
+            ),
+            Vec::<FsChange>::new()
+        );
+    }
+
+    #[test]
+    fn classify_stitches_and_splits_renames() {
+        let from = PathBuf::from("/root/old.md");
+        let to = PathBuf::from("/root/new.md");
+        // The debouncer's paired rename → one Renamed carrying both endpoints, from then to.
+        assert_eq!(
+            classify_event(
+                &EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                &[from.clone(), to.clone()]
+            ),
+            vec![FsChange::Renamed {
+                from: from.clone(),
+                to: to.clone(),
+            }]
+        );
+        // An unpaired half-rename: the From side reads as a removal, the To side as an upsert.
+        assert_eq!(
+            classify_event(
+                &EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                std::slice::from_ref(&from)
+            ),
+            vec![FsChange::Removed(from)]
+        );
+        assert_eq!(
+            classify_event(
+                &EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                std::slice::from_ref(&to)
+            ),
+            vec![FsChange::Upsert(to)]
+        );
+    }
+
+    #[test]
+    fn folder_of_picks_the_innermost_tracked_root() {
+        let roots = vec![
+            ("outer".to_string(), PathBuf::from("/home/docs")),
+            ("inner".to_string(), PathBuf::from("/home/docs/work")),
+        ];
+        // A file under the nested root belongs to the nested folder (longest prefix wins).
+        let (k, _) = folder_of(Path::new("/home/docs/work/plan.md"), &roots).unwrap();
+        assert_eq!(k, "inner");
+        // A file only under the outer root belongs to it.
+        let (k, _) = folder_of(Path::new("/home/docs/notes.md"), &roots).unwrap();
+        assert_eq!(k, "outer");
+        // A path under no tracked root → no folder.
+        assert!(folder_of(Path::new("/tmp/x.md"), &roots).is_none());
+    }
+
+    #[test]
+    fn diff_watch_set_starts_stops_and_flags_unmounts() {
+        let mut watched = HashMap::new();
+        watched.insert("keep".to_string(), PathBuf::from("/a"));
+        watched.insert("removed".to_string(), PathBuf::from("/b"));
+        watched.insert("unmounted".to_string(), PathBuf::from("/c"));
+        let registry = vec![
+            WatchTarget {
+                key: "keep".into(),
+                root: "/a".into(),
+                present: true,
+            },
+            // "removed" is absent from the registry (the user dropped it).
+            WatchTarget {
+                key: "unmounted".into(),
+                root: "/c".into(),
+                present: false, // still tracked, but its drive vanished under us
+            },
+            WatchTarget {
+                key: "fresh".into(),
+                root: "/d".into(),
+                present: true, // newly added, not yet watched
+            },
+        ];
+        let diff = diff_watch_set(&watched, &registry);
+        assert_eq!(
+            diff.to_watch,
+            vec![WatchTarget {
+                key: "fresh".into(),
+                root: "/d".into(),
+                present: true
+            }],
+            "a present, un-watched folder is started"
+        );
+        let mut unwatch = diff.to_unwatch.clone();
+        unwatch.sort();
+        assert_eq!(
+            unwatch,
+            vec![PathBuf::from("/b"), PathBuf::from("/c")],
+            "the removed folder and the vanished-root folder are both stopped"
+        );
+        assert_eq!(
+            diff.gone_absent,
+            vec!["unmounted".to_string()],
+            "only the still-registered vanished root is flagged for unreachable"
+        );
     }
 }
