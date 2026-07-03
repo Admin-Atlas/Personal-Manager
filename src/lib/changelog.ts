@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.76.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "Groundwork: PM is starting to build a proper “what needs your attention” layer under the daily briefing — things like an approaching deadline or a presentation happening today become tracked items with their own memory, rather than a paragraph the model rewrites from scratch each day. Nothing changes on screen yet; this first step just lays the foundation so the briefing (and, later, chat) can point to the same stable to-dos and let you mark them done.",
+    ],
+  },
+  {
     version: "2.75.0-alpha",
     date: "2026-07-03",
     highlights: [

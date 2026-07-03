@@ -894,6 +894,61 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (project, day, kind)
     );
     "#,
+    // v32: the structured flag layer (board card 9). Proactive flags become first-class records
+    // EVALUATED BEFORE the briefing/chat model writes, then rendered into prose — replacing the
+    // free-associating daily briefing with a stable decision layer under it. The generated sentence
+    // is volatile; the flag underneath is stable, so identity and resolution attach to the FLAG,
+    // never to the rendered text — which is what makes daily regeneration idempotent.
+    //
+    // ANCHORING — no new migration needed. A flag hangs off a STABLE identity that already exists:
+    // `anchor_kind='calendar'` → an iCal `UID` (`calendar_events.uid`, v18); `anchor_kind='milestone'`
+    // → a milestone surrogate id (`project_milestones.id`, v20). Deadline-derived flags deliberately
+    // anchor on the MILESTONE id, NOT the project (a project has many dated milestones — pitch,
+    // presentation, internal — and each spawns its own flags; anchoring on project id and adding
+    // milestones later would be a destructive re-key, which rule #3 forbids). Resolution keys on
+    // `(anchor_kind, anchor, type)` (UNIQUE), so resolving "pitch prep" never touches
+    // "presentation prep" or "happening-today" on the same anchor.
+    //
+    // No FK on `anchor` — like `project_milestones.event_uid`, it's an app-maintained SOFT link
+    // resolved in code, not a DB relation: an anchor may point at a UID not currently in the mirror
+    // (the mirror is rebuilt each sync) or a milestone id, and a GC pass (a later PR) prunes flags
+    // whose anchored time has passed. Cascade-deleting on a transient calendar row would be wrong.
+    //
+    // STORAGE SEAM (the done-vs-preference split, kept physically separate from day one so it never
+    // needs a re-key): THIS table is the per-instance flag-STATE home — transient, high-confidence,
+    // scoped to the anchored instance, GC'd once it passes. Its `state`/`source`/`user_confirmed`/
+    // `artifact_ptr` columns ARE that record. A CROSS-instance PREFERENCE ("stop nagging me two hours
+    // out; I always prep the night before" — which tunes a flag TYPE's threshold or suppresses the
+    // type for this user) is durable and lives in the `preferences` table (v13), NEVER here. The two
+    // are never co-mingled.
+    //
+    // `source` reuses the spine-hardening vocabulary but with this layer's values — WHICH PATH CLOSED
+    // the flag: 'detection' (found automatically) | 'assertion' (the user said so). NULL while the
+    // flag is still active. On conflict assertion outranks detection (enforced in code, a later PR).
+    // `confidence`/`user_confirmed` mirror v12/v13 (assertion → user_confirmed=1). Additive only
+    // (rule #3) — nothing reads or writes this table yet; older stores start with one empty table.
+    r#"
+    CREATE TABLE flags (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        anchor_kind    TEXT NOT NULL CHECK (anchor_kind IN ('calendar','milestone')),  -- identity space of `anchor`
+        anchor         TEXT NOT NULL,                                                   -- iCal UID | milestone id (as text)
+        type           TEXT NOT NULL CHECK (type IN
+                           ('prepare-ahead','deadline-approaching','happening-today','overdue')),
+        threshold      TEXT,                                                            -- how far ahead it fires; NULL = type default
+        state          TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','resolved')),
+        source         TEXT CHECK (source IN ('detection','assertion') OR source IS NULL),  -- which path CLOSED it; NULL while active
+        confidence     REAL    NOT NULL DEFAULT 1.0 CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        user_confirmed INTEGER NOT NULL DEFAULT 0   CHECK (user_confirmed IN (0,1)),
+        artifact_ptr   TEXT,                                                            -- documents.source_id of the satisfying artifact
+        artifact_url   TEXT,                                                            -- documents.external_ref (open URL); display-only, moves on rename
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        resolved_at    TEXT,
+        UNIQUE (anchor_kind, anchor, type)                                             -- resolution keys on (anchor,type); one live flag per key
+    );
+    CREATE INDEX idx_flags_state  ON flags(state);
+    CREATE INDEX idx_flags_anchor ON flags(anchor_kind, anchor);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -943,7 +998,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 31,
+            version, 32,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -953,7 +1008,8 @@ mod tests {
              last-turn prompt size for the context meter is v26; chat title provenance is v27; \
              chat preference source + extraction cursor is v28; \
              Drive parent-folder tag + normalized source_account is v29; \
-             spreadsheet ingestion table is v30; project activity log is v31)"
+             spreadsheet ingestion table is v30; project activity log is v31; \
+             structured flag layer is v32)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1134,6 +1190,82 @@ mod tests {
         assert_eq!(
             undated, 0,
             "a project with NULL/blank deadline backfills nothing"
+        );
+    }
+
+    /// v32 lands the structured flag layer (board card 9): first-class flag records with the
+    /// documented defaults (state 'active', confidence 1.0, user_confirmed 0), the `anchor_kind` /
+    /// `type` / `state` / `source` CHECKs, and the `(anchor_kind, anchor, type)` UNIQUE key that
+    /// resolution keys on. There is deliberately NO foreign key on `anchor` (it soft-links a
+    /// milestone id or an iCal UID, resolved in code), so a flag survives even when its anchored
+    /// calendar row isn't in the mirror. Additive only — nothing reads or writes it yet.
+    #[test]
+    fn flags_land_with_defaults_checks_and_unique_key() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // A flag inserts with just its anchor + type; the additive defaults fill the rest.
+        conn.execute(
+            "INSERT INTO flags(anchor_kind, anchor, type) \
+             VALUES ('milestone', '42', 'deadline-approaching')",
+            [],
+        )
+        .unwrap();
+        let (state, confidence, user_confirmed, source): (String, f64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT state, confidence, user_confirmed, source FROM flags WHERE anchor = '42'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "active", "new flags default to active");
+        assert_eq!(confidence, 1.0, "confidence defaults to 1.0");
+        assert_eq!(user_confirmed, 0, "user_confirmed defaults to 0");
+        assert!(source.is_none(), "source is NULL while the flag is active");
+
+        // The CHECKs reject values outside each enum.
+        assert!(
+            conn.execute(
+                "INSERT INTO flags(anchor_kind, anchor, type) VALUES ('project', '1', 'overdue')",
+                [],
+            )
+            .is_err(),
+            "anchor_kind CHECK rejects 'project'"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO flags(anchor_kind, anchor, type) VALUES ('milestone', '1', 'reminder')",
+                [],
+            )
+            .is_err(),
+            "type CHECK rejects an unknown flag type"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO flags(anchor_kind, anchor, type, source) \
+                 VALUES ('milestone', '1', 'overdue', 'user')",
+                [],
+            )
+            .is_err(),
+            "source CHECK rejects 'user' (only detection|assertion|NULL)"
+        );
+
+        // A different (anchor, type) on the same anchor coexists; the SAME (anchor_kind, anchor,
+        // type) triple is rejected — resolving one type never collides with another.
+        conn.execute(
+            "INSERT INTO flags(anchor_kind, anchor, type) VALUES ('milestone', '42', 'overdue')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO flags(anchor_kind, anchor, type) \
+                 VALUES ('milestone', '42', 'deadline-approaching')",
+                [],
+            )
+            .is_err(),
+            "UNIQUE(anchor_kind, anchor, type) forbids a duplicate live flag"
         );
     }
 
