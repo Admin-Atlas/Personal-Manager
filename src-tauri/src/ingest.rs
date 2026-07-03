@@ -2235,6 +2235,20 @@ pub(crate) fn is_vault_markdown(path: &Path) -> bool {
     matches!(extension(path).as_deref(), Some("md") | Some("pmenc"))
 }
 
+/// Whether a local file's extension is one the ingest pipeline can turn into indexed text — the union
+/// of the document (`SUPPORTED`), photo (`PHOTO_EXTS`), and spreadsheet (`SPREADSHEET_EXTS`) routes.
+/// Shared with the local-folder connector so a watched-folder walk and `ingest_one` agree on what is
+/// worth pointing at; anything else (binaries, archives, temp files) is skipped at the walk.
+pub(crate) fn is_supported_source(path: &Path) -> bool {
+    match extension(path) {
+        Some(e) => {
+            let e = e.as_str();
+            SUPPORTED.contains(&e) || PHOTO_EXTS.contains(&e) || SPREADSHEET_EXTS.contains(&e)
+        }
+        None => false,
+    }
+}
+
 /// Bring every Markdown file in `dir` into `write_with`'s policy, in place: decode each
 /// file with `read_with` (read-by-magic, so it handles plaintext or the prior key),
 /// re-encode with `write_with`, rename to the target on-disk name (`.md` <-> `.md.pmenc`),
@@ -2408,7 +2422,7 @@ pub(crate) fn iso_now(conn: &Connection) -> Result<String> {
     )
 }
 
-fn iso_from_mtime(conn: &Connection, path: &Path) -> Result<String> {
+pub(crate) fn iso_from_mtime(conn: &Connection, path: &Path) -> Result<String> {
     let secs = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()

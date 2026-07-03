@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "2.79.0-alpha"
+version = "2.80.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -76,6 +76,12 @@ open = "5"
 chrono = "0.4"
 chrono-tz = "0.10"
 rrule = "0.14"
+
+# Local-folder indexing (index-only connector). `file-id` reads a file's OS-stable
+# identity (NTFS FileId on Windows, inode on Unix) so a rename/move keeps the same
+# indexed item and its classification, rather than reading as delete-plus-add. The
+# live `notify` watcher is a later card; this first pass reconciles a folder on demand.
+file-id = "0.2"
 
 # OpenRouter streaming chat client. rustls keeps TLS independent of SQLCipher's crypto.
 # `blocking` is used by python_fetch (macOS interpreter download) from inside spawn_blocking.
