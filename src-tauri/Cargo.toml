@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "2.80.0-alpha"
+version = "2.81.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -79,9 +79,14 @@ rrule = "0.14"
 
 # Local-folder indexing (index-only connector). `file-id` reads a file's OS-stable
 # identity (NTFS FileId on Windows, inode on Unix) so a rename/move keeps the same
-# indexed item and its classification, rather than reading as delete-plus-add. The
-# live `notify` watcher is a later card; this first pass reconciles a folder on demand.
+# indexed item and its classification, rather than reading as delete-plus-add.
+# `notify` (+ `notify-debouncer-full`) is the live filesystem watcher: the debouncer
+# coalesces the multi-write burst of a save into one settled event and stitches
+# rename From→To pairs together, so a folder stays indexed without polling. Both fold
+# into the same reconcile the on-demand "Sync now" uses (walk + mtime→hash).
 file-id = "0.2"
+notify = "8"
+notify-debouncer-full = "0.7"
 
 # OpenRouter streaming chat client. rustls keeps TLS independent of SQLCipher's crypto.
 # `blocking` is used by python_fetch (macOS interpreter download) from inside spawn_blocking.

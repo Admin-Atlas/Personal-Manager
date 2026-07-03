@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.81.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "Groundwork (cont.): PM now watches the folders you've pointed it at and keeps them indexed on its own — save a file and its contents are searchable within a few seconds, rename or move one and it keeps its place, project and tags, delete one and it quietly drops out of your results (still findable if you search for it by name). It also catches up whenever you reopen PM, so anything you changed while it was closed is folded in. It never keeps a copy of your files — it only reads them to index, exactly as before. The button to add a folder is the last piece, coming next.",
+    ],
+  },
+  {
     version: "2.80.0-alpha",
     date: "2026-07-03",
     highlights: [

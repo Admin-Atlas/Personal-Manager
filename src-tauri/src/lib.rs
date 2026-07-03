@@ -689,6 +689,13 @@ pub fn run() {
             // launch pass scans turns added while the app was closed (the eager per-conversation nudge
             // fires from `send_message`). Background, best-effort, explicit-only — never inferred.
             chat_prefs::spawn_prefs_scheduler(handle.clone());
+
+            // Watch every tracked local folder (board card 6, PR2) for live changes: a debounced
+            // filesystem watcher that re-embeds a saved file within seconds and keeps deletes/renames
+            // reconciled, without a full walk. Reuses the on-demand sync's per-file semantics; runs a
+            // catch-up reconcile on each unlock (self-healing anything changed while closed), and is a
+            // no-op until a folder is tracked. Observer-only — takes no vault lock.
+            commands::spawn_local_watcher(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
