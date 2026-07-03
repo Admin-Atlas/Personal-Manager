@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { type CSSProperties, useEffect, useMemo, useState } from "react";
+import {
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import type { ChunkSpan, Document, ImageData } from "../lib/types";
 import {
   documentChunkSpans,
@@ -11,7 +17,12 @@ import {
   readDocumentImage,
 } from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
-import { offsetsAlignToBody, segmentByLeaves, shadeBuckets } from "../lib/chunkOverlay";
+import {
+  offsetsAlignToBody,
+  parentGroupStarts,
+  segmentByLeaves,
+  shadeLeaves,
+} from "../lib/chunkOverlay";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
@@ -41,6 +52,20 @@ interface Props {
   onClose: () => void;
 }
 
+// The reader is a resizable right dock. It never grows past half the window (the reading pane should
+// never crowd out the surface it was opened from) and never shrinks below a comfortable column. The
+// last width is remembered across opens.
+const READER_MIN_WIDTH = 340;
+const READER_DEFAULT_WIDTH = 480;
+const READER_WIDTH_KEY = "pm.reader.width";
+
+/** Clamp a candidate panel width to [min, half the window], reading the live viewport width. */
+function clampReaderWidth(w: number): number {
+  const max = Math.round(window.innerWidth * 0.5);
+  const min = Math.min(READER_MIN_WIDTH, max);
+  return Math.max(min, Math.min(max, w));
+}
+
 export function DocumentReader({ doc, stale, onClose }: Props) {
   // Two orthogonal axes: `showPower` (density preset) turns the overlay ON; `devMode` (capability)
   // swaps the overlay substrate from rendered Markdown to raw source.
@@ -58,6 +83,10 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [showChunks, setShowChunks] = useState(false);
   const [spans, setSpans] = useState<ChunkSpan[] | null>(null);
+  const [width, setWidth] = useState<number>(() => {
+    const saved = Number(localStorage.getItem(READER_WIDTH_KEY));
+    return Number.isFinite(saved) && saved > 0 ? saved : READER_DEFAULT_WIDTH;
+  });
 
   const known = KNOWN_TYPES.has(doc.source_type);
   const isIndexOnly = doc.source_type === "index_only";
@@ -130,6 +159,31 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Remember the chosen width across opens (and re-clamp a stored width that no longer fits, e.g. after
+  // the window shrank). CSS `max-width: 50vw` caps the live render too, so a stale value is never wrong.
+  useEffect(() => {
+    localStorage.setItem(READER_WIDTH_KEY, String(width));
+  }, [width]);
+
+  // Drag the left edge to resize. The panel is docked to the right, so width = distance from the pointer
+  // to the right edge of the window; clamped to [min, half-window]. Pointer capture keeps the drag alive
+  // even when the cursor moves faster than the handle.
+  function startResize(e: ReactPointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+    const onMove = (ev: globalThis.PointerEvent) => {
+      setWidth(clampReaderWidth(window.innerWidth - ev.clientX));
+    };
+    const onUp = () => {
+      handle.releasePointerCapture(e.pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   // The overlay only applies where the body is the full text the offsets index — never over an image,
   // and never over an index-only summary fallback (whose text the offsets don't align to).
   const renderedAsMarkdown = body != null && image == null && (!isIndexOnly || bodyFull);
@@ -149,7 +203,20 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
   }
 
   return (
-    <aside className="fixed right-0 top-0 z-40 flex h-full w-[min(480px,100vw)] flex-col border-l border-border bg-panel shadow-2xl">
+    // Docked to the right, starting *below* the custom title bar (`top-9` = its `h-9`) so its drag
+    // region and window controls stay reachable — the reader never covers the window chrome.
+    <aside
+      className="fixed bottom-0 right-0 top-9 z-40 flex flex-col border-l border-border bg-panel shadow-2xl"
+      style={{ width, maxWidth: "50vw", minWidth: `${READER_MIN_WIDTH}px` }}
+    >
+      {/* Left-edge grip: drag to resize up to half the window. */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize reader"
+        onPointerDown={startResize}
+        className="absolute inset-y-0 left-0 z-10 w-1.5 -translate-x-1/2 cursor-col-resize bg-transparent transition-colors hover:bg-accent-soft"
+      />
       <div className="flex items-start gap-2 border-b border-rule px-4 py-3">
         <div className="min-w-0 flex-1">
           <div className="truncate font-head text-base text-ink" title={doc.title}>
@@ -309,7 +376,8 @@ function ChunkOverlayView({
     () => (aligned ? segmentByLeaves(body, spans) : []),
     [body, spans, aligned],
   );
-  const shades = useMemo(() => shadeBuckets(segments), [segments]);
+  const shades = useMemo(() => shadeLeaves(segments), [segments]);
+  const groupStarts = useMemo(() => parentGroupStarts(segments), [segments]);
 
   // The stored offsets don't index this exact body (an index-only item re-embedded from its summary):
   // render it plainly rather than paint boundaries in the wrong places.
@@ -331,12 +399,16 @@ function ChunkOverlayView({
 
   return (
     <div className="overflow-hidden rounded-[var(--radius-sm)] border border-rule">
-      {segments.map((seg) => (
+      {segments.map((seg, i) => (
         <div
           key={seg.chunkId}
-          className={`border-t border-rule px-2 py-1 first:border-t-0 ${
-            shades.get(seg.chunkId) === 1 ? "bg-accent-soft" : ""
-          }`}
+          className={`px-2 py-1 ${
+            i === 0
+              ? ""
+              : groupStarts.has(seg.chunkId)
+                ? "border-t-2 border-border" // heavier divider between sibling parent groups
+                : "border-t border-rule" // thin divider between leaves within a group
+          } ${shades.get(seg.chunkId) === 1 ? "bg-accent-soft" : ""}`}
           // Zero-dep virtualization: off-screen chunk blocks skip layout/paint until scrolled near.
           style={
             {

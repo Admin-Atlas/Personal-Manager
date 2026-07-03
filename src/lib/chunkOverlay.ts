@@ -105,21 +105,33 @@ export function segmentByLeaves(body: string, leaves: ChunkSpan[]): ChunkSegment
 }
 
 /**
- * Assign each segment an alternating shade bucket (0/1) by parent group, in first-appearance order, so
- * adjacent parent groups read as distinct bands. A parentless leaf is its own group.
+ * Assign each leaf an alternating zebra shade (0/1) in document order, so **every** chunk reads as a
+ * distinct band the whole way down. (Shading by parent group instead turns a document dominated by one
+ * long heading-section — where every leaf shares a parent — into a single uniform band that looks like
+ * the shading simply stops; the zebra doesn't.) Parent grouping is conveyed separately, by a heavier
+ * divider at group boundaries — see [`parentGroupStarts`].
  */
-export function shadeBuckets(segments: ChunkSegment[]): Map<number, 0 | 1> {
-  const groupIndex = new Map<number, number>();
-  let next = 0;
+export function shadeLeaves(segments: ChunkSegment[]): Map<number, 0 | 1> {
   const out = new Map<number, 0 | 1>();
-  for (const seg of segments) {
-    const key = seg.parentId ?? -seg.chunkId; // parentless leaf → unique negative key
-    let idx = groupIndex.get(key);
-    if (idx === undefined) {
-      idx = next++;
-      groupIndex.set(key, idx);
-    }
-    out.set(seg.chunkId, (idx % 2) as 0 | 1);
-  }
+  segments.forEach((seg, i) => out.set(seg.chunkId, (i % 2) as 0 | 1));
   return out;
+}
+
+/**
+ * The leaves that begin a new parent group — the parent id differs from the previous leaf's, and a
+ * parentless leaf (a single-leaf section) always stands alone. The overlay draws a heavier divider
+ * before these so sibling groups stay legible while the zebra marks the individual leaves within them.
+ */
+export function parentGroupStarts(segments: ChunkSegment[]): Set<number> {
+  const starts = new Set<number>();
+  let prevParent: number | null = null;
+  let first = true;
+  for (const seg of segments) {
+    // A group start on the first leaf, on any parentless leaf (each stands alone), or whenever the
+    // parent id changes from the previous leaf.
+    if (first || seg.parentId == null || seg.parentId !== prevParent) starts.add(seg.chunkId);
+    prevParent = seg.parentId;
+    first = false;
+  }
+  return starts;
 }
