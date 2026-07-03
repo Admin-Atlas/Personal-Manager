@@ -49,6 +49,7 @@ import {
   onVaultCurtain,
   openUrl,
   resumeDriveSync,
+  resumeLocalFolderSync,
   resumeOneDriveSync,
   reviewQueue,
   setChatModels,
@@ -325,6 +326,12 @@ export default function App() {
   // Same for an interrupted OneDrive sync (independent connector, its own resume marker).
   useEffect(() => {
     if (keySet) void resumeOneDriveSync().catch(() => {});
+  }, [keySet]);
+
+  // And an interrupted local-folder sync (board card 6, its own resume marker). The live filesystem
+  // watcher is spawned separately at app setup; this just finishes any walk left mid-index by a close.
+  useEffect(() => {
+    if (keySet) void resumeLocalFolderSync().catch(() => {});
   }, [keySet]);
 
   // Keep the read-only calendar mirror fresh in the background: one poll shortly after unlock, then

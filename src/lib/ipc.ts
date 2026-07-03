@@ -39,6 +39,9 @@ import type {
   IngestEvent,
   LanguageOptions,
   LayoutProgressEvent,
+  LocalFolder,
+  LocalFolderSyncState,
+  LocalSyncEvent,
   Message,
   ModelInfo,
   ModelRecommendations,
@@ -716,6 +719,42 @@ export const getOneDriveScope = (email: string) =>
 /** Persist one account's indexing scope; follow with `syncOneDrive(email)` to apply it. */
 export const setOneDriveScope = (email: string, scope: OneDriveScope) =>
   invoke<void>("set_onedrive_scope", { email, scope });
+
+// --- Local folders (index-only connector, board card 6) ---
+
+/** Every tracked local folder, with its live document count, state, and whether its path is present. */
+export const listLocalFolders = () => invoke<LocalFolder[]>("list_local_folders");
+
+/** Track a folder (by absolute path) — registers it and returns its stable key. Index it with
+ *  {@link syncLocalFolder}; the live watcher then keeps it current. Re-adding a folder reuses its row. */
+export const addLocalFolder = (path: string) => invoke<string>("add_local_folder", { path });
+
+/** Stop tracking a folder: drop its registration and flag its items `unreachable` — they stay findable
+ *  (summaries searchable offline), never hard-deleted, just like a cloud disconnect. Pass the key. */
+export const removeLocalFolder = (key: string) => invoke<void>("remove_local_folder", { key });
+
+/** Start syncing one folder (or all when `folder` is null). Detached in the backend — progress arrives
+ *  via the global `local://sync` event (subscribe with {@link onLocalSync}). */
+export const syncLocalFolder = (folder: string | null) =>
+  invoke<number>("sync_local_folder", { folder });
+
+/** The current background local-sync snapshot — used to restore the progress UI on returning to Settings. */
+export const localFolderSyncStatus = () => invoke<LocalFolderSyncState>("local_folder_sync_status");
+
+/** Ask the running local sync to stop after the current file. Already-indexed files are kept. */
+export const stopLocalFolderSync = () => invoke<void>("stop_local_folder_sync");
+
+/** Resume a local sync interrupted by a previous app close/crash mid-index. Called once on launch. */
+export const resumeLocalFolderSync = () => invoke<boolean>("resume_local_folder_sync");
+
+/** Subscribe to global local-sync progress (fires regardless of which view started the sync). */
+export const onLocalSync = (handler: (e: LocalSyncEvent) => void): Promise<UnlistenFn> =>
+  listen<LocalSyncEvent>("local://sync", (e) => handler(e.payload));
+
+/** Fire when the live filesystem watcher applied a batch of changes (a folder's items changed on disk
+ *  outside a manual sync) — the UI refetches its folder list so counts/states stay current. */
+export const onLocalChanged = (handler: () => void): Promise<UnlistenFn> =>
+  listen("local://changed", () => handler());
 
 /** Fetch an index-only document's full body live from its source (the body is never stored). */
 export const fetchIndexOnlyBody = (docId: number) =>
