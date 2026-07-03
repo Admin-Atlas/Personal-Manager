@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.68.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "New: projects you haven't set a priority for can now show one anyway. If other projects depend on a project — it's a parent of them, or they're blocked on it — the Focus view now works that out on its own and shows a priority tag marked “(auto)”, so the projects other work is waiting on stand out even before you've triaged them. Set a priority yourself in Triage at any time and it takes over, exactly as before.",
+    ],
+  },
+  {
     version: "2.67.0-alpha",
     date: "2026-07-03",
     highlights: [

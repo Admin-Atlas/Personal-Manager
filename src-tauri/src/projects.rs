@@ -78,6 +78,53 @@ pub fn derive_status(s: &StatusSignals) -> ProjectStatus {
     ProjectStatus::OnTrack
 }
 
+/// The signals behind a project's auto-importance tier — kept separate from storage so
+/// `compute_auto_importance` stays pure (deterministically unit-testable), like `derive_status`.
+pub struct ImportanceSignals {
+    /// How many *other* projects name this one as their `parent` or `blocked_by` (deduped by
+    /// project name) — "is this project depended-on by others" from the roadmap card.
+    pub dependents: u32,
+    pub days_since_activity: Option<f64>,
+}
+
+/// The structural auto-importance tier — the deferred "real" value behind Auto (board card:
+/// "structural signal, not document importance"). Zero dependents is the same honest
+/// "no signal" default as an untriaged project (`None`, no tag), rather than defaulting
+/// every leaf project to "low". Blended with activity: a depended-on project that's
+/// actively worked outranks one that's gone quiet.
+pub fn compute_auto_importance(s: &ImportanceSignals) -> Option<&'static str> {
+    if s.dependents == 0 {
+        return None;
+    }
+    let stale = matches!(s.days_since_activity, Some(d) if d > STALE_DAYS);
+    Some(match (s.dependents, stale) {
+        (n, false) if n >= 2 => "high",
+        (_, false) => "medium",
+        (n, true) if n >= 2 => "medium",
+        (_, true) => "low",
+    })
+}
+
+/// How many *other* projects depend on `name` — i.e. name it as their `parent` or
+/// `blocked_by`. Case-insensitive via `.to_lowercase()` (not `eq_ignore_ascii_case` — see
+/// `set_metadata`'s Café/CAFÉ note), deduped so a project pointing at `name` via both
+/// fields counts once. `edges` is every project's own (name, parent, blocked_by).
+pub fn count_dependents(name: &str, edges: &[(String, Option<String>, Option<String>)]) -> u32 {
+    let name_lc = name.to_lowercase();
+    edges
+        .iter()
+        .filter(|(n, parent, blocked_by)| {
+            n.to_lowercase() != name_lc
+                && (parent
+                    .as_deref()
+                    .is_some_and(|p| p.to_lowercase() == name_lc)
+                    || blocked_by
+                        .as_deref()
+                        .is_some_and(|b| b.to_lowercase() == name_lc))
+        })
+        .count() as u32
+}
+
 /// One row of the focus view: a project, its derived status, and the raw signals
 /// behind it (so the UI can show the "why" and offer inline editing).
 #[derive(Clone, Serialize)]
@@ -97,6 +144,10 @@ pub struct ProjectOverview {
     /// which shows no tag. (The old "highest document importance" heuristic was dropped as
     /// misleading; a structural auto-importance signal is a deferred follow-up.)
     pub importance: Option<String>,
+    /// The computed structural auto-importance tier (see `compute_auto_importance`) — the
+    /// value "Auto" resolves to. Always populated from signals alone, independent of
+    /// `importance`; the frontend falls back to this only when `importance` is `None`.
+    pub auto_importance: Option<String>,
     /// The soonest upcoming calendar event whose title names this project (Step 6) —
     /// the zero-setup fallback that only kicks in when a project has NO milestones; an
     /// explicit milestone supersedes it. Populated only in that fallback case so the
@@ -162,6 +213,15 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     let raw: Vec<_> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
 
+    // Every project's own (name, parent, blocked_by), snapshotted before the loop below
+    // consumes `raw` by value — the structural graph `count_dependents` reduces per project.
+    let edges: Vec<(String, Option<String>, Option<String>)> = raw
+        .iter()
+        .map(|(name, _, _, _, _, blocked_by, parent, _, _)| {
+            (name.clone(), parent.clone(), blocked_by.clone())
+        })
+        .collect();
+
     // All milestones, resolved (calendar-linked dates synced) and grouped by project, in
     // one pass — the milestone set is what now drives the status (card 7).
     let mut milestones_by_project = milestones::all_by_project(conn, today)?;
@@ -200,6 +260,11 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
             blocked_by: blocked_by.as_deref(),
             parent: parent.as_deref(),
         });
+        let auto_importance = compute_auto_importance(&ImportanceSignals {
+            dependents: count_dependents(&name, &edges),
+            days_since_activity: dsince,
+        })
+        .map(str::to_string);
         out.push(ProjectOverview {
             name,
             status,
@@ -210,6 +275,7 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
             blocked_by,
             parent,
             importance,
+            auto_importance,
             calendar_event,
             milestones: project_milestones,
             governing_milestone,
@@ -526,6 +592,59 @@ mod tests {
     }
 
     #[test]
+    fn auto_importance_is_none_with_no_dependents() {
+        let s = ImportanceSignals {
+            dependents: 0,
+            days_since_activity: Some(1.0),
+        };
+        assert_eq!(compute_auto_importance(&s), None, "no signal, no tag");
+    }
+
+    #[test]
+    fn auto_importance_tiers_by_dependents_and_staleness() {
+        let active = |dependents| ImportanceSignals {
+            dependents,
+            days_since_activity: Some(1.0),
+        };
+        let stale = |dependents| ImportanceSignals {
+            dependents,
+            days_since_activity: Some(STALE_DAYS + 1.0),
+        };
+        assert_eq!(compute_auto_importance(&active(2)), Some("high"));
+        assert_eq!(compute_auto_importance(&active(1)), Some("medium"));
+        assert_eq!(compute_auto_importance(&stale(2)), Some("medium"));
+        assert_eq!(compute_auto_importance(&stale(1)), Some("low"));
+        // No activity data at all reads as not-stale (mirrors `derive_status`'s `matches!` guard).
+        assert_eq!(
+            compute_auto_importance(&ImportanceSignals {
+                dependents: 1,
+                days_since_activity: None,
+            }),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn count_dependents_excludes_self_dedupes_and_ignores_case() {
+        let edges = vec![
+            // Self-reference must not count.
+            ("Atlas".to_string(), Some("Atlas".into()), None),
+            ("Child A".to_string(), Some("Atlas".into()), None),
+            ("Child B".to_string(), None, Some("ATLAS".into())),
+            // Both fields point at Atlas — counts once, not twice.
+            (
+                "Child C".to_string(),
+                Some("atlas".into()),
+                Some("atlas".into()),
+            ),
+            ("Unrelated".to_string(), Some("Other".into()), None),
+        ];
+        assert_eq!(count_dependents("Atlas", &edges), 3);
+        assert_eq!(count_dependents("Other", &edges), 1);
+        assert_eq!(count_dependents("Nobody", &edges), 0);
+    }
+
+    #[test]
     fn parse_drops_self_reference_and_normalizes_size() {
         let raw = "```json\n{\"size\":\"QUICK\",\"parent\":\"Self\",\"blocked_by\":\"Infra\",\"deadline\":\"2026-07-01\",\"reasoning\":\"small\"}\n```";
         let p = parse_proposal(raw, "Self");
@@ -645,6 +764,70 @@ mod tests {
         set_metadata(&conn, "Imp", None, None, None, None, Some("auto".into())).unwrap();
         let rows = list_overviews(&conn, "2026-06-28").unwrap();
         assert_eq!(overview_for(&rows, "Imp").importance, None);
+    }
+
+    /// Auto-importance is computed from the structural graph (parent/blocked_by), independent
+    /// of the manual override — Atlas has 2 dependents and recent activity, so it reads "high";
+    /// setting a manual override on Atlas leaves the computed signal untouched (the two fields
+    /// don't mix), and a project with no dependents shows no auto tag.
+    #[test]
+    fn auto_importance_reflects_dependents_independent_of_manual_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        for (path, hash, project) in [
+            ("v1", "h1", "Atlas"),
+            ("v2", "h2", "Child A"),
+            ("v3", "h3", "Child B"),
+        ] {
+            conn.execute(
+                "INSERT INTO documents(vault_path, content_hash, project, last_activity) \
+                 VALUES (?1, ?2, ?3, '2026-06-27T10:00:00Z')",
+                params![path, hash, project],
+            )
+            .unwrap();
+        }
+        set_metadata(
+            &conn,
+            "Child A",
+            None,
+            None,
+            None,
+            Some("Atlas".into()),
+            None,
+        )
+        .unwrap();
+        set_metadata(
+            &conn,
+            "Child B",
+            None,
+            None,
+            None,
+            Some("Atlas".into()),
+            None,
+        )
+        .unwrap();
+
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        let atlas = overview_for(&rows, "Atlas");
+        assert_eq!(atlas.importance, None, "no manual override set");
+        assert_eq!(
+            atlas.auto_importance.as_deref(),
+            Some("high"),
+            "2 dependents + recent activity"
+        );
+        assert_eq!(
+            overview_for(&rows, "Child A").auto_importance,
+            None,
+            "nothing depends on a leaf project"
+        );
+
+        // A manual override on Atlas takes the tag but leaves the computed signal untouched.
+        set_metadata(&conn, "Atlas", None, None, None, None, Some("low".into())).unwrap();
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        let atlas = overview_for(&rows, "Atlas");
+        assert_eq!(atlas.importance.as_deref(), Some("low"));
+        assert_eq!(atlas.auto_importance.as_deref(), Some("high"));
     }
 
     /// `touch` makes a project read as active: a project whose only document is ancient is

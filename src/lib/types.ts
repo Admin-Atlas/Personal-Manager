@@ -405,6 +405,9 @@ export interface ProjectOverview {
   blocked_by: string | null;
   parent: string | null;
   importance: Importance;
+  /** Computed structural auto-importance — the value "Auto" resolves to (independent of
+   *  the manual `importance` override). `null` when nothing depends on this project. */
+  auto_importance: Importance;
   /** The upcoming calendar event whose title names this project (Step 6) — the
    *  zero-milestone fallback that drives "Due soon" only when the project has none. */
   calendar_event: CalendarMatch | null;

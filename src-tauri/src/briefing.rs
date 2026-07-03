@@ -286,6 +286,7 @@ mod tests {
             blocked_by: None,
             parent: None,
             importance: None,
+            auto_importance: None,
             calendar_event: None,
             milestones: Vec::new(),
             governing_milestone: None,
