@@ -8,6 +8,7 @@ import { Collapsible, SegmentedControl } from "./ui";
 import { CalendarConnection } from "./CalendarConnection";
 import { GoogleDriveConnection } from "./GoogleDriveConnection";
 import { OneDriveConnection } from "./OneDriveConnection";
+import { LocalFolderConnection } from "./LocalFolderConnection";
 import { GoogleCredentialBlock } from "./GoogleCredentialBlock";
 import { MicrosoftCredentialBlock } from "./MicrosoftCredentialBlock";
 import { IcsFeedSubscription } from "./IcsFeedSubscription";
@@ -50,8 +51,23 @@ export function ConnectorsSettings({
       <GoogleProvider />
       <MicrosoftProvider />
       <AppleProvider />
+      <ThisDevice />
       <CalendarSubscriptions />
     </div>
+  );
+}
+
+/** The **This device** group — sources that live on this machine, no provider or sign-in. Currently
+ *  just local folders (board card 6); iCloud/OneDrive local mirrors would slot in here too. Kept apart
+ *  from the provider groups because it belongs to no cloud account and takes no OAuth client. */
+function ThisDevice() {
+  return (
+    <ConnectorGroup
+      title="This device"
+      blurb="Index folders on this computer. Everything is index-only — a searchable pointer and summary; the files stay on disk. PM watches each folder and keeps it current as you work."
+    >
+      <LocalFolderConnection />
+    </ConnectorGroup>
   );
 }
 

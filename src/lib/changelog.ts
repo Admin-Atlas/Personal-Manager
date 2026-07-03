@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.82.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "You can now point PM at a folder on your own computer. Open Settings → Connectors → This device → Add a folder, pick one, and PM indexes the documents inside it — so what's in your files turns up in search, right alongside your Google Drive and OneDrive. As with those, nothing is copied into PM: it only reads each file to index it, and the file stays exactly where it is. Once a folder is added PM watches it and keeps it current as you work — edit a file and it re-indexes within seconds, rename or move one and it keeps its place, delete one and it drops out of your results (still findable by name). Each folder shows how many files it's indexed and when it last synced, with Sync now and Remove; removing a folder just stops the watching — the items you've already indexed stay findable. This completes local folders as a source.",
+    ],
+  },
+  {
     version: "2.81.0-alpha",
     date: "2026-07-03",
     highlights: [

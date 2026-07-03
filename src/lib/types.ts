@@ -755,6 +755,67 @@ export type OneDriveSyncEvent =
   | { type: "item"; processed: number; total: number; name: string }
   | { type: "finished"; report: OneDriveSyncReport };
 
+// --- Local folders (index-only connector, board card 6) ---
+
+/** A tracked local folder as the Connectors UI lists it (mirrors the Rust `LocalFolder`). Every file
+ *  inside is index-only — a searchable pointer + summary; the bytes stay on disk and are read on
+ *  demand. `present` is whether the path is a readable directory right now (an unmounted/removed root
+ *  reads `false` even while `state` is still `ok`, so the row can nudge before the next sync flags it). */
+export interface LocalFolder {
+  /** The stable folder key (the connector source id is `local:<key>`). */
+  key: string;
+  /** The absolute path being tracked. */
+  path: string;
+  /** The folder's own name, shown as the label. */
+  label: string;
+  state: "ok" | "unreachable" | "error";
+  last_synced_at: string | null;
+  /** How many index-only documents this folder currently has. */
+  indexed: number;
+  /** Whether the path is a readable directory right now (false = unmounted/removed). */
+  present: boolean;
+}
+
+/** A file a local sync tried to index but couldn't (unsupported/empty type, or a read error),
+ *  surfaced in the post-sync report so the user knows what was left out. */
+export interface LocalSyncIssue {
+  name: string;
+  reason: string;
+}
+
+/** The outcome of a local-folder sync pass: indexed/updated/removed counts, the not-indexed list, and
+ *  whether the user stopped it early. Mirrors `DriveSyncReport` so the report UI is shared. */
+export interface LocalSyncReport {
+  indexed: number;
+  updated: number;
+  removed: number;
+  skipped: number;
+  failed: number;
+  /** The user pressed Stop — already-indexed files are kept; the rest were left for next time. */
+  cancelled: boolean;
+  /** Files attempted but not indexed (capped; see `issues_truncated`). */
+  issues: LocalSyncIssue[];
+  /** True when more files couldn't be indexed than `issues` lists. */
+  issues_truncated: boolean;
+}
+
+/** Snapshot of an in-flight local-folder sync, so the UI can restore progress after navigating away.
+ *  `running` is false when idle; `last_report` holds the most recent result. */
+export interface LocalFolderSyncState {
+  running: boolean;
+  processed: number;
+  total: number | null;
+  /** The folder key being synced, or null for an all-folders pass. */
+  folder: string | null;
+  last_report: LocalSyncReport | null;
+}
+
+/** Streamed progress while a local-folder sync runs (mapped onto the shared IngestProgress bar). */
+export type LocalSyncEvent =
+  | { type: "counted"; total: number }
+  | { type: "item"; processed: number; total: number; name: string }
+  | { type: "finished"; report: LocalSyncReport };
+
 /** One document's 2-D position on the semantic memory map (coords are in [0,1]²). */
 export interface SemanticCoord {
   id: number;
