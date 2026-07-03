@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.78.0-alpha",
+    date: "2026-07-03",
+    highlights: [
+      "Groundwork (cont.): items in your “what needs your attention” layer can now be marked done — and PM treats that as a decision it remembers, not a line it erases. A resolved item drops out of the briefing, and a later re-scan can't quietly bring it back; if you'd already prepared for an event, its “happening today” note reads “you're prepared — file's here” with a link, instead of nagging you to prepare again. The button to mark things done straight from the briefing lands in the next update — this step puts the resolution rules and the honest record underneath them in place.",
+    ],
+  },
+  {
     version: "2.77.0-alpha",
     date: "2026-07-03",
     highlights: [

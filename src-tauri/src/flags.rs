@@ -32,7 +32,15 @@
 //! slipped milestone) — resolved flags are protected state and never touched. Because the briefing
 //! path and the [`spawn_flag_detection_scheduler`] backstop both derive from the same deterministic
 //! reducer, they converge on the same set and never fight. The briefing then renders that active
-//! set (see [`crate::briefing`]); assertion/HITL and chat grounding follow in later PRs.
+//! set (see [`crate::briefing`]); chat grounding follows in a later PR.
+//!
+//! **Assertion/resolution (PR3):** [`resolve`] closes a flag and records WHICH path did it —
+//! `assertion` is a deliberate user vouch (the `resolve_flag` command), `detection` a machine verdict
+//! that stays HITL-gated. On conflict assertion outranks detection, and re-detection can never
+//! un-resolve or clobber a vouched flag (decision 2). Resolution is durable STATE the render layer
+//! reads, not a delete: a resolved `prepare-ahead` (with its artifact link) is *consumed* by an active
+//! `happening-today` on the same anchor, so the briefing says "you're prepared — file's here" instead
+//! of dropping the line (decision 3, [`list_resolved`] feeding [`crate::briefing`]).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -58,19 +66,19 @@ pub const TYPE_DEADLINE_APPROACHING: &str = "deadline-approaching";
 pub const TYPE_HAPPENING_TODAY: &str = "happening-today";
 pub const TYPE_OVERDUE: &str = "overdue";
 
-// Lifecycle + provenance. Detection/reconcile query these states as SQL literals; the Rust-side
-// constants (and the `SOURCE_*` pair) are the assertion/resolution vocabulary the manual "done"
-// flow (PR3) compares against, so they're exercised only by unit tests until then — hence the
-// scoped `#[allow(dead_code)]`.
-#[allow(dead_code)] // consumed by assertion/resolution (PR3)
+// Lifecycle + provenance. Detection, reconcile and resolution all match these states/sources as SQL
+// string LITERALS, so the Rust-side constants are the shared vocabulary the code reasons in (e.g.
+// `resolve` derives `user_confirmed` from `source == SOURCE_ASSERTION`) and the tests assert against.
+// STATE_* / SOURCE_DETECTION have no direct lib `use` yet — SQL names them inline, and the
+// detector-close path is HITL-gated (PR4) — so they carry a scoped `#[allow(dead_code)]`.
+#[allow(dead_code)] // named inline in SQL; exercised by tests + the serialized `Flag`
 pub const STATE_ACTIVE: &str = "active";
-#[allow(dead_code)] // consumed by assertion/resolution (PR3)
+#[allow(dead_code)] // named inline in SQL; exercised by tests + the serialized `Flag`
 pub const STATE_RESOLVED: &str = "resolved";
 
 // Which path CLOSED a flag (NULL while active). On conflict, assertion outranks detection.
-#[allow(dead_code)] // consumed by assertion/resolution (PR3)
+#[allow(dead_code)] // the detector-close path is HITL-gated (PR4); tests exercise it today
 pub const SOURCE_DETECTION: &str = "detection";
-#[allow(dead_code)] // consumed by assertion/resolution (PR3)
 pub const SOURCE_ASSERTION: &str = "assertion";
 
 /// A flag as stored, and as the briefing/chat layer will read it. `type` is a Rust keyword,
@@ -133,9 +141,8 @@ fn row_to_flag(r: &rusqlite::Row) -> rusqlite::Result<Flag> {
     })
 }
 
-/// One flag by id, or `None` if the id is unknown. Used by the resolution flow (PR3) and the
-/// tests; not yet reached from lib code, so it's allowed to be "dead" until then.
-#[allow(dead_code)]
+/// One flag by id, or `None` if the id is unknown. The `resolve_flag` command reads the freshly
+/// resolved row back through this to return it to the frontend; the tests use it too.
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Flag>> {
     Ok(conn
         .query_row(
@@ -173,6 +180,20 @@ pub fn list_active(conn: &Connection, anchor_kind: Option<&str>) -> Result<Vec<F
     Ok(rows)
 }
 
+/// The RESOLVED flags of one `type`, for the render-time enrichment join (decision 3): a resolved
+/// `prepare-ahead` on the same anchor as an active `happening-today` folds "you're prepared — file's
+/// here" into that event's line instead of nagging. The briefing keys these by `(anchor_kind, anchor)`.
+pub fn list_resolved(conn: &Connection, flag_type: &str) -> Result<Vec<Flag>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {FLAG_COLUMNS} FROM flags \
+         WHERE state = 'resolved' AND type = ?1 ORDER BY id"
+    ))?;
+    let out: Vec<Flag> = stmt
+        .query_map(params![flag_type], row_to_flag)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(out)
+}
+
 /// Insert a detected flag, or refresh the live row's detection-derived fields if one already
 /// exists for its `(anchor_kind, anchor, type)`. **Resolution-preserving:** a row the user (or
 /// a confirmed detection) has already RESOLVED is left completely untouched — the `WHERE
@@ -206,22 +227,34 @@ pub fn upsert_active(conn: &Connection, f: &DraftFlag) -> Result<i64> {
 }
 
 /// Resolve a flag: record WHICH path closed it and, optionally, the satisfying artifact it now
-/// points at. Assertion is a deliberate user vouch (`user_confirmed = 1`); a detection verdict
-/// is machine-derived (`user_confirmed = 0`) and — per the HITL-confirm-before-suppress rule —
-/// must be confirmed before it is allowed to cross anything off (that gate lives in the
-/// resolution PR). Passing `artifact_ptr = None` keeps whatever pointer detection already found.
-/// The `resolve_flag` command (PR3) is its first lib consumer; until then only the tests call it.
-#[allow(dead_code)]
-pub fn resolve(conn: &Connection, id: i64, source: &str, artifact_ptr: Option<&str>) -> Result<()> {
-    let user_confirmed = i64::from(source == SOURCE_ASSERTION);
+/// points at (its rename-stable `documents.source_id` plus the current open URL — both display state
+/// a downstream flag surfaces). Assertion is a deliberate user vouch (`user_confirmed = 1`); a
+/// detection verdict is machine-derived (`user_confirmed = 0`) and — per HITL-confirm-before-suppress
+/// — must be confirmed before it may cross anything off (the confirm gate lives in the UI).
+///
+/// **Assertion outranks detection (decision 2):** the `WHERE … (?3 = 1 OR user_confirmed = 0)` guard
+/// lets an assertion write unconditionally but blocks a *detection* verdict from ever clobbering a row
+/// a user has already vouched for — a re-detection can neither downgrade the source nor overwrite the
+/// asserted artifact. Passing `None` for either artifact field keeps whatever is already stored.
+pub fn resolve(
+    conn: &Connection,
+    id: i64,
+    source: &str,
+    artifact_ptr: Option<&str>,
+    artifact_url: Option<&str>,
+) -> Result<()> {
+    // `user_confirmed` and the guard share one value: an assertion (== 1) always applies; a detection
+    // verdict (== 0) applies only while the row is not already user-confirmed.
+    let is_assertion = i64::from(source == SOURCE_ASSERTION);
     conn.execute(
         "UPDATE flags SET \
              state = 'resolved', source = ?2, user_confirmed = ?3, \
              artifact_ptr = COALESCE(?4, artifact_ptr), \
+             artifact_url = COALESCE(?5, artifact_url), \
              updated_at  = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
              resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-         WHERE id = ?1",
-        params![id, source, user_confirmed, artifact_ptr],
+         WHERE id = ?1 AND (?3 = 1 OR user_confirmed = 0)",
+        params![id, source, is_assertion, artifact_ptr, artifact_url],
     )?;
     Ok(())
 }
@@ -541,7 +574,14 @@ mod tests {
     fn upsert_never_unresolves_a_resolved_flag() {
         let (_dir, conn) = open_test_db();
         let id = upsert_active(&conn, &draft("7", TYPE_PREPARE_AHEAD)).unwrap();
-        resolve(&conn, id, SOURCE_ASSERTION, Some("gdrive:me@x.com:prep")).unwrap();
+        resolve(
+            &conn,
+            id,
+            SOURCE_ASSERTION,
+            Some("gdrive:me@x.com:prep"),
+            None,
+        )
+        .unwrap();
 
         // Re-detection (the daily rescan) must NOT flip a resolved flag back to active or clobber
         // its user-asserted resolution — the storage-level guard behind decision 1's idempotency.
@@ -575,8 +615,8 @@ mod tests {
         let asserted = upsert_active(&conn, &draft("1", TYPE_OVERDUE)).unwrap();
         let detected = upsert_active(&conn, &draft("2", TYPE_OVERDUE)).unwrap();
 
-        resolve(&conn, asserted, SOURCE_ASSERTION, None).unwrap();
-        resolve(&conn, detected, SOURCE_DETECTION, None).unwrap();
+        resolve(&conn, asserted, SOURCE_ASSERTION, None, None).unwrap();
+        resolve(&conn, detected, SOURCE_DETECTION, None, None).unwrap();
 
         let a = get(&conn, asserted).unwrap().unwrap();
         assert!(a.user_confirmed, "assertion is a confirmed vouch");
@@ -587,6 +627,63 @@ mod tests {
             !d.user_confirmed,
             "a detection verdict is unconfirmed until HITL confirms it"
         );
+    }
+
+    /// Decision 2, both directions: once a user has vouched (assertion), a later detection verdict is
+    /// inert — it can't downgrade the source or overwrite the asserted artifact; but an assertion CAN
+    /// upgrade a row a detection had merely closed.
+    #[test]
+    fn assertion_outranks_a_later_detection_verdict() {
+        let (_dir, conn) = open_test_db();
+
+        // User asserts a flag done, naming the artifact.
+        let vouched = upsert_active(&conn, &draft("5", TYPE_OVERDUE)).unwrap();
+        resolve(
+            &conn,
+            vouched,
+            SOURCE_ASSERTION,
+            Some("gdrive:me@x.com:artA"),
+            Some("https://a"),
+        )
+        .unwrap();
+        // A later detection verdict must not clobber the user's vouch.
+        resolve(
+            &conn,
+            vouched,
+            SOURCE_DETECTION,
+            Some("gdrive:me@x.com:artB"),
+            Some("https://b"),
+        )
+        .unwrap();
+        let f = get(&conn, vouched).unwrap().unwrap();
+        assert_eq!(f.source.as_deref(), Some(SOURCE_ASSERTION), "source held");
+        assert!(f.user_confirmed, "vouch held");
+        assert_eq!(
+            f.artifact_ptr.as_deref(),
+            Some("gdrive:me@x.com:artA"),
+            "asserted artifact not overwritten by detection"
+        );
+        assert_eq!(f.artifact_url.as_deref(), Some("https://a"));
+
+        // The reverse: a detection-closed row CAN be upgraded by a later user assertion.
+        let guessed = upsert_active(&conn, &draft("6", TYPE_OVERDUE)).unwrap();
+        resolve(&conn, guessed, SOURCE_DETECTION, None, None).unwrap();
+        resolve(
+            &conn,
+            guessed,
+            SOURCE_ASSERTION,
+            Some("gdrive:me@x.com:artC"),
+            None,
+        )
+        .unwrap();
+        let g = get(&conn, guessed).unwrap().unwrap();
+        assert_eq!(
+            g.source.as_deref(),
+            Some(SOURCE_ASSERTION),
+            "assertion overrides a prior detection"
+        );
+        assert!(g.user_confirmed);
+        assert_eq!(g.artifact_ptr.as_deref(), Some("gdrive:me@x.com:artC"));
     }
 
     #[test]
@@ -755,7 +852,7 @@ mod tests {
             .into_iter()
             .find(|f| f.anchor == "10")
             .unwrap();
-        resolve(&conn, m10.id, SOURCE_ASSERTION, None).unwrap();
+        resolve(&conn, m10.id, SOURCE_ASSERTION, None, None).unwrap();
 
         // Second pass: milestone 11 is now met (drops out) and the event is gone. Milestone 10 is
         // still unmet+overdue, so detection re-proposes it — but it's resolved, so it stays resolved.

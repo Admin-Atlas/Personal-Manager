@@ -5237,7 +5237,11 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
             eprintln!("flag detection skipped during briefing refresh: {e}");
         }
         let active = flags::list_active(&conn, None)?;
-        let snapshot = briefing::build_flag_snapshot(&active, &projects, &events, &now, zone);
+        // Resolved prepare-ahead flags let a still-active happening-today render "you're prepared —
+        // file's here" (card 9, decision 3) instead of the line simply disappearing on resolution.
+        let resolved_prep = flags::list_resolved(&conn, flags::TYPE_PREPARE_AHEAD)?;
+        let snapshot =
+            briefing::build_flag_snapshot(&active, &resolved_prep, &projects, &events, &now, zone);
         // The briefing is the whole-picture view, so global + context preferences shape its voice.
         let profile = preferences::preferences_preamble(&conn, preferences::PrefContext::global())?;
         (snapshot, profile, models)
@@ -5266,6 +5270,41 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
     );
     briefing::save_briefing(&conn, &text, &now)?;
     briefing::get_briefing(&conn)
+}
+
+/// Mark a flag done — a deliberate user assertion (card 9). Assertion outranks detection, so the flag
+/// leaves the active set the briefing/chat render (resolution is a *filter*, not a text edit) and a
+/// later re-detection can't reopen it. When the user names the satisfying artifact, its rename-stable
+/// `source_id` and current open URL are recorded, so a downstream `happening-today` on the same anchor
+/// can surface "you're prepared — file's here" (decision 3). Returns the resolved flag.
+#[tauri::command]
+pub fn resolve_flag(
+    state: State<'_, AppState>,
+    flag_id: i64,
+    artifact_source_id: Option<String>,
+) -> Result<flags::Flag> {
+    let conn = state.conn()?;
+    // The artifact's current open URL is display-only (it moves on rename, whereas source_id is the
+    // rename-survives identity). Looked up here, then handed to `resolve` purely as stored state.
+    let artifact_url: Option<String> = match artifact_source_id.as_deref() {
+        Some(sid) => conn
+            .query_row(
+                "SELECT external_ref FROM documents WHERE source_id = ?1",
+                params![sid],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten(),
+        None => None,
+    };
+    flags::resolve(
+        &conn,
+        flag_id,
+        flags::SOURCE_ASSERTION,
+        artifact_source_id.as_deref(),
+        artifact_url.as_deref(),
+    )?;
+    flags::get(&conn, flag_id)?.ok_or_else(|| Error::Other("Flag not found.".into()))
 }
 
 // --- cost logger (spec §11.2 / §17.1) ---

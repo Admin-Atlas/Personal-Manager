@@ -871,6 +871,33 @@ export interface DailyBriefing {
   stale: boolean;
 }
 
+/** A structured proactive flag (board card 9): a decision the briefing and chat render, anchored on a
+ *  stable milestone id (`anchor_kind: "milestone"`) or calendar iCal UID (`"calendar"`). Resolving a
+ *  flag filters it out of the rendered set rather than editing prose — the sentence is volatile, the
+ *  flag underneath is stable. Mirrors `Flag` in src-tauri/src/flags.rs (`r#type` serialises as `type`). */
+export interface Flag {
+  id: number;
+  anchor_kind: string;
+  anchor: string;
+  type: string;
+  /** How far ahead of the anchored time the flag fires; null = the type's default. */
+  threshold: string | null;
+  /** "active" | "resolved". */
+  state: string;
+  /** Which path closed it — "detection" | "assertion"; null while active. */
+  source: string | null;
+  confidence: number;
+  /** A deliberate user vouch — true iff closed by assertion. */
+  user_confirmed: boolean;
+  /** `documents.source_id` of the satisfying artifact (rename-survives identity), if any. */
+  artifact_ptr: string | null;
+  /** The artifact's open URL — display-only (moves on rename). */
+  artifact_url: string | null;
+  created_at: string;
+  updated_at: string;
+  resolved_at: string | null;
+}
+
 /** Machine-readable cause of a setup failure, so the UI can show a tailored
  *  troubleshooting guide. Mirrors `SidecarErrorKind` in src-tauri/src/sidecar.rs. */
 export type SidecarErrorKind =

@@ -10,8 +10,10 @@
 //! [`build_flag_snapshot`] renders the *active* (unresolved) flag set as the facts — so resolving
 //! a flag simply removes it from the set fed to the model, and regenerating the briefing is
 //! idempotent (the sentence is volatile, the flag underneath is stable; the model never invents).
-//! Alongside the flags it keeps a compact ambient project-status tail (blocked / quick wins / gone
-//! quiet / on-track), an axis the flag layer doesn't cover.
+//! A resolved flag doesn't just vanish, either: a resolved `prepare-ahead` *enriches* its still-active
+//! `happening-today` sibling ("you're prepared — file's here") rather than the line disappearing
+//! (decision 3). Alongside the flags it keeps a compact ambient project-status tail (blocked / quick
+//! wins / gone quiet / on-track), an axis the flag layer doesn't cover.
 //!
 //! Structurally this mirrors the Learning-You profile ([`crate::learning`]): a
 //! model-generated text blob stored in the key/value `settings` table (additive — no
@@ -108,8 +110,14 @@ fn is_stale(conn: &Connection, updated_at: Option<&str>) -> Result<bool> {
 /// flag simply isn't in `flags`, so it can't be named. Below the flags sits a compact ambient
 /// project-status tail (blocked / quick wins / gone quiet / on-track), an axis flags don't cover;
 /// the old ad-hoc "Due soon" line and raw agenda dump are gone — the flag layer owns those now.
+///
+/// **Resolution-as-enrichment (decision 3):** `resolved_prep` carries the resolved `prepare-ahead`
+/// flags. For each active `happening-today` on the *same anchor*, the event's line is enriched to
+/// "you're prepared" (plus the artifact link when the resolution named one) instead of the flag being
+/// silently dropped — a resolved flag consumes, rather than deletes, its sibling.
 pub fn build_flag_snapshot(
     flags: &[Flag],
+    resolved_prep: &[Flag],
     projects: &[ProjectOverview],
     events: &[CalendarEvent],
     now: &str,
@@ -144,6 +152,14 @@ pub fn build_flag_snapshot(
         }
     }
 
+    // Resolution-as-enrichment: a resolved prepare-ahead means the user is already set for that
+    // event, so its still-active happening-today line says "you're prepared" instead of nagging.
+    let resolved_prep_by_anchor: HashMap<(&str, &str), &Flag> = resolved_prep
+        .iter()
+        .filter(|f| f.r#type == flags::TYPE_PREPARE_AHEAD)
+        .map(|f| ((f.anchor_kind.as_str(), f.anchor.as_str()), f))
+        .collect();
+
     let mut overdue = Vec::new();
     let mut due_soon = Vec::new();
     let mut today_events = Vec::new();
@@ -161,7 +177,12 @@ pub fn build_flag_snapshot(
                 }
             }
             flags::TYPE_HAPPENING_TODAY => {
-                if let Some(line) = event_line(&event_by_uid, &f.anchor, zone, true) {
+                if let Some(mut line) = event_line(&event_by_uid, &f.anchor, zone, true) {
+                    if let Some(prep) =
+                        resolved_prep_by_anchor.get(&(f.anchor_kind.as_str(), f.anchor.as_str()))
+                    {
+                        line.push_str(&prepared_suffix(prep));
+                    }
                     today_events.push(line);
                 }
             }
@@ -260,6 +281,16 @@ fn event_line(
         Some(format!("{} — today at {when}{loc}", e.summary))
     } else {
         Some(format!("{} — {when}{loc}, prep ahead", e.summary))
+    }
+}
+
+/// The enrichment tail a resolved prepare-ahead adds to its sibling happening-today line: the user
+/// is already set, so name that (and the file they prepared, if the resolution pointed at one) rather
+/// than repeating "prepare for …". `artifact_url` is display-only state, framed as a fact for the model.
+fn prepared_suffix(prep: &Flag) -> String {
+    match prep.artifact_url.as_deref().filter(|s| !s.is_empty()) {
+        Some(url) => format!(" — you're prepared; file: {url}"),
+        None => " — you're prepared".into(),
     }
 }
 
@@ -452,8 +483,15 @@ mod tests {
             ),
         ];
 
-        let snap =
-            build_flag_snapshot(&active, &projects, &events, "2026-07-03T08:00", Tz::UTC).unwrap();
+        let snap = build_flag_snapshot(
+            &active,
+            &[],
+            &projects,
+            &events,
+            "2026-07-03T08:00",
+            Tz::UTC,
+        )
+        .unwrap();
         assert!(snap.contains("Today is 2026-07-03T08:00 (UTC)."));
         // Flag layer — the milestone/event each flag anchors on is named.
         assert!(snap.contains("Overdue"));
@@ -474,7 +512,37 @@ mod tests {
 
     #[test]
     fn flag_snapshot_is_none_when_no_flags_and_no_projects() {
-        assert!(build_flag_snapshot(&[], &[], &[], "2026-07-03T08:00", Tz::UTC).is_none());
+        assert!(build_flag_snapshot(&[], &[], &[], &[], "2026-07-03T08:00", Tz::UTC).is_none());
+    }
+
+    /// Decision 3: a resolved prepare-ahead on the same anchor enriches the active happening-today
+    /// line ("you're prepared", with the artifact link) rather than the event losing its flag.
+    #[test]
+    fn happening_today_is_enriched_by_a_resolved_prep_on_the_same_anchor() {
+        let events = vec![event("uid-mtg", "Board review", "2026-07-03T15:00:00Z")];
+        let active = vec![flag(
+            flags::ANCHOR_CALENDAR,
+            "uid-mtg",
+            flags::TYPE_HAPPENING_TODAY,
+        )];
+        // A resolved prepare-ahead on the SAME uid, carrying the file the user prepared.
+        let mut prep = flag(flags::ANCHOR_CALENDAR, "uid-mtg", flags::TYPE_PREPARE_AHEAD);
+        prep.state = flags::STATE_RESOLVED.into();
+        prep.artifact_url = Some("https://drive/deck".into());
+
+        let snap = build_flag_snapshot(&active, &[prep], &[], &events, "2026-07-03T08:00", Tz::UTC)
+            .unwrap();
+        assert!(snap.contains("Board review — today at"));
+        assert!(snap.contains("you're prepared"), "enriched, not dropped");
+        assert!(
+            snap.contains("https://drive/deck"),
+            "artifact link folded in"
+        );
+
+        // Without a resolved prep the same event line stays a plain happening-today line.
+        let plain =
+            build_flag_snapshot(&active, &[], &[], &events, "2026-07-03T08:00", Tz::UTC).unwrap();
+        assert!(!plain.contains("you're prepared"));
     }
 
     #[test]

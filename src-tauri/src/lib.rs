@@ -804,6 +804,7 @@ pub fn run() {
             commands::open_url,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
+            commands::resolve_flag,
             commands::cost_summary,
             commands::refresh_pricing,
             commands::model_recommendations,
