@@ -35,6 +35,11 @@ use crate::index_only::{self, ChangeEvent, ItemState, SourceState};
 use crate::{ingest, secrets, AppState};
 
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
+/// Google Sheets API v4 base — used ONLY for the metadata-only Google Sheets index (tab names + each
+/// tab's header row + grid dimensions), never to read the full grid.
+const SHEETS_API: &str = "https://sheets.googleapis.com/v4/spreadsheets";
+/// The Google-native Sheet MIME type (routed to the metadata-only path, not a full-grid CSV export).
+const SHEET_MIME: &str = "application/vnd.google-apps.spreadsheet";
 /// Cap on a single fetched/exported file body (25 MiB) so one huge file can't balloon memory; an
 /// over-cap file is skipped with a surfaced note rather than indexed.
 const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
@@ -123,6 +128,11 @@ pub struct DriveAccount {
     pub state: String,
     /// How many index-only documents this account currently has.
     pub indexed: i64,
+    /// Whether this account's token carries the `spreadsheets.readonly` scope. `false` for accounts
+    /// that last consented before Sheets support existed — the UI shows a "Reconnect for Sheets" prompt,
+    /// and their Google Sheets index by name only until they re-consent. Read from the keychain token,
+    /// no network.
+    pub has_sheets_scope: bool,
 }
 
 /// Insert (or refresh) the registry row for a connected account; resets its state to `ok`.
@@ -154,6 +164,12 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<DriveAccount>> {
     let mut out = Vec::with_capacity(rows.len());
     for (id, email, label, last_synced_at, state) in rows {
         let email = email.unwrap_or_default();
+        // Whether this account granted the Sheets scope (keychain read, no network). Drives the
+        // "Reconnect for Sheets" prompt; a keychain error reads as "not granted" rather than failing
+        // the whole account list.
+        let has_sheets_scope =
+            google::token_has_scope(&account_token_key(&email), google::SHEETS_SCOPE)
+                .unwrap_or(false);
         // This account's My Drive items, plus the shared-drive items of any drive it OWNS (shared
         // drives are account-independent and indexed once by their owner — a non-owner counts only
         // its own My Drive).
@@ -176,6 +192,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<DriveAccount>> {
             last_synced_at,
             state,
             indexed,
+            has_sheets_scope,
         });
     }
     Ok(out)
@@ -868,6 +885,10 @@ pub enum FetchPlan {
     DownloadText,
     /// A binary document (pdf/docx/…) — download to a temp file and convert via the sidecar.
     DownloadBinary,
+    /// A Google Sheet — index METADATA ONLY (tab names + header row + grid dimensions) via the Sheets
+    /// API; the full grid is never pulled. This is the "index-only Sheets" path: retrieval surfaces the
+    /// `webViewLink`, and a user who wants the cell content promotes it to a full local import.
+    SheetMetadata,
     /// Nothing useful to index (folders, forms, drawings, shortcuts) — skip.
     Skip,
 }
@@ -876,7 +897,8 @@ pub enum FetchPlan {
 pub fn fetch_plan(mime: &str) -> FetchPlan {
     match mime {
         "application/vnd.google-apps.document" => FetchPlan::Export { mime: "text/plain" },
-        "application/vnd.google-apps.spreadsheet" => FetchPlan::Export { mime: "text/csv" },
+        // A Sheet is indexed metadata-only (never the full grid) — see FetchPlan::SheetMetadata.
+        SHEET_MIME => FetchPlan::SheetMetadata,
         "application/vnd.google-apps.presentation" => FetchPlan::Export { mime: "text/plain" },
         // Every other google-apps type (folder, form, drawing, site, map, script, shortcut, …) has
         // no useful plain-text export.
@@ -1315,7 +1337,170 @@ pub async fn fetch_body(
             let (markdown, _title) = converted?;
             Ok(non_empty(&markdown))
         }
+        FetchPlan::SheetMetadata => fetch_sheet_metadata(token_key, file).await,
     }
+}
+
+/// One tab of a Google Sheet, from the Sheets API `sheets.properties` (grid dimensions are the
+/// allocated grid, not the populated-row count — labelled as such in the body).
+struct SheetTab {
+    title: String,
+    rows: i64,
+    cols: i64,
+}
+
+/// Build the metadata-only indexable body for a Google Sheet — tab names, each tab's header row and
+/// grid dimensions — via the Sheets API, NEVER the full grid (that is the whole point of index-only
+/// Sheets). Two tiny calls: one `spreadsheets.get` (properties only, `includeGridData=false`) and one
+/// `values:batchGet` for row 1 of every tab. Gated on the account holding `spreadsheets.readonly`: an
+/// account that hasn't re-consented for Sheets (or any Sheets-API read error) degrades to a
+/// Drive-metadata-only body so the Sheet stays index-only-findable and its `webViewLink` still works —
+/// no 403 is ever issued into the sync error path. `None` only when there is genuinely nothing to index.
+async fn fetch_sheet_metadata(token_key: &str, file: &DriveFile) -> Result<Option<String>> {
+    if !google::token_has_scope(token_key, google::SHEETS_SCOPE)? {
+        return Ok(sheet_reconnect_body(file));
+    }
+    // Build via query_pairs_mut so the `fields` mask's parens/commas are properly percent-encoded.
+    let mut meta_url = reqwest::Url::parse(&format!("{SHEETS_API}/{}", file.id))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    meta_url
+        .query_pairs_mut()
+        .append_pair("includeGridData", "false")
+        .append_pair(
+            "fields",
+            "properties.title,sheets(properties(title,gridProperties(rowCount,columnCount)))",
+        );
+    let meta = match google::authorized_get(token_key, meta_url.as_str()).await {
+        Ok(v) => v,
+        // A Sheets-API failure (revoked scope, deleted, transient) must not fail the whole sync item —
+        // fall back to the Drive-metadata body, which keeps the Sheet findable + linkable.
+        Err(_) => return Ok(sheet_reconnect_body(file)),
+    };
+    let tabs = parse_sheet_tabs(&meta);
+    let title = meta["properties"]["title"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&file.name);
+    // Header rows are best-effort: an empty sheet or a failed batchGet just omits column names.
+    let headers = fetch_sheet_headers(token_key, &file.id, &tabs)
+        .await
+        .unwrap_or_default();
+    Ok(Some(build_sheet_body(file, title, &tabs, &headers)))
+}
+
+/// Parse the per-tab properties from a `spreadsheets.get` response into [`SheetTab`]s.
+fn parse_sheet_tabs(meta: &Value) -> Vec<SheetTab> {
+    meta["sheets"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let p = &s["properties"];
+                    let title = p["title"].as_str()?.to_string();
+                    let gp = &p["gridProperties"];
+                    Some(SheetTab {
+                        title,
+                        rows: gp["rowCount"].as_i64().unwrap_or(0),
+                        cols: gp["columnCount"].as_i64().unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Row 1 (the header) of every tab, in one `values:batchGet`. Each range is `'Tab'!1:1` with the tab
+/// name single-quoted (A1 notation) and any internal quote doubled. Returns one header-cell vec per
+/// tab, in the tabs' order; a tab with no row 1 yields an empty vec.
+async fn fetch_sheet_headers(
+    token_key: &str,
+    spreadsheet_id: &str,
+    tabs: &[SheetTab],
+) -> Result<Vec<Vec<String>>> {
+    if tabs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut url = reqwest::Url::parse(&format!("{SHEETS_API}/{spreadsheet_id}/values:batchGet"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("majorDimension", "ROWS");
+        for tab in tabs {
+            q.append_pair("ranges", &header_range(&tab.title));
+        }
+    }
+    let v = google::authorized_get(token_key, url.as_str()).await?;
+    let ranges = v["valueRanges"].as_array().cloned().unwrap_or_default();
+    Ok(tabs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            ranges
+                .get(i)
+                .and_then(|r| r["values"].as_array())
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.as_array())
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(|c| c.as_str().unwrap_or("").trim().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect())
+}
+
+/// A1-notation range for a tab's header row, tab name single-quoted with internal quotes doubled.
+fn header_range(tab_title: &str) -> String {
+    format!("'{}'!1:1", tab_title.replace('\'', "''"))
+}
+
+/// Assemble the metadata-only Sheet body from the parsed tabs + header rows. Kept compact (ideally
+/// ≤ the 500-char offline summary) so it round-trips a Rebuild verbatim via `stored_summary`.
+fn build_sheet_body(
+    file: &DriveFile,
+    spreadsheet_title: &str,
+    tabs: &[SheetTab],
+    headers: &[Vec<String>],
+) -> String {
+    let mut s = format!("Google Sheet \"{spreadsheet_title}\"");
+    if let Some(m) = &file.modified_time {
+        s.push_str(&format!(" (last modified {})", &m[..m.len().min(10)]));
+    }
+    s.push_str(&format!(
+        " — {} tab{}.\n",
+        tabs.len(),
+        if tabs.len() == 1 { "" } else { "s" }
+    ));
+    for (i, tab) in tabs.iter().enumerate() {
+        s.push_str(&format!(
+            "Tab \"{}\" (grid {}x{}",
+            tab.title, tab.rows, tab.cols
+        ));
+        let cols: Vec<&String> = headers
+            .get(i)
+            .map(|h| h.iter().filter(|c| !c.is_empty()).collect())
+            .unwrap_or_default();
+        if cols.is_empty() {
+            s.push_str(").\n");
+        } else {
+            let names: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
+            s.push_str(&format!("); columns: {}.\n", names.join(", ")));
+        }
+    }
+    s.trim_end().to_string()
+}
+
+/// The fallback body for a Sheet on an account that hasn't granted `spreadsheets.readonly`: index it by
+/// name so it stays findable + its `webViewLink` opens, and tell the user how to enrich it. The tab
+/// names + headers fill in on the next sync after they reconnect.
+fn sheet_reconnect_body(file: &DriveFile) -> Option<String> {
+    Some(format!(
+        "Google Sheet \"{}\". Reconnect this Google account in Settings \u{2192} Connectors to index \
+         its tab names and column headers.",
+        file.name
+    ))
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -1602,9 +1787,10 @@ mod tests {
             fetch_plan("application/vnd.google-apps.document"),
             FetchPlan::Export { mime: "text/plain" }
         );
+        // A Sheet is metadata-only now (was Export text/csv) — never the full grid.
         assert_eq!(
             fetch_plan("application/vnd.google-apps.spreadsheet"),
-            FetchPlan::Export { mime: "text/csv" }
+            FetchPlan::SheetMetadata
         );
         assert_eq!(
             fetch_plan("application/vnd.google-apps.folder"),
@@ -1622,6 +1808,80 @@ mod tests {
             fetch_plan("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
             FetchPlan::DownloadBinary
         );
+    }
+
+    fn sheet_file() -> DriveFile {
+        DriveFile {
+            id: "sid".into(),
+            name: "Q2 Budget".into(),
+            mime_type: SHEET_MIME.into(),
+            modified_time: Some("2026-07-01T09:30:00.000Z".into()),
+            md5: None,
+            trashed: false,
+            web_view_link: Some("https://docs.google.com/spreadsheets/d/sid".into()),
+            parent_id: None,
+        }
+    }
+
+    #[test]
+    fn parse_sheet_tabs_reads_properties() {
+        let meta = serde_json::json!({
+            "properties": {"title": "Q2 Budget"},
+            "sheets": [
+                {"properties": {"title": "Summary", "gridProperties": {"rowCount": 128, "columnCount": 4}}},
+                {"properties": {"title": "Detail",  "gridProperties": {"rowCount": 1450, "columnCount": 6}}}
+            ]
+        });
+        let tabs = parse_sheet_tabs(&meta);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].title, "Summary");
+        assert_eq!((tabs[0].rows, tabs[0].cols), (128, 4));
+        assert_eq!(tabs[1].title, "Detail");
+    }
+
+    #[test]
+    fn header_range_quotes_and_escapes_tab_names() {
+        assert_eq!(header_range("Summary"), "'Summary'!1:1");
+        // A tab name with a single quote gets it doubled (A1 escaping) so the range stays valid.
+        assert_eq!(header_range("Bob's tab"), "'Bob''s tab'!1:1");
+    }
+
+    #[test]
+    fn build_sheet_body_is_metadata_only_and_dated() {
+        let file = sheet_file();
+        let tabs = vec![
+            SheetTab {
+                title: "Summary".into(),
+                rows: 128,
+                cols: 3,
+            },
+            SheetTab {
+                title: "Detail".into(),
+                rows: 1450,
+                cols: 2,
+            },
+        ];
+        let headers = vec![
+            vec!["Project".to_string(), "Amount".to_string(), "".to_string()], // trailing empty dropped
+            vec![], // no header row on this tab
+        ];
+        let body = build_sheet_body(&file, "Q2 Budget", &tabs, &headers);
+        assert!(body.starts_with("Google Sheet \"Q2 Budget\" (last modified 2026-07-01) — 2 tabs."));
+        assert!(body.contains("Tab \"Summary\" (grid 128x3); columns: Project, Amount."));
+        // A tab with no header row shows just its grid dimensions, no "columns:".
+        assert!(
+            body.contains("Tab \"Detail\" (grid 1450x2).\n")
+                || body.contains("Tab \"Detail\" (grid 1450x2).")
+        );
+        // Never any cell values beyond the header — this is metadata-only.
+        assert!(!body.contains("1200"));
+    }
+
+    #[test]
+    fn sheet_reconnect_body_names_the_sheet() {
+        let body = sheet_reconnect_body(&sheet_file()).unwrap();
+        assert!(body.contains("Google Sheet \"Q2 Budget\""));
+        assert!(body.contains("Reconnect"));
     }
 
     #[test]

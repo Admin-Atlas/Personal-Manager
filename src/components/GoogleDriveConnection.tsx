@@ -210,8 +210,12 @@ export function GoogleDriveConnection({ refreshSignal = 0 }: { refreshSignal?: n
                     // one mid-index; only the syncing row and in-flight connect/disconnect block it.
                     syncDisabled={syncAccount === a.email || busy != null}
                     disconnectDisabled={anyBusy}
+                    reconnectDisabled={anyBusy}
                     onSync={() => sync(a.email)}
                     onDisconnect={() => setConfirmEmail(a.email)}
+                    // Reconnect re-runs the same consent flow, which now requests the Sheets scope and
+                    // unions it onto the existing Drive grant (prompt=select_account → pick this email).
+                    onReconnect={connect}
                   />
                   {a.state === "ok" && (
                     <Collapsible
@@ -372,55 +376,74 @@ function AccountRow({
   queued,
   syncDisabled,
   disconnectDisabled,
+  reconnectDisabled,
   onSync,
   onDisconnect,
+  onReconnect,
 }: {
   account: DriveAccount;
   syncingThis: boolean;
   queued: boolean;
   syncDisabled: boolean;
   disconnectDisabled: boolean;
+  reconnectDisabled: boolean;
   onSync: () => void;
   onDisconnect: () => void;
+  onReconnect: () => void;
 }) {
   const unreachable = account.state !== "ok";
   return (
-    <div className="flex items-center justify-between gap-2">
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="truncate text-sm text-ink">{account.email}</span>
-          {unreachable ? (
-            <span className="shrink-0 text-[10px] uppercase tracking-wide text-st-due">
-              unreachable
-            </span>
-          ) : (
-            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--st-quick)]" />
-          )}
+    <div>
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-sm text-ink">{account.email}</span>
+            {unreachable ? (
+              <span className="shrink-0 text-[10px] uppercase tracking-wide text-st-due">
+                unreachable
+              </span>
+            ) : (
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--st-quick)]" />
+            )}
+          </div>
+          <p className="mt-0.5 truncate text-xs text-ink4">
+            {account.indexed} indexed
+            {account.last_synced_at
+              ? ` · synced ${formatWhen(account.last_synced_at)}`
+              : " · not synced yet"}
+          </p>
         </div>
-        <p className="mt-0.5 truncate text-xs text-ink4">
-          {account.indexed} indexed
-          {account.last_synced_at
-            ? ` · synced ${formatWhen(account.last_synced_at)}`
-            : " · not synced yet"}
-        </p>
+        <div className="flex shrink-0 items-center gap-1">
+          <Button
+            onClick={onSync}
+            disabled={syncDisabled}
+            className="px-2 py-1 text-xs disabled:opacity-40"
+          >
+            {syncingThis ? "Syncing…" : queued ? "Queued" : "Sync now"}
+          </Button>
+          <Button
+            variant="tertiary"
+            onClick={onDisconnect}
+            disabled={disconnectDisabled}
+            className="px-2 py-1 text-xs hover:text-st-due"
+          >
+            Disconnect
+          </Button>
+        </div>
       </div>
-      <div className="flex shrink-0 items-center gap-1">
-        <Button
-          onClick={onSync}
-          disabled={syncDisabled}
-          className="px-2 py-1 text-xs disabled:opacity-40"
-        >
-          {syncingThis ? "Syncing…" : queued ? "Queued" : "Sync now"}
-        </Button>
-        <Button
-          variant="tertiary"
-          onClick={onDisconnect}
-          disabled={disconnectDisabled}
-          className="px-2 py-1 text-xs hover:text-st-due"
-        >
-          Disconnect
-        </Button>
-      </div>
+      {account.state === "ok" && !account.has_sheets_scope && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="text-xs text-ink4">Google Sheets are indexed by name only.</span>
+          <Button
+            variant="tertiary"
+            onClick={onReconnect}
+            disabled={reconnectDisabled}
+            className="px-1.5 py-0.5 text-xs"
+          >
+            Reconnect for Sheets
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

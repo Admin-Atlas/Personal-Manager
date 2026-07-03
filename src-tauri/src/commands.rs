@@ -3116,17 +3116,17 @@ pub async fn connect_drive(
     client_secret: Option<String>,
 ) -> Result<drive::DriveAccount> {
     let own = own_client(client_id, client_secret)?;
+    // Request read-only Drive AND read-only Sheets together (space-joined per OAuth), so the account
+    // grants both in one consent. Sheets powers the metadata-only Google Sheets index; an account that
+    // last consented before Sheets existed keeps working for Drive and re-grants Sheets on reconnect
+    // (`include_granted_scopes=true` unions it). Reconnecting an existing account runs this same flow.
+    let scopes = format!("{} {}", google::DRIVE_SCOPE, google::SHEETS_SCOPE);
     let token = match &own {
         Some((id, secret)) => {
-            google::run_consent_with_client(
-                google::DRIVE_SCOPE,
-                "Google Drive",
-                id.clone(),
-                secret.clone(),
-            )
-            .await?
+            google::run_consent_with_client(&scopes, "Google Drive", id.clone(), secret.clone())
+                .await?
         }
-        None => google::run_consent(google::DRIVE_SCOPE, "Google Drive").await?,
+        None => google::run_consent(&scopes, "Google Drive").await?,
     };
     let (email, name) = drive::about_user(&token).await?;
     if let Some((id, secret)) = &own {
