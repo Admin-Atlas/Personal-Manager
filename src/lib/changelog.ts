@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.87.0-alpha",
+    date: "2026-07-04",
+    highlights: [
+      "Pinboard notes now do lists — and formatting. Start a line with . or - for a bullet, 1. for a numbered list, i. for roman numerals, > for an arrow/quote, or [] for a checkbox, and pressing Enter carries the list on (the next bullet, the next number, a fresh checkbox); Enter on an empty item ends the list. Each note has an Edit/Preview toggle: preview renders it properly — headings, bullets, numbered and roman lists, checkboxes and quotes — and double-clicking the preview drops you back into editing. A note is still just plain text underneath, so nothing is locked into a special format.",
+      "The Timeline card on the Pinboard is now available on every density, not just Standard and Power — so a minimal setup can sketch dated plans too.",
+    ],
+  },
+  {
     version: "2.86.0-alpha",
     date: "2026-07-04",
     highlights: [

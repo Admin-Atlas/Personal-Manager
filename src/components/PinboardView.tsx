@@ -1,9 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { formatDate } from "../lib/format";
+import { Markdown } from "../lib/markdown";
 import { CELL, COLS, MIN_H, MIN_W, ROWS, pxRectToCells } from "../lib/pinboard/grid";
+import { continueList, toRenderMarkdown } from "../lib/pinboard/notesMarkdown";
 import { usePinboard } from "../lib/pinboard/usePinboard";
 import type { Rect, Widget } from "../lib/pinboard/types";
 import { useDepth } from "../theme";
@@ -35,8 +43,9 @@ function rectToPx(r: Rect): PxRect {
  * The Pinboard (spec §4): a bounded planning board of draggable, resizable widgets —
  * post-it notes and simple dated timelines — persisted locally. Hand-rolled on pointer
  * events + CSS transforms with grid-snap (no layout library); the snap/clamp maths live in
- * `lib/pinboard/grid.ts`. Depth-aware: notes at every depth, timelines from `standard` up,
- * per-widget metadata at `power`.
+ * `lib/pinboard/grid.ts`. Notes and timelines are available at every depth; per-widget
+ * metadata shows at `power`. Notes are Markdown, with an edit/preview toggle and smart
+ * list continuation (`lib/pinboard/notesMarkdown.ts`).
  */
 export function PinboardView() {
   const { showMeta, showPower } = useDepth();
@@ -140,17 +149,15 @@ export function PinboardView() {
           >
             + Note
           </Button>
-          {/* Timelines are a richer surface — offered from standard depth up. */}
-          {showMeta && (
-            <Button
-              variant="secondary"
-              onClick={addTimeline}
-              className="px-2.5 py-1 text-xs"
-              data-help="pinboard-add-timeline"
-            >
-              + Timeline
-            </Button>
-          )}
+          {/* Notes and timelines are both available at every density. */}
+          <Button
+            variant="secondary"
+            onClick={addTimeline}
+            className="px-2.5 py-1 text-xs"
+            data-help="pinboard-add-timeline"
+          >
+            + Timeline
+          </Button>
         </div>
       </header>
 
@@ -260,14 +267,63 @@ function NoteBody({
   widget: Widget;
   onChange: (id: string, patch: Partial<Widget>) => void;
 }) {
+  const text = widget.text ?? "";
+  // Filled notes open rendered (preview) so lists read as lists; a fresh/empty note opens ready
+  // to type. The mode is view state only — the note itself is always plain Markdown in `text`.
+  const [mode, setMode] = useState<"edit" | "preview">(text.trim() ? "preview" : "edit");
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // Enter continues the current list (next bullet / number / roman / checkbox) or exits it on an
+  // empty item; Shift+Enter is always a plain newline. Caret is restored after React re-renders
+  // the controlled value.
+  function onKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key !== "Enter" || e.shiftKey) return;
+    const ta = e.currentTarget;
+    if (ta.selectionStart !== ta.selectionEnd) return;
+    const res = continueList(ta.value, ta.selectionStart);
+    if (!res) return;
+    e.preventDefault();
+    onChange(widget.id, { text: res.text });
+    requestAnimationFrame(() => {
+      if (taRef.current) taRef.current.selectionStart = taRef.current.selectionEnd = res.caret;
+    });
+  }
+
   return (
     <div className="flex h-full flex-col">
-      <Textarea
-        value={widget.text ?? ""}
-        onChange={(e) => onChange(widget.id, { text: e.target.value })}
-        placeholder="Jot something down…"
-        className="min-h-0 flex-1 resize-none border-0 bg-transparent text-sm leading-snug focus:ring-0"
-      />
+      <div className="flex shrink-0 items-center justify-end px-2 pt-1">
+        <button
+          type="button"
+          onClick={() => setMode((m) => (m === "edit" ? "preview" : "edit"))}
+          className="rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-ink4 hover:text-ink2"
+          title={mode === "edit" ? "Preview the note" : "Edit the note"}
+          data-help="pinboard-note-mode"
+        >
+          {mode === "edit" ? "Preview" : "Edit"}
+        </button>
+      </div>
+      {mode === "edit" ? (
+        <Textarea
+          ref={taRef}
+          value={text}
+          onChange={(e) => onChange(widget.id, { text: e.target.value })}
+          onKeyDown={onKeyDown}
+          placeholder="Jot something down…  (. or - bullets, 1. numbered, i. roman, > arrows, [] checkboxes)"
+          className="min-h-0 flex-1 resize-none border-0 bg-transparent text-sm leading-snug focus:ring-0"
+        />
+      ) : (
+        <div
+          className="min-h-0 flex-1 overflow-auto px-2 text-sm"
+          onDoubleClick={() => setMode("edit")}
+          title="Double-click to edit"
+        >
+          {text.trim() ? (
+            <Markdown>{toRenderMarkdown(text)}</Markdown>
+          ) : (
+            <p className="text-ink4">Empty note — switch to Edit to write.</p>
+          )}
+        </div>
+      )}
       <div className="flex shrink-0 items-center gap-1 px-2 pb-1" data-help="pinboard-note-tint">
         {NOTE_COLORS.map((c) => (
           <button

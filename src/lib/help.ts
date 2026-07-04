@@ -472,7 +472,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "pinboard-note": {
     title: "A note",
-    body: "A sticky note — type anything into it and it saves as you go. Drag its header to move it, resize from the bottom-right corner, and use the ✕ to remove it. The dots along the bottom tint it a colour so related notes read together.",
+    body: "A sticky note — type anything into it and it saves as you go. Notes are Markdown: start a line with . or - for a bullet, 1. for a numbered list, i. for roman numerals, > for an arrow/quote, or [] for a checkbox, and pressing Enter continues the list for you. Drag the header to move it, resize from the bottom-right corner, and use the ✕ to remove it. The dots along the bottom tint it a colour so related notes read together.",
+  },
+  "pinboard-note-mode": {
+    title: "Edit or preview",
+    body: "Switch between writing the note (plain text, with smart list continuation) and previewing it rendered — headings, bullets, numbered and roman lists, checkboxes and quotes all formatted. Double-click the preview to jump back to editing. It's the same note either way; this only changes how it's shown.",
   },
   "pinboard-note-tint": {
     title: "Tint this note",
