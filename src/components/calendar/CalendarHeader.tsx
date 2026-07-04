@@ -93,7 +93,10 @@ export function CalendarHeader({
   }));
 
   return (
-    <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-rule px-4 py-2">
+    <header
+      className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-rule px-4 py-2"
+      data-help="calendar-header"
+    >
       <div className="flex items-center gap-1">
         <Button variant="tertiary" onClick={onPrev} title="Previous" aria-label="Previous">
           ‹
@@ -115,13 +118,15 @@ export function CalendarHeader({
         {viewOptions.length > 1 && (
           <SegmentedControl options={viewOptions} value={view} onChange={onViewChange} />
         )}
-        <CalendarsDropdown
-          accounts={accounts}
-          calendars={calendars}
-          hidden={hidden}
-          onToggle={onToggleCalendar}
-          colorOf={colorOf}
-        />
+        <div className="flex items-center" data-help="calendar-filter">
+          <CalendarsDropdown
+            accounts={accounts}
+            calendars={calendars}
+            hidden={hidden}
+            onToggle={onToggleCalendar}
+            colorOf={colorOf}
+          />
+        </div>
         <Button variant="secondary" onClick={onRefresh} disabled={syncing} title="Refresh now">
           {syncing ? "Refreshing…" : "Refresh"}
         </Button>

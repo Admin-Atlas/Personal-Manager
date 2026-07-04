@@ -24,6 +24,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Chat",
     body: "Ask questions in plain language. PM answers using your own documents and shows which files it drew from, so you can trust and trace every answer.",
   },
+  "nav-calendar": {
+    title: "Calendar",
+    body: "One place to see everything from the calendars you've connected — Google, Outlook and iCal subscriptions — laid over each other, read-only. Switch between Agenda, Month, Week and Year, jump to today, and choose which calendars show. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
+  },
   "nav-documents": {
     title: "Documents",
     body: "Your ingested files. Drag files or a folder in and PM converts them to Markdown, splits them into chunks, and indexes them so they become searchable.",
@@ -162,6 +166,28 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Explain retrieval",
     body: "Opens from the button on the message row. Shows exactly which chunks of your documents a query pulls in and how each one scored, and lets you tune the one lever that matters — the retrieval depth (the size of the candidate pool the reranker weighs, not how many results are shown). Dragging the depth slider previews live; a separate button commits it. Describe what it's missing and PM suggests what to change — it never changes anything on its own.",
   },
+  "chat-idle-prompt": {
+    title: "Idle conversation",
+    body: "This chat has been quiet for a while. Starting a new one keeps each topic separate and gives the assistant a clean slate, rather than carrying a stale thread forward. Dismiss to keep writing in this one — nothing is deleted either way.",
+  },
+  "chat-resumed": {
+    title: "Where you left off",
+    body: "Marks where an earlier conversation picks back up, with when it was last active — so a long-running chat you return to reads in order instead of looking brand-new.",
+  },
+
+  // Calendar (unified read-only view, card 8)
+  "calendar-view": {
+    title: "Your calendar",
+    body: "A single read-only view of every calendar you've connected, merged together and colour-coded by source. PM never writes to your calendars here — it mirrors them so you can see your whole schedule in one place, and it uses the same events for your agenda, chat answers and 'Due soon' flags. Connect or choose calendars in Settings → Connectors.",
+  },
+  "calendar-header": {
+    title: "Move around & choose a view",
+    body: "‹ Today › steps through time and jumps back to now; the buttons beside it switch between Agenda, Month, Week and Year, and the label shows the range you're looking at. Everything here only changes what you see — it never changes your actual calendars.",
+  },
+  "calendar-filter": {
+    title: "Which calendars show",
+    body: "Tick the connected calendars you want laid over each other; untick one to hide it here without disconnecting it. Each keeps its own colour so you can tell sources apart. This only changes what's shown — it doesn't stop PM syncing that calendar.",
+  },
 
   // Settings
   "settings-api-key": {
@@ -232,6 +258,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Google sign-in (one-time setup)",
     body: "One Google Cloud 'Desktop app' OAuth client — your own, pasted once and shared by every Google service (Calendar, Drive). PM ships no Google secret, so you supply your own; it stays in your keychain. Setting it up connects nothing on its own. If your account uses Advanced Protection, Google blocks this — use a calendar subscription (iCal) instead.",
   },
+  "connectors-microsoft-client": {
+    title: "Microsoft sign-in (one-time setup)",
+    body: "One Microsoft (Azure) app registration — your own client id, pasted once and shared by every Microsoft service (OneDrive). PM ships no Microsoft secret and stores none: it's a public client, so you supply only the id and it lives in your keychain. Setting it up connects nothing on its own — you then add each account separately.",
+  },
   "connectors-ics": {
     title: "Calendar subscription (iCal)",
     body: "Paste a calendar's private 'secret address in iCal format' — no sign-in, no Google Cloud project, and it works even with Advanced Protection. Read-only: it powers your agenda, schedule questions in chat, and the 'Due soon' status when an event names a project. The feed URL is a secret link and lives only in your keychain.",
@@ -256,9 +286,41 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Sync results",
     body: "A summary of the last sync: how many files were indexed, updated, or removed, plus any that couldn't be indexed and why (an unsupported file type, or a fetch error). Files that couldn't be read are simply skipped — nothing is lost, and they don't block the rest. Indexed files become searchable and show up in Documents. If you stopped the sync early, everything indexed so far is kept; sync again to finish the rest.",
   },
+  "settings-onedrive": {
+    title: "OneDrive",
+    body: "Index your OneDrive (read-only) so PM can find and answer from those files. It's index-only: PM stores a searchable pointer and a short summary, never the file itself — the full file stays in OneDrive and is fetched when you open it. Connect more than one account; each syncs on its own. Tokens live only in your keychain.",
+  },
+  "settings-onedrive-firstsync": {
+    title: "First sync",
+    body: "The first sync walks your whole OneDrive and indexes every file it can read, so on a large drive it takes a while and uses some bandwidth. After that it only fetches what changed. Files deleted in OneDrive are kept findable but marked 'source missing' — never silently dropped.",
+  },
+  "settings-onedrive-scope": {
+    title: "What OneDrive indexes",
+    body: "Choose which folders an account indexes. By default the whole drive is in scope; narrow it to specific folders (everything inside a chosen folder is indexed). Saving re-syncs — newly in-scope files get indexed, and files that fall out of scope are kept findable but marked 'source missing'. Still index-only: the files stay in OneDrive.",
+  },
+  "settings-onedrive-report": {
+    title: "Sync results",
+    body: "A summary of the last OneDrive sync — indexed, updated and removed counts, plus anything that couldn't be indexed and why. Unreadable files are skipped, not lost, and don't hold up the rest. Stop early and everything indexed so far is kept; sync again to finish.",
+  },
+  "settings-local-folders": {
+    title: "Folders on this device",
+    body: "Point PM at folders on your own computer and it indexes the documents inside them, so their contents turn up in search alongside your cloud sources. Nothing is copied — PM only reads each file to index it, and watches the folder to stay current as files change. Each folder shows what it's indexed and when; removing a folder just stops the watching, and what's already indexed stays findable.",
+  },
+  "settings-local-report": {
+    title: "Folder sync results",
+    body: "A summary of the last folder scan — how many files were indexed, updated, or dropped, and any that couldn't be read (an unsupported type, or a permission error). Skipped files don't block the rest; sync again to retry. Files removed on disk are kept findable but marked 'source missing'.",
+  },
   "settings-data": {
     title: "Data",
     body: "Everything you keep in PM lives in one folder named 'Personal Manager' — the Markdown vault of your documents plus the encrypted store (settings, pinboard, and the search index). Your documents in the vault are stored unencrypted so any tool can read them; their at-rest protection relies on your OS full-disk encryption (BitLocker on Windows, FileVault on macOS), so turn that on. 'Open data folder' reveals it in your file manager so you can copy or back it up by hand. 'Export all data' bundles the vault and the store into a single .zip you choose where to save; the regenerable runtime (the local model environment) is left out, and the store stays encrypted inside the archive.",
+  },
+  "settings-vault": {
+    title: "Vault mode",
+    body: "Whether this vault is private to this device or shareable — protected by a passphrase so you can safely copy it to another machine and open it there. Making it shareable can also encrypt your Markdown at rest. A private vault is tied to this device's keychain; a shareable one travels with its passphrase, and there's no way in without it, so keep it safe.",
+  },
+  "settings-backup": {
+    title: "Encrypted backup",
+    body: "Beyond a one-off backup, PM can run them on a schedule and keep the last few for you. Scheduled backups only fire when it's safe and unobtrusive — PM unlocked, the machine idle and online, and a passphrase set. Point it at more than one place (say a folder plus Google Drive) and each backup is packed once and copied to all of them. Older backups beyond the number you keep are pruned automatically.",
   },
   "settings-license": {
     title: "License",
@@ -342,6 +404,14 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Suggest attributes",
     body: "Asks the AI to propose a size, a parent project, a blocker, and (if your documents mention one) a deadline for each project. Nothing is applied until you confirm it in a project's Triage panel — AI proposes, you decide.",
   },
+  "focus-box": {
+    title: "Say what you mean",
+    body: "One box that reads your plain words and does the right thing: tell it something's handled ('the deck is done') and it ticks that item off; say how you want to be nudged ('stop reminding me so early') and it saves that as a lasting preference; or ask a question and it opens a chat to answer. No menus, no picking the right item first. Anything that would cross something off asks you to confirm, so nothing changes by accident.",
+  },
+  "focus-box-input": {
+    title: "Type here",
+    body: "Write in plain language and press Enter. PM works out whether you're marking something done, setting a preference, or asking — you don't choose a mode. A suggestion you haven't confirmed waits for you, and survives switching tabs and back.",
+  },
   "focus-agenda": {
     title: "Upcoming",
     body: "Your next events from the calendars you connected, read-only. PM also uses these to answer schedule questions in chat and to flag a project 'Due soon' when an event's title names it. Connect or sync in Settings → Google Calendar.",
@@ -366,6 +436,18 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Resize the panel",
     body: "Drag this edge to make the side panel wider or narrower. The width is a share of the window, so it stays in proportion as you resize the app, and it's remembered on this device.",
   },
+  "project-sidebar": {
+    title: "Project panel",
+    body: "Everything about the open project, on the right: its milestones on top and its filed documents below, over a chat that draws on just this project. Drag the left edge to widen it, and the divider between milestones and files to change their split.",
+  },
+  "project-milestones-panel": {
+    title: "This project's milestones",
+    body: "The project's deadlines, editable in place — add one, date it, tick it off, reorder, or link it to a calendar event. The nearest one you haven't ticked drives the project's 'Due soon' status. Drag the divider below to give this panel more or less room against the files list.",
+  },
+  "project-split": {
+    title: "Resize milestones vs files",
+    body: "Drag to change how the panel is split between the milestones (top) and the files (bottom). The ratio is remembered on this device, so the panel opens the way you left it.",
+  },
   "project-chat": {
     title: "Project chat",
     body: "A chat that only draws on this project's documents, so the rest of your knowledge falls away while you focus. Ask anything about just this project.",
@@ -373,6 +455,32 @@ export const HELP: Record<string, HelpEntry> = {
   "project-files": {
     title: "Project files",
     body: "Every document filed under this project. This is the grounding the scoped chat answers from.",
+  },
+
+  // Pinboard (spec §4) — a free-form planning board
+  "pinboard-board": {
+    title: "Your planning board",
+    body: "A free space to think. Add notes and timelines, then drag them anywhere and resize from the bottom-right corner — they snap to a grid and stay where you put them between visits. The board is saved on this device, encrypted with the rest of your data, and is separate from your indexed documents.",
+  },
+  "pinboard-add-note": {
+    title: "Add a note",
+    body: "Drops a sticky note on the board to jot anything down. Notes are free text; tint one with a colour to group or flag it. Available at every density.",
+  },
+  "pinboard-add-timeline": {
+    title: "Add a timeline",
+    body: "Drops a timeline card for laying out dated milestones in order — handy for sketching a plan at a glance.",
+  },
+  "pinboard-note": {
+    title: "A note",
+    body: "A sticky note — type anything into it and it saves as you go. Drag its header to move it, resize from the bottom-right corner, and use the ✕ to remove it. The dots along the bottom tint it a colour so related notes read together.",
+  },
+  "pinboard-note-tint": {
+    title: "Tint this note",
+    body: "Colour the note to group or flag it — the colours are the same status hues PM uses elsewhere (due, quick win, and so on), so a tint can carry a light meaning. It's purely visual and changes nothing else.",
+  },
+  "pinboard-timeline": {
+    title: "A timeline",
+    body: "A card for dated milestones. Give it a title and add rows with a date and a short label; they sort themselves earliest to latest. Drag the header to move it and resize from the corner.",
   },
 };
 

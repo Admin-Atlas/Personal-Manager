@@ -132,12 +132,22 @@ export function PinboardView() {
               {board.widgets.length} item{board.widgets.length === 1 ? "" : "s"}
             </span>
           )}
-          <Button variant="secondary" onClick={addNote} className="px-2.5 py-1 text-xs">
+          <Button
+            variant="secondary"
+            onClick={addNote}
+            className="px-2.5 py-1 text-xs"
+            data-help="pinboard-add-note"
+          >
             + Note
           </Button>
           {/* Timelines are a richer surface — offered from standard depth up. */}
           {showMeta && (
-            <Button variant="secondary" onClick={addTimeline} className="px-2.5 py-1 text-xs">
+            <Button
+              variant="secondary"
+              onClick={addTimeline}
+              className="px-2.5 py-1 text-xs"
+              data-help="pinboard-add-timeline"
+            >
               + Timeline
             </Button>
           )}
@@ -146,6 +156,7 @@ export function PinboardView() {
 
       <div className="flex-1 overflow-auto p-6">
         <div
+          data-help="pinboard-board"
           className={`relative mx-auto rounded-[var(--radius)] border border-border ${
             drag ? "select-none" : ""
           }`}
@@ -177,6 +188,7 @@ export function PinboardView() {
             return (
               <div
                 key={w.id}
+                data-help={w.kind === "note" ? "pinboard-note" : "pinboard-timeline"}
                 className="absolute flex flex-col overflow-hidden rounded-[var(--radius-sm)] border shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none"
                 style={{ left: px.x, top: px.y, width: px.w, height: px.h, ...tint }}
               >
@@ -256,7 +268,7 @@ function NoteBody({
         placeholder="Jot something down…"
         className="min-h-0 flex-1 resize-none border-0 bg-transparent text-sm leading-snug focus:ring-0"
       />
-      <div className="flex shrink-0 items-center gap-1 px-2 pb-1">
+      <div className="flex shrink-0 items-center gap-1 px-2 pb-1" data-help="pinboard-note-tint">
         {NOTE_COLORS.map((c) => (
           <button
             key={c}
