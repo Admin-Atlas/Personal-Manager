@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.89.0-alpha",
+    date: "2026-07-04",
+    highlights: [
+      "A Pinboard note can now become a real document. Hit Ingest on a note and PM takes it in the same way it takes any file — it's chunked, indexed and dropped into your Review queue to file to a project and set its importance, after which it turns up in Documents, Focus, chat and search like everything else. The note shows “In review” until you file it, then “Filed · project”. Edit the note later and one “Re-ingest” updates the same document while keeping where you filed it. The ingested document is its own copy from that point on — so if you tidy the note away, what you ingested stays put.",
+    ],
+  },
+  {
     version: "2.88.0-alpha",
     date: "2026-07-04",
     highlights: [

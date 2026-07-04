@@ -13,6 +13,8 @@ import { formatDate } from "../lib/format";
 import {
   addMilestone,
   deleteMilestone,
+  ingestNote,
+  listDocuments,
   listMilestones,
   listProjects,
   setMilestoneState,
@@ -29,6 +31,17 @@ import { Button, Input, Textarea } from "./ui";
 
 /** Note tint options — design tokens, never hex, so they track the active theme. */
 const NOTE_COLORS = ["st-quick", "st-due", "st-look", "st-track", "st-part"];
+
+/** The live filing state of a note's ingested document, keyed by `note:<widgetId>`. */
+type DocStatus = { reviewed: boolean; project: string };
+
+/** A cheap, stable string hash (djb2) — just to tell whether a note's text has changed since it
+ *  was last ingested. Not cryptographic and not the backend content hash. */
+function cheapHash(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = (((h << 5) + h) ^ s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
 
 interface PxRect {
   x: number;
@@ -74,6 +87,29 @@ export function PinboardView() {
 
   const [drag, setDrag] = useState<DragStart | null>(null);
   const [livePx, setLivePx] = useState<PxRect | null>(null);
+
+  // Live filing state of any ingested notes, so a note can show "in review" / "filed to X" and
+  // reflect a later review made in the Review tab. One list_documents read on mount + on focus.
+  const [docStatus, setDocStatus] = useState<Map<string, DocStatus>>(new Map());
+  const refreshDocs = useCallback(() => {
+    listDocuments()
+      .then((docs) => {
+        const map = new Map<string, DocStatus>();
+        for (const d of docs) {
+          if (d.source_id) map.set(d.source_id, { reviewed: d.reviewed, project: d.project });
+        }
+        setDocStatus(map);
+      })
+      .catch(() => {
+        /* leave the last known statuses */
+      });
+  }, []);
+  useEffect(() => refreshDocs(), [refreshDocs]);
+  useEffect(() => {
+    const onFocus = () => refreshDocs();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshDocs]);
 
   // While a drag is active, track the pointer on the window so it keeps following even when
   // the cursor leaves the widget; commit the snapped cell rect on release. Effect re-runs only
@@ -231,7 +267,12 @@ export function PinboardView() {
                 {/* Body */}
                 <div className="min-h-0 flex-1 overflow-auto">
                   {w.kind === "note" ? (
-                    <NoteBody widget={w} onChange={updateWidget} />
+                    <NoteBody
+                      widget={w}
+                      onChange={updateWidget}
+                      status={docStatus.get(`note:${w.id}`)}
+                      onIngested={refreshDocs}
+                    />
                   ) : (
                     <TimelineBody
                       widget={w}
@@ -273,15 +314,40 @@ export function PinboardView() {
 function NoteBody({
   widget,
   onChange,
+  status,
+  onIngested,
 }: {
   widget: Widget;
   onChange: (id: string, patch: Partial<Widget>) => void;
+  status?: DocStatus;
+  onIngested: () => void;
 }) {
   const text = widget.text ?? "";
   // Filled notes open rendered (preview) so lists read as lists; a fresh/empty note opens ready
   // to type. The mode is view state only — the note itself is always plain Markdown in `text`.
   const [mode, setMode] = useState<"edit" | "preview">(text.trim() ? "preview" : "edit");
   const taRef = useRef<HTMLTextAreaElement>(null);
+
+  const [ingesting, setIngesting] = useState(false);
+  const [ingestErr, setIngestErr] = useState<string | null>(null);
+  const ingested = !!widget.ingestedAt;
+  // The note has diverged from what was last ingested → offer a re-ingest.
+  const edited = ingested && widget.ingestedHash !== cheapHash(text);
+
+  async function ingest() {
+    if (!text.trim() || ingesting) return;
+    setIngesting(true);
+    setIngestErr(null);
+    try {
+      await ingestNote(widget.id, text);
+      onChange(widget.id, { ingestedAt: new Date().toISOString(), ingestedHash: cheapHash(text) });
+      onIngested();
+    } catch (e) {
+      setIngestErr(String(e));
+    } finally {
+      setIngesting(false);
+    }
+  }
 
   // Enter continues the current list (next bullet / number / roman / checkbox) or exits it on an
   // empty item; Shift+Enter is always a plain newline. Caret is restored after React re-renders
@@ -301,17 +367,61 @@ function NoteBody({
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex shrink-0 items-center justify-end px-2 pt-1">
+      <div className="flex shrink-0 items-center justify-between gap-1 px-2 pt-1">
+        <div className="flex min-w-0 items-center gap-1" data-help="pinboard-note-ingest">
+          {!ingested ? (
+            <button
+              type="button"
+              onClick={ingest}
+              disabled={ingesting || !text.trim()}
+              className="rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
+              title="Send this note to PM as a document (it goes through Review)"
+            >
+              {ingesting ? "Ingesting…" : "Ingest"}
+            </button>
+          ) : (
+            <>
+              <span
+                className="truncate text-[10px] text-ink4"
+                title={
+                  status
+                    ? status.reviewed
+                      ? `Filed under ${status.project}`
+                      : "Waiting in the Review queue"
+                    : "Ingested as a document"
+                }
+              >
+                {status
+                  ? status.reviewed
+                    ? `Filed · ${status.project}`
+                    : "In review"
+                  : "Ingested"}
+              </span>
+              {edited && (
+                <button
+                  type="button"
+                  onClick={ingest}
+                  disabled={ingesting}
+                  className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
+                  title="Update the ingested document with your latest edits"
+                >
+                  {ingesting ? "…" : "Re-ingest"}
+                </button>
+              )}
+            </>
+          )}
+        </div>
         <button
           type="button"
           onClick={() => setMode((m) => (m === "edit" ? "preview" : "edit"))}
-          className="rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-ink4 hover:text-ink2"
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-ink4 hover:text-ink2"
           title={mode === "edit" ? "Preview the note" : "Edit the note"}
           data-help="pinboard-note-mode"
         >
           {mode === "edit" ? "Preview" : "Edit"}
         </button>
       </div>
+      {ingestErr && <p className="shrink-0 px-2 text-[10px] text-st-due">{ingestErr}</p>}
       {mode === "edit" ? (
         <Textarea
           ref={taRef}

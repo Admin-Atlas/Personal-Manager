@@ -478,6 +478,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Edit or preview",
     body: "Switch between writing the note (plain text, with smart list continuation) and previewing it rendered — headings, bullets, numbered and roman lists, checkboxes and quotes all formatted. Double-click the preview to jump back to editing. It's the same note either way; this only changes how it's shown.",
   },
+  "pinboard-note-ingest": {
+    title: "Ingest as a document",
+    body: "Send this note into PM the way any document goes in: it's chunked, indexed, and lands in the Review queue for you to file to a project and set its importance — after which it turns up in Documents, Focus and search like anything else. It shows 'In review' until you file it, then 'Filed · project'. Edit the note and a 'Re-ingest' button updates the same document, keeping its filing. The document is its own copy: once ingested, deleting the note doesn't remove it.",
+  },
   "pinboard-note-tint": {
     title: "Tint this note",
     body: "Colour the note to group or flag it — the colours are the same status hues PM uses elsewhere (due, quick win, and so on), so a tint can carry a light meaning. It's purely visual and changes nothing else.",
