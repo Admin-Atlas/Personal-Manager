@@ -270,6 +270,21 @@ impl SidecarManager {
         *self.status.lock().unwrap() = status;
     }
 
+    /// Stop the running child (if any) and mark the engine un-provisioned, so the caller can
+    /// delete the whole `runtime/` directory out from under it. On Windows the interpreter's
+    /// `python.exe`/DLLs are held open while the child lives, so the file locks must be released
+    /// first or the removal fails; taking the `Process` out of the mutex drops it, and its `Drop`
+    /// kills the child (releasing the handles). We flip the status to `NotInstalled` so the next
+    /// ingest re-provisions a fresh venv rather than trusting an in-memory `Ready` for a directory
+    /// that no longer exists. Best-effort and idempotent — used only by the "Remove PM data"
+    /// teardown ([`crate::wipe`]).
+    pub fn prepare_for_runtime_removal(&self) {
+        if let Ok(mut proc) = self.proc.lock() {
+            proc.take(); // drop → Process::drop kills the child, freeing the interpreter's locks
+        }
+        self.set_status(SidecarStatus::NotInstalled);
+    }
+
     /// Provision the venv if needed: create it from a base Python and install the
     /// pinned requirements. Idempotent and cheap once the `.ready` marker matches
     /// the current `requirements.txt`. Blocking and slow on first run.

@@ -72,6 +72,38 @@ export interface AppLockStatus {
   locked: boolean;
 }
 
+// --- "Remove PM data" teardown (Settings → Data & Security) ---
+
+/** Which classes of PM's on-machine data to remove. Browser local storage is cleared in the
+ *  webview (not part of the backend command), so it isn't represented here. */
+export interface WipeSelection {
+  /** The regenerable runtime (Python engine, t-SNE/OCR, Whisper model) — re-downloads on next use. */
+  regenerable: boolean;
+  /** The Markdown vault + encrypted database (the real user data). Irreversible. */
+  vaultAndDb: boolean;
+  /** Every OS-keychain secret; implies revoking Google grants + reporting Microsoft accounts. */
+  keychain: boolean;
+}
+
+/** What a wipe actually did, for the "done" summary. All counts are best-effort. */
+export interface WipeReport {
+  /** Human-readable labels of the classes removed. */
+  removed: string[];
+  /** Approx bytes freed on disk. */
+  freedBytes: number;
+  /** Google grants revoked at Google's end. */
+  googleRevoked: number;
+  /** Google tokens that couldn't be revoked (offline / already invalid); local copy gone regardless. */
+  googleRevokeFailures: number;
+  /** Connected Microsoft account emails — no programmatic revoke, so the user finishes at
+   *  account.microsoft.com (the UI links there). */
+  microsoftAccounts: string[];
+  /** Keychain entries deleted. */
+  keychainDeleted: number;
+  /** True when the store or keychain was touched, so the app can't keep running and must close. */
+  quitRequired: boolean;
+}
+
 // --- Shared & portable vaults (spec §2–6) ---
 
 /** How the vault's SQLCipher key is held: a random key in this device's keychain (the

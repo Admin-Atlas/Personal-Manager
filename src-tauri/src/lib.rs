@@ -58,6 +58,7 @@ mod sidecar;
 mod splitter;
 mod spreadsheets;
 mod vault;
+mod wipe;
 
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
@@ -857,6 +858,10 @@ pub fn run() {
             commands::open_data_folder,
             commands::export_all_data,
             commands::export_plaintext_markdown,
+            // "Remove PM data" teardown (Settings → Data & Security) — the à-la-carte counterpart to
+            // the Windows uninstaller's automatic `runtime/` cleanup.
+            wipe::wipe_pm_data,
+            wipe::confirm_wipe_identity,
             // Encrypted portable backup: local `.pmbackup` archive/restore, plus two off-machine
             // destinations that share the compress→encrypt core and the one schedule — Proton Drive
             // (via its CLI) and Google Drive (via the Drive v3 REST API).

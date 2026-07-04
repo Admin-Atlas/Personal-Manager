@@ -77,6 +77,8 @@ import type {
   TsneStatus,
   VaultLockStatus,
   VaultStatus,
+  WipeReport,
+  WipeSelection,
 } from "./types";
 
 export const hasOpenRouterKey = () => invoke<boolean>("has_openrouter_key");
@@ -883,6 +885,19 @@ export const openDataFolder = () => invoke<void>("open_data_folder");
 /** Bundle the data folder into a single .zip at `destPath` (store snapshot + vault;
  *  the regenerable runtime/ is excluded). The store stays encrypted in the archive. */
 export const exportAllData = (destPath: string) => invoke<void>("export_all_data", { destPath });
+
+/** "Remove PM data": erase the selected classes of on-machine data (regenerable runtime, vault +
+ *  database, OS keychain). Selecting the keychain also revokes Google grants and reports connected
+ *  Microsoft accounts (which have no programmatic revoke). Returns a summary; when `quitRequired` is
+ *  set the app can no longer run and must be closed. Gated in the UI behind the full confirmation
+ *  ladder — never call this without it. */
+export const wipePmData = (selection: WipeSelection) =>
+  invoke<WipeReport>("wipe_pm_data", { selection });
+
+/** Run an OS user-presence check (Windows Hello / Touch ID) as the penultimate gate of the wipe
+ *  ladder. `true` on success, `false` on cancel/failure, and it rejects when the verifier can't run
+ *  at all (the caller treats that like a cancel). No session side effect. */
+export const confirmWipeIdentity = () => invoke<boolean>("confirm_wipe_identity");
 
 // --- Encrypted backup (Proton Drive / user cloud) — PR1 local `.pmbackup` archive + restore ---
 

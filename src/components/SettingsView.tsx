@@ -39,6 +39,7 @@ import { ModelListEditor } from "./ModelListEditor";
 import { ModelRecommendationCards } from "./ModelRecommendationCards";
 import { IngestProgress } from "./IngestProgress";
 import { RebuildProgress } from "./RebuildProgress";
+import { RemovePmData } from "./RemovePmData";
 import { StorageSettings } from "./StorageSettings";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
@@ -1341,6 +1342,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                 </div>
 
                 <VaultCard />
+
+                <RemovePmData biometricAvailable={appLock?.available ?? false} />
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-license">
                   <Collapsible title="License" defaultOpen={showPower}>

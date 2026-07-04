@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.91.0-alpha",
+    date: "2026-07-04",
+    highlights: [
+      "Uninstalling PM now tidies up after itself. The regular uninstaller clears the large, re-downloadable components too — the document engine, the enhanced-map and photo-text add-ons, and the speech model — so removing PM no longer leaves gigabytes behind. Your vault, database and sign-ins are deliberately kept, so if you reinstall, PM picks up right where you left off.",
+      "There's a new way to fully clear PM off your machine. Settings → Data & Security → “Remove PM data” lets you erase things piece by piece: the downloaded components, your vault and encrypted database, your saved keys and sign-ins, and this window's preferences. Removing your saved keys also revokes PM's access to your connected Google accounts (Microsoft is one click away, at account.live.com, since it can't be revoked from within an app). It's made hard to do by accident — you unlock the choices, review exactly what's selected and what each one means, pass a Windows Hello check if you use one, and type “Delete PM Data” to finish. Encrypted backups are left untouched on purpose, with a reminder to remove those yourself at Proton or Google Drive.",
+    ],
+  },
+  {
     version: "2.90.0-alpha",
     date: "2026-07-04",
     highlights: [

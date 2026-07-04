@@ -308,3 +308,68 @@ pub fn set_cached_vault_key(vault_id: &str, key_hex: &str) -> Result<()> {
 pub fn clear_cached_vault_key(vault_id: &str) -> Result<()> {
     delete(&vault_key_entry(vault_id))
 }
+
+// --- Full keychain teardown ("Remove PM data" → OS keychain, spec §6/§8.7) ---
+//
+// Delete EVERY secret PM has ever written under the `org.itsatlas.pm` service. The OS
+// keychain can't be enumerated (the crate looks up by exact key), so this is the single
+// authoritative list of what PM stores: the fixed keys are named here, and the dynamic
+// per-account / per-vault keys are reconstructed from ids the caller reads out of the DB
+// before the store is torn down. Every delete is idempotent (absent = success), so a
+// partial install (never connected a Drive account, etc.) wipes cleanly with no errors.
+
+/// The fixed (non-parameterised) keychain keys PM writes. Keep in sync with the `const`s above —
+/// a new fixed secret must be added here or it would survive a "remove everything" wipe.
+const FIXED_KEYS: &[&str] = &[
+    OPENROUTER_KEY,
+    OPENROUTER_BACKGROUND_KEY,
+    DB_KEY,
+    BACKUP_PASSPHRASE,
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    GOOGLE_TOKEN,          // legacy shared token (pre per-service)
+    GOOGLE_TOKEN_CALENDAR, // legacy fixed calendar token (pre per-account)
+    CALENDAR_ICS_FEEDS,
+    MICROSOFT_CLIENT_ID,
+];
+
+/// Delete every PM secret from the OS keychain, returning how many entries were actually present and
+/// removed. `token_keys` are the fully-formed per-account OAuth token keys the caller built from
+/// connected accounts (Drive/Calendar/OneDrive/Outlook — via the public `*_PREFIX` constants);
+/// `google_client_emails` are accounts that carry their OWN Google client (Advanced-Protection);
+/// `vault_ids` are vaults whose derived key this profile has cached. Best-effort: a failure on one
+/// entry never aborts the rest — this runs when the user is deliberately erasing PM, so "delete as
+/// much as possible" is the right posture.
+pub fn wipe_all_secrets(
+    token_keys: &[String],
+    google_client_emails: &[String],
+    vault_ids: &[String],
+) -> usize {
+    let mut deleted = 0usize;
+
+    // Delete one entry, counting it only if it was actually there. An error (rare — the credential
+    // store being unavailable) is swallowed so a single stubborn entry can't abort the whole wipe.
+    let mut wipe = |key: &str| {
+        if let Ok(entry) = entry(key) {
+            if entry.delete_credential().is_ok() {
+                deleted += 1;
+            }
+        }
+    };
+
+    for k in FIXED_KEYS {
+        wipe(k);
+    }
+    for k in token_keys {
+        wipe(k);
+    }
+    for email in google_client_emails {
+        wipe(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"));
+        wipe(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"));
+    }
+    for id in vault_ids {
+        wipe(&vault_key_entry(id));
+    }
+
+    deleted
+}

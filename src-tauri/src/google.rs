@@ -100,6 +100,43 @@ fn http() -> Result<reqwest::Client> {
         .map_err(Error::from)
 }
 
+/// Google's OAuth token-revocation endpoint (RFC 7009). Revoking a token here severs the grant at
+/// Google's end, not just locally.
+const REVOKE_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
+
+/// Best-effort revoke of a stored Google token blob at Google's end, so "Remove PM data" actually
+/// severs the grant instead of only forgetting the local copy. Revoking the **refresh** token
+/// invalidates the entire grant (every access token minted from it), so PM disappears from the
+/// account's "Connected apps"; we fall back to the access token when no refresh token was stored.
+/// `token_json` is the raw keychain blob (a [`Token`] as JSON). The caller runs this before deleting
+/// the keychain entry and treats any error as non-fatal — the local secret is removed regardless, so
+/// a revoke that can't reach the network still leaves nothing on this device.
+pub async fn revoke(token_json: &str) -> Result<()> {
+    let token: Token = serde_json::from_str(token_json)
+        .map_err(|e| Error::Other(format!("token blob is not valid JSON: {e}")))?;
+    let to_revoke = token
+        .refresh_token
+        .as_ref()
+        .map(|s| s.expose().to_string())
+        .unwrap_or_else(|| token.access_token.expose().to_string());
+    let resp = http()?
+        .post(REVOKE_ENDPOINT)
+        .form(&[("token", to_revoke.as_str())])
+        .send()
+        .await
+        .map_err(Error::from)?;
+    // 200 = revoked; 400 = the token was already invalid/expired. Both mean the grant is not live,
+    // which is exactly the desired end state, so neither is an error worth surfacing.
+    if resp.status().is_success() || resp.status() == reqwest::StatusCode::BAD_REQUEST {
+        Ok(())
+    } else {
+        Err(Error::Other(format!(
+            "Google token revocation returned HTTP {}",
+            resp.status()
+        )))
+    }
+}
+
 /// Run the OAuth consent flow and RETURN the token without persisting it: open the browser to
 /// Google's consent screen for `scope`, catch the loopback redirect, and exchange the code. The
 /// caller chooses which keychain key to store it under — for a Drive account that key is derived
