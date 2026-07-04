@@ -34,10 +34,25 @@ on the user's Advanced-Protection account, so a live connector can't work (see t
 2026-06-19 Step 7 decision-log entry). **Voice input** to the chat bar is done
 (v0.8.0): a mic button in the shared `Composer` records a clip and transcribes it
 **on-device** via a `transcribe` handler in the Python sidecar (`faster-whisper`,
-`base.en`) — see `src/lib/useRecorder.ts` + the `transcribe_audio` command. **With
-that, every v1 spec feature is built** — what remains is the post-v1 work (design/
-polish, code cleanup, a security/efficiency pass, a fresh public repo, and a release)
-plus the deliberate cuts (Google Tasks, and everything in spec §10).
+`base.en`) — see `src/lib/useRecorder.ts` + the `transcribe_audio` command.
+
+**With that, every v1 spec feature was built** — v1 shipped its first public release as
+`v2.0.1-alpha` (2026-06-23), and PM is now well into **Stage 3**, a large body of work past
+v1 tracked on the **PM Roadmap** board (the living source of truth for what's built and in
+flight — read it before starting a feature). Stage-3 work already shipped includes: a
+re-scoped **retrieval foundation** (model registry + role indirection, a config-stamp
+Rebuild mechanism, a token-sized structure-aware splitter, multilingual e5-large);
+**entity resolution** (canonical projects + aliases) and a **structured preference model**
+that replaced the Learning-You blob; **chat as a first-class source** (PM's own chats are
+chunked, embedded, indexed and retrievable, with bounded context cost); **index-only
+connectors** for Google Drive, OneDrive and local folders (pointer + embedding, bytes
+fetched live — never imported); a **multi-provider read-only calendar** with a unified
+**Calendar** view tab; **project milestones** and a **structured flag layer**; **encrypted
+portable backups** (Proton Drive / Google Drive); a **semantic memory map**; **spreadsheet**
+and **photo/OCR** ingestion; a **document reader**; a **pinboard**; runtime **developer
+mode**; and the **V2 design system** (below). The deliberate cuts still stand (Google Tasks;
+everything in spec §10); design/polish, a pre-release security pass, and the public-repo
+release remain the open post-v1 work.
 
 ## Architecture
 
@@ -45,51 +60,61 @@ plus the deliberate cuts (Google Tasks, and everything in spec §10).
   - `src/lib/ipc.ts` — the only place that calls Rust. Typed wrappers over Tauri
     commands; streaming/progress use a `Channel`.
   - `src/lib/types.ts` — shared types mirroring the Rust structs.
-  - `src/components/` — `Sidebar` (Focus/Chat/Documents/Review/Map nav), `FocusView`
-    (project status cards + triage + the calendar Upcoming agenda), `ProjectView`
-    (per-project files + scoped chat), `ChatView`, `Composer`, `SettingsView` (keys,
-    model, Learning-You profile, help toggle), `GoogleCalendarSettings` (the Step 6
-    connector — BYO creds, connect, calendar picker, sync), `DocumentsView`
-    (drag-drop ingestion), `ReviewView` (sorting review), `GraphView` (force-directed
-    document→project map), `HelpOverlay` (help mode), `CommandPalette` (Ctrl/Cmd+K
-    quick-jump to any project/file/conversation).
+  - `src/components/` — the nav surfaces (`Sidebar` → Focus / Chat / Documents / Review /
+    Map / Calendar / Pinboard, plus the capability-gated Teach + Dev): `FocusView` (status
+    cards + triage + milestones + the calendar agenda + the daily briefing), `ProjectView`
+    (per-project files + scoped chat), `ChatView` / `Composer` (+ `ContextMeter`,
+    `RetrievalExplainPanel`), `DocumentsView` + `DocumentReader`, `ReviewView`, `GraphView`
+    (the canvas memory map), `calendar/` (the unified calendar view, incl. a Terminal fork),
+    `PinboardView`, `TeachView` / `TeachPreferences` (entities + preferences), `DevView`
+    (read-only inspectors), `ConnectorsSettings` + per-provider connection components,
+    `SettingsView` (tabbed: keys/model, appearance, storage, backup, security, developer…),
+    `CommandPalette` (Ctrl/Cmd+K), `HelpOverlay`. Shared primitives live in
+    `src/components/ui/`.
+  - Theme + capability state is frontend-only (`src/theme/`, `src/lib/capabilities.tsx`,
+    localStorage — never IPC). Ingested Markdown renders ONLY through the sanitizing
+    `src/lib/markdown.tsx` boundary.
   - `src/lib/help.ts` — help-mode registry (`data-help` id → explanation) + context.
-- **Backend** — `src-tauri/src/` (Rust).
-  - `lib.rs` — Tauri builder, app state (`Mutex<Connection>` + `SidecarManager`),
-    plugins, command registry.
-  - `db/` — the encrypted store: `open()` (SQLCipher key + sqlite-vec + FTS5 +
-    migrations), `migrations.rs` (additive, `user_version`-based), settings helpers.
-  - `sidecar.rs` — the Python document sidecar: provisions a managed venv on
-    first run and speaks newline-JSON over stdio to `convert` + `embed` +
-    `transcribe` (on-device speech-to-text for voice input, `faster-whisper`).
-  - `ingest.rs` — convert → hash → chunk → embed → vault + index; `rebuild`.
-  - `retrieval.rs` — hybrid search (sqlite-vec KNN + FTS5) fused with Reciprocal
-    Rank Fusion; builds the grounding prompt + citation list for chat.
-  - `review.rs` — the sorting-review proposal (background model classifies a doc
-    into project/tags/importance) + correction logging.
-  - `projects.rs` — project triage for the focus view: the `projects` metadata
-    table, the pure `derive_status` (one status per project, spec §4.1), and the
-    AI-proposes-you-confirm attribute proposal (background key, untrusted DATA).
-  - `google.rs` — Google OAuth (Step 6): the loopback-PKCE connect flow (BYO
-    "Desktop app" creds in the keychain, read-only scope) + `authorized_get` with
-    transparent token refresh. Connector-generic, so Tasks can reuse it.
-  - `calendar.rs` — read-only calendar: the `calendar_events` mirror (migration v6,
-    refilled per sync), the `.ics` feed list (secret URLs in the keychain) + OAuth
-    calendar list/sync, the token-based project name → event match that feeds
-    `derive_status`, and the chat agenda preamble. Everything fetched is untrusted
-    DATA (rule #6).
-  - `ics.rs` — iCalendar (.ics) feed parsing (the no-OAuth path): RFC 5545
-    line-unfolding + property parsing, `chrono`/`chrono-tz` time resolution to UTC,
-    and `rrule` recurrence expansion bounded to the agenda window.
-  - `learning.rs` — the Learning-You profile (§4.5): distils `corrections` into a
-    readable profile (self-edit on the background key) + the prompt preamble.
-  - `secrets.rs` — OS keychain wrapper (API key + background key + DB key).
-  - `openrouter.rs` — streaming chat client (SSE) + non-streaming `complete()`.
-  - `commands.rs` — the `#[tauri::command]` surface.
-  - `paths.rs` — resolves the data directory, vault, venv, and sidecar source.
-- **Sidecar** — `sidecar/pm_sidecar.py` + `requirements.txt` (committed code).
-  MarkItDown conversion + `fastembed` ONNX embeddings (bge-small-en-v1.5, 384-d).
-  The venv and downloaded model are runtime artifacts, never committed.
+- **Backend** — `src-tauri/src/` (Rust). Grouped by area; the roadmap board + `docs/` carry
+  the living detail. Pure decision functions stay DB/network-free and unit-tested.
+  - **Core** — `lib.rs` (Tauri builder, app state `Mutex<Connection>` + `SidecarManager` +
+    single-flight `BusyGuard` flags, background schedulers, plugins, command registry),
+    `commands.rs` + `commands_dev.rs` (the `#[tauri::command]` surface), `error.rs`,
+    `paths.rs`, `clock.rs`.
+  - **Store** — `db/` (`open()` = SQLCipher key + sqlite-vec + FTS5 + migrations;
+    `migrations.rs` additive + `user_version`-based, past v30); `vault/` (the Markdown vault
+    + its crypto / KDF / ACL / pointer / migration).
+  - **Ingestion & retrieval** — `ingest.rs` (convert → hash → chunk → embed → vault + index;
+    the `write_document_truth` truth-writer seam; `rebuild`), `splitter.rs` (structure-aware
+    token-sized chunker), `retrieval.rs` (hybrid sqlite-vec KNN + FTS5 fused with Reciprocal
+    Rank Fusion → grounding prompt + citations), `registry.rs` / `retrieval_config.rs` /
+    `model_gateway.rs` (model roles, the config stamp, the model gateway), `retrieval_diag.rs`,
+    `index_only.rs` (the pointer+embed observe-and-react reducer), `photos.rs` /
+    `spreadsheets.rs` (dedicated processors), `review.rs` (sorting-review proposal +
+    corrections), `projects.rs` (triage + the pure `derive_status`, spec §4.1), `entities.rs`,
+    `preferences.rs`, `milestones.rs`, `flags.rs`, `project_activity.rs`, `recommend.rs`,
+    `briefing.rs`, `layout.rs` (semantic-map dimensionality reduction).
+  - **Chat pipeline** — `chat.rs` (turn model, vault-as-truth), `chat_index.rs` (append-only
+    indexing), `chat_summary.rs` (rolling summary), `chat_title.rs`, `chat_prefs.rs`,
+    `context_budget.rs`.
+  - **Connectors & calendar** — `google.rs` / `microsoft.rs` (OAuth loopback-PKCE, BYO creds
+    in the keychain), `drive.rs`, `onedrive.rs`, `outlook_calendar.rs`, `localfolder.rs`,
+    `calendar.rs` + `ics.rs` (the read-only multi-provider mirror + RFC 5545 parsing).
+    Everything fetched is untrusted DATA (rule #6).
+  - **Backup** — `backup/`: portable passphrase-encrypted zstd `.pmbackup`; a
+    `destination.rs` enum fans out to the Proton Drive CLI (`proton.rs`) + Google Drive REST
+    (`gdrive.rs`); `schedule.rs`.
+  - **Platform** — `secrets.rs` (OS keychain: API key + background key + DB key + OAuth
+    tokens + feed URLs), `openrouter.rs` (streaming SSE + non-streaming `complete()`; the key
+    stays in Rust), `cost.rs`, `applock.rs` / `lock_session.rs`, `components.rs` (the Storage
+    manager), `sidecar.rs` / `python_fetch.rs`, `wipe.rs` (Remove-PM-data).
+- **Sidecar** — `sidecar/pm_sidecar.py` + `requirements.txt` (committed code). A managed venv
+  (provisioned on first run) speaks newline-JSON over stdio: `convert` (MarkItDown),
+  `embed` / `count_tokens` / `rerank` (fastembed ONNX, model-parameterised — English
+  `bge-small-en-v1.5` 384-d by default, multilingual e5-large 1024-d), `transcribe`
+  (`faster-whisper` voice input), `analyze_image` (OCR), `analyze_spreadsheet`, and `reduce`
+  (PCA / optional t-SNE map layout). The venv and downloaded models are runtime artifacts,
+  never committed.
 
 ## Design system (V2)
 
