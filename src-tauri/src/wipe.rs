@@ -241,7 +241,10 @@ pub async fn wipe_pm_data(
     }
 
     // --- Vault & database. Close the store first so the DB file's lock is released. ---
-    if selection.vault_and_db {
+    // Wiping the keychain removes the DB's only key, so a store left behind could never be opened
+    // again — the two must go together. We enforce that invariant here (not only in the UI), so the
+    // keychain option can never orphan an unreadable store even if a caller sends the pair unset.
+    if selection.vault_and_db || selection.keychain {
         let resolved = vault::resolve(&app)?;
         let data_dir = paths::data_dir(&app)?;
 

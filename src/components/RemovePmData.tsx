@@ -113,9 +113,10 @@ export function RemovePmData({ biometricAvailable }: Props) {
 
   const anySelected = sel.regenerable || sel.vaultAndDb || sel.keychain || sel.localStorage;
   const selectedItems = ITEMS.filter((i) => sel[i.key]);
-  // Removing the keychain (which holds the DB's only key) without also removing the store leaves an
-  // unreadable database behind — worth calling out prominently.
-  const orphansStore = sel.keychain && !sel.vaultAndDb;
+  // The database's only key lives in the keychain, so a store left behind after the keychain is wiped
+  // can never be opened again. We therefore FORCE "Vault & database" on whenever "Saved keys" is
+  // selected — the vault checkbox is locked on in that case — and keep the warning explaining why.
+  const vaultForcedByKeychain = sel.keychain;
 
   function reset() {
     setSel(EMPTY_SELECTION);
@@ -126,7 +127,14 @@ export function RemovePmData({ biometricAvailable }: Props) {
   }
 
   function toggle(key: keyof Selection) {
-    setSel((s) => ({ ...s, [key]: !s[key] }));
+    setSel((s) => {
+      const next = { ...s, [key]: !s[key] };
+      // Enforce the invariant "keychain implies vault & database" in both directions: ticking saved
+      // keys pulls in the store, and the store can't be unticked while saved keys are selected.
+      if (key === "keychain" && next.keychain) next.vaultAndDb = true;
+      if (key === "vaultAndDb" && !next.vaultAndDb && next.keychain) next.vaultAndDb = true;
+      return next;
+    });
   }
 
   // "Continue to deletion" → the optional Hello gate, then the type-to-confirm step.
@@ -206,37 +214,49 @@ export function RemovePmData({ biometricAvailable }: Props) {
       {stage === "select" && (
         <div className="mt-3">
           <div className="space-y-2">
-            {ITEMS.map((item) => (
-              <label
-                key={item.key}
-                className="flex cursor-pointer items-start gap-3 rounded-[var(--radius)] border border-border bg-surface px-3 py-2.5 transition hover:border-border2"
-              >
-                <input
-                  type="checkbox"
-                  className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--st-due)]"
-                  checked={sel[item.key]}
-                  onChange={() => toggle(item.key)}
-                />
-                <span className="min-w-0">
-                  <span
-                    className={`block text-sm font-medium ${item.danger ? "text-st-due" : "text-ink2"}`}
-                  >
-                    {item.label}
+            {ITEMS.map((item) => {
+              // "Vault & database" is locked on while "Saved keys" is selected (see vaultForcedByKeychain).
+              const locked = item.key === "vaultAndDb" && vaultForcedByKeychain;
+              return (
+                <label
+                  key={item.key}
+                  className={`flex items-start gap-3 rounded-[var(--radius)] border border-border bg-surface px-3 py-2.5 transition ${
+                    locked ? "cursor-default opacity-90" : "cursor-pointer hover:border-border2"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--st-due)] disabled:opacity-60"
+                    checked={sel[item.key]}
+                    disabled={locked}
+                    onChange={() => toggle(item.key)}
+                  />
+                  <span className="min-w-0">
+                    <span
+                      className={`block text-sm font-medium ${item.danger ? "text-st-due" : "text-ink2"}`}
+                    >
+                      {item.label}
+                      {locked && (
+                        <span className="ml-1.5 font-normal text-ink4">
+                          · included with saved keys
+                        </span>
+                      )}
+                    </span>
+                    <span className="mt-0.5 block text-xs text-ink4">{item.detail}</span>
                   </span>
-                  <span className="mt-0.5 block text-xs text-ink4">{item.detail}</span>
-                </span>
-              </label>
-            ))}
+                </label>
+              );
+            })}
           </div>
 
-          {orphansStore && (
+          {vaultForcedByKeychain && (
             <p
               className="mt-2 rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
               style={{ background: "color-mix(in oklab, var(--st-due) 12%, transparent)" }}
             >
-              Heads up: removing your saved keys without the vault &amp; database will leave the
-              database permanently unreadable — its only key lives in the keychain. Add “Vault &amp;
-              database” too, or expect to start fresh next launch.
+              Removing your saved keys also removes the vault &amp; database — the database&apos;s
+              only key lives in the keychain, so the store can&apos;t be kept without it. Both are
+              permanent.
             </p>
           )}
 
@@ -292,10 +312,10 @@ export function RemovePmData({ biometricAvailable }: Props) {
               </li>
             ))}
           </ul>
-          {orphansStore && (
+          {vaultForcedByKeychain && (
             <p className="mt-3 text-xs text-st-due">
-              Note: without “Vault &amp; database”, the encrypted store is left behind but can never
-              be opened again — its key is being removed.
+              Removing your saved keys removes the vault &amp; database along with them — the
+              database&apos;s only key is in the keychain, so it can&apos;t be kept.
             </p>
           )}
           {(sel.vaultAndDb || sel.keychain) && (
