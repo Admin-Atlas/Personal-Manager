@@ -353,8 +353,11 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
               </div>
             </div>
           )}
-          <RetrievalExplainPanel messages={chat.messages} project={project} />
-          <Composer disabled={chat.sending} onSend={chat.handleSend} />
+          <Composer
+            disabled={chat.sending}
+            onSend={chat.handleSend}
+            tools={<RetrievalExplainPanel messages={chat.messages} project={project} />}
+          />
         </main>
 
         <aside

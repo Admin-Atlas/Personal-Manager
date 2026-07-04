@@ -18,6 +18,7 @@ import type { DevRetrievalExplain, Message } from "../lib/types";
 import { getSettings, retrievalDiagnose, retrievalExplain, setRetrievalK } from "../lib/ipc";
 import { useTheme } from "../theme";
 import { RetrievalScoreTable } from "./RetrievalScoreTable";
+import { Popover } from "./calendar/Popover";
 import { Button } from "./ui";
 
 /** The depth bounds mirror the backend clamp (`db::RETRIEVAL_K_{MIN,MAX}`). */
@@ -147,139 +148,141 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
   const dirty = savedK != null && k !== savedK;
 
   return (
-    <div className="border-t border-border bg-panel" data-help="chat-retrieval-explain">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between px-4 py-1.5 text-left text-xs text-ink4 hover:text-ink2"
-        title="See which notes this chat retrieved and tune how deep it searches"
-      >
-        <span>
-          <span aria-hidden="true">🔍</span> Explain retrieval
-        </span>
-        <span className="font-mono text-faint">{open ? "▾" : "▸"}</span>
-      </button>
+    <Popover
+      side="top"
+      align="left"
+      open={open}
+      onOpenChange={setOpen}
+      ariaLabel="Explain retrieval"
+      panelClassName="w-[min(92vw,34rem)] max-h-[60vh] overflow-y-auto"
+      trigger={({ open: isOpen, toggle }) => (
+        <button
+          type="button"
+          onClick={toggle}
+          data-help="chat-retrieval-explain"
+          title="See which notes this chat retrieved and tune how deep it searches"
+          className="flex shrink-0 items-center gap-1 rounded-[var(--radius-sm)] border border-border2 px-2 py-1 text-xs text-ink4 hover:text-ink2"
+          style={isOpen ? { color: "var(--ink2)" } : undefined}
+        >
+          <span aria-hidden="true">🔍</span>
+          <span>Explain</span>
+        </button>
+      )}
+    >
+      <div className="p-2">
+        <form
+          className="flex flex-wrap items-end gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            runExplain(query, k);
+          }}
+        >
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Query to explain…"
+            className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
+          />
+          <Button type="submit" variant="secondary" disabled={running || !query.trim()}>
+            {running ? "Running…" : "Explain"}
+          </Button>
+        </form>
 
-      {open && (
-        <div className="max-h-[46vh] overflow-y-auto px-4 pb-3">
-          <form
-            className="flex flex-wrap items-end gap-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              runExplain(query, k);
-            }}
-          >
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Query to explain…"
-              className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
-            />
-            <Button type="submit" variant="secondary" disabled={running || !query.trim()}>
-              {running ? "Running…" : "Explain"}
-            </Button>
-          </form>
-
-          {/* The depth lever. The explainer makes legible that k widens the reranker's pool — it is
+        {/* The depth lever. The explainer makes legible that k widens the reranker's pool — it is
               NOT "show me more results". */}
-          <div className="mt-3 rounded-[var(--radius-sm)] border border-border bg-surface p-3">
-            <div className="flex items-center gap-3">
-              <label className="flex flex-1 items-center gap-2 text-xs text-ink3">
-                Depth (k)
-                <input
-                  type="range"
-                  min={K_MIN}
-                  max={K_MAX}
-                  value={k}
-                  onChange={(e) => setK(Number(e.target.value))}
-                  className="flex-1 accent-[var(--accent)]"
-                  aria-label="Retrieval depth (candidate pool size)"
-                />
-                <span className="w-6 text-right font-mono text-ink2">{k}</span>
-              </label>
-              <Button
-                variant="primary"
-                onClick={commitDepth}
-                disabled={!dirty || committing}
-                title={
-                  dirty
-                    ? "Make this the depth every chat searches at"
-                    : "This is already your retrieval depth"
-                }
-              >
-                {committing ? "Saving…" : "Use this depth"}
-              </Button>
-            </div>
-            <p className="mt-2 text-[11px] leading-snug text-ink4">
-              Depth is the size of the candidate <em>pool</em> the reranker gets to weigh — not how
-              many results are shown. Widen it and a note that ranked just below the cut can finally
-              reach the reranker; a note beyond it never does, however relevant it is.
-              {savedK != null && !dirty ? ` Your saved depth is ${savedK}.` : ""}
-              {dirty ? " Previewing — not saved yet." : ""}
-            </p>
-          </div>
-
-          {err && <p className="mt-2 text-xs text-[var(--st-due)]">{err}</p>}
-
-          {explain && (
-            <div className="mt-3">
-              <p className="font-mono text-[11px] text-ink4">
-                {explain.embedder_label} · rerank {explain.reranking_enabled ? "on" : "off"}
-                {explain.reranking_enabled
-                  ? ` (applied: ${explain.reranked ? "yes" : "no"})`
-                  : ""}{" "}
-                · k={explain.k}
-              </p>
-              {explain.rows.length === 0 ? (
-                <p className="mt-2 text-xs text-ink4">
-                  No candidates — nothing indexed matched this query.
-                </p>
-              ) : (
-                <RetrievalScoreTable rows={explain.rows} />
-              )}
-            </div>
-          )}
-
-          {/* The recommend-don't-actuate diagnostic. It reads the state above and advises; any change
-              is the user's to make on the slider — there is deliberately no apply button here. */}
-          <div className="mt-3 border-t border-rule pt-3">
-            <label className="text-xs text-ink3" htmlFor="retrieval-symptom">
-              Not finding what you expect? Describe it and PM will suggest what to try.
-            </label>
-            <div className="mt-1 flex flex-wrap items-end gap-2">
+        <div className="mt-3 rounded-[var(--radius-sm)] border border-border bg-surface p-3">
+          <div className="flex items-center gap-3">
+            <label className="flex flex-1 items-center gap-2 text-xs text-ink3">
+              Depth (k)
               <input
-                id="retrieval-symptom"
-                value={symptom}
-                onChange={(e) => setSymptom(e.target.value)}
-                placeholder="e.g. it keeps missing notes I know I wrote"
-                className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    diagnose();
-                  }
-                }}
+                type="range"
+                min={K_MIN}
+                max={K_MAX}
+                value={k}
+                onChange={(e) => setK(Number(e.target.value))}
+                className="flex-1 accent-[var(--accent)]"
+                aria-label="Retrieval depth (candidate pool size)"
               />
-              <Button
-                variant="secondary"
-                onClick={diagnose}
-                disabled={diagnosing || !symptom.trim() || !explain}
-                title={
-                  explain ? "" : "Run an explain first so the diagnostic has something to read"
-                }
-              >
-                {diagnosing ? "Thinking…" : "Diagnose"}
-              </Button>
-            </div>
-            {diagErr && <p className="mt-2 text-xs text-[var(--st-due)]">{diagErr}</p>}
-            {advice && (
-              <div className="mt-2 whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-surface px-3 py-2 text-xs leading-relaxed text-ink2">
-                {advice}
-              </div>
+              <span className="w-6 text-right font-mono text-ink2">{k}</span>
+            </label>
+            <Button
+              variant="primary"
+              onClick={commitDepth}
+              disabled={!dirty || committing}
+              title={
+                dirty
+                  ? "Make this the depth every chat searches at"
+                  : "This is already your retrieval depth"
+              }
+            >
+              {committing ? "Saving…" : "Use this depth"}
+            </Button>
+          </div>
+          <p className="mt-2 text-[11px] leading-snug text-ink4">
+            Depth is the size of the candidate <em>pool</em> the reranker gets to weigh — not how
+            many results are shown. Widen it and a note that ranked just below the cut can finally
+            reach the reranker; a note beyond it never does, however relevant it is.
+            {savedK != null && !dirty ? ` Your saved depth is ${savedK}.` : ""}
+            {dirty ? " Previewing — not saved yet." : ""}
+          </p>
+        </div>
+
+        {err && <p className="mt-2 text-xs text-[var(--st-due)]">{err}</p>}
+
+        {explain && (
+          <div className="mt-3">
+            <p className="font-mono text-[11px] text-ink4">
+              {explain.embedder_label} · rerank {explain.reranking_enabled ? "on" : "off"}
+              {explain.reranking_enabled ? ` (applied: ${explain.reranked ? "yes" : "no"})` : ""} ·
+              k={explain.k}
+            </p>
+            {explain.rows.length === 0 ? (
+              <p className="mt-2 text-xs text-ink4">
+                No candidates — nothing indexed matched this query.
+              </p>
+            ) : (
+              <RetrievalScoreTable rows={explain.rows} />
             )}
           </div>
+        )}
+
+        {/* The recommend-don't-actuate diagnostic. It reads the state above and advises; any change
+              is the user's to make on the slider — there is deliberately no apply button here. */}
+        <div className="mt-3 border-t border-rule pt-3">
+          <label className="text-xs text-ink3" htmlFor="retrieval-symptom">
+            Not finding what you expect? Describe it and PM will suggest what to try.
+          </label>
+          <div className="mt-1 flex flex-wrap items-end gap-2">
+            <input
+              id="retrieval-symptom"
+              value={symptom}
+              onChange={(e) => setSymptom(e.target.value)}
+              placeholder="e.g. it keeps missing notes I know I wrote"
+              className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  diagnose();
+                }
+              }}
+            />
+            <Button
+              variant="secondary"
+              onClick={diagnose}
+              disabled={diagnosing || !symptom.trim() || !explain}
+              title={explain ? "" : "Run an explain first so the diagnostic has something to read"}
+            >
+              {diagnosing ? "Thinking…" : "Diagnose"}
+            </Button>
+          </div>
+          {diagErr && <p className="mt-2 text-xs text-[var(--st-due)]">{diagErr}</p>}
+          {advice && (
+            <div className="mt-2 whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-surface px-3 py-2 text-xs leading-relaxed text-ink2">
+              {advice}
+            </div>
+          )}
         </div>
-      )}
-    </div>
+      </div>
+    </Popover>
   );
 }

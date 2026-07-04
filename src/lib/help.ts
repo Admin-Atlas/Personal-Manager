@@ -154,6 +154,14 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Sources",
     body: "The documents this answer was grounded in. They make the answer verifiable — open the file to check.",
   },
+  "context-meter": {
+    title: "Context usage",
+    body: "How full the selected model's context window is for this conversation — the button sits on the message row so it's out of the way until you need it. It stays quiet on the calm preset and turns red near the limit; open it to Compress (fold older turns into a running summary, with an Undo), switch to a larger-context model, or continue anyway. Your full conversation is always kept word-for-word in your vault.",
+  },
+  "chat-retrieval-explain": {
+    title: "Explain retrieval",
+    body: "Opens from the button on the message row. Shows exactly which chunks of your documents a query pulls in and how each one scored, and lets you tune the one lever that matters — the retrieval depth (the size of the candidate pool the reranker weighs, not how many results are shown). Dragging the depth slider previews live; a separate button commits it. Describe what it's missing and PM suggests what to change — it never changes anything on its own.",
+  },
 
   // Settings
   "settings-api-key": {

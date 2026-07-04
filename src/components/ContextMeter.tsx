@@ -16,6 +16,7 @@ import { chatContextStatus, compressChat, revertCompress } from "../lib/ipc";
 import type { CompressResult, ContextStatus } from "../lib/types";
 import { useDepth } from "../theme/depth";
 import { Button, Modal } from "./ui";
+import { Popover } from "./calendar/Popover";
 
 interface Props {
   conversationId: number | null;
@@ -33,9 +34,8 @@ function formatTokens(n: number): string {
 }
 
 export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
-  const { minimal, showMeta, showPower } = useDepth();
+  const { minimal, showPower } = useDepth();
   const [status, setStatus] = useState<ContextStatus | null>(null);
-  const [dismissed, setDismissed] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
   const [compressing, setCompressing] = useState(false);
   const [reverting, setReverting] = useState(false);
@@ -47,18 +47,13 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
       return;
     }
     chatContextStatus(conversationId)
-      .then((s) => {
-        setStatus(s);
-        // Re-arm the alert once usage falls back under the line (the next crossing nags again).
-        if (!s.alerting) setDismissed(false);
-      })
+      .then((s) => setStatus(s))
       .catch(() => setStatus(null));
   }, [conversationId]);
 
-  // Re-read on conversation switch and after each new turn (and reset transient UI on switch).
+  // Re-read on conversation switch and after each new turn (and close the panel on switch).
   useEffect(() => {
     setPanelOpen(false);
-    setDismissed(false);
     refresh();
   }, [conversationId, refresh]);
   useEffect(() => {
@@ -69,10 +64,7 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
 
   const known = status.percent != null;
   const pct = Math.round((status.percent ?? 0) * 100);
-  const frac = Math.max(0, Math.min(1, status.percent ?? 0));
   const alerting = status.alerting;
-  const barColor = alerting ? "var(--st-due)" : "var(--accent)";
-  const showPanel = (alerting && !dismissed) || panelOpen;
 
   // Minimal depth stays out of the way entirely until usage is in alert territory.
   if (minimal && !alerting) return null;
@@ -109,115 +101,104 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
   }
 
   function handleContinue() {
-    setDismissed(true);
     setPanelOpen(false);
   }
 
   return (
-    <div className="border-t border-border px-4 pt-2">
-      <div className="mx-auto max-w-3xl">
-        <button
-          type="button"
-          onClick={() => setPanelOpen((o) => !o)}
-          title={
-            known
-              ? `${pct}% of ${status.model}'s context used`
-              : `Context usage is unknown for ${status.model}`
-          }
-          className="flex w-full items-center gap-2 text-left"
-          data-help="context-meter"
-        >
-          {alerting && (
-            <span
-              aria-hidden
-              className="h-1.5 w-1.5 shrink-0 rounded-full"
-              style={{ background: "var(--st-due)" }}
-            />
-          )}
-          {showMeta && (
-            <span
-              className="shrink-0 text-xs"
-              style={{ color: alerting ? "var(--st-due)" : "var(--ink4)" }}
-            >
-              Context
-            </span>
-          )}
-          {/* The bar (standard + power). A token-driven track so it can carry the alert colour. */}
-          {showMeta && (
-            <span className="h-1 flex-1 overflow-hidden rounded-[var(--radius-sm)] bg-border">
-              {known && (
-                <span
-                  className="block h-full rounded-[var(--radius-sm)] transition-[width] duration-300 ease-out"
-                  style={{ width: `${frac * 100}%`, background: barColor }}
-                />
-              )}
-            </span>
-          )}
-          {showMeta && (
-            <span
-              className="shrink-0 font-mono text-xs"
-              style={{ color: alerting ? "var(--st-due)" : "var(--ink4)" }}
-            >
-              {known ? `${pct}%` : "—"}
-              {showPower && known && status.used_tokens != null && status.context_window != null
-                ? ` · ${formatTokens(status.used_tokens)}/${formatTokens(status.context_window)}`
-                : ""}
-            </span>
-          )}
-          {/* Minimal depth: no bar, just the alert affordance. */}
-          {minimal && (
-            <span className="text-xs" style={{ color: "var(--st-due)" }}>
-              Context almost full — review
-            </span>
-          )}
-        </button>
-
-        {showPanel && (
-          <div className="mt-2 rounded-[var(--radius-sm)] border border-border2 bg-surface p-3">
-            <p className="text-sm text-ink2">
-              {alerting
-                ? `This conversation is filling ${status.model}'s context (${known ? `${pct}%` : "—"}).`
-                : `${status.model}'s context is ${known ? `${pct}%` : "—"} full.`}
-            </p>
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              {status.compress.available ? (
-                <Button variant="primary" onClick={handleCompress} disabled={compressing}>
-                  {compressing ? "Compressing…" : "Compress"}
-                </Button>
-              ) : (
-                status.compress.reason && (
-                  <span className="text-xs text-ink4">{status.compress.reason}</span>
-                )
-              )}
-              {status.upgrade.length > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {status.upgrade.map((m) => (
-                    <Button
-                      key={m.id}
-                      variant="secondary"
-                      onClick={() => {
-                        onUpgrade(m.id);
-                        setPanelOpen(false);
-                        setDismissed(true);
-                        // The host re-reads settings; refresh once the switch has landed.
-                        setTimeout(refresh, 0);
-                      }}
-                      title={`${m.name || m.id} · ${formatTokens(m.context_length)} context`}
-                    >
-                      Switch to {m.name || m.id} ({formatTokens(m.context_length)})
-                    </Button>
-                  ))}
-                </div>
-              )}
-              {alerting && (
-                <Button variant="tertiary" onClick={handleContinue}>
-                  Continue anyway
-                </Button>
-              )}
-            </div>
-          </div>
+    <>
+      <Popover
+        side="top"
+        align="left"
+        open={panelOpen}
+        onOpenChange={setPanelOpen}
+        ariaLabel="Context usage"
+        panelClassName="w-[min(90vw,26rem)] max-h-[60vh] overflow-y-auto"
+        trigger={({ toggle }) => (
+          <button
+            type="button"
+            onClick={toggle}
+            title={
+              known
+                ? `${pct}% of ${status.model}'s context used`
+                : `Context usage is unknown for ${status.model}`
+            }
+            data-help="context-meter"
+            className="flex shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] border border-border2 px-2 py-1 text-xs text-ink4 hover:text-ink2"
+            style={
+              alerting
+                ? {
+                    color: "var(--st-due)",
+                    borderColor: "color-mix(in oklab, var(--st-due) 45%, var(--border2))",
+                  }
+                : undefined
+            }
+          >
+            {alerting && (
+              <span
+                aria-hidden
+                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{ background: "var(--st-due)" }}
+              />
+            )}
+            {minimal ? (
+              <span>Context full</span>
+            ) : (
+              <>
+                <span>Context</span>
+                <span className="font-mono">
+                  {known ? `${pct}%` : "—"}
+                  {showPower && known && status.used_tokens != null && status.context_window != null
+                    ? ` · ${formatTokens(status.used_tokens)}/${formatTokens(status.context_window)}`
+                    : ""}
+                </span>
+              </>
+            )}
+          </button>
         )}
-      </div>
+      >
+        <div className="p-2">
+          <p className="text-sm text-ink2">
+            {alerting
+              ? `This conversation is filling ${status.model}'s context (${known ? `${pct}%` : "—"}).`
+              : `${status.model}'s context is ${known ? `${pct}%` : "—"} full.`}
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {status.compress.available ? (
+              <Button variant="primary" onClick={handleCompress} disabled={compressing}>
+                {compressing ? "Compressing…" : "Compress"}
+              </Button>
+            ) : (
+              status.compress.reason && (
+                <span className="text-xs text-ink4">{status.compress.reason}</span>
+              )
+            )}
+            {status.upgrade.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {status.upgrade.map((m) => (
+                  <Button
+                    key={m.id}
+                    variant="secondary"
+                    onClick={() => {
+                      onUpgrade(m.id);
+                      setPanelOpen(false);
+                      // The host re-reads settings; refresh once the switch has landed.
+                      setTimeout(refresh, 0);
+                    }}
+                    title={`${m.name || m.id} · ${formatTokens(m.context_length)} context`}
+                  >
+                    Switch to {m.name || m.id} ({formatTokens(m.context_length)})
+                  </Button>
+                ))}
+              </div>
+            )}
+            {alerting && (
+              <Button variant="tertiary" onClick={handleContinue}>
+                Continue anyway
+              </Button>
+            )}
+          </div>
+        </div>
+      </Popover>
 
       {/* HITL verify: compression is already applied; show what was condensed so the user can Undo. */}
       <Modal open={preview != null} onClose={() => setPreview(null)} widthClassName="max-w-md">
@@ -247,6 +228,6 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
           </div>
         </div>
       </Modal>
-    </div>
+    </>
   );
 }

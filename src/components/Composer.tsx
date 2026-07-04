@@ -1,16 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useRef, useState } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { useRecorder } from "../lib/useRecorder";
 import { Button, Textarea } from "./ui";
 
 interface Props {
   disabled: boolean;
   onSend: (text: string) => void;
+  /** Compact chat tools shown on the input row itself (the context meter + retrieval-explain
+   *  triggers) — space-efficient alternative to full-width bars stacked above the composer.
+   *  Each renders its own popover; absent tools simply render nothing. */
+  tools?: ReactNode;
 }
 
-export function Composer({ disabled, onSend }: Props) {
+export function Composer({ disabled, onSend, tools }: Props) {
   const [text, setText] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -45,6 +49,7 @@ export function Composer({ disabled, onSend }: Props) {
     <div className="border-t border-border p-4">
       <div className="mx-auto max-w-3xl" data-help="chat-composer">
         <div className="flex items-end gap-2">
+          {tools && <div className="flex shrink-0 items-center gap-1.5">{tools}</div>}
           <button
             type="button"
             onClick={toggleMic}

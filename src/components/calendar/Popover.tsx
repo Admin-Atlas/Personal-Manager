@@ -16,22 +16,51 @@ interface Props {
   children: ReactNode | ((args: { close: () => void }) => ReactNode);
   /** Which edge the panel aligns to under the trigger. */
   align?: "left" | "right";
+  /** Which side of the trigger the panel opens on. "bottom" (default) drops down; "top" lifts it up —
+   *  for triggers pinned to the window's bottom edge, e.g. the chat composer row. */
+  side?: "top" | "bottom";
   panelClassName?: string;
   /** Accessible name for the panel — it's a `group` of controls (a checkbox list or a date grid),
    *  not a `menu` of menuitems, so screen readers shouldn't enter menu-navigation mode. */
   ariaLabel?: string;
+  /** Controlled open state. Pass with `onOpenChange` to drive the popover from the parent (so it can
+   *  gate effects on open or close it from an action inside). Omit for self-managed open state. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
-export function Popover({ trigger, children, align = "left", panelClassName, ariaLabel }: Props) {
-  const [open, setOpen] = useState(false);
+export function Popover({
+  trigger,
+  children,
+  align = "left",
+  side = "bottom",
+  panelClassName,
+  ariaLabel,
+  open: controlledOpen,
+  onOpenChange,
+}: Props) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const isControlled = controlledOpen !== undefined;
+  const open = isControlled ? controlledOpen : internalOpen;
   const rootRef = useRef<HTMLDivElement>(null);
   // The element focused when we opened, so Escape can hand focus back to the trigger (not the body).
   const restoreFocusRef = useRef<HTMLElement | null>(null);
 
-  const close = useCallback((restoreFocus: boolean) => {
-    setOpen(false);
-    if (restoreFocus && restoreFocusRef.current) restoreFocusRef.current.focus();
-  }, []);
+  const setOpen = useCallback(
+    (v: boolean) => {
+      if (!isControlled) setInternalOpen(v);
+      onOpenChange?.(v);
+    },
+    [isControlled, onOpenChange],
+  );
+
+  const close = useCallback(
+    (restoreFocus: boolean) => {
+      setOpen(false);
+      if (restoreFocus && restoreFocusRef.current) restoreFocusRef.current.focus();
+    },
+    [setOpen],
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -53,13 +82,14 @@ export function Popover({ trigger, children, align = "left", panelClassName, ari
 
   return (
     <div ref={rootRef} className="relative">
-      {trigger({ open, toggle: () => setOpen((v) => !v) })}
+      {trigger({ open, toggle: () => setOpen(!open) })}
       {open && (
         <div
           role="group"
           aria-label={ariaLabel}
           className={cn(
-            "absolute z-30 mt-1 min-w-[15rem] rounded-[var(--radius-sm)] border border-border2 bg-panel p-1 shadow-lg",
+            "absolute z-30 min-w-[15rem] rounded-[var(--radius-sm)] border border-border2 bg-panel p-1 shadow-lg",
+            side === "top" ? "bottom-full mb-1" : "mt-1",
             align === "right" ? "right-0" : "left-0",
             panelClassName,
           )}
