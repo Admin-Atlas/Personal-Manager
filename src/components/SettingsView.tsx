@@ -66,14 +66,7 @@ interface Props {
 
 /** The non-onboarding Settings tabs (left rail). Onboarding stays a single untabbed scroll. */
 type SettingsTab =
-  | "general"
-  | "ai"
-  | "search"
-  | "connectors"
-  | "data"
-  | "backup"
-  | "storage"
-  | "developer";
+  "general" | "ai" | "search" | "connectors" | "data" | "backup" | "storage" | "developer";
 
 const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },

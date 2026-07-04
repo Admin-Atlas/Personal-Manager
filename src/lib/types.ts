@@ -414,12 +414,7 @@ export interface DraftPreference {
 
 /** The one status a project shows in the focus view. Exactly one applies. */
 export type ProjectStatus =
-  | "due_soon"
-  | "blocked"
-  | "quick_win"
-  | "take_a_look"
-  | "part_of"
-  | "on_track";
+  "due_soon" | "blocked" | "quick_win" | "take_a_look" | "part_of" | "on_track";
 
 /** A rough effort estimate for a project ("quick" → Quick win), or unset. */
 export type ProjectSize = "quick" | "standard" | "large" | null;
