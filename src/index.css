@@ -151,6 +151,17 @@ body {
 .pm-markdown li {
   margin: 0.125rem 0;
 }
+/* GFM task lists (from a note's `[]` / `[x]` markers): drop the redundant bullet beside the
+   checkbox and give the box a little breathing room. :has covers the item whether or not the
+   sanitizer keeps the task-list class. The checkbox is disabled in rendered Markdown — toggle it
+   by editing the note's `[]`/`[x]`. */
+.pm-markdown li:has(input[type="checkbox"]) {
+  list-style: none;
+}
+.pm-markdown li input[type="checkbox"] {
+  margin-right: 0.4rem;
+  transform: translateY(1px);
+}
 .pm-markdown strong {
   color: var(--ink);
   font-weight: 600;
