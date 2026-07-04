@@ -358,8 +358,10 @@ fn summarize(body: &str) -> String {
 /// Content hash for an index-only document: the stable SOURCE id folded into the indexed text's
 /// digest. Two different sources that happen to share identical text stay TWO items (index-only
 /// dedup is by source id, never by content) and never collide on `documents.content_hash`'s UNIQUE
-/// constraint — unlike a vault import, where identical content IS the same document.
-fn pointer_content_hash(source_id: &str, indexed_text: &str) -> String {
+/// constraint — unlike a vault import, where identical content IS the same document. Also used by
+/// the note→vault ingest ([`crate::ingest::ingest_note_document`]), which dedups by `note:<widget_id>`
+/// for the same reason, so two notes with identical text stay distinct.
+pub(crate) fn pointer_content_hash(source_id: &str, indexed_text: &str) -> String {
     ingest::hex_digest(format!("{source_id}\u{0}{indexed_text}").as_bytes())
 }
 

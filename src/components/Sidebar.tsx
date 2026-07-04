@@ -46,6 +46,11 @@ interface Props {
   /** How many auto-switch fallbacks are configured behind each primary (0 = none). */
   chatFallbacks: number;
   backgroundFallbacks: number;
+  /** Live width (px) from the resize hook, and its drag handle + feedback (owned by App so the
+   *  collapsed reopen tab can render in the sidebar's place). */
+  width: number;
+  onStartResize: (e: React.PointerEvent) => void;
+  resizing: boolean;
 }
 
 export function Sidebar({
@@ -65,6 +70,9 @@ export function Sidebar({
   backgroundModel,
   chatFallbacks,
   backgroundFallbacks,
+  width,
+  onStartResize,
+  resizing,
 }: Props) {
   const { showMeta } = useDepth();
   // The Teach tab is a Depth-keyed feature reveal (hidden for the minimalist preset), overridable
@@ -82,7 +90,21 @@ export function Sidebar({
   // owns the mutation + list refresh).
   const [pendingMove, setPendingMove] = useState<Conversation | null>(null);
   return (
-    <aside className="flex h-full w-64 flex-col border-r border-border bg-panel">
+    <aside
+      style={{ width }}
+      className="relative flex h-full flex-col border-r border-border bg-panel"
+    >
+      {/* Right-edge grip: drag to resize; drag all the way to the window edge to snap it shut. */}
+      <div
+        onPointerDown={onStartResize}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        title="Drag to resize · drag to the edge to hide"
+        className={`absolute right-0 top-0 z-10 h-full w-1.5 cursor-col-resize touch-none transition-colors hover:bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] ${
+          resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
+        }`}
+      />
       <div className="flex items-center justify-between px-4 py-3">
         <div className="flex items-center gap-2">
           <span className="font-head text-sm font-semibold tracking-wide text-ink">PM</span>
@@ -256,17 +278,20 @@ export function Sidebar({
       )}
 
       <div className="border-t border-border p-2">
-        <button
-          onClick={onOpenSettings}
-          data-help="sidebar-models"
-          title="Models in use — click to change"
-          className="mb-1 w-full rounded-[var(--radius-sm)] px-3 py-1.5 text-left hover:bg-surface"
-        >
-          {showMeta && <ModelRow role="Chat" id={chatModel} fallbacks={chatFallbacks} />}
-          {showMeta && (
+        {/* The model footer is an optional feature reveal — hidden whole in Minimal mode. Gate the
+            entire button (not just the rows) so no empty, hover-highlighting ghost box is left
+            behind and the divider sits directly above "What's New". */}
+        {showMeta && (
+          <button
+            onClick={onOpenSettings}
+            data-help="sidebar-models"
+            title="Models in use — click to change"
+            className="mb-1 w-full rounded-[var(--radius-sm)] px-3 py-1.5 text-left hover:bg-surface"
+          >
+            <ModelRow role="Chat" id={chatModel} fallbacks={chatFallbacks} />
             <ModelRow role="Tasks" id={backgroundModel} fallbacks={backgroundFallbacks} />
-          )}
-        </button>
+          </button>
+        )}
         <button
           onClick={onOpenWhatsNew}
           className="w-full rounded-[var(--radius-sm)] px-3 py-2 text-left text-sm text-ink3 hover:bg-surface hover:text-ink"

@@ -150,7 +150,7 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
   return (
     <Popover
       side="top"
-      align="left"
+      align="right"
       open={open}
       onOpenChange={setOpen}
       ariaLabel="Explain retrieval"

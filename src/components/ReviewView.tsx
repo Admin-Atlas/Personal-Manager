@@ -11,6 +11,7 @@ import { ImportancePicker } from "./ImportancePicker";
 import { TagEditor } from "./TagEditor";
 import { ChatBadge } from "./ChatBadge";
 import { rankImportance } from "../lib/importance";
+import { useReader } from "../lib/reader";
 
 interface Props {
   /** Called after the queue changes so the parent can refresh the sidebar badge. */
@@ -307,18 +308,25 @@ function ReviewRow({
   onChange: (patch: Partial<Edit>) => void;
 }) {
   const { showPower } = useDepth();
+  // Open the same shared, app-level document reader the Documents tab and project file list use
+  // (mounted once via ReaderProvider) — click the title to read the document while triaging it.
+  const { openReader, current: readerDoc } = useReader();
   const value = edit ?? { project: doc.project, tags: doc.tags, importance: doc.importance };
 
   return (
     <li>
       <Card className="p-4" data-help="review-row">
         <div className="flex items-center gap-2">
-          <div
-            className="min-w-0 flex-1 truncate font-head text-sm font-medium text-ink"
-            title={doc.title}
+          <button
+            type="button"
+            onClick={() => openReader(doc)}
+            className={`-mx-1.5 min-w-0 flex-1 cursor-pointer truncate rounded-[var(--radius-sm)] px-1.5 py-0.5 text-left font-head text-sm font-medium transition-colors hover:bg-surface hover:text-accent-text ${
+              readerDoc?.id === doc.id ? "bg-accent-soft text-accent-text" : "text-ink"
+            }`}
+            title={`Open “${doc.title}”`}
           >
             {doc.title}
-          </div>
+          </button>
           {doc.source_type === "chat" && <ChatBadge />}
         </div>
         {proposal?.reasoning ? (

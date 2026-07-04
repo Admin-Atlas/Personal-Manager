@@ -33,6 +33,32 @@ function formatTokens(n: number): string {
   return `${n}`;
 }
 
+/** A small circular gauge that fills clockwise with context usage — the Claude-Code context
+ *  indicator, rendered from design tokens (accent fill on a border2 track; --st-due when alerting).
+ *  The exact percent stays in the trigger's title tooltip, so the ring carries the at-a-glance signal. */
+function FillRing({ pct, alerting }: { pct: number; alerting: boolean }) {
+  const r = 6;
+  const circumference = 2 * Math.PI * r;
+  const filled = Math.max(0, Math.min(1, pct / 100));
+  return (
+    <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0" aria-hidden="true">
+      <circle cx="8" cy="8" r={r} fill="none" stroke="var(--border2)" strokeWidth="2.5" />
+      <circle
+        cx="8"
+        cy="8"
+        r={r}
+        fill="none"
+        stroke={alerting ? "var(--st-due)" : "var(--accent)"}
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeDasharray={circumference}
+        strokeDashoffset={circumference * (1 - filled)}
+        transform="rotate(-90 8 8)"
+      />
+    </svg>
+  );
+}
+
 export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
   const { minimal, showPower } = useDepth();
   const [status, setStatus] = useState<ContextStatus | null>(null);
@@ -145,12 +171,19 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
             ) : (
               <>
                 <span>Context</span>
-                <span className="font-mono">
-                  {known ? `${pct}%` : "—"}
-                  {showPower && known && status.used_tokens != null && status.context_window != null
-                    ? ` · ${formatTokens(status.used_tokens)}/${formatTokens(status.context_window)}`
-                    : ""}
-                </span>
+                {known ? (
+                  <FillRing pct={pct} alerting={alerting} />
+                ) : (
+                  <span className="font-mono">—</span>
+                )}
+                {showPower &&
+                  known &&
+                  status.used_tokens != null &&
+                  status.context_window != null && (
+                    <span className="font-mono">
+                      {formatTokens(status.used_tokens)}/{formatTokens(status.context_window)}
+                    </span>
+                  )}
               </>
             )}
           </button>

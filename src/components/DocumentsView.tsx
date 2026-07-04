@@ -503,7 +503,7 @@ export function DocumentsView({ onReviewClick }: Props) {
       </header>
 
       <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-3xl px-6 py-6">
+        <div className="px-6 py-6">
           {unreviewed > 0 && onReviewClick && (
             <button
               onClick={onReviewClick}
@@ -727,16 +727,26 @@ export function DocumentsView({ onReviewClick }: Props) {
             {documents.length === 0 ? (
               <p className="text-sm text-ink4">No documents yet.</p>
             ) : (
-              <table className="w-full text-left text-sm">
+              // table-fixed + explicit column widths: the Title column takes the leftover space and
+              // truncates long titles/source paths instead of forcing the whole table (and page) to
+              // scroll sideways. The metadata columns are sized to their content.
+              <table className="w-full table-fixed text-left text-sm">
                 <thead className="font-mono text-xs uppercase tracking-wide text-ink3">
                   <tr className="border-b border-border">
                     <SortHeader label="Title" sortKey="title" sort={sort} onSort={toggleSort} />
-                    <SortHeader label="Project" sortKey="project" sort={sort} onSort={toggleSort} />
+                    <SortHeader
+                      label="Project"
+                      sortKey="project"
+                      sort={sort}
+                      onSort={toggleSort}
+                      widthClass="w-40"
+                    />
                     <SortHeader
                       label="Importance"
                       sortKey="importance"
                       sort={sort}
                       onSort={toggleSort}
+                      widthClass="w-28"
                     />
                     <SortHeader
                       label="Chunks"
@@ -744,6 +754,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                       sort={sort}
                       onSort={toggleSort}
                       align="right"
+                      widthClass="w-20"
                     />
                     {showPower && (
                       <SortHeader
@@ -752,6 +763,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                         sort={sort}
                         onSort={toggleSort}
                         align="right"
+                        widthClass="w-32"
                       />
                     )}
                   </tr>
@@ -767,7 +779,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                       >
                         <td className="py-2 pr-3">
                           <div className="flex items-center gap-2">
-                            <div className="truncate text-ink" title={doc.title}>
+                            <div className="min-w-0 flex-1 truncate text-ink" title={doc.title}>
                               {doc.title}
                             </div>
                             {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
@@ -993,16 +1005,19 @@ function SortHeader({
   sort,
   onSort,
   align,
+  widthClass,
 }: {
   label: string;
   sortKey: SortKey;
   sort: DocSort | null;
   onSort: (key: SortKey) => void;
   align?: "right";
+  /** Fixed column width (Tailwind class) for the table-fixed layout; omit to take the leftover space. */
+  widthClass?: string;
 }) {
   const active = sort?.key === sortKey;
   return (
-    <th className={`py-2 font-medium ${align === "right" ? "text-right" : ""}`}>
+    <th className={`py-2 font-medium ${widthClass ?? ""} ${align === "right" ? "text-right" : ""}`}>
       <button
         type="button"
         onClick={() => onSort(sortKey)}

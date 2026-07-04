@@ -801,6 +801,263 @@ pub fn promote_spreadsheet(
     load_document(&conn, doc_id)
 }
 
+/// Ingest (or re-ingest) a pinboard note as a REAL vault Markdown document. The note is already
+/// Markdown, so it is written to the vault like any document — the FULL body in a `.md`/`.pmenc`
+/// file, real chunk text, full-text FTS — not an index-only pointer that keeps only a 500-char
+/// summary. This is what makes a note survive its own deletion: the body lives in the vault, and a
+/// Rebuild reproduces it losslessly from disk.
+///
+/// Identity is the note's stable `source_id` (`note:<widget_id>`), folded into `content_hash`
+/// ([`crate::index_only::pointer_content_hash`]) so two notes with identical text stay distinct and
+/// an edit-then-revert is a clean no-op. Three cases, keyed off the existing row for this source id:
+///   * **none** — a fresh ingest (project `Unsorted`, unreviewed), into the review queue;
+///   * **an existing vault note** — rewrite the SAME vault file and re-embed in place, KEEPING its
+///     project / tags / importance / reviewed (the "Re-ingest edits" affordance);
+///   * **a legacy `index_only` note** (shipped in v2.89.0-alpha #214) — promote it in place: materialise
+///     the vault `.md`, swap the summary chunk for the real leaves, clear the index-only-only columns,
+///     keep the filing, and drop the manifest pointer so it can't be resurrected as a ghost.
+///
+/// Nothing reconciles a `note:` source, so the document is standalone; the vault filename is the
+/// stable widget id, so an edit overwrites the same file instead of orphaning one per revision.
+///
+/// The existing document for a note's `source_id`, with the filing to carry forward on re-ingest.
+struct ExistingNote {
+    doc_id: i64,
+    source_type: String,
+    content_hash: String,
+    project: String,
+    tags: Vec<String>,
+    importance: Option<String>,
+    reviewed: bool,
+    created_at: Option<String>,
+    vault_path: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_note_document(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    vault_root: &Path,
+    manifest_cipher: &crate::index_only::ManifestCipher,
+    widget_id: &str,
+    title: &str,
+    body: &str,
+) -> Result<Document> {
+    let source_id = format!("note:{widget_id}");
+    let content_hash = crate::index_only::pointer_content_hash(&source_id, body);
+
+    // The existing document for this note, if any — across source types (a fresh `vault` note or a
+    // legacy `index_only` pointer from #214). Read the filing so an update/promote can preserve it.
+    let existing: Option<ExistingNote> = {
+        let conn = state.conn()?;
+        match conn.query_row(
+            "SELECT id, source_type, content_hash, project, tags, importance, reviewed, created_at, \
+                    vault_path \
+             FROM documents WHERE source_id = ?1",
+            params![source_id],
+            |r| {
+                let tags_json: String = r.get(4)?;
+                Ok(ExistingNote {
+                    doc_id: r.get(0)?,
+                    source_type: r.get(1)?,
+                    content_hash: r.get(2)?,
+                    project: r.get(3)?,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    importance: r.get(5)?,
+                    reviewed: r.get::<_, i64>(6)? != 0,
+                    created_at: r.get(7)?,
+                    vault_path: r.get(8)?,
+                })
+            },
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    // Unchanged and already a full vault note → nothing to do (the idempotency guarantee).
+    if let Some(e) = &existing {
+        if e.source_type == SOURCE_TYPE_VAULT && e.content_hash == content_hash {
+            let conn = state.conn()?;
+            return load_document(&conn, e.doc_id);
+        }
+    }
+
+    // Chunk + embed the full body off the lock, like a fresh ingest.
+    let chunks = split_document(gateway, body, title, &content_hash)?;
+    let texts = leaf_embed_texts(&chunks);
+    let embeddings = gateway.embed_documents(&texts)?;
+    check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
+
+    let now = {
+        let conn = state.conn()?;
+        iso_now(&conn)?
+    };
+
+    // Keep an existing note's filing; a fresh note starts unsorted in the review queue.
+    let (project, tags, importance, reviewed, created_at, old_vault_path) = match &existing {
+        Some(e) => (
+            e.project.clone(),
+            e.tags.clone(),
+            e.importance.clone(),
+            e.reviewed,
+            e.created_at.clone().unwrap_or_else(|| now.clone()),
+            Some(e.vault_path.clone()),
+        ),
+        None => (
+            "Unsorted".into(),
+            Vec::new(),
+            None,
+            false,
+            now.clone(),
+            None,
+        ),
+    };
+
+    // Name the file by the stable widget id so an edit overwrites the same file.
+    let vault_name = cipher.on_disk_name(&format!("note-{widget_id}.md"));
+    let vault_file = vault.join(&vault_name);
+    // If we're overwriting an existing note's file in place, snapshot its bytes first so a failed DB
+    // half can restore them — the vault file must never diverge from the (rolled-back) DB row it
+    // mirrors, or a later Rebuild would bake the divergence in.
+    let overwrote_existing_file = old_vault_path
+        .as_deref()
+        .is_some_and(|p| p == vault_name && !p.starts_with("idx://"));
+    let prior_bytes = if overwrote_existing_file {
+        std::fs::read(&vault_file).ok()
+    } else {
+        None
+    };
+
+    // Write the vault truth (full body) before touching the DB, carrying the note's `source_id` claim so
+    // a Rebuild re-links it to the board.
+    let front = Frontmatter {
+        title,
+        source_path: "",
+        ext: Some("md"),
+        content_hash: &content_hash,
+        created_at: &created_at,
+        ingested_at: &now,
+        project: &project,
+        tags: &tags,
+        importance: importance.as_deref(),
+        last_activity: &now,
+        reviewed,
+        photo: None,
+        spreadsheet: None,
+        source_id: Some(&source_id),
+        external_ref: None,
+    };
+    cipher.write_to(&vault_file, &render_markdown(&front, body))?;
+
+    let result = (|| -> Result<Document> {
+        match &existing {
+            None => {
+                // Fresh: guard against a content_hash clash with an unrelated document, then index.
+                {
+                    let conn = state.conn()?;
+                    let clashes: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM documents WHERE content_hash = ?1",
+                            params![content_hash],
+                            |_| Ok(()),
+                        )
+                        .optional_exists()?;
+                    if clashes {
+                        return Err(Error::Other(
+                            "A document with identical text is already ingested.".into(),
+                        ));
+                    }
+                }
+                let meta = DocMeta {
+                    source_path: None,
+                    vault_path: vault_name.clone(),
+                    title: title.to_string(),
+                    content_hash: content_hash.clone(),
+                    ext: Some("md".into()),
+                    byte_size: None,
+                    created_at: Some(created_at.clone()),
+                    last_activity: Some(now.clone()),
+                    ingested_at: now.clone(),
+                    project: project.clone(),
+                    tags: tags.clone(),
+                    importance: importance.clone(),
+                    reviewed,
+                    source: SourceMeta {
+                        source_id: Some(source_id.clone()),
+                        ..SourceMeta::default()
+                    },
+                };
+                index_document(state, &meta, &chunks, &embeddings, None, None)
+            }
+            Some(e) => {
+                let doc_id = e.doc_id;
+                // Update or promote in place (same id → keeps entity link + any citations): swap the
+                // chunks for the real leaves and clear the index-only-only columns, KEEPING the filing.
+                let mut conn = state.conn()?;
+                let tx = conn.transaction()?;
+                replace_chunks(&tx, doc_id, &chunks, &embeddings, false, None)?;
+                tx.execute(
+                    "UPDATE documents SET source_type = ?2, source_state = ?3, vault_path = ?4, \
+                            content_hash = ?5, ext = ?6, title = ?7, byte_size = NULL, \
+                            source_path = NULL, stored_summary = NULL, source_modified_at = NULL, \
+                            source_content_hash = NULL, source_parent_folder_id = NULL, \
+                            source_parent_folder_name = NULL, ingested_at = ?8, last_activity = ?8 \
+                     WHERE id = ?1",
+                    params![
+                        doc_id,
+                        SOURCE_TYPE_VAULT,
+                        SOURCE_STATE_OK,
+                        vault_name,
+                        content_hash,
+                        "md",
+                        title,
+                        now,
+                    ],
+                )?;
+                tx.commit()?;
+                load_document(&conn, doc_id)
+            }
+        }
+    })();
+
+    let document = match result {
+        Ok(d) => d,
+        Err(e) => {
+            // The DB half rolled back (or never ran). Put the vault file back exactly as the DB still
+            // sees it: restore the prior bytes when we overwrote an existing note, else remove the
+            // freshly-written file. Keeps file and DB consistent — no divergence a Rebuild would bake in.
+            match prior_bytes {
+                Some(bytes) => {
+                    let _ = std::fs::write(&vault_file, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&vault_file);
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    // A promoted legacy note must be stripped from the encrypted manifest so the DB-∪-file union can't
+    // resurrect it as an index-only ghost. AFTER the commit (mirror already excludes it). Idempotent.
+    if matches!(&existing, Some(e) if e.source_type == SOURCE_TYPE_INDEX_ONLY) {
+        crate::index_only::forget_source(vault_root, manifest_cipher, &source_id)?;
+    }
+    // Remove a stale prior vault file if the on-disk name changed (a vault re-key) — never a synthetic
+    // index-only path (`idx://…`), which isn't a file.
+    if let Some(old) = old_vault_path {
+        if old != vault_name && !old.starts_with("idx://") {
+            let _ = std::fs::remove_file(vault.join(&old));
+        }
+    }
+
+    Ok(document)
+}
+
 /// Copy a photo's original bytes into `vault/photos/<hash>.<ext>` following the vault cipher (so an
 /// encrypted vault keeps the image encrypted at rest). Returns the vault-relative on-disk path stored
 /// on the `photos` row. Named by content hash so re-saving the same image is idempotent.
@@ -1042,7 +1299,15 @@ fn rebuild_one(
                 ..SourceMeta::spreadsheet()
             }
         } else {
-            SourceMeta::default()
+            // A plain vault document may still carry a source claim — a pinboard note keyed
+            // `note:<widget_id>` (so the board re-links and a re-ingest updates in place instead of
+            // duplicating), or any future locally-stored source. Round-trip it. A hand-imported local
+            // file has no `source_id` line, so this stays a bare vault document exactly as before.
+            SourceMeta {
+                source_id: fields.get("source_id").cloned(),
+                external_ref: fields.get("external_ref").cloned(),
+                ..SourceMeta::default()
+            }
         },
     };
     index_document(

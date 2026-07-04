@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getPref, setPref } from "../ipc";
-import { clampRect, findFreeRect } from "./grid";
+import { clampRect, COLS, findFreeRect, ROWS } from "./grid";
 import {
   BOARD_VERSION,
   EMPTY_BOARD,
@@ -50,7 +50,11 @@ function isValidWidget(w: unknown): w is Widget {
   );
 }
 
-function parseBoard(raw: string | null): Board {
+/** A generous absolute cap (cells) so a corrupt/hand-edited pref can't blow the board up to a
+ *  pathological size, while still dwarfing any real (even multi-monitor) layout. */
+const MAX_BOARD_CELLS = 512;
+
+function parseBoard(raw: string | null, cols: number, rows: number): Board {
   if (!raw) return EMPTY_BOARD;
   try {
     const parsed = JSON.parse(raw) as Board;
@@ -59,9 +63,17 @@ function parseBoard(raw: string | null): Board {
     if (!parsed || parsed.version !== BOARD_VERSION || !Array.isArray(parsed.widgets)) {
       return EMPTY_BOARD;
     }
-    const widgets = parsed.widgets
-      .filter(isValidWidget)
-      .map((w) => ({ ...w, rect: clampRect(w.rect) }));
+    const valid = parsed.widgets.filter(isValidWidget);
+    // Expand the clamp bounds to contain every already-valid widget (capped), so a board authored on
+    // a larger screen isn't snapped inward when reopened on a smaller one — the board just scrolls to
+    // reach it. A single widget beyond the sane cap is still clamped, guarding a corrupt pref.
+    let boundCols = cols;
+    let boundRows = rows;
+    for (const w of valid) {
+      boundCols = Math.max(boundCols, Math.min(w.rect.x + w.rect.w, MAX_BOARD_CELLS));
+      boundRows = Math.max(boundRows, Math.min(w.rect.y + w.rect.h, MAX_BOARD_CELLS));
+    }
+    const widgets = valid.map((w) => ({ ...w, rect: clampRect(w.rect, boundCols, boundRows) }));
     return { version: BOARD_VERSION, widgets };
   } catch {
     return EMPTY_BOARD;
@@ -69,10 +81,17 @@ function parseBoard(raw: string | null): Board {
 }
 
 /** Board state + the mutators the view needs. Loads once from the store on mount and
- *  re-persists every change. */
-export function usePinboard() {
+ *  re-persists every change. `bounds` is the board's maximum cell extent (the screen size —
+ *  see PinboardView): stored widgets are clamped to it on load and new widgets placed within it,
+ *  so a widget dragged into the enlarged board survives a reload instead of snapping back. */
+export function usePinboard(bounds: { cols: number; rows: number } = { cols: COLS, rows: ROWS }) {
   const [board, setBoard] = useState<Board>(EMPTY_BOARD);
   const loaded = useRef(false);
+  // Read through a ref so the mount-only load effect and the stable mutators always see the
+  // current bounds without re-subscribing (bounds is derived from the fixed screen size, so it
+  // doesn't actually change, but this keeps the hooks honest).
+  const boundsRef = useRef(bounds);
+  boundsRef.current = bounds;
 
   // Load the stored board once. Until this resolves, `loaded` stays false so the persist
   // effect below won't write the empty default over a real board.
@@ -80,7 +99,7 @@ export function usePinboard() {
     let cancelled = false;
     getPref(PREF_KEY)
       .then((raw) => {
-        if (!cancelled) setBoard(parseBoard(raw));
+        if (!cancelled) setBoard(parseBoard(raw, boundsRef.current.cols, boundsRef.current.rows));
       })
       .catch(() => {
         /* store not ready — keep the empty board */
@@ -102,7 +121,7 @@ export function usePinboard() {
 
   const addNote = useCallback(() => {
     setBoard((b) => {
-      const rect = findFreeRect(b.widgets, 7, 5);
+      const rect = findFreeRect(b.widgets, 7, 5, boundsRef.current.cols, boundsRef.current.rows);
       const widget: Widget = { id: makeId(), kind: "note", rect, text: "", color: "st-quick" };
       return { ...b, widgets: [...b.widgets, widget] };
     });
@@ -110,7 +129,7 @@ export function usePinboard() {
 
   const addTimeline = useCallback(() => {
     setBoard((b) => {
-      const rect = findFreeRect(b.widgets, 9, 8);
+      const rect = findFreeRect(b.widgets, 9, 8, boundsRef.current.cols, boundsRef.current.rows);
       const widget: Widget = { id: makeId(), kind: "timeline", rect, title: "Timeline", items: [] };
       return { ...b, widgets: [...b.widgets, widget] };
     });

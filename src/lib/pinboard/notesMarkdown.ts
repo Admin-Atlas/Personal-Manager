@@ -164,3 +164,140 @@ export function toRenderMarkdown(raw: string): string {
     })
     .join("\n");
 }
+
+// --- toolbar / keyboard formatting helpers (pure) -------------------------------------------
+// Back the note editor's formatting buttons and their keyboard shortcuts. Each returns the new
+// text plus the selection to restore, so the caller round-trips through the controlled <textarea>
+// without touching the DOM. They emit the note's shorthand dialect so continueList/toRenderMarkdown
+// keep working.
+
+export interface TextEdit {
+  text: string;
+  selStart: number;
+  selEnd: number;
+}
+
+export type LineMarkerKind = "bullet" | "number" | "checkbox" | "heading" | "quote";
+
+/** The marker each kind writes (number counts up per line, so it's templated below). */
+const LINE_PREFIX: Record<Exclude<LineMarkerKind, "number">, string> = {
+  bullet: "- ",
+  checkbox: "[] ",
+  heading: "# ",
+  quote: "> ",
+};
+
+/** Length of the given kind's marker at the start of a line (incl. indent + trailing space), or 0. */
+const MARKER_LEN_RE: Record<LineMarkerKind, RegExp> = {
+  bullet: /^(\s*)- /,
+  number: /^(\s*)\d+\. /,
+  checkbox: /^(\s*)\[[ xX]?\] /,
+  heading: /^(\s*)#{1,6} /,
+  quote: /^(\s*)> /,
+};
+
+function markerLen(line: string, kind: LineMarkerKind): number {
+  return MARKER_LEN_RE[kind].exec(line)?.[0].length ?? 0;
+}
+
+/** Split a line into its indent and its content, stripping a leading heading OR any list marker so
+ *  one kind can be swapped for another cleanly. */
+function splitMarker(line: string): { indent: string; content: string } {
+  const indent = /^\s*/.exec(line)?.[0] ?? "";
+  const rest = line.slice(indent.length);
+  const heading = /^#{1,6}\s+/.exec(rest);
+  if (heading) return { indent, content: rest.slice(heading[0].length) };
+  const m = matchMarker(line);
+  if (m) return { indent: m.indent, content: m.content };
+  return { indent, content: rest };
+}
+
+/**
+ * Toggle a line-level marker across every line the selection touches. If all non-blank lines already
+ * carry the marker it's removed; otherwise any existing marker is swapped for this one (indent kept).
+ */
+export function applyLineMarker(
+  value: string,
+  selStart: number,
+  selEnd: number,
+  kind: LineMarkerKind,
+): TextEdit {
+  const collapsed = selStart === selEnd;
+  const blockStart = value.lastIndexOf("\n", selStart - 1) + 1;
+  // A selection ending exactly at the start of the next line shouldn't pull that line in (standard
+  // editor convention) — scan for the block's end from just before that boundary newline instead.
+  const scanFrom = !collapsed && value[selEnd - 1] === "\n" ? selEnd - 1 : selEnd;
+  const nextNl = value.indexOf("\n", scanFrom);
+  const blockEnd = nextNl === -1 ? value.length : nextNl;
+  const lines = value.slice(blockStart, blockEnd).split("\n");
+
+  const nonBlank = lines.filter((l) => l.trim() !== "");
+  const allMarked = nonBlank.length > 0 && nonBlank.every((l) => markerLen(l, kind) > 0);
+  // Skip blank lines only when the block has real content (don't mark the gaps in a multi-line
+  // selection). If the whole block is blank — an empty note or an empty line — still add the marker so
+  // a list can be STARTED there; otherwise the button/shortcut would be a dead no-op.
+  const skipBlank = nonBlank.length > 0;
+
+  let n = 1;
+  const out = lines.map((line) => {
+    if (skipBlank && line.trim() === "") return line;
+    if (allMarked) {
+      const indent = /^\s*/.exec(line)?.[0] ?? "";
+      return indent + line.slice(markerLen(line, kind));
+    }
+    const { indent, content } = splitMarker(line);
+    const prefix = kind === "number" ? `${n++}. ` : LINE_PREFIX[kind];
+    return `${indent}${prefix}${content}`;
+  });
+
+  const block = out.join("\n");
+  return {
+    text: value.slice(0, blockStart) + block + value.slice(blockEnd),
+    // A collapsed caret becomes a caret at the end of the (now-marked) line so typing continues
+    // naturally; a real selection stays selected over the affected block.
+    selStart: collapsed ? blockStart + block.length : blockStart,
+    selEnd: blockStart + block.length,
+  };
+}
+
+/**
+ * Toggle an inline wrap (bold `**`, italic `*`, code `` ` ``) around the selection. Unwraps when
+ * already wrapped; with a collapsed caret, inserts the pair and puts the caret between.
+ */
+export function toggleWrap(
+  value: string,
+  selStart: number,
+  selEnd: number,
+  delim: string,
+): TextEdit {
+  const inner = value.slice(selStart, selEnd);
+  const before = value.slice(Math.max(0, selStart - delim.length), selStart);
+  const after = value.slice(selEnd, selEnd + delim.length);
+  // Only treat the selection as already-wrapped when EXACTLY `delim` sits on each side — not when
+  // those chars belong to a longer run of the same marker (e.g. italic `*` selected inside bold
+  // `**foo**`, where a naive unwrap would strip one of the bold asterisks). Guard against a same-char
+  // neighbour just outside the candidate delimiters.
+  const runChar = delim[0];
+  const outerBefore = value[selStart - delim.length - 1] ?? "";
+  const outerAfter = value[selEnd + delim.length] ?? "";
+  if (before === delim && after === delim && outerBefore !== runChar && outerAfter !== runChar) {
+    return {
+      text: value.slice(0, selStart - delim.length) + inner + value.slice(selEnd + delim.length),
+      selStart: selStart - delim.length,
+      selEnd: selEnd - delim.length,
+    };
+  }
+  if (inner) {
+    return {
+      text: value.slice(0, selStart) + delim + inner + delim + value.slice(selEnd),
+      selStart: selStart + delim.length,
+      selEnd: selEnd + delim.length,
+    };
+  }
+  const pos = selStart + delim.length;
+  return {
+    text: value.slice(0, selStart) + delim + delim + value.slice(selEnd),
+    selStart: pos,
+    selEnd: pos,
+  };
+}

@@ -39,8 +39,11 @@ export function Modal({
   if (!open) return null;
 
   return (
+    // Start below the custom title bar (top-9 = its h-9) so the frameless window's drag region and
+    // min/max/close controls stay visible and clickable while a modal is open — same convention as
+    // DocumentReader. The scrim never covers the top chrome.
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-6"
+      className="fixed inset-x-0 bottom-0 top-9 z-50 flex items-center justify-center p-6"
       style={{ background: "rgba(8,6,4,0.5)" }}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
