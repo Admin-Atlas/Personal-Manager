@@ -31,6 +31,12 @@ export interface Widget {
   color?: string;
   // note
   text?: string;
+  /** Set once a note has been ingested as a document (ISO time). The document is keyed on the
+   *  widget id (`note:<id>`) and lives independently — deleting the note never removes it. */
+  ingestedAt?: string;
+  /** A cheap client-side hash of the note text at last ingest, so the UI can offer "re-ingest
+   *  edits" when the text has since changed. Not the backend content hash. */
+  ingestedHash?: string;
   // timeline
   title?: string;
   items?: TimelineItem[];

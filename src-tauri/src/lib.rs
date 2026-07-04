@@ -756,6 +756,7 @@ pub fn run() {
             commands::ensure_sidecar,
             commands::ingest_paths,
             commands::rebuild_index,
+            commands::ingest_note,
             #[cfg(debug_assertions)]
             commands::dev_apply_change_event,
             commands::list_documents,

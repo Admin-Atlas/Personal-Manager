@@ -1720,6 +1720,135 @@ pub async fn dev_apply_change_event(
     .map_err(|e| Error::Other(format!("dev change task panicked: {e}")))?
 }
 
+/// What a pinboard note became after ingest — enough for the board to show "in review" / "filed
+/// to X" without a second query. `source_id` is `note:<widget_id>`; the document lives on its own
+/// (nothing reconciles a `note:` source) so it survives the note being deleted.
+#[derive(Serialize)]
+pub struct NoteIngest {
+    pub source_id: String,
+    pub document_id: i64,
+    pub reviewed: bool,
+    pub project: String,
+}
+
+/// The title for a note-derived document: its first non-blank line, trimmed and capped by
+/// characters (never splitting a codepoint), else a friendly fallback. Pure — see tests.
+fn derive_title(body: &str) -> String {
+    const MAX: usize = 80;
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.is_empty() {
+        return "Untitled note".into();
+    }
+    let mut out: String = line.chars().take(MAX).collect();
+    if line.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
+
+/// Ingest a pinboard note's text as an index-only document, so it flows through the
+/// review → proposal → project-importance pipeline and then shows in Documents / Focus / the
+/// briefing like any document. Keyed on the note's widget id (`note:<widget_id>`), so it's
+/// idempotent: an unchanged re-ingest is a no-op, and an edited note re-embeds in place, KEEPING
+/// whatever project / tags / importance it was filed under. The document is standalone — no
+/// reconcile watches a `note:` source — so deleting the note never removes what was ingested.
+#[tauri::command]
+pub async fn ingest_note(app: AppHandle, widget_id: String, text: String) -> Result<NoteIngest> {
+    tokio::task::spawn_blocking(move || -> Result<NoteIngest> {
+        let body = text.trim();
+        if body.is_empty() {
+            return Err(Error::Other(
+                "this note is empty — nothing to ingest".into(),
+            ));
+        }
+        let body = body.to_string();
+        let source_id = format!("note:{widget_id}");
+
+        let state = app.state::<AppState>();
+        state.sidecar.ensure_installed()?;
+        let gateway = {
+            let conn = state.conn()?;
+            state.gateway(&conn)?
+        };
+        let (vault_root, manifest_cipher) = state.manifest_io()?;
+
+        // The item's current persisted state for the reducer (`None` if never ingested).
+        let current: Option<(Option<String>, Option<String>, String)> = {
+            let conn = state.conn()?;
+            match conn.query_row(
+                "SELECT source_modified_at, source_content_hash, source_state \
+                 FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
+                params![source_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ) {
+                Ok(row) => Some(row),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let now = {
+            let conn = state.conn()?;
+            ingest::iso_now(&conn)?
+        };
+        let new_hash = ingest::hex_digest(body.as_bytes());
+
+        // One Update event: the pure reducer picks IngestNew (unseen) / ReEmbed (edited — keeps the
+        // filing) / Noop (unchanged). This is the idempotency guarantee — never call register_pointer
+        // directly on a re-ingest (documents.content_hash is UNIQUE, so a second call would throw).
+        let event = index_only::ChangeEvent::Update {
+            source_id: source_id.clone(),
+            modified_at: Some(now.clone()),
+            new_content_hash: Some(new_hash.clone()),
+        };
+        let input = index_only::PointerInput {
+            source_id: source_id.clone(),
+            title: derive_title(&body),
+            external_ref: None,
+            source_modified_at: Some(now.clone()),
+            source_content_hash: Some(new_hash),
+            body,
+            source_parent_folder_id: None,
+            source_parent_folder_name: None,
+        };
+        let item_state = current.map(|(smod, shash, sstate)| index_only::ItemState {
+            source_id: source_id.clone(),
+            source_modified_at: smod,
+            source_content_hash: shash,
+            source_state: index_only::SourceState::from_db(&sstate),
+        });
+        let actions = index_only::react(event, item_state.as_ref());
+        index_only::apply_actions(
+            &state,
+            &gateway,
+            &vault_root,
+            &manifest_cipher,
+            &actions,
+            Some(&input),
+        )?;
+
+        // Read back what the note became so the UI can show "in review" / "filed to X".
+        let conn = state.conn()?;
+        let (document_id, reviewed, project): (i64, bool, String) = conn.query_row(
+            "SELECT id, reviewed, project FROM documents \
+             WHERE source_id = ?1 AND source_type = 'index_only'",
+            params![source_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(NoteIngest {
+            source_id,
+            document_id,
+            reviewed,
+            project,
+        })
+    })
+    .await
+    .map_err(|e| Error::Other(format!("ingest note task panicked: {e}")))?
+}
+
 #[tauri::command]
 pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<Document>> {
     let conn = state.conn()?;
@@ -8339,6 +8468,30 @@ pub fn set_backup_destinations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_title_takes_first_non_blank_line_capped() {
+        // First non-blank line, trimmed.
+        assert_eq!(derive_title("  Buy milk\nand eggs"), "Buy milk");
+        assert_eq!(
+            derive_title("\n\n   Second para is the title"),
+            "Second para is the title"
+        );
+        // Empty / whitespace-only → a friendly fallback (register_pointer also rejects empty bodies).
+        assert_eq!(derive_title(""), "Untitled note");
+        assert_eq!(derive_title("   \n  \n"), "Untitled note");
+        // Long first line is capped by characters with an ellipsis (never splitting a codepoint).
+        let long = "x".repeat(100);
+        let title = derive_title(&long);
+        assert_eq!(title.chars().count(), 81); // 80 chars + the ellipsis
+        assert!(title.ends_with('…'));
+        // A multi-byte first line is capped by chars, not bytes — no panic, no split codepoint.
+        let emoji = "🌍".repeat(100);
+        assert_eq!(
+            derive_title(&emoji).chars().filter(|c| *c == '🌍').count(),
+            80
+        );
+    }
 
     #[test]
     fn open_external_url_allows_only_http_schemes() {

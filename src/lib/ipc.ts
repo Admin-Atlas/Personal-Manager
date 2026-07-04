@@ -338,6 +338,21 @@ export const ensureSidecar = () => invoke<void>("ensure_sidecar");
 
 export const listDocuments = () => invoke<Document[]>("list_documents");
 
+/** What a pinboard note became after ingest (source id `note:<widgetId>`). */
+export interface NoteIngest {
+  source_id: string;
+  document_id: number;
+  reviewed: boolean;
+  project: string;
+}
+
+/** Ingest a pinboard note's text as an index-only document — it flows through review → proposal →
+ *  project-importance like any doc. Idempotent on the widget id: an unchanged re-ingest is a no-op,
+ *  an edited note re-embeds in place keeping its filing. The document persists if the note is
+ *  deleted. */
+export const ingestNote = (widgetId: string, text: string) =>
+  invoke<NoteIngest>("ingest_note", { widgetId, text });
+
 /**
  * Dev-only (debug builds): drive the index-only substrate (board card 3) through its reducer without
  * a real connector. `kind` is "add" (ingest `body` as a new index-only item titled `title`), "update"
