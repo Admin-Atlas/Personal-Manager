@@ -668,13 +668,20 @@ export default function App() {
                   onOpenChatCitation={openChatCitation}
                   focusTurn={focusTurn}
                 />
-                <ContextMeter
-                  conversationId={activeId}
-                  refreshKey={chat.messages.length}
-                  onUpgrade={handleUpgrade}
+                <Composer
+                  disabled={chat.sending}
+                  onSend={handleSend}
+                  tools={
+                    <>
+                      <ContextMeter
+                        conversationId={activeId}
+                        refreshKey={chat.messages.length}
+                        onUpgrade={handleUpgrade}
+                      />
+                      <RetrievalExplainPanel messages={chat.messages} />
+                    </>
+                  }
                 />
-                <RetrievalExplainPanel messages={chat.messages} />
-                <Composer disabled={chat.sending} onSend={handleSend} />
               </main>
             )}
 

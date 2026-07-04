@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.85.0-alpha",
+    date: "2026-07-04",
+    highlights: [
+      "The chat input is tidier. The two strips that used to stack above the message box — the context-window meter and “Explain retrieval” — are now compact buttons on the input row itself, each opening the same panel just above it when you need it. Same information and controls, less space taken up, so more of the window is your conversation. The context button still turns red and nudges you when a conversation is filling the model's window, and Explain retrieval still only appears on the Standard and Power presets.",
+    ],
+  },
+  {
     version: "2.84.0-alpha",
     date: "2026-07-04",
     highlights: [
