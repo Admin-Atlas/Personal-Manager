@@ -10,15 +10,17 @@
 // coherently when the System changes. Everything else around an event (card, border, rules, tints)
 // still uses tokens.
 
-import { ACCENTS, type System } from "./profiles";
+import { ACCENTS, MONO_ACCENT, type System } from "./profiles";
 
 /** The categorical source hues for a System: its accent picker palette minus the `accent` currently
- *  reserved for chrome (~5 hues). If the active accent isn't one of the picker hues (a custom
- *  accent), the full palette stands — there's nothing to reserve-and-remove. */
+ *  reserved for chrome (~5 hues). The monochrome sentinel is never a source hue (it's not a colour),
+ *  so it's always dropped too. If the active accent isn't one of the picker hues (a custom accent),
+ *  the full palette stands — there's nothing to reserve-and-remove. */
 export function sourcePalette(system: System, accent: string): string[] {
   const active = accent.trim().toLowerCase();
-  const rest = ACCENTS[system].filter((h) => h.toLowerCase() !== active);
-  return rest.length > 0 ? rest : [...ACCENTS[system]];
+  const hues = ACCENTS[system].filter((h) => h !== MONO_ACCENT);
+  const rest = hues.filter((h) => h.toLowerCase() !== active);
+  return rest.length > 0 ? rest : hues;
 }
 
 /** A stable, collision-free colour for each calendar id: sort the ids deterministically and walk the

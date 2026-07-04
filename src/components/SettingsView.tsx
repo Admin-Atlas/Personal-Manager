@@ -43,7 +43,16 @@ import { StorageSettings } from "./StorageSettings";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
-import { useTheme, useDepth, ACCENTS } from "../theme";
+import {
+  useTheme,
+  useDepth,
+  ACCENTS,
+  MONO_ACCENT,
+  EIGENGRAU,
+  deviceCoords,
+  coordsForTimezone,
+  formatCoords,
+} from "../theme";
 import { Button, Collapsible, ConfirmDialog, Input, NavItem, SegmentedControl, Select } from "./ui";
 
 interface Props {
@@ -82,7 +91,13 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     system,
     setSystem,
     mode,
-    setMode,
+    modePref,
+    setModePref,
+    modeSource,
+    modeCoords,
+    modeNextChange,
+    autoLocation,
+    setAutoLocation,
     depth,
     setDepth,
     accent,
@@ -695,14 +710,93 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-sm text-ink2">Mode</span>
                     <SegmentedControl
-                      value={mode}
-                      onChange={setMode}
+                      value={modePref}
+                      onChange={setModePref}
                       options={[
-                        { value: "dark", label: "Dark" },
                         { value: "light", label: "Light" },
+                        { value: "dark", label: "Dark" },
+                        {
+                          value: "system",
+                          label: "System",
+                          title: "Follow your device's light/dark setting",
+                        },
+                        {
+                          value: "auto",
+                          label: "Auto",
+                          title: "Follow sunrise and sunset at your location",
+                        },
                       ]}
                     />
                   </div>
+                  {modePref === "system" && (
+                    <p className="mt-1.5 text-xs text-ink4">
+                      Following your device's light/dark setting — currently{" "}
+                      {mode === "dark" ? "dark" : "light"}.
+                    </p>
+                  )}
+                  {modePref === "auto" && (
+                    <>
+                      <p className="mt-1.5 text-xs text-ink4">
+                        {modeSource === "auto" ? (
+                          <>
+                            Follows sunrise &amp; sunset — currently{" "}
+                            {mode === "dark" ? "dark" : "light"}
+                            {modeCoords ? ` · ${formatCoords(modeCoords)}` : ""}
+                            {modeNextChange
+                              ? ` · switches to ${mode === "dark" ? "light" : "dark"} at ${modeNextChange.toLocaleTimeString(
+                                  [],
+                                  { hour: "2-digit", minute: "2-digit" },
+                                )}`
+                              : ""}
+                            .
+                          </>
+                        ) : (
+                          <>
+                            Couldn't determine your location, so it's following your device's
+                            light/dark setting for now. Enter a location below for sunrise &amp;
+                            sunset.
+                          </>
+                        )}
+                      </p>
+                      <div className="mt-2 flex items-center justify-between gap-3">
+                        <span className="text-sm text-ink2">Location</span>
+                        <div className="flex items-center gap-2">
+                          <Input
+                            value={autoLocation}
+                            onChange={(e) => setAutoLocation(e.target.value)}
+                            placeholder={
+                              deviceCoords()
+                                ? `${formatCoords(deviceCoords()!)} (detected)`
+                                : "e.g. 51.51, -0.13"
+                            }
+                            aria-label="Location for sunrise and sunset, as latitude, longitude"
+                            className="w-44"
+                          />
+                          {autoLocation && (
+                            <button
+                              type="button"
+                              className="text-xs text-ink4 transition hover:text-ink"
+                              onClick={() => setAutoLocation("")}
+                            >
+                              Reset
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <p className="mt-1 text-xs text-ink4">
+                        Latitude, longitude. Blank uses your device's timezone
+                        {(() => {
+                          try {
+                            const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                            return tz && coordsForTimezone(tz) ? ` (${tz})` : "";
+                          } catch {
+                            return "";
+                          }
+                        })()}
+                        . Nothing about your location leaves this device.
+                      </p>
+                    </>
+                  )}
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-sm text-ink2">Depth</span>
                     <SegmentedControl
@@ -718,20 +812,33 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-sm text-ink2">Accent</span>
                     <div className="flex items-center gap-1.5">
-                      {ACCENTS[system].map((hex) => (
-                        <button
-                          key={hex}
-                          type="button"
-                          aria-label={`Accent ${hex}`}
-                          onClick={() => setAccent(hex)}
-                          style={{ background: hex }}
-                          className={`h-5 w-5 rounded-full transition ${
-                            accent === hex
-                              ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
-                              : ""
-                          }`}
-                        />
-                      ))}
+                      {ACCENTS[system].map((hex) => {
+                        const isMono = hex === MONO_ACCENT;
+                        return (
+                          <button
+                            key={hex}
+                            type="button"
+                            aria-label={isMono ? "Monochrome (Eigengrau)" : `Accent ${hex}`}
+                            title={
+                              isMono
+                                ? "Monochrome — Eigengrau base, white text & accents"
+                                : undefined
+                            }
+                            onClick={() => setAccent(hex)}
+                            style={{
+                              background: isMono ? EIGENGRAU : hex,
+                              // The Eigengrau swatch is near-black; a white rim makes it legible and
+                              // signals the "white accents" treatment.
+                              border: isMono ? "1px solid rgba(255,255,255,0.55)" : undefined,
+                            }}
+                            className={`h-5 w-5 rounded-full transition ${
+                              accent === hex
+                                ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
+                                : ""
+                            }`}
+                          />
+                        );
+                      })}
                     </div>
                   </div>
                   <div

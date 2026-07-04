@@ -9,6 +9,11 @@
 
 export type System = "editorial" | "slate" | "terminal";
 export type Mode = "dark" | "light";
+/** What the user *picked* for Mode. Resolves to a concrete {@link Mode} at runtime:
+ *  `light`/`dark` are explicit; `system` follows the OS light/dark setting; `auto` follows
+ *  sunrise/sunset at the user's location (see resolveMode.ts). Only the resolved Mode ever
+ *  reaches tokens/components — this preference is what's persisted and shown in Settings. */
+export type ModePref = Mode | "system" | "auto";
 export type Depth = "min" | "standard" | "power";
 export type Role =
   | "bg"
@@ -26,6 +31,8 @@ export type StatusKey = "due" | "blocked" | "quick" | "look" | "part" | "track";
 
 export const SYSTEMS: readonly System[] = ["editorial", "slate", "terminal"];
 export const MODES: readonly Mode[] = ["dark", "light"];
+// The four Mode *preferences* offered in Settings (see {@link ModePref}). Order is the picker order.
+export const MODE_PREFS: readonly ModePref[] = ["light", "dark", "system", "auto"];
 export const DEPTHS: readonly Depth[] = ["min", "standard", "power"];
 
 // Order is load-bearing: themeVars maps these positionally onto each ramp / status row.
@@ -173,11 +180,55 @@ export const PROFILES: Record<System, Record<Mode, Ramp>> = {
   },
 };
 
-// Picker palettes; index 0 is each System's default accent.
+// The sentinel "accent" that selects the monochrome (Eigengrau) treatment instead of a hue.
+// It is NOT a colour — tokens.ts special-cases it to a chroma-0 neutral ramp with white
+// text/accents (dark) or near-black (light). Offered only in Slate (see ACCENTS below), and
+// the app's default there. Its base dark background is Eigengrau, the perceptual "colour of
+// darkness". Feature colours (the map palette, semantic status) are unaffected and stay in colour.
+export const MONO_ACCENT = "mono";
+/** Eigengrau — HEX #16161D / RGB (22,22,29). The exact base background for the dark monochrome
+ *  theme; the rest of that ramp is a straight neutral greyscale up to white (no accent tint). */
+export const EIGENGRAU = "#16161d";
+
+// Picker palettes; index 0 is each System's default accent. Slate leads with the monochrome
+// sentinel, so a fresh Slate install is Eigengrau; the coloured hues remain selectable after it.
 export const ACCENTS: Record<System, readonly string[]> = {
   editorial: ["#d2825b", "#c96f4c", "#cda44e", "#8f9a5b", "#c789a4", "#6f8bbf"],
-  slate: ["#5b8cff", "#5bb5c0", "#9b8cf0", "#5fd6a0", "#e0a86a", "#ff93b4"],
+  slate: [MONO_ACCENT, "#5b8cff", "#5bb5c0", "#9b8cf0", "#5fd6a0", "#e0a86a", "#ff93b4"],
   terminal: ["#9ece6a", "#e0af68", "#7dcfff", "#bb9af7", "#f7768e", "#7fe0b0"],
+};
+
+// The monochrome ramp for the {@link MONO_ACCENT} treatment: per-role Lightness only, rendered at
+// chroma 0 (pure neutral — no accent hue fans through it). tokens.ts pins --bg to the exact
+// Eigengrau hex in dark; every other role is a straight grey. Dark = Eigengrau base + white ink;
+// light = paper base + near-black ink. Kept here so a palette tweak is a data change, never code.
+export const MONO_RAMP: Record<Mode, Record<Role, number>> = {
+  dark: {
+    bg: 0.168, // pinned to EIGENGRAU at apply time; this L is the greyscale sibling for the ramp
+    panel: 0.138,
+    surface: 0.222,
+    border: 0.3,
+    border2: 0.36,
+    rule: 0.258,
+    ink: 0.94, // soft off-white (~#ECECEC), NOT pure white — avoids halation/glare on the dark bg
+    ink2: 0.86,
+    ink3: 0.66,
+    ink4: 0.555,
+    faint: 0.44,
+  },
+  light: {
+    bg: 0.992,
+    panel: 0.968,
+    surface: 0.951,
+    border: 0.884,
+    border2: 0.82,
+    rule: 0.916,
+    ink: 0.2, // near-black text
+    ink2: 0.34,
+    ink3: 0.5,
+    ink4: 0.6,
+    faint: 0.72,
+  },
 };
 
 // Semantic status colours (NOT accent-tied). Order matches STATUS_KEYS; light is deepened for
