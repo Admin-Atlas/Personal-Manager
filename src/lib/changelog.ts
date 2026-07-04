@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.86.0-alpha",
+    date: "2026-07-04",
+    highlights: [
+      "Help mode now explains a lot more of PM. Turn it on in Settings → General and hover — the whole Pinboard is covered for the first time (the board, notes, timelines and the tint colours), as is the Calendar tab (the view, how to move around it, and choosing which calendars show). A batch of spots that used to highlight but say nothing when hovered — the “say what you mean” box on your home screen, the project side panel and its milestones/files split, OneDrive and local-folder connectors and their sync results, encrypted backup, vault sharing, the Microsoft sign-in, and the idle/resumed markers in chat — now all explain themselves. Nothing about how PM works changed; there's just far less of it left unexplained.",
+    ],
+  },
+  {
     version: "2.85.0-alpha",
     date: "2026-07-04",
     highlights: [
