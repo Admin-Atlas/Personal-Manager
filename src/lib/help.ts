@@ -484,7 +484,19 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "pinboard-timeline": {
     title: "A timeline",
-    body: "A card for dated milestones. Give it a title and add rows with a date and a short label; they sort themselves earliest to latest. Drag the header to move it and resize from the corner.",
+    body: "A card for dated milestones. Give it a title and add rows with a date and a short label; they sort themselves earliest to latest. Or link it to a real project (below) to show and edit that project's actual milestones. Drag the header to move it and resize from the corner.",
+  },
+  "pinboard-timeline-project": {
+    title: "Link a project",
+    body: "Bind this timeline to one of your projects — pick an existing one or type a new name. Once linked, the card shows that project's real milestones on a line, and adding or editing one here writes straight to the project, so it also shows in your daily briefing and the project's Focus panel. A brand-new name becomes a real project when you add its first milestone (it appears on your Focus page once it also has a document).",
+  },
+  "pinboard-timeline-line": {
+    title: "Milestones on a line",
+    body: "This project's milestones, laid out earliest to latest. Each is a dot on the line with its date above and label below — edit either in place, click the dot to mark it done, or ✕ to remove it, and every change syncs with the project everywhere else. A 📅 date is synced from a linked calendar event and is read-only here.",
+  },
+  "pinboard-timeline-unlink": {
+    title: "Unlink the project",
+    body: "Detach this card from its project and return it to a freeform timeline. The project and its milestones are untouched — only this card stops tracking them.",
   },
 };
 

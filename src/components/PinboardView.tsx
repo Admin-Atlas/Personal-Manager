@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -9,11 +10,20 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { formatDate } from "../lib/format";
+import {
+  addMilestone,
+  deleteMilestone,
+  listMilestones,
+  listProjects,
+  setMilestoneState,
+  updateMilestone,
+} from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
 import { CELL, COLS, MIN_H, MIN_W, ROWS, pxRectToCells } from "../lib/pinboard/grid";
 import { continueList, toRenderMarkdown } from "../lib/pinboard/notesMarkdown";
 import { usePinboard } from "../lib/pinboard/usePinboard";
 import type { Rect, Widget } from "../lib/pinboard/types";
+import type { Milestone } from "../lib/types";
 import { useDepth } from "../theme";
 import { Button, Input, Textarea } from "./ui";
 
@@ -344,27 +354,238 @@ function NoteBody({
   );
 }
 
-function TimelineBody({
-  widget,
-  showPower,
-  onChange,
-  onAddItem,
-  onUpdateItem,
-  onRemoveItem,
-}: {
+interface TimelineBodyProps {
   widget: Widget;
   showPower: boolean;
   onChange: (id: string, patch: Partial<Widget>) => void;
   onAddItem: (id: string) => void;
   onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
   onRemoveItem: (id: string, itemId: string) => void;
+}
+
+/** A timeline is either *bound* to a real project — showing and editing that project's live
+ *  milestones, which flow to the brief + Focus — or a freeform scratch list (the default). */
+function TimelineBody(props: TimelineBodyProps) {
+  if (props.widget.project) {
+    return (
+      <BoundTimeline
+        project={props.widget.project}
+        showPower={props.showPower}
+        onUnlink={() => props.onChange(props.widget.id, { project: undefined })}
+      />
+    );
+  }
+  return <FreeformTimeline {...props} />;
+}
+
+/** A milestone's effective date as YYYY-MM-DD, or "" when undated. */
+function msDate(m: Milestone): string {
+  return m.due_date?.slice(0, 10) ?? "";
+}
+
+/** A project-bound timeline: reads the project's real milestones and lays them out earliest→latest
+ *  on a line. Every add/edit/remove writes straight through the milestone commands, so it stays in
+ *  step with the daily brief and the project's Focus/sidebar (and refetches on window focus, so a
+ *  milestone added elsewhere shows up here). */
+function BoundTimeline({
+  project,
+  showPower,
+  onUnlink,
+}: {
+  project: string;
+  showPower: boolean;
+  onUnlink: () => void;
 }) {
+  const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(() => {
+    let cancelled = false;
+    listMilestones(project)
+      .then((ms) => !cancelled && setMilestones(ms))
+      .catch(() => !cancelled && setMilestones([]))
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
+
+  useEffect(() => refresh(), [refresh]);
+
+  useEffect(() => {
+    const onFocus = () => refresh();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refresh]);
+
+  // Earliest→latest by effective date; undated sink to the end.
+  const ordered = [...milestones].sort((a, b) => {
+    const da = msDate(a);
+    const db = msDate(b);
+    if (!da) return 1;
+    if (!db) return -1;
+    return da.localeCompare(db);
+  });
+
+  async function add() {
+    await addMilestone(project, "deadline", null, null);
+    refresh();
+  }
+
+  return (
+    <div className="flex h-full flex-col px-2 py-1">
+      <div className="mb-1 flex items-center justify-between gap-1">
+        <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink2" title={project}>
+          {project}
+        </span>
+        <button
+          onClick={onUnlink}
+          title="Unlink this project (its milestones stay in the project)"
+          data-help="pinboard-timeline-unlink"
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-ink4 hover:text-ink2"
+        >
+          Unlink
+        </button>
+      </div>
+
+      {loading ? (
+        <p className="text-[11px] text-ink4">Loading…</p>
+      ) : ordered.length === 0 ? (
+        <p className="text-[11px] text-ink4">No milestones yet — add one below.</p>
+      ) : (
+        <div className="relative min-h-0 flex-1 overflow-x-auto" data-help="pinboard-timeline-line">
+          {/* the line the dots sit on */}
+          <div className="pointer-events-none absolute inset-x-2 top-8 h-px bg-border2" />
+          <div className="flex items-start gap-1 pb-1">
+            {ordered.map((m) => (
+              <MilestoneColumn key={m.id} m={m} onChanged={refresh} showPower={showPower} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <button
+        onClick={add}
+        className="mt-1 shrink-0 self-start rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface"
+      >
+        + Milestone
+      </button>
+    </div>
+  );
+}
+
+/** One milestone as a column on the bound timeline: date on top, a dot on the line, its label
+ *  below, and a remove ✕ — every edit persists through the milestone commands. Calendar-linked
+ *  milestones show their synced date read-only. */
+function MilestoneColumn({
+  m,
+  onChanged,
+  showPower,
+}: {
+  m: Milestone;
+  onChanged: () => void;
+  showPower: boolean;
+}) {
+  const [label, setLabel] = useState(m.label);
+  const [date, setDate] = useState(msDate(m));
+  const met = m.state === "met";
+
+  // Adopt fresh values when a refetch brings them in (e.g. a calendar-linked date syncing).
+  useEffect(() => setLabel(m.label), [m.label]);
+  useEffect(() => setDate(m.due_date?.slice(0, 10) ?? ""), [m.due_date]);
+
+  async function persist() {
+    const nextLabel = label.trim() || "deadline";
+    const nextDate = m.calendar_linked ? null : date || null;
+    const curDate = m.calendar_linked ? null : msDate(m) || null;
+    if (nextLabel === m.label && nextDate === curDate) return;
+    await updateMilestone(m.id, nextLabel, nextDate);
+    onChanged();
+  }
+
+  return (
+    <div className="flex w-[5.5rem] shrink-0 flex-col items-center gap-1 text-center">
+      {m.calendar_linked ? (
+        <span
+          className="flex h-6 items-center font-mono text-[9px] text-accent-text"
+          title={
+            m.event_missing ? "Linked event not found in your calendars" : "Synced from calendar"
+          }
+        >
+          📅 {m.due_date ? formatDate(msDate(m)) : "—"}
+        </span>
+      ) : (
+        <input
+          type="date"
+          value={date}
+          onChange={(e) => setDate(e.target.value)}
+          onBlur={persist}
+          className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[9px] text-ink3 focus:border-accent focus:outline-none"
+        />
+      )}
+      <button
+        onClick={async () => {
+          await setMilestoneState(m.id, !met);
+          onChanged();
+        }}
+        title={met ? "Mark not done" : "Mark done"}
+        aria-label={met ? "Mark not done" : "Mark done"}
+        className="h-2.5 w-2.5 shrink-0 rounded-full border"
+        style={{
+          background: met ? "var(--st-track)" : "var(--accent)",
+          borderColor: "var(--panel)",
+        }}
+      />
+      <input
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onBlur={persist}
+        placeholder="label"
+        className={`w-full rounded-[var(--radius-sm)] bg-transparent px-0.5 text-center text-[10px] text-ink2 focus:outline-none ${
+          met ? "text-ink4 line-through" : ""
+        }`}
+      />
+      <button
+        onClick={async () => {
+          await deleteMilestone(m.id);
+          onChanged();
+        }}
+        aria-label="Remove milestone"
+        className="text-[10px] text-ink4 hover:text-st-due"
+      >
+        ✕
+      </button>
+      {showPower && m.event_missing && <span className="text-[9px] text-st-due">⚠ unsynced</span>}
+    </div>
+  );
+}
+
+/** The default freeform timeline: type-in dated rows that live in the widget, plus a picker to
+ *  bind the card to a real project (which switches it to {@link BoundTimeline}). */
+function FreeformTimeline({
+  widget,
+  showPower,
+  onChange,
+  onAddItem,
+  onUpdateItem,
+  onRemoveItem,
+}: TimelineBodyProps) {
+  const [projects, setProjects] = useState<string[]>([]);
+  const [projDraft, setProjDraft] = useState("");
+  useEffect(() => {
+    listProjects()
+      .then(setProjects)
+      .catch(() => setProjects([]));
+  }, []);
+  const listId = `pm-projects-${widget.id}`;
+
   // Show items in date order; undated items sink to the bottom.
   const items = [...(widget.items ?? [])].sort((a, b) => {
     if (!a.date) return 1;
     if (!b.date) return -1;
     return a.date.localeCompare(b.date);
   });
+
   return (
     <div className="flex h-full flex-col px-2 py-1">
       <Input
@@ -411,6 +632,29 @@ function TimelineBody({
       >
         + Milestone
       </button>
+      {/* Bind to a real project to sync milestones with the brief + Focus. Typing a new name is
+          allowed (it's created when the first milestone is added). */}
+      <div className="mt-1 flex shrink-0 items-center gap-1" data-help="pinboard-timeline-project">
+        <input
+          list={listId}
+          value={projDraft}
+          onChange={(e) => setProjDraft(e.target.value)}
+          placeholder="Link a project…"
+          className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 text-[11px] text-ink3 focus:border-accent focus:outline-none"
+        />
+        <datalist id={listId}>
+          {projects.map((p) => (
+            <option key={p} value={p} />
+          ))}
+        </datalist>
+        <button
+          onClick={() => projDraft.trim() && onChange(widget.id, { project: projDraft.trim() })}
+          disabled={!projDraft.trim()}
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface disabled:opacity-40"
+        >
+          Link
+        </button>
+      </div>
     </div>
   );
 }
