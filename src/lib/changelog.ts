@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.88.0-alpha",
+    date: "2026-07-04",
+    highlights: [
+      "A Pinboard timeline can now track a real project. Link one (pick an existing project or type a new name) and the card shows that project's actual milestones laid out on a line, earliest to latest — each a dot with its date and label. Add, rename, re-date, tick off or remove a milestone here and it writes straight through to the project, so the very same deadlines show up in your daily briefing and the project's Focus panel — and a milestone you add there appears on the timeline too (it refreshes when you come back to the window). Dates synced from a linked calendar event stay read-only. Unlink any time to go back to a plain scratch timeline; the project keeps its milestones. Timelines with nothing linked behave exactly as before.",
+    ],
+  },
+  {
     version: "2.87.0-alpha",
     date: "2026-07-04",
     highlights: [

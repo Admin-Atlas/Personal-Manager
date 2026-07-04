@@ -34,6 +34,11 @@ export interface Widget {
   // timeline
   title?: string;
   items?: TimelineItem[];
+  /** When set, a timeline widget is *bound* to this project: it shows and edits that project's
+   *  real milestones (backend `project_milestones`) instead of the freeform `items` above, so
+   *  changes flow to the daily brief and the project's Focus/sidebar. Unset → freeform (default).
+   *  Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1. */
+  project?: string;
 }
 
 export interface Board {
