@@ -18,22 +18,54 @@ interface Options {
    * handle leftwards (negative dx) widens the panel; a left-docked panel uses `"right"`.
    */
   edge: "left" | "right";
+  /**
+   * When set, the panel can be *snap-collapsed*: once it's already at its minimum width and the
+   * user keeps dragging the handle past the outer {@link collapseThreshold} of the window (toward
+   * the edge the panel is docked to), it snaps shut. The caller then shows a small reopen affordance
+   * and calls {@link ResizableResult.expand} to bring it back at the minimum width.
+   */
+  collapsible?: boolean;
+  /** Fraction of the window width near the docked edge that triggers a snap-collapse (default 0.05). */
+  collapseThreshold?: number;
+}
+
+interface ResizableResult {
+  /** Live pixel width to apply to the panel (`style={{ width }}`). Meaningless while collapsed. */
+  width: number;
+  /** Pointer-down handler for the grab handle. */
+  startResize: (e: React.PointerEvent) => void;
+  /** True mid-drag, for cursor / select-none feedback. */
+  resizing: boolean;
+  /** True while the panel is snap-collapsed (only ever true when `collapsible`). */
+  collapsed: boolean;
+  /** Reopen a collapsed panel at its minimum width (so the user can drag it wider again). */
+  expand: () => void;
 }
 
 /**
  * A panel width stored as a *fraction of the window*, never a pixel count, so it stays
  * proportional as the window resizes (per the "relative, not pixel-locked" requirement).
  * Drag-resizable from one edge via a window-level pointer capture (mirrors the Pinboard
- * drag), clamped to `[minFrac, maxFrac]`, and remembered on this device.
- *
- * Returns the live pixel `width` to apply (`style={{ width }}`), a `startResize`
- * pointer-down handler for the grab handle, and `resizing` for cursor/select-none feedback.
+ * drag), clamped to `[minFrac, maxFrac]`, and remembered on this device. Optionally
+ * snap-collapsible by dragging past the window edge (see {@link Options.collapsible}).
  */
-export function useResizable({ storageKey, defaultFrac, minFrac, maxFrac, edge }: Options) {
+export function useResizable({
+  storageKey,
+  defaultFrac,
+  minFrac,
+  maxFrac,
+  edge,
+  collapsible = false,
+  collapseThreshold = 0.05,
+}: Options): ResizableResult {
+  const collapsedKey = `${storageKey}.collapsed`;
   const [frac, setFrac] = useState(() => {
     const raw = Number(localStorage.getItem(storageKey));
     return clamp(Number.isFinite(raw) && raw > 0 ? raw : defaultFrac, minFrac, maxFrac);
   });
+  const [collapsed, setCollapsed] = useState(
+    () => collapsible && localStorage.getItem(collapsedKey) === "true",
+  );
   const [resizing, setResizing] = useState(false);
   const [vw, setVw] = useState(() => window.innerWidth);
   const fracRef = useRef(frac);
@@ -47,13 +79,36 @@ export function useResizable({ storageKey, defaultFrac, minFrac, maxFrac, edge }
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  const expand = useCallback(() => {
+    setCollapsed(false);
+    setFrac(minFrac); // reopen at the minimum so the user can drag it back out
+    localStorage.setItem(collapsedKey, "false");
+    localStorage.setItem(storageKey, String(minFrac));
+  }, [collapsedKey, minFrac, storageKey]);
+
   const startResize = useCallback(
     (e: React.PointerEvent) => {
       e.preventDefault();
       const startX = e.clientX;
       const startWidth = clamp(fracRef.current, minFrac, maxFrac) * window.innerWidth;
       setResizing(true);
+      let collapsedDuringDrag = false;
       const onMove = (ev: PointerEvent) => {
+        if (collapsedDuringDrag) return; // already snapped shut this gesture — ignore the rest of it
+        // Snap shut once the pointer reaches the outer sliver of the window nearest the docked edge
+        // (the panel is already pinned at min width by then, so this only fires on an over-drag).
+        if (collapsible) {
+          const w = window.innerWidth;
+          const inCollapseZone =
+            edge === "left"
+              ? ev.clientX >= w * (1 - collapseThreshold) // right-docked: drag toward the right edge
+              : ev.clientX <= w * collapseThreshold; // left-docked: drag toward the left edge
+          if (inCollapseZone) {
+            collapsedDuringDrag = true;
+            setCollapsed(true);
+            return; // the natural pointerup ends the gesture and persists the collapsed state
+          }
+        }
         const dx = ev.clientX - startX;
         const nextPx = edge === "left" ? startWidth - dx : startWidth + dx;
         setFrac(clamp(nextPx / window.innerWidth, minFrac, maxFrac));
@@ -66,14 +121,15 @@ export function useResizable({ storageKey, defaultFrac, minFrac, maxFrac, edge }
         window.removeEventListener("blur", finish);
         setResizing(false);
         localStorage.setItem(storageKey, String(fracRef.current));
+        if (collapsible) localStorage.setItem(collapsedKey, String(collapsedDuringDrag));
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", finish);
       window.addEventListener("pointercancel", finish);
       window.addEventListener("blur", finish);
     },
-    [edge, minFrac, maxFrac, storageKey],
+    [edge, minFrac, maxFrac, storageKey, collapsible, collapseThreshold, collapsedKey],
   );
 
-  return { width: clamp(frac, minFrac, maxFrac) * vw, startResize, resizing };
+  return { width: clamp(frac, minFrac, maxFrac) * vw, startResize, resizing, collapsed, expand };
 }

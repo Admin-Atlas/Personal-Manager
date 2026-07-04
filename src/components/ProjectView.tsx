@@ -22,6 +22,7 @@ import { ImportancePicker } from "./ImportancePicker";
 import { MilestoneList } from "./MilestoneList";
 import { TagEditor } from "./TagEditor";
 import { ChatBadge } from "./ChatBadge";
+import { CollapseTab } from "./CollapseTab";
 import { rankImportance } from "../lib/importance";
 import { useReader } from "../lib/reader";
 import { useDepth, useTheme } from "../theme";
@@ -75,12 +76,15 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
     width: asideWidth,
     startResize,
     resizing,
+    collapsed: asideCollapsed,
+    expand: expandAside,
   } = useResizable({
     storageKey: "pm.project.sidebarFrac",
     defaultFrac: 0.24,
     minFrac: 0.16,
     maxFrac: 0.5,
     edge: "left",
+    collapsible: true,
   });
   // The sidebar's Milestones (top) / Files (bottom) split. The ratio is a hard pref across the app
   // (card 7E) — see useSidebarSplit. Only in play when the Milestones panel is shown.
@@ -356,65 +360,69 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
           <Composer
             disabled={chat.sending}
             onSend={chat.handleSend}
-            tools={<RetrievalExplainPanel messages={chat.messages} project={project} />}
+            rightTools={<RetrievalExplainPanel messages={chat.messages} project={project} />}
           />
         </main>
 
-        <aside
-          style={{ width: asideWidth }}
-          className="relative flex shrink-0 flex-col overflow-hidden border-l border-border bg-panel"
-          data-help="project-sidebar"
-        >
-          <div
-            onPointerDown={startResize}
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize panel"
-            title="Drag to resize"
-            data-help="project-resize"
-            className={`absolute left-0 top-0 z-10 h-full w-1.5 cursor-col-resize touch-none transition-colors hover:bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] ${
-              resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
-            }`}
-          />
-          {hasMilestones ? (
-            // Milestones (top) + Files (bottom), split by a draggable divider (hard-pref ratio).
-            <div ref={splitRef} className="flex min-h-0 flex-1 flex-col">
-              <div
-                style={{ flexBasis: `${topFrac * 100}%` }}
-                className="min-h-0 shrink-0 grow-0 overflow-y-auto overflow-x-hidden"
-                data-help="project-milestones-panel"
-              >
-                {milestonesPanel}
+        {asideCollapsed ? (
+          <CollapseTab side="right" onExpand={expandAside} />
+        ) : (
+          <aside
+            style={{ width: asideWidth }}
+            className="relative flex shrink-0 flex-col overflow-hidden border-l border-border bg-panel"
+            data-help="project-sidebar"
+          >
+            <div
+              onPointerDown={startResize}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize panel"
+              title="Drag to resize · drag to the edge to hide"
+              data-help="project-resize"
+              className={`absolute left-0 top-0 z-10 h-full w-1.5 cursor-col-resize touch-none transition-colors hover:bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] ${
+                resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
+              }`}
+            />
+            {hasMilestones ? (
+              // Milestones (top) + Files (bottom), split by a draggable divider (hard-pref ratio).
+              <div ref={splitRef} className="flex min-h-0 flex-1 flex-col">
+                <div
+                  style={{ flexBasis: `${topFrac * 100}%` }}
+                  className="min-h-0 shrink-0 grow-0 overflow-y-auto overflow-x-hidden"
+                  data-help="project-milestones-panel"
+                >
+                  {milestonesPanel}
+                </div>
+                <div
+                  onPointerDown={startSplit}
+                  role="separator"
+                  aria-orientation="horizontal"
+                  aria-label="Resize milestones and files"
+                  title="Drag to resize"
+                  data-help="project-split"
+                  className={`h-1.5 shrink-0 cursor-row-resize touch-none border-y border-border transition-colors hover:bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] ${
+                    splitting ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
+                  }`}
+                />
+                <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">{filesPanel}</div>
               </div>
-              <div
-                onPointerDown={startSplit}
-                role="separator"
-                aria-orientation="horizontal"
-                aria-label="Resize milestones and files"
-                title="Drag to resize"
-                data-help="project-split"
-                className={`h-1.5 shrink-0 cursor-row-resize touch-none border-y border-border transition-colors hover:bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] ${
-                  splitting ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
-                }`}
-              />
-              <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">{filesPanel}</div>
-            </div>
-          ) : (
-            // No milestones yet: the (Depth-gated) add control sits at its natural height, Files
-            // fills the rest of the sidebar.
-            <div className="flex min-h-0 flex-1 flex-col">
-              {showAddMilestone && (
-                <div className="shrink-0 border-b border-border">{milestonesPanel}</div>
-              )}
-              <div
-                className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
-                data-help="project-files"
-              >
-                {filesPanel}
+            ) : (
+              // No milestones yet: the (Depth-gated) add control sits at its natural height, Files
+              // fills the rest of the sidebar.
+              <div className="flex min-h-0 flex-1 flex-col">
+                {showAddMilestone && (
+                  <div className="shrink-0 border-b border-border">{milestonesPanel}</div>
+                )}
+                <div
+                  className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+                  data-help="project-files"
+                >
+                  {filesPanel}
+                </div>
               </div>
-            </div>
-          )}
-        </aside>
+            )}
+          </aside>
+        )}
       </div>
     </div>
   );

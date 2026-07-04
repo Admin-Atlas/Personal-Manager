@@ -1721,8 +1721,9 @@ pub async fn dev_apply_change_event(
 }
 
 /// What a pinboard note became after ingest — enough for the board to show "in review" / "filed
-/// to X" without a second query. `source_id` is `note:<widget_id>`; the document lives on its own
-/// (nothing reconciles a `note:` source) so it survives the note being deleted.
+/// to X" without a second query. `source_id` is `note:<widget_id>`; the document is a full vault
+/// Markdown file that lives on its own (nothing reconciles a `note:` source), so it survives the
+/// note being deleted.
 #[derive(Serialize)]
 pub struct NoteIngest {
     pub source_id: String,
@@ -1750,12 +1751,15 @@ fn derive_title(body: &str) -> String {
     out
 }
 
-/// Ingest a pinboard note's text as an index-only document, so it flows through the
-/// review → proposal → project-importance pipeline and then shows in Documents / Focus / the
-/// briefing like any document. Keyed on the note's widget id (`note:<widget_id>`), so it's
-/// idempotent: an unchanged re-ingest is a no-op, and an edited note re-embeds in place, KEEPING
-/// whatever project / tags / importance it was filed under. The document is standalone — no
-/// reconcile watches a `note:` source — so deleting the note never removes what was ingested.
+/// Ingest a pinboard note's text as a REAL vault Markdown document (the note is already Markdown),
+/// so it flows through the review → proposal → project-importance pipeline and then shows in
+/// Documents / Focus / the briefing like any document. Keyed on the note's widget id
+/// (`note:<widget_id>`), so it's idempotent: an unchanged re-ingest is a no-op, and an edited note
+/// re-embeds in place, KEEPING whatever project / tags / importance it was filed under. The document
+/// is standalone — no reconcile watches a `note:` source, and its full body lives in the vault — so
+/// deleting the note never removes it, and it's fully readable/searchable offline (not a 500-char
+/// summary). See [`ingest::ingest_note_document`], which also promotes any note ingested under the
+/// earlier index-only path (v2.89.0-alpha #214) in place.
 #[tauri::command]
 pub async fn ingest_note(app: AppHandle, widget_id: String, text: String) -> Result<NoteIngest> {
     tokio::task::spawn_blocking(move || -> Result<NoteIngest> {
@@ -1765,8 +1769,7 @@ pub async fn ingest_note(app: AppHandle, widget_id: String, text: String) -> Res
                 "this note is empty — nothing to ingest".into(),
             ));
         }
-        let body = body.to_string();
-        let source_id = format!("note:{widget_id}");
+        let title = derive_title(body);
 
         let state = app.state::<AppState>();
         state.sidecar.ensure_installed()?;
@@ -1774,75 +1777,26 @@ pub async fn ingest_note(app: AppHandle, widget_id: String, text: String) -> Res
             let conn = state.conn()?;
             state.gateway(&conn)?
         };
+        let (vault, cipher) = state.markdown_io()?;
         let (vault_root, manifest_cipher) = state.manifest_io()?;
 
-        // The item's current persisted state for the reducer (`None` if never ingested).
-        let current: Option<(Option<String>, Option<String>, String)> = {
-            let conn = state.conn()?;
-            match conn.query_row(
-                "SELECT source_modified_at, source_content_hash, source_state \
-                 FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
-                params![source_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            ) {
-                Ok(row) => Some(row),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(e) => return Err(e.into()),
-            }
-        };
-        let now = {
-            let conn = state.conn()?;
-            ingest::iso_now(&conn)?
-        };
-        let new_hash = ingest::hex_digest(body.as_bytes());
-
-        // One Update event: the pure reducer picks IngestNew (unseen) / ReEmbed (edited — keeps the
-        // filing) / Noop (unchanged). This is the idempotency guarantee — never call register_pointer
-        // directly on a re-ingest (documents.content_hash is UNIQUE, so a second call would throw).
-        let event = index_only::ChangeEvent::Update {
-            source_id: source_id.clone(),
-            modified_at: Some(now.clone()),
-            new_content_hash: Some(new_hash.clone()),
-        };
-        let input = index_only::PointerInput {
-            source_id: source_id.clone(),
-            title: derive_title(&body),
-            external_ref: None,
-            source_modified_at: Some(now.clone()),
-            source_content_hash: Some(new_hash),
-            body,
-            source_parent_folder_id: None,
-            source_parent_folder_name: None,
-        };
-        let item_state = current.map(|(smod, shash, sstate)| index_only::ItemState {
-            source_id: source_id.clone(),
-            source_modified_at: smod,
-            source_content_hash: shash,
-            source_state: index_only::SourceState::from_db(&sstate),
-        });
-        let actions = index_only::react(event, item_state.as_ref());
-        index_only::apply_actions(
+        let document = ingest::ingest_note_document(
             &state,
             &gateway,
+            &vault,
+            &cipher,
             &vault_root,
             &manifest_cipher,
-            &actions,
-            Some(&input),
+            &widget_id,
+            &title,
+            body,
         )?;
 
-        // Read back what the note became so the UI can show "in review" / "filed to X".
-        let conn = state.conn()?;
-        let (document_id, reviewed, project): (i64, bool, String) = conn.query_row(
-            "SELECT id, reviewed, project FROM documents \
-             WHERE source_id = ?1 AND source_type = 'index_only'",
-            params![source_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
         Ok(NoteIngest {
-            source_id,
-            document_id,
-            reviewed,
-            project,
+            source_id: format!("note:{widget_id}"),
+            document_id: document.id,
+            reviewed: document.reviewed,
+            project: document.project,
         })
     })
     .await

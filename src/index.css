@@ -274,3 +274,32 @@ body {
   outline-offset: 2px;
   border-radius: var(--radius-sm);
 }
+
+/* Always-visible, draggable scrollbars ("ribbons") for surfaces a no-wheel user must be able to drag
+   to reach the edges — notably the Pinboard, whose board is intentionally larger than the window.
+   Styling ::-webkit-scrollbar opts the element out of WebView2/Chromium's thin auto-hiding overlay
+   bar, giving an always-present, grabbable thumb on both axes. IMPORTANT: do NOT also set the standard
+   `scrollbar-width`/`scrollbar-color` here — in Chromium 121+ (which WebView2 is) any standard
+   scrollbar property makes the engine ignore the ::-webkit-scrollbar rules and fall back to the thin
+   overlay bar. That was the "empty bar, no pill to drag" bug. Token-driven so it tracks the theme; the
+   thumb inset is faked with a transparent padding-box border so it reads as a pill. */
+.pm-scrollbars::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+.pm-scrollbars::-webkit-scrollbar-track {
+  background: transparent;
+}
+.pm-scrollbars::-webkit-scrollbar-thumb {
+  background: var(--border2);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+.pm-scrollbars::-webkit-scrollbar-thumb:hover {
+  background: var(--ink4);
+  background-clip: padding-box;
+}
+.pm-scrollbars::-webkit-scrollbar-corner {
+  background: transparent;
+}

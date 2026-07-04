@@ -19,6 +19,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.90.0-alpha",
+    date: "2026-07-04",
+    highlights: [
+      "Ingesting a Pinboard note now saves it into your vault as a real Markdown document — the whole note, not a short summary. So it's fully readable and searchable offline, it survives you tidying the note away, and a full Rebuild reproduces it from disk like any other document. Notes you'd already ingested under the previous version are quietly upgraded to the full document the next time you re-ingest them, keeping wherever you'd filed them.",
+      "Pinboard notes gained a formatting toolbar. Under a note you're editing there are buttons for bold, italic, a heading, and bullet / numbered / checklist lists — each toggles on and off, applies to the line(s) you've selected, and has a keyboard shortcut (shown when you hover). A note also renders itself whenever you're not editing it — lists, headings, checkboxes and all — and you click it to write again; the separate Edit/Preview toggle is gone.",
+      "The Pinboard now fills the window. The board grows to match your screen — the notes and text stay exactly the same size, there's just more room — so a maximised window shows the whole board with no scrollbars, and shrinking the window scrolls it to its edges with proper draggable scrollbars you can grab. PM opens maximised now, too.",
+      "You can resize and hide the side panels. Drag the edge of the left navigation sidebar, or a project's side panel, to set its width — and drag it all the way to the window edge to tuck it away behind a slim tab, then click the tab to bring it back. Your choice is remembered.",
+      "The chat input is tidier again. The message box grows as you type a longer draft (up to a point, then it scrolls) and shrinks back when you send; the mic·box·Send cluster stays centred under your conversation with the context and Explain buttons tucked just outside it; and the context-window indicator is now a small ring that fills as a conversation grows — turning red when it's getting full — in place of a bare percentage.",
+      "A handful of smaller fixes: pop-up dialogs now open below the title bar so the window's own minimise and close buttons stay reachable; in the Review queue you can click a document's title to read it in the panel while you file it; the Documents table no longer pushes the page sideways when a title is long (it trims instead); and a vertical mouse-wheel always scrolls vertically everywhere, while a wide table scrolls sideways as you'd expect.",
+    ],
+  },
+  {
     version: "2.89.0-alpha",
     date: "2026-07-04",
     highlights: [

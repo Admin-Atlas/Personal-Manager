@@ -472,15 +472,15 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "pinboard-note": {
     title: "A note",
-    body: "A sticky note — type anything into it and it saves as you go. Notes are Markdown: start a line with . or - for a bullet, 1. for a numbered list, i. for roman numerals, > for an arrow/quote, or [] for a checkbox, and pressing Enter continues the list for you. Drag the header to move it, resize from the bottom-right corner, and use the ✕ to remove it. The dots along the bottom tint it a colour so related notes read together.",
+    body: "A sticky note — type anything into it and it saves as you go. Notes are Markdown: start a line with . or - for a bullet, 1. for a numbered list, i. for roman numerals, > for an arrow/quote, or [] for a checkbox, and pressing Enter continues the list for you. The note renders itself when you're not editing — click it to write again. Drag the header to move it, resize from the bottom-right corner, and use the ✕ to remove it. The dots along the bottom tint it a colour so related notes read together.",
   },
-  "pinboard-note-mode": {
-    title: "Edit or preview",
-    body: "Switch between writing the note (plain text, with smart list continuation) and previewing it rendered — headings, bullets, numbered and roman lists, checkboxes and quotes all formatted. Double-click the preview to jump back to editing. It's the same note either way; this only changes how it's shown.",
+  "pinboard-note-format": {
+    title: "Format the note",
+    body: "Quick formatting for the note: bold, italic, heading, and bullet / numbered / checklist lists. Each button applies to the selected line(s) — press it again to turn it off. Every button also has a keyboard shortcut (shown when you hover) so you can format without leaving the keyboard.",
   },
   "pinboard-note-ingest": {
     title: "Ingest as a document",
-    body: "Send this note into PM the way any document goes in: it's chunked, indexed, and lands in the Review queue for you to file to a project and set its importance — after which it turns up in Documents, Focus and search like anything else. It shows 'In review' until you file it, then 'Filed · project'. Edit the note and a 'Re-ingest' button updates the same document, keeping its filing. The document is its own copy: once ingested, deleting the note doesn't remove it.",
+    body: "Save this note into your vault as a real Markdown document, the way any document goes in: it's written to your vault, chunked, indexed, and lands in the Review queue for you to file to a project and set its importance — after which it turns up in Documents, Focus and search like anything else. It shows 'In review' until you file it, then 'Filed · project'. Edit the note and a 'Re-ingest' button updates the same document, keeping its filing. The document is its own copy in your vault: deleting the note never removes it.",
   },
   "pinboard-note-tint": {
     title: "Tint this note",

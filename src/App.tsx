@@ -30,6 +30,9 @@ import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { ReaderProvider } from "./lib/reader";
+import { installAxisScrollNormalizer } from "./lib/scrollAxis";
+import { useResizable } from "./lib/useResizable";
+import { CollapseTab } from "./components/CollapseTab";
 import { useChatStream } from "./lib/useChatStream";
 import { useProjectChat } from "./lib/useProjectChat";
 import { isNewChatTrigger } from "./lib/chatSession";
@@ -358,6 +361,22 @@ export default function App() {
     return () => clearInterval(id);
   }, [keySet]);
 
+  // Normalise wheel-scroll direction app-wide (installed once): a vertical wheel always scrolls
+  // vertically, never getting translated into sideways motion over a horizontally-scrollable table.
+  useEffect(() => installAxisScrollNormalizer(), []);
+
+  // The left navigation sidebar's width (fraction of the window, so it stays proportional). It's
+  // drag-resizable and snap-collapsible: drag the grip to the window edge and it hides behind a slim
+  // reopen tab (see useResizable + CollapseTab).
+  const leftBar = useResizable({
+    storageKey: "pm.sidebar.frac",
+    defaultFrac: 0.17,
+    minFrac: 0.14,
+    maxFrac: 0.32,
+    edge: "right",
+    collapsible: true,
+  });
+
   // Pre-compute the Map's layouts in the background after unlock, at idle priority: the by-project
   // force layout off the main thread (a worker), and the semantic layout in the backend (which defers
   // to an active Drive sync). Both prime caches so opening the Map is instant and never stutters launch.
@@ -554,45 +573,53 @@ export default function App() {
       <ReaderProvider view={view}>
         <div className={`flex h-full flex-col bg-bg text-ink ${helpMode ? "help-mode" : ""}`}>
           <UpdateBanner update={update} />
-          <div className="relative flex flex-1 overflow-hidden">
-            <Sidebar
-              view={view}
-              onNavigate={setView}
-              conversations={inProject ? projectChat.conversations : conversations}
-              activeId={inProject ? projectChat.convId : activeId}
-              reviewCount={reviewCount}
-              onSelect={
-                inProject
-                  ? projectChat.openConversation
-                  : (id) => {
-                      setView("chat");
-                      selectConversation(id);
-                    }
-              }
-              onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
-              onMove={inProject ? projectChat.moveConversation : handleMoveConversation}
-              onNew={
-                inProject
-                  ? projectChat.newChat
-                  : () => {
-                      setView("chat");
-                      newConversation();
-                    }
-              }
-              onOpenSettings={() => setShowSettings(true)}
-              onOpenWhatsNew={() => setShowWhatsNew(true)}
-              onOpenPalette={() => setShowPalette(true)}
-              chatModel={settings?.chat_models[0] ?? null}
-              backgroundModel={settings?.background_models[0] ?? null}
-              chatFallbacks={
-                settings?.chat_auto_switch ? Math.max(0, settings.chat_models.length - 1) : 0
-              }
-              backgroundFallbacks={
-                settings?.background_auto_switch
-                  ? Math.max(0, settings.background_models.length - 1)
-                  : 0
-              }
-            />
+          <div
+            className={`relative flex flex-1 overflow-hidden ${leftBar.resizing ? "select-none" : ""}`}
+          >
+            {leftBar.collapsed && <CollapseTab side="left" onExpand={leftBar.expand} />}
+            {!leftBar.collapsed && (
+              <Sidebar
+                width={leftBar.width}
+                onStartResize={leftBar.startResize}
+                resizing={leftBar.resizing}
+                view={view}
+                onNavigate={setView}
+                conversations={inProject ? projectChat.conversations : conversations}
+                activeId={inProject ? projectChat.convId : activeId}
+                reviewCount={reviewCount}
+                onSelect={
+                  inProject
+                    ? projectChat.openConversation
+                    : (id) => {
+                        setView("chat");
+                        selectConversation(id);
+                      }
+                }
+                onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
+                onMove={inProject ? projectChat.moveConversation : handleMoveConversation}
+                onNew={
+                  inProject
+                    ? projectChat.newChat
+                    : () => {
+                        setView("chat");
+                        newConversation();
+                      }
+                }
+                onOpenSettings={() => setShowSettings(true)}
+                onOpenWhatsNew={() => setShowWhatsNew(true)}
+                onOpenPalette={() => setShowPalette(true)}
+                chatModel={settings?.chat_models[0] ?? null}
+                backgroundModel={settings?.background_models[0] ?? null}
+                chatFallbacks={
+                  settings?.chat_auto_switch ? Math.max(0, settings.chat_models.length - 1) : 0
+                }
+                backgroundFallbacks={
+                  settings?.background_auto_switch
+                    ? Math.max(0, settings.background_models.length - 1)
+                    : 0
+                }
+              />
+            )}
 
             {view === "focus" ? (
               <main className="flex h-full flex-1 flex-col">
@@ -671,16 +698,14 @@ export default function App() {
                 <Composer
                   disabled={chat.sending}
                   onSend={handleSend}
-                  tools={
-                    <>
-                      <ContextMeter
-                        conversationId={activeId}
-                        refreshKey={chat.messages.length}
-                        onUpgrade={handleUpgrade}
-                      />
-                      <RetrievalExplainPanel messages={chat.messages} />
-                    </>
+                  leftTools={
+                    <ContextMeter
+                      conversationId={activeId}
+                      refreshKey={chat.messages.length}
+                      onUpgrade={handleUpgrade}
+                    />
                   }
+                  rightTools={<RetrievalExplainPanel messages={chat.messages} />}
                 />
               </main>
             )}
@@ -701,11 +726,9 @@ export default function App() {
               </div>
             )}
 
-            {showWhatsNew && (
-              <div className="absolute inset-0 z-50" style={{ background: "rgba(8,6,4,0.5)" }}>
-                <WhatsNew onClose={closeWhatsNew} currentVersion={appVersion} />
-              </div>
-            )}
+            {/* WhatsNew renders its own Modal (scrim + centering, kept below the title bar), so it
+                needs no extra wrapper scrim here — that only double-darkened the content. */}
+            {showWhatsNew && <WhatsNew onClose={closeWhatsNew} currentVersion={appVersion} />}
 
             {showPalette && (
               <CommandPalette
