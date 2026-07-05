@@ -214,11 +214,16 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     }
   }
 
-  // On landing: load project statuses, syncing the calendar first if connected
-  // (best effort) so a name-matched event can flip a project to "Due soon" (Step
-  // 6). One effect with a single refresh, then today's briefing (Step 7).
+  // On landing: paint the project cards and today's briefing IMMEDIATELY (Steps 6-7). The old code
+  // gated them behind a NETWORK calendar sync, so cold-start time-to-content was the sync's latency
+  // (F-09). Now the calendar chain runs in parallel and re-derives the cards once it lands, so a
+  // name-matched synced event can still flip a project to "Due soon" — exactly the immediate-then-
+  // resync pattern onFlagResolved uses. refreshSeqRef makes the later refresh() win if the immediate
+  // and post-sync loads resolve out of order; aliveRef still guards setEvents.
   useEffect(() => {
-    (async () => {
+    void refresh();
+    void loadBriefing();
+    void (async () => {
       try {
         const overview = await calendarOverview();
         if (overview.accounts.length > 0) {
@@ -228,12 +233,11 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
             setEvents(evts);
             cachedEvents = evts;
           }
+          await refresh();
         }
       } catch {
         /* connector optional — focus view works without it */
       }
-      await refresh();
-      void loadBriefing();
     })();
   }, []);
 

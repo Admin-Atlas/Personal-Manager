@@ -19,7 +19,8 @@
 //! mitigation).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +130,34 @@ pub(crate) fn locate_proton_cli() -> Option<PathBuf> {
 
 // --- Invoking the CLI ---------------------------------------------------------------
 
+/// A generous ceiling on any single Proton CLI call. Without it a hung transfer (a stalled network)
+/// holds `backup_busy` forever — blocking every later backup/restore until the app restarts — and
+/// Cancel does nothing during the longest phase (F-13). 2h doubles the 1h gdrive reqwest ceiling,
+/// since the CLI path is slower.
+const CLI_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// How often the poll loop wakes to check for child exit / deadline / cancel — responsive to Cancel
+/// (a fraction of a second) without busy-spinning the CPU.
+const CLI_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Why a polled CLI run was stopped before the child exited. Cancel takes priority over timeout
+/// (both can read true if the deadline lapses in the same tick a cancel lands). Pure, so the
+/// priority is unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum CliStop {
+    Cancelled,
+    TimedOut,
+}
+
+fn cli_stop_reason(cancelled: bool, timed_out: bool) -> Option<CliStop> {
+    if cancelled {
+        Some(CliStop::Cancelled)
+    } else if timed_out {
+        Some(CliStop::TimedOut)
+    } else {
+        None
+    }
+}
+
 /// Windows: run the child without flashing a console window. No-op elsewhere. Mirrors the
 /// sidecar's helper (kept local — one line, avoids a shared-module dependency).
 #[cfg(windows)]
@@ -152,15 +181,90 @@ fn looks_not_logged_in(s: &str) -> bool {
 /// `spawn_blocking`, never while holding the DB lock (like the sidecar). A "not signed in"
 /// result (on any exit code — the CLI is inconsistent) is mapped to [`NOT_CONNECTED_MSG`] so
 /// callers can distinguish it; any other non-zero exit surfaces the trimmed CLI output.
+///
+/// This is a thin wrapper over [`run_proton_polled`] with no cancel flag — so every CLI call (list,
+/// connection probe, ensure-folder, disconnect, trash, retention) still gets the [`CLI_TIMEOUT`]
+/// ceiling for free; only the transfer phases additionally honour Cancel.
 fn run_proton(cli: &Path, args: &[&str]) -> Result<String> {
+    run_proton_polled(cli, args, None)
+}
+
+/// [`run_proton`], but spawned and polled so it can be bounded by [`CLI_TIMEOUT`] and — when a
+/// `cancel` flag is supplied (the transfer phases) — stopped promptly when the user hits Cancel. On
+/// either stop the child is killed and reaped, which lets the caller's `BusyGuard` drop and release
+/// `backup_busy` instead of wedging it until app restart (F-13). Blocking — call from
+/// `spawn_blocking`, never while holding the DB lock.
+fn run_proton_polled(
+    cli: &Path,
+    args: &[&str],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<String> {
+    use std::sync::atomic::Ordering;
+
     let mut cmd = Command::new(cli);
-    cmd.args(args);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     no_window(&mut cmd);
-    let out = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| Error::Other(format!("could not run the Proton Drive CLI: {e}")))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Drain both pipes on side threads: a chatty CLI could otherwise fill a pipe buffer and block
+    // (deadlock) while we're polling for exit rather than reading. Each thread ends at EOF, which
+    // arrives when the child exits or we kill it.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stdout_pipe.as_mut() {
+            let _ = std::io::Read::read_to_end(p, &mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = std::io::Read::read_to_end(p, &mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let cancelled = cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+                let timed_out = Instant::now() >= deadline;
+                if let Some(reason) = cli_stop_reason(cancelled, timed_out) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_thread.join();
+                    let _ = err_thread.join();
+                    return Err(Error::Other(match reason {
+                        CliStop::Cancelled => "Backup cancelled.".into(),
+                        CliStop::TimedOut => {
+                            "The Proton Drive CLI timed out and was stopped.".into()
+                        }
+                    }));
+                }
+                std::thread::sleep(CLI_POLL_INTERVAL);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Other(format!(
+                    "could not run the Proton Drive CLI: {e}"
+                )));
+            }
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out_thread.join().unwrap_or_default()).into_owned();
+    let err_bytes = err_thread.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&err_bytes);
     // "not signed in" is a plain-text message the CLI prints on failure. Only treat it as such
     // when it's NOT inside an expected JSON payload — otherwise a decrypted node *name* that
     // happens to contain "need to login" would misclassify a genuine listing as not-connected.
@@ -172,7 +276,7 @@ fn run_proton(cli: &Path, args: &[&str]) -> Result<String> {
     if looks_not_logged_in(&stderr) || (!stdout_is_json && looks_not_logged_in(&stdout)) {
         return Err(Error::Other(NOT_CONNECTED_MSG.into()));
     }
-    if out.status.success() {
+    if status.success() {
         Ok(stdout)
     } else {
         let detail = format!("{}\n{}", stdout.trim(), stderr.trim());
@@ -494,11 +598,17 @@ fn is_already_exists(msg: &str) -> bool {
 }
 
 /// Upload a finished archive into the backup folder (folder ensured first). `-c replace` keeps
-/// it non-interactive (names are unique, so no real conflict); `-t` skips thumbnailing.
-pub(crate) fn upload_archive(cli: &Path, local: &Path) -> Result<()> {
+/// it non-interactive (names are unique, so no real conflict); `-t` skips thumbnailing. The
+/// `cancel` flag is threaded into the transfer itself so a mid-upload Cancel is honoured (F-13);
+/// the folder-ensure call is a fast metadata op left on the plain (timeout-only) path.
+pub(crate) fn upload_archive(
+    cli: &Path,
+    local: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     ensure_backup_folder(cli)?;
     let local = local.to_string_lossy();
-    let out = run_proton(
+    let out = run_proton_polled(
         cli,
         &[
             "filesystem",
@@ -510,18 +620,26 @@ pub(crate) fn upload_archive(cli: &Path, local: &Path) -> Result<()> {
             "-t",
             "--json",
         ],
+        cancel,
     )?;
     check_transfer(&out)
 }
 
 /// Download one archive (by bare name) into `dest_dir`. The CLI writes it as `dest_dir/<name>`.
-pub(crate) fn download_archive(cli: &Path, name: &str, dest_dir: &Path) -> Result<()> {
+/// `cancel` makes the (longest) Download phase interruptible; the live caller is the direct
+/// `restore_from_proton` path — the enum destination's download arm passes `None` (see there).
+pub(crate) fn download_archive(
+    cli: &Path,
+    name: &str,
+    dest_dir: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     if !naming::valid_archive_name(name) {
         return Err(Error::Other("invalid backup name".into()));
     }
     let remote = format!("{REMOTE_BACKUP_DIR}/{name}");
     let dest = dest_dir.to_string_lossy();
-    let out = run_proton(
+    let out = run_proton_polled(
         cli,
         &[
             "filesystem",
@@ -532,6 +650,7 @@ pub(crate) fn download_archive(cli: &Path, name: &str, dest_dir: &Path) -> Resul
             "replace",
             "--json",
         ],
+        cancel,
     )?;
     check_transfer(&out)
 }
@@ -583,6 +702,16 @@ pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_stop_reason_prioritizes_cancel_then_timeout() {
+        // Neither → keep waiting; both → cancel wins (a user-initiated stop reads better than a
+        // timeout message); each alone maps to itself. This is the poll loop's kill decision.
+        assert_eq!(cli_stop_reason(false, false), None);
+        assert_eq!(cli_stop_reason(false, true), Some(CliStop::TimedOut));
+        assert_eq!(cli_stop_reason(true, false), Some(CliStop::Cancelled));
+        assert_eq!(cli_stop_reason(true, true), Some(CliStop::Cancelled));
+    }
 
     /// A real `filesystem list --json` node captured from the CLI (2026-07-02), so the parser
     /// is pinned to the actual serialized shape, not a guess.

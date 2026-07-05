@@ -862,6 +862,11 @@ export const readDocumentImage = (docId: number) =>
  *  (the webview can't open `target="_blank"` itself); the backend guards the scheme to http/https. */
 export const openUrl = (url: string) => invoke<void>("open_url", { url });
 
+/** Bump the backend user-activity clock (F-08). Called throttled from App's interaction listener so
+ *  idle-gated background jobs back off during real use (reading/triaging/editing), not only on chat
+ *  sends + ingest. Fire-and-forget: no payload, no return. */
+export const markActivity = () => invoke<void>("mark_activity");
+
 // --- Personal Assistant: Daily briefing (Step 7, spec §4 P1) ---
 
 /** The stored "here's your picture today" briefing + whether it's due a refresh. */

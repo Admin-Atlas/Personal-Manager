@@ -953,6 +953,17 @@ pub fn get_messages(state: State<'_, AppState>, conversation_id: i64) -> Result<
     Ok(rows)
 }
 
+/// Bump the user-activity clock from the webview. The frontend calls this (throttled) on real
+/// interaction — reading, scrolling, triaging, editing, browsing — so every idle-gated background
+/// job (chat indexer, summary/title/prefs reconcile, backup, activity rollup, flag scan) treats
+/// active use as active, not only chat sends + ingest (F-08). Cheap and non-blocking: one
+/// `Mutex<Instant>` write, no DB guard, no `.await`.
+#[tauri::command]
+pub fn mark_activity(state: State<'_, AppState>) -> Result<()> {
+    state.mark_user_activity();
+    Ok(())
+}
+
 /// Persist the user's turn, stream the assistant's reply from OpenRouter (tokens
 /// pushed over `on_event`), then persist the assistant's turn.
 #[tauri::command]
@@ -1664,7 +1675,7 @@ pub async fn dev_apply_change_event(
         state.sidecar.ensure_installed()?;
         let gateway = {
             let conn = state.conn()?;
-            state.gateway(&conn)?
+            state.gateway_for_write(&conn)?
         };
         let (vault_root, manifest_cipher) = state.manifest_io()?;
 
@@ -1835,7 +1846,7 @@ pub async fn ingest_note(app: AppHandle, widget_id: String, text: String) -> Res
         state.sidecar.ensure_installed()?;
         let gateway = {
             let conn = state.conn()?;
-            state.gateway(&conn)?
+            state.gateway_for_write(&conn)?
         };
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, manifest_cipher) = state.manifest_io()?;
@@ -2509,7 +2520,13 @@ pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> 
     spawn_entity_mutation(
         app,
         move |tx, vault, cipher, vault_root, manifest_cipher| {
+            // Capture the old canonical BEFORE the rename so we can re-key the name-keyed project
+            // satellites (triage, milestones, activity, chats) onto the new name — otherwise the
+            // renamed project silently loses all of them (F-05). Runs before the document rewrite,
+            // whose truth-writer would otherwise lazily upsert a bare new-name projects row.
+            let old = entities::canonical_name(tx, entity_id)?;
             let canonical = entities::rename_entity(tx, entity_id, &new_name)?;
+            projects::rename_project_satellites(tx, &old, &canonical)?;
             rewrite_entity_documents(
                 tx,
                 vault,
@@ -2532,8 +2549,13 @@ pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Resul
     spawn_entity_mutation(
         app,
         move |tx, vault, cipher, vault_root, manifest_cipher| {
+            // Capture the folded project's name BEFORE the merge deletes the source entity, then fold
+            // its name-keyed satellites into the survivor's name (F-05). `rename_project_satellites`
+            // keeps the survivor's own triage (INSERT OR IGNORE) and sums the daily rollup on collision.
+            let old = entities::canonical_name(tx, from_id)?;
             entities::merge_entities(tx, from_id, into_id)?;
             let canonical = entities::canonical_name(tx, into_id)?;
+            projects::rename_project_satellites(tx, &old, &canonical)?;
             rewrite_entity_documents(
                 tx,
                 vault,
@@ -4308,7 +4330,7 @@ fn apply_drive_actions(
     let gateway = {
         let conn = state.conn()?;
         state
-            .gateway(&conn)?
+            .gateway_for_write(&conn)?
             .with_embed_batch(db::indexing_embed_batch(&conn))
     };
     index_only::apply_actions(
@@ -4964,7 +4986,7 @@ fn apply_local_actions(
     let gateway = {
         let conn = state.conn()?;
         state
-            .gateway(&conn)?
+            .gateway_for_write(&conn)?
             .with_embed_batch(db::indexing_embed_batch(&conn))
     };
     index_only::apply_actions(
@@ -5411,7 +5433,7 @@ pub async fn promote_index_only(app: AppHandle, doc_id: i64) -> Result<Document>
             let (vault_root, manifest_cipher) = state.manifest_io()?;
             let gateway = {
                 let conn = state.conn()?;
-                state.gateway(&conn)?
+                state.gateway_for_write(&conn)?
             };
             ingest::promote_spreadsheet(
                 state.inner(),
@@ -8002,6 +8024,12 @@ pub(crate) async fn run_backup(
     let mut any_ok = false;
     let mut failures: Vec<String> = Vec::new();
     for (i, dest) in targets.iter().enumerate() {
+        // Honour Cancel between destinations (F-13): a hit during one upload stops the fan-out
+        // before the next starts. With no destination yet succeeded, `any_ok` stays false and the
+        // post-loop "Backup cancelled." branch reports it.
+        if state.backup_cancel.load(Ordering::SeqCst) {
+            break;
+        }
         emit_backup_progress(
             app,
             BackupEvent::Phase {
@@ -8009,7 +8037,7 @@ pub(crate) async fn run_backup(
                 fraction: i as f32 / n as f32,
             },
         );
-        match dest.upload(&archive_path, &archive_name).await {
+        match dest.upload(app, &archive_path, &archive_name).await {
             Ok(()) => {
                 any_ok = true;
                 emit_backup_progress(
@@ -8138,7 +8166,7 @@ pub async fn restore_from_proton(
         let dl = tempfile::Builder::new()
             .prefix("pm-restore-proton-")
             .tempdir()?;
-        crate::backup::proton::download_archive(&cli, &name, dl.path())?;
+        crate::backup::proton::download_archive(&cli, &name, dl.path(), Some(&st.backup_cancel))?;
         report(BackupPhase::Download, 1.0);
         let local = dl.path().join(&name);
         backup::restore::restore(&local, &passphrase, &target2, report, &st.backup_cancel)

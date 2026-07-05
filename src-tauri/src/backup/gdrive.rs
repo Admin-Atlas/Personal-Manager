@@ -18,7 +18,7 @@
 //! CLI errors on a duplicate folder name), Drive permits duplicates, so `ensure_backup_folder`
 //! converges deterministically on the earliest-created folder.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -38,6 +38,15 @@ const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// Runaway guard on `files.list` pagination — a backstop against a never-clearing page token, not
 /// a coverage cap (the backup folder holds at most a few dozen archives).
 const MAX_PAGES: usize = 100;
+
+/// Bytes sent per resumable-upload chunk. Peak upload memory is one of these, not the whole archive
+/// — the point of F-07 on the 8 GB target. Google requires every chunk except the last to be a
+/// multiple of 256 KiB; 8 MiB = 32 × 256 KiB. The exact size is a throughput/overhead trade-off
+/// pending live measurement — not yet tuned against a real transfer.
+const UPLOAD_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+/// Bounded per-chunk retries. On a transient failure we refresh the token, re-query the committed
+/// offset, and resume from there — so a blip costs one chunk, not the whole transfer.
+const UPLOAD_MAX_RETRIES: usize = 5;
 
 // --- HTTP plumbing -------------------------------------------------------------------------------
 
@@ -230,20 +239,18 @@ pub(crate) async fn ensure_backup_folder(token_key: &str) -> Result<String> {
 
 /// Upload a finished archive into the backup folder via a **resumable** upload (needs neither the
 /// `multipart` reqwest feature nor a second request format): initiate a session with the metadata,
-/// then PUT the bytes to the returned session URI. The file is read into memory off the async
-/// runtime; for a very large vault this could be revisited with a chunked `Content-Range` upload.
+/// then stream the bytes to the returned session URI in `Content-Range` chunks. Peak memory is one
+/// chunk ([`UPLOAD_CHUNK_SIZE`]), not the whole archive, and a mid-transfer blip resumes from the
+/// last server-acknowledged byte instead of restarting the whole PUT (F-07).
 pub(crate) async fn upload_archive(
     token_key: &str,
     local: &Path,
     archive_name: &str,
     folder_id: &str,
 ) -> Result<()> {
-    // Read the archive off the async runtime (blocking file I/O).
-    let path: PathBuf = local.to_path_buf();
-    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path))
-        .await
-        .map_err(|e| Error::Other(format!("reading the archive panicked: {e}")))??;
-    let len = bytes.len();
+    // A cheap stat (not a whole-file read) — the total feeds the session's declared length and the
+    // per-chunk Content-Range math.
+    let len = std::fs::metadata(local)?.len();
 
     // 1) Initiate the resumable session. Small JSON body → safe to 401-retry via `authorized_send`.
     let meta = serde_json::json!({ "name": archive_name, "parents": [folder_id] }).to_string();
@@ -270,21 +277,131 @@ pub(crate) async fn upload_archive(
         .map(str::to_string)
         .ok_or_else(|| Error::Other("Google Drive didn't return an upload session".into()))?;
 
-    // 2) Transfer the bytes in one PUT. The session URI is pre-authorized; we include the bearer
-    //    too. The body is sent once (a stream/large Vec can't be cheaply retried), so we rely on
-    //    the proactively-refreshed token from step 1 rather than a 401 retry here.
-    let bearer = google::valid_access_token(token_key).await?;
-    let put = http_client()?
-        .put(&session)
-        .bearer_auth(bearer.expose())
-        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-        .body(bytes)
-        .send()
-        .await?;
-    if !put.status().is_success() {
-        return Err(drive_error(put, "uploading the archive").await);
+    // 2) Stream the archive to the session URI in bounded chunks (see below).
+    transfer_archive(token_key, &session, local, len).await
+}
+
+/// The resumable chunk loop: seek to the committed offset, read one [`UPLOAD_CHUNK_SIZE`] slice, PUT
+/// it with an inclusive `Content-Range`, and advance to the offset the server acknowledges (`308
+/// Resume Incomplete` carries a `Range: bytes=0-<lastByte>` header). A transient failure (network
+/// error, 5xx, or a token that expired mid-transfer) is retried up to [`UPLOAD_MAX_RETRIES`] times:
+/// refresh the token, re-query the committed offset, and resume — so a blip costs one chunk, not the
+/// whole archive. Peak memory is one chunk buffer.
+async fn transfer_archive(token_key: &str, session: &str, local: &Path, total: u64) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let client = http_client()?;
+    let mut file = std::fs::File::open(local)?;
+    let mut bearer = google::valid_access_token(token_key).await?;
+    let mut offset: u64 = 0;
+    let mut retries = 0usize;
+
+    while offset < total {
+        let want = UPLOAD_CHUNK_SIZE.min(total - offset);
+        let mut buf = vec![0u8; want as usize];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut buf)?;
+
+        let sent = client
+            .put(session)
+            .bearer_auth(bearer.expose())
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(
+                reqwest::header::CONTENT_RANGE,
+                content_range(offset, want, total),
+            )
+            .body(buf)
+            .send()
+            .await;
+
+        match sent {
+            // The final chunk commits with 200/201 (the file resource).
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            // 308 Resume Incomplete: advance to the server-acknowledged byte.
+            Ok(resp) if resp.status() == reqwest::StatusCode::PERMANENT_REDIRECT => {
+                offset = next_offset_from_range(&resp).unwrap_or(offset + want);
+                retries = 0;
+            }
+            // A retryable failure (5xx or a mid-transfer 401): refresh, re-sync the offset, resume.
+            Ok(resp)
+                if (resp.status().is_server_error()
+                    || resp.status() == reqwest::StatusCode::UNAUTHORIZED)
+                    && retries < UPLOAD_MAX_RETRIES =>
+            {
+                retries += 1;
+                bearer = google::refresh_now(token_key).await?;
+                offset = query_committed_offset(&client, token_key, session, total).await?;
+                if offset >= total {
+                    return Ok(());
+                }
+            }
+            // A hard client error (or retries exhausted): surface it.
+            Ok(resp) => return Err(drive_error(resp, "uploading the archive").await),
+            // A transport error: retry the same way while we have budget, else give up.
+            Err(_) if retries < UPLOAD_MAX_RETRIES => {
+                retries += 1;
+                bearer = google::refresh_now(token_key).await?;
+                offset = query_committed_offset(&client, token_key, session, total).await?;
+                if offset >= total {
+                    return Ok(());
+                }
+            }
+            Err(e) => return Err(Error::from(e)),
+        }
     }
     Ok(())
+}
+
+/// Probe how many bytes the resumable session has committed so far: a PUT with an empty body and
+/// `Content-Range: bytes */<total>`. A 2xx means it's already fully stored; a 308 carries the
+/// `Range` header we parse for the next byte to send.
+async fn query_committed_offset(
+    client: &reqwest::Client,
+    token_key: &str,
+    session: &str,
+    total: u64,
+) -> Result<u64> {
+    let bearer = google::valid_access_token(token_key).await?;
+    let resp = client
+        .put(session)
+        .bearer_auth(bearer.expose())
+        .header(reqwest::header::CONTENT_RANGE, format!("bytes */{total}"))
+        .body(Vec::<u8>::new())
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        return Ok(total);
+    }
+    if resp.status() == reqwest::StatusCode::PERMANENT_REDIRECT {
+        return Ok(next_offset_from_range(&resp).unwrap_or(0));
+    }
+    Err(drive_error(resp, "resuming the upload").await)
+}
+
+/// Build an inclusive `Content-Range` value (`bytes {offset}-{end}/{total}`) for a chunk. Pure, so
+/// the off-by-one that a naive `offset + len` end would introduce is unit-tested.
+fn content_range(offset: u64, len: u64, total: u64) -> String {
+    let end = offset + len - 1;
+    format!("bytes {offset}-{end}/{total}")
+}
+
+/// Parse the last committed byte out of Drive's `Range: bytes=0-<lastByte>` header and return the
+/// NEXT byte to send (`lastByte + 1`). Pure, so the resume-offset math is unit-tested without a live
+/// `Response`. Absent/garbage header → `None` (caller falls back conservatively).
+fn parse_range_last(raw: &str) -> Option<u64> {
+    raw.rsplit('-')
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n + 1)
+}
+
+fn next_offset_from_range(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_range_last)
 }
 
 /// List PM's archives in the backup folder (newest first). Filters to `.pmbackup` and sorts
@@ -482,5 +599,32 @@ mod tests {
         let doomed = naming::select_for_deletion(&names, 1);
         assert_eq!(doomed.len(), 2);
         assert!(!doomed.contains(&"pm-backup-v1-20260703T000000Z.pmbackup".to_string()));
+    }
+
+    // --- F-07: resumable chunked upload arithmetic (the two off-by-one-prone points) ---
+
+    #[test]
+    fn content_range_is_inclusive() {
+        // The first full 8 MiB chunk of a 20 MiB archive, then the short final chunk. The `end` is
+        // INCLUSIVE (last byte), so a naive `offset + len` would be one too high.
+        let total = 20 * 1024 * 1024;
+        assert_eq!(
+            content_range(0, UPLOAD_CHUNK_SIZE, total),
+            "bytes 0-8388607/20971520"
+        );
+        assert_eq!(
+            content_range(UPLOAD_CHUNK_SIZE, total - UPLOAD_CHUNK_SIZE, total),
+            "bytes 8388608-20971519/20971520"
+        );
+    }
+
+    #[test]
+    fn parse_range_last_yields_the_next_byte() {
+        // Drive's 308 carries `Range: bytes=0-<lastByte>`; the next byte to send is lastByte + 1.
+        assert_eq!(parse_range_last("bytes=0-1048575"), Some(1048576));
+        assert_eq!(parse_range_last("bytes=0-0"), Some(1));
+        // Absent/garbage → None, so the caller falls back conservatively rather than mis-seeking.
+        assert_eq!(parse_range_last(""), None);
+        assert_eq!(parse_range_last("garbage"), None);
     }
 }
