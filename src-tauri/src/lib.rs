@@ -43,6 +43,7 @@ mod lock_session;
 mod microsoft;
 mod milestones;
 mod model_gateway;
+mod oauth_loopback;
 mod onedrive;
 mod openrouter;
 mod outlook_calendar;

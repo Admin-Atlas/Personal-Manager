@@ -15,11 +15,10 @@
 //!
 //! Scopes are **read-only** (`Files.Read`); PM never writes to OneDrive (spec non-goal #4).
 
-use base64::Engine;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::oauth_loopback;
 use crate::secret::Secret;
 use crate::secrets;
 
@@ -38,8 +37,6 @@ pub const ONEDRIVE_SCOPE: &str = "Files.Read offline_access User.Read";
 /// `User.Read` (to learn which account the token grants, via `/me`). `Calendars.Read` reads events
 /// from every calendar the account owns or is shared on; PM never writes (spec non-goal #4).
 pub const CALENDAR_SCOPE: &str = "Calendars.Read offline_access User.Read";
-/// How long to wait for the browser consent redirect before giving up.
-const REDIRECT_TIMEOUT_SECS: u64 = 180;
 
 /// The stored OAuth token blob (one keychain entry, JSON). `expiry` is Unix seconds. The
 /// bearer/refresh values are [`Secret`], so the derived `Debug` can never print them.
@@ -77,8 +74,8 @@ fn http() -> Result<reqwest::Client> {
 /// caller's job. `success_label` names the connected product on the browser success page.
 pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
     let client_id = client_id()?;
-    let (verifier, challenge) = pkce()?;
-    let state = random_token(16)?;
+    let (verifier, challenge) = oauth_loopback::pkce()?;
+    let state = oauth_loopback::random_token(16)?;
 
     // Bind the loopback listener first so the port is known before we build the URL. Bind 127.0.0.1
     // (not "localhost") and use it verbatim as the redirect host, so there is no DNS/IPv6 ambiguity
@@ -97,10 +94,11 @@ pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
     // Wait for Microsoft to redirect back with the code (blocking accept, off-runtime).
     let expected_state = state.clone();
     let label = success_label.to_string();
-    let code =
-        tokio::task::spawn_blocking(move || wait_for_redirect(listener, &expected_state, &label))
-            .await
-            .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
+    let code = tokio::task::spawn_blocking(move || {
+        oauth_loopback::wait_for_redirect(listener, &expected_state, "Microsoft", &label)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
 
     let token = exchange_code(&client_id, &code, &redirect_uri, &verifier).await?;
     if token.refresh_token.is_none() {
@@ -186,8 +184,9 @@ async fn authorized_send(token_key: &str, url: &str) -> Result<reqwest::Response
     let client_id = client_id()?;
     let mut token = load_token(token_key)?;
 
-    if token.expiry <= now_unix() + 60 {
-        token = do_refresh(&client_id, &token, token_key).await?;
+    // Lock-free fast path; `do_refresh` re-checks expiry under the per-key lock before any network call.
+    if token.expiry <= oauth_loopback::now_unix() + 60 {
+        token = do_refresh(&client_id, token_key, false).await?;
     }
 
     let mut resp = http()?
@@ -196,7 +195,7 @@ async fn authorized_send(token_key: &str, url: &str) -> Result<reqwest::Response
         .send()
         .await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        token = do_refresh(&client_id, &token, token_key).await?;
+        token = do_refresh(&client_id, token_key, true).await?;
         resp = http()?
             .get(url)
             .bearer_auth(token.access_token.expose())
@@ -283,7 +282,19 @@ async fn exchange_code(
 
 /// Refresh the access token under `token_key`; carries the existing refresh token forward when
 /// Microsoft doesn't return a new one, and re-persists the blob. Public client — no secret.
-async fn do_refresh(client_id: &str, current: &Token, token_key: &str) -> Result<Token> {
+///
+/// Serialized per key by the shared [`oauth_loopback::refresh_lock`], reloading the blob *under* the
+/// lock. This matters more for Microsoft than Google: Entra ROTATES the refresh token on every use, so
+/// two concurrent refreshes racing would have the loser post an already-invalidated refresh token and
+/// wedge the account. Reloading under the lock means the loser refreshes from the winner's freshly
+/// persisted (rotated) token instead. `force = false` (proactive) returns early when the reloaded token
+/// is already fresh; `force = true` (reactive 401) always refreshes (the token may be revoked).
+async fn do_refresh(client_id: &str, token_key: &str, force: bool) -> Result<Token> {
+    let _guard = oauth_loopback::refresh_lock(token_key).await;
+    let current = load_token(token_key)?;
+    if !force && current.expiry > oauth_loopback::now_unix() + 60 {
+        return Ok(current);
+    }
     let refresh = current
         .refresh_token
         .clone()
@@ -314,7 +325,7 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
     Ok(Token {
         access_token: Secret::from(t.access_token),
         refresh_token: t.refresh_token.map(Secret::from),
-        expiry: now_unix() + t.expires_in.unwrap_or(3600),
+        expiry: oauth_loopback::now_unix() + t.expires_in.unwrap_or(3600),
         scope: t.scope,
     })
 }
@@ -333,23 +344,7 @@ pub fn save_token(token_key: &str, token: &Token) -> Result<()> {
     secrets::set_microsoft_token_for(token_key, &json)
 }
 
-// --- PKCE + auth URL ---
-
-/// A PKCE verifier/challenge pair. The verifier is hex (a valid PKCE charset); the challenge is the
-/// base64url-nopad SHA-256 of the verifier (the S256 method).
-fn pkce() -> Result<(String, String)> {
-    let verifier = random_token(32)?;
-    let digest = Sha256::digest(verifier.as_bytes());
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    Ok((verifier, challenge))
-}
-
-/// `n` random bytes, hex-encoded — used for the PKCE verifier and the CSRF state.
-fn random_token(n: usize) -> Result<String> {
-    let mut bytes = vec![0u8; n];
-    getrandom::fill(&mut bytes).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
-    Ok(hex::encode(bytes))
-}
+// --- auth URL (PKCE + loopback machinery live in `crate::oauth_loopback`) ---
 
 /// Build Microsoft's consent URL. `offline_access` (carried in `scope`) yields the refresh token;
 /// `prompt=select_account` lets the user pick which Microsoft account (so a second account can be
@@ -379,189 +374,9 @@ pub fn build_auth_url(
     Ok(url.to_string())
 }
 
-// --- loopback redirect server ---
-
-/// Accept connections until the OAuth redirect arrives, validate the CSRF `state`, and return the
-/// authorization `code`. Polls with a deadline so it can't hang forever (browsers also make stray
-/// requests like /favicon.ico, which we ignore).
-fn wait_for_redirect(
-    listener: std::net::TcpListener,
-    expected_state: &str,
-    success_label: &str,
-) -> Result<String> {
-    use std::io::Read;
-
-    listener.set_nonblocking(true)?;
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(REDIRECT_TIMEOUT_SECS);
-
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return Err(Error::Other(
-                "Timed out waiting for Microsoft sign-in. Please try again.".into(),
-            ));
-        }
-        let (mut stream, _) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        stream.set_nonblocking(false).ok();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .ok();
-        let mut buf = [0u8; 4096];
-        let n = match stream.read(&mut buf) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let Some(target) = request_target(&request) else {
-            let _ = write_page(&mut stream, "Waiting for Microsoft…");
-            continue;
-        };
-        let params = parse_query(&target);
-
-        if let Some(err) = params.get("error") {
-            let _ = write_page(
-                &mut stream,
-                "Sign-in was cancelled. You can close this tab.",
-            );
-            return Err(Error::Other(format!(
-                "Microsoft sign-in was declined: {err}"
-            )));
-        }
-        match params.get("code") {
-            Some(code)
-                if params
-                    .get("state")
-                    .is_some_and(|s| ct_eq(s, expected_state)) =>
-            {
-                let _ = write_page(
-                    &mut stream,
-                    &format!(
-                        "PM is connected to {success_label}. You can close this tab and return to PM."
-                    ),
-                );
-                return Ok(code.clone());
-            }
-            Some(_) => {
-                let _ = write_page(
-                    &mut stream,
-                    "Sign-in could not be verified. Please try again.",
-                );
-                return Err(Error::Other(
-                    "OAuth state mismatch — sign-in aborted for safety.".into(),
-                ));
-            }
-            None => {
-                // Not the redirect (e.g. a favicon probe) — keep waiting.
-                let _ = write_page(&mut stream, "Waiting for Microsoft…");
-            }
-        }
-    }
-}
-
-/// The request target from the first request line: `GET /?code=… HTTP/1.1` → `/?code=…`.
-fn request_target(request: &str) -> Option<String> {
-    let line = request.lines().next()?;
-    line.split_whitespace().nth(1).map(str::to_string)
-}
-
-/// Constant-time equality for the OAuth CSRF `state` token, so the comparison can't be turned into a
-/// timing oracle. (The length check is fine to short-circuit — the token length is fixed, not secret.)
-fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Parse a `/path?a=1&b=2` target's query into a map, percent-decoding values.
-fn parse_query(target: &str) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    if let Some((_, query)) = target.split_once('?') {
-        for pair in query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                map.insert(k.to_string(), percent_decode(v));
-            }
-        }
-    }
-    map
-}
-
-/// Minimal application/x-www-form-urlencoded decode (handles `+` and `%XX`).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-            }
-            b => out.push(b),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Write a tiny styled HTML page back to the browser and close the connection.
-fn write_page(stream: &mut std::net::TcpStream, message: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>PM</title></head>\
-         <body style=\"font-family:system-ui,sans-serif;background:#0a0a0a;color:#e5e5e5;\
-         display:flex;align-items:center;justify-content:center;height:100vh;margin:0\">\
-         <p style=\"font-size:15px;max-width:28rem;text-align:center;padding:0 1rem\">{message}</p>\
-         </body></html>"
-    );
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream.write_all(response.as_bytes())
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pkce_challenge_matches_known_vector() {
-        // RFC 7636 Appendix B reference verifier → challenge.
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let digest = Sha256::digest(verifier.as_bytes());
-        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
-    }
 
     #[test]
     fn auth_url_carries_pkce_offline_scope_and_no_secret() {
@@ -584,18 +399,5 @@ mod tests {
         assert!(url.contains("state=state-abc"));
         // Public client — a secret must never appear in the authorize URL.
         assert!(!url.contains("client_secret"));
-    }
-
-    #[test]
-    fn query_parsing_decodes_and_extracts_code() {
-        let params = parse_query("/?state=abc&code=M.C107%2Ffoo");
-        assert_eq!(params.get("code").unwrap(), "M.C107/foo");
-        assert_eq!(params.get("state").unwrap(), "abc");
-    }
-
-    #[test]
-    fn request_target_pulls_the_path() {
-        let req = "GET /?code=xyz&state=s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-        assert_eq!(request_target(req).unwrap(), "/?code=xyz&state=s");
     }
 }
