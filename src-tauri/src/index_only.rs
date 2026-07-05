@@ -451,12 +451,27 @@ pub fn register_pointer(
             source_parent_folder_name: input.source_parent_folder_name,
         },
     };
+    // F-04: landing this item resolves its project with `create_if_new`, which MINTS a mirror entity
+    // when that project is new. Note whether it already existed BEFORE the insert so we can push a
+    // genuine mint out to the portable rules file below — otherwise the next session's mirror rebuild
+    // (the file is truth) would silently roll the new entity back. Normally a no-op: index-only items
+    // land as the seeded 'Unsorted' project, so `project_existed` is almost always true.
+    let project_existed = {
+        let conn = state.conn()?;
+        crate::entities::resolve_project(&conn, &meta.project, false)?.is_some()
+    };
     let document = embed_and_index(state, gateway, body, &meta)?;
     // Persist the new item's classification to the portable manifest — a best-effort skip would lose
     // it on the next Rebuild, so a failure here propagates.
     {
         let conn = state.conn()?;
         write_synced(&conn, vault_root, cipher)?;
+    }
+    // Structural guarantee (mirror ⊆ rules after any mint, mirroring `ingest::rebuild`'s own sync):
+    // if this item created a new project entity, keep the portable rules file current. Best-effort +
+    // gated on an actual mint, so a normal (Unsorted) sync writes nothing.
+    if !project_existed {
+        state.sync_entity_rules();
     }
     Ok(document)
 }
