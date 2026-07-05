@@ -194,6 +194,13 @@ impl connector_sync::SyncSlot for DriveSyncState {
         self.total = None;
         self.account = None;
     }
+    fn begin_pass(&mut self, target: Option<String>) {
+        *self = DriveSyncState {
+            running: true,
+            account: target,
+            ..Default::default()
+        };
+    }
 }
 
 impl connector_sync::SyncSlot for OneDriveSyncState {
@@ -214,6 +221,13 @@ impl connector_sync::SyncSlot for OneDriveSyncState {
         self.total = None;
         self.account = None;
     }
+    fn begin_pass(&mut self, target: Option<String>) {
+        *self = OneDriveSyncState {
+            running: true,
+            account: target,
+            ..Default::default()
+        };
+    }
 }
 
 impl connector_sync::SyncSlot for LocalFolderSyncState {
@@ -233,6 +247,13 @@ impl connector_sync::SyncSlot for LocalFolderSyncState {
         self.processed = 0;
         self.total = None;
         self.folder = None;
+    }
+    fn begin_pass(&mut self, target: Option<String>) {
+        *self = LocalFolderSyncState {
+            running: true,
+            folder: target,
+            ..Default::default()
+        };
     }
 }
 
