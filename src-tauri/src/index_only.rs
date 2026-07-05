@@ -791,9 +791,17 @@ pub struct ReconcileItem<T> {
 /// → [`Add`](ChangeEvent::Add) (ingests, or reactivates a folder removed then re-added); a known file
 /// no longer present → [`Delete`](ChangeEvent::Delete). `source_id_of` namespaces a provider-local id,
 /// so My Drive, shared drives, and OneDrive all share this core.
+///
+/// `complete` is the enumeration's own report of whether it saw *everything* (the `truncated` flag from
+/// [`crate::connector_sync::paginate`], inverted). When it's `false` the listing was cut short by a
+/// page/folder guard, so a file's absence proves nothing — the deletion pass is **skipped entirely**
+/// and only the positively-observed Adds/Updates are returned. Without this, a truncated enumeration
+/// would soft-delete every still-present file it simply didn't reach (audit F-30). Adds/Updates are
+/// always safe: they're only emitted for files actually seen.
 pub fn reconcile_enumeration<T: EnumeratedFile>(
     files: Vec<T>,
     known: std::collections::HashSet<String>,
+    complete: bool,
     source_id_of: impl Fn(&str) -> String,
 ) -> Vec<ReconcileItem<T>> {
     let mut present: std::collections::HashSet<String> =
@@ -820,13 +828,17 @@ pub fn reconcile_enumeration<T: EnumeratedFile>(
             payload: Some(f),
         });
     }
-    for source_id in known {
-        if !present.contains(&source_id) {
-            items.push(ReconcileItem {
-                source_id: source_id.clone(),
-                event: ChangeEvent::Delete { source_id },
-                payload: None,
-            });
+    // Absence only means "deleted" when we're sure we saw the whole listing. A truncated pass hands
+    // back Adds/Updates for what it did reach and leaves the known-but-unseen set alone to retry.
+    if complete {
+        for source_id in known {
+            if !present.contains(&source_id) {
+                items.push(ReconcileItem {
+                    source_id: source_id.clone(),
+                    event: ChangeEvent::Delete { source_id },
+                    payload: None,
+                });
+            }
         }
     }
     items
@@ -1462,7 +1474,8 @@ mod tests {
             .collect();
         let files = vec![ef("a", "h-a2"), ef("c", "h-c1")];
 
-        let plan = reconcile_enumeration(files, known, |id| format!("acc:{id}"));
+        // A COMPLETE enumeration: absence is trustworthy, so the missing known item is deleted.
+        let plan = reconcile_enumeration(files, known, true, |id| format!("acc:{id}"));
 
         // Present files first, in enumeration order, then the single absent-known deletion.
         assert_eq!(plan.len(), 3);
@@ -1499,6 +1512,66 @@ mod tests {
             }
         );
         assert!(plan[2].payload.is_none());
+    }
+
+    #[test]
+    fn reconcile_enumeration_skips_deletions_when_truncated() {
+        // F-30: the same scenario, but the enumeration was cut short by the page/folder guard
+        // (`complete = false`). "b" is absent only because we never reached it — deleting it would
+        // wipe a still-present file. So NO Delete is emitted; only the positively-observed Add/Update
+        // for the files we did see survive, and "b" is left untouched to retry next pass.
+        let known: std::collections::HashSet<String> = ["acc:a".to_string(), "acc:b".to_string()]
+            .into_iter()
+            .collect();
+        let files = vec![ef("a", "h-a2"), ef("c", "h-c1")];
+
+        let plan = reconcile_enumeration(files, known, false, |id| format!("acc:{id}"));
+
+        assert_eq!(plan.len(), 2, "a truncated pass emits no deletions");
+        assert!(
+            plan.iter()
+                .all(|i| !matches!(i.event, ChangeEvent::Delete { .. })),
+            "no Delete may be inferred from a truncated enumeration"
+        );
+        // The present files are still classified exactly as before (Update for known, Add for new).
+        assert_eq!(plan[0].source_id, "acc:a");
+        assert!(matches!(plan[0].event, ChangeEvent::Update { .. }));
+        assert_eq!(plan[1].source_id, "acc:c");
+        assert!(matches!(plan[1].event, ChangeEvent::Add { .. }));
+    }
+
+    #[test]
+    fn reconcile_enumeration_empty_truncation_deletes_nothing() {
+        // The worst case F-30 guards: the page/folder guard tripped on the very first page, so the
+        // enumeration is EMPTY. Every known item is "absent" — but a complete=false pass must delete
+        // none of them (a complete=true empty pass would, correctly, delete them all).
+        let known: std::collections::HashSet<String> = [
+            "acc:a".to_string(),
+            "acc:b".to_string(),
+            "acc:c".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let truncated = reconcile_enumeration(Vec::<FakeFile>::new(), known.clone(), false, |id| {
+            format!("acc:{id}")
+        });
+        assert!(
+            truncated.is_empty(),
+            "an empty truncated enumeration must not delete the whole known set"
+        );
+
+        let complete = reconcile_enumeration(Vec::<FakeFile>::new(), known, true, |id| {
+            format!("acc:{id}")
+        });
+        assert_eq!(
+            complete.len(),
+            3,
+            "an empty COMPLETE enumeration means everything really is gone → 3 deletions"
+        );
+        assert!(complete
+            .iter()
+            .all(|i| matches!(i.event, ChangeEvent::Delete { .. })));
     }
 
     // --- executor state transitions (no embedder needed) ---

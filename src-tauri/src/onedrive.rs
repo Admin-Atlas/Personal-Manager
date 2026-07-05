@@ -31,7 +31,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::index_only::{self, ChangeEvent, ItemState, SourceState};
 use crate::microsoft;
-use crate::{ingest, secrets, AppState};
+use crate::{connector_sync, ingest, secrets, AppState};
 
 /// Cap on a single fetched file body (25 MiB) so one huge file can't balloon memory; an over-cap file
 /// is skipped with a surfaced note rather than indexed.
@@ -600,10 +600,19 @@ pub async fn me_account(token: &microsoft::Token) -> Result<(String, String)> {
 /// Pull the whole-drive delta since `cursor` (a stored `@odata.deltaLink` URL) + the next delta link.
 /// `cursor = None` is the first sync / a re-baseline: the no-token `/root/delta` returns the full
 /// enumeration AND a fresh delta link in one walk. Follows `@odata.nextLink` across pages.
+///
+/// Returns the entries, the delta cursor to persist, and whether the page guard tripped. On a clean
+/// walk the cursor is the `@odata.deltaLink` (the true incremental checkpoint). On a **truncated** walk
+/// it is instead the last `@odata.nextLink` — itself a resumable checkpoint: the caller advances to it
+/// and the next sync CONTINUES the walk from there. That's safe because the delta feed carries explicit
+/// removes (tombstones), never absence-inferred deletions, so a partial pass loses nothing and a large
+/// backlog drains across syncs (before F-30 a runaway page token hard-failed the whole account here). A
+/// page with neither link is a malformed Graph response and still errors. See
+/// [`connector_sync::paginate`].
 pub async fn list_delta(
     token_key: &str,
     cursor: Option<&str>,
-) -> Result<(Vec<DriveDelta>, String)> {
+) -> Result<(Vec<DriveDelta>, String, bool)> {
     let mut url = cursor.map(String::from).unwrap_or_else(root_delta_url);
     let mut all = Vec::new();
     for _ in 0..MAX_PAGES {
@@ -612,7 +621,9 @@ pub async fn list_delta(
         all.extend(entries);
         match (next, delta) {
             (Some(n), _) => url = n,
-            (None, Some(link)) => return Ok((all, link)),
+            (None, Some(link)) => return Ok((all, link, false)),
+            // A page with neither a next nor a delta link is a malformed Graph response, not a
+            // truncation — surface it rather than silently baselining an incomplete pass.
             (None, None) => {
                 return Err(Error::Other(
                     "OneDrive delta returned no continuation token.".into(),
@@ -620,15 +631,22 @@ pub async fn list_delta(
             }
         }
     }
-    Err(Error::Other(
-        "OneDrive delta exceeded the page guard — too many changes in one pass.".into(),
-    ))
+    // Page guard: `url` holds the next `@odata.nextLink` we'd have fetched — a resumable checkpoint.
+    // Hand it back so the caller advances and the next sync continues from here, rather than re-fetching
+    // the same head forever (the withhold-on-truncation rule is for enumerations, not the delta feed).
+    eprintln!("onedrive: delta hit the page guard at {MAX_PAGES} pages");
+    Ok((all, url, true))
 }
 
 /// Enumerate the files under the selected folders (recursively, breadth via a queue), deduped, each
 /// folder walked once even if reachable from two selections. Folders themselves are never returned —
 /// only the files beneath them. The folder-scoped counterpart to [`list_delta`].
-pub async fn enumerate_folders(token_key: &str, roots: &[String]) -> Result<Vec<DriveItem>> {
+/// Returns the deduped files plus whether the walk was cut short by the folder-count guard (`true` ⇒
+/// INCOMPLETE — the caller must not treat an unseen file as deleted; see [`connector_sync::paginate`]).
+pub async fn enumerate_folders(
+    token_key: &str,
+    roots: &[String],
+) -> Result<(Vec<DriveItem>, bool)> {
     use std::collections::HashSet;
     let mut out: Vec<DriveItem> = Vec::new();
     let mut seen_folders: HashSet<String> = HashSet::new();
@@ -642,7 +660,7 @@ pub async fn enumerate_folders(token_key: &str, roots: &[String]) -> Result<Vec<
         nodes += 1;
         if nodes > MAX_PAGES {
             eprintln!("onedrive: folder walk hit the node guard at {MAX_PAGES} folders");
-            break;
+            return Ok((out, true));
         }
         let mut url = item_children_url(&folder);
         loop {
@@ -661,26 +679,27 @@ pub async fn enumerate_folders(token_key: &str, roots: &[String]) -> Result<Vec<
             }
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// The immediate subfolders of `parent_id` (or the drive root when `None`) — one lazy level of the
 /// folder picker. Sorted by name for a stable tree.
 pub async fn list_folders(token_key: &str, parent_id: Option<&str>) -> Result<Vec<OneDriveFolder>> {
-    let mut url = match parent_id {
+    let initial = match parent_id {
         Some(id) => item_children_url(id),
         None => root_children_url(),
     };
-    let mut out = Vec::new();
-    for _ in 0..MAX_PAGES {
-        let v = microsoft::authorized_get(token_key, &url).await?;
-        let (folders, next) = parse_folders(&v);
-        out.extend(folders);
-        match next {
-            Some(n) => url = n,
-            None => break,
+    // A picker (one lazy level): a truncated listing just shows fewer rows, so the guard flag is
+    // discarded. The Graph `@odata.nextLink` IS the page cursor; the first page uses the initial URL.
+    let (mut out, _truncated) = connector_sync::paginate(MAX_PAGES, |cursor| {
+        let initial = initial.as_str();
+        async move {
+            let url = cursor.unwrap_or_else(|| initial.to_string());
+            let v = microsoft::authorized_get(token_key, &url).await?;
+            Ok(parse_folders(&v))
         }
-    }
+    })
+    .await?;
     out.sort_by_key(|f| f.name.to_lowercase());
     Ok(out)
 }

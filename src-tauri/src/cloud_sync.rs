@@ -101,6 +101,13 @@ struct AccountWork<Item> {
     /// empty; its `finalize_or_flag` ignores it.
     extra_cursors: Vec<(String, String)>,
     auth_failed: bool,
+    /// Set when any of this account's listings hit its page/folder guard (audit F-30). For a truncated
+    /// *enumeration* (a full re-list / folder reconcile) the gather also withheld the cursor advance and
+    /// dropped inferred deletions — absence proves nothing on a partial list. A truncated *delta feed*
+    /// instead advances its resumable cursor (nothing withheld: its removes are explicit, so it just
+    /// resumes next pass). Either way this flag makes phase 2 surface a coverage-incomplete note so the
+    /// partial pass isn't mistaken for a clean one.
+    coverage_incomplete: bool,
 }
 
 /// The phase-2 resolution of one gathered work item: either a no-op to skip (a changes-feed entry that
@@ -375,6 +382,20 @@ async fn run_cloud_pass<C: CloudDriver>(
             continue;
         }
 
+        // A gather that hit its page/folder guard already withheld the enumeration's cursor advance and
+        // skipped inferred deletions; surface it so the partial pass isn't read as a clean one (F-30).
+        // Pushed directly, NOT through the per-file `record_issue` (which is capped): there's at most one
+        // of these per account and it's the only report-side signal a pass was partial, so it must never
+        // be starved by a full per-file issues list.
+        if w.coverage_incomplete {
+            issues.push(CloudSyncIssue {
+                name: w.email.clone(),
+                reason: "Only part of this account could be listed this sync (too many items to page \
+                         through at once). Nothing was removed; the rest is picked up on the next sync."
+                    .to_string(),
+            });
+        }
+
         for item in &w.items {
             // Stop requested mid-account? Halt after the current file — already-indexed files stay.
             if sync_cancelled::<C>(app) {
@@ -623,12 +644,13 @@ async fn gather_shared(
     token_key: &str,
     email: &str,
     sel: &drive::SharedSelection,
-) -> Result<(Vec<DriveItem>, Option<(String, String)>)> {
+) -> Result<(Vec<DriveItem>, Option<(String, String)>, bool)> {
     match sel.folders.as_deref() {
-        Some(folders) => Ok((
-            gather_shared_folders(app, token_key, &sel.drive_id, folders).await?,
-            None,
-        )),
+        Some(folders) => {
+            let (items, truncated) =
+                gather_shared_folders(app, token_key, &sel.drive_id, folders).await?;
+            Ok((items, None, truncated))
+        }
         None => gather_shared_whole(app, token_key, email, &sel.drive_id).await,
     }
 }
@@ -643,8 +665,8 @@ async fn gather_shared_folders(
     token_key: &str,
     drive_id: &str,
     folders: &[String],
-) -> Result<Vec<DriveItem>> {
-    let files = drive::enumerate_shared(token_key, drive_id, Some(folders)).await?;
+) -> Result<(Vec<DriveItem>, bool)> {
+    let (files, truncated) = drive::enumerate_shared(token_key, drive_id, Some(folders)).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -652,12 +674,15 @@ async fn gather_shared_folders(
             .into_iter()
             .collect()
     };
-    Ok(index_only::reconcile_enumeration(files, known, |file_id| {
+    // A truncated enumeration (`complete = false`) must not infer deletions — a still-present file we
+    // didn't reach would otherwise be soft-deleted (F-30).
+    let items = index_only::reconcile_enumeration(files, known, !truncated, |file_id| {
         drive::shared_source_id(drive_id, file_id)
     })
     .into_iter()
     .map(drive_reconciled)
-    .collect())
+    .collect();
+    Ok((items, truncated))
 }
 
 /// Folder-scoped reconcile for **My Drive**: the personal counterpart to [`gather_shared_folders`].
@@ -669,8 +694,8 @@ async fn gather_my_drive_folders(
     token_key: &str,
     email: &str,
     folders: &[String],
-) -> Result<Vec<DriveItem>> {
-    let files = drive::enumerate_my_folders(token_key, folders).await?;
+) -> Result<(Vec<DriveItem>, bool)> {
+    let (files, truncated) = drive::enumerate_my_folders(token_key, folders).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -678,12 +703,14 @@ async fn gather_my_drive_folders(
             .into_iter()
             .collect()
     };
-    Ok(index_only::reconcile_enumeration(files, known, |file_id| {
+    // A truncated enumeration (`complete = false`) must not infer deletions (F-30).
+    let items = index_only::reconcile_enumeration(files, known, !truncated, |file_id| {
         drive::source_id_for(email, file_id)
     })
     .into_iter()
     .map(drive_reconciled)
-    .collect())
+    .collect();
+    Ok((items, truncated))
 }
 
 /// Whole-drive sync via a **per-drive delta cursor** — the same cheap path My Drive uses, so a large
@@ -696,16 +723,17 @@ async fn gather_shared_whole(
     token_key: &str,
     email: &str,
     drive_id: &str,
-) -> Result<(Vec<DriveItem>, Option<(String, String)>)> {
+) -> Result<(Vec<DriveItem>, Option<(String, String)>, bool)> {
     let cursor = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         drive::get_shared_cursor(&conn, email, drive_id)?
     };
 
-    // First sync / 410 reset: the whole drive enumerated as Adds + a fresh baseline cursor.
-    async fn baseline(token_key: &str, drive_id: &str) -> Result<(Vec<DriveItem>, String)> {
-        let files = drive::enumerate_shared(token_key, drive_id, None).await?;
+    // First sync / 410 reset: the whole drive enumerated as Adds + a fresh baseline cursor. Also
+    // reports whether the enumeration was truncated (⇒ don't baseline the cursor yet — retry next pass).
+    async fn baseline(token_key: &str, drive_id: &str) -> Result<(Vec<DriveItem>, String, bool)> {
+        let (files, truncated) = drive::enumerate_shared(token_key, drive_id, None).await?;
         let new_cursor = drive::start_page_token(token_key, Some(drive_id)).await?;
         let items = files
             .into_iter()
@@ -722,26 +750,32 @@ async fn gather_shared_whole(
                 }
             })
             .collect();
-        Ok((items, new_cursor))
+        Ok((items, new_cursor, truncated))
     }
+
+    // A truncated *baseline enumeration* indexes what it gathered but withholds the cursor (a partial
+    // re-list can't be baselined), so the next sync re-enumerates. The delta branch below, by contrast,
+    // advances even when truncated — its page token is resumable (F-30).
+    let baseline_cursor =
+        |truncated: bool, c: String| (!truncated).then(|| (drive_id.to_string(), c));
 
     let cursor = match cursor {
         None => {
-            let (items, c) = baseline(token_key, drive_id).await?;
-            return Ok((items, Some((drive_id.to_string(), c))));
+            let (items, c, truncated) = baseline(token_key, drive_id).await?;
+            return Ok((items, baseline_cursor(truncated, c), truncated));
         }
         Some(c) => c,
     };
 
-    let (changes, new_cursor) = match drive::list_shared_changes(token_key, drive_id, &cursor).await
-    {
-        Ok(v) => v,
-        Err(e) if drive::is_cursor_expired(&e) => {
-            let (items, c) = baseline(token_key, drive_id).await?;
-            return Ok((items, Some((drive_id.to_string(), c))));
-        }
-        Err(e) => return Err(e),
-    };
+    let (changes, new_cursor, truncated) =
+        match drive::list_shared_changes(token_key, drive_id, &cursor).await {
+            Ok(v) => v,
+            Err(e) if drive::is_cursor_expired(&e) => {
+                let (items, c, truncated) = baseline(token_key, drive_id).await?;
+                return Ok((items, baseline_cursor(truncated, c), truncated));
+            }
+            Err(e) => return Err(e),
+        };
 
     let mut items: Vec<DriveItem> = Vec::with_capacity(changes.len());
     for change in &changes {
@@ -759,7 +793,9 @@ async fn gather_shared_whole(
             });
         }
     }
-    Ok((items, Some((drive_id.to_string(), new_cursor))))
+    // Delta feed: advance the (possibly intermediate) cursor even when truncated — resumable checkpoint,
+    // explicit removes only, so it drains a big backlog across passes instead of re-fetching the head.
+    Ok((items, Some((drive_id.to_string(), new_cursor)), truncated))
 }
 
 /// The Google Drive connector's [`CloudDriver`] — see [`crate::commands::sync_drive`] /
@@ -834,6 +870,7 @@ impl CloudDriver for DriveDriver {
         let mut new_cursor: Option<String> = None;
         let mut extra_cursors: Vec<(String, String)> = Vec::new();
         let mut auth_failed = false;
+        let mut coverage_incomplete = false;
         let mut last_err: Option<Error> = None;
 
         // --- My Drive. Whole-drive uses the cheap delta cursor; folder-scoped re-enumerates +
@@ -842,7 +879,10 @@ impl CloudDriver for DriveDriver {
             match scope.my_drive_folders.as_deref() {
                 Some(folders) => {
                     match gather_my_drive_folders(app, &token_key, &email, folders).await {
-                        Ok(mut recon) => items.append(&mut recon),
+                        Ok((mut recon, truncated)) => {
+                            items.append(&mut recon);
+                            coverage_incomplete |= truncated;
+                        }
                         Err(e) => {
                             if drive::is_auth_failure(&e) {
                                 auth_failed = true;
@@ -857,34 +897,57 @@ impl CloudDriver for DriveDriver {
                         let conn = state.conn()?;
                         drive::get_cursor(&conn, &email)?
                     };
-                    // A full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset).
+                    // A full enumerate + fresh baseline cursor (first sync, or a 410 cursor reset). A
+                    // truncated enumeration returns `None` for the cursor to persist — a partial
+                    // re-list can't be baselined, so the next sync re-enumerates from scratch (F-30).
                     let full_relist = |token_key: String| async move {
-                        let files = drive::enumerate_drive(&token_key).await?;
+                        let (files, truncated) = drive::enumerate_drive(&token_key).await?;
                         let cursor = drive::start_page_token(&token_key, None).await?;
-                        Ok::<_, Error>((files, cursor))
+                        Ok::<_, Error>((files, (!truncated).then_some(cursor), truncated))
                     };
-                    let outcome: Result<(Vec<DriveItem>, String)> = if cursor.is_none() {
-                        full_relist(token_key.clone()).await.map(|(files, c)| {
-                            (files.into_iter().map(DriveItem::Enumerated).collect(), c)
-                        })
+                    // The 2nd element is the cursor to PERSIST: `None` = withhold, `Some` = advance. The
+                    // changes feed advances even when truncated — its page token is a resumable
+                    // checkpoint and the feed has no absence-inferred deletes, so it drains a big backlog
+                    // across passes instead of re-fetching the same head forever.
+                    let outcome: Result<(Vec<DriveItem>, Option<String>, bool)> = if cursor
+                        .is_none()
+                    {
+                        full_relist(token_key.clone())
+                            .await
+                            .map(|(files, persist, truncated)| {
+                                (
+                                    files.into_iter().map(DriveItem::Enumerated).collect(),
+                                    persist,
+                                    truncated,
+                                )
+                            })
                     } else {
                         match drive::list_changes(&token_key, cursor.as_deref().unwrap_or("")).await
                         {
-                            Ok((changes, c)) => {
-                                Ok((changes.into_iter().map(DriveItem::Changed).collect(), c))
-                            }
+                            Ok((changes, c, truncated)) => Ok((
+                                changes.into_iter().map(DriveItem::Changed).collect(),
+                                Some(c),
+                                truncated,
+                            )),
                             Err(e) if drive::is_cursor_expired(&e) => {
-                                full_relist(token_key.clone()).await.map(|(files, c)| {
-                                    (files.into_iter().map(DriveItem::Enumerated).collect(), c)
-                                })
+                                full_relist(token_key.clone()).await.map(
+                                    |(files, persist, truncated)| {
+                                        (
+                                            files.into_iter().map(DriveItem::Enumerated).collect(),
+                                            persist,
+                                            truncated,
+                                        )
+                                    },
+                                )
                             }
                             Err(e) => Err(e),
                         }
                     };
                     match outcome {
-                        Ok((mut my_items, c)) => {
+                        Ok((mut my_items, persist_cursor, truncated)) => {
                             items.append(&mut my_items);
-                            new_cursor = Some(c);
+                            new_cursor = persist_cursor;
+                            coverage_incomplete |= truncated;
                         }
                         Err(e) => {
                             if drive::is_auth_failure(&e) {
@@ -913,8 +976,11 @@ impl CloudDriver for DriveDriver {
                     continue;
                 }
                 match gather_shared(app, &token_key, &email, sel).await {
-                    Ok((mut recon, cursor)) => {
+                    Ok((mut recon, cursor, truncated)) => {
                         items.append(&mut recon);
+                        coverage_incomplete |= truncated;
+                        // A truncated shared drive returns no cursor, so nothing is pushed here — it
+                        // retries next pass rather than baselining past unlisted files (F-30).
                         if let Some(advanced) = cursor {
                             extra_cursors.push(advanced);
                         }
@@ -940,6 +1006,7 @@ impl CloudDriver for DriveDriver {
                 new_cursor,
                 extra_cursors,
                 auth_failed,
+                coverage_incomplete,
             },
             last_err,
         ))
@@ -1044,8 +1111,8 @@ async fn gather_onedrive_folders(
     token_key: &str,
     email: &str,
     folders: &[String],
-) -> Result<Vec<OneDriveItem>> {
-    let items = onedrive::enumerate_folders(token_key, folders).await?;
+) -> Result<(Vec<OneDriveItem>, bool)> {
+    let (items, truncated) = onedrive::enumerate_folders(token_key, folders).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -1053,16 +1120,18 @@ async fn gather_onedrive_folders(
             .into_iter()
             .collect()
     };
-    Ok(
-        index_only::reconcile_enumeration(items, known, |id| onedrive::source_id_for(email, id))
-            .into_iter()
-            .map(|r| OneDriveItem::Reconciled {
-                source_id: r.source_id,
-                event: r.event,
-                item: r.payload,
-            })
-            .collect(),
-    )
+    // A truncated enumeration (`complete = false`) must not infer deletions (F-30).
+    let work = index_only::reconcile_enumeration(items, known, !truncated, |id| {
+        onedrive::source_id_for(email, id)
+    })
+    .into_iter()
+    .map(|r| OneDriveItem::Reconciled {
+        source_id: r.source_id,
+        event: r.event,
+        item: r.payload,
+    })
+    .collect();
+    Ok((work, truncated))
 }
 
 /// The OneDrive connector's [`CloudDriver`] (the Microsoft sibling of [`DriveDriver`]). The whole drive
@@ -1134,13 +1203,17 @@ impl CloudDriver for OneDriveDriver {
         let mut items: Vec<OneDriveItem> = Vec::new();
         let mut new_cursor: Option<String> = None;
         let mut auth_failed = false;
+        let mut coverage_incomplete = false;
         let mut last_err: Option<Error> = None;
 
         match scope.folders.as_deref() {
             // Folder-scoped: re-enumerate selected folders + reconcile (no cursor).
             Some(folders) => {
                 match gather_onedrive_folders(app, &token_key, &email, folders).await {
-                    Ok(mut recon) => items.append(&mut recon),
+                    Ok((mut recon, truncated)) => {
+                        items.append(&mut recon);
+                        coverage_incomplete |= truncated;
+                    }
                     Err(e) => {
                         if onedrive::is_auth_failure(&e) {
                             auth_failed = true;
@@ -1157,10 +1230,9 @@ impl CloudDriver for OneDriveDriver {
                     let conn = state.conn()?;
                     onedrive::get_cursor(&conn, &email)?
                 };
-                let outcome: Result<(Vec<OneDriveItem>, String)> = match &cursor {
-                    None => onedrive::list_delta(&token_key, None)
-                        .await
-                        .map(|(deltas, link)| {
+                let outcome: Result<(Vec<OneDriveItem>, String, bool)> = match &cursor {
+                    None => onedrive::list_delta(&token_key, None).await.map(
+                        |(deltas, link, truncated)| {
                             (
                                 deltas
                                     .into_iter()
@@ -1168,16 +1240,19 @@ impl CloudDriver for OneDriveDriver {
                                     .map(OneDriveItem::Enumerated)
                                     .collect(),
                                 link,
+                                truncated,
                             )
-                        }),
+                        },
+                    ),
                     Some(link) => match onedrive::list_delta(&token_key, Some(link)).await {
-                        Ok((deltas, link)) => {
-                            Ok((deltas.into_iter().map(OneDriveItem::Delta).collect(), link))
-                        }
+                        Ok((deltas, link, truncated)) => Ok((
+                            deltas.into_iter().map(OneDriveItem::Delta).collect(),
+                            link,
+                            truncated,
+                        )),
                         Err(e) if onedrive::is_cursor_expired(&e) => {
-                            onedrive::list_delta(&token_key, None)
-                                .await
-                                .map(|(deltas, link)| {
+                            onedrive::list_delta(&token_key, None).await.map(
+                                |(deltas, link, truncated)| {
                                     (
                                         deltas
                                             .into_iter()
@@ -1185,16 +1260,24 @@ impl CloudDriver for OneDriveDriver {
                                             .map(OneDriveItem::Enumerated)
                                             .collect(),
                                         link,
+                                        truncated,
                                     )
-                                })
+                                },
+                            )
                         }
                         Err(e) => Err(e),
                     },
                 };
                 match outcome {
-                    Ok((mut its, link)) => {
+                    Ok((mut its, link, truncated)) => {
                         items.append(&mut its);
+                        // The delta cursor is always advanced — even a truncated walk hands back a
+                        // resumable `@odata.nextLink`, so the next sync continues rather than re-fetching
+                        // the same head forever. The feed's removes are explicit, so there's no
+                        // absence-inferred deletion to guard against; a truncated pass is just flagged
+                        // as still catching up (F-30 withholds only for enumerations).
                         new_cursor = Some(link);
+                        coverage_incomplete |= truncated;
                     }
                     Err(e) => {
                         if onedrive::is_auth_failure(&e) {
@@ -1214,6 +1297,7 @@ impl CloudDriver for OneDriveDriver {
                 new_cursor,
                 extra_cursors: Vec::new(),
                 auth_failed,
+                coverage_incomplete,
             },
             last_err,
         ))
