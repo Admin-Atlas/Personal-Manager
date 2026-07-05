@@ -165,7 +165,9 @@ otherwise). Implemented in `src/lib/format.ts`.
 2. **Encryption stays on.** The store is opened with `PRAGMA key`; don't add code
    paths that open it unencrypted.
 3. **Migrations are additive.** Never write a migration that drops or rewrites
-   user data — app updates must never wipe the store.
+   user data — app updates must never wipe the store. A re-key of index-only rows
+   (e.g. connector row IDs) must ship an old→new mapping so user classifications
+   survive.
 4. **Don't hold the DB lock across `.await`.** Lock, do quick sync work, drop the
    guard, then do network/async work.
 5. **The API key stays in Rust.** OpenRouter is called from the backend; the key

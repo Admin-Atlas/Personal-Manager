@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.91.3-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Behind the scenes: documented a rule for future data-format changes so your organised files and folders always stay put. No change to how you use PM.",
+    ],
+  },
+  {
     version: "2.91.2-alpha",
     date: "2026-07-04",
     highlights: [
