@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.14-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Steadier connector indexing. If a tracked folder ever changed so fast that the live watcher lost track of a burst of edits, PM used to quietly fall behind until you synced by hand — it now notices and re-checks that folder on its own. And when Google is briefly rate-limiting or having a hiccup, an indexed Google Sheet no longer gets stuck showing a “reconnect this account” note when nothing is actually wrong; it stays findable by name and fills its details back in on the next clean sync.",
+    ],
+  },
+  {
     version: "2.92.13-alpha",
     date: "2026-07-06",
     highlights: [
