@@ -10,11 +10,10 @@
 //! tokens. Scopes are **read-only** (spec non-goal #4). Access tokens are refreshed
 //! transparently; the token blob lives only in the keychain, never on disk.
 
-use base64::Engine;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::oauth_loopback;
 use crate::secret::Secret;
 use crate::secrets;
 
@@ -43,8 +42,6 @@ pub const DRIVE_FILE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 /// The keychain key for the Calendar service's token — passed into the per-service token
 /// helpers below (the connector-generic flow takes a key so Drive accounts get their own).
 pub const CALENDAR_TOKEN_KEY: &str = secrets::GOOGLE_TOKEN_CALENDAR;
-/// How long to wait for the browser consent redirect before giving up.
-const REDIRECT_TIMEOUT_SECS: u64 = 180;
 
 /// The stored OAuth token blob (one keychain entry, JSON). `expiry` is Unix seconds.
 /// The bearer/refresh values are [`Secret`], so the derived `Debug` here can never
@@ -169,8 +166,8 @@ async fn run_consent_inner(
     success_label: &str,
     (client_id, client_secret): (String, Secret),
 ) -> Result<Token> {
-    let (verifier, challenge) = pkce()?;
-    let state = random_token(16)?;
+    let (verifier, challenge) = oauth_loopback::pkce()?;
+    let state = oauth_loopback::random_token(16)?;
 
     // Bind the loopback listener first so the port is known before we build the URL.
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -185,10 +182,11 @@ async fn run_consent_inner(
     // Wait for Google to redirect back with the code (blocking accept, off-runtime).
     let expected_state = state.clone();
     let label = success_label.to_string();
-    let code =
-        tokio::task::spawn_blocking(move || wait_for_redirect(listener, &expected_state, &label))
-            .await
-            .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
+    let code = tokio::task::spawn_blocking(move || {
+        oauth_loopback::wait_for_redirect(listener, &expected_state, "Google", &label)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
 
     let token = exchange_code(
         &client_id,
@@ -266,20 +264,37 @@ where
     F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
 {
     let bearer = valid_access_token(token_key).await?;
-    let resp = build(client, bearer.expose()).send().await?;
+    let mut resp = build(client, bearer.expose()).send().await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         let bearer = refresh_now(token_key).await?;
-        let retried = build(client, bearer.expose()).send().await?;
+        resp = build(client, bearer.expose()).send().await?;
         // A refresh that succeeds but whose new access token is still rejected (revoked grant /
         // scope downgrade) would otherwise surface a raw provider 401 body. Map it to a clear
         // "reconnect" message instead.
-        if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(Error::Other(
                 "Your Google session has expired — reconnect the account in Settings → Connectors."
                     .into(),
             ));
         }
-        return Ok(retried);
+    }
+    // A transient 429 throttle (Drive throttles big first-syncs harder than steady state): honour one
+    // bounded `Retry-After` and retry once, mirroring the OneDrive/Graph send path so both providers
+    // handle throttling in one place. The bearer is still valid — a throttle isn't an auth problem, so
+    // no refresh. A 403 *usage-limit* (Drive's other throttle shape) can't be told from an auth 403
+    // without reading the body, so it isn't retried here; the sync classifies it as retryable via
+    // [`crate::drive::is_rate_limited`] and simply re-checks the account next pass (F-26).
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let wait = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2)
+            .min(60);
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        let bearer = valid_access_token(token_key).await?;
+        resp = build(client, bearer.expose()).send().await?;
     }
     Ok(resp)
 }
@@ -347,12 +362,25 @@ async fn exchange_code(
 
 /// Refresh the access token under `token_key`; carries the existing refresh token forward when
 /// Google doesn't return a new one (it usually doesn't), and re-persists the blob.
+///
+/// Serialized per key by the shared [`oauth_loopback::refresh_lock`], and the token blob is reloaded
+/// *under* that lock: if a concurrent refresh of the same key won the race while we waited, we use its
+/// freshly-persisted blob rather than a stale in-hand copy (Google doesn't rotate refresh tokens, but
+/// this keeps the two providers' refresh path identical and avoids a redundant network round-trip).
+/// `force = false` (the proactive path) returns early when the reloaded token is already fresh;
+/// `force = true` (the reactive 401 path) always refreshes, because the token may be revoked, not
+/// merely expired.
 async fn do_refresh(
     client_id: &str,
     client_secret: &str,
-    current: &Token,
     token_key: &str,
+    force: bool,
 ) -> Result<Token> {
+    let _guard = oauth_loopback::refresh_lock(token_key).await;
+    let current = load_token(token_key)?;
+    if !force && current.expiry > oauth_loopback::now_unix() + 60 {
+        return Ok(current);
+    }
     let refresh = current
         .refresh_token
         .clone()
@@ -384,7 +412,7 @@ async fn token_from_response(resp: reqwest::Response) -> Result<Token> {
     Ok(Token {
         access_token: Secret::from(t.access_token),
         refresh_token: t.refresh_token.map(Secret::from),
-        expiry: now_unix() + t.expires_in.unwrap_or(3600),
+        expiry: oauth_loopback::now_unix() + t.expires_in.unwrap_or(3600),
         scope: t.scope,
     })
 }
@@ -411,8 +439,9 @@ pub fn save_token(token_key: &str, token: &Token) -> Result<()> {
 pub async fn valid_access_token(token_key: &str) -> Result<Secret> {
     let (client_id, client_secret) = client_creds_for_key(token_key)?;
     let mut token = load_token(token_key)?;
-    if token.expiry <= now_unix() + 60 {
-        token = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
+    // Lock-free fast path; `do_refresh` re-checks expiry under the per-key lock before any network call.
+    if token.expiry <= oauth_loopback::now_unix() + 60 {
+        token = do_refresh(&client_id, client_secret.expose(), token_key, false).await?;
     }
     Ok(token.access_token.clone())
 }
@@ -422,8 +451,7 @@ pub async fn valid_access_token(token_key: &str) -> Result<Secret> {
 /// the refreshed blob, exactly like the GET path's reactive refresh.
 pub async fn refresh_now(token_key: &str) -> Result<Secret> {
     let (client_id, client_secret) = client_creds_for_key(token_key)?;
-    let token = load_token(token_key)?;
-    let refreshed = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
+    let refreshed = do_refresh(&client_id, client_secret.expose(), token_key, true).await?;
     Ok(refreshed.access_token.clone())
 }
 
@@ -444,23 +472,7 @@ pub fn token_has_scope(token_key: &str, scope: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
-// --- PKCE + auth URL ---
-
-/// A PKCE verifier/challenge pair. The verifier is hex (a valid PKCE charset); the
-/// challenge is the base64url-nopad SHA-256 of the verifier (the S256 method).
-fn pkce() -> Result<(String, String)> {
-    let verifier = random_token(32)?;
-    let digest = Sha256::digest(verifier.as_bytes());
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    Ok((verifier, challenge))
-}
-
-/// `n` random bytes, hex-encoded — used for the PKCE verifier and the CSRF state.
-fn random_token(n: usize) -> Result<String> {
-    let mut bytes = vec![0u8; n];
-    getrandom::fill(&mut bytes).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
-    Ok(hex::encode(bytes))
-}
+// --- auth URL (PKCE + loopback machinery live in `crate::oauth_loopback`) ---
 
 /// Build Google's consent URL. `access_type=offline` + `prompt=consent` guarantee a
 /// refresh token so PM can stay connected. `select_account` forces Google's account chooser every
@@ -493,188 +505,9 @@ pub fn build_auth_url(
     Ok(url.to_string())
 }
 
-// --- loopback redirect server ---
-
-/// Accept connections until the OAuth redirect arrives, validate the CSRF `state`,
-/// and return the authorization `code`. Polls with a deadline so it can't hang
-/// forever (browsers also make stray requests like /favicon.ico, which we ignore).
-fn wait_for_redirect(
-    listener: std::net::TcpListener,
-    expected_state: &str,
-    success_label: &str,
-) -> Result<String> {
-    use std::io::Read;
-
-    listener.set_nonblocking(true)?;
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(REDIRECT_TIMEOUT_SECS);
-
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return Err(Error::Other(
-                "Timed out waiting for Google sign-in. Please try again.".into(),
-            ));
-        }
-        let (mut stream, _) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        stream.set_nonblocking(false).ok();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .ok();
-        let mut buf = [0u8; 4096];
-        let n = match stream.read(&mut buf) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let Some(target) = request_target(&request) else {
-            let _ = write_page(&mut stream, "Waiting for Google…");
-            continue;
-        };
-        let params = parse_query(&target);
-
-        if let Some(err) = params.get("error") {
-            let _ = write_page(
-                &mut stream,
-                "Sign-in was cancelled. You can close this tab.",
-            );
-            return Err(Error::Other(format!("Google sign-in was declined: {err}")));
-        }
-        match params.get("code") {
-            Some(code)
-                if params
-                    .get("state")
-                    .is_some_and(|s| ct_eq(s, expected_state)) =>
-            {
-                let _ = write_page(
-                    &mut stream,
-                    &format!(
-                        "PM is connected to {success_label}. You can close this tab and return to PM."
-                    ),
-                );
-                return Ok(code.clone());
-            }
-            Some(_) => {
-                let _ = write_page(
-                    &mut stream,
-                    "Sign-in could not be verified. Please try again.",
-                );
-                return Err(Error::Other(
-                    "OAuth state mismatch — sign-in aborted for safety.".into(),
-                ));
-            }
-            None => {
-                // Not the redirect (e.g. a favicon probe) — keep waiting.
-                let _ = write_page(&mut stream, "Waiting for Google…");
-            }
-        }
-    }
-}
-
-/// The request target from the first request line: `GET /?code=… HTTP/1.1` → `/?code=…`.
-fn request_target(request: &str) -> Option<String> {
-    let line = request.lines().next()?;
-    line.split_whitespace().nth(1).map(str::to_string)
-}
-
-/// Constant-time equality for the OAuth CSRF `state` token, so the comparison
-/// can't be turned into a timing oracle. (The length check is fine to short-circuit
-/// — the token length is fixed and not secret.)
-fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Parse a `/path?a=1&b=2` target's query into a map, percent-decoding values.
-fn parse_query(target: &str) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    if let Some((_, query)) = target.split_once('?') {
-        for pair in query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                map.insert(k.to_string(), percent_decode(v));
-            }
-        }
-    }
-    map
-}
-
-/// Minimal application/x-www-form-urlencoded decode (handles `+` and `%XX`).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-            }
-            b => out.push(b),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Write a tiny styled HTML page back to the browser and close the connection.
-fn write_page(stream: &mut std::net::TcpStream, message: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>PM</title></head>\
-         <body style=\"font-family:system-ui,sans-serif;background:#0a0a0a;color:#e5e5e5;\
-         display:flex;align-items:center;justify-content:center;height:100vh;margin:0\">\
-         <p style=\"font-size:15px;max-width:28rem;text-align:center;padding:0 1rem\">{message}</p>\
-         </body></html>"
-    );
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream.write_all(response.as_bytes())
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pkce_challenge_matches_known_vector() {
-        // RFC 7636 Appendix B reference verifier → challenge.
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let digest = Sha256::digest(verifier.as_bytes());
-        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
-    }
 
     #[test]
     fn auth_url_carries_pkce_offline_and_readonly_scope() {
@@ -696,18 +529,5 @@ mod tests {
         assert!(url.contains("calendar.readonly"));
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A54321"));
         assert!(url.contains("state=state-abc"));
-    }
-
-    #[test]
-    fn query_parsing_decodes_and_extracts_code() {
-        let params = parse_query("/?state=abc&code=4%2F0Ab%2Cd&scope=read");
-        assert_eq!(params.get("code").unwrap(), "4/0Ab,d");
-        assert_eq!(params.get("state").unwrap(), "abc");
-    }
-
-    #[test]
-    fn request_target_pulls_the_path() {
-        let req = "GET /?code=xyz&state=s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-        assert_eq!(request_target(req).unwrap(), "/?code=xyz&state=s");
     }
 }

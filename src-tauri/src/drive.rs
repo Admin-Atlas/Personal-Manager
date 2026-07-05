@@ -1357,9 +1357,29 @@ pub fn is_cursor_expired(err: &Error) -> bool {
     err.to_string().contains("(410")
 }
 
+/// True if a Drive error is transient rate-limiting rather than an auth problem. Google surfaces a
+/// throttle as an HTTP 429, or as a 403 whose error `reason` is a usage-limit (`rateLimitExceeded`,
+/// `userRateLimitExceeded`, domain `usageLimits`). The grant is fine — the account is just being
+/// throttled — so a sync must treat it as retryable (leave the account's state, don't advance the
+/// cursor) instead of fanning every item out to `unreachable` (F-26). The reason strings ride in the
+/// truncated error body; a 403 with no usage-limit reason (e.g. `insufficientPermissions`) is a real
+/// auth failure and is NOT matched here.
+pub fn is_rate_limited(err: &Error) -> bool {
+    let s = err.to_string();
+    (s.contains("(429") || s.contains("(403"))
+        && (s.contains("rateLimitExceeded")
+            || s.contains("userRateLimitExceeded")
+            || s.contains("usageLimits"))
+}
+
 /// True if a Drive API error is an auth failure (revoked/expired) for the whole account — the signal
-/// to fan the account out to `unreachable` rather than treat it as mass deletion.
+/// to fan the account out to `unreachable` rather than treat it as mass deletion. A rate-limit 403
+/// ([`is_rate_limited`]) is explicitly excluded: it's transient, so it must not masquerade as a
+/// revoked grant and flip a healthy account to `unreachable` over a momentary quota blip (F-26).
 pub fn is_auth_failure(err: &Error) -> bool {
+    if is_rate_limited(err) {
+        return false;
+    }
     let s = err.to_string();
     s.contains("(401") || s.contains("(403")
 }
@@ -1636,6 +1656,56 @@ mod tests {
         assert!(is_sheet("application/vnd.google-apps.spreadsheet"));
         assert!(!is_sheet("application/vnd.google-apps.document"));
         assert!(!is_sheet("text/csv"));
+    }
+
+    #[test]
+    fn rate_limit_403_is_retryable_not_an_auth_failure() {
+        // The exact error shape `json_or_err` builds for a Drive quota blip.
+        let err = Error::Other(
+            "Google API request failed (403): {\"error\":{\"errors\":[{\"domain\":\"usageLimits\",\
+             \"reason\":\"rateLimitExceeded\",\"message\":\"Rate Limit Exceeded\"}],\"code\":403}}"
+                .into(),
+        );
+        assert!(is_rate_limited(&err));
+        // The point of F-26: a throttle must NOT flip the whole account to `unreachable`.
+        assert!(!is_auth_failure(&err));
+    }
+
+    #[test]
+    fn user_rate_limit_403_is_retryable() {
+        let err = Error::Other(
+            "Google API request failed (403): {\"error\":{\"errors\":[{\"reason\":\
+             \"userRateLimitExceeded\"}]}}"
+                .into(),
+        );
+        assert!(is_rate_limited(&err));
+        assert!(!is_auth_failure(&err));
+    }
+
+    #[test]
+    fn throttle_429_is_retryable_not_an_auth_failure() {
+        let err = Error::Other("Google API request failed (429): rateLimitExceeded".into());
+        assert!(is_rate_limited(&err));
+        assert!(!is_auth_failure(&err));
+    }
+
+    #[test]
+    fn permission_403_is_a_real_auth_failure() {
+        // A 403 with NO usage-limit reason (revoked/insufficient scope) still fans out to `unreachable`.
+        let err = Error::Other(
+            "Google API request failed (403): {\"error\":{\"errors\":[{\"reason\":\
+             \"insufficientPermissions\"}]}}"
+                .into(),
+        );
+        assert!(!is_rate_limited(&err));
+        assert!(is_auth_failure(&err));
+    }
+
+    #[test]
+    fn revoked_401_is_a_real_auth_failure() {
+        let err = Error::Other("Google API request failed (401): invalid_grant".into());
+        assert!(!is_rate_limited(&err));
+        assert!(is_auth_failure(&err));
     }
 
     #[test]

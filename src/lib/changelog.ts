@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.9-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Sturdier cloud sign-in and sync: a brief Google Drive rate-limit no longer makes PM treat a healthy account as disconnected, and two things refreshing an account's sign-in at the same moment can no longer leave it stuck (most likely to have affected Microsoft/OneDrive). Under the hood, the Google and Microsoft sign-in flows now share one piece of plumbing.",
+    ],
+  },
+  {
     version: "2.92.8-alpha",
     date: "2026-07-05",
     highlights: [
