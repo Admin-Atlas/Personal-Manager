@@ -1,0 +1,208 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import type { SyncEvent, SyncReport } from "./types";
+
+/**
+ * The **detached index-only sync** shared by the Drive, OneDrive, and local-folder connectors. All
+ * three run the identical lifecycle: a background sync that keeps going if you leave Settings,
+ * single-flighted (a second "Sync now" mid-run is folded into a follow-up pass and shows "Queued"),
+ * stop-able (keeps everything indexed so far), with progress + a post-sync report restored from the
+ * backend snapshot on (re)mount. This hook owns that whole state machine once; each connector injects
+ * its provider-specific IPC and renders its own shell (scope pickers, sign-in, identity model).
+ */
+
+/** The common fields of every connector's in-flight sync snapshot (each also carries its own target
+ *  field — `account` or `folder` — read via {@link DetachedSyncOptions.targetOf}). */
+export interface DetachedSyncSnapshot {
+  running: boolean;
+  processed: number;
+  total: number | null;
+  last_report: SyncReport | null;
+}
+
+export interface DetachedSyncOptions<S extends DetachedSyncSnapshot> {
+  /** Subscribe to the connector's global progress events; returns the unlisten handle. */
+  subscribe: (cb: (ev: SyncEvent) => void) => Promise<UnlistenFn>;
+  /** Fetch the current background-sync snapshot (to restore progress / the last report on mount). */
+  fetchStatus: () => Promise<S>;
+  /** Pull the "which item is syncing" target out of a snapshot (`s.account` or `s.folder`). */
+  targetOf: (snapshot: S) => string | null;
+  /** Start a background sync for one target (or all when null). */
+  start: (target: string | null) => Promise<unknown>;
+  /** Ask the running sync to stop after the current file. */
+  stop: () => Promise<unknown>;
+  /** Called after a sync finishes (and on any {@link watch} event) so the connector refetches its list. */
+  onSettled: () => void;
+  /** Optional extra subscription — the local-folder watcher's `local://changed`, which also refetches. */
+  watch?: (cb: () => void) => Promise<UnlistenFn>;
+}
+
+export interface DetachedSync {
+  /** The label of an in-flight connect/disconnect/add action, or null. */
+  busy: string | null;
+  error: string | null;
+  setError: (e: string | null) => void;
+  /** Run a labelled one-shot action (connect / disconnect / add): sets `busy`, clears `error`, catches. */
+  run: (label: string, fn: () => Promise<void>) => Promise<void>;
+  /** Live progress of the running sync, or null when idle. */
+  progress: { processed: number; total: number | null } | null;
+  /** `progress != null` — a sync is on screen. */
+  syncing: boolean;
+  /** The target (account email / folder key) currently syncing, or null for an all-targets pass. */
+  target: string | null;
+  /** Targets queued mid-run (folded into the backend's follow-up pass) — their row shows "Queued". */
+  queued: Set<string>;
+  /** The most recent finished sync's report, or null. */
+  report: SyncReport | null;
+  dismissReport: () => void;
+  /** True between pressing Stop and the "finished" event arriving. */
+  stopping: boolean;
+  confirmStop: boolean;
+  setConfirmStop: (v: boolean) => void;
+  /** Start (or queue) a sync for one target (or all when null). */
+  sync: (target: string | null) => void;
+  /** Ask the running sync to stop. */
+  requestStop: () => void;
+}
+
+export function useDetachedSync<S extends DetachedSyncSnapshot>(
+  opts: DetachedSyncOptions<S>,
+): DetachedSync {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<{ processed: number; total: number | null } | null>(
+    null,
+  );
+  const [target, setTarget] = useState<string | null>(null);
+  const [queued, setQueued] = useState<Set<string>>(new Set());
+  const [report, setReport] = useState<SyncReport | null>(null);
+  const [stopping, setStopping] = useState(false);
+  const [confirmStop, setConfirmStop] = useState(false);
+  // Live mirror of "a sync is on screen", so a fire-and-forget "Sync now" from an earlier render (the
+  // connect tail, which may fire mid-sync) can tell whether it owns the visible bar without hijacking
+  // a running sync's progress.
+  const syncingRef = useRef(false);
+  // Latest options in a ref, so the mount-once subscription always calls the current closures (the
+  // caller passes fresh inline functions each render) without re-subscribing every render.
+  const optsRef = useRef(opts);
+  useEffect(() => {
+    optsRef.current = opts;
+  });
+
+  useEffect(() => {
+    syncingRef.current = progress != null;
+  }, [progress]);
+
+  // Subscribe to the detached sync's global progress events, and — if a sync is already in flight when
+  // this view (re)mounts — restore the bar from the backend snapshot so it never looks stalled. If it
+  // already finished, show the last report so a returning user still sees the result. Mount-once: the
+  // IPC bindings are read from `optsRef`, so the subscription is set up and torn down exactly once.
+  useEffect(() => {
+    let mounted = true;
+    const unlistenP = optsRef.current.subscribe((ev) => {
+      if (!mounted) return;
+      if (ev.type === "counted") setProgress({ processed: 0, total: ev.total });
+      else if (ev.type === "item") setProgress({ processed: ev.processed, total: ev.total });
+      else if (ev.type === "finished") {
+        setProgress(null);
+        setTarget(null);
+        setQueued(new Set());
+        setStopping(false);
+        // Clear any unconfirmed Stop prompt: the sync is over, so "Stop indexing?" is moot. Without
+        // this it would stay latent (the dialog now lives in SyncProgress, which unmounts on finish)
+        // and pop spuriously over the NEXT sync. (The old always-mounted dialog self-healed on dismiss.)
+        setConfirmStop(false);
+        setReport(ev.report);
+        optsRef.current.onSettled();
+      }
+    });
+    // The live watcher applied a batch of on-disk changes outside a manual sync — refetch so counts
+    // and state badges reflect it (local folders only; cheap — the list is small).
+    const watchP = optsRef.current.watch?.(() => {
+      if (mounted) optsRef.current.onSettled();
+    });
+    void optsRef.current
+      .fetchStatus()
+      .then((s) => {
+        if (!mounted) return;
+        if (s.running) {
+          setProgress({ processed: s.processed, total: s.total });
+          setTarget(optsRef.current.targetOf(s));
+        } else if (s.last_report) {
+          setReport(s.last_report);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+      void unlistenP.then((fn) => fn());
+      void watchP?.then((fn) => fn());
+    };
+  }, []);
+
+  const run = useCallback(async (label: string, fn: () => Promise<void>) => {
+    setBusy(label);
+    setError(null);
+    try {
+      await fn();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  // Start a background sync for one target (or all). Fire-and-forget: progress arrives via the global
+  // listener above, and the sync survives navigating away. The backend single-flights, so a request
+  // made while one is already running is folded into a follow-up pass — only the call that *starts* a
+  // sync drives the optimistic progress + error rollback, so it never hijacks a running bar.
+  const sync = useCallback((tgt: string | null) => {
+    setError(null);
+    const startsIt = !syncingRef.current;
+    if (startsIt) {
+      setReport(null);
+      setTarget(tgt);
+      setQueued(new Set());
+      setProgress({ processed: 0, total: null });
+    } else if (tgt != null) {
+      setQueued((q) => new Set(q).add(tgt));
+    }
+    void optsRef.current.start(tgt).catch((e) => {
+      if (startsIt) {
+        setError(String(e));
+        setProgress(null);
+        setTarget(null);
+      }
+    });
+  }, []);
+
+  // Stop the running sync (the caller gates this behind a confirm). The backend halts after the current
+  // file and keeps everything indexed so far; the "finished" event (a `cancelled` report) clears the bar.
+  const requestStop = useCallback(() => {
+    setStopping(true);
+    void optsRef.current.stop().catch(() => setStopping(false));
+  }, []);
+
+  const dismissReport = useCallback(() => setReport(null), []);
+
+  return {
+    busy,
+    error,
+    setError,
+    run,
+    progress,
+    syncing: progress != null,
+    target,
+    queued,
+    report,
+    dismissReport,
+    stopping,
+    confirmStop,
+    setConfirmStop,
+    sync,
+    requestStop,
+  };
+}

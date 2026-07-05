@@ -539,6 +539,40 @@ export interface IcsFeedInfo {
   provider: string;
 }
 
+// --- Shared detached-sync types (index-only connectors: Drive / OneDrive / local folders) ---
+// The Drive, OneDrive, and local-folder connectors all run the same detached, single-flighted,
+// stop-able index-only sync, so they share one report/issue/event shape (mirrors the Rust structs).
+// Each connector's in-flight *snapshot* keeps its own target field (`account` vs `folder`).
+
+/** A file a sync tried to index but couldn't (an unsupported/empty type, or a fetch/read error),
+ *  surfaced in the post-sync report so the user knows exactly what was left out. */
+export interface SyncIssue {
+  name: string;
+  reason: string;
+}
+
+/** The outcome of one index-only sync pass: indexed/updated/removed counts, the not-indexed list,
+ *  and whether the user stopped it early. Shared by every index-only connector. */
+export interface SyncReport {
+  indexed: number;
+  updated: number;
+  removed: number;
+  skipped: number;
+  failed: number;
+  /** The user pressed Stop — already-indexed files are kept; the rest were left for next time. */
+  cancelled: boolean;
+  /** Files attempted but not indexed (capped; see `issues_truncated`). */
+  issues: SyncIssue[];
+  /** True when more files couldn't be indexed than `issues` lists. */
+  issues_truncated: boolean;
+}
+
+/** Streamed progress while a sync runs (mapped onto the shared IngestProgress bar). */
+export type SyncEvent =
+  | { type: "counted"; total: number }
+  | { type: "item"; processed: number; total: number; name: string }
+  | { type: "finished"; report: SyncReport };
+
 /** A connected Google Drive account (Connectors → Drive). Each is independent — its own token,
  *  sync cursor, and indexed items. */
 export interface DriveAccount {
@@ -591,29 +625,6 @@ export interface DriveScope {
   shared: SharedSelection[];
 }
 
-/** A file a Drive sync tried to index but couldn't (e.g. an unsupported type, or a fetch error),
- *  surfaced in the post-sync report so the user knows what was left out. */
-export interface DriveSyncIssue {
-  name: string;
-  reason: string;
-}
-
-/** The outcome of a Drive sync pass: how many items were indexed/updated/removed, the not-indexed
- *  list, and whether the user stopped it early. */
-export interface DriveSyncReport {
-  indexed: number;
-  updated: number;
-  removed: number;
-  skipped: number;
-  failed: number;
-  /** The user pressed Stop — already-indexed files are kept; the rest were left for next time. */
-  cancelled: boolean;
-  /** Files attempted but not indexed (capped; see `issues_truncated`). */
-  issues: DriveSyncIssue[];
-  /** True when more files couldn't be indexed than `issues` lists. */
-  issues_truncated: boolean;
-}
-
 /** Snapshot of an in-flight Drive sync, so the UI can resume showing progress after navigating away
  *  and back. `running` is false when nothing is syncing; `last_report` holds the most recent result
  *  (so a user returning after it finished still sees the summary). */
@@ -623,14 +634,8 @@ export interface DriveSyncState {
   total: number | null;
   /** The account (email) being synced, or null for an all-accounts pass. */
   account: string | null;
-  last_report: DriveSyncReport | null;
+  last_report: SyncReport | null;
 }
-
-/** Streamed progress while a Drive sync runs (mapped onto the shared IngestProgress bar). */
-export type DriveSyncEvent =
-  | { type: "counted"; total: number }
-  | { type: "item"; processed: number; total: number; name: string }
-  | { type: "finished"; report: DriveSyncReport };
 
 // --- Encrypted backup (Proton Drive / user cloud) — PR1 local `.pmbackup` archive + restore ---
 
@@ -776,24 +781,6 @@ export interface OneDriveScope {
   folders: string[] | null;
 }
 
-/** A file a OneDrive sync tried to index but couldn't, surfaced in the post-sync report. */
-export interface OneDriveSyncIssue {
-  name: string;
-  reason: string;
-}
-
-/** The outcome of a OneDrive sync pass. */
-export interface OneDriveSyncReport {
-  indexed: number;
-  updated: number;
-  removed: number;
-  skipped: number;
-  failed: number;
-  cancelled: boolean;
-  issues: OneDriveSyncIssue[];
-  issues_truncated: boolean;
-}
-
 /** Snapshot of an in-flight OneDrive sync, so the UI can resume showing progress after navigating
  *  away and back. */
 export interface OneDriveSyncState {
@@ -801,14 +788,8 @@ export interface OneDriveSyncState {
   processed: number;
   total: number | null;
   account: string | null;
-  last_report: OneDriveSyncReport | null;
+  last_report: SyncReport | null;
 }
-
-/** Streamed progress while a OneDrive sync runs (mapped onto the shared IngestProgress bar). */
-export type OneDriveSyncEvent =
-  | { type: "counted"; total: number }
-  | { type: "item"; processed: number; total: number; name: string }
-  | { type: "finished"; report: OneDriveSyncReport };
 
 // --- Local folders (index-only connector, board card 6) ---
 
@@ -831,29 +812,6 @@ export interface LocalFolder {
   present: boolean;
 }
 
-/** A file a local sync tried to index but couldn't (unsupported/empty type, or a read error),
- *  surfaced in the post-sync report so the user knows what was left out. */
-export interface LocalSyncIssue {
-  name: string;
-  reason: string;
-}
-
-/** The outcome of a local-folder sync pass: indexed/updated/removed counts, the not-indexed list, and
- *  whether the user stopped it early. Mirrors `DriveSyncReport` so the report UI is shared. */
-export interface LocalSyncReport {
-  indexed: number;
-  updated: number;
-  removed: number;
-  skipped: number;
-  failed: number;
-  /** The user pressed Stop — already-indexed files are kept; the rest were left for next time. */
-  cancelled: boolean;
-  /** Files attempted but not indexed (capped; see `issues_truncated`). */
-  issues: LocalSyncIssue[];
-  /** True when more files couldn't be indexed than `issues` lists. */
-  issues_truncated: boolean;
-}
-
 /** Snapshot of an in-flight local-folder sync, so the UI can restore progress after navigating away.
  *  `running` is false when idle; `last_report` holds the most recent result. */
 export interface LocalFolderSyncState {
@@ -862,14 +820,8 @@ export interface LocalFolderSyncState {
   total: number | null;
   /** The folder key being synced, or null for an all-folders pass. */
   folder: string | null;
-  last_report: LocalSyncReport | null;
+  last_report: SyncReport | null;
 }
-
-/** Streamed progress while a local-folder sync runs (mapped onto the shared IngestProgress bar). */
-export type LocalSyncEvent =
-  | { type: "counted"; total: number }
-  | { type: "item"; processed: number; total: number; name: string }
-  | { type: "finished"; report: LocalSyncReport };
 
 /** One document's 2-D position on the semantic memory map (coords are in [0,1]²). */
 export interface SemanticCoord {

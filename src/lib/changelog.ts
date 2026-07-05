@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.10-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Under-the-hood tidying: the Google Drive, OneDrive, and local-folder connector screens now share one set of building blocks — the account/folder list, the sync progress bar, the post-sync summary, and the Stop control — instead of three near-identical copies, so a fix or polish to one lands for all three. Nothing about how connecting or syncing works has changed; this is purely house-keeping.",
+    ],
+  },
+  {
     version: "2.92.9-alpha",
     date: "2026-07-05",
     highlights: [

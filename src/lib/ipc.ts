@@ -30,7 +30,6 @@ import type {
   DriveFolder,
   DriveScope,
   DriveStatus,
-  DriveSyncEvent,
   DriveSyncState,
   Entity,
   Flag,
@@ -43,7 +42,6 @@ import type {
   LayoutProgressEvent,
   LocalFolder,
   LocalFolderSyncState,
-  LocalSyncEvent,
   Message,
   ModelInfo,
   ModelRecommendations,
@@ -53,7 +51,6 @@ import type {
   OneDriveFolder,
   OneDriveScope,
   OneDriveStatus,
-  OneDriveSyncEvent,
   OneDriveSyncState,
   Preference,
   Milestone,
@@ -73,6 +70,7 @@ import type {
   SharedDrive,
   SidecarStatus,
   StorageReport,
+  SyncEvent,
   TsneInstallEvent,
   TsneStatus,
   VaultLockStatus,
@@ -669,8 +667,8 @@ export const stopDriveSync = () => invoke<void>("stop_drive_sync");
 export const resumeDriveSync = () => invoke<boolean>("resume_drive_sync");
 
 /** Subscribe to global Drive sync progress (fires regardless of which view started the sync). */
-export const onDriveSync = (handler: (e: DriveSyncEvent) => void): Promise<UnlistenFn> =>
-  listen<DriveSyncEvent>("drive://sync", (e) => handler(e.payload));
+export const onDriveSync = (handler: (e: SyncEvent) => void): Promise<UnlistenFn> =>
+  listen<SyncEvent>("drive://sync", (e) => handler(e.payload));
 
 /** The shared drives one account can see (for the "add shared drives" picker). */
 export const listDriveSharedDrives = (email: string) =>
@@ -729,8 +727,8 @@ export const stopOneDriveSync = () => invoke<void>("stop_onedrive_sync");
 export const resumeOneDriveSync = () => invoke<boolean>("resume_onedrive_sync");
 
 /** Subscribe to global OneDrive sync progress (fires regardless of which view started the sync). */
-export const onOneDriveSync = (handler: (e: OneDriveSyncEvent) => void): Promise<UnlistenFn> =>
-  listen<OneDriveSyncEvent>("onedrive://sync", (e) => handler(e.payload));
+export const onOneDriveSync = (handler: (e: SyncEvent) => void): Promise<UnlistenFn> =>
+  listen<SyncEvent>("onedrive://sync", (e) => handler(e.payload));
 
 /** Immediate subfolders of a folder (one lazy picker level); pass `null` for the drive root. */
 export const listOneDriveFolders = (email: string, parentId: string | null) =>
@@ -772,8 +770,8 @@ export const stopLocalFolderSync = () => invoke<void>("stop_local_folder_sync");
 export const resumeLocalFolderSync = () => invoke<boolean>("resume_local_folder_sync");
 
 /** Subscribe to global local-sync progress (fires regardless of which view started the sync). */
-export const onLocalSync = (handler: (e: LocalSyncEvent) => void): Promise<UnlistenFn> =>
-  listen<LocalSyncEvent>("local://sync", (e) => handler(e.payload));
+export const onLocalSync = (handler: (e: SyncEvent) => void): Promise<UnlistenFn> =>
+  listen<SyncEvent>("local://sync", (e) => handler(e.payload));
 
 /** Fire when the live filesystem watcher applied a batch of changes (a folder's items changed on disk
  *  outside a manual sync) — the UI refetches its folder list so counts/states stay current. */
