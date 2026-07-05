@@ -1346,11 +1346,21 @@ async fn process_local_watch_batch(app: &AppHandle, res: DebounceEventResult) {
     if !ready {
         return;
     }
-    // Watcher-level errors (a path briefly inaccessible) are left to the periodic reconcile; an
-    // unmount surfaces there as an absent root → `unreachable`.
+    // A watcher-level error (an inotify/FSEvents queue overflow, or a path briefly inaccessible) means
+    // we may have MISSED changes in this batch — and nothing else reconciles folder CONTENT on a timer
+    // (the manager only catches up on a fresh unlock or a newly-watched folder). So self-heal with a
+    // detached full reconcile, exactly as the manager does on unlock: idempotent (walk + diff) and
+    // single-flight, so an error burst folds into one follow-up pass instead of piling up syncs. An
+    // unmount still surfaces separately in the manager as an absent root → `unreachable`.
     let events = match res {
         Ok(events) => events,
-        Err(_) => return,
+        Err(_) => {
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = local_sync_core(&app2, None).await;
+            });
+            return;
+        }
     };
     // Snapshot the tracked roots once for this batch, to place each event's path to its folder.
     let roots: Vec<(String, std::path::PathBuf)> = {

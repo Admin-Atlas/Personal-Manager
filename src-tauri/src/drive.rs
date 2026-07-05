@@ -1465,9 +1465,12 @@ async fn fetch_sheet_metadata(token_key: &str, file: &DriveFile) -> Result<Optio
         );
     let meta = match google::authorized_get(token_key, meta_url.as_str()).await {
         Ok(v) => v,
-        // A Sheets-API failure (revoked scope, deleted, transient) must not fail the whole sync item —
-        // fall back to the Drive-metadata body, which keeps the Sheet findable + linkable.
-        Err(_) => return Ok(sheet_reconnect_body(file)),
+        // A Sheets-API read failed after the scope check passed. Never fail the whole sync item over it,
+        // but don't embed a misleading "reconnect" instruction for a transient blip: only a genuine auth
+        // failure keeps the reconnect prompt; a 429/5xx/network error degrades to a neutral name-only
+        // body so the Sheet stays findable + linkable and its real metadata fills in on the next clean
+        // sync (see `sheet_error_fallback_body`).
+        Err(e) => return Ok(sheet_error_fallback_body(file, &e)),
     };
     let tabs = parse_sheet_tabs(&meta);
     let title = meta["properties"]["title"]
@@ -1594,6 +1597,28 @@ fn sheet_reconnect_body(file: &DriveFile) -> Option<String> {
          its tab names and column headers.",
         file.name
     ))
+}
+
+/// The fallback body for a Sheet whose metadata couldn't be read this sync because of a transient
+/// Sheets-API error (429/5xx/network) rather than a missing grant. Names the Sheet so it stays findable
+/// and its `webViewLink` still opens, WITHOUT a "reconnect" instruction — the account is fine; the tab
+/// names + column headers fill in on the next sync that reads it cleanly.
+fn sheet_offline_body(file: &DriveFile) -> Option<String> {
+    Some(format!("Google Sheet \"{}\".", file.name))
+}
+
+/// Choose the fallback body when the Sheets metadata read errored *after* the scope check passed. A
+/// genuine auth failure ([`is_auth_failure`] — a revoked/insufficient grant) keeps the actionable
+/// reconnect prompt; any other error is transient (rate-limit, 5xx, network) and must NOT embed a
+/// misleading reconnect instruction that would then stick until the Sheet next changes — so it degrades
+/// to a neutral name-only body ([`sheet_offline_body`]). Pure so the transient-vs-auth split is tested
+/// without a live API (F-28).
+fn sheet_error_fallback_body(file: &DriveFile, err: &Error) -> Option<String> {
+    if is_auth_failure(err) {
+        sheet_reconnect_body(file)
+    } else {
+        sheet_offline_body(file)
+    }
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -2066,6 +2091,29 @@ mod tests {
     fn sheet_reconnect_body_names_the_sheet() {
         let body = sheet_reconnect_body(&sheet_file()).unwrap();
         assert!(body.contains("Google Sheet \"Q2 Budget\""));
+        assert!(body.contains("Reconnect"));
+    }
+
+    #[test]
+    fn transient_sheets_error_degrades_to_a_neutral_name_only_body() {
+        // A 429 rate-limit is transient: the fallback must name the Sheet (so it stays findable) WITHOUT
+        // the misleading "reconnect" instruction that would otherwise stick until the Sheet next changed.
+        let err = Error::Other("Google API request failed (429): rateLimitExceeded".into());
+        let body = sheet_error_fallback_body(&sheet_file(), &err).unwrap();
+        assert!(body.contains("Google Sheet \"Q2 Budget\""));
+        assert!(!body.contains("Reconnect"));
+    }
+
+    #[test]
+    fn genuine_auth_failure_keeps_the_reconnect_prompt() {
+        // A 403 with no usage-limit reason is a real grant problem (not a throttle) — here the reconnect
+        // prompt IS the right, actionable message, unlike a transient blip.
+        let err = Error::Other(
+            "Google API request failed (403): {\"error\":{\"errors\":[{\"reason\":\
+             \"insufficientPermissions\"}]}}"
+                .into(),
+        );
+        let body = sheet_error_fallback_body(&sheet_file(), &err).unwrap();
         assert!(body.contains("Reconnect"));
     }
 
