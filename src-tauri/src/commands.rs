@@ -485,6 +485,10 @@ pub struct VaultStatus {
     /// Documents view surfaces this as a dismissible banner. False when the vault is locked or
     /// has no documents yet.
     pub retrieval_rebuild_needed: bool,
+    /// A friendly, retryable message when the store *failed to open* at boot (a transient AV /
+    /// search-indexer file lock, disk I/O) — distinct from a locked passphrase vault, which
+    /// reports `needs_unlock` instead. The UI shows a Retry surface; `None` in the normal case.
+    pub open_error: Option<String>,
 }
 
 /// Report the current vault's mode and whether it needs unlocking (a passphrase vault
@@ -517,6 +521,11 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
     } else {
         false
     };
+    let open_error = state
+        .boot_open_error
+        .lock()
+        .map_err(|_| Error::Other("boot-error lock poisoned".into()))?
+        .clone();
     Ok(VaultStatus {
         mode,
         needs_unlock: !state.is_unlocked(),
@@ -524,7 +533,44 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         location: resolved.vault_root.to_string_lossy().into_owned(),
         vault_id,
         retrieval_rebuild_needed,
+        open_error,
     })
+}
+
+/// Retry opening the store after a transient boot-time open failure (B1-6). Re-runs the
+/// boot open path; on success installs the session and clears the carried error, so the UI's
+/// Retry surface unmounts and the app proceeds. A now-locked passphrase vault (key not
+/// cached) clears the error too and falls through to the unlock prompt. A still-failing open
+/// re-arms the error and returns it, so the surface shows the fresh message.
+#[tauri::command]
+pub fn retry_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    let set_error = |value: Option<String>| -> Result<()> {
+        *state
+            .boot_open_error
+            .lock()
+            .map_err(|_| Error::Other("boot-error lock poisoned".into()))? = value;
+        Ok(())
+    };
+    match vault::open_at_boot(&resolved, &meta) {
+        Ok(Some((conn, master))) => {
+            state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+            set_error(None)?;
+            // Re-engage the cooperative writer lock now the store is open again.
+            lock_session::engage(&app)?;
+            Ok(())
+        }
+        Ok(None) => {
+            set_error(None)?;
+            Ok(())
+        }
+        Err(e) => {
+            set_error(Some(e.to_string()))?;
+            Err(e)
+        }
+    }
 }
 
 /// Convert this profile's device vault into a shareable, passphrase-protected one. Runs

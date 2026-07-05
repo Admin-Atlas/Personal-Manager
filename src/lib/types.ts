@@ -124,6 +124,10 @@ export interface VaultStatus {
    *  build (a model, chunking, or splitter change) — i.e. a one-time Rebuild is recommended.
    *  The Documents view shows this as a dismissible banner. False when locked or empty. */
   retrieval_rebuild_needed: boolean;
+  /** A friendly, retryable message when the store *failed to open* at boot (a transient AV /
+   *  search-indexer file lock, disk I/O) — distinct from a locked passphrase vault, which sets
+   *  `needs_unlock` instead. The app shows a Retry surface; null in the normal case. */
+  open_error: string | null;
 }
 
 /** Cooperative single-writer state for a shared vault. `active` = this instance is the

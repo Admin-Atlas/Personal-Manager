@@ -341,14 +341,46 @@ fn tick(app: &AppHandle) -> Result<()> {
                     return Ok(());
                 }
             }
-            // Otherwise keep the heartbeat fresh.
+            // Otherwise keep the heartbeat fresh — but re-verify ownership first. If another
+            // profile force-took this vault while we were suspended past the stale threshold
+            // (B1-1), `refresh` reports lost ownership instead of clobbering the new owner's
+            // lockfile; we then step back exactly like a hand-off (close the store, curtain,
+            // go Waiting) rather than running as a second Active writer.
             let now = lock::now_ms();
             let mut session = state.lock_session.lock().unwrap();
             if now.saturating_sub(session.last_heartbeat_ms) >= lock::HEARTBEAT_INTERVAL_SECS * 1000
             {
-                if let Some(lock) = session.lock.as_mut() {
-                    lock::refresh(&root, lock)?;
-                    session.last_heartbeat_ms = lock.heartbeat_ms;
+                let outcome = match session.lock.as_mut() {
+                    Some(lock) => Some(lock::refresh(&root, lock)?),
+                    None => None,
+                };
+                match outcome {
+                    Some(lock::RefreshOutcome::Refreshed) => {
+                        if let Some(hb) = session.lock.as_ref().map(|l| l.heartbeat_ms) {
+                            session.last_heartbeat_ms = hb;
+                        }
+                    }
+                    Some(lock::RefreshOutcome::LostOwnership(new_owner)) => {
+                        drop(session);
+                        close_store(state);
+                        {
+                            let mut session = state.lock_session.lock().unwrap();
+                            session.mode = Some(LockMode::Waiting);
+                            session.lock = None;
+                            session.other_profile = Some(new_owner.profile.clone());
+                        }
+                        // Reuse the "other-active" curtain: from the user's side this is the
+                        // same situation as finding another writer already active on open.
+                        let _ = app.emit(
+                            "vault://curtain",
+                            CurtainEvent {
+                                reason: "other-active",
+                                other_profile: Some(new_owner.profile),
+                            },
+                        );
+                        return Ok(());
+                    }
+                    None => {}
                 }
             }
         }

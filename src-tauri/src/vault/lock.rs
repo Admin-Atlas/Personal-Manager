@@ -169,10 +169,32 @@ fn write_lock(vault_root: &Path, lock: &LockFile) -> Result<()> {
     write_json_atomic(&lock_path(vault_root), lock)
 }
 
-/// Refresh our heartbeat (called on the heartbeat interval while active).
-pub fn refresh(vault_root: &Path, lock: &mut LockFile) -> Result<()> {
+/// The result of a heartbeat [`refresh`]: did we still own the lockfile, or did another
+/// instance take it while we were Active? The caller relinquishes on the latter rather than
+/// clobbering the new owner — a blind overwrite would leave two Active writers on one vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The lockfile was still ours (or absent — no competing owner); the heartbeat was written.
+    Refreshed,
+    /// A *different* instance owns the lockfile now; we did NOT write. Carries the new owner's
+    /// lockfile so the caller can name it in the curtain.
+    LostOwnership(LockFile),
+}
+
+/// Refresh our heartbeat (called on the heartbeat interval while active). Re-reads the
+/// lockfile FIRST and only writes if it is still ours: a plain overwrite would clobber a new
+/// owner that legitimately force-took the vault while this instance was suspended past the
+/// stale threshold, leaving two Active writers on one folder (split-brain; WAL corruption on
+/// a share — B1-1). A missing file means no competing owner, so we re-acquire, as before.
+pub fn refresh(vault_root: &Path, lock: &mut LockFile) -> Result<RefreshOutcome> {
+    if let Some(current) = read_lock(vault_root)? {
+        if current.instance_id != lock.instance_id {
+            return Ok(RefreshOutcome::LostOwnership(current));
+        }
+    }
     lock.heartbeat_ms = now_ms();
-    write_lock(vault_root, lock)
+    write_lock(vault_root, lock)?;
+    Ok(RefreshOutcome::Refreshed)
 }
 
 /// Release the lock, but only if it is still ours — never delete another instance's lock.
@@ -302,12 +324,42 @@ mod tests {
         let mut lock = acquire(root, "me", "Alice").unwrap();
         let original = lock.heartbeat_ms;
         lock.heartbeat_ms = original.saturating_sub(10_000); // pretend it's old
-        refresh(root, &mut lock).unwrap();
+        assert_eq!(refresh(root, &mut lock).unwrap(), RefreshOutcome::Refreshed);
         assert!(lock.heartbeat_ms >= original);
         assert_eq!(
             read_lock(root).unwrap().unwrap().heartbeat_ms,
             lock.heartbeat_ms
         );
+    }
+
+    #[test]
+    fn refresh_relinquishes_when_another_instance_took_the_lock() {
+        // The split-brain guard (B1-1): while we were Active another profile force-took the
+        // vault (wrote its own lockfile). Our next heartbeat must NOT overwrite it — it must
+        // report lost ownership and leave the new owner's lockfile untouched, so we can step
+        // back rather than run as a second Active writer.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut ours = acquire(root, "us", "Alice").unwrap();
+        let theirs = force_take(root, "them", "Bob").unwrap();
+        match refresh(root, &mut ours).unwrap() {
+            RefreshOutcome::LostOwnership(owner) => assert_eq!(owner.instance_id, "them"),
+            RefreshOutcome::Refreshed => panic!("must not reclaim another instance's lock"),
+        }
+        // The on-disk lock is still the new owner's — we did not clobber it.
+        assert_eq!(read_lock(root).unwrap(), Some(theirs));
+    }
+
+    #[test]
+    fn refresh_reacquires_when_the_lockfile_vanished() {
+        // No competing owner (the file is simply gone) — re-acquire rather than curtain, so a
+        // transient removal doesn't needlessly step us back.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut ours = acquire(root, "us", "Alice").unwrap();
+        remove_if_exists(&lock_path(root)).unwrap();
+        assert_eq!(refresh(root, &mut ours).unwrap(), RefreshOutcome::Refreshed);
+        assert_eq!(read_lock(root).unwrap().unwrap().instance_id, "us");
     }
 
     #[test]

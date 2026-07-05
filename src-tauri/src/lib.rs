@@ -257,6 +257,12 @@ pub struct AppState {
     /// switch keeps a restore-you-never-switch-to from clobbering the LIVE vault's cached key. Dropped
     /// (and zeroized) on exit; a restore not switched-to in this session is simply re-done.
     pub pending_restore_keys: Mutex<std::collections::HashMap<String, secret::Secret>>,
+    /// A friendly, retryable message when the store *failed to open* at boot (a transient
+    /// Windows file lock from antivirus/the search indexer, or disk I/O) — as opposed to a
+    /// locked passphrase vault, which is `None` here and `needs_unlock` instead. Set once in
+    /// `setup` so the app degrades to a locked state with a Retry rather than panicking out of
+    /// setup (B1-6); cleared by `retry_open_vault` on a successful reopen.
+    pub boot_open_error: Mutex<Option<String>>,
 }
 
 /// Single-flight guard with RAII release. [`BusyGuard::acquire`] returns `Some` if it flipped the flag
@@ -586,12 +592,24 @@ pub fn run() {
             // On a successful open we also get the Markdown cipher; pair it with the
             // resolved Markdown dir as the session's vault runtime. A locked
             // (passphrase, uncached) vault leaves both `None` until an unlock command.
-            let (conn, vault_runtime) = match vault::open_at_boot(&resolved, &meta)? {
-                Some((conn, master)) => (
+            let (conn, vault_runtime, boot_open_error) = match vault::open_at_boot(&resolved, &meta)
+            {
+                Ok(Some((conn, master))) => (
                     Some(conn),
                     Some(VaultRuntime::build(&resolved, &meta, &master)),
+                    None,
                 ),
-                None => (None, None),
+                Ok(None) => (None, None, None),
+                // A boot-time open failure (a transient AV/search-indexer file lock, disk I/O)
+                // must NOT abort the whole app — `db::open` already maps these to friendly,
+                // retryable messages. Degrade to a not-opened store and carry the message so the
+                // UI can offer Retry, exactly like a locked vault (B1-6). Only a genuinely
+                // corrupt store then needs a manual fix, instead of every transient hiccup.
+                Err(e) => {
+                    let msg = e.to_string();
+                    eprintln!("vault: boot open failed, starting locked with Retry: {msg}");
+                    (None, None, Some(msg))
+                }
             };
 
             // The sidecar source folder is optional at boot — chat works without
@@ -627,6 +645,7 @@ pub fn run() {
                 backup_cancel: AtomicBool::new(false),
                 backup_busy: AtomicBool::new(false),
                 pending_restore_keys: Mutex::new(std::collections::HashMap::new()),
+                boot_open_error: Mutex::new(boot_open_error),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -725,6 +744,7 @@ pub fn run() {
             commands::set_app_lock,
             commands::unlock_app,
             commands::vault_status,
+            commands::retry_open_vault,
             commands::create_shareable_vault,
             commands::change_vault_passphrase,
             commands::make_vault_private,

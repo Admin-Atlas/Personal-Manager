@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.91.8-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Startup is more forgiving. If PM can't open your vault the instant it launches — usually because antivirus or Windows Search is briefly scanning the file — it no longer closes with an error. You get a friendly “try again” screen instead, and your documents are untouched.",
+      "Sharing a vault across two Windows profiles is safer: if one computer goes to sleep and the other takes over as the writer, the sleeping one now steps aside cleanly when it wakes, instead of both trying to write at once. And switching a vault back to private-to-this-device now recovers reliably if it's interrupted partway, rather than getting stuck on the next launch.",
+    ],
+  },
+  {
     version: "2.91.7-alpha",
     date: "2026-07-05",
     highlights: [
