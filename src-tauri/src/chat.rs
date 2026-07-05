@@ -79,6 +79,43 @@ pub(crate) fn assert_user_turn_allowed(conn: &Connection, conversation_id: i64) 
     Ok(())
 }
 
+/// Discard a trailing reply-less user turn, returning whether one was removed.
+///
+/// Such a turn is the wreckage of a previous `send_message` that inserted the user row but never
+/// recorded a reply — its stream failed (network drop, provider 4xx/5xx, an over-window prompt, or the
+/// streaming read-stall) or the process died between persisting the turn and its reply. Left in place it
+/// trips [`assert_user_turn_allowed`] on *every* subsequent send, so one transient failure wedges the
+/// conversation permanently — the only prior escape was deleting the whole chat (F-02 / B5-1).
+///
+/// Removing it is safe because this row was never truth: [`record_turn_pair`] appends only a *completed*
+/// pair to the vault, and the indexer reads only [`completed_turn_pairs_after`], which excludes an
+/// unpaired trailing user turn — so the orphan exists solely in the `messages` table and is neither
+/// vault-written nor indexed. The user is simply resending; the failed attempt is dropped. This covers
+/// both the stream-error path (cleaned on the user's next send) and an orphan persisted across a crash.
+///
+/// Deletes by the most-recent row's id, and only when that row is a user turn: the alternation guard
+/// prevents a second user row from ever stacking behind a pending one, so at most one dangling turn can
+/// exist and it is always the last — a mid-history user message can never be caught. Idempotent: a no-op
+/// when the last row is an assistant reply, or the conversation is empty. Relies on the same UI
+/// serialization [`assert_user_turn_allowed`] documents (input blocked while a reply streams), so a
+/// still-streaming turn is never mistaken for an orphan.
+pub(crate) fn discard_dangling_user_turn(conn: &Connection, conversation_id: i64) -> Result<bool> {
+    let last: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, role FROM messages WHERE conversation_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((id, role)) = last {
+        if role == "user" {
+            conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Every completed turn-pair in a conversation whose assistant message id is greater than `after_turn_id`
 /// (pass `None` for "from the beginning"), in chronological order. A trailing user message with no reply
 /// yet is **excluded** — only complete pairs are returned. This is the cursor-driven read card B embeds
@@ -597,6 +634,51 @@ mod tests {
         add_message(&conn, conv, "assistant", "hello");
         // Reply landed: a new user turn is allowed again.
         assert!(assert_user_turn_allowed(&conn, conv).is_ok());
+    }
+
+    #[test]
+    fn discard_dangling_user_turn_unwedges_a_failed_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(dir.path());
+        let conv = new_conversation(&conn);
+
+        let count = |c: &Connection| -> i64 {
+            c.query_row(
+                "SELECT count(*) FROM messages WHERE conversation_id = ?1",
+                params![conv],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Empty conversation: nothing to discard.
+        assert!(!discard_dangling_user_turn(&conn, conv).unwrap());
+
+        // A completed pair, then a user turn whose reply stream failed — the F-02 wedge: the next send
+        // is now refused by the alternation guard.
+        add_message(&conn, conv, "user", "a");
+        let b = add_message(&conn, conv, "assistant", "b");
+        add_message(&conn, conv, "user", "orphan"); // reply never landed
+        assert!(assert_user_turn_allowed(&conn, conv).is_err(), "wedged");
+
+        // Discarding the orphan removes exactly that one row and unwedges the conversation.
+        assert!(discard_dangling_user_turn(&conn, conv).unwrap());
+        assert_eq!(count(&conn), 2, "only the orphan is gone");
+        assert!(assert_user_turn_allowed(&conn, conv).is_ok(), "unwedged");
+        // The completed pair beneath it is untouched — a mid-history user row is never caught.
+        let pairs = completed_turn_pairs_after(&conn, conv, None).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            (
+                pairs[0].user.as_str(),
+                pairs[0].assistant.as_str(),
+                pairs[0].turn_id
+            ),
+            ("a", "b", b)
+        );
+
+        // Idempotent: with a reply now the trailing row, there is nothing to discard.
+        assert!(!discard_dangling_user_turn(&conn, conv).unwrap());
     }
 
     #[test]
