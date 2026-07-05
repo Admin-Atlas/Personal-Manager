@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.4-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "If a Google Drive or OneDrive sync hit a snag part-way through — a file it couldn't fetch or index — the connector could still show as fully synced and quietly leave those files out. Now a sync that runs into an error is flagged so you can see it needs another try, and the files it couldn't reach are picked up automatically on the next sync instead of being skipped.",
+    ],
+  },
+  {
     version: "2.92.3-alpha",
     date: "2026-07-05",
     highlights: [

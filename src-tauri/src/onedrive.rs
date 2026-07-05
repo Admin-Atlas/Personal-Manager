@@ -249,6 +249,27 @@ pub fn finalize_sync(conn: &Connection, email: &str, cursor: Option<&str>) -> Re
     Ok(())
 }
 
+/// Persist a finished sync pass for one account, honoring whether any item failed — the decision seam
+/// for F-29. A clean pass commits via [`finalize_sync`] (advances the cursor, stamps the time, state
+/// `'ok'`). A pass with any failed item is instead flagged `'error'` via [`set_state`], which leaves
+/// the cursor **unadvanced** and `last_synced_at` at its last-good value: the failure surfaces in the
+/// Connectors warning instead of hiding behind a misleading `'ok'`, and the failed items retry on the
+/// next sync (`index_only::react` makes the already-good items cheap no-ops) rather than being skipped
+/// past an advanced cursor. Kept out of the engine so the branch is unit-testable end to end. Mirrors
+/// the calendar sync's "check failures first" rule.
+pub fn finalize_or_flag(
+    conn: &Connection,
+    email: &str,
+    account_failed: bool,
+    cursor: Option<&str>,
+) -> Result<()> {
+    if account_failed {
+        set_state(conn, email, "error")
+    } else {
+        finalize_sync(conn, email, cursor)
+    }
+}
+
 /// What an account indexes: the personal OneDrive, whole or folder-scoped. Persisted as JSON in
 /// `connector_sources.folder_ids` (no migration — the column already exists, nullable). A
 /// missing/empty value means the default scope (whole drive) so a freshly-connected account behaves
@@ -823,6 +844,55 @@ mod tests {
         assert_eq!(account_of(&sid).as_deref(), Some("a@b.com"));
         assert_eq!(account_of("gdrive:a@b.com:FILE"), None);
         assert_eq!(account_of("not-an-id"), None);
+    }
+
+    #[test]
+    fn finalize_or_flag_advances_on_a_clean_pass_and_holds_last_good_on_a_failed_one() {
+        // F-29: the engine routes each account through `finalize_or_flag(.., account_failed, ..)`. This
+        // drives that decision directly (not just the helpers it calls): a clean pass advances the
+        // cursor + stamps the time + state 'ok'; a failed pass flips state to 'error' and — even when a
+        // *fresh* cursor is offered — leaves the cursor and last-good time exactly as they were, so the
+        // failed items retry next sync and the Connectors warning shows. A revert of the branch back to
+        // an unconditional finalize would advance the cursor on the failed pass and fail this test.
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), key).unwrap();
+        upsert_account(&conn, "a@b.com", "A").unwrap();
+
+        let row = |c: &Connection| -> (String, Option<String>) {
+            c.query_row(
+                "SELECT state, last_synced_at FROM connector_sources WHERE id = ?1",
+                params![account_id("a@b.com")],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        // A clean pass (account_failed = false) commits: cursor advanced, time stamped, state 'ok'.
+        finalize_or_flag(&conn, "a@b.com", false, Some("CUR1")).unwrap();
+        let (state_ok, synced_ok) = row(&conn);
+        assert_eq!(state_ok, "ok");
+        assert!(synced_ok.is_some(), "a clean pass stamps last_synced_at");
+        assert_eq!(
+            get_cursor(&conn, "a@b.com").unwrap().as_deref(),
+            Some("CUR1")
+        );
+
+        // A failed pass (account_failed = true) takes the error path: even though a fresh "CUR2" cursor
+        // is offered, state flips to 'error' and the cursor + last-good time are left exactly as the
+        // clean pass set them.
+        finalize_or_flag(&conn, "a@b.com", true, Some("CUR2")).unwrap();
+        let (state_err, synced_err) = row(&conn);
+        assert_eq!(state_err, "error");
+        assert_eq!(
+            synced_err, synced_ok,
+            "the failure path must not restamp last_synced_at"
+        );
+        assert_eq!(
+            get_cursor(&conn, "a@b.com").unwrap().as_deref(),
+            Some("CUR1"),
+            "the failure path must not advance the cursor",
+        );
     }
 
     #[test]
