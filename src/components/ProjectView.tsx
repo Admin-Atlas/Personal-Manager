@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Composer } from "./Composer";
+import { ContextMeter } from "./ContextMeter";
 import { RetrievalExplainPanel } from "./RetrievalExplainPanel";
 import {
   listCalendarEvents,
@@ -44,6 +45,9 @@ interface Props {
   /** Open a past chat a citation points to, at its cited turn — routes up to App's global chat view
    *  (the cited chat may not be this project's) (board card 7E PR3). */
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
+  /** Switch chat to a larger-context model (the meter's Upgrade action). The same App handler the
+   *  global chat uses — chat models are a single global setting, so both meters upgrade the same way. */
+  onUpgrade: (modelId: string) => void;
   onBack: () => void;
 }
 
@@ -51,7 +55,14 @@ interface Props {
  *  confined to just this project — "everything narrows to just it". The scoped chat's session lives
  *  in App (so the left sidebar lists this project's conversations, like the global chat); this view
  *  renders the active thread plus the project's milestones and documents. */
-export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onBack }: Props) {
+export function ProjectView({
+  project,
+  chat,
+  focusDocId,
+  onOpenChatCitation,
+  onUpgrade,
+  onBack,
+}: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
@@ -360,6 +371,13 @@ export function ProjectView({ project, chat, focusDocId, onOpenChatCitation, onB
           <Composer
             disabled={chat.sending}
             onSend={chat.handleSend}
+            leftTools={
+              <ContextMeter
+                conversationId={chat.convId}
+                refreshKey={chat.messages.length}
+                onUpgrade={onUpgrade}
+              />
+            }
             rightTools={<RetrievalExplainPanel messages={chat.messages} project={project} />}
           />
         </main>

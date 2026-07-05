@@ -715,6 +715,7 @@ export default function App() {
                   chat={projectChat}
                   focusDocId={selectedDocId}
                   onOpenChatCitation={openChatCitation}
+                  onUpgrade={handleUpgrade}
                   onBack={() => setView("focus")}
                 />
               </main>
