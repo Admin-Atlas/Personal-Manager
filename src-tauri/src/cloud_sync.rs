@@ -1,21 +1,573 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The Google Drive and OneDrive sync engines — each a detached, single-flight, crash-resumable pass
-//! that gathers a connected account's work off the DB lock (phase 1: My Drive / whole-drive delta
-//! cursor or a folder-scoped reconcile), then processes it item by item (phase 2: `index_only::react`
-//! -> fetch a body only when needed -> apply off the lock). Lifted verbatim out of [`crate::commands`]
-//! so the IPC layer keeps only the thin `#[tauri::command]` wrappers that call in here; the behaviour
-//! is unchanged. The two engines still mirror each other closely — unifying them behind one driver is
-//! the next step. The shared single-flight + crash-resume-marker lifecycle and the blocking index-only
-//! apply live in [`crate::connector_sync`].
+//! The Google Drive and OneDrive sync engines, unified behind one [`CloudDriver`]. Each is a detached,
+//! single-flight, crash-resumable pass that gathers a connected account's work off the DB lock (phase
+//! 1: a whole-drive delta cursor or a folder-scoped reconcile), then processes it item by item (phase
+//! 2: `index_only::react` -> fetch a body only when needed -> apply off the lock). Phase 2 — identical
+//! between the two providers except for the pointer's parent-folder tagging (Drive only) and the
+//! provider labels in messages — is written **once** in [`run_cloud_pass`]; the genuinely
+//! provider-specific parts (phase-1 gathering, the fetch/pointer/finalize seams, the `AppState`
+//! snapshot + event name) live behind the [`CloudDriver`] trait, implemented by [`DriveDriver`] and
+//! [`OneDriveDriver`]. This replaces the two ~350-line `run_*_sync` engines that mirrored each other
+//! byte-for-byte (audit X-D1). The shared single-flight + crash-resume-marker lifecycle and the
+//! blocking index-only apply live in [`crate::connector_sync`]; the local-folder connector keeps its
+//! own engine in [`crate::localfolder`] (it has no cloud sibling to share a driver with).
+//!
+//! The driver methods that touch the network are declared `-> impl Future<…> + Send` (native RPITIT,
+//! no `async-trait`): [`crate::commands::resume_drive_sync`] spawns the core onto the async runtime, so
+//! the whole generic pass future must be `Send`, and the explicit bound makes that provable through the
+//! generic `C`.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
+use rusqlite::Connection;
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{Error, Result};
 use crate::{connector_sync, db, drive, index_only, onedrive, AppState};
+
+// --- unified report / progress types (shared by both cloud connectors) ---------------------------
+
+/// A file PM tried to index but couldn't, surfaced in the post-sync report so the user knows what was
+/// left out (e.g. an unsupported file type MarkItDown can't read, or a fetch error). Not a fatal
+/// error — the sync carries on; these are just reported. Shared by Drive + OneDrive (their reports
+/// were byte-identical before this unification); the local-folder connector keeps its own.
+#[derive(Clone, Serialize, Default)]
+pub struct CloudSyncIssue {
+    pub name: String,
+    pub reason: String,
+}
+
+/// The outcome of a cloud sync pass: how many items were indexed/updated/removed, the list of files
+/// that couldn't be indexed (capped), and whether the user stopped it early. Shown in Settings after a
+/// sync and stashed in the live snapshot so a user returning after it finished still sees the result.
+#[derive(Clone, Serialize, Default)]
+pub struct CloudSyncReport {
+    pub indexed: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// The user pressed Stop — already-indexed files are kept; the rest were left for next time.
+    pub cancelled: bool,
+    /// Files attempted but not indexed (unsupported/empty, or a fetch error), capped for memory.
+    pub issues: Vec<CloudSyncIssue>,
+    /// True when more files couldn't be indexed than the capped `issues` list holds.
+    pub issues_truncated: bool,
+}
+
+/// Progress for a running cloud sync, broadcast globally on the driver's `EVENT_NAME` (`drive://sync`
+/// / `onedrive://sync`) and mirrored into the shared snapshot. The frontend maps `processed`/`total`
+/// onto the shared `IngestProgress` bar and shows `report` when finished. One event type for both
+/// providers — the JSON shape is unchanged from the former `DriveSyncEvent`/`OneDriveSyncEvent`, so
+/// the existing per-provider listeners keep working.
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CloudSyncEvent {
+    /// The total number of files/changes this run will work through (sent once, before the items).
+    Counted { total: usize },
+    /// One item processed (1-based `processed` of `total`).
+    Item {
+        processed: usize,
+        total: usize,
+        name: String,
+    },
+    /// The run is done; `report` carries the breakdown + the not-indexed list (+ a `cancelled` flag).
+    Finished { report: CloudSyncReport },
+}
+
+/// Marker key for a Drive sync started but not cleanly finished (crash-resume). Set when a sync begins
+/// and removed when it ends (completed or stopped); a value surviving a restart means the app was
+/// closed/crashed mid-index, and [`crate::commands::resume_drive_sync`] picks it back up.
+pub(crate) const DRIVE_SYNC_PENDING_KEY: &str = "drive_sync_pending";
+/// Marker key for a OneDrive sync started but not cleanly finished (crash-resume); the Drive sibling.
+pub(crate) const ONEDRIVE_SYNC_PENDING_KEY: &str = "onedrive_sync_pending";
+
+// --- the driver seam -----------------------------------------------------------------------------
+
+/// All of one account's gathered work for a sync pass, generic over the connector's phase-1 work item
+/// (`DriveItem` / `OneDriveItem`). Built off the DB lock in phase 1, drained in phase 2.
+struct AccountWork<Item> {
+    email: String,
+    token_key: String,
+    items: Vec<Item>,
+    /// The advanced whole-drive delta cursor — set only when the whole drive synced this pass.
+    new_cursor: Option<String>,
+    /// Additional advanced delta cursors to persist — Drive's per-shared-drive `(driveId, cursor)`
+    /// pairs (whole-drive shared selections). OneDrive has no such concept and always leaves this
+    /// empty; its `finalize_or_flag` ignores it.
+    extra_cursors: Vec<(String, String)>,
+    auth_failed: bool,
+}
+
+/// The phase-2 resolution of one gathered work item: either a no-op to skip (a changes-feed entry that
+/// maps to nothing) or a concrete `(fetchable file, source id, change event)` to process. The file
+/// borrows from the work item, so it stays available for the body fetch + pointer.
+enum Resolved<'a, F> {
+    /// The change maps to a no-op (e.g. a trashed-then-gone id we never indexed) — count it skipped.
+    Skip,
+    Process {
+        file: Option<&'a F>,
+        source_id: String,
+        event: index_only::ChangeEvent,
+    },
+}
+
+/// What [`run_cloud_pass`] needs from a cloud connector: the provider-specific phase-1 gather, the
+/// per-item fetch/pointer/finalize seams, and the `AppState` snapshot + wire-event identity. Everything
+/// the two engines shared byte-for-byte (the phase-2 loop, progress emission, issue recording,
+/// single-flight lifecycle) lives generically outside the trait.
+///
+/// `Send`/`Sync` on the trait and its associated types make the monomorphised pass future `Send`, which
+/// [`crate::commands::resume_drive_sync`] requires (it spawns the core onto the async runtime).
+///
+/// Module-private: the two `*_sync_core` entry points below hide it entirely (they don't name it), so
+/// nothing outside this file needs to see the driver seam.
+trait CloudDriver: Send + Sync {
+    /// The fetchable file (`drive::DriveFile` / `onedrive::DriveItem`) — carries the name + builds the
+    /// pointer + is passed to `fetch_body`.
+    type File: Send + Sync;
+    /// The phase-1 work item enum (`DriveItem` / `OneDriveItem`).
+    type Item: Send;
+    /// Per-pass state threaded into `make_pointer` — Drive's parent-folder-name memo (id → name),
+    /// resolved once per folder across a whole pass; `()` for OneDrive, which doesn't tag folders.
+    type FolderCache: Default + Send;
+
+    /// The crash-resume marker key ([`DRIVE_SYNC_PENDING_KEY`] / [`ONEDRIVE_SYNC_PENDING_KEY`]).
+    const PENDING_KEY: &'static str;
+    /// The global progress event name (`drive://sync` / `onedrive://sync`).
+    const EVENT_NAME: &'static str;
+    /// The source-id namespace prefix (`gdrive` / `onedrive`) — used in the whole-account
+    /// `SourceFailure` source string and the apply-panic message.
+    const SOURCE_KIND: &'static str;
+    /// Human label for the user-facing issue/error text (`Drive` / `OneDrive`).
+    const PROVIDER_LABEL: &'static str;
+
+    /// This connector's live-sync snapshot field on [`AppState`] (`drive_sync` / `onedrive_sync`).
+    fn snapshot(state: &AppState) -> &Mutex<crate::CloudSyncState>;
+    /// This connector's cooperative stop flag on [`AppState`].
+    fn cancel_flag(state: &AppState) -> &AtomicBool;
+
+    /// Every connected account's email for an all-accounts pass.
+    fn account_emails(conn: &Connection) -> Result<Vec<String>>;
+    /// The stored item state for a source id (drives the reducer + the `known` change mapping).
+    fn read_item_state(conn: &Connection, source_id: &str)
+        -> Result<Option<index_only::ItemState>>;
+    /// Flag an account `error` (whole-account auth failure — its cursor is left unadvanced).
+    fn set_error_state(conn: &Connection, email: &str) -> Result<()>;
+    /// Persist the pass for one account: commit (cursor advance + `ok`) when clean, or flag `error`
+    /// with the cursor left unadvanced when any item failed. Drive also persists `extra_cursors`.
+    fn finalize_or_flag(
+        conn: &Connection,
+        work: &AccountWork<Self::Item>,
+        account_failed: bool,
+    ) -> Result<()>;
+    /// The file's display name for the report/progress (falls back to the source id when absent).
+    fn file_name(file: &Self::File) -> String;
+
+    /// Gather one account's work off the DB lock (phase 1): the whole-drive delta cursor and/or a
+    /// folder-scoped reconcile, plus Drive's opted-in shared drives. Returns the [`AccountWork`] and
+    /// any soft (per-account) error to fold into the pass's `last_err` — hard errors (a poisoned
+    /// lock, a failed scope read) propagate via `?`.
+    fn gather_account(
+        &self,
+        app: &AppHandle,
+        email: String,
+    ) -> impl std::future::Future<Output = Result<(AccountWork<Self::Item>, Option<Error>)>> + Send;
+
+    /// Resolve one gathered item into its `(file, source id, event)` for phase 2, or `Skip`. Reads the
+    /// store for the incremental (`Changed`/`Delta`) case's `known` check.
+    fn resolve_item<'a>(
+        &self,
+        app: &AppHandle,
+        email: &str,
+        item: &'a Self::Item,
+    ) -> Result<Resolved<'a, Self::File>>;
+
+    /// Fetch a file's body live (only called when the reducer needs one — a fresh ingest or re-embed).
+    fn fetch_body(
+        state: &AppState,
+        token_key: &str,
+        file: &Self::File,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send;
+
+    /// Build the foundation pointer for a freshly-fetched body. Drive resolves the parent-folder name
+    /// (memoised in `cache`) as sorting-review context; OneDrive builds it directly (no folder tag).
+    fn make_pointer(
+        &self,
+        token_key: &str,
+        file: &Self::File,
+        source_id: String,
+        body: String,
+        cache: &mut Self::FolderCache,
+    ) -> impl std::future::Future<Output = index_only::PointerInput> + Send;
+}
+
+// --- generic engine ------------------------------------------------------------------------------
+
+/// Apply `f` to this connector's live-sync snapshot, best-effort (a poisoned lock is skipped). Binding
+/// the lock guard to a named local first sidesteps the `if let` temporary-lifetime pitfall.
+fn with_cloud_snap<C: CloudDriver>(app: &AppHandle, f: impl FnOnce(&mut crate::CloudSyncState)) {
+    let state = app.state::<AppState>();
+    let guard = C::snapshot(state.inner()).lock();
+    if let Ok(mut snap) = guard {
+        f(&mut snap);
+    }
+}
+
+/// Update the connector's snapshot and broadcast its progress event globally. The snapshot lets the UI
+/// restore an in-flight sync after navigating away; the global event (vs a per-call Channel) means
+/// progress reaches whatever component is mounted, not just the starter.
+fn emit_progress<C: CloudDriver>(app: &AppHandle, ev: CloudSyncEvent) {
+    with_cloud_snap::<C>(app, |snap| match &ev {
+        CloudSyncEvent::Counted { total } => {
+            snap.total = Some(*total);
+            snap.processed = 0;
+        }
+        CloudSyncEvent::Item {
+            processed, total, ..
+        } => {
+            snap.processed = *processed;
+            snap.total = Some(*total);
+        }
+        // Keep the last result in the snapshot too, so a user returning to Settings after the sync
+        // finished still sees the summary (the live event only reaches a mounted listener).
+        CloudSyncEvent::Finished { report } => {
+            snap.last_report = Some(report.clone());
+        }
+    });
+    let _ = app.emit(C::EVENT_NAME, ev);
+}
+
+/// True if the running sync has been asked to stop.
+fn sync_cancelled<C: CloudDriver>(app: &AppHandle) -> bool {
+    C::cancel_flag(app.state::<AppState>().inner()).load(Ordering::SeqCst)
+}
+
+/// Record a file that couldn't be indexed, up to the cap (after which we just flag truncation).
+fn record_issue(issues: &mut Vec<CloudSyncIssue>, truncated: &mut bool, name: &str, reason: &str) {
+    if issues.len() < connector_sync::MAX_REPORT_ISSUES {
+        issues.push(CloudSyncIssue {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        });
+    } else {
+        *truncated = true;
+    }
+}
+
+/// Drive both cloud sync engines: the detached, single-flight, crash-resumable lifecycle around one
+/// [`run_cloud_pass`]. **My Drive / the whole drive** (on by default) uses the efficient delta cursor —
+/// the first sync enumerates everything (the slow one the UI warns about), later syncs apply only the
+/// changes feed. **Folder-scoped** accounts (and Drive's opted-in shared drives) are re-enumerated and
+/// reconciled each pass. Every item is index-only: a pointer + embedding, the body fetched live. Never
+/// holds the DB lock across a network/embed call (rule #4).
+///
+/// **Runs detached**: progress is broadcast via the global `EVENT_NAME` event and mirrored into the
+/// shared snapshot, so the sync keeps running — and the UI keeps reflecting it — even if the user
+/// leaves Settings. **Single-flight**: a request arriving mid-sync is folded into one follow-up
+/// all-accounts pass rather than starting a second, racy sync. **Durable**: a crash-resume marker is
+/// persisted while running and cleared on a clean exit, so an interrupted run resumes on next launch.
+/// Already-indexed files survive (each is committed as it goes). Returns items touched by the last pass.
+async fn run_cloud_sync<C: CloudDriver>(
+    app: &AppHandle,
+    driver: C,
+    account: Option<String>,
+) -> Result<usize> {
+    let st: &AppState = app.state::<AppState>().inner();
+    connector_sync::run_detached_sync(
+        st,
+        C::snapshot(st),
+        C::cancel_flag(st),
+        C::PENDING_KEY,
+        account,
+        |target| run_cloud_pass(app, &driver, target),
+    )
+    .await
+}
+
+/// One sync pass: gather each account's work off the lock (phase 1), then process it item by item
+/// (phase 2). Split out so [`run_cloud_sync`]'s single-flight wrapper can run it more than once (the
+/// follow-up sweep) and own the running/marker lifecycle.
+async fn run_cloud_pass<C: CloudDriver>(
+    app: &AppHandle,
+    driver: &C,
+    account: Option<String>,
+) -> Result<usize> {
+    // The engine is needed for index-only embedding + binary conversion — ensure it once up front.
+    {
+        let state = app.state::<AppState>();
+        state.sidecar.ensure_installed()?;
+    }
+
+    let emails: Vec<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        match account {
+            Some(e) => vec![e],
+            None => C::account_emails(&conn)?,
+        }
+    };
+
+    let mut work: Vec<AccountWork<C::Item>> = Vec::new();
+    let mut last_err: Option<Error> = None;
+
+    // Phase 1 — gather each account's work off the lock. The driver owns the provider-specific shape
+    // (My Drive + shared drives, or a single OneDrive) and reports any soft, per-account error to fold
+    // into `last_err`; hard errors propagate via `?`.
+    for email in emails {
+        let (w, soft_err) = driver.gather_account(app, email).await?;
+        if let Some(e) = soft_err {
+            last_err = Some(e);
+        }
+        work.push(w);
+    }
+
+    let total: usize = work.iter().map(|w| w.items.len()).sum();
+    emit_progress::<C>(app, CloudSyncEvent::Counted { total });
+
+    // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
+    let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
+    let mut processed = 0usize;
+    // Files we attempted but couldn't index (unsupported/empty, or a fetch error), for the report.
+    let mut issues: Vec<CloudSyncIssue> = Vec::new();
+    let mut issues_truncated = false;
+    // Set if the user pressed Stop. Already-applied items stay committed; we stop early and skip the
+    // interrupted account's cursor advance, so the next sync re-checks it.
+    let mut cancelled = false;
+    // Per-pass driver state (Drive's parent-folder-name memo; `()` for OneDrive).
+    let mut folder_cache = C::FolderCache::default();
+
+    'accounts: for w in &work {
+        // Stop requested (before this account, or after finishing the previous one)? Halt — keeping
+        // everything indexed so far. The interrupted account's cursor is left unadvanced below.
+        if sync_cancelled::<C>(app) {
+            cancelled = true;
+            break 'accounts;
+        }
+
+        // Any item in this account failing (a body fetch or an apply) blocks the clean finalize below:
+        // the account is stamped 'error' with its cursor left unadvanced instead of a misleading 'ok'.
+        // Reset per account so one bad account doesn't taint the next (the global `failed` counter is
+        // cross-account and can't gate this per-account decision). Mirrors the calendar sync's "check
+        // failures first" rule (F-29).
+        let mut account_failed = false;
+
+        // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
+        if w.auth_failed {
+            let actions = index_only::react(
+                index_only::ChangeEvent::SourceFailure {
+                    source: format!("{}:{}", C::SOURCE_KIND, w.email),
+                },
+                None,
+            );
+            let app2 = app.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                connector_sync::apply_connector_actions(&app2, &actions, None)
+            })
+            .await;
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            C::set_error_state(&conn, &w.email)?;
+            continue;
+        }
+
+        for item in &w.items {
+            // Stop requested mid-account? Halt after the current file — already-indexed files stay.
+            if sync_cancelled::<C>(app) {
+                cancelled = true;
+                break 'accounts;
+            }
+            let (file, source_id, event) = match driver.resolve_item(app, &w.email, item)? {
+                Resolved::Skip => {
+                    processed += 1;
+                    skipped += 1;
+                    continue;
+                }
+                Resolved::Process {
+                    file,
+                    source_id,
+                    event,
+                } => (file, source_id, event),
+            };
+
+            let name = file.map(C::file_name).unwrap_or_else(|| source_id.clone());
+            let current = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                C::read_item_state(&conn, &source_id)?
+            };
+            let actions = index_only::react(event, current.as_ref());
+            let category = connector_sync::action_category(&actions);
+
+            let needs_body = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    index_only::Action::IngestNew { .. } | index_only::Action::ReEmbed { .. }
+                )
+            });
+            let fetched = if needs_body {
+                let body = match file {
+                    Some(f) => {
+                        let state = app.state::<AppState>();
+                        C::fetch_body(state.inner(), &w.token_key, f).await
+                    }
+                    None => Ok(None),
+                };
+                match body {
+                    // Build the pointer only now a body is in hand — Drive's parent-folder lookup
+                    // (memoised in `folder_cache`) rides along here rather than on every attempt.
+                    Ok(Some(text)) => match file {
+                        Some(f) => Some(
+                            driver
+                                .make_pointer(
+                                    &w.token_key,
+                                    f,
+                                    source_id.clone(),
+                                    text,
+                                    &mut folder_cache,
+                                )
+                                .await,
+                        ),
+                        None => None,
+                    },
+                    Ok(None) => {
+                        processed += 1;
+                        skipped += 1;
+                        record_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            "No extractable text (unsupported file type or empty)",
+                        );
+                        emit_progress::<C>(
+                            app,
+                            CloudSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        processed += 1;
+                        failed += 1;
+                        record_issue(
+                            &mut issues,
+                            &mut issues_truncated,
+                            &name,
+                            &format!("Couldn't fetch from {}: {e}", C::PROVIDER_LABEL),
+                        );
+                        last_err = Some(e);
+                        account_failed = true;
+                        emit_progress::<C>(
+                            app,
+                            CloudSyncEvent::Item {
+                                processed,
+                                total,
+                                name,
+                            },
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let app2 = app.clone();
+            let apply = tokio::task::spawn_blocking(move || {
+                connector_sync::apply_connector_actions(&app2, &actions, fetched)
+            })
+            .await
+            // Lower-cased label ("drive" / "onedrive") reproduces the pre-unification per-engine panic
+            // text exactly; only hit on a spawn_blocking JoinError (an apply-task panic), never normally.
+            .map_err(|e| {
+                Error::Other(format!(
+                    "{} apply task panicked: {e}",
+                    C::PROVIDER_LABEL.to_lowercase()
+                ))
+            })?;
+            match apply {
+                Ok(()) => match category {
+                    connector_sync::ActionKind::Indexed => indexed += 1,
+                    connector_sync::ActionKind::Updated => updated += 1,
+                    connector_sync::ActionKind::Removed => removed += 1,
+                    connector_sync::ActionKind::Other => skipped += 1,
+                },
+                Err(e) => {
+                    failed += 1;
+                    record_issue(
+                        &mut issues,
+                        &mut issues_truncated,
+                        &name,
+                        &format!("Indexing failed: {e}"),
+                    );
+                    last_err = Some(e);
+                    account_failed = true;
+                }
+            }
+            processed += 1;
+            emit_progress::<C>(
+                app,
+                CloudSyncEvent::Item {
+                    processed,
+                    total,
+                    name,
+                },
+            );
+            // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously. Re-read
+            // the setting each item (a cheap read, dropped before the await per rule #4) so flipping
+            // Fast/Gentle mid-sync takes effect on the very next file, not only on the next run. Only
+            // items that reached here did real work (the cheap no-op/skip paths `continue` above).
+            let pause_ms = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                db::indexing_pause_ms(&conn)
+            };
+            if pause_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            }
+        }
+
+        // Persist the pass, honoring whether any item failed: a clean account commits (cursor advance,
+        // time, state 'ok'); an account with ANY failed item is flagged 'error' with its cursor left
+        // unadvanced, so the failure isn't hidden behind a misleading 'ok' and the failed items retry
+        // next sync. Auth-failed accounts already `continue`d above. (F-29)
+        {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            C::finalize_or_flag(&conn, w, account_failed)?;
+        }
+    }
+
+    let report = CloudSyncReport {
+        indexed,
+        updated,
+        removed,
+        skipped,
+        failed,
+        cancelled,
+        issues,
+        issues_truncated,
+    };
+    emit_progress::<C>(app, CloudSyncEvent::Finished { report });
+
+    // A deliberate stop isn't an error. Otherwise surface a failure (auth/expired) even when some
+    // items succeeded — the good ones are already committed.
+    if !cancelled {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(indexed + updated + removed)
+}
+
+// --- Google Drive driver -------------------------------------------------------------------------
 
 /// Resolve a Drive folder id to its display name for sorting-review context, memoising by id across a
 /// whole sync pass (folder ids are globally unique in Drive) so tagging many files in one folder costs
@@ -35,7 +587,7 @@ async fn resolve_folder_name(
     name
 }
 
-/// One unit of sync work for an account, gathered off the lock in phase 1.
+/// One unit of sync work for a Drive account, gathered off the lock in phase 1.
 enum DriveItem {
     /// A My-Drive first-sync file → `Add`.
     Enumerated(drive::DriveFile),
@@ -59,19 +611,6 @@ fn drive_reconciled(r: index_only::ReconcileItem<drive::DriveFile>) -> DriveItem
         event: r.event,
         file: r.payload,
     }
-}
-
-/// All of one account's gathered work for a sync pass (My Drive + shared drives together).
-struct AccountWork {
-    email: String,
-    token_key: String,
-    items: Vec<DriveItem>,
-    /// The advanced My-Drive delta cursor — set only when My Drive was synced this pass.
-    new_cursor: Option<String>,
-    /// Advanced delta cursors for whole-drive shared selections — `(driveId, newCursor)`, one per
-    /// whole-drive shared drive that synced cleanly this pass. Folder-scoped selections add nothing.
-    shared_new_cursors: Vec<(String, String)>,
-    auth_failed: bool,
 }
 
 /// Gather one opted-in shared drive's work, dispatching on how much of it is in scope:
@@ -223,130 +762,67 @@ async fn gather_shared_whole(
     Ok((items, Some((drive_id.to_string(), new_cursor))))
 }
 
-/// Apply `f` to the shared drive-sync snapshot, best-effort (a poisoned lock is skipped). Binding the
-/// lock guard to a named local first sidesteps the `if let` temporary-lifetime pitfall.
-fn with_drive_snap(app: &AppHandle, f: impl FnOnce(&mut crate::DriveSyncState)) {
-    let state = app.state::<AppState>();
-    let guard = state.drive_sync.lock();
-    if let Ok(mut snap) = guard {
-        f(&mut snap);
+/// The Google Drive connector's [`CloudDriver`] — see [`crate::commands::sync_drive`] /
+/// [`crate::commands::resume_drive_sync`]. Honours each account's scope: **My Drive** (on by default)
+/// uses the efficient delta cursor (first sync enumerates everything, later syncs the changes feed);
+/// **shared drives** the account opted into are re-enumerated + reconciled each pass (whole drive, or
+/// selected folders), de-duplicated across accounts via `claim_or_skip_shared_drive`.
+struct DriveDriver;
+
+impl CloudDriver for DriveDriver {
+    type File = drive::DriveFile;
+    type Item = DriveItem;
+    type FolderCache = std::collections::HashMap<String, Option<String>>;
+
+    const PENDING_KEY: &'static str = DRIVE_SYNC_PENDING_KEY;
+    const EVENT_NAME: &'static str = "drive://sync";
+    const SOURCE_KIND: &'static str = "gdrive";
+    const PROVIDER_LABEL: &'static str = "Drive";
+
+    fn snapshot(state: &AppState) -> &Mutex<crate::CloudSyncState> {
+        &state.drive_sync
     }
-}
-
-/// Update the shared drive-sync snapshot and broadcast a `drive://sync` progress event globally. The
-/// snapshot lets the UI restore an in-flight sync after navigating away; the global event (vs a
-/// per-call Channel) means progress reaches whatever component is mounted, not just the starter.
-fn emit_drive_progress(app: &AppHandle, ev: drive::DriveSyncEvent) {
-    with_drive_snap(app, |snap| match &ev {
-        drive::DriveSyncEvent::Counted { total } => {
-            snap.total = Some(*total);
-            snap.processed = 0;
-        }
-        drive::DriveSyncEvent::Item {
-            processed, total, ..
-        } => {
-            snap.processed = *processed;
-            snap.total = Some(*total);
-        }
-        // Keep the last result in the snapshot too, so a user returning to Settings after the sync
-        // finished still sees the summary (the live event only reaches a mounted listener).
-        drive::DriveSyncEvent::Finished { report } => {
-            snap.last_report = Some(report.clone());
-        }
-    });
-    let _ = app.emit("drive://sync", ev);
-}
-
-/// Key in the `settings` table marking a sync that was started but not cleanly finished. Set when a
-/// sync begins and removed when it ends (completed or stopped); a value surviving across a restart
-/// therefore means the app was closed/crashed mid-index, and [`crate::commands::resume_drive_sync`]
-/// picks it back up.
-pub(crate) const DRIVE_SYNC_PENDING_KEY: &str = "drive_sync_pending";
-
-/// True if the running sync has been asked to stop.
-fn sync_cancelled(app: &AppHandle) -> bool {
-    app.state::<AppState>()
-        .drive_sync_cancel
-        .load(Ordering::SeqCst)
-}
-
-/// Record a file that couldn't be indexed, up to the cap (after which we just flag truncation).
-fn record_issue(
-    issues: &mut Vec<drive::DriveSyncIssue>,
-    truncated: &mut bool,
-    name: &str,
-    reason: &str,
-) {
-    if issues.len() < connector_sync::MAX_REPORT_ISSUES {
-        issues.push(drive::DriveSyncIssue {
-            name: name.to_string(),
-            reason: reason.to_string(),
-        });
-    } else {
-        *truncated = true;
-    }
-}
-
-/// The sync engine behind both [`crate::commands::sync_drive`] and
-/// [`crate::commands::resume_drive_sync`], honouring each account's
-/// scope. **My Drive** (on by default) uses the efficient delta cursor — the first sync enumerates
-/// everything (the slow one the UI warns about), later syncs apply only the changes feed. **Shared
-/// drives** the account opted into are re-enumerated and reconciled each pass (whole drive, or just
-/// the selected folders). Every item is index-only: a pointer + embedding, the body fetched live.
-/// Never holds the DB lock across a network/embed call (rule #4).
-///
-/// **Runs detached**: progress is broadcast via the global `drive://sync` event (not a per-call
-/// Channel) and mirrored into [`AppState::drive_sync`], so the sync keeps running — and the UI keeps
-/// reflecting it — even if the user leaves the Settings page.
-///
-/// **Single-flight**: a request arriving while a sync is already running (e.g. the user connected
-/// another account mid-index, or a stray button press) is folded into one follow-up all-accounts
-/// pass rather than starting a second, racy sync — backend-enforced, so the UI can't break it. The
-/// follow-up cheaply re-checks already-synced accounts (delta) and fully indexes any new one.
-///
-/// **Durable**: a crash-resume marker is persisted while running and cleared on a clean exit, so an
-/// interrupted run is resumed on next launch. Already-indexed files survive (each is committed as it
-/// goes), so a stop or crash never loses work. Returns the number of items touched by the last pass.
-pub(crate) async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
-    let st: &AppState = app.state::<AppState>().inner();
-    connector_sync::run_detached_sync(
-        st,
-        &st.drive_sync,
-        &st.drive_sync_cancel,
-        DRIVE_SYNC_PENDING_KEY,
-        account,
-        |target| run_drive_sync(app, target),
-    )
-    .await
-}
-
-/// One sync pass: gather each account's work, then process it. Split out so [`drive_sync_core`] can
-/// run it more than once (the follow-up sweep) and so the wrapper owns the running/marker lifecycle.
-async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usize> {
-    // The engine is needed for index-only embedding + binary conversion — ensure it once up front.
-    {
-        let state = app.state::<AppState>();
-        state.sidecar.ensure_installed()?;
+    fn cancel_flag(state: &AppState) -> &AtomicBool {
+        &state.drive_sync_cancel
     }
 
-    let emails: Vec<String> = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        match account {
-            Some(e) => vec![e],
-            None => drive::list_accounts(&conn)?
-                .into_iter()
-                .map(|a| a.email)
-                .collect(),
-        }
-    };
+    fn account_emails(conn: &Connection) -> Result<Vec<String>> {
+        Ok(drive::list_accounts(conn)?
+            .into_iter()
+            .map(|a| a.email)
+            .collect())
+    }
+    fn read_item_state(
+        conn: &Connection,
+        source_id: &str,
+    ) -> Result<Option<index_only::ItemState>> {
+        drive::read_item_state(conn, source_id)
+    }
+    fn set_error_state(conn: &Connection, email: &str) -> Result<()> {
+        drive::set_state(conn, email, "error")
+    }
+    fn finalize_or_flag(
+        conn: &Connection,
+        work: &AccountWork<DriveItem>,
+        account_failed: bool,
+    ) -> Result<()> {
+        drive::finalize_or_flag(
+            conn,
+            &work.email,
+            account_failed,
+            work.new_cursor.as_deref(),
+            &work.extra_cursors,
+        )
+    }
+    fn file_name(file: &drive::DriveFile) -> String {
+        file.name.clone()
+    }
 
-    let mut work: Vec<AccountWork> = Vec::new();
-    let mut last_err: Option<Error> = None;
-
-    // Phase 1 — gather each account's work off the lock: My Drive via its delta cursor, then each
-    // opted-in shared drive via a reconcile. One AccountWork per account carries both.
-    for email in emails {
+    async fn gather_account(
+        &self,
+        app: &AppHandle,
+        email: String,
+    ) -> Result<(AccountWork<DriveItem>, Option<Error>)> {
         let token_key = drive::account_token_key(&email);
         let scope = {
             let state = app.state::<AppState>();
@@ -356,8 +832,9 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
 
         let mut items: Vec<DriveItem> = Vec::new();
         let mut new_cursor: Option<String> = None;
-        let mut shared_new_cursors: Vec<(String, String)> = Vec::new();
+        let mut extra_cursors: Vec<(String, String)> = Vec::new();
         let mut auth_failed = false;
+        let mut last_err: Option<Error> = None;
 
         // --- My Drive. Whole-drive uses the cheap delta cursor; folder-scoped re-enumerates +
         // reconciles (like a folder-scoped shared drive), advancing no cursor. ---
@@ -439,7 +916,7 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                     Ok((mut recon, cursor)) => {
                         items.append(&mut recon);
                         if let Some(advanced) = cursor {
-                            shared_new_cursors.push(advanced);
+                            extra_cursors.push(advanced);
                         }
                     }
                     Err(e) => {
@@ -455,270 +932,94 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
             }
         }
 
-        work.push(AccountWork {
-            email,
-            token_key,
-            items,
-            new_cursor,
-            shared_new_cursors,
-            auth_failed,
-        });
+        Ok((
+            AccountWork {
+                email,
+                token_key,
+                items,
+                new_cursor,
+                extra_cursors,
+                auth_failed,
+            },
+            last_err,
+        ))
     }
 
-    let total: usize = work.iter().map(|w| w.items.len()).sum();
-    emit_drive_progress(app, drive::DriveSyncEvent::Counted { total });
-
-    // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
-    let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
-    let mut processed = 0usize;
-    // Files we attempted but couldn't index (unsupported/empty, or a fetch error), for the report.
-    let mut issues: Vec<drive::DriveSyncIssue> = Vec::new();
-    let mut issues_truncated = false;
-    // Set if the user pressed Stop. Already-applied items stay committed; we stop early and skip the
-    // interrupted account's cursor advance, so the next sync re-checks it.
-    let mut cancelled = false;
-    // Parent-folder names resolved once per unique folder id for the whole pass (see
-    // [`resolve_folder_name`]) — snapshotted onto each newly-synced document as review context.
-    let mut folder_names: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
-
-    'accounts: for w in &work {
-        // Stop requested (before this account, or after finishing the previous one)? Halt — keeping
-        // everything indexed so far. The interrupted account's cursor is left unadvanced below.
-        if sync_cancelled(app) {
-            cancelled = true;
-            break 'accounts;
-        }
-
-        // Any item in this account failing (a body fetch or an apply) blocks the clean finalize below:
-        // the account is stamped 'error' with its cursor left unadvanced instead of a misleading 'ok'.
-        // Reset per account so one bad account doesn't taint the next (the global `failed` counter is
-        // cross-account and can't gate this per-account decision). Mirrors the calendar sync's "check
-        // failures first" rule (F-29).
-        let mut account_failed = false;
-
-        // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
-        if w.auth_failed {
-            let actions = index_only::react(
-                index_only::ChangeEvent::SourceFailure {
-                    source: format!("gdrive:{}", w.email),
-                },
-                None,
-            );
-            let app2 = app.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                connector_sync::apply_connector_actions(&app2, &actions, None)
-            })
-            .await;
-            let state = app.state::<AppState>();
-            let conn = state.conn()?;
-            drive::set_state(&conn, &w.email, "error")?;
-            continue;
-        }
-
-        for item in &w.items {
-            // Stop requested mid-account? Halt after the current file — already-indexed files stay.
-            if sync_cancelled(app) {
-                cancelled = true;
-                break 'accounts;
-            }
-            let (file, source_id, event): (Option<&drive::DriveFile>, String, _) = match item {
-                DriveItem::Enumerated(file) => {
-                    let sid = drive::source_id_for(&w.email, &file.id);
-                    let ev = index_only::ChangeEvent::Add {
-                        source_id: sid.clone(),
-                        modified_at: file.modified_time.clone(),
-                    };
-                    (Some(file), sid, ev)
-                }
-                DriveItem::Changed(change) => {
-                    let sid = drive::source_id_for(&w.email, &change.file_id);
-                    let known = {
-                        let state = app.state::<AppState>();
-                        let conn = state.conn()?;
-                        drive::read_item_state(&conn, &sid)?.is_some()
-                    };
-                    match drive::map_change(change, &w.email, known) {
-                        Some(ev) => (change.file.as_ref(), sid, ev),
-                        None => {
-                            processed += 1;
-                            skipped += 1;
-                            continue;
-                        }
-                    }
-                }
-                // Shared-drive reconcile: the event (Update/Delete) is already built.
-                DriveItem::Reconciled {
-                    source_id,
-                    event,
-                    file,
-                } => (file.as_ref(), source_id.clone(), event.clone()),
-            };
-
-            let name = file
-                .map(|f| f.name.clone())
-                .unwrap_or_else(|| source_id.clone());
-            let current = {
-                let state = app.state::<AppState>();
-                let conn = state.conn()?;
-                drive::read_item_state(&conn, &source_id)?
-            };
-            let actions = index_only::react(event, current.as_ref());
-            let category = connector_sync::action_category(&actions);
-
-            let needs_body = actions.iter().any(|a| {
-                matches!(
-                    a,
-                    index_only::Action::IngestNew { .. } | index_only::Action::ReEmbed { .. }
-                )
-            });
-            let fetched = if needs_body {
-                let body = match file {
-                    Some(f) => {
-                        let state = app.state::<AppState>();
-                        drive::fetch_body(state.inner(), &w.token_key, f).await
-                    }
-                    None => Ok(None),
+    fn resolve_item<'a>(
+        &self,
+        app: &AppHandle,
+        email: &str,
+        item: &'a DriveItem,
+    ) -> Result<Resolved<'a, drive::DriveFile>> {
+        Ok(match item {
+            DriveItem::Enumerated(file) => {
+                let sid = drive::source_id_for(email, &file.id);
+                let ev = index_only::ChangeEvent::Add {
+                    source_id: sid.clone(),
+                    modified_at: file.modified_time.clone(),
                 };
-                // Snapshot the parent-folder name (cached per pass) alongside the body — plain review
-                // context for the sorting proposal, resolved off the file's first `parents` entry.
-                let folder_name = match file.and_then(|f| f.parent_id.as_deref()) {
-                    Some(pid) => resolve_folder_name(&w.token_key, pid, &mut folder_names).await,
-                    None => None,
+                Resolved::Process {
+                    file: Some(file),
+                    source_id: sid,
+                    event: ev,
+                }
+            }
+            DriveItem::Changed(change) => {
+                let sid = drive::source_id_for(email, &change.file_id);
+                let known = {
+                    let state = app.state::<AppState>();
+                    let conn = state.conn()?;
+                    drive::read_item_state(&conn, &sid)?.is_some()
                 };
-                match body {
-                    Ok(Some(text)) => file.map(|f| f.pointer(source_id.clone(), text, folder_name)),
-                    Ok(None) => {
-                        processed += 1;
-                        skipped += 1;
-                        record_issue(
-                            &mut issues,
-                            &mut issues_truncated,
-                            &name,
-                            "No extractable text (unsupported file type or empty)",
-                        );
-                        emit_drive_progress(
-                            app,
-                            drive::DriveSyncEvent::Item {
-                                processed,
-                                total,
-                                name,
-                            },
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        processed += 1;
-                        failed += 1;
-                        record_issue(
-                            &mut issues,
-                            &mut issues_truncated,
-                            &name,
-                            &format!("Couldn't fetch from Drive: {e}"),
-                        );
-                        last_err = Some(e);
-                        account_failed = true;
-                        emit_drive_progress(
-                            app,
-                            drive::DriveSyncEvent::Item {
-                                processed,
-                                total,
-                                name,
-                            },
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-
-            let app2 = app.clone();
-            let apply = tokio::task::spawn_blocking(move || {
-                connector_sync::apply_connector_actions(&app2, &actions, fetched)
-            })
-            .await
-            .map_err(|e| Error::Other(format!("drive apply task panicked: {e}")))?;
-            match apply {
-                Ok(()) => match category {
-                    connector_sync::ActionKind::Indexed => indexed += 1,
-                    connector_sync::ActionKind::Updated => updated += 1,
-                    connector_sync::ActionKind::Removed => removed += 1,
-                    connector_sync::ActionKind::Other => skipped += 1,
-                },
-                Err(e) => {
-                    failed += 1;
-                    record_issue(
-                        &mut issues,
-                        &mut issues_truncated,
-                        &name,
-                        &format!("Indexing failed: {e}"),
-                    );
-                    last_err = Some(e);
-                    account_failed = true;
+                match drive::map_change(change, email, known) {
+                    Some(ev) => Resolved::Process {
+                        file: change.file.as_ref(),
+                        source_id: sid,
+                        event: ev,
+                    },
+                    None => Resolved::Skip,
                 }
             }
-            processed += 1;
-            emit_drive_progress(
-                app,
-                drive::DriveSyncEvent::Item {
-                    processed,
-                    total,
-                    name,
-                },
-            );
-            // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously. Re-read
-            // the setting each item (a cheap read, dropped before the await per rule #4) so flipping
-            // Fast/Gentle mid-sync takes effect on the very next file, not only on the next run. Only
-            // items that reached here did real work (the cheap no-op/skip paths `continue` above).
-            let pause_ms = {
-                let state = app.state::<AppState>();
-                let conn = state.conn()?;
-                db::indexing_pause_ms(&conn)
-            };
-            if pause_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
-            }
-        }
-
-        // Persist the pass, honoring whether any item failed: a clean account commits (cursor advance,
-        // time, state 'ok'); an account with ANY failed item is flagged 'error' with its cursor left
-        // unadvanced, so the failure isn't hidden behind a misleading 'ok' and the failed items retry
-        // next sync. See `drive::finalize_or_flag`. Auth-failed accounts already `continue`d above. (F-29)
-        {
-            let state = app.state::<AppState>();
-            let conn = state.conn()?;
-            drive::finalize_or_flag(
-                &conn,
-                &w.email,
-                account_failed,
-                w.new_cursor.as_deref(),
-                &w.shared_new_cursors,
-            )?;
-        }
+            // Shared-drive reconcile: the event (Add/Update/Delete) is already built.
+            DriveItem::Reconciled {
+                source_id,
+                event,
+                file,
+            } => Resolved::Process {
+                file: file.as_ref(),
+                source_id: source_id.clone(),
+                event: event.clone(),
+            },
+        })
     }
 
-    let report = drive::DriveSyncReport {
-        indexed,
-        updated,
-        removed,
-        skipped,
-        failed,
-        cancelled,
-        issues,
-        issues_truncated,
-    };
-    emit_drive_progress(app, drive::DriveSyncEvent::Finished { report });
-
-    // A deliberate stop isn't an error. Otherwise surface a failure (auth/expired) even when some
-    // items succeeded — the good ones are already committed.
-    if !cancelled {
-        if let Some(e) = last_err {
-            return Err(e);
-        }
+    async fn fetch_body(
+        state: &AppState,
+        token_key: &str,
+        file: &drive::DriveFile,
+    ) -> Result<Option<String>> {
+        drive::fetch_body(state, token_key, file).await
     }
-    Ok(indexed + updated + removed)
+
+    async fn make_pointer(
+        &self,
+        token_key: &str,
+        file: &drive::DriveFile,
+        source_id: String,
+        body: String,
+        cache: &mut std::collections::HashMap<String, Option<String>>,
+    ) -> index_only::PointerInput {
+        // Snapshot the parent-folder name (cached per pass) alongside the body — plain review context
+        // for the sorting proposal, resolved off the file's first `parents` entry.
+        let folder_name = match file.parent_id.as_deref() {
+            Some(pid) => resolve_folder_name(token_key, pid, cache).await,
+            None => None,
+        };
+        file.pointer(source_id, body, folder_name)
+    }
 }
+
+// --- OneDrive driver -----------------------------------------------------------------------------
 
 /// One unit of OneDrive sync work for an account, gathered off the lock in phase 1.
 enum OneDriveItem {
@@ -732,16 +1033,6 @@ enum OneDriveItem {
         event: index_only::ChangeEvent,
         item: Option<onedrive::DriveItem>,
     },
-}
-
-/// All of one account's gathered work for a sync pass.
-struct OneDriveAccountWork {
-    email: String,
-    token_key: String,
-    items: Vec<OneDriveItem>,
-    /// The advanced whole-drive delta link — set only when the whole drive synced this pass.
-    new_cursor: Option<String>,
-    auth_failed: bool,
 }
 
 /// Folder-scoped reconcile for OneDrive: enumerate the selected folders live and diff against the
@@ -774,106 +1065,65 @@ async fn gather_onedrive_folders(
     )
 }
 
-/// Apply `f` to the shared OneDrive-sync snapshot, best-effort (a poisoned lock is skipped).
-fn with_onedrive_snap(app: &AppHandle, f: impl FnOnce(&mut crate::OneDriveSyncState)) {
-    let state = app.state::<AppState>();
-    let guard = state.onedrive_sync.lock();
-    if let Ok(mut snap) = guard {
-        f(&mut snap);
+/// The OneDrive connector's [`CloudDriver`] (the Microsoft sibling of [`DriveDriver`]). The whole drive
+/// uses the efficient Graph delta cursor (first sync enumerates everything, later syncs apply only
+/// changes); a folder-scoped account is re-enumerated + reconciled each pass. No shared-drive concept,
+/// so `extra_cursors` stays empty.
+struct OneDriveDriver;
+
+impl CloudDriver for OneDriveDriver {
+    type File = onedrive::DriveItem;
+    type Item = OneDriveItem;
+    type FolderCache = ();
+
+    const PENDING_KEY: &'static str = ONEDRIVE_SYNC_PENDING_KEY;
+    const EVENT_NAME: &'static str = "onedrive://sync";
+    const SOURCE_KIND: &'static str = "onedrive";
+    const PROVIDER_LABEL: &'static str = "OneDrive";
+
+    fn snapshot(state: &AppState) -> &Mutex<crate::CloudSyncState> {
+        &state.onedrive_sync
     }
-}
-
-/// Update the OneDrive-sync snapshot and broadcast a `onedrive://sync` progress event globally (so
-/// progress reaches whatever component is mounted, and the UI can restore an in-flight sync).
-fn emit_onedrive_progress(app: &AppHandle, ev: onedrive::OneDriveSyncEvent) {
-    with_onedrive_snap(app, |snap| match &ev {
-        onedrive::OneDriveSyncEvent::Counted { total } => {
-            snap.total = Some(*total);
-            snap.processed = 0;
-        }
-        onedrive::OneDriveSyncEvent::Item {
-            processed, total, ..
-        } => {
-            snap.processed = *processed;
-            snap.total = Some(*total);
-        }
-        onedrive::OneDriveSyncEvent::Finished { report } => {
-            snap.last_report = Some(report.clone());
-        }
-    });
-    let _ = app.emit("onedrive://sync", ev);
-}
-
-/// Marker key for a OneDrive sync started but not cleanly finished (crash-resume); see the Drive
-/// equivalent.
-pub(crate) const ONEDRIVE_SYNC_PENDING_KEY: &str = "onedrive_sync_pending";
-
-/// True if the running OneDrive sync has been asked to stop.
-fn onedrive_sync_cancelled(app: &AppHandle) -> bool {
-    app.state::<AppState>()
-        .onedrive_sync_cancel
-        .load(Ordering::SeqCst)
-}
-
-/// Record a file that couldn't be indexed, up to the cap (after which we just flag truncation).
-fn record_onedrive_issue(
-    issues: &mut Vec<onedrive::OneDriveSyncIssue>,
-    truncated: &mut bool,
-    name: &str,
-    reason: &str,
-) {
-    if issues.len() < connector_sync::MAX_REPORT_ISSUES {
-        issues.push(onedrive::OneDriveSyncIssue {
-            name: name.to_string(),
-            reason: reason.to_string(),
-        });
-    } else {
-        *truncated = true;
-    }
-}
-
-/// The OneDrive sync engine (mirrors [`drive_sync_core`]): detached, single-flight, durable. The
-/// whole drive uses the efficient Graph delta cursor (first sync enumerates everything, later syncs
-/// apply only changes); a folder-scoped account is re-enumerated + reconciled each pass. Every item is
-/// index-only: a pointer + embedding, the body fetched live. Never holds the DB lock across a
-/// network/embed call (rule #4).
-pub(crate) async fn onedrive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
-    let st: &AppState = app.state::<AppState>().inner();
-    connector_sync::run_detached_sync(
-        st,
-        &st.onedrive_sync,
-        &st.onedrive_sync_cancel,
-        ONEDRIVE_SYNC_PENDING_KEY,
-        account,
-        |target| run_onedrive_sync(app, target),
-    )
-    .await
-}
-
-/// One OneDrive sync pass: gather each account's work, then process it.
-async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<usize> {
-    {
-        let state = app.state::<AppState>();
-        state.sidecar.ensure_installed()?;
+    fn cancel_flag(state: &AppState) -> &AtomicBool {
+        &state.onedrive_sync_cancel
     }
 
-    let emails: Vec<String> = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        match account {
-            Some(e) => vec![e],
-            None => onedrive::list_accounts(&conn)?
-                .into_iter()
-                .map(|a| a.email)
-                .collect(),
-        }
-    };
+    fn account_emails(conn: &Connection) -> Result<Vec<String>> {
+        Ok(onedrive::list_accounts(conn)?
+            .into_iter()
+            .map(|a| a.email)
+            .collect())
+    }
+    fn read_item_state(
+        conn: &Connection,
+        source_id: &str,
+    ) -> Result<Option<index_only::ItemState>> {
+        onedrive::read_item_state(conn, source_id)
+    }
+    fn set_error_state(conn: &Connection, email: &str) -> Result<()> {
+        onedrive::set_state(conn, email, "error")
+    }
+    fn finalize_or_flag(
+        conn: &Connection,
+        work: &AccountWork<OneDriveItem>,
+        account_failed: bool,
+    ) -> Result<()> {
+        onedrive::finalize_or_flag(
+            conn,
+            &work.email,
+            account_failed,
+            work.new_cursor.as_deref(),
+        )
+    }
+    fn file_name(file: &onedrive::DriveItem) -> String {
+        file.name.clone()
+    }
 
-    let mut work: Vec<OneDriveAccountWork> = Vec::new();
-    let mut last_err: Option<Error> = None;
-
-    // Phase 1 — gather each account's work off the lock.
-    for email in emails {
+    async fn gather_account(
+        &self,
+        app: &AppHandle,
+        email: String,
+    ) -> Result<(AccountWork<OneDriveItem>, Option<Error>)> {
         let token_key = onedrive::account_token_key(&email);
         let scope = {
             let state = app.state::<AppState>();
@@ -884,6 +1134,7 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
         let mut items: Vec<OneDriveItem> = Vec::new();
         let mut new_cursor: Option<String> = None;
         let mut auth_failed = false;
+        let mut last_err: Option<Error> = None;
 
         match scope.folders.as_deref() {
             // Folder-scoped: re-enumerate selected folders + reconcile (no cursor).
@@ -955,237 +1206,94 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
             }
         }
 
-        work.push(OneDriveAccountWork {
-            email,
-            token_key,
-            items,
-            new_cursor,
-            auth_failed,
-        });
+        Ok((
+            AccountWork {
+                email,
+                token_key,
+                items,
+                new_cursor,
+                extra_cursors: Vec::new(),
+                auth_failed,
+            },
+            last_err,
+        ))
     }
 
-    let total: usize = work.iter().map(|w| w.items.len()).sum();
-    emit_onedrive_progress(app, onedrive::OneDriveSyncEvent::Counted { total });
-
-    // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
-    let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
-    let mut processed = 0usize;
-    let mut issues: Vec<onedrive::OneDriveSyncIssue> = Vec::new();
-    let mut issues_truncated = false;
-    let mut cancelled = false;
-
-    'accounts: for w in &work {
-        if onedrive_sync_cancelled(app) {
-            cancelled = true;
-            break 'accounts;
-        }
-
-        // Any item in this account failing (a body fetch or an apply) blocks the clean finalize below:
-        // the account is stamped 'error' with its cursor left unadvanced instead of a misleading 'ok'.
-        // Reset per account so one bad account doesn't taint the next (the global `failed` counter is
-        // cross-account and can't gate this per-account decision). Mirrors the calendar sync's "check
-        // failures first" rule (F-29).
-        let mut account_failed = false;
-
-        // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
-        if w.auth_failed {
-            let actions = index_only::react(
-                index_only::ChangeEvent::SourceFailure {
-                    source: format!("onedrive:{}", w.email),
-                },
-                None,
-            );
-            let app2 = app.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                connector_sync::apply_connector_actions(&app2, &actions, None)
-            })
-            .await;
-            let state = app.state::<AppState>();
-            let conn = state.conn()?;
-            onedrive::set_state(&conn, &w.email, "error")?;
-            continue;
-        }
-
-        for item in &w.items {
-            if onedrive_sync_cancelled(app) {
-                cancelled = true;
-                break 'accounts;
-            }
-            let (file, source_id, event): (Option<&onedrive::DriveItem>, String, _) = match item {
-                OneDriveItem::Enumerated(it) => {
-                    let sid = onedrive::source_id_for(&w.email, &it.id);
-                    let ev = index_only::ChangeEvent::Add {
-                        source_id: sid.clone(),
-                        modified_at: it.modified_time.clone(),
-                    };
-                    (Some(it), sid, ev)
-                }
-                OneDriveItem::Delta(delta) => {
-                    let sid = onedrive::source_id_for(&w.email, &delta.item_id);
-                    let known = {
-                        let state = app.state::<AppState>();
-                        let conn = state.conn()?;
-                        onedrive::read_item_state(&conn, &sid)?.is_some()
-                    };
-                    match onedrive::map_change(delta, &w.email, known) {
-                        Some(ev) => (delta.file.as_ref(), sid, ev),
-                        None => {
-                            processed += 1;
-                            skipped += 1;
-                            continue;
-                        }
-                    }
-                }
-                OneDriveItem::Reconciled {
-                    source_id,
-                    event,
-                    item,
-                } => (item.as_ref(), source_id.clone(), event.clone()),
-            };
-
-            let name = file
-                .map(|f| f.name.clone())
-                .unwrap_or_else(|| source_id.clone());
-            let current = {
-                let state = app.state::<AppState>();
-                let conn = state.conn()?;
-                onedrive::read_item_state(&conn, &source_id)?
-            };
-            let actions = index_only::react(event, current.as_ref());
-            let category = connector_sync::action_category(&actions);
-
-            let needs_body = actions.iter().any(|a| {
-                matches!(
-                    a,
-                    index_only::Action::IngestNew { .. } | index_only::Action::ReEmbed { .. }
-                )
-            });
-            let fetched = if needs_body {
-                let body = match file {
-                    Some(f) => {
-                        let state = app.state::<AppState>();
-                        onedrive::fetch_body(state.inner(), &w.token_key, f).await
-                    }
-                    None => Ok(None),
+    fn resolve_item<'a>(
+        &self,
+        app: &AppHandle,
+        email: &str,
+        item: &'a OneDriveItem,
+    ) -> Result<Resolved<'a, onedrive::DriveItem>> {
+        Ok(match item {
+            OneDriveItem::Enumerated(it) => {
+                let sid = onedrive::source_id_for(email, &it.id);
+                let ev = index_only::ChangeEvent::Add {
+                    source_id: sid.clone(),
+                    modified_at: it.modified_time.clone(),
                 };
-                match body {
-                    Ok(Some(text)) => file.map(|f| f.pointer(source_id.clone(), text)),
-                    Ok(None) => {
-                        processed += 1;
-                        skipped += 1;
-                        record_onedrive_issue(
-                            &mut issues,
-                            &mut issues_truncated,
-                            &name,
-                            "No extractable text (unsupported file type or empty)",
-                        );
-                        emit_onedrive_progress(
-                            app,
-                            onedrive::OneDriveSyncEvent::Item {
-                                processed,
-                                total,
-                                name,
-                            },
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        processed += 1;
-                        failed += 1;
-                        record_onedrive_issue(
-                            &mut issues,
-                            &mut issues_truncated,
-                            &name,
-                            &format!("Couldn't fetch from OneDrive: {e}"),
-                        );
-                        last_err = Some(e);
-                        account_failed = true;
-                        emit_onedrive_progress(
-                            app,
-                            onedrive::OneDriveSyncEvent::Item {
-                                processed,
-                                total,
-                                name,
-                            },
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-
-            let app2 = app.clone();
-            let apply = tokio::task::spawn_blocking(move || {
-                connector_sync::apply_connector_actions(&app2, &actions, fetched)
-            })
-            .await
-            .map_err(|e| Error::Other(format!("onedrive apply task panicked: {e}")))?;
-            match apply {
-                Ok(()) => match category {
-                    connector_sync::ActionKind::Indexed => indexed += 1,
-                    connector_sync::ActionKind::Updated => updated += 1,
-                    connector_sync::ActionKind::Removed => removed += 1,
-                    connector_sync::ActionKind::Other => skipped += 1,
-                },
-                Err(e) => {
-                    failed += 1;
-                    record_onedrive_issue(
-                        &mut issues,
-                        &mut issues_truncated,
-                        &name,
-                        &format!("Indexing failed: {e}"),
-                    );
-                    last_err = Some(e);
-                    account_failed = true;
+                Resolved::Process {
+                    file: Some(it),
+                    source_id: sid,
+                    event: ev,
                 }
             }
-            processed += 1;
-            emit_onedrive_progress(
-                app,
-                onedrive::OneDriveSyncEvent::Item {
-                    processed,
-                    total,
-                    name,
-                },
-            );
-            let pause_ms = {
-                let state = app.state::<AppState>();
-                let conn = state.conn()?;
-                db::indexing_pause_ms(&conn)
-            };
-            if pause_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            OneDriveItem::Delta(delta) => {
+                let sid = onedrive::source_id_for(email, &delta.item_id);
+                let known = {
+                    let state = app.state::<AppState>();
+                    let conn = state.conn()?;
+                    onedrive::read_item_state(&conn, &sid)?.is_some()
+                };
+                match onedrive::map_change(delta, email, known) {
+                    Some(ev) => Resolved::Process {
+                        file: delta.file.as_ref(),
+                        source_id: sid,
+                        event: ev,
+                    },
+                    None => Resolved::Skip,
+                }
             }
-        }
-
-        // Persist the pass, honoring whether any item failed: a clean account commits (cursor advance,
-        // time, state 'ok'); an account with ANY failed item is flagged 'error' with its cursor left
-        // unadvanced, so the failure isn't hidden behind a misleading 'ok' and the failed items retry
-        // next sync. See `onedrive::finalize_or_flag`. Auth-failed accounts already `continue`d above. (F-29)
-        {
-            let state = app.state::<AppState>();
-            let conn = state.conn()?;
-            onedrive::finalize_or_flag(&conn, &w.email, account_failed, w.new_cursor.as_deref())?;
-        }
+            OneDriveItem::Reconciled {
+                source_id,
+                event,
+                item,
+            } => Resolved::Process {
+                file: item.as_ref(),
+                source_id: source_id.clone(),
+                event: event.clone(),
+            },
+        })
     }
 
-    let report = onedrive::OneDriveSyncReport {
-        indexed,
-        updated,
-        removed,
-        skipped,
-        failed,
-        cancelled,
-        issues,
-        issues_truncated,
-    };
-    emit_onedrive_progress(app, onedrive::OneDriveSyncEvent::Finished { report });
-
-    if !cancelled {
-        if let Some(e) = last_err {
-            return Err(e);
-        }
+    async fn fetch_body(
+        state: &AppState,
+        token_key: &str,
+        file: &onedrive::DriveItem,
+    ) -> Result<Option<String>> {
+        onedrive::fetch_body(state, token_key, file).await
     }
-    Ok(indexed + updated + removed)
+
+    async fn make_pointer(
+        &self,
+        _token_key: &str,
+        file: &onedrive::DriveItem,
+        source_id: String,
+        body: String,
+        _cache: &mut (),
+    ) -> index_only::PointerInput {
+        file.pointer(source_id, body)
+    }
+}
+
+// --- thin entry points the IPC-layer command wrappers call ---------------------------------------
+
+/// The sync engine behind [`crate::commands::sync_drive`] / [`crate::commands::resume_drive_sync`].
+pub(crate) async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
+    run_cloud_sync(app, DriveDriver, account).await
+}
+
+/// The sync engine behind [`crate::commands::sync_onedrive`] / [`crate::commands::resume_onedrive_sync`].
+pub(crate) async fn onedrive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
+    run_cloud_sync(app, OneDriveDriver, account).await
 }

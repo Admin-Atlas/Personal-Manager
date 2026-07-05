@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.7-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Under-the-hood tidying: Google Drive and OneDrive now share a single sync engine instead of two near-identical copies, so a fix or improvement to cloud syncing lands once for both. Nothing about how syncing works has changed — this is purely house-keeping.",
+    ],
+  },
+  {
     version: "2.92.6-alpha",
     date: "2026-07-05",
     highlights: [

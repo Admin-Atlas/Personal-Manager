@@ -3450,7 +3450,7 @@ pub fn set_drive_scope(
 /// The currently-running Drive sync snapshot (empty / `running:false` when idle), so the Settings UI
 /// can resume showing progress after the user leaves and returns.
 #[tauri::command]
-pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::DriveSyncState> {
+pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncState> {
     state
         .drive_sync
         .lock()
@@ -4155,7 +4155,7 @@ pub fn set_onedrive_scope(
 
 /// The currently-running OneDrive sync snapshot, so the Settings UI can resume showing progress.
 #[tauri::command]
-pub fn onedrive_sync_status(state: State<'_, AppState>) -> Result<crate::OneDriveSyncState> {
+pub fn onedrive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncState> {
     state
         .onedrive_sync
         .lock()

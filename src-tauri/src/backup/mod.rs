@@ -104,7 +104,7 @@ pub enum BackupKind {
 }
 
 /// The result of a finished backup/restore, kept in the shared snapshot so a user who
-/// navigates away and back still sees the outcome (mirrors `DriveSyncReport`).
+/// navigates away and back still sees the outcome (mirrors `CloudSyncReport`).
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupReport {
     pub kind: BackupKind,

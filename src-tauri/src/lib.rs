@@ -121,12 +121,15 @@ impl VaultRuntime {
 /// Shared app state. The SQLite connection is guarded by a mutex; commands lock
 /// it only for short synchronous work, never across an `.await`. The sidecar
 /// manages its own interior locking.
-/// A snapshot of the Drive sync that's currently running (if any), shared so the Settings UI can
-/// reflect an in-flight sync no matter which view is mounted. The sync runs detached from the
-/// component that started it — leaving Settings (or starting it, then navigating away) doesn't stop
-/// it; the UI re-reads this on return and follows the `drive://sync` events live.
+/// A snapshot of a cloud sync (Google Drive or OneDrive) that's currently running (if any), shared so
+/// the Settings UI can reflect an in-flight sync no matter which view is mounted. The sync runs
+/// detached from the component that started it — leaving Settings (or starting it, then navigating
+/// away) doesn't stop it; the UI re-reads this on return and follows the `drive://sync` /
+/// `onedrive://sync` events live. One struct for both providers: `AppState` keeps a separate
+/// `drive_sync` / `onedrive_sync` field so the two connectors run and report independently, but the
+/// snapshot shape is identical (audit X-D1).
 #[derive(Default, Clone, serde::Serialize)]
-pub struct DriveSyncState {
+pub struct CloudSyncState {
     pub running: bool,
     pub processed: usize,
     pub total: Option<usize>,
@@ -139,28 +142,11 @@ pub struct DriveSyncState {
     pub rerun: bool,
     /// The most recent finished sync's report (counts + the not-indexed list), so a user returning to
     /// Settings after a sync has completed still sees the result. Cleared when a new sync starts.
-    pub last_report: Option<drive::DriveSyncReport>,
-}
-
-/// A snapshot of the OneDrive sync that's currently running (if any) — the Microsoft sibling of
-/// [`DriveSyncState`]. Kept as its own field/channel so the two connectors run and report
-/// independently.
-#[derive(Default, Clone, serde::Serialize)]
-pub struct OneDriveSyncState {
-    pub running: bool,
-    pub processed: usize,
-    pub total: Option<usize>,
-    /// The account being synced (email), or `None` for an all-accounts pass.
-    pub account: Option<String>,
-    /// Internal single-flight flag (a sync requested while one was running). Not exposed to the UI.
-    #[serde(skip)]
-    pub rerun: bool,
-    /// The most recent finished sync's report, so a user returning after a sync still sees the result.
-    pub last_report: Option<onedrive::OneDriveSyncReport>,
+    pub last_report: Option<cloud_sync::CloudSyncReport>,
 }
 
 /// A snapshot of the local-folder sync that's currently running (if any) — the filesystem sibling of
-/// [`DriveSyncState`]. Its own field/channel so the connectors run and report independently.
+/// [`CloudSyncState`]. Its own field/channel so the connectors run and report independently.
 #[derive(Default, Clone, serde::Serialize)]
 pub struct LocalFolderSyncState {
     pub running: bool,
@@ -180,7 +166,7 @@ pub struct LocalFolderSyncState {
 // own counters + target) via [`connector_sync::SyncSlot`] so the guard can own that lifecycle
 // generically. The guard clears `running` on drop — including on a panicked pass — so a sync that
 // crashes can't wedge the connector with `running = true` for the session (audit F-43).
-impl connector_sync::SyncSlot for DriveSyncState {
+impl connector_sync::SyncSlot for CloudSyncState {
     fn running(&self) -> bool {
         self.running
     }
@@ -199,34 +185,7 @@ impl connector_sync::SyncSlot for DriveSyncState {
         self.account = None;
     }
     fn begin_pass(&mut self, target: Option<String>) {
-        *self = DriveSyncState {
-            running: true,
-            account: target,
-            ..Default::default()
-        };
-    }
-}
-
-impl connector_sync::SyncSlot for OneDriveSyncState {
-    fn running(&self) -> bool {
-        self.running
-    }
-    fn set_running(&mut self, running: bool) {
-        self.running = running;
-    }
-    fn rerun(&self) -> bool {
-        self.rerun
-    }
-    fn set_rerun(&mut self, rerun: bool) {
-        self.rerun = rerun;
-    }
-    fn reset_for_rerun(&mut self) {
-        self.processed = 0;
-        self.total = None;
-        self.account = None;
-    }
-    fn begin_pass(&mut self, target: Option<String>) {
-        *self = OneDriveSyncState {
+        *self = CloudSyncState {
             running: true,
             account: target,
             ..Default::default()
@@ -306,12 +265,12 @@ pub struct AppState {
     pub lock_session: Mutex<lock_session::LockSession>,
     /// Snapshot of the currently-running Drive sync (so the UI can resume showing progress after the
     /// user navigates away and back). Empty/`running:false` when no sync is in flight.
-    pub drive_sync: Mutex<DriveSyncState>,
+    pub drive_sync: Mutex<CloudSyncState>,
     /// Cooperative stop flag for the running Drive sync. `stop_drive_sync` sets it; the sync loop
     /// checks it between files and halts, keeping everything indexed so far. Reset at each sync start.
     pub drive_sync_cancel: AtomicBool,
     /// Snapshot of the currently-running OneDrive sync (the Microsoft sibling of `drive_sync`).
-    pub onedrive_sync: Mutex<OneDriveSyncState>,
+    pub onedrive_sync: Mutex<CloudSyncState>,
     /// Cooperative stop flag for the running OneDrive sync (the sibling of `drive_sync_cancel`).
     pub onedrive_sync_cancel: AtomicBool,
     /// Snapshot of the currently-running local-folder sync (the filesystem sibling of `drive_sync`).
@@ -748,9 +707,9 @@ pub fn run() {
                 app_unlocked: AtomicBool::new(false),
                 instance_id: vault::lock::new_instance_id(),
                 lock_session: Mutex::new(lock_session::LockSession::default()),
-                drive_sync: Mutex::new(DriveSyncState::default()),
+                drive_sync: Mutex::new(CloudSyncState::default()),
                 drive_sync_cancel: AtomicBool::new(false),
-                onedrive_sync: Mutex::new(OneDriveSyncState::default()),
+                onedrive_sync: Mutex::new(CloudSyncState::default()),
                 onedrive_sync_cancel: AtomicBool::new(false),
                 local_sync: Mutex::new(LocalFolderSyncState::default()),
                 local_sync_cancel: AtomicBool::new(false),
