@@ -61,25 +61,6 @@ fn http_client() -> Result<reqwest::Client> {
         .map_err(Error::from)
 }
 
-/// Send an authorized request built by `build`, refreshing once and retrying on a 401 (the
-/// backstop for a token revoked/expired early — mirrors [`crate::google`]'s GET path). `build` is
-/// re-invoked to construct a fresh request on retry, so it must be cheap/idempotent — only used
-/// here for small metadata calls (never the big upload body, which is sent once with a proactively
-/// refreshed token).
-async fn authorized_send<F>(token_key: &str, build: F) -> Result<reqwest::Response>
-where
-    F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
-{
-    let client = http_client()?;
-    let bearer = google::valid_access_token(token_key).await?;
-    let resp = build(&client, bearer.expose()).send().await?;
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let bearer = google::refresh_now(token_key).await?;
-        return Ok(build(&client, bearer.expose()).send().await?);
-    }
-    Ok(resp)
-}
-
 /// Turn a non-success Drive response into a friendly error, truncating (and never logging) the
 /// body — which never contains the bearer token.
 async fn drive_error(resp: reqwest::Response, action: &str) -> Error {
@@ -175,7 +156,10 @@ async fn list_files_with_ids(
     let mut page: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let url = files_list_url(&q, fields, page.as_deref())?;
-        let resp = authorized_send(token_key, |c, bearer| c.get(&url).bearer_auth(bearer)).await?;
+        let resp = google::authorized_send(&http_client()?, token_key, |c, bearer| {
+            c.get(&url).bearer_auth(bearer)
+        })
+        .await?;
         if !resp.status().is_success() {
             return Err(drive_error(resp, "listing backups").await);
         }
@@ -203,7 +187,10 @@ async fn list_files_with_ids(
 /// names; two devices could race), [`pick_folder`] converges on the earliest-created one.
 pub(crate) async fn ensure_backup_folder(token_key: &str) -> Result<String> {
     let url = files_list_url(&folder_query(), "files(id,createdTime)", None)?;
-    let resp = authorized_send(token_key, |c, bearer| c.get(&url).bearer_auth(bearer)).await?;
+    let resp = google::authorized_send(&http_client()?, token_key, |c, bearer| {
+        c.get(&url).bearer_auth(bearer)
+    })
+    .await?;
     if !resp.status().is_success() {
         return Err(drive_error(resp, "finding the backup folder").await);
     }
@@ -221,7 +208,7 @@ pub(crate) async fn ensure_backup_folder(token_key: &str) -> Result<String> {
     let body =
         serde_json::json!({ "name": BACKUP_FOLDER_NAME, "mimeType": FOLDER_MIME }).to_string();
     let create_url = format!("{DRIVE_API}/files?fields=id");
-    let resp = authorized_send(token_key, |c, bearer| {
+    let resp = google::authorized_send(&http_client()?, token_key, |c, bearer| {
         c.post(&create_url)
             .bearer_auth(bearer)
             .header(
@@ -255,7 +242,7 @@ pub(crate) async fn upload_archive(
     // 1) Initiate the resumable session. Small JSON body → safe to 401-retry via `authorized_send`.
     let meta = serde_json::json!({ "name": archive_name, "parents": [folder_id] }).to_string();
     let init_url = format!("{UPLOAD_API}?uploadType=resumable&fields=id");
-    let init = authorized_send(token_key, |c, bearer| {
+    let init = google::authorized_send(&http_client()?, token_key, |c, bearer| {
         c.post(&init_url)
             .bearer_auth(bearer)
             .header("X-Upload-Content-Type", "application/octet-stream")
@@ -445,7 +432,7 @@ pub(crate) async fn apply_retention(
         };
         let patch_url = format!("{DRIVE_API}/files/{id}");
         let body = serde_json::json!({ "trashed": true }).to_string();
-        let resp = authorized_send(token_key, |c, bearer| {
+        let resp = google::authorized_send(&http_client()?, token_key, |c, bearer| {
             c.patch(&patch_url)
                 .bearer_auth(bearer)
                 .header(
@@ -480,7 +467,10 @@ pub(crate) async fn download_archive(token_key: &str, name: &str, dest_dir: &Pat
         .ok_or_else(|| Error::Other("that backup is no longer on Google Drive".into()))?;
 
     let url = format!("{DRIVE_API}/files/{id}?alt=media");
-    let resp = authorized_send(token_key, |c, bearer| c.get(&url).bearer_auth(bearer)).await?;
+    let resp = google::authorized_send(&http_client()?, token_key, |c, bearer| {
+        c.get(&url).bearer_auth(bearer)
+    })
+    .await?;
     if !resp.status().is_success() {
         return Err(drive_error(resp, "downloading the archive").await);
     }

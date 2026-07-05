@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.8-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Steadier cloud sync on very large accounts: when Google Drive or OneDrive is too big to list in a single pass, PM now keeps what it found and picks up the rest on the next sync — instead of, in rare cases, removing files it simply hadn't reached yet, or a very large OneDrive not syncing at all. Under the hood, Drive syncing and Drive backup now share one piece of Google plumbing.",
+    ],
+  },
+  {
     version: "2.92.7-alpha",
     date: "2026-07-05",
     highlights: [

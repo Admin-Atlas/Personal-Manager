@@ -190,6 +190,37 @@ where
     result
 }
 
+/// Drive a token-paginated listing to exhaustion or a runaway page guard — the single answer to "what
+/// if the continuation token never clears", replacing the silent-truncate / hard-fail / node-break mix
+/// each connector used to hand-roll (the root of audit F-30). `fetch(cursor)` returns one page's
+/// `(items, next_cursor)`; the first call gets `None`, and a `None` next ends the walk.
+///
+/// Returns everything gathered plus whether the guard tripped. **`truncated == true` means the listing
+/// is INCOMPLETE**: a caller diffing it against what's already indexed must NOT treat a file's absence
+/// as a deletion (see [`index_only::reconcile_enumeration`]'s `complete` flag), and a delta/baseline
+/// caller must NOT advance its sync cursor past this pass — else a backstop meant for a stuck token
+/// turns into false deletions or silently-skipped files. `max_pages` is the caller's own bound (each
+/// connector keeps its constant, so the number stays visible at the call site).
+pub async fn paginate<T, F, Fut>(max_pages: usize, fetch: F) -> Result<(Vec<T>, bool)>
+where
+    F: Fn(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<T>, Option<String>)>>,
+{
+    let mut out: Vec<T> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..max_pages {
+        let (mut items, next) = fetch(cursor).await?;
+        out.append(&mut items);
+        match next {
+            Some(n) => cursor = Some(n),
+            None => return Ok((out, false)),
+        }
+    }
+    // Every page up to the guard returned a next-token: the token never cleared. Hand back what we
+    // gathered, flagged incomplete, rather than looping forever or hard-erroring the whole sync.
+    Ok((out, true))
+}
+
 /// Which tally bucket a reducer's actions fall into, for a sync summary. Named for the shared
 /// index-only foundation, not any one connector — Drive, OneDrive, and the local folder all classify
 /// their per-item work through [`action_category`].

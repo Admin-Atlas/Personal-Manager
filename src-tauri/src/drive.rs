@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::google::{self, Token};
 use crate::index_only::{self, ChangeEvent, ItemState, SourceState};
-use crate::{ingest, secrets, AppState};
+use crate::{connector_sync, ingest, secrets, AppState};
 
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
 /// Google Sheets API v4 base — used ONLY for the metadata-only Google Sheets index (tab names + each
@@ -1027,23 +1027,15 @@ fn my_files_url(q: &str, page: Option<&str>) -> Result<String> {
     Ok(url.to_string())
 }
 
-/// Enumerate every non-trashed file in My Drive (paginated) — the first-sync baseline.
-pub async fn enumerate_drive(token_key: &str) -> Result<Vec<DriveFile>> {
-    let mut out = Vec::new();
-    let mut page: Option<String> = None;
-    for _ in 0..MAX_PAGES {
+/// Enumerate every non-trashed file in My Drive (paginated) — the first-sync baseline. Returns the
+/// files plus whether the page guard tripped (`true` ⇒ INCOMPLETE: the caller must not baseline a
+/// cursor past a partial listing — see [`connector_sync::paginate`]).
+pub async fn enumerate_drive(token_key: &str) -> Result<(Vec<DriveFile>, bool)> {
+    connector_sync::paginate(MAX_PAGES, |page| async move {
         let v = google::authorized_get(token_key, &files_url(page.as_deref())?).await?;
-        let (files, next) = parse_files(&v);
-        out.extend(files);
-        match next {
-            Some(t) => page = Some(t),
-            None => return Ok(out),
-        }
-    }
-    eprintln!(
-        "drive: enumerate hit the page guard at {MAX_PAGES} pages; some files were not listed"
-    );
-    Ok(out)
+        Ok(parse_files(&v))
+    })
+    .await
 }
 
 // --- shared drives (Team Drives) — a separate corpus from My Drive ------------------------------
@@ -1062,20 +1054,16 @@ fn shared_drives_url(page: Option<&str>) -> Result<String> {
     Ok(url.to_string())
 }
 
-/// Every shared drive this account can see (`drives.list`) — for the "add shared drives" picker.
+/// Every shared drive this account can see (`drives.list`) — for the "add shared drives" picker. A
+/// picker has no deletion/cursor semantics, so a truncated listing just shows fewer rows; the guard is
+/// a pure runaway backstop here (hence the discarded flag).
 pub async fn list_shared_drives(token_key: &str) -> Result<Vec<SharedDrive>> {
-    let mut out = Vec::new();
-    let mut page: Option<String> = None;
-    for _ in 0..MAX_PAGES {
+    let (drives, _truncated) = connector_sync::paginate(MAX_PAGES, |page| async move {
         let v = google::authorized_get(token_key, &shared_drives_url(page.as_deref())?).await?;
-        let (drives, next) = parse_shared_drives(&v);
-        out.extend(drives);
-        match next {
-            Some(t) => page = Some(t),
-            None => return Ok(out),
-        }
-    }
-    Ok(out)
+        Ok(parse_shared_drives(&v))
+    })
+    .await?;
+    Ok(drives)
 }
 
 /// A `files.list` URL scoped to one shared drive (`corpora=drive` + the all-drives flags) for an
@@ -1121,22 +1109,21 @@ pub async fn list_folders(
 ) -> Result<Vec<DriveFolder>> {
     let my_drive = drive_id == MY_DRIVE_ROOT;
     let q = format!("'{parent_id}' in parents and mimeType = '{FOLDER_MIME}' and trashed = false");
-    let mut out = Vec::new();
-    let mut page: Option<String> = None;
-    for _ in 0..MAX_PAGES {
-        let url = if my_drive {
-            my_files_url(&q, page.as_deref())?
-        } else {
-            shared_files_url(drive_id, &q, "id,name", "name", page.as_deref())?
-        };
-        let v = google::authorized_get(token_key, &url).await?;
-        let (folders, next) = parse_folders(&v);
-        out.extend(folders);
-        if next.is_none() {
-            break;
+    // A picker (one lazy level): a truncated listing just shows fewer rows, so the guard flag is
+    // discarded. `q` is borrowed (not moved) into each page's future so the `Fn` closure can re-run.
+    let (mut out, _truncated) = connector_sync::paginate(MAX_PAGES, |page| {
+        let q = q.as_str();
+        async move {
+            let url = if my_drive {
+                my_files_url(q, page.as_deref())?
+            } else {
+                shared_files_url(drive_id, q, "id,name", "name", page.as_deref())?
+            };
+            let v = google::authorized_get(token_key, &url).await?;
+            Ok(parse_folders(&v))
         }
-        page = next;
-    }
+    })
+    .await?;
     // The personal corpus isn't server-sorted by name (no `orderBy`); sort for a stable picker.
     if my_drive {
         out.sort_by_key(|a| a.name.to_lowercase());
@@ -1151,12 +1138,10 @@ pub async fn enumerate_shared(
     token_key: &str,
     drive_id: &str,
     folders: Option<&[String]>,
-) -> Result<Vec<DriveFile>> {
+) -> Result<(Vec<DriveFile>, bool)> {
     match folders {
         None => {
-            let mut out = Vec::new();
-            let mut page: Option<String> = None;
-            for _ in 0..MAX_PAGES {
+            connector_sync::paginate(MAX_PAGES, |page| async move {
                 let url = shared_files_url(
                     drive_id,
                     "trashed = false",
@@ -1165,15 +1150,9 @@ pub async fn enumerate_shared(
                     page.as_deref(),
                 )?;
                 let v = google::authorized_get(token_key, &url).await?;
-                let (files, next) = parse_files(&v);
-                out.extend(files);
-                match next {
-                    Some(t) => page = Some(t),
-                    None => return Ok(out),
-                }
-            }
-            eprintln!("drive: shared whole-drive enumerate hit the page guard");
-            Ok(out)
+                Ok(parse_files(&v))
+            })
+            .await
         }
         Some(roots) => {
             walk_folders(token_key, roots, |q, page| {
@@ -1188,11 +1167,13 @@ pub async fn enumerate_shared(
 /// beneath them — deduped, and each folder walked once even if reachable from two selections. The
 /// `url_for(q, page)` closure builds each `files.list` page URL, so My Drive (`my_files_url`) and
 /// shared drives (`shared_files_url`) share one walk. Folders themselves are never returned.
+/// Returns the deduped files plus whether the walk was cut short by the folder-count guard (`true` ⇒
+/// INCOMPLETE — the caller must not treat an unseen file as deleted; see [`connector_sync::paginate`]).
 async fn walk_folders(
     token_key: &str,
     roots: &[String],
     url_for: impl Fn(&str, Option<&str>) -> Result<String>,
-) -> Result<Vec<DriveFile>> {
+) -> Result<(Vec<DriveFile>, bool)> {
     use std::collections::HashSet;
     let mut out: Vec<DriveFile> = Vec::new();
     let mut seen_folders: HashSet<String> = HashSet::new();
@@ -1206,7 +1187,7 @@ async fn walk_folders(
         nodes += 1;
         if nodes > MAX_PAGES {
             eprintln!("drive: folder walk hit the node guard at {MAX_PAGES} folders");
-            break;
+            return Ok((out, true));
         }
         let q = format!("'{folder}' in parents and trashed = false");
         let mut page: Option<String> = None;
@@ -1227,12 +1208,16 @@ async fn walk_folders(
             }
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// Enumerate the files under the selected **My Drive** folders (recursively, deduped) — the personal
-/// counterpart to `enumerate_shared`'s folder branch, for folder-scoped My Drive.
-pub async fn enumerate_my_folders(token_key: &str, folders: &[String]) -> Result<Vec<DriveFile>> {
+/// counterpart to `enumerate_shared`'s folder branch, for folder-scoped My Drive. Carries the same
+/// truncated flag as [`walk_folders`].
+pub async fn enumerate_my_folders(
+    token_key: &str,
+    folders: &[String],
+) -> Result<(Vec<DriveFile>, bool)> {
     walk_folders(token_key, folders, my_files_url).await
 }
 
@@ -1278,11 +1263,15 @@ fn changes_url(page_token: &str, drive_id: Option<&str>) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// Returns the changes, the cursor to persist, and whether the page guard tripped (`true` ⇒ the caller
+/// must NOT advance its stored cursor — the changes seen still apply idempotently, and the next sync
+/// resumes from the old cursor; see [`connector_sync::paginate`]). Keeps a hand-rolled loop rather than
+/// [`connector_sync::paginate`] because it must also carry the `newStartPageToken` that ends the feed.
 async fn list_changes_for(
     token_key: &str,
     drive_id: Option<&str>,
     cursor: &str,
-) -> Result<(Vec<DriveChange>, String)> {
+) -> Result<(Vec<DriveChange>, String, bool)> {
     let mut all = Vec::new();
     let mut page = cursor.to_string();
     for _ in 0..MAX_PAGES {
@@ -1291,18 +1280,21 @@ async fn list_changes_for(
         all.extend(changes);
         match (next, new_start) {
             (Some(t), _) => page = t,
-            (None, Some(start)) => return Ok((all, start)),
-            (None, None) => return Ok((all, page)),
+            (None, Some(start)) => return Ok((all, start, false)),
+            (None, None) => return Ok((all, page, false)),
         }
     }
     eprintln!("drive: changes hit the page guard at {MAX_PAGES} pages");
-    Ok((all, page))
+    Ok((all, page, true))
 }
 
 /// Pull every **My Drive** change since `cursor` + the next baseline cursor (`newStartPageToken`). On
 /// an expired cursor Google returns HTTP 410 — surfaced as an error the caller detects
 /// ([`is_cursor_expired`]) to fall back to a full re-list.
-pub async fn list_changes(token_key: &str, cursor: &str) -> Result<(Vec<DriveChange>, String)> {
+pub async fn list_changes(
+    token_key: &str,
+    cursor: &str,
+) -> Result<(Vec<DriveChange>, String, bool)> {
     list_changes_for(token_key, None, cursor).await
 }
 
@@ -1311,7 +1303,7 @@ pub async fn list_shared_changes(
     token_key: &str,
     drive_id: &str,
     cursor: &str,
-) -> Result<(Vec<DriveChange>, String)> {
+) -> Result<(Vec<DriveChange>, String, bool)> {
     list_changes_for(token_key, Some(drive_id), cursor).await
 }
 

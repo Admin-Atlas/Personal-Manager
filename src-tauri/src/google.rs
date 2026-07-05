@@ -213,14 +213,20 @@ async fn run_consent_inner(
 /// access token first if it's near expiry, and retries once after a refresh on 401. Never
 /// touches the DB, so callers hold no lock across it (rule #4).
 pub async fn authorized_get(token_key: &str, url: &str) -> Result<serde_json::Value> {
-    let resp = authorized_send(token_key, url).await?;
+    let resp = authorized_send(&http()?, token_key, |c, bearer| {
+        c.get(url).bearer_auth(bearer)
+    })
+    .await?;
     json_or_err(resp).await
 }
 
 /// As [`authorized_get`], but returns the raw response BYTES — for Drive file downloads/exports,
 /// whose bodies are not JSON. Caps the body at `max_bytes` so a huge file can't balloon memory.
 pub async fn authorized_get_bytes(token_key: &str, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
-    let resp = authorized_send(token_key, url).await?;
+    let resp = authorized_send(&http()?, token_key, |c, bearer| {
+        c.get(url).bearer_auth(bearer)
+    })
+    .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let detail = crate::error::truncate_detail(&resp.text().await.unwrap_or_default());
@@ -243,29 +249,27 @@ pub async fn get_json_with_token(token: &Token, url: &str) -> Result<serde_json:
     json_or_err(resp).await
 }
 
-/// Shared authorised GET: proactive refresh a minute before expiry, plus a single
-/// 401-retry-after-refresh (the backstop for a token revoked or expired early). Returns the raw
-/// response so the caller can decode it as JSON or bytes.
-async fn authorized_send(token_key: &str, url: &str) -> Result<reqwest::Response> {
-    let (client_id, client_secret) = client_creds_for_key(token_key)?;
-    let mut token = load_token(token_key)?;
-
-    if token.expiry <= now_unix() + 60 {
-        token = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
-    }
-
-    let resp = http()?
-        .get(url)
-        .bearer_auth(token.access_token.expose())
-        .send()
-        .await?;
+/// Send an authorised Google request built by `build`: proactive refresh a minute before expiry,
+/// plus a single 401-retry-after-refresh (the backstop for a token revoked or expired early). `build`
+/// is re-invoked to construct a fresh request on retry, so it must be cheap/idempotent — only small
+/// metadata calls take the retry path (the backup uploader streams its big body once, with a
+/// pre-refreshed token). The `client` is caller-supplied so each caller keeps its own timeout policy:
+/// the default 30s for GETs, the long-transfer client for backup metadata. This is the single home of
+/// Google's authorised-send-with-refresh (promoted from the backup layer's private copy so Drive's
+/// REST plumbing lives once). Never touches the DB, so callers hold no lock across it (rule #4).
+pub async fn authorized_send<F>(
+    client: &reqwest::Client,
+    token_key: &str,
+    build: F,
+) -> Result<reqwest::Response>
+where
+    F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+{
+    let bearer = valid_access_token(token_key).await?;
+    let resp = build(client, bearer.expose()).send().await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let token = do_refresh(&client_id, client_secret.expose(), &token, token_key).await?;
-        let retried = http()?
-            .get(url)
-            .bearer_auth(token.access_token.expose())
-            .send()
-            .await?;
+        let bearer = refresh_now(token_key).await?;
+        let retried = build(client, bearer.expose()).send().await?;
         // A refresh that succeeds but whose new access token is still rejected (revoked grant /
         // scope downgrade) would otherwise surface a raw provider 401 body. Map it to a clear
         // "reconnect" message instead.
@@ -400,9 +404,10 @@ pub fn save_token(token_key: &str, token: &Token) -> Result<()> {
 }
 
 /// A currently-valid bearer access token for `token_key`, refreshing proactively if it's within
-/// 60s of expiry (and re-persisting the refreshed blob). Public so callers that build their OWN
-/// requests — the backup uploader's Drive POST/PUT/PATCH — can authorize them; the private
-/// [`authorized_send`] is GET-only. Callers should still handle a reactive 401 via [`refresh_now`].
+/// 60s of expiry (and re-persisting the refreshed blob). The shared [`authorized_send`] uses this for
+/// its proactive refresh; it's also public so callers that stream their OWN request — the backup
+/// uploader's chunked Drive PUT, sent once outside the retry helper — can authorize it and handle a
+/// reactive 401 via [`refresh_now`].
 pub async fn valid_access_token(token_key: &str) -> Result<Secret> {
     let (client_id, client_secret) = client_creds_for_key(token_key)?;
     let mut token = load_token(token_key)?;
