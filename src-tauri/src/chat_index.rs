@@ -486,6 +486,14 @@ pub(crate) fn reconcile_chat_index(state: &AppState) -> Result<Summary> {
             }
         }
     }
+    // F-04: birthing a chat document resolves its scope project with `create_if_new`, which can mint
+    // a mirror entity. This sweep runs OUTSIDE `ingest::rebuild` (which syncs at its own end), so push
+    // any such mint out to the portable rules file here — otherwise the next session's mirror rebuild
+    // (the file is truth) would roll the new entity back. Once per sweep, only when something indexed;
+    // best-effort + a byte-identical no-op when nothing was minted.
+    if summary.sessions > 0 {
+        state.sync_entity_rules();
+    }
     Ok(summary)
 }
 

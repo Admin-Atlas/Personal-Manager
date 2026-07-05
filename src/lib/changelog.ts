@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.91.4-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Reliability fix: the preferences you teach PM for a specific project are now always kept when PM refreshes its internal project index. Previously a rare internal rebuild could clear them. Nothing changes in how you use PM — your taught preferences just stay put.",
+    ],
+  },
+  {
     version: "2.91.3-alpha",
     date: "2026-07-05",
     highlights: [

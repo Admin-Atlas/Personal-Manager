@@ -485,14 +485,34 @@ fn mirror_matches(conn: &Connection, rules: &Rules) -> Result<bool> {
 }
 
 /// Rebuild the mirror (entities + entity_aliases) from the rules file, then re-point
-/// `documents.entity_id` + `projects.entity_id` by resolving their canonical-name caches through
-/// the rebuilt aliases. Ids are reassigned (an index detail), which is exactly why the document
-/// pointers are re-resolved here rather than carried (invariant: entity_id is reassigned on
-/// rebuild by resolving the frontmatter/cache name through the rules). Idempotent.
+/// `documents.entity_id`, `projects.entity_id` + `preferences.entity_id` by resolving their
+/// canonical-name caches through the rebuilt aliases. Ids are reassigned (an index detail), which
+/// is exactly why the pointers are re-resolved here rather than carried (invariant: entity_id is
+/// reassigned on rebuild by resolving the frontmatter/cache name through the rules). Idempotent.
 pub fn rebuild_mirror_from_rules(conn: &Connection, rules: &Rules) -> Result<()> {
-    // Drop the pointers first so deleting the entities they reference doesn't trip the FK.
+    // Project-scoped preferences FK `entities(id)` ON DELETE CASCADE, so the wholesale entity
+    // delete below would cascade-DELETE every project preference — and unlike documents/projects,
+    // preferences carry no re-derivable name cache and live ONLY in the DB (not the vault, not the
+    // rules file), so that loss is permanent and silent. Snapshot each preference's project name
+    // BEFORE nulling its pointer (the null is what stops the cascade, exactly as the two below do
+    // for their tables and as `merge_entities` does before its own delete), then re-resolve the
+    // name through the rebuilt aliases after reinsert.
+    let pref_snapshot: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT p.id, e.canonical_name FROM preferences p \
+             JOIN entities e ON e.id = p.entity_id WHERE p.entity_id IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    // Drop the pointers first so deleting the entities they reference doesn't trip the FK (and, for
+    // preferences, so the ON DELETE CASCADE never fires — the snapshot above re-points them below).
     conn.execute("UPDATE documents SET entity_id = NULL", [])?;
     conn.execute("UPDATE projects SET entity_id = NULL", [])?;
+    conn.execute("UPDATE preferences SET entity_id = NULL", [])?;
     conn.execute("DELETE FROM entity_aliases", [])?;
     conn.execute("DELETE FROM entities", [])?;
 
@@ -523,6 +543,35 @@ pub fn rebuild_mirror_from_rules(conn: &Connection, rules: &Rules) -> Result<()>
          WHERE e.type = 'project' AND ea.alias = projects.name)",
         [],
     )?;
+
+    // Re-point the snapshotted project preferences through the rebuilt aliases. Resolving the OLD
+    // canonical name still finds the entity across a rename (the old name survives as an alias, so
+    // the preference follows the rename, mirroring the documents/projects repoints above). A name
+    // that no longer resolves at all — its project was genuinely merged/deleted in the rules file —
+    // leaves the preference with entity_id = NULL: dormant (skipped by `relevant_preferences`) but
+    // PRESERVED and still listed in the Teach tab, never silently deleted.
+    let repoints: Vec<(i64, i64)> = {
+        let mut resolve = conn.prepare(
+            "SELECT ea.entity_id FROM entity_aliases ea JOIN entities e ON e.id = ea.entity_id \
+             WHERE e.type = 'project' AND ea.alias = ?1",
+        )?;
+        let mut out = Vec::new();
+        for (pref_id, name) in &pref_snapshot {
+            if let Some(new_id) = resolve
+                .query_row(params![name], |r| r.get::<_, i64>(0))
+                .optional()?
+            {
+                out.push((*pref_id, new_id));
+            }
+        }
+        out
+    };
+    for (pref_id, new_id) in repoints {
+        conn.execute(
+            "UPDATE preferences SET entity_id = ?1 WHERE id = ?2",
+            params![new_id, pref_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -829,6 +878,125 @@ mod tests {
         // The unconfirmed 'Unsorted' fallback stays unconfirmed across the round-trip.
         let unsorted = resolve_project(&conn, "Unsorted", false).unwrap().unwrap();
         assert!(!confirmed(&conn, unsorted));
+    }
+
+    #[test]
+    fn rebuild_repoints_project_preferences_instead_of_deleting_them() {
+        // F-01 regression: `preferences.entity_id` is `ON DELETE CASCADE`, so a naive mirror rebuild
+        // (`DELETE FROM entities`) used to cascade-DELETE every project-scoped preference — a
+        // permanent, silent loss, since preferences live only in the DB (never the vault or the rules
+        // file). The rebuild must snapshot + re-point them through the reassigned ids instead.
+        let (_d, conn) = store_with_doc("PM");
+        let pm = resolve_project(&conn, "PM", false).unwrap().unwrap();
+        let pref_id = crate::preferences::add_preference(
+            &conn,
+            "project",
+            Some(pm),
+            None,
+            "reply in British English",
+            "user",
+            1.0,
+            true,
+        )
+        .unwrap();
+
+        // Rebuild from a file that still contains PM (its id is reassigned in the process).
+        let rules = rules_from_mirror(&conn).unwrap();
+        rebuild_mirror_from_rules(&conn, &rules).unwrap();
+
+        // The preference row survived and now points at PM's NEW id.
+        let pm2 = resolve_project(&conn, "PM", false).unwrap().unwrap();
+        let (value, entity): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT value, entity_id FROM preferences WHERE id = ?1",
+                params![pref_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(value, "reply in British English");
+        assert_eq!(
+            entity,
+            Some(pm2),
+            "the project preference re-points to PM's reassigned id, not lost to the cascade"
+        );
+    }
+
+    #[test]
+    fn rebuild_keeps_a_preference_whose_project_left_the_rules_file_as_dormant() {
+        // F-01 edge: when the rules file the mirror rebuilds from no longer contains a preference's
+        // project (a genuine merge/delete in the file, or an older/restored file), the preference is
+        // still not deleted — it is preserved as a DORMANT row (`entity_id = NULL`): skipped by
+        // `relevant_preferences`, still listed in the Teach tab.
+        let (_d, conn) = store_with_doc("PM");
+        let pm = resolve_project(&conn, "PM", false).unwrap().unwrap();
+        let pref_id = crate::preferences::add_preference(
+            &conn,
+            "project",
+            Some(pm),
+            None,
+            "prefers bullet summaries",
+            "user",
+            1.0,
+            true,
+        )
+        .unwrap();
+
+        // Rebuild from rules that dropped PM entirely.
+        let mut rules = rules_from_mirror(&conn).unwrap();
+        rules.entities.retain(|e| e.canonical_name != "PM");
+        rebuild_mirror_from_rules(&conn, &rules).unwrap();
+
+        assert_eq!(resolve_project(&conn, "PM", false).unwrap(), None);
+        let (value, entity): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT value, entity_id FROM preferences WHERE id = ?1",
+                params![pref_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(value, "prefers bullet summaries");
+        assert_eq!(
+            entity, None,
+            "an unresolved project preference is kept dormant, never silently deleted"
+        );
+    }
+
+    #[test]
+    fn syncing_a_minted_entity_to_the_rules_file_survives_the_next_reconcile() {
+        // F-04 regression: entities minted on ingest paths must be pushed to the portable rules file
+        // (the sync-on-mint added to `register_pointer` and the chat sweep). Without that sync the
+        // file lags, and the next `reconcile_on_open` — which treats the file as truth — rebuilds the
+        // mirror and rolls the new entity back (pre-F-01 also cascade-wiping its preferences). With
+        // the sync, the file matches the mirror and the reconcile is a no-op that keeps the entity.
+        let (dir, conn) = store_with_doc("PM");
+        let cipher = RulesCipher::from_master("vault-xyz", &[7u8; 32]);
+        // Establish the file from the initial mirror, as the first session open would.
+        reconcile_on_open(&conn, dir.path(), &cipher).unwrap();
+
+        // A later ingest mints a brand-new project entity in the mirror, then syncs it out (the fix).
+        let field_notes = resolve_project(&conn, "Field Notes", true)
+            .unwrap()
+            .unwrap();
+        write_rules_file(dir.path(), &cipher, &rules_from_mirror(&conn).unwrap()).unwrap();
+
+        // The next open reconciles: the file already carries the entity, so nothing is rebuilt.
+        reconcile_on_open(&conn, dir.path(), &cipher).unwrap();
+        assert_eq!(
+            resolve_project(&conn, "Field Notes", false).unwrap(),
+            Some(field_notes),
+            "a synced mint is preserved across the file-is-truth reconcile"
+        );
+
+        // Contrast (guards the reconcile semantics the fix relies on): an UNsynced mint still lags the
+        // file, so the reconcile rolls it back — which is exactly the drift the sync-on-mint prevents,
+        // and confirms the fix is the sync, not an unsafe additive-reconcile change.
+        resolve_project(&conn, "Ephemeral", true).unwrap();
+        reconcile_on_open(&conn, dir.path(), &cipher).unwrap();
+        assert_eq!(
+            resolve_project(&conn, "Ephemeral", false).unwrap(),
+            None,
+            "an unsynced mint is rolled back by the file-is-truth reconcile"
+        );
     }
 
     #[test]
