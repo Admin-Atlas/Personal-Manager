@@ -59,7 +59,7 @@ impl<'a> ModelGateway<'a> {
     /// the gentle batch cap never applies here — always the embedder default.
     pub fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let prefixed = registry::apply_prefix(&self.embedder, EmbedRole::Query, texts);
-        self.sidecar.embed(&prefixed, &self.embedder, None)
+        self.embed_within_line_budget(&prefixed, None)
     }
 
     /// Embed documents/passages with the active embedder, applying its passage-side prefix (e5's
@@ -67,14 +67,72 @@ impl<'a> ModelGateway<'a> {
     /// batch cap (bounded peak memory) when one is set.
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let prefixed = registry::apply_prefix(&self.embedder, EmbedRole::Passage, texts);
-        self.sidecar
-            .embed(&prefixed, &self.embedder, self.embed_batch)
+        self.embed_within_line_budget(&prefixed, self.embed_batch)
+    }
+
+    /// Embed `texts` in sub-batches each kept under a request-line byte budget, concatenating the
+    /// vectors in input order. One sidecar request serializing all of a large document's chunks at
+    /// once could exceed the line size the child *silently drops*, wedging the sidecar
+    /// (F-06 / B3-1); batching keeps every request well under it while preserving the 1:1
+    /// input→vector mapping. `batch` is the separate per-forward-pass memory cap, passed straight
+    /// through. Empty input makes no sidecar call at all.
+    fn embed_within_line_budget(
+        &self,
+        texts: &[String],
+        batch: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let mut vectors = Vec::with_capacity(texts.len());
+        for group in split_by_byte_budget(texts, REQUEST_TEXT_BUDGET) {
+            vectors.extend(self.sidecar.embed(group, &self.embedder, batch)?);
+        }
+        Ok(vectors)
     }
 
     /// Token counts under the active embedder's tokenizer — the splitter sizes chunks by this.
+    /// Batched under the same request-line byte budget as embedding, for the same reason (a large
+    /// document's texts would otherwise serialize into one over-cap request line), preserving the
+    /// 1:1 input→count order.
     pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
-        self.sidecar.count_tokens(texts, &self.embedder)
+        let mut counts = Vec::with_capacity(texts.len());
+        for group in split_by_byte_budget(texts, REQUEST_TEXT_BUDGET) {
+            counts.extend(self.sidecar.count_tokens(group, &self.embedder)?);
+        }
+        Ok(counts)
     }
+}
+
+/// Per-request text-byte budget for embed / count-token batching. Kept well under the sidecar's
+/// `MAX_SIDECAR_REQUEST_LINE` (48 MiB) so that even after JSON wrapping + the retrieval prefix a
+/// batch's request line stays comfortably below the size the child would silently drop
+/// (F-06 / B3-1). 16 MiB of text is only a handful of requests even for a very large document,
+/// and the per-request overhead is dwarfed by the embedding forward pass itself.
+const REQUEST_TEXT_BUDGET: usize = 16 * 1024 * 1024;
+
+/// Group `texts` into consecutive runs whose combined byte length stays within `budget`, so no
+/// single sidecar request line approaches the size the child silently drops. Order is preserved
+/// and every text lands in exactly one group, so concatenating per-group results reproduces a
+/// 1:1 mapping back to the input. A lone text larger than `budget` becomes its own group — it
+/// can't be split without changing what gets embedded, and the request-line guard in
+/// `sidecar::request` is the backstop there, but the splitter keeps individual chunks far below
+/// the budget so it doesn't arise in normal ingestion. Returns no groups for empty input.
+fn split_by_byte_budget(texts: &[String], budget: usize) -> Vec<&[String]> {
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    let mut running = 0usize;
+    for (i, t) in texts.iter().enumerate() {
+        // Close the open group before a text that would push it over budget — unless the group is
+        // empty, in which case a single oversized text has to go on its own.
+        if running > 0 && running + t.len() > budget {
+            groups.push(&texts[start..i]);
+            start = i;
+            running = 0;
+        }
+        running += t.len();
+    }
+    if start < texts.len() {
+        groups.push(&texts[start..]);
+    }
+    groups
 }
 
 /// The splitter sizes chunks by tokens through this adapter, so its core stays Python-free and
@@ -97,5 +155,74 @@ impl Reranker for ModelGateway<'_> {
             Ok(scores) => Ok(Some(scores)),
             Err(_) => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(specs: &[usize]) -> Vec<String> {
+        specs.iter().map(|&n| "x".repeat(n)).collect()
+    }
+
+    /// Concatenating the groups reproduces the input, in order, for every case.
+    fn assert_reproduces(texts: &[String], budget: usize) -> Vec<&[String]> {
+        let groups = split_by_byte_budget(texts, budget);
+        let flat: Vec<&String> = groups.iter().flat_map(|g| g.iter()).collect();
+        let want: Vec<&String> = texts.iter().collect();
+        assert_eq!(
+            flat, want,
+            "groups must concatenate back to the input in order"
+        );
+        groups
+    }
+
+    #[test]
+    fn empty_input_yields_no_groups() {
+        // No groups → the gateway makes no sidecar call at all.
+        assert!(split_by_byte_budget(&[], REQUEST_TEXT_BUDGET).is_empty());
+    }
+
+    #[test]
+    fn everything_under_budget_is_one_group() {
+        let texts = strings(&[10, 20, 30]);
+        let groups = assert_reproduces(&texts, 1000);
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn oversized_batch_splits_into_budget_bounded_groups() {
+        // 5 texts of 30 bytes, budget 100 → groups of at most 3 (90 ≤ 100, a 4th would be 120).
+        let texts = strings(&[30, 30, 30, 30, 30]);
+        let groups = assert_reproduces(&texts, 100);
+        assert!(groups.len() > 1, "must split");
+        for g in &groups {
+            let total: usize = g.iter().map(|s| s.len()).sum();
+            assert!(total <= 100, "each group stays within budget, got {total}");
+        }
+    }
+
+    #[test]
+    fn a_group_may_exactly_equal_the_budget() {
+        // Two 50-byte texts fit exactly in a 100-byte budget; the third opens a new group.
+        let texts = strings(&[50, 50, 50]);
+        let groups = assert_reproduces(&texts, 100);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 1);
+    }
+
+    #[test]
+    fn a_single_oversized_text_stands_alone() {
+        // A lone text over budget can't be split; it becomes its own group rather than being
+        // dropped or wedging — the request-line guard is the hard backstop beyond this.
+        let texts = strings(&[10, 500, 10]);
+        let groups = assert_reproduces(&texts, 100);
+        // The 500-byte text is isolated in a group of exactly one.
+        assert!(
+            groups.iter().any(|g| g.len() == 1 && g[0].len() == 500),
+            "the oversized text must be alone in its own group"
+        );
     }
 }

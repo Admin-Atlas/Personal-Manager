@@ -71,6 +71,18 @@ const MAX_SIDECAR_LINE: usize = 64 * 1024 * 1024;
 /// to a failed call instead of an infinite loop.
 const MAX_SKIP_LINES: usize = 1024;
 
+/// Hard cap on a single *request* line we will send to the child, kept below the child's own
+/// `MAX_LINE_CHARS` (64 MiB, mirrored in `pm_sidecar.py`). The child *silently drops* a line
+/// over that cap — no reply — which would leave [`SidecarManager::request`] blocked forever on
+/// a reply that never comes, wedging the whole (serialized) sidecar: ingest, chat retrieval,
+/// rerank, transcribe and the map all queue behind the dead call until restart (F-06 / B3-1).
+/// Refusing to *send* an oversized line turns that permanent wedge into a clean per-call error.
+/// Byte length here is conservative against the child's *character* cap (UTF-8 bytes ≥ chars),
+/// and the 16 MiB headroom to 64 MiB absorbs JSON quoting/escaping of the payload. The gateway
+/// keeps embed / count-token requests well under this by batching (see `model_gateway`); this
+/// guard is the backstop for any caller that doesn't.
+const MAX_SIDECAR_REQUEST_LINE: usize = 48 * 1024 * 1024;
+
 /// The OPTIONAL t-SNE reducer for the semantic memory map, pinned. **Not** in `requirements.txt` —
 /// the base venv stays lean; the user installs it on demand from Settings (see
 /// [`SidecarManager::install_optional_tsne`]). openTSNE pulls scikit-learn + scipy (numpy is already
@@ -1007,40 +1019,27 @@ impl SidecarManager {
         }))
         .map_err(|e| Error::Other(format!("encode sidecar request: {e}")))?;
 
-        // On any IO failure, drop the (possibly dead) child so the next call
-        // respawns it.
+        // Refuse to send a line the child would silently drop (see MAX_SIDECAR_REQUEST_LINE):
+        // that drop yields no reply and would wedge this call — and every queued call behind
+        // the process mutex — forever. Nothing has been written yet, so the child stays healthy
+        // and only this one call fails. (Normal callers stay far under this; the gateway
+        // batches embed/count-token requests so a large document never reaches it.)
+        if line.len() > MAX_SIDECAR_REQUEST_LINE {
+            return Err(Error::Other(format!(
+                "sidecar {method} request line is {} bytes, over the {MAX_SIDECAR_REQUEST_LINE}-byte \
+                 cap — refusing to send it (the child would drop it silently and wedge)",
+                line.len()
+            )));
+        }
+
+        // On any IO failure — or a deadline with no reply — drop the (possibly dead) child so
+        // the next call respawns it.
+        let timeout = request_timeout(method);
         let send = (|| -> std::io::Result<Value> {
             proc.stdin.write_all(line.as_bytes())?;
             proc.stdin.write_all(b"\n")?;
             proc.stdin.flush()?;
-
-            let mut skipped = 0usize;
-            loop {
-                // Bounded read: a runaway/oversized reply fails the call (and
-                // respawns the child) instead of buffering unbounded into memory.
-                let Some(bytes) = read_line_capped(&mut proc.stdout, MAX_SIDECAR_LINE)? else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "sidecar closed its output",
-                    ));
-                };
-                let trimmed = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
-                if !trimmed.is_empty() {
-                    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-                        if value["id"].as_u64() == Some(id) {
-                            return Ok(value);
-                        }
-                    }
-                }
-                // Empty or non-matching line — bound how many we'll wade through.
-                skipped += 1;
-                if skipped > MAX_SKIP_LINES {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "sidecar produced too many unmatched lines",
-                    ));
-                }
-            }
+            read_reply_with_timeout(proc, id, timeout)
         })();
 
         match send {
@@ -1124,6 +1123,104 @@ fn read_line_capped<R: BufRead>(r: &mut R, max: usize) -> std::io::Result<Option
                 "sidecar reply exceeded the size cap",
             ));
         }
+    }
+}
+
+/// Read newline-JSON replies from the child until one carries our request `id`, bounding how
+/// many blank/non-matching lines we wade through first. With the monotonic request id a stale
+/// line can never match, so anything skipped is noise. Returns the matched reply, an
+/// `UnexpectedEof` if the child closed its output, or `InvalidData` if it is too chatty or a
+/// single line overflows the size cap. Generic over the reader so it unit-tests against a
+/// `Cursor` without a live child.
+fn read_reply<R: BufRead>(stdout: &mut R, id: u64) -> std::io::Result<Value> {
+    let mut skipped = 0usize;
+    loop {
+        // Bounded read: a runaway/oversized reply fails the call (and respawns the child)
+        // instead of buffering unbounded into memory.
+        let Some(bytes) = read_line_capped(stdout, MAX_SIDECAR_LINE)? else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sidecar closed its output",
+            ));
+        };
+        let trimmed = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
+        if !trimmed.is_empty() {
+            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                if value["id"].as_u64() == Some(id) {
+                    return Ok(value);
+                }
+            }
+        }
+        // Empty or non-matching line — bound how many we'll wade through.
+        skipped += 1;
+        if skipped > MAX_SKIP_LINES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sidecar produced too many unmatched lines",
+            ));
+        }
+    }
+}
+
+/// Read the reply to request `id`, but give up after `timeout` by killing the child so a
+/// wedged or silent handler (a stalled first-use model download, an ONNX hang, a pathological
+/// convert) can't block the caller — and thus the whole serialized sidecar — forever
+/// (F-06 / B3-1). The blocking read runs on a scoped thread so this thread can, on the
+/// deadline, kill the child; killing closes the child's stdout, which unblocks the reader at
+/// EOF so the scope's implicit join always completes. This needs no shared kill handle and no
+/// platform-specific process API — `std::thread::scope` + `child.kill()` is portable. On
+/// timeout the child is killed and reaped, and `request` respawns it next call (the same
+/// recovery as an IO error). A reply that arrives in time — success *or* a protocol error — is
+/// returned unchanged, so nothing about the fast path changes.
+fn read_reply_with_timeout(
+    proc: &mut Process,
+    id: u64,
+    timeout: std::time::Duration,
+) -> std::io::Result<Value> {
+    // Disjoint borrows: the reader thread owns `stdout`, the watchdog owns `child`.
+    let Process { child, stdout, .. } = &mut *proc;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            // If the watchdog already timed out and dropped `rx`, the send fails — harmless.
+            let _ = tx.send(read_reply(stdout, id));
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(reply) => reply,
+            Err(_) => {
+                // Deadline hit (or the reader panicked and dropped its sender): kill the child
+                // so its stdout closes and the scoped reader unblocks at EOF, then reap it. The
+                // scope waits for that reader to finish before returning.
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "sidecar did not reply within its deadline",
+                ))
+            }
+        }
+    })
+}
+
+/// A per-method deadline for a sidecar request. These are **backstops against a permanently
+/// wedged child**, not tight SLAs, so they are deliberately generous: the reachable, guaranteed
+/// trigger (an oversized request line) is already closed by [`MAX_SIDECAR_REQUEST_LINE`] + the
+/// gateway's batching, leaving only rare true stalls for the timeout to catch. Download-bearing
+/// methods get the longest grace because a first-use model download (hundreds of MB up to
+/// ~1 GB) runs *inside* the request with no stdout output, and killing a slow-but-real download
+/// would break local ML — far worse than waiting. Values are intentionally round; tune on the
+/// live rig if a legitimate operation is ever cut short.
+fn request_timeout(method: &str) -> std::time::Duration {
+    use std::time::Duration;
+    match method {
+        // First use of any of these can download a model; keep the grace long.
+        "embed" | "rerank" | "transcribe" | "analyze_image" => Duration::from_secs(30 * 60),
+        // CPU-bound conversion / parse / projection of a possibly-large or pathological input.
+        "convert" | "analyze_spreadsheet" | "reduce" => Duration::from_secs(10 * 60),
+        // Pure tokeniser pass — fast once the tokeniser is loaded.
+        "count_tokens" => Duration::from_secs(5 * 60),
+        // Any other (or future) method: a safe, generous default.
+        _ => Duration::from_secs(10 * 60),
     }
 }
 
@@ -1566,6 +1663,56 @@ mod tests {
         let mut r = Cursor::new(vec![b'x'; 5000]);
         let err = read_line_capped(&mut r, 1024).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_reply_returns_the_line_matching_the_request_id() {
+        // The reply is preceded by a blank line and a stale reply for a different id (both noise
+        // the monotonic id can never match); read_reply skips them and returns our reply.
+        let mut r = Cursor::new(
+            b"\n{\"id\":1,\"ok\":true,\"result\":{}}\n{\"id\":7,\"ok\":true,\"result\":{\"v\":42}}\n"
+                .to_vec(),
+        );
+        let reply = read_reply(&mut r, 7).unwrap();
+        assert_eq!(reply["id"].as_u64(), Some(7));
+        assert_eq!(reply["result"]["v"].as_u64(), Some(42));
+    }
+
+    #[test]
+    fn read_reply_reports_eof_when_the_child_closes_without_replying() {
+        // The oversized-line drop on the Python side (and any dead child) shows up here as a
+        // closed stdout — read_reply surfaces it as UnexpectedEof so request() respawns.
+        let mut r = Cursor::new(b"{\"id\":3,\"ok\":true,\"result\":{}}\n".to_vec());
+        let err = read_reply(&mut r, 9).unwrap_err(); // id 9 never appears → read to EOF
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn read_reply_gives_up_after_too_many_unmatched_lines() {
+        // A chatty child that never sends our id must fail the call, not loop forever.
+        let mut buf = Vec::new();
+        for _ in 0..(MAX_SKIP_LINES + 5) {
+            buf.extend_from_slice(b"{\"id\":1,\"ok\":true,\"result\":{}}\n");
+        }
+        let mut r = Cursor::new(buf);
+        let err = read_reply(&mut r, 999).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn request_timeouts_are_generous_for_download_bearing_methods() {
+        // Methods that can trigger a first-use model download get the longest grace so a slow
+        // but real download is never mistaken for a hang; a plain tokeniser pass gets less; an
+        // unknown method still gets a safe non-zero default.
+        let secs = |m| request_timeout(m).as_secs();
+        assert_eq!(secs("embed"), 30 * 60);
+        assert_eq!(secs("transcribe"), 30 * 60);
+        assert!(secs("count_tokens") < secs("embed"));
+        assert!(secs("count_tokens") > 0);
+        assert!(
+            secs("something_new") > 0,
+            "unknown methods get a safe default"
+        );
     }
 
     fn paths_with_source(source_dir: PathBuf) -> SidecarPaths {

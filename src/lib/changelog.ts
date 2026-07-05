@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.91.7-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Reliability fix for the document engine: a very large file — a big log or text dump — no longer jams PM's search, indexing, transcription and map. Previously one oversized file could quietly freeze all of them until you restarted; now the big file is handled in pieces and everything keeps working.",
+      "If the document engine ever does get stuck — a first-time model download that stalls, an operation that hangs — PM now notices and recovers on its own instead of staying frozen until the next restart.",
+    ],
+  },
+  {
     version: "2.91.6-alpha",
     date: "2026-07-05",
     highlights: [
