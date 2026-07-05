@@ -24,6 +24,7 @@ mod error;
 // populates first-class flag records, the briefing renders the active set, and a backstop
 // scheduler keeps them current. Assertion/resolution and chat grounding arrive in the following PRs.
 mod flags;
+mod fts_segment;
 mod google;
 mod ics;
 mod index_only;

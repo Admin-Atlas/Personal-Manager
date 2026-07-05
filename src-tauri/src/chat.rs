@@ -525,14 +525,17 @@ pub(crate) fn triviality(pair: &TurnPair) -> Triviality {
     }
 }
 
-/// Reduce a message to its bare alphanumerics, lowercased (punctuation, emoji, and whitespace dropped),
-/// then test it against a tight allow-list of acknowledgements/greetings. Kept deliberately small: a
-/// false *Substantive* only means a trivial pair is indexed (mild), while a false *Trivial* would drop
-/// real content (bad) — so when in doubt this returns false.
+/// Reduce a message to its bare alphanumerics of **any** script, lowercased (punctuation, emoji, and
+/// whitespace dropped), then test it against a tight allow-list of acknowledgements/greetings. Kept
+/// deliberately small: a false *Substantive* only means a trivial pair is indexed (mild), while a false
+/// *Trivial* would drop real content (bad) — so when in doubt this returns false. Using `is_alphanumeric`
+/// (not `is_ascii_alphanumeric`) is what keeps a short non-Latin message — a CJK request, a Cyrillic note
+/// — from normalising to empty and being misread as chatter, then skipped by both the chat index and the
+/// preference extractor with the cursor advanced past it forever (audit F-31).
 fn is_pure_chatter(text: &str) -> bool {
     let normalized: String = text
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect();
     // A message that was punctuation/emoji only (e.g. "👍") normalises to empty — also chatter.
@@ -973,6 +976,15 @@ mod tests {
         assert!(trivial("got it", "Great."));
         assert!(trivial("👍", "👍"));
         assert!(trivial("Hey there", "Hello!"));
+
+        // F-31: a short non-Latin exchange carrying a real fact must be KEPT. Before the any-script
+        // fix these normalised to empty and were misread as chatter — dropped from the index and the
+        // preference scan, cursor advanced past them forever. Both sides short so the length gate
+        // doesn't mask the classification (a CJK scheduling note, a Cyrillic decision).
+        assert!(!trivial("下周三下午三点开会", "好的，已记录。"));
+        assert!(!trivial("встреча в среду в три", "хорошо"));
+        // A pure-emoji exchange is still trivial — the empty-normalisation branch stays correct.
+        assert!(trivial("🎉🎉", "👍"));
 
         // Anything stating a decision/fact/preference, or a real Q&A, is kept — even when terse.
         assert!(!trivial(

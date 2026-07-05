@@ -1522,6 +1522,9 @@ async fn retrieve_grounding(
                 ..Default::default()
             },
             strategy: retrieval::Strategy::HybridRrf,
+            // The keyword branch mirrors the vault's index tokenisation (F-33); the flag rides the
+            // already-resolved gateway, so no extra DB read and no model id crosses the boundary.
+            multilingual: gateway.embedder().multilingual,
         };
         // Fuse under the lock, then drop it before reranking — the cross-encoder is a sidecar
         // call that can block on a model download. Reranking off (toggle) skips it entirely.
@@ -1914,6 +1917,7 @@ pub async fn search_documents(
             k,
             filters: retrieval::Filters::default(),
             strategy: retrieval::Strategy::HybridRrf,
+            multilingual: gateway.embedder().multilingual,
         };
         // Fuse under the lock, then rerank off it (the cross-encoder is a sidecar call).
         let fused = {

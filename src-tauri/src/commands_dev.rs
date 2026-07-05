@@ -651,10 +651,12 @@ pub(crate) fn run_retrieval_explain(
         return Err(Error::Other("failed to embed the query".into()));
     };
 
-    // Fused + recency-decayed candidates with per-stage scores, under one short lock.
+    // Fused + recency-decayed candidates with per-stage scores, under one short lock. Pass the
+    // vault's multilingual flag so the panel's keyword branch segments CJK exactly as production
+    // does (F-33) — otherwise the diagnostic would show hits the real chat path wouldn't.
     let candidates = {
         let conn = state.conn()?;
-        retrieval::explain(&conn, query, &query_vec, k, project)?
+        retrieval::explain(&conn, query, &query_vec, k, project, embedder.multilingual)?
     };
 
     // Off-lock reranking: capture each candidate's score and reorder, mirroring production but

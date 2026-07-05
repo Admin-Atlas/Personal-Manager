@@ -135,6 +135,12 @@ pub struct RetrieveQuery<'a> {
     pub k: usize,
     pub filters: Filters,
     pub strategy: Strategy,
+    /// Whether the vault's embedder is multilingual (carried from `ModelEntry.multilingual`, never a
+    /// model id — model-agnostic). When set, the keyword branch segments CJK/kana/Hangul into the
+    /// same bigrams the index stored, so hybrid search doesn't collapse to vector-only for
+    /// non-space-delimited scripts (F-33). English/default vaults leave this `false` and the keyword
+    /// branch is byte-for-byte unchanged.
+    pub multilingual: bool,
 }
 
 /// The fused (pre-rerank) half of retrieval: run the requested strategy's hybrid core and return
@@ -150,6 +156,7 @@ pub fn retrieve_fused(conn: &Connection, q: &RetrieveQuery) -> Result<Vec<Retrie
             q.k,
             q.filters.project.as_deref(),
             q.filters.exclude_chat,
+            q.multilingual,
         ),
     }
 }
@@ -216,6 +223,7 @@ fn hybrid_core(
     k: usize,
     project: Option<&str>,
     exclude_chat: Option<(i64, i64)>,
+    multilingual: bool,
 ) -> Result<Vec<RetrievedChunk>> {
     let branch_limit = BRANCH_LIMIT.max(k);
     let allowed = match project {
@@ -235,7 +243,7 @@ fn hybrid_core(
         branch_limit
     };
     let mut vec_hits = vector_search(conn, query_embedding, fetch)?;
-    let mut fts_hits = keyword_search(conn, query_text, fetch)?;
+    let mut fts_hits = keyword_search(conn, query_text, fetch, multilingual)?;
     if let Some(allowed) = &allowed {
         vec_hits.retain(|id| allowed.contains(id));
         fts_hits.retain(|id| allowed.contains(id));
@@ -327,9 +335,15 @@ fn vector_search_scored(
     Ok(rows)
 }
 
-/// BM25-ranked keyword search over `chunks_fts`. Returns chunk ids best-first.
-fn keyword_search(conn: &Connection, query_text: &str, limit: usize) -> Result<Vec<i64>> {
-    let Some(match_query) = fts_query(query_text) else {
+/// BM25-ranked keyword search over `chunks_fts`. Returns chunk ids best-first. `multilingual`
+/// selects the CJK-bigram query builder that mirrors the multilingual index (F-33).
+fn keyword_search(
+    conn: &Connection,
+    query_text: &str,
+    limit: usize,
+    multilingual: bool,
+) -> Result<Vec<i64>> {
+    let Some(match_query) = fts_query(query_text, multilingual) else {
         return Ok(Vec::new());
     };
     let mut stmt = conn
@@ -342,16 +356,49 @@ fn keyword_search(conn: &Connection, query_text: &str, limit: usize) -> Result<V
     Ok(rows)
 }
 
+/// The most bigram phrases a single multilingual query contributes to one MATCH expression. A long
+/// CJK paste would otherwise expand into ~one phrase per character and could blow past FTS5's
+/// expression limits; capping (after dedupe) keeps the expression bounded. This guards only the new
+/// multilingual path — the principled term cap for *all* scripts is a separate finding (F-32).
+const MULTILINGUAL_TERM_CAP: usize = 64;
+
 /// Turn arbitrary user text into a safe FTS5 MATCH expression: keep alphanumeric
 /// runs, quote each as a phrase, and OR them together. Returns `None` if nothing
 /// usable remains, so the caller skips the keyword branch rather than hitting an
 /// `fts5: syntax error` on stray punctuation.
-fn fts_query(text: &str) -> Option<String> {
-    let terms: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"", t.to_lowercase()))
-        .collect();
+///
+/// On a multilingual vault (F-33) the terms come from [`crate::fts_segment::fts_tokens`] instead —
+/// the same segmentation the index stored — so a space-less CJK run becomes OR-ed bigram phrases
+/// that actually match, while Latin words in the same query stay whole. The non-multilingual path
+/// is left byte-for-byte identical, so English/default vaults produce exactly the MATCH string they
+/// did before and never change behaviour.
+fn fts_query(text: &str, multilingual: bool) -> Option<String> {
+    if !multilingual {
+        let terms: Vec<String> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("\"{}\"", t.to_lowercase()))
+            .collect();
+        return if terms.is_empty() {
+            None
+        } else {
+            Some(terms.join(" OR "))
+        };
+    }
+    // Multilingual: dedupe (overlapping bigrams repeat) and cap so a long paste can't build a
+    // pathological expression. Each token stays a quoted phrase, preserving the injection/syntax
+    // safety the English path relies on for untrusted query text.
+    let mut seen = std::collections::HashSet::new();
+    let mut terms: Vec<String> = Vec::new();
+    for token in crate::fts_segment::fts_tokens(text) {
+        let lowered = token.to_lowercase();
+        if seen.insert(lowered.clone()) {
+            terms.push(format!("\"{lowered}\""));
+            if terms.len() >= MULTILINGUAL_TERM_CAP {
+                break;
+            }
+        }
+    }
     if terms.is_empty() {
         None
     } else {
@@ -526,6 +573,7 @@ pub fn explain(
     query_embedding: &[f32],
     k: usize,
     project: Option<&str>,
+    multilingual: bool,
 ) -> Result<Vec<ExplainCandidate>> {
     use std::collections::HashMap;
 
@@ -541,7 +589,7 @@ pub fn explain(
     };
 
     let mut vec_scored = vector_search_scored(conn, query_embedding, fetch)?;
-    let mut fts_hits = keyword_search(conn, query_text, fetch)?;
+    let mut fts_hits = keyword_search(conn, query_text, fetch, multilingual)?;
     if let Some(allowed) = &allowed {
         vec_scored.retain(|(id, _)| allowed.contains(id));
         fts_hits.retain(|id| allowed.contains(id));
@@ -687,6 +735,7 @@ mod tests {
                 ..Default::default()
             },
             strategy: Strategy::HybridRrf,
+            multilingual: false,
         };
         retrieve(conn, &q, None).unwrap()
     }
@@ -694,14 +743,36 @@ mod tests {
     #[test]
     fn fts_query_sanitizes_punctuation() {
         assert_eq!(
-            fts_query("hello, world!").as_deref(),
+            fts_query("hello, world!", false).as_deref(),
             Some("\"hello\" OR \"world\"")
         );
-        assert_eq!(fts_query("   !!! ").as_deref(), None);
+        assert_eq!(fts_query("   !!! ", false).as_deref(), None);
         assert_eq!(
-            fts_query("ID-12:34").as_deref(),
+            fts_query("ID-12:34", false).as_deref(),
             Some("\"id\" OR \"12\" OR \"34\"")
         );
+    }
+
+    #[test]
+    fn fts_query_bigrams_cjk_only_when_multilingual() {
+        // English/default path is untouched: CJK stays one phrase (the F-33 bug we DON'T fix for
+        // non-multilingual vaults, so their MATCH strings never change).
+        assert_eq!(
+            fts_query("机器学习", false).as_deref(),
+            Some("\"机器学习\"")
+        );
+        // Multilingual path: the same run becomes OR-ed bigram phrases that mirror the index, so a
+        // sub-span query can actually land; Latin words in the same query stay whole.
+        assert_eq!(
+            fts_query("机器学习", true).as_deref(),
+            Some("\"机器\" OR \"器学\" OR \"学习\"")
+        );
+        assert_eq!(
+            fts_query("GPT模型", true).as_deref(),
+            Some("\"gpt\" OR \"模型\"")
+        );
+        // Overlapping bigrams dedupe rather than repeat.
+        assert_eq!(fts_query("好好好", true).as_deref(), Some("\"好好\""));
     }
 
     #[test]
@@ -1071,6 +1142,7 @@ mod tests {
             k: 6,
             filters: Filters::default(),
             strategy: Strategy::HybridRrf,
+            multilingual: false,
         };
 
         let base = retrieve(&conn, &q, None).unwrap();
@@ -1120,6 +1192,7 @@ mod tests {
                 ..Default::default()
             },
             strategy: Strategy::HybridRrf,
+            multilingual: false,
         };
         let scoped = retrieve(&conn, &q, None).unwrap();
         assert_eq!(scoped.len(), 1);
@@ -1201,6 +1274,7 @@ mod tests {
                 ..Default::default()
             },
             strategy: Strategy::HybridRrf,
+            multilingual: false,
         };
         let got = retrieve(&conn, &with_dedup, None).unwrap();
         let contents: Vec<&str> = got.iter().map(|c| c.content.as_str()).collect();
@@ -1244,6 +1318,7 @@ mod tests {
             k: 6,
             filters: Filters::default(),
             strategy: Strategy::HybridRrf,
+            multilingual: false,
         };
         let ids = |v: &[RetrievedChunk]| v.iter().map(|c| c.chunk_id).collect::<Vec<_>>();
 
@@ -1281,7 +1356,7 @@ mod tests {
         );
 
         // A query matching the first chunk in BOTH branches (semantically + the word "purr").
-        let rows = explain(&conn, "purr", &unit_vec(0), 6, None).unwrap();
+        let rows = explain(&conn, "purr", &unit_vec(0), 6, None, false).unwrap();
         assert!(rows.len() >= 2, "both chunks should be candidates");
 
         // The best match leads and carries scores from both branches.

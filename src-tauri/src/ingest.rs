@@ -1540,6 +1540,27 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
     Ok(tx.last_insert_rowid())
 }
 
+/// Insert one leaf's keyword-search row into `chunks_fts`. On a multilingual vault the text is run
+/// through [`crate::fts_segment::fts_tokens`] and re-joined with spaces, so the default `unicode61`
+/// tokenizer sees each CJK bigram (and each Latin word) as its own token — without which a
+/// space-less CJK run collapses to one unmatchable token and keyword search silently dies (F-33).
+/// The English/default path (`multilingual == false`) inserts the text verbatim, so those vaults'
+/// FTS rows stay byte-for-byte identical. Must stay in lockstep with the query-side segmentation in
+/// `retrieval::fts_query`: both go through the one shared `fts_segment` helper so a query bigram
+/// always equals an indexed token.
+fn insert_fts_row(tx: &Connection, rowid: i64, text: &str, multilingual: bool) -> Result<()> {
+    let content: std::borrow::Cow<'_, str> = if multilingual {
+        crate::fts_segment::fts_tokens(text).join(" ").into()
+    } else {
+        text.into()
+    };
+    tx.execute(
+        "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
+        params![rowid, content.as_ref()],
+    )?;
+    Ok(())
+}
+
 /// Append one turn-pair's freshly-split chunks to an existing chat document, **continuing** its ordinal
 /// sequence rather than replacing anything — the append-only model card B requires (old chunks are never
 /// re-split or re-embedded). Mirrors [`insert_chunks`]'s rowid invariants (`chunk_vec`/`chunks_fts` keyed
@@ -1555,6 +1576,9 @@ pub(crate) fn append_chat_chunks(
     chat_turn_id: i64,
     chunk_at: &str,
 ) -> Result<i64> {
+    // CJK-segment the FTS content only on multilingual vaults (F-33); resolved once per call — a
+    // single sync settings read on this same connection, no lock held across an await.
+    let multilingual = crate::db::selected_embedder(tx)?.multilingual;
     let mut uid_to_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     let mut leaf_idx = 0usize;
     let mut ordinal = start_ordinal;
@@ -1594,10 +1618,7 @@ pub(crate) fn append_chat_chunks(
                 "INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)",
                 params![chunk_id, vector],
             )?;
-            tx.execute(
-                "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
-                params![chunk_id, chunk.embed_content],
-            )?;
+            insert_fts_row(tx, chunk_id, &chunk.embed_content, multilingual)?;
             leaf_idx += 1;
         }
     }
@@ -1619,6 +1640,8 @@ fn insert_chunks(
     index_only: bool,
     stored_summary: Option<&str>,
 ) -> Result<()> {
+    // CJK-segment the FTS content only on multilingual vaults (F-33); resolved once per document.
+    let multilingual = crate::db::selected_embedder(tx)?.multilingual;
     let mut uid_to_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     let mut leaf_idx = 0usize;
     let mut first_leaf_id: Option<i64> = None;
@@ -1664,10 +1687,7 @@ fn insert_chunks(
             // docs index nothing here — keeping the body out of the index — and become
             // keyword-findable by their summary, attached to the first leaf rowid below.
             if !index_only {
-                tx.execute(
-                    "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
-                    params![chunk_id, chunk.embed_content],
-                )?;
+                insert_fts_row(tx, chunk_id, &chunk.embed_content, multilingual)?;
             }
             first_leaf_id.get_or_insert(chunk_id);
             leaf_idx += 1;
@@ -1677,10 +1697,7 @@ fn insert_chunks(
     if index_only {
         if let (Some(rowid), Some(summary)) = (first_leaf_id, stored_summary) {
             if !summary.trim().is_empty() {
-                tx.execute(
-                    "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
-                    params![rowid, summary],
-                )?;
+                insert_fts_row(tx, rowid, summary, multilingual)?;
             }
         }
     }

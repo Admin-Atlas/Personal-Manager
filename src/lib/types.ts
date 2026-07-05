@@ -1066,6 +1066,8 @@ export interface RetrievalStamp {
   embedder_id: string;
   dimension: number;
   index_params: string;
+  /** chunks_fts tokenisation mode — cjk-bigram-v1 on a multilingual vault, or none otherwise (F-33). */
+  fts_segmentation: string;
 }
 
 /** Index-time + runtime facts for the Dev tab's System panel. */
