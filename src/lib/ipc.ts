@@ -178,6 +178,11 @@ export const unlockApp = () => invoke<boolean>("unlock_app");
 /** The vault's mode, whether it needs unlocking on this profile, encryption + location. */
 export const vaultStatus = () => invoke<VaultStatus>("vault_status");
 
+/** Retry opening the store after a transient boot-time open failure (an AV / search-indexer
+ *  file lock, disk I/O). Resolves once the store opens (or falls through to the unlock prompt);
+ *  rejects with the fresh error if it still can't open. */
+export const retryOpenVault = () => invoke<void>("retry_open_vault");
+
 /** Convert this device vault into a shareable, passphrase-protected one (re-keys the
  *  store and encrypts the Markdown via the one migration routine). */
 export const createShareableVault = (passphrase: string) =>

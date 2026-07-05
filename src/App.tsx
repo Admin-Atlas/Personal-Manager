@@ -25,6 +25,7 @@ import { Sidebar, type View } from "./components/Sidebar";
 import { SettingsView } from "./components/SettingsView";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { VaultCurtain } from "./components/VaultCurtain";
+import { VaultOpenError } from "./components/VaultOpenError";
 import { VaultUnlock } from "./components/VaultUnlock";
 import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
@@ -222,6 +223,11 @@ export default function App() {
         const writerLock = await vaultLockStatus().catch(() => null);
         setVaultLock(writerLock);
         if (writerLock && !writerLock.active) return;
+        // The store failed to open at boot (a transient file lock, disk I/O) — the open-error
+        // gate renders from `vault.open_error` and offers Retry. Checked before `needs_unlock`
+        // because a device vault has no passphrase to prompt for. The store is closed, so skip
+        // the store-backed load below.
+        if (vs?.open_error) return;
         if (vs?.needs_unlock) {
           setVaultNeedsUnlock(true);
           return;
@@ -540,6 +546,13 @@ export default function App() {
         }
       />
     );
+  }
+
+  // A transient boot-time open failure (an AV / search-indexer file lock, disk I/O) degrades
+  // to this Retry gate instead of aborting the app (B1-6). It sits before the unlock prompt:
+  // a device vault that failed to open has no passphrase to enter, just a file to retry.
+  if (vault?.open_error) {
+    return <VaultOpenError status={vault} onResolved={completeUnlock} />;
   }
 
   // The vault unlock gate comes next — it gates real decryption (the store is closed),

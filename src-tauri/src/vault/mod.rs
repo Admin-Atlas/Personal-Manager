@@ -604,7 +604,31 @@ pub fn open_at_boot(
         Some(key) => key,
         None => return Ok(None),
     };
-    let conn = db::open(&resolved.db_path, key.expose())?;
+    let conn = match db::open(&resolved.db_path, key.expose()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            // A Device-mode vault whose *cached* key fails to open may be a half-finished
+            // make-private (B1-3): the store was re-keyed to the random device key and the meta
+            // flipped to Device, but a crash before `update_keychain` left the old
+            // passphrase-derived key in the per-vault cache — which `current_db_key` prefers.
+            // Retry once with the freshly derived device key; if that opens, the cache was
+            // stale, so clear it and continue on the clean device path. Any other failure (a
+            // genuine wrong key / corruption / transient file lock) propagates unchanged.
+            if meta.key_mode == KeyMode::Device
+                && secrets::get_cached_vault_key(&meta.vault_id)?.is_some()
+            {
+                let device_key = secrets::get_or_create_db_key()?;
+                if let Ok(conn) = db::open(&resolved.db_path, device_key.expose()) {
+                    secrets::clear_cached_vault_key(&meta.vault_id)?;
+                    let master = master_from_db_key_hex(device_key.expose())?;
+                    return Ok(Some((conn, master)));
+                }
+            }
+            // No recovery applied, or the device key didn't open it either — the original
+            // error is the honest one to report (the cache wasn't the problem).
+            return Err(e);
+        }
+    };
     let master = master_from_db_key_hex(key.expose())?;
     Ok(Some((conn, master)))
 }
