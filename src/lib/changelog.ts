@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.91.9-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Renaming or merging a project now keeps everything attached to it. Before, a rename could quietly strip a project of its milestones, deadline, status, saved chats and activity history — now they all move across to the new name.",
+      "PM stays out of your way while you work. Background housekeeping — indexing, summaries, backups and the daily catch-up — now waits for a genuine pause instead of kicking in while you're reading, scrolling, triaging or editing.",
+      "The app opens faster. The first screen no longer waits on a calendar sync or a chain of startup checks before it appears — your projects show up right away, and the calendar fills in a moment later.",
+      "Backups are sturdier. A large Google Drive backup now uploads in pieces — gentler on memory, and it resumes instead of restarting if the connection blips — and a Proton backup can no longer hang forever: it times out on its own, and Cancel now works mid-transfer.",
+    ],
+  },
+  {
     version: "2.91.8-alpha",
     date: "2026-07-05",
     highlights: [

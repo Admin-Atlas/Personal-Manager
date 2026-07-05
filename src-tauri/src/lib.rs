@@ -289,8 +289,10 @@ impl Drop for BusyGuard<'_> {
 }
 
 impl AppState {
-    /// Mark the user as active right now — bumped on a chat send and on ingest, so the idle chat-indexer
-    /// backs off while work is happening.
+    /// Mark the user as active right now. Bumped on a chat send, on ingest, and — via the
+    /// `mark_activity` command (F-08) — on any real webview interaction (reading, scrolling,
+    /// triaging, editing), so every idle-gated background job backs off during active use, not only
+    /// during chat and imports.
     pub fn mark_user_activity(&self) {
         if let Ok(mut t) = self.last_user_activity.lock() {
             *t = Instant::now();
@@ -553,6 +555,31 @@ impl AppState {
             reranker,
         ))
     }
+
+    /// Like [`AppState::gateway`], but first refuses an embedder whose vector width the vault's
+    /// **live** `chunk_vec` can no longer hold (via [`ingest::guard_dimension`]). This is the seam
+    /// for every embed-**write** path — note ingest, spreadsheet promote, and the connector
+    /// executors that run unattended each sync cycle. Without it, after the user switches search
+    /// language but before re-indexing, those writes pass `check_embeddings` (which compares against
+    /// the embedder's own width, not the table's) and then fail deep inside the insert with a raw
+    /// sqlite-vec error — on a background connector sync, every cycle, with no guidance. The guard
+    /// converts that into the same "re-index the vault" message `ingest::run` already gives (F-46).
+    /// Read/query paths keep using the unchecked [`AppState::gateway`]: a query against a stale
+    /// index is a separate concern, and guarding it would add a `sqlite_master` read to the
+    /// chat-retrieval hot path.
+    pub fn gateway_for_write(
+        &self,
+        conn: &Connection,
+    ) -> error::Result<model_gateway::ModelGateway<'_>> {
+        let embedder = db::selected_embedder(conn)?;
+        ingest::guard_dimension(conn, &embedder)?;
+        let reranker = registry::reranker_for(&embedder);
+        Ok(model_gateway::ModelGateway::new(
+            &self.sidecar,
+            embedder,
+            reranker,
+        ))
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -770,6 +797,7 @@ pub fn run() {
             commands::set_conversation_project,
             commands::delete_conversation,
             commands::send_message,
+            commands::mark_activity,
             commands::chat_context_status,
             commands::compress_chat,
             commands::revert_compress,

@@ -50,6 +50,7 @@ import {
   getSettings,
   hasOpenRouterKey,
   listConversations,
+  markActivity,
   onVaultAcquired,
   onVaultCurtain,
   openUrl,
@@ -112,6 +113,10 @@ export default function App() {
   // send must not write its result into a conversation the user has since left.
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
+  // Cold start primes the most-recent conversation as active but defers fetching its messages until
+  // the first chat-view open (F-09) — the landing view is Focus, so they'd be off-screen anyway.
+  const primedConvId = useRef<number | null>(null);
+  const chatPrimeLoaded = useRef(false);
   // The on-screen conversation's row (for the editable title header); null on a fresh, unsent chat.
   const activeConv = conversations.find((c) => c.id === activeId) ?? null;
   // Chat send/stream state lives in a shared hook so the global chat and the
@@ -185,6 +190,35 @@ export default function App() {
     return () => document.removeEventListener("click", onClick);
   }, []);
 
+  // Idle-gate seam (F-08): treat ANY real interaction as active use, so idle-gated background jobs
+  // (chat indexer, summary/title/prefs reconcile, backup, activity rollup, flag scan) back off while
+  // the user reads/triages/edits — not only on chat sends + ingest, which was the whole starved
+  // signal. Leading-edge throttle: at most one tiny IPC every 30s of continuous interaction, well
+  // under the smallest 60s idle gate. Discrete intent events only (pointerdown / keydown / wheel) —
+  // deliberately NOT pointermove, so idle mouse-drift doesn't read as active; `wheel` covers
+  // scroll-while-reading. Passive + capture so it observes even when a child stops propagation, and
+  // never blocks or preventDefaults. Mounted unconditionally: marking activity while locked is
+  // harmless because every scheduler is independently gated on the vault being open + ready.
+  useEffect(() => {
+    let last = 0;
+    const ACTIVITY_THROTTLE_MS = 30_000;
+    const bump = () => {
+      const now = Date.now();
+      if (now - last < ACTIVITY_THROTTLE_MS) return;
+      last = now;
+      void markActivity().catch(() => {});
+    };
+    const opts = { capture: true, passive: true } as const;
+    window.addEventListener("pointerdown", bump, opts);
+    window.addEventListener("keydown", bump, opts);
+    window.addEventListener("wheel", bump, opts);
+    return () => {
+      window.removeEventListener("pointerdown", bump, opts);
+      window.removeEventListener("keydown", bump, opts);
+      window.removeEventListener("wheel", bump, opts);
+    };
+  }, []);
+
   // Auto-open "What's New" once after the app updates to a version the user
   // hasn't seen yet. We persist the last-seen version so it shows exactly once
   // per upgrade; opening it (or closing the auto-shown one) marks it seen.
@@ -210,31 +244,38 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
+        // The four boot reads are independent, so fetch them in ONE parallel batch rather than four
+        // serial round-trips behind each other (F-09). `has_openrouter_key` reads the OS keychain,
+        // not the encrypted store, so it's safe to fetch eagerly even when a gate below early-returns
+        // before it's consumed. The gate ORDER is preserved exactly.
+        const [appLocked, vs, writerLock, has] = await Promise.all([
+          appLockStatus().catch(() => null),
+          vaultStatus().catch(() => null),
+          vaultLockStatus().catch(() => null),
+          hasOpenRouterKey().catch(() => false),
+        ]);
         // Resolve the launch lock before the first paint so locked content never flashes.
-        const appLocked = await appLockStatus().catch(() => null);
         if (appLocked?.locked) setLocked(true);
-        // A passphrase vault with no cached key on this profile boots locked (the store
-        // can't open until unlocked), so defer the store-backed load until it is.
-        const vs = await vaultStatus().catch(() => null);
+        // A passphrase vault with no cached key on this profile boots locked (the store can't open
+        // until unlocked), so defer the store-backed load until it is.
         setVault(vs);
-        // Another profile may already be the active writer of a shared vault — then this
-        // instance is curtained (its store closed). That takes priority over the unlock
-        // prompt (the key is cached; the vault just isn't ours to write right now).
-        const writerLock = await vaultLockStatus().catch(() => null);
+        // Another profile may already be the active writer of a shared vault — then this instance is
+        // curtained (its store closed). That takes priority over the unlock prompt (the key is
+        // cached; the vault just isn't ours to write right now).
         setVaultLock(writerLock);
         if (writerLock && !writerLock.active) return;
-        // The store failed to open at boot (a transient file lock, disk I/O) — the open-error
-        // gate renders from `vault.open_error` and offers Retry. Checked before `needs_unlock`
-        // because a device vault has no passphrase to prompt for. The store is closed, so skip
-        // the store-backed load below.
+        // The store failed to open at boot (a transient file lock, disk I/O) — the open-error gate
+        // renders from `vault.open_error` and offers Retry. Checked before `needs_unlock` because a
+        // device vault has no passphrase to prompt for. The store is closed, so skip the load below.
         if (vs?.open_error) return;
         if (vs?.needs_unlock) {
           setVaultNeedsUnlock(true);
           return;
         }
-        const has = await hasOpenRouterKey();
         setKeySet(has);
-        if (has) await refreshConversations(true);
+        // Defer the primed conversation's getMessages off the first-paint path (the landing view is
+        // Focus, so those messages aren't shown yet); loaded lazily on first chat open (F-09).
+        if (has) await refreshConversations(true, true);
       } catch (e) {
         chat.setError(String(e));
       } finally {
@@ -251,7 +292,8 @@ export default function App() {
       setVault(await vaultStatus().catch(() => null));
       const has = await hasOpenRouterKey();
       setKeySet(has);
-      if (has) await refreshConversations(true);
+      // Passphrase-vault cold start also lands on Focus, so defer messages identically (F-09).
+      if (has) await refreshConversations(true, true);
     } catch (e) {
       chat.setError(String(e));
     } finally {
@@ -305,11 +347,19 @@ export default function App() {
     return () => clearInterval(id);
   }, [vaultLock?.active]);
 
-  async function refreshConversations(selectFirst = false) {
+  async function refreshConversations(selectFirst = false, deferMessages = false) {
     const list = await listConversations();
     setConversations(list);
     if (selectFirst && list.length > 0) {
-      await selectConversation(list[0].id);
+      if (deferMessages) {
+        // Prime the selection (so the title header renders) but skip the getMessages round-trip; the
+        // one-shot effect below loads it when chat is first opened (F-09). Every other caller passes
+        // deferMessages=false and loads eagerly, exactly as before.
+        setActiveId(list[0].id);
+        primedConvId.current = list[0].id;
+      } else {
+        await selectConversation(list[0].id);
+      }
     }
   }
 
@@ -366,6 +416,26 @@ export default function App() {
     const id = setInterval(() => void poll(), 15 * 60 * 1000);
     return () => clearInterval(id);
   }, [keySet]);
+
+  // Load the boot-primed conversation's messages the first time the user opens chat (F-09): cold
+  // start primes the selection but defers this fetch off the first-paint path. Fires at most once.
+  // The post-await `activeIdRef.current === target` guard is the correctness anchor — if a "+ New"
+  // chat, an explicit sidebar/citation pick, or a focus-box "ask" (which spins up a new conversation
+  // in the same tick) has since moved the active conversation, the primed messages are dropped
+  // rather than overwriting what's on screen. `messages.length > 0` short-circuits the common case
+  // where an explicit selectConversation already loaded a thread.
+  useEffect(() => {
+    if (view !== "chat" || chatPrimeLoaded.current) return;
+    chatPrimeLoaded.current = true;
+    const target = primedConvId.current;
+    if (target == null || activeId !== target || chat.messages.length > 0) return;
+    void getMessages(target)
+      .then((msgs) => {
+        if (activeIdRef.current === target) chat.setMessages(msgs);
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fire once on first chat-view entry
+  }, [view]);
 
   // Normalise wheel-scroll direction app-wide (installed once): a vertical wheel always scrolls
   // vertically, never getting translated into sideways motion over a horizontally-scrollable table.

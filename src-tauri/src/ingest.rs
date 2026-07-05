@@ -2731,6 +2731,28 @@ mod tests {
         assert!(!warmup_ok(None, 1024));
     }
 
+    #[test]
+    fn guard_dimension_refuses_a_width_the_live_table_cannot_hold() {
+        // The embed-WRITE seam (`AppState::gateway_for_write`, F-46) leans on this guard to turn a
+        // raw vec0 width mismatch — which a search-language switch before re-index creates on the
+        // *unattended* connector-sync write paths — into the same "re-index" guidance `ingest::run`
+        // already gives, instead of a cryptic sqlite-vec error every sync cycle.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        let embedder = crate::db::selected_embedder(&conn).unwrap();
+        // Fresh vault: chunk_vec matches the selected embedder's width -> the guard passes.
+        guard_dimension(&conn, &embedder).expect("a matching width must pass");
+        // Rebuild chunk_vec at a width the embedder can't fill (derived from the embedder so the
+        // test pins no model id and holds whatever the vault default is): the guard must refuse.
+        let other = embedder.dimension + 128;
+        conn.execute_batch(&format!(
+            "DROP TABLE chunk_vec; CREATE VIRTUAL TABLE chunk_vec USING vec0(embedding float[{other}]);"
+        ))
+        .unwrap();
+        let err = guard_dimension(&conn, &embedder).unwrap_err();
+        assert!(err.to_string().contains("re-index"), "got: {err}");
+    }
+
     const TEST_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     /// Hand-insert a vault row and an index-only row (no embedder needed) and return their ids.

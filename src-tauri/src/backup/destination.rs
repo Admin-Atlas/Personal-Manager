@@ -15,8 +15,11 @@
 
 use std::path::{Path, PathBuf};
 
+use tauri::{AppHandle, Manager};
+
 use super::naming::BackupEntry;
 use crate::error::{Error, Result};
+use crate::AppState;
 
 /// A single place PM pushes encrypted archives to.
 pub enum BackupDestination {
@@ -37,11 +40,17 @@ impl BackupDestination {
     }
 
     /// Push the finished archive at `local` (whose basename is `archive_name`) to this destination.
-    pub async fn upload(&self, local: &Path, archive_name: &str) -> Result<()> {
+    /// `app` is only needed by the Proton arm, which re-derives the shared `backup_cancel` flag
+    /// inside its blocking task so a mid-upload Cancel is honoured (F-13); the Google arm ignores it.
+    pub async fn upload(&self, app: &AppHandle, local: &Path, archive_name: &str) -> Result<()> {
         match self {
             Self::Proton { cli } => {
-                let (cli, local) = (cli.clone(), local.to_path_buf());
-                spawn_blocking_result(move || super::proton::upload_archive(&cli, &local)).await
+                let (cli, local, app) = (cli.clone(), local.to_path_buf(), app.clone());
+                spawn_blocking_result(move || {
+                    let st = app.state::<AppState>();
+                    super::proton::upload_archive(&cli, &local, Some(&st.backup_cancel))
+                })
+                .await
             }
             Self::GoogleDrive { token_key } => {
                 let folder = super::gdrive::ensure_backup_folder(token_key).await?;
@@ -84,8 +93,14 @@ impl BackupDestination {
         match self {
             Self::Proton { cli } => {
                 let (cli, name, dest) = (cli.clone(), name.to_string(), dest_dir.to_path_buf());
-                spawn_blocking_result(move || super::proton::download_archive(&cli, &name, &dest))
-                    .await
+                // `None`: this enum arm is never exercised — live Proton restore uses the direct
+                // `proton::download_archive` call in `restore_from_proton`, which threads the real
+                // cancel flag. Passing `None` keeps this dead arm compiling + timeout-bounded without
+                // dragging an AppHandle into an otherwise-cold path.
+                spawn_blocking_result(move || {
+                    super::proton::download_archive(&cli, &name, &dest, None)
+                })
+                .await
             }
             Self::GoogleDrive { token_key } => {
                 super::gdrive::download_archive(token_key, name, dest_dir).await

@@ -340,6 +340,86 @@ pub fn set_metadata(
     Ok(())
 }
 
+/// Re-key every name-keyed project satellite from `old` to `new` inside the caller's transaction —
+/// the migration a rename/merge was silently skipping (F-05). Renaming (or merging) a project
+/// rewrites the vault-truth `documents.project` + frontmatter, but the DB-derived satellites are
+/// keyed on the project *name*, so without this the renamed project loses its triage row (deadline,
+/// size, importance, governing status), its milestones, its activity history and its chats — and the
+/// flag layer, which anchors on milestone id, prunes flags whose milestones vanished.
+///
+/// The audit named four satellites; there are more, and the order is load-bearing because
+/// `foreign_keys` is ON (see `db::open`) and the FK children (`project_milestones`,
+/// `project_activity`, `project_activity_daily`) reference `projects(name)` `ON DELETE CASCADE` with
+/// **no** `ON UPDATE`. A naive `UPDATE projects SET name` would orphan them; deleting the old row
+/// first would cascade-wipe them. So: create the destination row, move the children onto it, then
+/// drop the now-childless source.
+///
+/// On a plain rename the destination doesn't exist yet, so the source's triage carries across. On a
+/// merge the survivor's row already exists, so `INSERT OR IGNORE` keeps it (survivor wins its own
+/// triage) while the folded project's children still move onto the survivor name.
+pub fn rename_project_satellites(conn: &Connection, old: &str, new: &str) -> Result<()> {
+    let old = old.trim();
+    let new = new.trim();
+    if old.is_empty() || new.is_empty() || old == new {
+        return Ok(());
+    }
+    // 1. Ensure the destination triage row exists BEFORE re-keying the FK children. INSERT OR IGNORE:
+    //    absent (rename) -> carry the source row across (created_at preserved, updated_at stamped);
+    //    present (merge survivor) -> keep the survivor's row untouched.
+    conn.execute(
+        "INSERT OR IGNORE INTO projects \
+             (name, deadline, size, blocked_by, parent, importance, last_touched, entity_id, created_at, updated_at) \
+         SELECT ?2, deadline, size, blocked_by, parent, importance, last_touched, entity_id, created_at, \
+                strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+           FROM projects WHERE name = ?1",
+        params![old, new],
+    )?;
+    // 2. Move the FK children keyed on the project name. Milestone ids are STABLE, so flag anchors
+    //    (which reference milestone id, not project name) survive the move untouched.
+    conn.execute(
+        "UPDATE project_milestones SET project_name = ?2 WHERE project_name = ?1",
+        params![old, new],
+    )?;
+    conn.execute(
+        "UPDATE project_activity SET project = ?2 WHERE project = ?1",
+        params![old, new],
+    )?;
+    // 3. The daily rollup's PRIMARY KEY is (project, day, kind), so a plain re-key would UNIQUE-collide
+    //    on any (day, kind) the merge survivor already has. Sum the counts into the destination
+    //    (mirroring the rollup writer), then drop the source rows.
+    conn.execute(
+        "INSERT INTO project_activity_daily (project, day, kind, count) \
+             SELECT ?2, day, kind, count FROM project_activity_daily WHERE project = ?1 \
+         ON CONFLICT(project, day, kind) DO UPDATE SET count = count + excluded.count",
+        params![old, new],
+    )?;
+    conn.execute(
+        "DELETE FROM project_activity_daily WHERE project = ?1",
+        params![old],
+    )?;
+    // 4. Re-scope chats (free-form column, no FK).
+    conn.execute(
+        "UPDATE conversations SET project = ?2 WHERE project = ?1",
+        params![old, new],
+    )?;
+    // 5. Re-point OTHER projects that named this one as their parent/blocker (free-form name refs, no
+    //    FK — the audit listed the project's own satellites; these inbound name pointers are the same
+    //    class of stranded reference, so the rename fixes them too). `name <> ?2` guards the pathological
+    //    merge-cycle where the survivor itself listed the folded project, so we never write a self-parent.
+    conn.execute(
+        "UPDATE projects SET parent = ?2 WHERE parent = ?1 AND name <> ?2",
+        params![old, new],
+    )?;
+    conn.execute(
+        "UPDATE projects SET blocked_by = ?2 WHERE blocked_by = ?1 AND name <> ?2",
+        params![old, new],
+    )?;
+    // 6. Drop the now-childless source triage row (all FK children moved in 2-3; conversations and the
+    //    parent/blocker pointers carry no FK, so nothing cascades).
+    conn.execute("DELETE FROM projects WHERE name = ?1", params![old])?;
+    Ok(())
+}
+
 /// Trim a value and treat blank as absent.
 fn clean(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
@@ -864,5 +944,163 @@ mod tests {
             quiet.last_activity.as_deref().unwrap() > "2020-01-01",
             "the active date should reflect the touch, not the ancient document"
         );
+    }
+
+    // --- F-05: rename/merge migrates the name-keyed satellites ---
+
+    /// A rename must carry the project's name-keyed satellites onto the new name: triage,
+    /// milestones (with STABLE ids so flag anchors survive), activity and chats. Before this fix the
+    /// renamed project reappeared in Focus with no governing status, deadline or triage at all.
+    #[test]
+    fn rename_migrates_satellites_and_overview_still_governs() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash, project, last_activity) \
+             VALUES ('v1','h1','Atlas','2026-06-27T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        set_metadata(&conn, "Atlas", None, Some("large".into()), None, None, None).unwrap();
+        let mid = crate::milestones::add(&conn, "Atlas", "pitch", Some("2026-07-01".into()), None)
+            .unwrap();
+        conn.execute("INSERT INTO conversations(project) VALUES ('Atlas')", [])
+            .unwrap();
+        crate::project_activity::record(&conn, "Atlas", crate::project_activity::Kind::Chat, None);
+        conn.execute(
+            "INSERT INTO project_activity_daily(project, day, kind, count) VALUES ('Atlas', 20000, 'chat', 2)",
+            [],
+        )
+        .unwrap();
+
+        // The command layer relabels the vault-truth documents first; the helper then re-keys the
+        // DB-side satellites — the step that was missing.
+        conn.execute(
+            "UPDATE documents SET project='Atlas Initiative' WHERE project='Atlas'",
+            [],
+        )
+        .unwrap();
+        rename_project_satellites(&conn, "Atlas", "Atlas Initiative").unwrap();
+
+        // Milestone moved and kept its STABLE id (the flag layer anchors on it).
+        let m_project: String = conn
+            .query_row(
+                "SELECT project_name FROM project_milestones WHERE id=?1",
+                params![mid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(m_project, "Atlas Initiative");
+        // Triage carried across; the source row is gone.
+        let size: Option<String> = conn
+            .query_row(
+                "SELECT size FROM projects WHERE name='Atlas Initiative'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(size.as_deref(), Some("large"));
+        let old_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE name='Atlas'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_rows, 0);
+        // Chats + both activity tables moved.
+        let convo: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE project='Atlas Initiative'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(convo, 1);
+        let act: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_activity WHERE project='Atlas Initiative'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(act, 1);
+        let daily: i64 = conn
+            .query_row(
+                "SELECT count FROM project_activity_daily \
+                 WHERE project='Atlas Initiative' AND day=20000 AND kind='chat'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(daily, 2);
+
+        // And Focus still governs the renamed project — the exact user-visible failure.
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        let atlas = overview_for(&rows, "Atlas Initiative");
+        assert_eq!(atlas.status, ProjectStatus::DueSoon);
+        assert_eq!(
+            atlas.governing_milestone.as_ref().map(|g| g.label.as_str()),
+            Some("pitch")
+        );
+        assert!(
+            rows.iter().all(|o| o.name != "Atlas"),
+            "the old name must be gone from overviews"
+        );
+    }
+
+    /// A merge folds the daily rollup by SUMMING on its (project, day, kind) primary key. A plain
+    /// re-key would throw a UNIQUE-constraint error the moment the survivor already has a row for
+    /// that day+kind — which is the normal case for two active projects.
+    #[test]
+    fn merge_folds_daily_rollup_without_pk_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        set_metadata(&conn, "Old", None, Some("large".into()), None, None, None).unwrap();
+        set_metadata(&conn, "New", None, Some("quick".into()), None, None, None).unwrap();
+        conn.execute(
+            "INSERT INTO project_activity_daily(project,day,kind,count) VALUES ('Old',20000,'chat',3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_activity_daily(project,day,kind,count) VALUES ('New',20000,'chat',5)",
+            [],
+        )
+        .unwrap();
+
+        rename_project_satellites(&conn, "Old", "New").unwrap();
+
+        let summed: i64 = conn
+            .query_row(
+                "SELECT count FROM project_activity_daily \
+                 WHERE project='New' AND day=20000 AND kind='chat'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(summed, 8, "collided daily rows must SUM, not error");
+        let old_daily: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_activity_daily WHERE project='Old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_daily, 0);
+        // Survivor keeps its own triage (INSERT OR IGNORE); the source row is dropped.
+        let new_size: Option<String> = conn
+            .query_row("SELECT size FROM projects WHERE name='New'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(new_size.as_deref(), Some("quick"), "survivor triage wins");
+        let old_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projects WHERE name='Old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(old_rows, 0);
     }
 }
