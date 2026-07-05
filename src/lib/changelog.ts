@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.2-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Under-the-hood tidying: the Google Drive and OneDrive connectors now share a single piece of folder-sync reconciliation logic instead of keeping near-identical copies. Sync behaves exactly as before — this just means future fixes land in one place rather than needing to be applied twice.",
+    ],
+  },
+  {
     version: "2.92.1-alpha",
     date: "2026-07-05",
     highlights: [

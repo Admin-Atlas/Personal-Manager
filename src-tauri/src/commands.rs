@@ -3483,6 +3483,16 @@ enum DriveItem {
     },
 }
 
+/// Map a shared reconcile-plan entry ([`index_only::reconcile_enumeration`]) onto this connector's
+/// work item — the enumerated file rides along as `file` so phase 2 can fetch a body on `Add`/`Update`.
+fn drive_reconciled(r: index_only::ReconcileItem<drive::DriveFile>) -> DriveItem {
+    DriveItem::Reconciled {
+        source_id: r.source_id,
+        event: r.event,
+        file: r.payload,
+    }
+}
+
 /// All of one account's gathered work for a sync pass (My Drive + shared drives together).
 struct AccountWork {
     email: String,
@@ -3535,9 +3545,12 @@ async fn gather_shared_folders(
             .into_iter()
             .collect()
     };
-    Ok(reconcile_enumeration(files, known, |file_id| {
+    Ok(index_only::reconcile_enumeration(files, known, |file_id| {
         drive::shared_source_id(drive_id, file_id)
-    }))
+    })
+    .into_iter()
+    .map(drive_reconciled)
+    .collect())
 }
 
 /// Folder-scoped reconcile for **My Drive**: the personal counterpart to [`gather_shared_folders`].
@@ -3558,54 +3571,12 @@ async fn gather_my_drive_folders(
             .into_iter()
             .collect()
     };
-    Ok(reconcile_enumeration(files, known, |file_id| {
+    Ok(index_only::reconcile_enumeration(files, known, |file_id| {
         drive::source_id_for(email, file_id)
-    }))
-}
-
-/// Diff a live folder-scoped enumeration against the known-healthy set → reconcile events. A present
-/// file already known → `Update` (catches edits, no-ops otherwise); a present file new or previously
-/// missing/unreachable → `Add` (ingests, or reactivates a folder removed then re-added); a known file
-/// no longer present → `Delete`. `source_id_of` maps a Drive file id to its namespaced source id, so
-/// My Drive and shared drives share this core.
-fn reconcile_enumeration(
-    files: Vec<drive::DriveFile>,
-    known: std::collections::HashSet<String>,
-    source_id_of: impl Fn(&str) -> String,
-) -> Vec<DriveItem> {
-    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut items: Vec<DriveItem> = Vec::with_capacity(files.len());
-    for f in files {
-        let source_id = source_id_of(&f.id);
-        present.insert(source_id.clone());
-        let event = if known.contains(&source_id) {
-            index_only::ChangeEvent::Update {
-                source_id: source_id.clone(),
-                modified_at: f.modified_time.clone(),
-                new_content_hash: f.content_hash(),
-            }
-        } else {
-            index_only::ChangeEvent::Add {
-                source_id: source_id.clone(),
-                modified_at: f.modified_time.clone(),
-            }
-        };
-        items.push(DriveItem::Reconciled {
-            source_id,
-            event,
-            file: Some(f),
-        });
-    }
-    for source_id in known {
-        if !present.contains(&source_id) {
-            items.push(DriveItem::Reconciled {
-                source_id: source_id.clone(),
-                event: index_only::ChangeEvent::Delete { source_id },
-                file: None,
-            });
-        }
-    }
-    items
+    })
+    .into_iter()
+    .map(drive_reconciled)
+    .collect())
 }
 
 /// Whole-drive sync via a **per-drive delta cursor** — the same cheap path My Drive uses, so a large
@@ -5893,39 +5864,16 @@ async fn gather_onedrive_folders(
             .into_iter()
             .collect()
     };
-    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out: Vec<OneDriveItem> = Vec::with_capacity(items.len());
-    for it in items {
-        let source_id = onedrive::source_id_for(email, &it.id);
-        present.insert(source_id.clone());
-        let event = if known.contains(&source_id) {
-            index_only::ChangeEvent::Update {
-                source_id: source_id.clone(),
-                modified_at: it.modified_time.clone(),
-                new_content_hash: it.content_hash(),
-            }
-        } else {
-            index_only::ChangeEvent::Add {
-                source_id: source_id.clone(),
-                modified_at: it.modified_time.clone(),
-            }
-        };
-        out.push(OneDriveItem::Reconciled {
-            source_id,
-            event,
-            item: Some(it),
-        });
-    }
-    for source_id in known {
-        if !present.contains(&source_id) {
-            out.push(OneDriveItem::Reconciled {
-                source_id: source_id.clone(),
-                event: index_only::ChangeEvent::Delete { source_id },
-                item: None,
-            });
-        }
-    }
-    Ok(out)
+    Ok(
+        index_only::reconcile_enumeration(items, known, |id| onedrive::source_id_for(email, id))
+            .into_iter()
+            .map(|r| OneDriveItem::Reconciled {
+                source_id: r.source_id,
+                event: r.event,
+                item: r.payload,
+            })
+            .collect(),
+    )
 }
 
 /// Apply `f` to the shared OneDrive-sync snapshot, best-effort (a poisoned lock is skipped).

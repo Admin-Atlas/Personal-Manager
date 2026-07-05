@@ -338,6 +338,22 @@ pub struct DriveItem {
     pub web_url: Option<String>,
 }
 
+/// Lets a folder-scoped enumeration reconcile through the shared [`index_only::reconcile_enumeration`]
+/// planner. `content_hash` forwards to the inherent method (quickXor-or-sha256-or-modifiedTime).
+impl index_only::EnumeratedFile for DriveItem {
+    fn local_id(&self) -> &str {
+        &self.id
+    }
+    fn modified_at(&self) -> Option<String> {
+        self.modified_time.clone()
+    }
+    fn content_hash(&self) -> Option<String> {
+        // Method-call syntax resolves to the inherent `DriveItem::content_hash` (inherent methods
+        // shadow trait methods of the same name), so this forwards rather than recursing.
+        self.content_hash()
+    }
+}
+
 impl DriveItem {
     /// The source content hash for change detection: OneDrive's `quickXorHash` when present (on both
     /// personal and business drives), else `sha256Hash`, else `lastModifiedDateTime` (an honest change
