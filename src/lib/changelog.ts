@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.0-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Search now works properly in Chinese, Japanese, Korean and other languages that don't put spaces between words. If your vault's search language is set to multilingual, keyword search finds these documents instead of quietly falling back to a weaker match — and PM offers a one-time re-index to bring your existing documents across. Vaults searching in English are unaffected.",
+      "Short messages in any language are kept. A brief note in Chinese, Russian or another non-Latin script is no longer mistaken for small talk and skipped — it's indexed and learned from just like an English one.",
+    ],
+  },
+  {
     version: "2.91.9-alpha",
     date: "2026-07-05",
     highlights: [

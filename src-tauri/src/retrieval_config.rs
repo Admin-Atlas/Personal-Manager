@@ -45,6 +45,21 @@ pub struct RetrievalConfig {
     pub dimension: usize,
     /// A string seam for fusion/index knobs that affect stored structure.
     pub index_params: String,
+    /// The `chunks_fts` tokenisation mode — `cjk-bigram-v1` on a multilingual vault (CJK/kana/Hangul
+    /// runs pre-segmented into bigrams so keyword search works, F-33), otherwise `none`. The default
+    /// keeps English vaults' stamp byte-identical to before, so **only** a vault already on the
+    /// multilingual embedder sees a mismatch and is offered the one-time Rebuild. Serde-defaulted so
+    /// a stamp written before this field parses cleanly (to `none`) instead of failing to deserialize
+    /// and forcing every vault to rebuild.
+    #[serde(default = "default_fts_segmentation")]
+    pub fts_segmentation: String,
+}
+
+/// The pre-field value: a stamp written before FTS segmentation existed described a plain
+/// unicode61 index, i.e. no CJK segmentation — so it defaults to `"none"`, which equals what an
+/// English vault produces today and therefore never triggers a spurious Rebuild.
+fn default_fts_segmentation() -> String {
+    "none".to_string()
 }
 
 impl RetrievalConfig {
@@ -63,6 +78,14 @@ impl RetrievalConfig {
             embedder_id: embedder.id.to_string(),
             dimension: embedder.dimension,
             index_params: "hybrid-rrf-k60-recency90".to_string(),
+            // Gated on the registry capability, never a model id (model-agnostic). This is the
+            // whole delta that makes ONLY multilingual vaults rebuild for F-33 — no STAMP_VERSION
+            // bump, which would drag English vaults into a rebuild too.
+            fts_segmentation: if embedder.multilingual {
+                "cjk-bigram-v1".to_string()
+            } else {
+                "none".to_string()
+            },
         }
     }
 
@@ -114,6 +137,45 @@ mod tests {
         assert_eq!(cfg.dimension, 1024);
         // A different embedder ⇒ a different stamp ⇒ a Rebuild is offered.
         assert_ne!(cfg, RetrievalConfig::current());
+    }
+
+    #[test]
+    fn fts_segmentation_is_gated_on_the_multilingual_embedder() {
+        // English default → "none" (byte-identical to pre-field vaults, so no rebuild); the
+        // multilingual embedder → the CJK-bigram marker (F-33), so those vaults — and only those —
+        // see a stamp mismatch and are offered the Rebuild.
+        assert_eq!(RetrievalConfig::current().fts_segmentation, "none");
+        let e5 = registry::lookup("intfloat/multilingual-e5-large").unwrap();
+        assert!(e5.multilingual);
+        assert_eq!(
+            RetrievalConfig::current_for(&e5).fts_segmentation,
+            "cjk-bigram-v1"
+        );
+    }
+
+    #[test]
+    fn a_stamp_written_before_the_field_defaults_to_none() {
+        // The load-bearing serde default: a stamp serialized before fts_segmentation existed must
+        // deserialize to "none", NOT fail to parse. get_retrieval_stamp swallows a parse error into
+        // None (a mismatch), so a non-defaulted field would force EVERY vault — English included —
+        // to rebuild. With the default, an English vault's old stamp still compares equal.
+        let mut value = serde_json::to_value(RetrievalConfig::current()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fts_segmentation")
+            .expect("field present in the current serialization");
+        let back: RetrievalConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(back.fts_segmentation, "none");
+        // …and that reconstructed stamp still equals the current English stamp → no spurious rebuild.
+        assert_eq!(back, RetrievalConfig::current());
+    }
+
+    #[test]
+    fn segmentation_difference_alone_breaks_equality() {
+        let mut other = RetrievalConfig::current();
+        other.fts_segmentation = "cjk-bigram-v1".to_string();
+        assert_ne!(other, RetrievalConfig::current());
     }
 
     #[test]
