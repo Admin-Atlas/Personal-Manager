@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.11-alpha",
+    date: "2026-07-05",
+    highlights: [
+      'Sturdier re-indexing for cloud- and folder-indexed files: in two rare cases where PM was interrupted at exactly the wrong moment — a crash mid-way through indexing a cloud file, or right after turning an indexed file into a full local copy — a later "Re-index everything" could quietly drop that item or keep reporting it as failed. Both now self-heal on the next start, so nothing is silently lost. This is behind-the-scenes robustness; nothing you do changes.',
+    ],
+  },
+  {
     version: "2.92.10-alpha",
     date: "2026-07-05",
     highlights: [
