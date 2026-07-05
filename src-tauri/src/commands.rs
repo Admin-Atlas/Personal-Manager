@@ -4024,6 +4024,13 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
             break 'accounts;
         }
 
+        // Any item in this account failing (a body fetch or an apply) blocks the clean finalize below:
+        // the account is stamped 'error' with its cursor left unadvanced instead of a misleading 'ok'.
+        // Reset per account so one bad account doesn't taint the next (the global `failed` counter is
+        // cross-account and can't gate this per-account decision). Mirrors the calendar sync's "check
+        // failures first" rule (F-29).
+        let mut account_failed = false;
+
         // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
         if w.auth_failed {
             let actions = index_only::react(
@@ -4142,6 +4149,7 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                             &format!("Couldn't fetch from Drive: {e}"),
                         );
                         last_err = Some(e);
+                        account_failed = true;
                         emit_drive_progress(
                             app,
                             drive::DriveSyncEvent::Item {
@@ -4178,6 +4186,7 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                         &format!("Indexing failed: {e}"),
                     );
                     last_err = Some(e);
+                    account_failed = true;
                 }
             }
             processed += 1;
@@ -4203,15 +4212,17 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
             }
         }
 
-        // Persist the pass: advance My Drive's cursor (if synced) + each whole-drive shared cursor,
-        // stamp the time, and clear failure state. Auth-failed accounts already `continue`d above, so
-        // reaching here means the pass was healthy enough to commit its cursors.
+        // Persist the pass, honoring whether any item failed: a clean account commits (cursor advance,
+        // time, state 'ok'); an account with ANY failed item is flagged 'error' with its cursor left
+        // unadvanced, so the failure isn't hidden behind a misleading 'ok' and the failed items retry
+        // next sync. See `drive::finalize_or_flag`. Auth-failed accounts already `continue`d above. (F-29)
         {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            drive::finalize_sync(
+            drive::finalize_or_flag(
                 &conn,
                 &w.email,
+                account_failed,
                 w.new_cursor.as_deref(),
                 &w.shared_new_cursors,
             )?;
@@ -6138,6 +6149,13 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
             break 'accounts;
         }
 
+        // Any item in this account failing (a body fetch or an apply) blocks the clean finalize below:
+        // the account is stamped 'error' with its cursor left unadvanced instead of a misleading 'ok'.
+        // Reset per account so one bad account doesn't taint the next (the global `failed` counter is
+        // cross-account and can't gate this per-account decision). Mirrors the calendar sync's "check
+        // failures first" rule (F-29).
+        let mut account_failed = false;
+
         // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
         if w.auth_failed {
             let actions = index_only::react(
@@ -6248,6 +6266,7 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
                             &format!("Couldn't fetch from OneDrive: {e}"),
                         );
                         last_err = Some(e);
+                        account_failed = true;
                         emit_onedrive_progress(
                             app,
                             onedrive::OneDriveSyncEvent::Item {
@@ -6284,6 +6303,7 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
                         &format!("Indexing failed: {e}"),
                     );
                     last_err = Some(e);
+                    account_failed = true;
                 }
             }
             processed += 1;
@@ -6305,12 +6325,14 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
             }
         }
 
-        // Persist the pass: advance the whole-drive delta link (if synced), stamp the time, clear
-        // failure state. Auth-failed accounts already `continue`d above.
+        // Persist the pass, honoring whether any item failed: a clean account commits (cursor advance,
+        // time, state 'ok'); an account with ANY failed item is flagged 'error' with its cursor left
+        // unadvanced, so the failure isn't hidden behind a misleading 'ok' and the failed items retry
+        // next sync. See `onedrive::finalize_or_flag`. Auth-failed accounts already `continue`d above. (F-29)
         {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            onedrive::finalize_sync(&conn, &w.email, w.new_cursor.as_deref())?;
+            onedrive::finalize_or_flag(&conn, &w.email, account_failed, w.new_cursor.as_deref())?;
         }
     }
 
