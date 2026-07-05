@@ -3620,7 +3620,14 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
     // the source and never store it; the trailing segment after the last `:` is the provider's file id
     // (Drive fileIds and Graph itemIds both carry no `:`).
     let state = app.state::<AppState>();
-    state.sidecar.ensure_installed()?;
+    // `ensure_installed` is blocking (first run installs the venv + deps) — run it on the blocking
+    // pool so it never pins a tokio worker (F-41). The cloned handle reaches AppState in the closure.
+    {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || app.state::<AppState>().sidecar.ensure_installed())
+            .await
+            .map_err(|e| Error::Other(format!("sidecar install task panicked: {e}")))??;
+    }
     let no_text = || Error::Other("This file has no extractable text to show.".into());
     // Local folder: the body is on disk at the stored path (its `external_ref`). Read + convert it live,
     // exactly like a fresh index — nothing is stored.
@@ -3704,7 +3711,14 @@ pub async fn promote_index_only(app: AppHandle, doc_id: i64) -> Result<Document>
         .ok_or_else(|| Error::Other("This indexed item has no source pointer to import.".into()))?;
 
     let state = app.state::<AppState>();
-    state.sidecar.ensure_installed()?;
+    // `ensure_installed` is blocking (first run installs the venv + deps) — run it on the blocking
+    // pool so it never pins a tokio worker (F-41). The cloned handle reaches AppState in the closure.
+    {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || app.state::<AppState>().sidecar.ensure_installed())
+            .await
+            .map_err(|e| Error::Other(format!("sidecar install task panicked: {e}")))??;
+    }
     // The provider file id is the segment after the last `:` (Drive/Graph ids carry none), mirroring
     // `fetch_index_only_body`.
     let item_id = source_id
@@ -5130,23 +5144,27 @@ pub fn open_data_folder(app: AppHandle) -> Result<()> {
 #[tauri::command]
 pub async fn export_all_data(
     app: AppHandle,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     dest_path: String,
 ) -> Result<()> {
     // A temp *directory* (not file) so `VACUUM INTO` writes a fresh file into an empty
     // dir — it refuses a pre-existing target. The dir (and snapshot) is removed on drop.
     let tmp = tempfile::Builder::new().prefix("pm-export-").tempdir()?;
     let snapshot = tmp.path().join("pm.sqlite");
-    {
-        let conn = state.conn()?;
-        // VACUUM INTO takes a literal SQL string, not a bound parameter; escape any
-        // single quote in the (tool-generated) path so it can't break out.
-        let escaped = snapshot.to_string_lossy().replace('\'', "''");
-        conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
-    }
     let data_dir = paths::data_dir(&app)?;
     let dest = dest_path;
-    tokio::task::spawn_blocking(move || {
+    // Snapshot + zip on the blocking pool (F-42): a `VACUUM INTO` can copy a multi-GB store, so on
+    // the async runtime it pinned a tokio worker *and* held the global DB mutex for the whole copy.
+    // The guard is scoped to the vacuum inside the closure, so it still releases before the slower
+    // zip walk — same lock lifetime as before, just off the runtime. The snapshot reaches the store
+    // via the cloned `app` handle (DbGuard is !Send, so acquire it inside the closure). `tmp` stays
+    // owned here and outlives the task.
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            vault::migrate::vacuum_into(&conn, &snapshot)?;
+        }
         write_export_zip(&data_dir, &snapshot, std::path::Path::new(&dest))
     })
     .await
@@ -5296,8 +5314,19 @@ pub async fn create_local_backup(
         .tempdir()?;
     let snapshot = tmp.path().join("pm.sqlite");
     {
-        let conn = state.conn()?;
-        vault::migrate::vacuum_into(&conn, &snapshot)?;
+        // Snapshot on the blocking pool (F-42): a `VACUUM INTO` of a multi-GB store must not pin a
+        // tokio worker or hold the DB mutex on the async runtime. The guard is acquired and dropped
+        // inside the closure (DbGuard is !Send) via a cloned handle; `snapshot` is cloned in and the
+        // original flows into the pack inputs below.
+        let app = app.clone();
+        let snapshot = snapshot.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            vault::migrate::vacuum_into(&conn, &snapshot)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("snapshot task panicked: {e}")))??;
     }
     emit_backup_progress(
         &app,
@@ -5724,8 +5753,19 @@ pub(crate) async fn run_backup(
     let tmp = tempfile::Builder::new().prefix("pm-backup-").tempdir()?;
     let snapshot = tmp.path().join("pm.sqlite");
     {
-        let conn = state.conn()?;
-        vault::migrate::vacuum_into(&conn, &snapshot)?;
+        // Snapshot on the blocking pool (F-42): a `VACUUM INTO` of a multi-GB store must not pin a
+        // tokio worker or hold the DB mutex on the async runtime. The guard is acquired and dropped
+        // inside the closure (DbGuard is !Send) via a cloned handle; `snapshot` is cloned in and the
+        // original flows into the pack inputs below.
+        let app = app.clone();
+        let snapshot = snapshot.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            vault::migrate::vacuum_into(&conn, &snapshot)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("snapshot task panicked: {e}")))??;
     }
     emit_backup_progress(
         app,

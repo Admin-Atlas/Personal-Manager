@@ -791,10 +791,14 @@ struct FolderWork {
 /// One sync pass: walk each folder off the lock, then reconcile it against the known set. Split out so
 /// [`local_sync_core`] can run it again (the follow-up sweep) and own the running/marker lifecycle.
 async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize> {
-    // The sidecar converts each file's body to Markdown — ensure it once up front.
+    // The sidecar converts each file's body to Markdown — ensure it once up front. It's blocking
+    // (a first run installs the Python venv + deps), so run it on the blocking pool rather than
+    // the async runtime so a first-sync-after-install can't pin a tokio worker (F-41).
     {
-        let state = app.state::<AppState>();
-        state.sidecar.ensure_installed()?;
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || app.state::<AppState>().sidecar.ensure_installed())
+            .await
+            .map_err(|e| Error::Other(format!("sidecar install task panicked: {e}")))??;
     }
 
     let keys: Vec<String> = {

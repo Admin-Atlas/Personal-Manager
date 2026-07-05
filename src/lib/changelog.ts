@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.13-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood responsiveness. Making a backup or exporting your data used to briefly tie up the app while it took a consistent snapshot of your library, and the very first sync after installing an update could do the same while it set up the document engine. Both now happen off to the side, so the app stays smooth and responsive even while a large backup is running.",
+    ],
+  },
+  {
     version: "2.92.12-alpha",
     date: "2026-07-05",
     highlights: [

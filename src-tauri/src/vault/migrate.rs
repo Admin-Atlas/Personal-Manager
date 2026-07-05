@@ -615,4 +615,55 @@ mod tests {
         assert!(!from.join(MARKDOWN_SUBDIR).exists());
         assert!(from.join("unrelated.txt").exists());
     }
+
+    #[test]
+    fn vacuum_into_snapshots_every_committed_row_folding_the_wal() {
+        // `vacuum_into` is the one snapshot helper the export + both backup paths route through; it
+        // must produce a standalone copy holding every committed row even when the source keeps fresh
+        // pages in a `-wal` sidecar. Open a WAL-mode DB, write rows, snapshot, and reopen the snapshot
+        // (a plain single file) to prove the WAL was folded in.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("live.sqlite")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t (v) VALUES ('a'), ('b'), ('c');",
+        )
+        .unwrap();
+
+        // VACUUM INTO refuses a pre-existing target, so aim at a fresh (empty) directory.
+        let snap_dir = dir.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let dest = snap_dir.join(DB_FILENAME);
+        vacuum_into(&conn, &dest).unwrap();
+
+        let snap = rusqlite::Connection::open(&dest).unwrap();
+        let n: i64 = snap
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 3,
+            "the snapshot must contain every committed row, WAL included"
+        );
+    }
+
+    #[test]
+    fn vacuum_into_escapes_single_quotes_in_the_dest_path() {
+        // `VACUUM INTO` takes a literal SQL string, so a single quote in the destination path would
+        // break out of the quoting without escaping. A dir named `o'brien` exercises that — the
+        // snapshot must still be written, not fail on malformed SQL.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("live.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+
+        let quoted = dir.path().join("o'brien");
+        std::fs::create_dir_all(&quoted).unwrap();
+        let dest = quoted.join(DB_FILENAME);
+        vacuum_into(&conn, &dest).unwrap();
+        assert!(
+            dest.exists(),
+            "a dest path with a single quote must still produce a snapshot"
+        );
+    }
 }
