@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.3-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "A cloud or local-folder sync that hit an unexpected error could quietly leave that connector unable to sync again until you restarted PM. Now it always recovers on its own — the next sync just runs normally.",
+    ],
+  },
+  {
     version: "2.92.2-alpha",
     date: "2026-07-05",
     highlights: [
