@@ -1608,52 +1608,9 @@ fn stage_temp(name: &str, bytes: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
-// --- progress event (rendered by the shared IngestProgress component) ---------------------------
-
-/// Sync progress for the Settings UI. Distinct from `IngestEvent` because a sync also re-embeds and
-/// removes (which carry no freshly-ingested `Document`); the frontend maps `processed`/`total` onto
-/// the shared `IngestProgress` bar.
-/// A file PM tried to index but couldn't, surfaced in the post-sync report so the user knows what was
-/// left out (e.g. an unsupported file type MarkItDown can't read, or a fetch error). Not a fatal
-/// error — the sync carries on; these are just reported.
-#[derive(Clone, Serialize, Default)]
-pub struct DriveSyncIssue {
-    pub name: String,
-    pub reason: String,
-}
-
-/// The outcome of a sync pass: how many items were indexed/updated/removed, the list of files that
-/// couldn't be indexed (capped), and whether the user stopped it early. Shown in Settings after a
-/// sync and stashed in the live snapshot so a user returning after it finished still sees the result.
-#[derive(Clone, Serialize, Default)]
-pub struct DriveSyncReport {
-    pub indexed: usize,
-    pub updated: usize,
-    pub removed: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    /// The user pressed Stop — already-indexed files are kept; the rest were left for next time.
-    pub cancelled: bool,
-    /// Files attempted but not indexed (unsupported/empty, or a fetch error), capped for memory.
-    pub issues: Vec<DriveSyncIssue>,
-    /// True when more files couldn't be indexed than the capped `issues` list holds.
-    pub issues_truncated: bool,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum DriveSyncEvent {
-    /// The total number of files/changes this run will work through (sent once, before the items).
-    Counted { total: usize },
-    /// One item processed (1-based `processed` of `total`).
-    Item {
-        processed: usize,
-        total: usize,
-        name: String,
-    },
-    /// The run is done; `report` carries the breakdown + the not-indexed list (+ a `cancelled` flag).
-    Finished { report: DriveSyncReport },
-}
+// The sync progress event, report, and not-indexed issue types now live unified (shared with OneDrive)
+// as `CloudSyncEvent` / `CloudSyncReport` / `CloudSyncIssue` in [`crate::cloud_sync`] — the two
+// providers' copies were byte-identical (audit X-D1).
 
 #[cfg(test)]
 mod tests {
