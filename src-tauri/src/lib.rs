@@ -14,6 +14,7 @@ mod clock;
 mod commands;
 mod commands_dev;
 mod components;
+mod connector_sync;
 mod context_budget;
 mod cost;
 mod db;
@@ -168,6 +169,71 @@ pub struct LocalFolderSyncState {
     pub rerun: bool,
     /// The most recent finished sync's report, so a user returning after a sync still sees the result.
     pub last_report: Option<localfolder::LocalSyncReport>,
+}
+
+// The three detached-sync snapshots share their single-flight lifecycle through
+// [`connector_sync::SyncRunGuard`]; each exposes its `running`/`rerun` fields (and how to reset its
+// own counters + target) via [`connector_sync::SyncSlot`] so the guard can own that lifecycle
+// generically. The guard clears `running` on drop — including on a panicked pass — so a sync that
+// crashes can't wedge the connector with `running = true` for the session (audit F-43).
+impl connector_sync::SyncSlot for DriveSyncState {
+    fn running(&self) -> bool {
+        self.running
+    }
+    fn set_running(&mut self, running: bool) {
+        self.running = running;
+    }
+    fn rerun(&self) -> bool {
+        self.rerun
+    }
+    fn set_rerun(&mut self, rerun: bool) {
+        self.rerun = rerun;
+    }
+    fn reset_for_rerun(&mut self) {
+        self.processed = 0;
+        self.total = None;
+        self.account = None;
+    }
+}
+
+impl connector_sync::SyncSlot for OneDriveSyncState {
+    fn running(&self) -> bool {
+        self.running
+    }
+    fn set_running(&mut self, running: bool) {
+        self.running = running;
+    }
+    fn rerun(&self) -> bool {
+        self.rerun
+    }
+    fn set_rerun(&mut self, rerun: bool) {
+        self.rerun = rerun;
+    }
+    fn reset_for_rerun(&mut self) {
+        self.processed = 0;
+        self.total = None;
+        self.account = None;
+    }
+}
+
+impl connector_sync::SyncSlot for LocalFolderSyncState {
+    fn running(&self) -> bool {
+        self.running
+    }
+    fn set_running(&mut self, running: bool) {
+        self.running = running;
+    }
+    fn rerun(&self) -> bool {
+        self.rerun
+    }
+    fn set_rerun(&mut self, rerun: bool) {
+        self.rerun = rerun;
+    }
+    fn reset_for_rerun(&mut self) {
+        self.processed = 0;
+        self.total = None;
+        self.folder = None;
+    }
 }
 
 /// A snapshot of the currently-running backup or restore (if any), shared so the Backup

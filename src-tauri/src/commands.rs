@@ -28,10 +28,10 @@ use crate::retrieval_diag;
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
 use crate::{
-    applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, context_budget, cost, db,
-    drive, entities, flags, index_only, localfolder, lock_session, microsoft, onedrive, openrouter,
-    outlook_calendar, paths, preferences, recommend, secrets, vault, AppState, BusyGuard,
-    VaultRuntime,
+    applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, connector_sync,
+    context_budget, cost, db, drive, entities, flags, index_only, localfolder, lock_session,
+    microsoft, onedrive, openrouter, outlook_calendar, paths, preferences, recommend, secrets,
+    vault, AppState, BusyGuard, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one. Swappable in Settings and
@@ -3800,17 +3800,19 @@ pub fn resume_drive_sync(app: AppHandle) -> Result<bool> {
 /// interrupted run is resumed on next launch. Already-indexed files survive (each is committed as it
 /// goes), so a stop or crash never loses work. Returns the number of items touched by the last pass.
 async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
-    // Claim the single-flight slot, or fold this request into a follow-up pass if one is running.
+    let st: &AppState = app.state::<AppState>().inner();
+    // Claim the single-flight slot, or fold this request into the running pass's follow-up sweep. The
+    // guard clears `running` on drop — including if a pass panics — so a crashed sync can't wedge the
+    // connector with `running = true` for the rest of the session (F-43).
+    let Some(guard) = connector_sync::SyncRunGuard::claim(&st.drive_sync)? else {
+        return Ok(0);
+    };
+    // Reset the snapshot for this run (the guard already holds `running`).
     {
-        let state = app.state::<AppState>();
-        let mut snap = state
+        let mut snap = st
             .drive_sync
             .lock()
             .map_err(|_| Error::Other("drive sync state poisoned".into()))?;
-        if snap.running {
-            snap.rerun = true;
-            return Ok(0);
-        }
         *snap = crate::DriveSyncState {
             running: true,
             account: account.clone(),
@@ -3819,11 +3821,10 @@ async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usi
     }
     // Fresh stop flag for this run; persist a crash-resume marker (cleared on the clean exit below).
     {
-        let state = app.state::<AppState>();
-        state.drive_sync_cancel.store(false, Ordering::SeqCst);
+        st.drive_sync_cancel.store(false, Ordering::SeqCst);
         // Bind the guard to a named local before `if let`, so the `Result` temporary (which borrows
-        // `state`) is dropped before `state` is — otherwise it outlives the borrow (E0597).
-        let conn = state.conn();
+        // `st`) is dropped before `st` is — otherwise it outlives the borrow (E0597).
+        let conn = st.conn();
         if let Ok(conn) = conn {
             let marker = serde_json::to_string(&account).unwrap_or_else(|_| "null".to_string());
             let _ = db::set_setting(&conn, DRIVE_SYNC_PENDING_KEY, &marker);
@@ -3835,26 +3836,9 @@ async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usi
     loop {
         result = run_drive_sync(app, pass_account).await;
         let stopped = sync_cancelled(app);
-        // Check-and-clear `rerun` and clear `running` under one lock, so a request landing exactly as
-        // we finish isn't lost to a race against `running = false`.
-        let again = {
-            let state = app.state::<AppState>();
-            let mut snap = state
-                .drive_sync
-                .lock()
-                .map_err(|_| Error::Other("drive sync state poisoned".into()))?;
-            if snap.rerun && !stopped {
-                snap.rerun = false;
-                snap.processed = 0;
-                snap.total = None;
-                snap.account = None;
-                true
-            } else {
-                snap.running = false;
-                false
-            }
-        };
-        if !again {
+        // The guard drains `rerun` and clears `running` under one lock, so a request landing exactly
+        // as we finish isn't lost to a race against clearing `running`.
+        if !guard.pass_complete(stopped)? {
             break;
         }
         pass_account = None;
@@ -3862,8 +3846,7 @@ async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usi
 
     // Clean exit (finished or stopped): drop the crash-resume marker so launch doesn't re-run it.
     {
-        let state = app.state::<AppState>();
-        let conn = state.conn();
+        let conn = st.conn();
         if let Ok(conn) = conn {
             let _ = db::delete_setting(&conn, DRIVE_SYNC_PENDING_KEY);
         }
@@ -4472,17 +4455,19 @@ pub fn resume_local_folder_sync(app: AppHandle) -> Result<bool> {
 /// global `local://sync` event + [`crate::LocalFolderSyncState`]), and crash-resumable (a marker
 /// persisted while running, cleared on the clean exit). Returns the number of items touched.
 async fn local_sync_core(app: &AppHandle, folder: Option<String>) -> Result<usize> {
-    // Claim the single-flight slot, or fold this request into a follow-up pass if one is running.
+    let st: &AppState = app.state::<AppState>().inner();
+    // Claim the single-flight slot, or fold this request into the running pass's follow-up sweep. The
+    // guard clears `running` on drop — including if a pass panics — so a crashed sync can't wedge the
+    // connector with `running = true` for the rest of the session (F-43).
+    let Some(guard) = connector_sync::SyncRunGuard::claim(&st.local_sync)? else {
+        return Ok(0);
+    };
+    // Reset the snapshot for this run (the guard already holds `running`).
     {
-        let state = app.state::<AppState>();
-        let mut snap = state
+        let mut snap = st
             .local_sync
             .lock()
             .map_err(|_| Error::Other("local sync state poisoned".into()))?;
-        if snap.running {
-            snap.rerun = true;
-            return Ok(0);
-        }
         *snap = crate::LocalFolderSyncState {
             running: true,
             folder: folder.clone(),
@@ -4491,9 +4476,8 @@ async fn local_sync_core(app: &AppHandle, folder: Option<String>) -> Result<usiz
     }
     // Fresh stop flag; persist a crash-resume marker (cleared on the clean exit below).
     {
-        let state = app.state::<AppState>();
-        state.local_sync_cancel.store(false, Ordering::SeqCst);
-        let conn = state.conn();
+        st.local_sync_cancel.store(false, Ordering::SeqCst);
+        let conn = st.conn();
         if let Ok(conn) = conn {
             let marker = serde_json::to_string(&folder).unwrap_or_else(|_| "null".to_string());
             let _ = db::set_setting(&conn, LOCAL_SYNC_PENDING_KEY, &marker);
@@ -4505,32 +4489,15 @@ async fn local_sync_core(app: &AppHandle, folder: Option<String>) -> Result<usiz
     loop {
         result = run_local_sync(app, pass_folder).await;
         let stopped = local_sync_cancelled(app);
-        let again = {
-            let state = app.state::<AppState>();
-            let mut snap = state
-                .local_sync
-                .lock()
-                .map_err(|_| Error::Other("local sync state poisoned".into()))?;
-            if snap.rerun && !stopped {
-                snap.rerun = false;
-                snap.processed = 0;
-                snap.total = None;
-                snap.folder = None;
-                true
-            } else {
-                snap.running = false;
-                false
-            }
-        };
-        if !again {
+        // The guard drains `rerun` and clears `running` under one lock (race-free handoff).
+        if !guard.pass_complete(stopped)? {
             break;
         }
         pass_folder = None;
     }
 
     {
-        let state = app.state::<AppState>();
-        let conn = state.conn();
+        let conn = st.conn();
         if let Ok(conn) = conn {
             let _ = db::delete_setting(&conn, LOCAL_SYNC_PENDING_KEY);
         }
@@ -5992,16 +5959,19 @@ pub fn resume_onedrive_sync(app: AppHandle) -> Result<bool> {
 /// index-only: a pointer + embedding, the body fetched live. Never holds the DB lock across a
 /// network/embed call (rule #4).
 async fn onedrive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
+    let st: &AppState = app.state::<AppState>().inner();
+    // Claim the single-flight slot, or fold this request into the running pass's follow-up sweep. The
+    // guard clears `running` on drop — including if a pass panics — so a crashed sync can't wedge the
+    // connector with `running = true` for the rest of the session (F-43).
+    let Some(guard) = connector_sync::SyncRunGuard::claim(&st.onedrive_sync)? else {
+        return Ok(0);
+    };
+    // Reset the snapshot for this run (the guard already holds `running`).
     {
-        let state = app.state::<AppState>();
-        let mut snap = state
+        let mut snap = st
             .onedrive_sync
             .lock()
             .map_err(|_| Error::Other("onedrive sync state poisoned".into()))?;
-        if snap.running {
-            snap.rerun = true;
-            return Ok(0);
-        }
         *snap = crate::OneDriveSyncState {
             running: true,
             account: account.clone(),
@@ -6009,9 +5979,8 @@ async fn onedrive_sync_core(app: &AppHandle, account: Option<String>) -> Result<
         };
     }
     {
-        let state = app.state::<AppState>();
-        state.onedrive_sync_cancel.store(false, Ordering::SeqCst);
-        let conn = state.conn();
+        st.onedrive_sync_cancel.store(false, Ordering::SeqCst);
+        let conn = st.conn();
         if let Ok(conn) = conn {
             let marker = serde_json::to_string(&account).unwrap_or_else(|_| "null".to_string());
             let _ = db::set_setting(&conn, ONEDRIVE_SYNC_PENDING_KEY, &marker);
@@ -6023,32 +5992,15 @@ async fn onedrive_sync_core(app: &AppHandle, account: Option<String>) -> Result<
     loop {
         result = run_onedrive_sync(app, pass_account).await;
         let stopped = onedrive_sync_cancelled(app);
-        let again = {
-            let state = app.state::<AppState>();
-            let mut snap = state
-                .onedrive_sync
-                .lock()
-                .map_err(|_| Error::Other("onedrive sync state poisoned".into()))?;
-            if snap.rerun && !stopped {
-                snap.rerun = false;
-                snap.processed = 0;
-                snap.total = None;
-                snap.account = None;
-                true
-            } else {
-                snap.running = false;
-                false
-            }
-        };
-        if !again {
+        // The guard drains `rerun` and clears `running` under one lock (race-free handoff).
+        if !guard.pass_complete(stopped)? {
             break;
         }
         pass_account = None;
     }
 
     {
-        let state = app.state::<AppState>();
-        let conn = state.conn();
+        let conn = st.conn();
         if let Ok(conn) = conn {
             let _ = db::delete_setting(&conn, ONEDRIVE_SYNC_PENDING_KEY);
         }
