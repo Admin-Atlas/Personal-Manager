@@ -151,6 +151,30 @@ fn has_index_only(conn: &Connection) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Whether the DB mirror holds an index-only source that `manifest` (the file) is missing — the
+/// signature of the F-20 crash window: [`register_pointer`] commits the row before it writes the
+/// manifest, so a crash between the two leaves a mirror row absent from the portable truth. A cheap
+/// single-column scan compared against the file's id set; drives the gated mirror→file self-heal in
+/// [`reconcile_on_open`] so a normal boot (file already complete) rewrites nothing.
+fn mirror_has_unfiled(conn: &Connection, manifest: &Manifest) -> Result<bool> {
+    let filed: std::collections::HashSet<&str> = manifest
+        .items
+        .iter()
+        .map(|i| i.source_id.as_str())
+        .collect();
+    let mut stmt = conn.prepare(
+        "SELECT source_id FROM documents WHERE source_type = ?1 AND source_id IS NOT NULL",
+    )?;
+    let mut rows = stmt.query(params![ingest::SOURCE_TYPE_INDEX_ONLY])?;
+    while let Some(row) = rows.next()? {
+        let sid: String = row.get(0)?;
+        if !filed.contains(sid.as_str()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Serialize the index-only documents in the DB mirror into manifest items (canonical names; integer
 /// ids stay out of the file).
 fn mirror_items(conn: &Connection) -> Result<Vec<ManifestItem>> {
@@ -304,6 +328,15 @@ pub fn reconcile_on_open(
             let tx = conn.unchecked_transaction()?;
             apply_classification(&tx, &manifest)?;
             tx.commit()?;
+            // F-20 self-heal (mirror→file). `register_pointer` commits the DB row before it writes the
+            // manifest, so a crash in that window leaves an index-only row in the mirror but absent from
+            // the file (the portable truth). `apply_classification` only flows file→DB; without a pass
+            // in the other direction the orphan persists until an unrelated `write_synced`, and a
+            // Rebuild-from-manifest before that drops the item entirely. Union the mirror back into the
+            // file when it holds ids the file lacks — gated so a normal boot rewrites nothing.
+            if mirror_has_unfiled(conn, &manifest)? {
+                write_synced(conn, vault_root, cipher)?;
+            }
             Ok(())
         }
         Ok(None) => {
@@ -495,7 +528,7 @@ pub fn rebuild_from_manifest(
     };
     let (mut restored, mut failed) = (0usize, 0usize);
     for item in &manifest.items {
-        match restore_item(state, gateway, item) {
+        match restore_item(state, gateway, vault_root, cipher, item) {
             Ok(()) => restored += 1,
             Err(e) => {
                 failed += 1;
@@ -508,8 +541,51 @@ pub fn rebuild_from_manifest(
     Ok((restored, failed))
 }
 
+/// Self-heal a stale manifest entry left by a promote (F-21). When a source is promoted to a full
+/// local import ([`crate::ingest::promote_spreadsheet`] / note-promote), a non-index-only document
+/// owns its `source_id`, and the promote strips the manifest entry — but that strip lands AFTER the DB
+/// commit, so a crash between them can leave the id in the file. On the next Rebuild the vault walk
+/// re-creates the promoted document first, so [`restore_item`] re-inserting an index-only row with the
+/// same `source_id` would collide on the `idx_documents_source_id` UNIQUE index and fail that item on
+/// EVERY Rebuild forever. Mirror [`register_pointer`]'s already-promoted guard: if a non-index-only doc
+/// owns the id, strip the stale entry (idempotent [`forget_source`]) and report the skip. Returns
+/// whether the item was a promoted stale entry (and was healed).
+fn heal_if_promoted(
+    conn: &Connection,
+    vault_root: &Path,
+    cipher: &ManifestCipher,
+    source_id: &str,
+) -> Result<bool> {
+    let promoted = conn
+        .query_row(
+            "SELECT 1 FROM documents WHERE source_id = ?1 AND source_type != ?2",
+            params![source_id, ingest::SOURCE_TYPE_INDEX_ONLY],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if promoted {
+        forget_source(vault_root, cipher, source_id)?;
+    }
+    Ok(promoted)
+}
+
 /// Re-create one index-only document row from its manifest item, re-embedding from the summary.
-fn restore_item(state: &AppState, gateway: &ModelGateway<'_>, item: &ManifestItem) -> Result<()> {
+fn restore_item(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    vault_root: &Path,
+    cipher: &ManifestCipher,
+    item: &ManifestItem,
+) -> Result<()> {
+    // F-21: skip + self-heal a stale entry whose source was already promoted to a full import, rather
+    // than colliding on the `source_id` UNIQUE index and failing this item on every future Rebuild.
+    {
+        let conn = state.conn()?;
+        if heal_if_promoted(&conn, vault_root, cipher, &item.source_id)? {
+            return Ok(());
+        }
+    }
     let summary = item
         .stored_summary
         .as_deref()
@@ -1330,6 +1406,22 @@ mod tests {
         .unwrap();
     }
 
+    /// A full local import (e.g. a promoted spreadsheet) that owns `source_id` with a non-index-only
+    /// type — the DB half of the F-21 post-promote crash window.
+    fn insert_promoted(conn: &Connection, source_id: &str) {
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type, source_id, project) \
+             VALUES (?1, 'T', ?2, ?3, ?4, 'Unsorted')",
+            params![
+                format!("vault/{source_id}.md"),
+                format!("h-{source_id}"),
+                ingest::SOURCE_TYPE_SPREADSHEET,
+                source_id
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn reconcile_applies_the_file_classification_onto_existing_rows() {
         // The manifest is the portable truth for classification: when it disagrees with the DB row
@@ -1437,6 +1529,123 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         forget_source(empty.path(), &cipher, "anything").unwrap();
         assert!(read_manifest(empty.path(), &cipher).unwrap().is_none());
+    }
+
+    #[test]
+    fn reconcile_self_heals_a_mirror_row_missing_from_the_file() {
+        // F-20: `register_pointer` commits the DB row before it writes the manifest, so a crash in that
+        // window leaves an index-only row in the mirror but absent from the file. `reconcile_on_open`
+        // must union it back (mirror→file), or a later Rebuild-from-manifest drops the item entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+
+        // The file has only s2 (awaiting Rebuild); the DB mirror additionally holds the orphaned s1.
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("s2", "Archive")],
+            },
+        )
+        .unwrap();
+        insert_index_only(&conn, "s1", "Unsorted");
+
+        reconcile_on_open(&conn, dir.path(), &cipher).unwrap();
+
+        let ids: std::collections::HashSet<String> = read_manifest(dir.path(), &cipher)
+            .unwrap()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|i| i.source_id)
+            .collect();
+        assert!(
+            ids.contains("s1"),
+            "the orphaned mirror row is healed into the file"
+        );
+        assert!(
+            ids.contains("s2"),
+            "the awaiting-Rebuild file item is preserved, not dropped"
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_rewrite_a_complete_manifest() {
+        // The self-heal is gated: when the file already lists every mirror id, reconcile must not
+        // rewrite the manifest. Each write re-nonces the ciphertext, so byte-identical bytes prove no
+        // write happened (a normal boot must not churn the file or a backup diff every session).
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+
+        insert_index_only(&conn, "s1", "Unsorted");
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("s1", "Unsorted")],
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(manifest_path(dir.path())).unwrap();
+
+        reconcile_on_open(&conn, dir.path(), &cipher).unwrap();
+
+        let after = std::fs::read(manifest_path(dir.path())).unwrap();
+        assert_eq!(
+            before, after,
+            "a complete manifest is not needlessly rewritten"
+        );
+    }
+
+    #[test]
+    fn restore_skips_and_heals_a_promoted_source() {
+        // F-21: after a promote a non-index-only document owns the source_id, but a crash between the
+        // promote's commit and `forget_source` can leave the stale id in the manifest. On Rebuild the
+        // vault walk re-creates the promoted doc first, so re-inserting an index-only row would collide
+        // on the `source_id` UNIQUE index and fail forever. The guard must skip AND strip the entry.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+
+        // The manifest still lists s1; the DB has s1 as a PROMOTED (non-index-only) document.
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("s1", "Taxes"), item("s2", "Archive")],
+            },
+        )
+        .unwrap();
+        insert_promoted(&conn, "s1");
+
+        assert!(
+            heal_if_promoted(&conn, dir.path(), &cipher, "s1").unwrap(),
+            "a promoted source is detected and skipped"
+        );
+        let ids: Vec<String> = read_manifest(dir.path(), &cipher)
+            .unwrap()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|i| i.source_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["s2".to_string()],
+            "the stale promoted entry is stripped; other items stay"
+        );
+
+        // A genuine index-only source (no promoted owner) is NOT treated as promoted — restore proceeds.
+        insert_index_only(&conn, "s2", "Archive");
+        assert!(
+            !heal_if_promoted(&conn, dir.path(), &cipher, "s2").unwrap(),
+            "an index-only source is not mistaken for a promoted one"
+        );
     }
 
     // --- folder-scoped reconcile planner (pure) ---
