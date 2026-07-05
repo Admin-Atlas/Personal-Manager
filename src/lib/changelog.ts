@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.5-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Under-the-hood tidying: the Google Drive, OneDrive, and local-folder sync engines now share one copy of their common plumbing (the single-flight/crash-recovery wrapper and the indexing step) instead of three near-identical copies. Syncing behaves exactly as before — this just means future fixes land in one place.",
+    ],
+  },
+  {
     version: "2.92.4-alpha",
     date: "2026-07-05",
     highlights: [

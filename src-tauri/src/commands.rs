@@ -3801,57 +3801,15 @@ pub fn resume_drive_sync(app: AppHandle) -> Result<bool> {
 /// goes), so a stop or crash never loses work. Returns the number of items touched by the last pass.
 async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
     let st: &AppState = app.state::<AppState>().inner();
-    // Claim the single-flight slot, or fold this request into the running pass's follow-up sweep. The
-    // guard clears `running` on drop — including if a pass panics — so a crashed sync can't wedge the
-    // connector with `running = true` for the rest of the session (F-43).
-    let Some(guard) = connector_sync::SyncRunGuard::claim(&st.drive_sync)? else {
-        return Ok(0);
-    };
-    // Reset the snapshot for this run (the guard already holds `running`).
-    {
-        let mut snap = st
-            .drive_sync
-            .lock()
-            .map_err(|_| Error::Other("drive sync state poisoned".into()))?;
-        *snap = crate::DriveSyncState {
-            running: true,
-            account: account.clone(),
-            ..Default::default()
-        };
-    }
-    // Fresh stop flag for this run; persist a crash-resume marker (cleared on the clean exit below).
-    {
-        st.drive_sync_cancel.store(false, Ordering::SeqCst);
-        // Bind the guard to a named local before `if let`, so the `Result` temporary (which borrows
-        // `st`) is dropped before `st` is — otherwise it outlives the borrow (E0597).
-        let conn = st.conn();
-        if let Ok(conn) = conn {
-            let marker = serde_json::to_string(&account).unwrap_or_else(|_| "null".to_string());
-            let _ = db::set_setting(&conn, DRIVE_SYNC_PENDING_KEY, &marker);
-        }
-    }
-
-    let mut pass_account = account;
-    let mut result;
-    loop {
-        result = run_drive_sync(app, pass_account).await;
-        let stopped = sync_cancelled(app);
-        // The guard drains `rerun` and clears `running` under one lock, so a request landing exactly
-        // as we finish isn't lost to a race against clearing `running`.
-        if !guard.pass_complete(stopped)? {
-            break;
-        }
-        pass_account = None;
-    }
-
-    // Clean exit (finished or stopped): drop the crash-resume marker so launch doesn't re-run it.
-    {
-        let conn = st.conn();
-        if let Ok(conn) = conn {
-            let _ = db::delete_setting(&conn, DRIVE_SYNC_PENDING_KEY);
-        }
-    }
-    result
+    connector_sync::run_detached_sync(
+        st,
+        &st.drive_sync,
+        &st.drive_sync_cancel,
+        DRIVE_SYNC_PENDING_KEY,
+        account,
+        |target| run_drive_sync(app, target),
+    )
+    .await
 }
 
 /// One sync pass: gather each account's work, then process it. Split out so [`drive_sync_core`] can
@@ -4040,8 +3998,10 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                 None,
             );
             let app2 = app.clone();
-            let _ = tokio::task::spawn_blocking(move || apply_drive_actions(&app2, &actions, None))
-                .await;
+            let _ = tokio::task::spawn_blocking(move || {
+                connector_sync::apply_connector_actions(&app2, &actions, None)
+            })
+            .await;
             let state = app.state::<AppState>();
             let conn = state.conn()?;
             drive::set_state(&conn, &w.email, "error")?;
@@ -4096,7 +4056,7 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
                 drive::read_item_state(&conn, &source_id)?
             };
             let actions = index_only::react(event, current.as_ref());
-            let category = action_category(&actions);
+            let category = connector_sync::action_category(&actions);
 
             let needs_body = actions.iter().any(|a| {
                 matches!(
@@ -4166,16 +4126,17 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
             };
 
             let app2 = app.clone();
-            let apply =
-                tokio::task::spawn_blocking(move || apply_drive_actions(&app2, &actions, fetched))
-                    .await
-                    .map_err(|e| Error::Other(format!("drive apply task panicked: {e}")))?;
+            let apply = tokio::task::spawn_blocking(move || {
+                connector_sync::apply_connector_actions(&app2, &actions, fetched)
+            })
+            .await
+            .map_err(|e| Error::Other(format!("drive apply task panicked: {e}")))?;
             match apply {
                 Ok(()) => match category {
-                    DriveActionKind::Indexed => indexed += 1,
-                    DriveActionKind::Updated => updated += 1,
-                    DriveActionKind::Removed => removed += 1,
-                    DriveActionKind::Other => skipped += 1,
+                    connector_sync::ActionKind::Indexed => indexed += 1,
+                    connector_sync::ActionKind::Updated => updated += 1,
+                    connector_sync::ActionKind::Removed => removed += 1,
+                    connector_sync::ActionKind::Other => skipped += 1,
                 },
                 Err(e) => {
                     failed += 1;
@@ -4251,66 +4212,9 @@ async fn run_drive_sync(app: &AppHandle, account: Option<String>) -> Result<usiz
     Ok(indexed + updated + removed)
 }
 
-/// Which tally bucket a reducer's actions fall into, for the sync summary.
-enum DriveActionKind {
-    Indexed,
-    Updated,
-    Removed,
-    Other,
-}
-
-fn action_category(actions: &[index_only::Action]) -> DriveActionKind {
-    if actions
-        .iter()
-        .any(|a| matches!(a, index_only::Action::IngestNew { .. }))
-    {
-        DriveActionKind::Indexed
-    } else if actions
-        .iter()
-        .any(|a| matches!(a, index_only::Action::ReEmbed { .. }))
-    {
-        DriveActionKind::Updated
-    } else if actions.iter().any(|a| {
-        matches!(
-            a,
-            index_only::Action::SetState {
-                state: index_only::SourceState::SourceMissing,
-                ..
-            }
-        )
-    }) {
-        DriveActionKind::Removed
-    } else {
-        DriveActionKind::Other
-    }
-}
-
-/// Run a reducer's actions against the store + manifest, on a blocking thread (the index-only
-/// executor embeds via the sidecar). Mirrors `dev_apply_change_event`'s execution shape.
-fn apply_drive_actions(
-    app: &AppHandle,
-    actions: &[index_only::Action],
-    fetched: Option<index_only::PointerInput>,
-) -> Result<()> {
-    let state = app.state::<AppState>();
-    let (vault_root, cipher) = state.manifest_io()?;
-    // Gentle mode caps the embedding batch to bound peak memory. `apply_drive_actions` runs once per
-    // item, so reading it here also makes gentle batching engage mid-sync (alongside the pause).
-    let gateway = {
-        let conn = state.conn()?;
-        state
-            .gateway_for_write(&conn)?
-            .with_embed_batch(db::indexing_embed_batch(&conn))
-    };
-    index_only::apply_actions(
-        state.inner(),
-        &gateway,
-        &vault_root,
-        &cipher,
-        actions,
-        fetched.as_ref(),
-    )
-}
+// The per-item tally + the blocking index-only executor both now live in `connector_sync` (one copy
+// for all three connectors): `connector_sync::action_category` / `ActionKind` and
+// `connector_sync::apply_connector_actions`.
 
 // ===== Local-folder indexing (board card 6) =====
 //
@@ -4467,53 +4371,15 @@ pub fn resume_local_folder_sync(app: AppHandle) -> Result<bool> {
 /// persisted while running, cleared on the clean exit). Returns the number of items touched.
 async fn local_sync_core(app: &AppHandle, folder: Option<String>) -> Result<usize> {
     let st: &AppState = app.state::<AppState>().inner();
-    // Claim the single-flight slot, or fold this request into the running pass's follow-up sweep. The
-    // guard clears `running` on drop — including if a pass panics — so a crashed sync can't wedge the
-    // connector with `running = true` for the rest of the session (F-43).
-    let Some(guard) = connector_sync::SyncRunGuard::claim(&st.local_sync)? else {
-        return Ok(0);
-    };
-    // Reset the snapshot for this run (the guard already holds `running`).
-    {
-        let mut snap = st
-            .local_sync
-            .lock()
-            .map_err(|_| Error::Other("local sync state poisoned".into()))?;
-        *snap = crate::LocalFolderSyncState {
-            running: true,
-            folder: folder.clone(),
-            ..Default::default()
-        };
-    }
-    // Fresh stop flag; persist a crash-resume marker (cleared on the clean exit below).
-    {
-        st.local_sync_cancel.store(false, Ordering::SeqCst);
-        let conn = st.conn();
-        if let Ok(conn) = conn {
-            let marker = serde_json::to_string(&folder).unwrap_or_else(|_| "null".to_string());
-            let _ = db::set_setting(&conn, LOCAL_SYNC_PENDING_KEY, &marker);
-        }
-    }
-
-    let mut pass_folder = folder;
-    let mut result;
-    loop {
-        result = run_local_sync(app, pass_folder).await;
-        let stopped = local_sync_cancelled(app);
-        // The guard drains `rerun` and clears `running` under one lock (race-free handoff).
-        if !guard.pass_complete(stopped)? {
-            break;
-        }
-        pass_folder = None;
-    }
-
-    {
-        let conn = st.conn();
-        if let Ok(conn) = conn {
-            let _ = db::delete_setting(&conn, LOCAL_SYNC_PENDING_KEY);
-        }
-    }
-    result
+    connector_sync::run_detached_sync(
+        st,
+        &st.local_sync,
+        &st.local_sync_cancel,
+        LOCAL_SYNC_PENDING_KEY,
+        folder,
+        |target| run_local_sync(app, target),
+    )
+    .await
 }
 
 /// One folder's gathered work: the walk result + the known-item set, or a `missing` root to fan out.
@@ -4833,7 +4699,7 @@ async fn reconcile_present_file(
         }
     };
     let actions = index_only::react(event, cur_state.as_ref());
-    let category = action_category(&actions);
+    let category = connector_sync::action_category(&actions);
     let needs_body = actions.iter().any(|a| {
         matches!(
             a,
@@ -4845,8 +4711,8 @@ async fn reconcile_present_file(
             Ok(Some(input)) => {
                 apply_local_actions_off_lock(app, actions, Some(input)).await?;
                 Ok(match category {
-                    DriveActionKind::Indexed => PresentOutcome::Indexed,
-                    DriveActionKind::Updated => PresentOutcome::Updated,
+                    connector_sync::ActionKind::Indexed => PresentOutcome::Indexed,
+                    connector_sync::ActionKind::Updated => PresentOutcome::Updated,
                     _ => PresentOutcome::NoChange,
                 })
             }
@@ -4927,42 +4793,20 @@ async fn build_local_pointer(
     }))
 }
 
-/// Run a reducer's actions against the store + manifest on a blocking thread (the index-only executor
-/// embeds via the sidecar). The local sibling of [`apply_drive_actions`].
-fn apply_local_actions(
-    app: &AppHandle,
-    actions: &[index_only::Action],
-    fetched: Option<index_only::PointerInput>,
-) -> Result<()> {
-    let state = app.state::<AppState>();
-    let (vault_root, cipher) = state.manifest_io()?;
-    let gateway = {
-        let conn = state.conn()?;
-        state
-            .gateway_for_write(&conn)?
-            .with_embed_batch(db::indexing_embed_batch(&conn))
-    };
-    index_only::apply_actions(
-        state.inner(),
-        &gateway,
-        &vault_root,
-        &cipher,
-        actions,
-        fetched.as_ref(),
-    )
-}
-
-/// [`apply_local_actions`] on a blocking thread, awaited — so the async driver never runs the sidecar
-/// on the runtime.
+/// [`connector_sync::apply_connector_actions`] on a blocking thread, awaited — so the async driver
+/// never runs the sidecar on the runtime. Local applies per file mid-pass, so it needs the async form
+/// (the cloud engines spawn_blocking the shared apply inline).
 async fn apply_local_actions_off_lock(
     app: &AppHandle,
     actions: Vec<index_only::Action>,
     fetched: Option<index_only::PointerInput>,
 ) -> Result<()> {
     let app2 = app.clone();
-    tokio::task::spawn_blocking(move || apply_local_actions(&app2, &actions, fetched))
-        .await
-        .map_err(|e| Error::Other(format!("local apply task panicked: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        connector_sync::apply_connector_actions(&app2, &actions, fetched)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("local apply task panicked: {e}")))?
 }
 
 // --- the live filesystem watcher (board card 6, PR2) -----------------------
@@ -5693,7 +5537,7 @@ mod reader_tests {
 // are mechanical: a public client (no secret), the Graph delta query (one endpoint does first-sync
 // AND incremental), and a single personal-drive corpus (no shared drives) that is either whole-drive
 // (delta cursor) or folder-scoped (re-enumerate + reconcile). It reuses the index-only foundation,
-// the gentle-mode pacing, and `apply_drive_actions` / `action_category` unchanged.
+// the gentle-mode pacing, and `connector_sync::apply_connector_actions` / `action_category` unchanged.
 
 /// The OneDrive connector's state for Settings: whether the BYO Microsoft client id is configured,
 /// plus every connected account (each independent — its own token, sync, and items).
@@ -5971,52 +5815,15 @@ pub fn resume_onedrive_sync(app: AppHandle) -> Result<bool> {
 /// network/embed call (rule #4).
 async fn onedrive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
     let st: &AppState = app.state::<AppState>().inner();
-    // Claim the single-flight slot, or fold this request into the running pass's follow-up sweep. The
-    // guard clears `running` on drop — including if a pass panics — so a crashed sync can't wedge the
-    // connector with `running = true` for the rest of the session (F-43).
-    let Some(guard) = connector_sync::SyncRunGuard::claim(&st.onedrive_sync)? else {
-        return Ok(0);
-    };
-    // Reset the snapshot for this run (the guard already holds `running`).
-    {
-        let mut snap = st
-            .onedrive_sync
-            .lock()
-            .map_err(|_| Error::Other("onedrive sync state poisoned".into()))?;
-        *snap = crate::OneDriveSyncState {
-            running: true,
-            account: account.clone(),
-            ..Default::default()
-        };
-    }
-    {
-        st.onedrive_sync_cancel.store(false, Ordering::SeqCst);
-        let conn = st.conn();
-        if let Ok(conn) = conn {
-            let marker = serde_json::to_string(&account).unwrap_or_else(|_| "null".to_string());
-            let _ = db::set_setting(&conn, ONEDRIVE_SYNC_PENDING_KEY, &marker);
-        }
-    }
-
-    let mut pass_account = account;
-    let mut result;
-    loop {
-        result = run_onedrive_sync(app, pass_account).await;
-        let stopped = onedrive_sync_cancelled(app);
-        // The guard drains `rerun` and clears `running` under one lock (race-free handoff).
-        if !guard.pass_complete(stopped)? {
-            break;
-        }
-        pass_account = None;
-    }
-
-    {
-        let conn = st.conn();
-        if let Ok(conn) = conn {
-            let _ = db::delete_setting(&conn, ONEDRIVE_SYNC_PENDING_KEY);
-        }
-    }
-    result
+    connector_sync::run_detached_sync(
+        st,
+        &st.onedrive_sync,
+        &st.onedrive_sync_cancel,
+        ONEDRIVE_SYNC_PENDING_KEY,
+        account,
+        |target| run_onedrive_sync(app, target),
+    )
+    .await
 }
 
 /// One OneDrive sync pass: gather each account's work, then process it.
@@ -6165,8 +5972,10 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
                 None,
             );
             let app2 = app.clone();
-            let _ = tokio::task::spawn_blocking(move || apply_drive_actions(&app2, &actions, None))
-                .await;
+            let _ = tokio::task::spawn_blocking(move || {
+                connector_sync::apply_connector_actions(&app2, &actions, None)
+            })
+            .await;
             let state = app.state::<AppState>();
             let conn = state.conn()?;
             onedrive::set_state(&conn, &w.email, "error")?;
@@ -6219,7 +6028,7 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
                 onedrive::read_item_state(&conn, &source_id)?
             };
             let actions = index_only::react(event, current.as_ref());
-            let category = action_category(&actions);
+            let category = connector_sync::action_category(&actions);
 
             let needs_body = actions.iter().any(|a| {
                 matches!(
@@ -6283,16 +6092,17 @@ async fn run_onedrive_sync(app: &AppHandle, account: Option<String>) -> Result<u
             };
 
             let app2 = app.clone();
-            let apply =
-                tokio::task::spawn_blocking(move || apply_drive_actions(&app2, &actions, fetched))
-                    .await
-                    .map_err(|e| Error::Other(format!("onedrive apply task panicked: {e}")))?;
+            let apply = tokio::task::spawn_blocking(move || {
+                connector_sync::apply_connector_actions(&app2, &actions, fetched)
+            })
+            .await
+            .map_err(|e| Error::Other(format!("onedrive apply task panicked: {e}")))?;
             match apply {
                 Ok(()) => match category {
-                    DriveActionKind::Indexed => indexed += 1,
-                    DriveActionKind::Updated => updated += 1,
-                    DriveActionKind::Removed => removed += 1,
-                    DriveActionKind::Other => skipped += 1,
+                    connector_sync::ActionKind::Indexed => indexed += 1,
+                    connector_sync::ActionKind::Updated => updated += 1,
+                    connector_sync::ActionKind::Removed => removed += 1,
+                    connector_sync::ActionKind::Other => skipped += 1,
                 },
                 Err(e) => {
                     failed += 1;
