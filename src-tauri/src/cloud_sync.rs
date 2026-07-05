@@ -305,9 +305,14 @@ async fn run_cloud_pass<C: CloudDriver>(
     account: Option<String>,
 ) -> Result<usize> {
     // The engine is needed for index-only embedding + binary conversion — ensure it once up front.
+    // `ensure_installed` is blocking (a first run installs the Python venv + deps), so keep it off
+    // the async runtime — run it on the blocking pool so a first-sync-after-install can't pin a
+    // tokio worker (F-41). The cloned handle reaches AppState inside the closure.
     {
-        let state = app.state::<AppState>();
-        state.sidecar.ensure_installed()?;
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || app.state::<AppState>().sidecar.ensure_installed())
+            .await
+            .map_err(|e| Error::Other(format!("sidecar install task panicked: {e}")))??;
     }
 
     let emails: Vec<String> = {
