@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.91.5-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Safety fix for “Remove PM data”: if you had moved your vault into a folder that also held your own files, removing PM’s data now clears only PM’s files and leaves everything else untouched. Previously it could delete that whole folder. If PM had the folder to itself, the now-empty folder is tidied away as before.",
+    ],
+  },
+  {
     version: "2.91.4-alpha",
     date: "2026-07-05",
     highlights: [

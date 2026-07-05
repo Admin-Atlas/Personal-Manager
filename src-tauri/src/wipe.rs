@@ -172,6 +172,27 @@ fn remove_dir_all_retrying(path: &Path) {
     let _ = std::fs::remove_dir_all(path); // final try; ignore a residual locked file
 }
 
+/// Remove a directory **only if it is empty**, tolerating the same brief Windows handle-release lag
+/// as [`remove_dir_all_retrying`]. `remove_dir` is non-recursive, so this can only ever delete a
+/// folder PM had to itself: a relocated vault whose user-chosen root still holds the user's
+/// unrelated files can never be removed here (the call just fails, harmlessly). Retrying is
+/// therefore always safe — it only helps the transient "empty, but a just-deleted child's handle
+/// hasn't closed yet" case; a genuinely non-empty folder never succeeds and is left intact.
+fn remove_empty_dir_retrying(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    for attempt in 0..3 {
+        if std::fs::remove_dir(path).is_ok() || !path.exists() {
+            return;
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    let _ = std::fs::remove_dir(path); // final try; a root that still holds unrelated files just stays
+}
+
 /// Execute the confirmed removal. The UI has already gated this behind the full confirmation ladder
 /// (explicit checkboxes → "are you sure" itemisation → optional Windows Hello → type-to-confirm), so
 /// this simply carries it out in a safe order and reports what happened.
@@ -271,11 +292,16 @@ pub async fn wipe_pm_data(
         let _ = vault::lock::clear_baton_files(&resolved.vault_root);
         let _ = vault::migrate::clear_journal(&resolved.vault_root);
         remove_dir_all_retrying(&resolved.markdown_dir);
-        // A relocated vault's external root can go wholesale; also clear the pointer so PM reverts to
-        // the default location on next launch instead of chasing a folder that no longer exists.
+        // A relocated vault lives in a folder the *user* chose (`move_vault` passes their path
+        // straight through, commands.rs), which may already hold unrelated files. Its PM artifacts
+        // were each removed individually just above, so remove the root itself only if it is now
+        // empty — i.e. PM had the folder to itself. Never wholesale (`remove_dir_all`): that would
+        // take the user's other files in e.g. `D:\Documents` with it (F-03/B1-2).
         if resolved.vault_root != data_dir {
-            remove_dir_all_retrying(&resolved.vault_root);
+            remove_empty_dir_retrying(&resolved.vault_root);
         }
+        // Clear the pointer unconditionally so PM reverts to the default location on next launch,
+        // whether or not the relocated root was left standing (it may still hold the user's files).
         let _ = vault::pointer::clear(&data_dir);
 
         report.removed.push("Vault & encrypted database".into());
@@ -409,5 +435,53 @@ mod tests {
         // An empty account_email never yields a dangling `prefix::` key (filtered in SQL).
         let conn = conn_with_accounts(&[("google", "drive", "")]);
         assert!(enumerate_oauth_accounts(&conn).unwrap().is_empty());
+    }
+
+    // --- F-03: a relocated vault's user-chosen root must never be deleted wholesale ---
+
+    #[test]
+    fn removing_the_vault_root_deletes_it_only_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // The happy case: PM had the relocated folder to itself, so after its artifacts are gone the
+        // root is empty and gets tidied away.
+        let pm_only = tmp.path().join("pm-only-root");
+        std::fs::create_dir(&pm_only).unwrap();
+        remove_empty_dir_retrying(&pm_only);
+        assert!(
+            !pm_only.exists(),
+            "an empty relocated root should be removed"
+        );
+
+        // The dangerous case: the user pointed the vault at a folder that already held their own
+        // files (e.g. `D:\Documents`). PM's artifacts were removed individually upstream; the leftover
+        // unrelated files must survive, and the folder itself must be left standing.
+        let shared = tmp.path().join("Documents");
+        std::fs::create_dir(&shared).unwrap();
+        let their_file = shared.join("taxes-2025.xlsx");
+        std::fs::write(&their_file, b"not PM's to delete").unwrap();
+        let their_subdir = shared.join("photos");
+        std::fs::create_dir(&their_subdir).unwrap();
+
+        remove_empty_dir_retrying(&shared);
+
+        assert!(
+            shared.exists(),
+            "a non-empty relocated root must be left alone"
+        );
+        assert!(their_file.exists(), "the user's file must survive the wipe");
+        assert!(
+            their_subdir.exists(),
+            "the user's subfolder must survive the wipe"
+        );
+        assert_eq!(std::fs::read(&their_file).unwrap(), b"not PM's to delete");
+    }
+
+    #[test]
+    fn removing_a_missing_root_is_a_no_op() {
+        // The default-location case (vault_root == data_dir) never calls this, but a caller that
+        // passes an already-gone path must not error.
+        let tmp = tempfile::tempdir().unwrap();
+        remove_empty_dir_retrying(&tmp.path().join("never-existed"));
     }
 }
