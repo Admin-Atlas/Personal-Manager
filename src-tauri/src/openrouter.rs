@@ -329,8 +329,18 @@ where
     // fully-uncached behaviour.
     let body = chat_body(models, messages, true, cache_through);
 
+    // A long, healthy streamed reply can legitimately run for many minutes (a slow or reasoning model,
+    // a large grounded answer). Bounding the WHOLE request with a total `.timeout` therefore severs a
+    // reply mid-stream — the user watches tokens arrive, then gets an error, and the aborted turn is
+    // never persisted → via F-02 the conversation wedges (F-16 / B4-5). The total deadline was only ever
+    // meant to bound a hung connection, not a healthy slow stream. Replace it with the two signals that
+    // actually indicate a dead connection: `connect_timeout` bounds establishing the socket, and
+    // `read_timeout` bounds *silence between chunks* — it resets on every byte received, so steady tokens
+    // never trip it however long the reply, while a genuinely stalled stream still aborts. Non-streaming
+    // `complete` keeps its total deadline: there the whole answer arrives at once, so a total bound fits.
     let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
         .build()?
         .post(ENDPOINT)
         .bearer_auth(api_key)

@@ -951,8 +951,22 @@ pub async fn send_message(
             |row| row.get(0),
         )?;
 
+        // Self-heal a wedged conversation (F-02 / B5-1): a previous send whose reply stream failed
+        // (network/provider/timeout/over-window) — or a crash between persisting the user turn and its
+        // reply — leaves a reply-less user row that would trip `assert_user_turn_allowed` below and refuse
+        // every future send forever (the only prior escape: deleting the whole chat). Discard that orphan
+        // first; it was never vault-written or indexed (only completed pairs are), so this touches no truth
+        // — the user is simply resending. A no-op on a healthy conversation.
+        if chat::discard_dangling_user_turn(&conn, conversation_id)? {
+            eprintln!(
+                "chat: conversation {conversation_id} had an unanswered user turn from a prior failed \
+                 send; discarded it so this send can proceed"
+            );
+        }
+
         // Strict turn alternation (card 7A): refuse a second consecutive user turn so a turn-pair is
-        // always unambiguous. The UI already maintains this, so it is an invariant guard, not a new gate.
+        // always unambiguous. The UI already maintains this, and any recoverable orphan was cleared just
+        // above, so this now only fires on a genuine logic error — an invariant guard, not a new gate.
         chat::assert_user_turn_allowed(&conn, conversation_id)?;
         conn.execute(
             "INSERT INTO messages(conversation_id, role, content) VALUES (?1, 'user', ?2)",

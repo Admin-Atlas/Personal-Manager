@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.91.6-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Chat reliability: if a reply ever fails to come back — a dropped connection, a provider hiccup — that conversation is no longer stuck. Just send your next message and it carries on as normal; previously the only way out was deleting the whole chat.",
+      "Long answers are no longer cut off. A reply that takes several minutes to write now streams to the end instead of stopping partway; PM only gives up if the connection actually goes silent.",
+    ],
+  },
+  {
     version: "2.91.5-alpha",
     date: "2026-07-05",
     highlights: [
