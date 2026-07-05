@@ -55,3 +55,14 @@ export function formatDateTime(iso: string): string {
   if (Number.isNaN(d.getTime())) return iso;
   return `${formatDate(iso)} ${formatClock(d)}`;
 }
+
+/**
+ * A connector's "last synced" timestamp as a full local wall-clock string (date + time). Deliberately
+ * the OS locale format ({@link Date.toLocaleString}), NOT the app's DD-MM-YYYY — a returning user wants
+ * the exact moment the last sync ran. Leaves an unparseable value as-is. Shared by the index-only
+ * connectors (Drive / OneDrive / local folders).
+ */
+export function formatWhen(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}

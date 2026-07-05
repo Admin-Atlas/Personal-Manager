@@ -6,8 +6,7 @@ import { useDepth } from "../theme";
 import { driveStatus, oneDriveStatus } from "../lib/ipc";
 import { Collapsible, SegmentedControl } from "./ui";
 import { CalendarConnection } from "./CalendarConnection";
-import { GoogleDriveConnection } from "./GoogleDriveConnection";
-import { OneDriveConnection } from "./OneDriveConnection";
+import { CloudDriveConnection } from "./CloudDriveConnection";
 import { LocalFolderConnection } from "./LocalFolderConnection";
 import { GoogleCredentialBlock } from "./GoogleCredentialBlock";
 import { MicrosoftCredentialBlock } from "./MicrosoftCredentialBlock";
@@ -115,7 +114,7 @@ function GoogleProvider() {
       <Divider />
       <CalendarConnection provider="google" refreshSignal={signal} />
       <Divider />
-      <GoogleDriveConnection refreshSignal={signal} />
+      <CloudDriveConnection provider="google" refreshSignal={signal} />
       <Divider />
       <ComingSoonRow name="Gmail" />
     </ConnectorGroup>
@@ -156,7 +155,7 @@ function MicrosoftProvider() {
     >
       <MicrosoftCredentialBlock configured={configured} onChange={onClientChange} />
       <Divider />
-      <OneDriveConnection refreshSignal={signal} />
+      <CloudDriveConnection provider="microsoft" refreshSignal={signal} />
       <Divider />
       <CalendarConnection provider="microsoft" refreshSignal={signal} />
       <Divider />
