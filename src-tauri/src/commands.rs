@@ -5399,7 +5399,7 @@ pub async fn restore_local_backup(
     let data_dir = paths::data_dir(&app)?;
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let target = data_dir
-        .join("restored-vaults")
+        .join(crate::wipe::RESTORE_STAGING_DIR)
         .join(format!("restore-{ts}"));
 
     let app2 = app.clone();
@@ -5927,7 +5927,7 @@ pub async fn restore_from_proton(
     let data_dir = paths::data_dir(&app)?;
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let target = data_dir
-        .join("restored-vaults")
+        .join(crate::wipe::RESTORE_STAGING_DIR)
         .join(format!("restore-{ts}"));
 
     let app2 = app.clone();
@@ -6177,7 +6177,7 @@ pub async fn restore_from_gdrive(
     let data_dir = paths::data_dir(&app)?;
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let target = data_dir
-        .join("restored-vaults")
+        .join(crate::wipe::RESTORE_STAGING_DIR)
         .join(format!("restore-{ts}"));
 
     // Pull the archive into a scratch dir (async — the Drive download is native async) that

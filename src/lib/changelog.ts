@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.12-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Tidier, more reliable data removal. Two fixes to \"Remove PM data\": if you ever forget your vault passphrase, the removal now still clears your saved keys and secrets instead of stopping short — so you're never locked out of erasing your own data. And when you preview a restored backup, the temporary copy it creates is now cleaned up automatically on the next start and fully removed when you erase PM, so an old backup's contents never quietly linger on disk.",
+    ],
+  },
+  {
     version: "2.92.11-alpha",
     date: "2026-07-05",
     highlights: [

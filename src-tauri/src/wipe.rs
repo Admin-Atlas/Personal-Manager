@@ -34,6 +34,12 @@ use tauri::{AppHandle, State};
 use crate::error::{Error, Result};
 use crate::{google, paths, secrets, vault, AppState};
 
+/// The data-dir-relative folder every restore extracts into (`restored-vaults/restore-<ts>/`). Three
+/// concerns must agree on this name or a restored, decryptable vault copy leaks: the restore writers
+/// (`commands.rs`), the wipe's vault branch, and the boot-time [`sweep_restore_staging`] GC. It lives
+/// here — the module that owns the removal semantics — so those consumers can't drift from it.
+pub const RESTORE_STAGING_DIR: &str = "restored-vaults";
+
 /// Which classes of data to remove. Mirrors the four checkboxes; `camelCase` to match the webview.
 /// `local_storage` is cleared in the frontend, so it isn't represented here.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -193,6 +199,39 @@ fn remove_empty_dir_retrying(path: &Path) {
     let _ = std::fs::remove_dir(path); // final try; a root that still holds unrelated files just stays
 }
 
+/// Boot-time GC of abandoned restore staging. Each `restored-vaults/restore-*` folder holds a full,
+/// DECRYPTABLE copy of a vault that a restore extracted for the user to inspect before committing. If
+/// they committed (`switch_to_vault`), its key was promoted into the keychain and that folder IS the
+/// live vault — keep it. Every other copy's key lived only in `pending_restore_keys` (in memory) and
+/// died with the process that restored it, so it can never be opened again: it's pure plaintext-leak
+/// residue and is removed. Best-effort; a still-locked entry just waits for the next boot. (F-25)
+///
+/// Deletion is fail-safe: we canonicalise the active root once and skip the whole sweep if it won't
+/// resolve, then only ever remove a candidate whose *canonical* path resolves and differs from it — so
+/// a path-shape mismatch (trailing slash, case, `\\?\`) can never delete the vault in use.
+pub fn sweep_restore_staging(data_dir: &Path, active_vault_root: &Path) {
+    let staging = data_dir.join(RESTORE_STAGING_DIR);
+    // If the active root can't be resolved, do nothing rather than risk mistaking it for a stale copy.
+    let Ok(active) = active_vault_root.canonicalize() else {
+        return;
+    };
+    let Ok(rd) = std::fs::read_dir(&staging) else {
+        return; // no staging dir yet — nothing to sweep
+    };
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        // Only remove a folder we can positively resolve AND prove is not the live vault. A candidate
+        // that won't canonicalise is left alone (a lingering copy is harmless; a wrong delete is not).
+        match path.canonicalize() {
+            Ok(canon) if canon != active => remove_dir_all_retrying(&path),
+            _ => {}
+        }
+    }
+}
+
 /// Execute the confirmed removal. The UI has already gated this behind the full confirmation ladder
 /// (explicit checkboxes → "are you sure" itemisation → optional Windows Hello → type-to-confirm), so
 /// this simply carries it out in a safe order and reports what happened.
@@ -213,10 +252,19 @@ pub async fn wipe_pm_data(
         // Collect everything we need from the open store into owned values, then drop the guard so
         // nothing is held across the `.await` revoke calls below.
         let (accounts_result, vault_ids) = {
-            let conn = state.conn()?;
-            let accounts = enumerate_oauth_accounts(&conn);
+            // Enumerating OAuth accounts needs the open store — but a locked passphrase vault has no
+            // connection, and the whole point of this branch is that the *forgotten-passphrase* user
+            // must still be able to erase their secrets. So the connection is best-effort: no store ⇒
+            // no per-account tokens to enumerate, and we fall through to wiping the FIXED keys (DB key,
+            // API keys, backup passphrase) + the cached vault key regardless. Never abort the wipe on a
+            // locked vault. (F-24)
+            let accounts = match state.conn() {
+                Ok(conn) => enumerate_oauth_accounts(&conn),
+                Err(_) => Ok(Vec::new()),
+            };
             // The current vault's cached-key entry (`vault_key::<id>`); best-effort — a plain device
-            // vault has no cached key, and a missing meta just yields no id.
+            // vault has no cached key, and a missing meta just yields no id. Reads `vault-meta.json`
+            // (unencrypted), so this still resolves when the store itself is locked.
             let vault_ids = vault::resolve(&app)
                 .ok()
                 .and_then(|r| vault::load_meta(&r.vault_root).ok().flatten())
@@ -303,6 +351,15 @@ pub async fn wipe_pm_data(
         // Clear the pointer unconditionally so PM reverts to the default location on next launch,
         // whether or not the relocated root was left standing (it may still hold the user's files).
         let _ = vault::pointer::clear(&data_dir);
+
+        // Restore staging (`restored-vaults/restore-*`): full, DECRYPTABLE vault copies left behind by
+        // every restore the user inspected — the plaintext contents of a backup, sitting on disk. PM
+        // owns this whole tree (each `restore-*` is a PM-chosen path under the data dir, never a user
+        // folder), so unlike the relocated root above it's safe to remove wholesale. Removing "the
+        // vault & database" while leaving decryptable copies of it behind would be a footgun. (F-25)
+        let restore_staging = data_dir.join(RESTORE_STAGING_DIR);
+        report.freed_bytes += dir_size(&restore_staging);
+        remove_dir_all_retrying(&restore_staging);
 
         report.removed.push("Vault & encrypted database".into());
         report.quit_required = true;
@@ -483,5 +540,80 @@ mod tests {
         // passes an already-gone path must not error.
         let tmp = tempfile::tempdir().unwrap();
         remove_empty_dir_retrying(&tmp.path().join("never-existed"));
+    }
+
+    // --- F-25: boot-time GC of abandoned, decryptable restore staging ---
+
+    #[test]
+    fn sweep_removes_stale_copies_but_keeps_the_active_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let staging = data_dir.join(RESTORE_STAGING_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+
+        // Two staged restores: one is the vault the user switched to (still the LIVE vault, living
+        // under `restored-vaults/`); the other is an inspected-then-abandoned decryptable copy.
+        let active = staging.join("restore-active");
+        let stale = staging.join("restore-stale");
+        std::fs::create_dir(&active).unwrap();
+        std::fs::write(active.join("pm.sqlite"), b"live").unwrap();
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("pm.sqlite"), b"abandoned decryptable copy").unwrap();
+
+        sweep_restore_staging(data_dir, &active);
+
+        assert!(
+            active.exists(),
+            "the switched-to (live) restore must survive"
+        );
+        assert!(active.join("pm.sqlite").exists());
+        assert!(!stale.exists(), "an abandoned restore copy must be swept");
+    }
+
+    #[test]
+    fn sweep_removes_everything_when_running_from_the_default_location() {
+        // The common case: the profile runs from its default data dir, not a switched-to restore, so
+        // every staged copy is abandoned residue.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let staging = data_dir.join(RESTORE_STAGING_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        let a = staging.join("restore-1");
+        let b = staging.join("restore-2");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+
+        sweep_restore_staging(data_dir, data_dir);
+
+        assert!(
+            !a.exists() && !b.exists(),
+            "all staged copies must be swept"
+        );
+    }
+
+    #[test]
+    fn sweep_is_a_no_op_without_a_staging_dir() {
+        // No `restored-vaults/` at all — must not error.
+        let tmp = tempfile::tempdir().unwrap();
+        sweep_restore_staging(tmp.path(), tmp.path());
+    }
+
+    #[test]
+    fn sweep_skips_entirely_when_the_active_root_is_unresolvable() {
+        // Fail-safe: if the active root can't be canonicalised (transiently absent), do nothing rather
+        // than risk deleting the live vault by mismatching an unresolved path.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let staging = data_dir.join(RESTORE_STAGING_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        let copy = staging.join("restore-1");
+        std::fs::create_dir(&copy).unwrap();
+
+        sweep_restore_staging(data_dir, &data_dir.join("does-not-exist"));
+
+        assert!(
+            copy.exists(),
+            "with an unresolvable active root the sweep must delete nothing"
+        );
     }
 }
