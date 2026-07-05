@@ -7,7 +7,8 @@ use crate::error::Result;
 
 /// Schema migrations, applied in order. Each entry bumps `PRAGMA user_version`
 /// by one. Migrations are additive — never destructive — so app updates never
-/// wipe the store (spec §7).
+/// wipe the store (spec §7). Re-keying index-only rows (e.g. connector row IDs)
+/// must ship an old→new mapping so user classifications survive.
 const MIGRATIONS: &[&str] = &[
     // v1: conversations, messages, settings.
     r#"
