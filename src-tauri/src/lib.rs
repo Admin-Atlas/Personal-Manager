@@ -663,6 +663,15 @@ pub fn run() {
             // to the per-profile data dir when no pointer is set (today's behaviour).
             let resolved = vault::resolve(handle)?;
 
+            // GC abandoned restore staging before opening: each `restored-vaults/restore-*` is a full,
+            // decryptable vault copy left by a restore-and-inspect. A copy the user didn't switch to
+            // has an in-memory-only key that died with the last process, so it can never be reopened —
+            // sweep every staged copy except the one this profile is actually pointed at. Best-effort;
+            // a locked file just waits for the next boot. (F-25)
+            if let Ok(data_dir) = paths::data_dir(handle) {
+                wipe::sweep_restore_staging(&data_dir, &resolved.vault_root);
+            }
+
             // Metadata exists from creation (device-mode on a fresh install; spec §6).
             // A device vault opens now with the keychain key; a passphrase/shareable
             // vault opens only if this profile cached its key, otherwise the store stays
