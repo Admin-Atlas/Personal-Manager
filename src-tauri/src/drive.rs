@@ -670,6 +670,22 @@ pub struct DriveFile {
     pub parent_id: Option<String>,
 }
 
+/// Lets a folder-scoped enumeration reconcile through the shared [`index_only::reconcile_enumeration`]
+/// planner. `content_hash` forwards to the inherent method (md5-or-modifiedTime).
+impl index_only::EnumeratedFile for DriveFile {
+    fn local_id(&self) -> &str {
+        &self.id
+    }
+    fn modified_at(&self) -> Option<String> {
+        self.modified_time.clone()
+    }
+    fn content_hash(&self) -> Option<String> {
+        // Method-call syntax resolves to the inherent `DriveFile::content_hash` (inherent methods
+        // shadow trait methods of the same name), so this forwards rather than recursing.
+        self.content_hash()
+    }
+}
+
 impl DriveFile {
     /// The source content hash for change detection: Drive's `md5Checksum` when present (binary /
     /// uploaded files), else `modifiedTime` (Google-native docs have no md5; modifiedTime bumps on

@@ -761,6 +761,77 @@ pub fn react(event: ChangeEvent, current: Option<&ItemState>) -> Vec<Action> {
     }
 }
 
+// --- folder-scoped reconcile: diff a live enumeration against the known-healthy set ---
+
+/// A connector's enumerated file, reduced to the three fields a folder-scoped reconcile needs: the
+/// provider-local id, a last-modified timestamp, and a content hash (the change pointer). Implemented
+/// by `drive::DriveFile` and `onedrive::DriveItem`, so the Add/Update/Delete decision lives here once
+/// rather than being hand-copied per connector (the bug that let F-30's fix get written twice).
+pub trait EnumeratedFile {
+    /// The provider-local file id — the caller namespaces it into a `source_id`.
+    fn local_id(&self) -> &str;
+    /// The source's last-modified timestamp, if it reported one.
+    fn modified_at(&self) -> Option<String>;
+    /// The source content hash — the pointer used to tell an edit from a no-op touch.
+    fn content_hash(&self) -> Option<String>;
+}
+
+/// One entry of a folder-scoped reconcile plan: the namespaced `source_id`, the [`ChangeEvent`] the
+/// reducer will apply, and the enumerated `payload` (present for `Add`/`Update`, `None` for `Delete`,
+/// so the caller can fetch a body only when it exists).
+pub struct ReconcileItem<T> {
+    pub source_id: String,
+    pub event: ChangeEvent,
+    pub payload: Option<T>,
+}
+
+/// Diff a live folder-scoped enumeration against the known-healthy set → reconcile events. **PURE**:
+/// no DB, no IO, no clock. A present file already known → [`Update`](ChangeEvent::Update) (catches
+/// edits; the reducer no-ops an unchanged hash); a present file new or previously missing/unreachable
+/// → [`Add`](ChangeEvent::Add) (ingests, or reactivates a folder removed then re-added); a known file
+/// no longer present → [`Delete`](ChangeEvent::Delete). `source_id_of` namespaces a provider-local id,
+/// so My Drive, shared drives, and OneDrive all share this core.
+pub fn reconcile_enumeration<T: EnumeratedFile>(
+    files: Vec<T>,
+    known: std::collections::HashSet<String>,
+    source_id_of: impl Fn(&str) -> String,
+) -> Vec<ReconcileItem<T>> {
+    let mut present: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(files.len());
+    let mut items: Vec<ReconcileItem<T>> = Vec::with_capacity(files.len());
+    for f in files {
+        let source_id = source_id_of(f.local_id());
+        present.insert(source_id.clone());
+        let event = if known.contains(&source_id) {
+            ChangeEvent::Update {
+                source_id: source_id.clone(),
+                modified_at: f.modified_at(),
+                new_content_hash: f.content_hash(),
+            }
+        } else {
+            ChangeEvent::Add {
+                source_id: source_id.clone(),
+                modified_at: f.modified_at(),
+            }
+        };
+        items.push(ReconcileItem {
+            source_id,
+            event,
+            payload: Some(f),
+        });
+    }
+    for source_id in known {
+        if !present.contains(&source_id) {
+            items.push(ReconcileItem {
+                source_id: source_id.clone(),
+                event: ChangeEvent::Delete { source_id },
+                payload: None,
+            });
+        }
+    }
+    items
+}
+
 // --- the executor: perform a reducer's decisions against the store + manifest ---
 
 /// The connector-supplied current content for the item an `IngestNew`/`ReEmbed` concerns, asserting
@@ -1354,6 +1425,80 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         forget_source(empty.path(), &cipher, "anything").unwrap();
         assert!(read_manifest(empty.path(), &cipher).unwrap().is_none());
+    }
+
+    // --- folder-scoped reconcile planner (pure) ---
+
+    struct FakeFile {
+        id: String,
+        hash: Option<String>,
+    }
+
+    impl EnumeratedFile for FakeFile {
+        fn local_id(&self) -> &str {
+            &self.id
+        }
+        fn modified_at(&self) -> Option<String> {
+            Some("2026-06-26T00:00:00Z".into())
+        }
+        fn content_hash(&self) -> Option<String> {
+            self.hash.clone()
+        }
+    }
+
+    fn ef(id: &str, hash: &str) -> FakeFile {
+        FakeFile {
+            id: id.into(),
+            hash: Some(hash.into()),
+        }
+    }
+
+    #[test]
+    fn reconcile_enumeration_classifies_present_new_and_absent() {
+        // Two items are known-healthy; the live enumeration returns one of them (edited) plus a
+        // brand-new one, and drops the other. `source_id_of` namespaces the provider-local id.
+        let known: std::collections::HashSet<String> = ["acc:a".to_string(), "acc:b".to_string()]
+            .into_iter()
+            .collect();
+        let files = vec![ef("a", "h-a2"), ef("c", "h-c1")];
+
+        let plan = reconcile_enumeration(files, known, |id| format!("acc:{id}"));
+
+        // Present files first, in enumeration order, then the single absent-known deletion.
+        assert_eq!(plan.len(), 3);
+
+        // "a" was known → Update carrying its new hash; the payload rides along for the body fetch.
+        assert_eq!(plan[0].source_id, "acc:a");
+        assert_eq!(
+            plan[0].event,
+            ChangeEvent::Update {
+                source_id: "acc:a".into(),
+                modified_at: Some("2026-06-26T00:00:00Z".into()),
+                new_content_hash: Some("h-a2".into()),
+            }
+        );
+        assert!(plan[0].payload.is_some());
+
+        // "c" was new → Add.
+        assert_eq!(plan[1].source_id, "acc:c");
+        assert_eq!(
+            plan[1].event,
+            ChangeEvent::Add {
+                source_id: "acc:c".into(),
+                modified_at: Some("2026-06-26T00:00:00Z".into()),
+            }
+        );
+        assert!(plan[1].payload.is_some());
+
+        // "b" vanished from the enumeration → soft Delete, with no payload to fetch.
+        assert_eq!(plan[2].source_id, "acc:b");
+        assert_eq!(
+            plan[2].event,
+            ChangeEvent::Delete {
+                source_id: "acc:b".into()
+            }
+        );
+        assert!(plan[2].payload.is_none());
     }
 
     // --- executor state transitions (no embedder needed) ---
