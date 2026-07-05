@@ -11,6 +11,10 @@ mod chat_prefs;
 mod chat_summary;
 mod chat_title;
 mod clock;
+// The Google Drive + OneDrive sync engines, lifted out of `commands` so the IPC layer keeps only the
+// thin command wrappers. Two engines still (unifying them behind one driver is the next step); the
+// shared single-flight lifecycle lives in `connector_sync`.
+mod cloud_sync;
 mod commands;
 mod commands_dev;
 mod components;
@@ -830,7 +834,7 @@ pub fn run() {
             // reconciled, without a full walk. Reuses the on-demand sync's per-file semantics; runs a
             // catch-up reconcile on each unlock (self-healing anything changed while closed), and is a
             // no-op until a folder is tracked. Observer-only — takes no vault lock.
-            commands::spawn_local_watcher(handle.clone());
+            localfolder::spawn_local_watcher(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

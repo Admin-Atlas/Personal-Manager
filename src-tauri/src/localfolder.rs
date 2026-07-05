@@ -32,14 +32,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use notify::event::{EventKind, ModifyKind, RenameMode};
+use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
 
-use crate::error::Result;
-use crate::index_only;
-use crate::ingest;
+use crate::error::{Error, Result};
+use crate::{connector_sync, db, index_only, ingest, AppState};
 
 /// The `connector_sources.provider` / `.service` for a tracked local folder (the pair the v14 schema
 /// reserved for exactly this — free TEXT, so no constraint change).
@@ -687,6 +690,784 @@ pub enum LocalSyncEvent {
     Finished {
         report: LocalSyncReport,
     },
+}
+
+// ===== Local-folder indexing (board card 6) =====
+//
+// A third index-only source (siblings: Drive, OneDrive), reading from the filesystem. This first card
+// reconciles a tracked folder on demand — the live `notify` watcher is the next card. The engine
+// mirrors `drive_sync_core`: detached + single-flight + crash-resumable, broadcasting progress on
+// `local://sync` (the same `counted`/`item`/`finished` shape) so the UI reuses `IngestProgress`. All
+// change SEMANTICS are the shared foundation's (`index_only::react`/`apply_actions`); this only
+// supplies DETECTION (walk + mtime→hash) and the on-disk body fetch.
+
+/// Settings key marking a local-folder sync started but not cleanly finished (the crash-resume marker,
+/// sibling of [`crate::cloud_sync::DRIVE_SYNC_PENDING_KEY`]).
+pub(crate) const LOCAL_SYNC_PENDING_KEY: &str = "local_sync_pending";
+
+/// Apply `f` to the local-folder sync snapshot, best-effort (a poisoned lock is skipped).
+fn with_local_snap(app: &AppHandle, f: impl FnOnce(&mut crate::LocalFolderSyncState)) {
+    let state = app.state::<AppState>();
+    // Bind the guard to a named local before `if let` so the lock `Result` temporary (which borrows
+    // `state`) drops before `state` does — the E0597 pitfall the Drive snapshot helper documents.
+    let guard = state.local_sync.lock();
+    if let Ok(mut snap) = guard {
+        f(&mut snap);
+    }
+}
+
+/// Update the snapshot + broadcast a `local://sync` progress event globally (the local mirror of the
+/// cloud engines' `emit_drive_progress` / `emit_onedrive_progress`).
+fn emit_local_progress(app: &AppHandle, ev: LocalSyncEvent) {
+    with_local_snap(app, |snap| match &ev {
+        LocalSyncEvent::Counted { total } => {
+            snap.total = Some(*total);
+            snap.processed = 0;
+        }
+        LocalSyncEvent::Item {
+            processed, total, ..
+        } => {
+            snap.processed = *processed;
+            snap.total = Some(*total);
+        }
+        LocalSyncEvent::Finished { report } => {
+            snap.last_report = Some(report.clone());
+        }
+    });
+    let _ = app.emit("local://sync", ev);
+}
+
+/// True if the running local-folder sync has been asked to stop.
+fn local_sync_cancelled(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .local_sync_cancel
+        .load(Ordering::SeqCst)
+}
+
+/// Record a local file that couldn't be indexed, up to the shared report cap.
+fn record_local_issue(
+    issues: &mut Vec<LocalSyncIssue>,
+    truncated: &mut bool,
+    name: &str,
+    reason: &str,
+) {
+    if issues.len() < connector_sync::MAX_REPORT_ISSUES {
+        issues.push(LocalSyncIssue {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        });
+    } else {
+        *truncated = true;
+    }
+}
+
+/// The sync engine behind [`crate::commands::sync_local_folder`] and
+/// [`crate::commands::resume_local_folder_sync`]. Single-flight (a
+/// request arriving mid-sync folds into one follow-up all-folders pass), detached (progress via the
+/// global `local://sync` event + [`crate::LocalFolderSyncState`]), and crash-resumable (a marker
+/// persisted while running, cleared on the clean exit). Returns the number of items touched.
+pub(crate) async fn local_sync_core(app: &AppHandle, folder: Option<String>) -> Result<usize> {
+    let st: &AppState = app.state::<AppState>().inner();
+    connector_sync::run_detached_sync(
+        st,
+        &st.local_sync,
+        &st.local_sync_cancel,
+        LOCAL_SYNC_PENDING_KEY,
+        folder,
+        |target| run_local_sync(app, target),
+    )
+    .await
+}
+
+/// One folder's gathered work: the walk result + the known-item set, or a `missing` root to fan out.
+struct FolderWork {
+    key: String,
+    root: std::path::PathBuf,
+    files: Vec<LocalFile>,
+    known: std::collections::HashMap<String, KnownItem>,
+    missing: bool,
+}
+
+/// One sync pass: walk each folder off the lock, then reconcile it against the known set. Split out so
+/// [`local_sync_core`] can run it again (the follow-up sweep) and own the running/marker lifecycle.
+async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize> {
+    // The sidecar converts each file's body to Markdown — ensure it once up front.
+    {
+        let state = app.state::<AppState>();
+        state.sidecar.ensure_installed()?;
+    }
+
+    let keys: Vec<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        match folder {
+            Some(k) => vec![k],
+            None => folder_keys(&conn)?,
+        }
+    };
+
+    // Phase 1 — gather. Read each folder's root + known set (short locks), then walk off the lock (the
+    // walk stats + opens files for their OS id, so it must not hold the DB).
+    let mut work: Vec<FolderWork> = Vec::new();
+    for key in keys {
+        let root = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            folder_root(&conn, &key)?
+        };
+        let Some(root) = root else {
+            continue; // the registry row was removed mid-run
+        };
+        let known = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            known_items(&conn, &key)?
+        };
+        if !root.is_dir() {
+            work.push(FolderWork {
+                key,
+                root,
+                files: Vec::new(),
+                known,
+                missing: true,
+            });
+            continue;
+        }
+        let root2 = root.clone();
+        let files = tokio::task::spawn_blocking(move || walk(&root2))
+            .await
+            .map_err(|e| Error::Other(format!("local walk task panicked: {e}")))?;
+        work.push(FolderWork {
+            key,
+            root,
+            files,
+            known,
+            missing: false,
+        });
+    }
+
+    // Total = present files + known-but-absent (deletions); a missing folder is one fan-out step.
+    let total: usize = work
+        .iter()
+        .map(|w| {
+            if w.missing {
+                return 1;
+            }
+            let present: std::collections::HashSet<&String> =
+                w.files.iter().map(|f| &f.source_id).collect();
+            let deletions = w.known.keys().filter(|k| !present.contains(k)).count();
+            w.files.len() + deletions
+        })
+        .sum();
+    emit_local_progress(app, LocalSyncEvent::Counted { total });
+
+    // Phase 2 — reconcile.
+    let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0usize, 0, 0, 0, 0);
+    let mut processed = 0usize;
+    let mut issues: Vec<LocalSyncIssue> = Vec::new();
+    let mut issues_truncated = false;
+    let mut cancelled = false;
+    let mut last_err: Option<Error> = None;
+
+    'folders: for w in &work {
+        if local_sync_cancelled(app) {
+            cancelled = true;
+            break 'folders;
+        }
+
+        // Unreadable root → fan every item of this folder out to `unreachable` (never a mass deletion).
+        if w.missing {
+            let actions = index_only::react(
+                index_only::ChangeEvent::SourceFailure {
+                    source: folder_source_id(&w.key),
+                },
+                None,
+            );
+            apply_local_actions_off_lock(app, actions, None).await?;
+            {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                set_state(&conn, &w.key, "unreachable")?;
+            }
+            processed += 1;
+            emit_local_progress(
+                app,
+                LocalSyncEvent::Item {
+                    processed,
+                    total,
+                    name: w.root.to_string_lossy().to_string(),
+                },
+            );
+            continue;
+        }
+
+        let present: std::collections::HashSet<String> =
+            w.files.iter().map(|f| f.source_id.clone()).collect();
+
+        // Present files: came-back → rename → mtime→hash content, each via the shared reducer path
+        // (identical to what the live watcher runs per event — see [`reconcile_present_file`]).
+        for f in &w.files {
+            if local_sync_cancelled(app) {
+                cancelled = true;
+                break 'folders;
+            }
+            let name = f.rel_path.clone();
+            let known = w.known.get(&f.source_id).cloned();
+            match reconcile_present_file(app, f, known.as_ref()).await? {
+                PresentOutcome::Indexed => indexed += 1,
+                PresentOutcome::Updated => updated += 1,
+                PresentOutcome::NoChange => {}
+                PresentOutcome::NoText => {
+                    skipped += 1;
+                    record_local_issue(
+                        &mut issues,
+                        &mut issues_truncated,
+                        &name,
+                        "No extractable text (unsupported or empty file)",
+                    );
+                }
+                PresentOutcome::Failed(reason) => {
+                    failed += 1;
+                    record_local_issue(&mut issues, &mut issues_truncated, &name, &reason);
+                    last_err = Some(Error::Other(reason));
+                }
+            }
+
+            processed += 1;
+            emit_local_progress(
+                app,
+                LocalSyncEvent::Item {
+                    processed,
+                    total,
+                    name,
+                },
+            );
+
+            // Gentle mode: breathe between files (re-read the setting each item, off any await).
+            let pause_ms = {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                db::indexing_pause_ms(&conn)
+            };
+            if pause_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            }
+        }
+
+        // Deletions: known items no longer present → soft `source_missing` (kept findable).
+        for (source_id, item) in &w.known {
+            if present.contains(source_id) {
+                continue;
+            }
+            if local_sync_cancelled(app) {
+                cancelled = true;
+                break 'folders;
+            }
+            reconcile_deleted_item(app, source_id, item).await?;
+            removed += 1;
+            processed += 1;
+            emit_local_progress(
+                app,
+                LocalSyncEvent::Item {
+                    processed,
+                    total,
+                    name: source_id.clone(),
+                },
+            );
+        }
+
+        // Stamp the healthy pass.
+        {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            finalize_sync(&conn, &w.key)?;
+        }
+    }
+
+    let report = LocalSyncReport {
+        indexed,
+        updated,
+        removed,
+        skipped,
+        failed,
+        cancelled,
+        issues,
+        issues_truncated,
+    };
+    emit_local_progress(app, LocalSyncEvent::Finished { report });
+
+    if !cancelled {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(indexed + updated + removed)
+}
+
+/// How reconciling one present local file resolved. Kept distinct from an `Err` (a fatal DB/embed
+/// failure that aborts the pass): a per-file read/convert problem is a `Failed` the caller records as
+/// an issue and moves past.
+enum PresentOutcome {
+    /// A never-seen file was ingested.
+    Indexed,
+    /// An existing item's body changed and was re-embedded (classification preserved).
+    Updated,
+    /// A state-only change (came back / renamed / a same-hash touch) or nothing to do — no re-embed.
+    NoChange,
+    /// The file rendered to no extractable text — kept out of the index; caller records an issue.
+    NoText,
+    /// The file couldn't be read/converted — caller records the reason + counts it failed.
+    Failed(String),
+}
+
+/// Reconcile ONE present local file against its persisted state: came-back → rename → mtime→hash
+/// content, each via the shared [`index_only::react`] reducer. The single source of the per-file
+/// semantics — the on-demand walk calls it for every file it finds, the live watcher calls it for the
+/// one file an fs event touched, so both behave identically. Performs its IO (stat/hash/convert) off
+/// the DB lock. `known` is the item's persisted state (`None` = never indexed). A fatal DB/embed error
+/// propagates as `Err`; a per-file read/convert failure returns `Ok(PresentOutcome::Failed)`.
+async fn reconcile_present_file(
+    app: &AppHandle,
+    file: &LocalFile,
+    known: Option<&KnownItem>,
+) -> Result<PresentOutcome> {
+    let path_str = file.abs_path.to_string_lossy().to_string();
+
+    // Current mtime (formatted like ingest) + this item's persisted reducer state.
+    let current_iso = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        ingest::iso_from_mtime(&conn, &file.abs_path).ok()
+    };
+    let plan = plan_file(known, &path_str, current_iso.as_deref());
+    let cur_state = known.map(|k| k.to_item_state(&file.source_id));
+
+    // It came back (was missing/unreachable) → mark reachable before anything else.
+    if plan.came_back {
+        let actions = index_only::react(
+            index_only::ChangeEvent::Add {
+                source_id: file.source_id.clone(),
+                modified_at: current_iso.clone(),
+            },
+            cur_state.as_ref(),
+        );
+        apply_local_actions_off_lock(app, actions, None).await?;
+    }
+    // It moved (same OS id, new path) → update the stored ref, keeping classification.
+    if let Some(newref) = &plan.renamed_to {
+        let actions = index_only::react(
+            index_only::ChangeEvent::Rename {
+                source_id: file.source_id.clone(),
+                new_external_ref: Some(newref.clone()),
+            },
+            cur_state.as_ref(),
+        );
+        apply_local_actions_off_lock(app, actions, None).await?;
+    }
+    // Content unchanged (same mtime) and not new → the state work above (if any) is all there was.
+    if !plan.content_maybe_changed {
+        return Ok(PresentOutcome::NoChange);
+    }
+
+    // The mtime moved (or the file is new) → hash off the lock → Add / ReEmbed / touch.
+    let path = file.abs_path.clone();
+    let hashed =
+        tokio::task::spawn_blocking(move || std::fs::read(&path).map(|b| ingest::hex_digest(&b)))
+            .await
+            .map_err(|e| Error::Other(format!("local hash task panicked: {e}")))?;
+    let hash = match hashed {
+        Ok(h) => h,
+        Err(e) => {
+            return Ok(PresentOutcome::Failed(format!(
+                "Couldn't read the file: {e}"
+            )))
+        }
+    };
+    let event = if known.is_none() {
+        index_only::ChangeEvent::Add {
+            source_id: file.source_id.clone(),
+            modified_at: current_iso.clone(),
+        }
+    } else {
+        index_only::ChangeEvent::Update {
+            source_id: file.source_id.clone(),
+            modified_at: current_iso.clone(),
+            new_content_hash: Some(hash.clone()),
+        }
+    };
+    let actions = index_only::react(event, cur_state.as_ref());
+    let category = connector_sync::action_category(&actions);
+    let needs_body = actions.iter().any(|a| {
+        matches!(
+            a,
+            index_only::Action::IngestNew { .. } | index_only::Action::ReEmbed { .. }
+        )
+    });
+    if needs_body {
+        match build_local_pointer(app, file, &hash, current_iso.clone()).await {
+            Ok(Some(input)) => {
+                apply_local_actions_off_lock(app, actions, Some(input)).await?;
+                Ok(match category {
+                    connector_sync::ActionKind::Indexed => PresentOutcome::Indexed,
+                    connector_sync::ActionKind::Updated => PresentOutcome::Updated,
+                    _ => PresentOutcome::NoChange,
+                })
+            }
+            Ok(None) => Ok(PresentOutcome::NoText),
+            Err(e) => Ok(PresentOutcome::Failed(format!(
+                "Couldn't read the file: {e}"
+            ))),
+        }
+    } else {
+        // Same hash — a touch, not an edit. Advance the stored mtime so the next sync doesn't re-hash.
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        touch_modified_at(&conn, &file.source_id, current_iso.as_deref())?;
+        Ok(PresentOutcome::NoChange)
+    }
+}
+
+/// Reconcile ONE deleted local item → soft `source_missing` (kept findable, never a hard drop), via
+/// the shared reducer. Shared by the walk (a known id the walk no longer found) and the watcher (a
+/// remove event resolved to its item by external ref).
+async fn reconcile_deleted_item(app: &AppHandle, source_id: &str, known: &KnownItem) -> Result<()> {
+    let cur_state = known.to_item_state(source_id);
+    let actions = index_only::react(
+        index_only::ChangeEvent::Delete {
+            source_id: source_id.to_string(),
+        },
+        Some(&cur_state),
+    );
+    apply_local_actions_off_lock(app, actions, None).await
+}
+
+/// Read + convert a local file's body via the sidecar (off the DB lock), returning the foundation's
+/// [`index_only::PointerInput`] — the external ref is the absolute path, the parent folder rides along
+/// as review context. `Ok(None)` when the file renders to no indexable text (kept findable by title).
+async fn build_local_pointer(
+    app: &AppHandle,
+    file: &LocalFile,
+    hash: &str,
+    modified_at: Option<String>,
+) -> Result<Option<index_only::PointerInput>> {
+    let path = file.abs_path.clone();
+    let app2 = app.clone();
+    let converted = tokio::task::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        state.sidecar.convert(&path)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("local convert task panicked: {e}")))?;
+    let (markdown, title) = converted?;
+    let markdown = markdown.trim().to_string();
+    if markdown.is_empty() {
+        return Ok(None);
+    }
+    let title = if title.trim().is_empty() {
+        file.abs_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file.rel_path.clone())
+    } else {
+        title
+    };
+    let parent = file.abs_path.parent();
+    Ok(Some(index_only::PointerInput {
+        source_id: file.source_id.clone(),
+        title,
+        external_ref: Some(file.abs_path.to_string_lossy().to_string()),
+        source_modified_at: modified_at,
+        source_content_hash: Some(hash.to_string()),
+        body: markdown,
+        source_parent_folder_id: parent.map(|p| p.to_string_lossy().to_string()),
+        source_parent_folder_name: parent
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string()),
+    }))
+}
+
+/// [`connector_sync::apply_connector_actions`] on a blocking thread, awaited — so the async driver
+/// never runs the sidecar on the runtime. Local applies per file mid-pass, so it needs the async form
+/// (the cloud engines spawn_blocking the shared apply inline).
+async fn apply_local_actions_off_lock(
+    app: &AppHandle,
+    actions: Vec<index_only::Action>,
+    fetched: Option<index_only::PointerInput>,
+) -> Result<()> {
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || {
+        connector_sync::apply_connector_actions(&app2, &actions, fetched)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("local apply task panicked: {e}")))?
+}
+
+// --- the live filesystem watcher (board card 6, PR2) -----------------------
+//
+// The on-demand sync above answers "reconcile this folder now"; the watcher answers "keep it
+// reconciled". `notify-debouncer-full` coalesces the multi-write burst of a save into one settled
+// event (and stitches rename From→To pairs), so a save re-embeds within seconds without a full walk.
+// Every event is reduced to a per-file change (`classify_event` → `FsChange`), placed to
+// its tracked folder (`folder_of`), and pushed through the SAME `reconcile_present_file` /
+// `reconcile_deleted_item` the walk uses — the watcher adds detection, never new semantics.
+//
+// Two cooperating tasks: a MANAGER owns the debouncer and keeps its watch set in step with the
+// registry (start newly-added folders, stop removed/unmounted ones, catch up after a lock→unlock),
+// and a PROCESSOR drains the debounced events and applies them. No vault lock is taken — this is a
+// read-only observer, like the cloud connectors.
+
+/// Debounce window: wait this long after the last fs event on a path before emitting, so a
+/// multi-write save settles into one change (and the file is stable to hash).
+const LOCAL_WATCH_DEBOUNCE_SECS: u64 = 2;
+/// How often the manager reconciles its watch set with the tracked-folder registry and re-checks
+/// whether the vault is unlocked. Short enough that a just-added folder starts being watched promptly.
+const LOCAL_WATCH_TICK_SECS: u64 = 5;
+
+/// Start the live local-folder watcher: a debouncer feeding two background tasks for the life of the
+/// app. A no-op in practice until the user tracks a folder (nothing to watch), and quiet whenever the
+/// vault is locked (the manager drops its watches and the processor skips events; a lock→unlock
+/// re-watches everything and runs a catch-up reconcile for anything changed while away).
+pub fn spawn_local_watcher(app: AppHandle) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DebounceEventResult>();
+
+    // Manager: owns the debouncer, keeps the watch set matching the registry.
+    let manager_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let handler = move |res: DebounceEventResult| {
+            // Forward to the processor; a full channel/closed receiver just means we're shutting down.
+            let _ = tx.send(res);
+        };
+        let mut debouncer = match new_debouncer(
+            Duration::from_secs(LOCAL_WATCH_DEBOUNCE_SECS),
+            None,
+            handler,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("local watcher: could not start the debouncer: {e}");
+                return;
+            }
+        };
+        // key -> watched root. Cleared whenever the vault locks; rebuilt on the next unlock.
+        let mut watched: std::collections::HashMap<String, std::path::PathBuf> =
+            std::collections::HashMap::new();
+        let mut was_ready = false;
+        loop {
+            tokio::time::sleep(Duration::from_secs(LOCAL_WATCH_TICK_SECS)).await;
+            manage_local_watches(&manager_app, &mut debouncer, &mut watched, &mut was_ready);
+        }
+    });
+
+    // Processor: apply each debounced batch as it arrives (prompt, not tied to the manager's tick).
+    tauri::async_runtime::spawn(async move {
+        while let Some(res) = rx.recv().await {
+            process_local_watch_batch(&app, res).await;
+        }
+    });
+}
+
+/// One manager tick: bring the live watch set in line with the tracked-folder registry. Synchronous
+/// (all debouncer ops are non-async); the catch-up reconciles it triggers are fired detached so a big
+/// sync never stalls the tick. Clears every watch when the vault is locked and rebuilds + catches up
+/// on the next unlock.
+fn manage_local_watches(
+    app: &AppHandle,
+    debouncer: &mut notify_debouncer_full::Debouncer<
+        notify::RecommendedWatcher,
+        notify_debouncer_full::RecommendedCache,
+    >,
+    watched: &mut std::collections::HashMap<String, std::path::PathBuf>,
+    was_ready: &mut bool,
+) {
+    let ready = app.state::<AppState>().conn().is_ok();
+    if !ready {
+        // Vault locked → stop watching; a fresh unlock re-watches and re-syncs from scratch.
+        if *was_ready {
+            for root in watched.values() {
+                let _ = debouncer.unwatch(root);
+            }
+            watched.clear();
+            *was_ready = false;
+        }
+        return;
+    }
+
+    let targets = {
+        let state = app.state::<AppState>();
+        // Bind the lock Result to a named local before destructuring so its DbGuard temporary drops
+        // before `state` does (the E0597 pitfall the Drive snapshot helper documents).
+        let conn = state.conn();
+        let Ok(conn) = conn else { return };
+        watch_targets(&conn).unwrap_or_default()
+    };
+    let diff = diff_watch_set(watched, &targets);
+    for t in &diff.to_watch {
+        match debouncer.watch(&t.root, notify::RecursiveMode::Recursive) {
+            Ok(()) => {
+                watched.insert(t.key.clone(), t.root.clone());
+            }
+            Err(e) => eprintln!("local watcher: could not watch {}: {e}", t.root.display()),
+        }
+    }
+    for root in &diff.to_unwatch {
+        let _ = debouncer.unwatch(root);
+        watched.retain(|_, r| r != root);
+    }
+    // A watched root vanished under us (unmount/removal) → fan its items out to `unreachable` via a
+    // per-folder reconcile (the driver's missing-root branch), never a mass deletion.
+    for key in &diff.gone_absent {
+        let (app2, key2) = (app.clone(), key.clone());
+        tauri::async_runtime::spawn(async move {
+            let _ = local_sync_core(&app2, Some(key2)).await;
+        });
+    }
+    // A fresh unlock, or any newly-watched folder → catch up on changes made while closed/locked/away.
+    if !*was_ready || !diff.to_watch.is_empty() {
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = local_sync_core(&app2, None).await;
+        });
+    }
+    *was_ready = true;
+}
+
+/// Apply one debounced batch of filesystem events. Quiet while the vault is locked or the engine
+/// isn't ready (a catch-up sweep heals on the next unlock). Emits `local://changed` once if anything
+/// in the batch altered the index, so a UI can refresh.
+async fn process_local_watch_batch(app: &AppHandle, res: DebounceEventResult) {
+    let ready = {
+        let state = app.state::<AppState>();
+        state.conn().is_ok() && state.sidecar.is_ready()
+    };
+    if !ready {
+        return;
+    }
+    // Watcher-level errors (a path briefly inaccessible) are left to the periodic reconcile; an
+    // unmount surfaces there as an absent root → `unreachable`.
+    let events = match res {
+        Ok(events) => events,
+        Err(_) => return,
+    };
+    // Snapshot the tracked roots once for this batch, to place each event's path to its folder.
+    let roots: Vec<(String, std::path::PathBuf)> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn();
+        let Ok(conn) = conn else { return };
+        watch_targets(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| (t.key, t.root))
+            .collect()
+    };
+    if roots.is_empty() {
+        return;
+    }
+
+    let mut touched = false;
+    for event in events {
+        for change in classify_event(&event.event.kind, &event.event.paths) {
+            match handle_fs_change(app, change, &roots).await {
+                Ok(true) => touched = true,
+                Ok(false) => {}
+                Err(e) => eprintln!("local watcher: applying a change failed: {e}"),
+            }
+        }
+    }
+    if touched {
+        let _ = app.emit("local://changed", ());
+    }
+}
+
+/// Route one reduced filesystem change to the shared per-file reconcile. Returns whether the index
+/// changed. A rename repoints by the stable OS id: upsert `to` (keeps the item when the id survived,
+/// or ingests a fresh one when the file was only path-keyed), then a remove of `from` that no-ops on
+/// the survived-id case and soft-deletes the orphan otherwise.
+async fn handle_fs_change(
+    app: &AppHandle,
+    change: FsChange,
+    roots: &[(String, std::path::PathBuf)],
+) -> Result<bool> {
+    match change {
+        FsChange::Upsert(path) => upsert_local_path(app, &path, roots).await,
+        FsChange::Removed(path) => remove_local_path(app, &path, roots).await,
+        FsChange::Renamed { from, to } => {
+            let upserted = upsert_local_path(app, &to, roots).await?;
+            let removed = remove_local_path(app, &from, roots).await?;
+            Ok(upserted || removed)
+        }
+    }
+}
+
+/// Reconcile a created/modified path: place it to its folder, key it by OS file id, and run the shared
+/// present-file reconcile. Ignores directories and filtered files (their child file events carry the
+/// real changes). Returns whether it ingested or re-embedded.
+async fn upsert_local_path(
+    app: &AppHandle,
+    path: &std::path::Path,
+    roots: &[(String, std::path::PathBuf)],
+) -> Result<bool> {
+    let Some((key, root)) = folder_of(path, roots) else {
+        return Ok(false);
+    };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(false), // vanished between the event and now — a remove will follow
+    };
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !should_index(path, meta.len(), name.starts_with('.')) {
+        return Ok(false);
+    }
+    let file_id = file_identity(path, &root);
+    let source_id = source_id_for(&key, &file_id);
+    let rel_path = path
+        .strip_prefix(&root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+    let file = LocalFile {
+        source_id: source_id.clone(),
+        abs_path: path.to_path_buf(),
+        rel_path,
+        size: meta.len(),
+    };
+    let known = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        known_item(&conn, &source_id)?
+    };
+    Ok(matches!(
+        reconcile_present_file(app, &file, known.as_ref()).await?,
+        PresentOutcome::Indexed | PresentOutcome::Updated
+    ))
+}
+
+/// Reconcile a removed path → soft-delete the item that pointed at it (by stored external ref, since a
+/// gone path can't re-derive its OS id). A path we never indexed is a clean no-op.
+async fn remove_local_path(
+    app: &AppHandle,
+    path: &std::path::Path,
+    roots: &[(String, std::path::PathBuf)],
+) -> Result<bool> {
+    let Some((key, _root)) = folder_of(path, roots) else {
+        return Ok(false);
+    };
+    let abs = path.to_string_lossy().to_string();
+    let found = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        source_id_for_ref(&conn, &key, &abs)?
+    };
+    let Some((source_id, known)) = found else {
+        return Ok(false);
+    };
+    reconcile_deleted_item(app, &source_id, &known).await?;
+    Ok(true)
 }
 
 #[cfg(test)]
