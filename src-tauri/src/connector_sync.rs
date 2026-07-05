@@ -27,6 +27,11 @@ use tauri::{AppHandle, Manager};
 use crate::error::{Error, Result};
 use crate::{db, index_only, AppState};
 
+/// Cap on how many not-indexed files a connector's sync report lists (memory-bounded; the count of
+/// extras beyond this is still conveyed via each report's `issues_truncated`). Shared by the three
+/// connectors' `record_*_issue` helpers, which is why it lives here rather than in any one engine.
+pub(crate) const MAX_REPORT_ISSUES: usize = 200;
+
 /// The single-flight fields every detached-sync snapshot carries, so [`SyncRunGuard`] can own the
 /// `running`/`rerun` lifecycle without knowing the concrete snapshot type. Implemented by the three
 /// `*SyncState` snapshots in [`crate`] (each also carries connector-specific display fields — the

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.6-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "Under-the-hood tidying: the Google Drive, OneDrive, and local-folder sync engines moved out of the big command file into their own modules, so the connector code is easier to find and change. Nothing about how syncing works has changed — this is purely house-keeping.",
+    ],
+  },
+  {
     version: "2.92.5-alpha",
     date: "2026-07-05",
     highlights: [
