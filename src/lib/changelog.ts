@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.1-alpha",
+    date: "2026-07-05",
+    highlights: [
+      "A project's chat now shows the same context meter as the main chat. When a scoped conversation starts filling the model's context window, you get the same at-a-glance gauge and the same Compress / Continue / switch-to-a-bigger-model options — instead of silently running into the limit.",
+    ],
+  },
+  {
     version: "2.92.0-alpha",
     date: "2026-07-05",
     highlights: [
