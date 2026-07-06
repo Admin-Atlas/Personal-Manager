@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.28-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Clearer backup progress. While a backup is uploading to the cloud, the progress bar now shows a gentle “working” shimmer instead of sitting frozen at 0% (uploads don’t report a percentage). And if a backup reaches some destinations but not others — say it saves to Proton Drive but Google Drive is offline — you’ll see a plain note saying which one failed, instead of it looking like everything worked.",
+    ],
+  },
+  {
     version: "2.92.27-alpha",
     date: "2026-07-06",
     highlights: [
