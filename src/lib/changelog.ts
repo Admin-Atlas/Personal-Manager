@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.27-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Small fixes across the app. Dropping files onto Documents now respects the “copy photos into the vault” checkbox even if you ticked it after opening the tab. A pinboard note you turn into a document now reads cleanly everywhere, not just on the board. Switching chats quickly no longer briefly shows the wrong conversation. Clearing every model from a role and saving now sticks (it falls back to the default as the screen says). And the microphone is always released if you leave the screen mid-recording.",
+    ],
+  },
+  {
     version: "2.92.26-alpha",
     date: "2026-07-06",
     highlights: [

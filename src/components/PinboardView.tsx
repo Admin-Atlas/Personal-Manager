@@ -486,7 +486,11 @@ function NoteBody({
     setIngesting(true);
     setIngestErr(null);
     try {
-      await ingestNote(widget.id, text);
+      // Ingest the rendered markdown, not the pinboard shorthand dialect: the vault copy is read
+      // everywhere outside the board (reader, retrieval, chat citations), where the raw dialect
+      // markers render degraded and get indexed as noise. The widget keeps the raw `text`, and the
+      // edit-detection hash still tracks it, so "edited since last ingest" is unaffected.
+      await ingestNote(widget.id, toRenderMarkdown(text));
       onChange(widget.id, { ingestedAt: new Date().toISOString(), ingestedHash: cheapHash(text) });
       onIngested();
     } catch (e) {

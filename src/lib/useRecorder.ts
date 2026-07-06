@@ -65,6 +65,13 @@ export function useRecorder(onTranscript: (text: string) => void): Recorder {
     setError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Unmounted while the permission/acquisition promise was in flight? The unmount cleanup
+      // already ran and saw streamRef still null, so it couldn't release this stream — stop the
+      // tracks here or the mic stays live. Return before touching any refs or state.
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       streamRef.current = stream;
       const recorder = new MediaRecorder(stream);
       chunksRef.current = [];
