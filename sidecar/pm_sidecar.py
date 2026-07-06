@@ -35,6 +35,7 @@ converts/embeds/scores/transcribes bytes; it never executes file contents.
 
 import json
 import logging
+import os
 import sys
 import traceback
 
@@ -882,8 +883,10 @@ HANDLERS = {
 
 # Mirror the Rust reader's per-line cap. Rust is the trusted sender and never
 # sends anything near this, so a line this large can only be a fault or abuse —
-# drop it rather than hand it to json.loads.
-MAX_LINE_CHARS = 64 * 1024 * 1024
+# drop it rather than hand it to json.loads. Env-overridable ONLY so the protocol
+# test can exercise the drop path without piping 64 MiB; Rust never sets it, so
+# production always runs the full cap.
+MAX_LINE_CHARS = int(os.environ.get("PM_SIDECAR_MAX_LINE_CHARS", 64 * 1024 * 1024))
 
 
 def main():

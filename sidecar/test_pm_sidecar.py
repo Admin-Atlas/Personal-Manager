@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Bobby Yu
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Regression tests for the sidecar token counter.
+"""Regression tests for the sidecar: the token counter and the stdio protocol loop.
 
 The bug these lock down: fastembed's tokenizer has batch padding enabled (it pads
 every text to the batch's longest), and it is the SAME instance used for
@@ -20,6 +20,10 @@ Run: `python sidecar/test_pm_sidecar.py` (or `just sidecar-test`).
 """
 
 import importlib.util
+import json
+import os
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -356,6 +360,87 @@ class SpreadsheetTest(unittest.TestCase):
             out = S.do_analyze_spreadsheet({"path": path, "ext": "xlsx"})
         self.assertEqual([s["name"] for s in out["sheets"]], ["Budget", "Team"])
         self.assertEqual(out["sheets"][0]["inferred_types"], ["string", "int"])
+
+
+# --- the protocol loop itself (driven as a real subprocess) ---------------
+
+_SIDECAR_PATH = S.__file__
+
+
+class ProtocolTest(unittest.TestCase):
+    """Drive main() as a real subprocess over its newline-JSON stdio contract.
+
+    The per-handler tests above call do_* directly; nothing exercises the loop —
+    JSON-line framing, the ok/error envelope, id-echo on a parse failure, the
+    oversized-line drop, and loop survival after a handler error. This does, with
+    the standard library only (no model deps), so it runs in CI via `just sidecar-test`.
+    """
+
+    def _exchange(self, lines, env=None, timeout=30):
+        """Feed request lines to a fresh sidecar; return the parsed reply objects."""
+        proc_env = dict(os.environ)
+        if env:
+            proc_env.update(env)
+        proc = subprocess.run(
+            [sys.executable, _SIDECAR_PATH],
+            input="".join(line + "\n" for line in lines),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=proc_env,
+        )
+        return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+
+    def test_ping_roundtrips_with_its_id(self):
+        replies = self._exchange([json.dumps({"id": 7, "method": "ping"})])
+        self.assertEqual(replies, [{"id": 7, "ok": True, "result": {"ok": True}}])
+
+    def test_reduce_over_the_wire_returns_a_well_formed_result(self):
+        # `reduce` with <=3 vectors takes its dependency-free "trivial" path (no numpy,
+        # no models), so a real data-returning handler round-trips through the loop even
+        # in a bare environment — the case CI actually runs. (count_tokens/embed need
+        # fastembed and error without it; their math is pinned by CountTokensTest.)
+        req = {"id": 8, "method": "reduce", "params": {"vectors": [[0.1, 0.2], [0.3, 0.4]]}}
+        [reply] = self._exchange([json.dumps(req)])
+        self.assertEqual(reply["id"], 8)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["result"]["method"], "trivial")
+        self.assertEqual(len(reply["result"]["coords"]), 2)
+
+    def test_unknown_method_is_an_error_envelope_not_a_crash(self):
+        [reply] = self._exchange([json.dumps({"id": 9, "method": "nope"})])
+        self.assertEqual(reply["id"], 9)
+        self.assertFalse(reply["ok"])
+        self.assertIn("unknown method", reply["error"])
+
+    def test_malformed_json_replies_with_a_null_id(self):
+        [reply] = self._exchange(["{ not valid json"])
+        self.assertIsNone(reply["id"])
+        self.assertFalse(reply["ok"])
+
+    def test_blank_lines_draw_no_reply(self):
+        replies = self._exchange(["", "   ", json.dumps({"id": 1, "method": "ping"})])
+        self.assertEqual([r["id"] for r in replies], [1])
+
+    def test_oversized_line_is_dropped_and_the_loop_survives(self):
+        # Shrink the cap via env so the drop path is cheap to hit (no 64-MiB pipe).
+        # An over-cap line draws NO reply; the next request must still be answered.
+        over = json.dumps({"id": 2, "method": "ping", "params": {"pad": "A" * 500}})
+        after = json.dumps({"id": 3, "method": "ping"})
+        replies = self._exchange([over, after], env={"PM_SIDECAR_MAX_LINE_CHARS": "100"})
+        ids = [r["id"] for r in replies]
+        self.assertNotIn(2, ids)  # dropped, unanswered
+        self.assertIn(3, ids)  # loop kept going
+
+    def test_loop_survives_a_handler_error_between_requests(self):
+        reqs = [
+            json.dumps({"id": 1, "method": "ping"}),
+            json.dumps({"id": 2, "method": "nope"}),  # raises inside the handler
+            json.dumps({"id": 3, "method": "ping"}),  # must still be answered
+        ]
+        replies = self._exchange(reqs)
+        self.assertEqual([r["id"] for r in replies], [1, 2, 3])
+        self.assertEqual([r["ok"] for r in replies], [True, False, True])
 
 
 if __name__ == "__main__":
