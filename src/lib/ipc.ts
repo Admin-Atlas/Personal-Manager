@@ -38,6 +38,7 @@ import type {
   ImageData,
   Importance,
   IngestEvent,
+  InstallProgressEvent,
   LanguageOptions,
   LayoutProgressEvent,
   LocalFolder,
@@ -45,7 +46,6 @@ import type {
   Message,
   ModelInfo,
   ModelRecommendations,
-  OcrInstallEvent,
   OcrStatus,
   OneDriveAccount,
   OneDriveFolder,
@@ -55,7 +55,6 @@ import type {
   Preference,
   Milestone,
   ProjectOverview,
-  PythonInstallEvent,
   ProjectProposalEvent,
   ProjectSize,
   GdriveBackupStatus,
@@ -71,7 +70,6 @@ import type {
   SidecarStatus,
   StorageReport,
   SyncEvent,
-  TsneInstallEvent,
   TsneStatus,
   VaultLockStatus,
   VaultStatus,
@@ -830,18 +828,27 @@ export const removeStorageComponent = (id: string) =>
 export const onLayoutProgress = (handler: (e: LayoutProgressEvent) => void): Promise<UnlistenFn> =>
   listen<LayoutProgressEvent>("layout://progress", (e) => handler(e.payload));
 
+/** Subscribe to an optional component's install-download progress on `<component>://install`. One
+ *  channel shape for the three optional downloads (t-SNE, OCR, and the macOS Python fetch); the thin
+ *  `on*Install` aliases below name each channel for their callers. */
+export const onInstallProgress = (
+  component: "python" | "tsne" | "ocr",
+  handler: (e: InstallProgressEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<InstallProgressEvent>(`${component}://install`, (e) => handler(e.payload));
+
 /** Subscribe to the optional t-SNE download's progress (fires from whichever view triggered it). */
-export const onTsneInstall = (handler: (e: TsneInstallEvent) => void): Promise<UnlistenFn> =>
-  listen<TsneInstallEvent>("tsne://install", (e) => handler(e.payload));
+export const onTsneInstall = (handler: (e: InstallProgressEvent) => void): Promise<UnlistenFn> =>
+  onInstallProgress("tsne", handler);
 
 /** Subscribe to the optional OCR download's progress (fires from whichever view triggered it). */
-export const onOcrInstall = (handler: (e: OcrInstallEvent) => void): Promise<UnlistenFn> =>
-  listen<OcrInstallEvent>("ocr://install", (e) => handler(e.payload));
+export const onOcrInstall = (handler: (e: InstallProgressEvent) => void): Promise<UnlistenFn> =>
+  onInstallProgress("ocr", handler);
 
 /** Subscribe to the macOS interpreter download's progress (fires during first-run setup when PM has
  *  to download Python because none was found on the machine). */
-export const onPythonInstall = (handler: (e: PythonInstallEvent) => void): Promise<UnlistenFn> =>
-  listen<PythonInstallEvent>("python://install", (e) => handler(e.payload));
+export const onPythonInstall = (handler: (e: InstallProgressEvent) => void): Promise<UnlistenFn> =>
+  onInstallProgress("python", handler);
 
 /** Open a document's source: an index-only web link (Drive/OneDrive) opens in the system browser; a
  *  local-folder file path is revealed-and-selected in the OS file manager. Supersedes `open_external_ref`. */
