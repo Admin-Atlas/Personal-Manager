@@ -27,8 +27,9 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import rehypeExternalLinks from "rehype-external-links";
 
 // Extend the default (safe) schema only to let the external-links plugin's `target`/`rel` survive
-// sanitization on anchors — everything else stays at the conservative default allowlist.
-const SCHEMA = {
+// sanitization on anchors — everything else stays at the conservative default allowlist. Exported for
+// the T-07 unit test, which locks the allowlist against a regression that widens it.
+export const SCHEMA = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
@@ -37,8 +38,10 @@ const SCHEMA = {
 };
 
 // Relative/in-page targets are safe; absolute URLs must match the protocol allowlist or are dropped.
+// Exported for the T-07 unit test — this is the pure function that neutralises a hostile `javascript:`
+// (or any non-allowlisted) href to an empty string.
 const ABSOLUTE_ALLOWED = /^(https?:|mailto:)/i;
-function safeUrl(url: string): string {
+export function safeUrl(url: string): string {
   if (url.startsWith("#") || url.startsWith("/") || url.startsWith("./") || url.startsWith("../")) {
     return url;
   }

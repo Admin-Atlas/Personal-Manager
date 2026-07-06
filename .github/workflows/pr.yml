@@ -45,6 +45,8 @@ jobs:
         run: just eslint
       - name: Type-check (tsc --noEmit)
         run: just tsc
+      - name: Frontend tests (vitest)
+        run: just frontend-test
 
   # --- backend: format, clippy, check, tests (Rust) -----------------------
   rust:

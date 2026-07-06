@@ -23,7 +23,7 @@ default:
 check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
-check: check-fast clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks zizmor
+check: check-fast frontend-test clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks zizmor
 
 # Auto-apply every formatter (the writing counterpart to the --check recipes).
 fmt:
@@ -43,6 +43,11 @@ eslint:
 
 tsc:
     npx tsc --noEmit
+
+# Frontend unit tests (vitest, scoped to src/lib/** — the pure invariant-bearing modules the audit
+# flagged as guarded by nothing: date formatting, the markdown sanitize allowlist) (T-07).
+frontend-test:
+    npx vitest run
 
 # --- backend (Rust) -------------------------------------------------------
 
