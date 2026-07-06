@@ -44,7 +44,7 @@ export function Modal({
     // DocumentReader. The scrim never covers the top chrome.
     <div
       className="fixed inset-x-0 bottom-0 top-9 z-50 flex items-center justify-center p-6"
-      style={{ background: "rgba(8,6,4,0.5)" }}
+      style={{ background: "var(--scrim)" }}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}

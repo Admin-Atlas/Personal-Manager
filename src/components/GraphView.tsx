@@ -83,9 +83,14 @@ interface ThemeColors {
   uiFont: string;
 }
 
+// Neutral fallback when a theme custom property reads empty (e.g. mid theme-swap) — a legible mid-grey
+// on either canvas (I-02, was an inline hex). The graph draws on a <canvas>, which can't resolve
+// var(--…), so `readThemeColors` snapshots the tokens and this guards a momentarily-missing one.
+const THEME_FALLBACK = "#888";
+
 function readThemeColors(): ThemeColors {
   const s = getComputedStyle(document.documentElement);
-  const v = (name: string) => s.getPropertyValue(name).trim() || "#888";
+  const v = (name: string) => s.getPropertyValue(name).trim() || THEME_FALLBACK;
   return {
     border: v("--border"),
     bg: v("--bg"),

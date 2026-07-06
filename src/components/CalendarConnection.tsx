@@ -13,6 +13,7 @@ import {
 } from "../lib/ipc";
 import type { Calendar, CalendarAccount, CalendarOverview } from "../lib/types";
 import { useDevMode } from "../lib/capabilities";
+import { formatWhen } from "../lib/format";
 import { Button, ConfirmDialog, Skeleton } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
 import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
@@ -409,9 +410,4 @@ function calendarApiDisabled(error: string | null): { enableUrl: string } | null
   return {
     enableUrl: url ?? "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com",
   };
-}
-
-function formatWhen(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
