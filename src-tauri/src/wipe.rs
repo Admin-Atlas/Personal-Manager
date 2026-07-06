@@ -338,7 +338,16 @@ pub async fn wipe_pm_data(
                 .join(crate::index_only::MANIFEST_FILENAME),
         );
         let _ = vault::lock::clear_baton_files(&resolved.vault_root);
-        let _ = vault::migrate::clear_journal(&resolved.vault_root);
+        // The migration journal + its pre-migration backup live at the DATA DIR, not the vault root
+        // (so boot finds them while a migration relocates the vault). For a relocated vault the two
+        // differ, so clearing at `vault_root` was a no-op that stranded them: the leftover backup is
+        // a full DECRYPTABLE copy of the vault, and the stale journal would drive `recover()` on the
+        // next launch against paths the wipe just deleted — worst case resurrecting that backup as a
+        // live vault after the user chose "remove everything" (B1-4).
+        let _ = vault::migrate::clear_journal(&data_dir);
+        let migration_backup = vault::migrate::backup_dir(&data_dir);
+        report.freed_bytes += dir_size(&migration_backup);
+        remove_dir_all_retrying(&migration_backup);
         remove_dir_all_retrying(&resolved.markdown_dir);
         // A relocated vault lives in a folder the *user* chose (`move_vault` passes their path
         // straight through, commands.rs), which may already hold unrelated files. Its PM artifacts

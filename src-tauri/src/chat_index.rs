@@ -310,9 +310,71 @@ fn sync_chat_frontmatter(state: &AppState, doc_id: i64) -> Result<()> {
     chat::rewrite_chat_classification(
         &cipher,
         &vault.join(&vault_path),
+        None, // classification sync leaves the title alone
         importance.as_deref(),
         reviewed,
     )
+}
+
+/// DB half of [`mirror_title`]: point the linked chat `documents` row at the new title and hand back the
+/// vault path (+ its current org scalars) whose front-matter still needs patching. Returns `None` when the
+/// chat isn't indexed yet (`chat_sessions.document_id` NULL ⇒ the JOIN drops the row) or has no file yet, so
+/// the caller does nothing. Split out so the join + update is unit-testable without an `AppState`/vault.
+pub(crate) fn mirror_title_row(
+    conn: &Connection,
+    conversation_id: i64,
+    title: &str,
+) -> Result<Option<(String, Option<String>, bool)>> {
+    let row = conn
+        .query_row(
+            "SELECT cs.document_id, cs.vault_path, d.importance, d.reviewed \
+             FROM chat_sessions cs JOIN documents d ON d.id = cs.document_id \
+             WHERE cs.conversation_id = ?1",
+            params![conversation_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((doc_id, vault_path, importance, reviewed)) = row else {
+        return Ok(None); // not indexed yet — birth-time `chat_doc_meta` copies the then-current title
+    };
+    conn.execute(
+        "UPDATE documents SET title = ?1 WHERE id = ?2",
+        params![title, doc_id],
+    )?;
+    Ok(vault_path
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| (p, importance, reviewed)))
+}
+
+/// Mirror a generated or user-set chat title (which lands on `conversations.title`) forward onto the linked
+/// chat document — the denormalised `documents.title` AND the vault front-matter `title:` — so the Documents
+/// list, chat citations (both read `documents.title`, [`crate::retrieval`]), and a later Rebuild all track it
+/// instead of the 48-char first-message placeholder frozen at first index (B5-6). A no-op until the chat has
+/// been indexed. Short DB lock for the row update; the file patch runs off the lock, and the row update runs
+/// first so the visible citation/list fix lands even if the file patch later fails.
+pub(crate) fn mirror_title(state: &AppState, conversation_id: i64, title: &str) -> Result<()> {
+    let patch = {
+        let conn = state.conn()?;
+        mirror_title_row(&conn, conversation_id, title)?
+    };
+    if let Some((vault_path, importance, reviewed)) = patch {
+        let (vault, cipher) = state.markdown_io()?;
+        chat::rewrite_chat_classification(
+            &cipher,
+            &vault.join(&vault_path),
+            Some(title),
+            importance.as_deref(),
+            reviewed,
+        )?;
+    }
+    Ok(())
 }
 
 /// Land a session's pre-split, pre-embedded segments: birth the `documents` row on the first index that
@@ -829,6 +891,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vecs, 1, "leaf is vector-indexed");
+    }
+
+    #[test]
+    fn mirror_title_row_updates_the_indexed_document_and_returns_its_path() {
+        // B5-6: a generated/renamed title is copied forward from `conversations.title` onto the linked
+        // chat document. Before indexing there is no documents row, so the mirror is a no-op; after
+        // indexing it updates `documents.title` (frozen at the birth placeholder) and hands back the
+        // vault path whose front-matter still needs the same patch.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+
+        // Not indexed yet ⇒ pure no-op (the JOIN finds no linked document row).
+        assert_eq!(mirror_title_row(&conn, conv, "Renamed").unwrap(), None);
+
+        // Index the session: births the documents row, copying the CURRENT conversations.title
+        // ("My chat" — the placeholder stand-in) into documents.title, and links document_id.
+        let segs = vec![segment(
+            2,
+            "2026-06-28T10:00:01.000Z",
+            "**You:** hi\n\n**PM:** hello",
+        )];
+        let p = plan(&conn, conv);
+        commit_session_index(&mut conn, &p, &segs, 2, "2026-06-28T10:00:01.000Z").unwrap();
+        let title_at_birth: String = conn
+            .query_row(
+                "SELECT d.title FROM documents d JOIN chat_sessions cs ON cs.document_id = d.id \
+                 WHERE cs.conversation_id = ?1",
+                params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            title_at_birth, "My chat",
+            "birth freezes the then-current placeholder title"
+        );
+
+        // Mirror a real title: documents.title is updated, and the vault path (general chat ⇒ no
+        // importance, unreviewed) is returned for the off-lock front-matter patch.
+        let patched = mirror_title_row(&conn, conv, "Quarterly budget review").unwrap();
+        assert_eq!(
+            patched,
+            Some((format!("vault/chat-{conv}.md"), None, false)),
+            "hands back the file to patch + its current org scalars"
+        );
+        let title_after: String = conn
+            .query_row(
+                "SELECT d.title FROM documents d JOIN chat_sessions cs ON cs.document_id = d.id \
+                 WHERE cs.conversation_id = ?1",
+                params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            title_after, "Quarterly budget review",
+            "the mirror lands on the indexed documents.title"
+        );
     }
 
     #[test]

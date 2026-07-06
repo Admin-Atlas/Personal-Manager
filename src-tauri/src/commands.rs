@@ -890,17 +890,23 @@ pub fn rename_conversation(
             "A conversation title can't be empty.".into(),
         ));
     }
-    let conn = state.conn()?;
-    conn.execute(
-        "UPDATE conversations SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
-        params![title, conversation_id],
-    )?;
-    // No-op when the session row doesn't exist yet (a conversation with no recorded turn-pair) — that chat
-    // is not eligible for background titling anyway, so the user's title is safe regardless.
-    conn.execute(
-        "UPDATE chat_sessions SET title_state = 'custom' WHERE conversation_id = ?1",
-        params![conversation_id],
-    )?;
+    {
+        let conn = state.conn()?;
+        conn.execute(
+            "UPDATE conversations SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![title, conversation_id],
+        )?;
+        // No-op when the session row doesn't exist yet (a conversation with no recorded turn-pair) — that chat
+        // is not eligible for background titling anyway, so the user's title is safe regardless.
+        conn.execute(
+            "UPDATE chat_sessions SET title_state = 'custom' WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+    }
+    // Mirror the rename onto the linked chat document + its vault front-matter (B5-6), so the Documents list,
+    // citations, and a later Rebuild show the user's title instead of the first-message placeholder. The lock
+    // above is dropped first (mirror_title takes its own short lock); a no-op until the chat is indexed.
+    crate::chat_index::mirror_title(state.inner(), conversation_id, &title)?;
     Ok(title)
 }
 
@@ -2308,6 +2314,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                     &now,
                     &vault_root,
                     &manifest_cipher,
+                    ingest::FilingActivity::Record,
                 )?;
                 written.push(w);
                 entities::reassign_document(&tx, d.document_id, entity_id)?;
@@ -2419,6 +2426,7 @@ pub async fn set_document_metadata(
                 &now,
                 &vault_root,
                 &manifest_cipher,
+                ingest::FilingActivity::Record,
             )?);
             entities::reassign_document(&tx, document_id, entity_id)?;
             // A deliberate after-the-fact metadata edit vouches for the chosen entity — confirm it.
@@ -2552,6 +2560,9 @@ fn rewrite_entity_documents(
             &last_activity,
             vault_root,
             manifest_cipher,
+            // Identity maintenance, not engagement: renaming/merging an entity rewrites every linked
+            // doc, and logging one "filed" observation per doc would read as a burst of activity (B6-6).
+            ingest::FilingActivity::Suppress,
         )?);
     }
     Ok(written)
@@ -2676,6 +2687,7 @@ pub async fn reassign_document(app: AppHandle, document_id: i64, entity_id: i64)
                 &last_activity,
                 vault_root,
                 manifest_cipher,
+                ingest::FilingActivity::Record,
             )?])
         },
     )

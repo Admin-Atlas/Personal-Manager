@@ -1897,12 +1897,23 @@ fn truth_source(tx: &Connection, doc_id: i64) -> Result<TruthSource> {
     })
 }
 
+/// Whether filing a document should append a Stage-3 project-activity observation. A genuine user
+/// organize edit `Record`s per-project engagement; bulk identity maintenance (an entity
+/// rename/merge rewriting every linked doc — [`crate::commands`]) `Suppress`es it, because a
+/// rename is not per-document engagement and would otherwise read as a burst of it (B6-6).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FilingActivity {
+    Record,
+    Suppress,
+}
+
 /// Persist a document's organisational truth (canonical project + tags/importance/reviewed/
 /// last_activity) to wherever its source keeps it, returning the file snapshot for rollback. The
 /// single indirection point every metadata write goes through — so hard-coding front-matter can't
 /// creep back in: a vault document rewrites its Markdown front-matter, an index-only document
 /// rewrites the encrypted manifest (see [`TruthSource`]). `vault`/`cipher` reach the Markdown layer;
 /// `vault_root`/`manifest_cipher` reach the manifest — a caller passes both and the dispatch picks.
+/// `activity` decides whether filing into a real project logs engagement ([`FilingActivity`]).
 /// Pass a `rusqlite::Transaction` (it derefs to `&Connection`); commit it only once the whole batch
 /// is written. The returned `(path, prior_bytes)` rolls back via [`restore_vault_files`] for either
 /// arm (an empty prior means the file was freshly created — it gets removed, not zeroed).
@@ -1919,6 +1930,7 @@ pub fn write_document_truth(
     last_activity: &str,
     vault_root: &Path,
     manifest_cipher: &crate::index_only::ManifestCipher,
+    activity: FilingActivity,
 ) -> Result<(std::path::PathBuf, Vec<u8>)> {
     let written = match truth_source(tx, doc_id)? {
         TruthSource::VaultFrontmatter => rewrite_vault_metadata(
@@ -1948,8 +1960,9 @@ pub fn write_document_truth(
     // Stage-3 activity log: filing a document INTO a real project is per-project engagement, and this
     // seam is the single choke-point every user-initiated organize edit passes through (Rebuild and
     // chat-document birth insert their rows directly, bypassing it). "Unsorted" is the pre-triage
-    // bucket, not a project the user chose, so it doesn't count. Best-effort, inside the caller's tx.
-    if project != "Unsorted" {
+    // bucket, not a project the user chose, so it doesn't count; nor does a bulk identity rewrite
+    // (`FilingActivity::Suppress` — B6-6). Best-effort, inside the caller's tx.
+    if activity == FilingActivity::Record && project != "Unsorted" {
         crate::project_activity::record(
             tx,
             project,
@@ -3000,6 +3013,7 @@ mod tests {
             "2026-06-26T00:00:00Z",
             dir.path(),
             &cipher,
+            FilingActivity::Record,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -3060,6 +3074,7 @@ mod tests {
                 "2026-06-26T00:00:00Z",
                 dir.path(),
                 &cipher,
+                FilingActivity::Record,
             )
             .unwrap();
             tx.commit().unwrap();
@@ -3091,6 +3106,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM project_activity", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "filing into Unsorted logs nothing");
+    }
+
+    /// B6-6: a bulk identity rewrite (entity rename/merge) files each linked doc into the new
+    /// canonical name via `FilingActivity::Suppress`, so NO per-doc `ingest` observation is logged —
+    /// renaming a 200-doc project must not read as 200 filings in one instant on the Stage-4 heat map.
+    #[test]
+    fn write_document_truth_suppresses_activity_when_asked() {
+        use crate::index_only::ManifestCipher;
+        let (dir, mut conn, _vault_id, index_id) = store_with_one_of_each();
+        let cipher = ManifestCipher::from_master("vault-test", &[9u8; 32]);
+        let vault_dir = dir.path().join("vault");
+        let markdown = crate::vault::MarkdownCipher::plaintext("vault-test");
+
+        let tx = conn.transaction().unwrap();
+        write_document_truth(
+            &tx,
+            &vault_dir,
+            &markdown,
+            index_id,
+            "Project X", // a real project — would log under Record, but we Suppress
+            &[],
+            None,
+            true,
+            "2026-06-26T00:00:00Z",
+            dir.path(),
+            &cipher,
+            FilingActivity::Suppress,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project_activity", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "a suppressed filing logs no engagement");
     }
 
     #[test]

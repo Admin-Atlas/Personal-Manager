@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.40-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Your chats show their real name everywhere. When PM titles a conversation for you — or you rename one — that title now also updates in your Documents list and in the citations that point back to a chat, instead of keeping the short snippet it started life with.",
+      "'Remove all data' is more thorough. If PM was interrupted partway through moving your vault to a new folder, a wipe now also clears the temporary backup it left behind, so removing everything never leaves a readable copy of your data on disk.",
+      "Under-the-hood tidying. Renaming or merging a person or project no longer counts as fresh activity on every document it touches. No change to how anything looks.",
+    ],
+  },
+  {
     version: "2.92.39-alpha",
     date: "2026-07-06",
     highlights: [
