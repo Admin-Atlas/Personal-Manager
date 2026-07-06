@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.36-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "OneDrive files now remember their folder. When PM indexes a file from OneDrive, it notes which folder the file sits in — the same detail it already keeps for Google Drive files — so that folder is there as context when you look at where a document came from.",
+    ],
+  },
+  {
     version: "2.92.35-alpha",
     date: "2026-07-06",
     highlights: [
