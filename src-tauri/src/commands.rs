@@ -5358,6 +5358,10 @@ pub async fn create_local_backup(
     dest_path: String,
     passphrase: String,
 ) -> Result<()> {
+    // I-03: wipe the backup passphrase plaintext from memory on return — it flows into `pack` as a
+    // borrow and is dropped (zeroized) when the blocking task that owns it completes. The derived
+    // key is already Zeroizing; the raw passphrase was the backup-family gap left after #257.
+    let passphrase = zeroize::Zeroizing::new(passphrase);
     if passphrase.is_empty() {
         return Err(Error::Other("a backup passphrase is required".into()));
     }
@@ -5475,6 +5479,8 @@ pub async fn restore_local_backup(
     src_path: String,
     passphrase: String,
 ) -> Result<RestoreSummary> {
+    // I-03: wipe the backup passphrase plaintext from memory on return (see `create_local_backup`).
+    let passphrase = zeroize::Zeroizing::new(passphrase);
     if passphrase.is_empty() {
         return Err(Error::Other("the backup passphrase is required".into()));
     }
@@ -5811,6 +5817,10 @@ pub(crate) async fn run_backup(
     targets: Vec<BackupDestination>,
     retention: Option<u32>,
 ) -> Result<String> {
+    // I-03: wipe the passphrase plaintext on return. This is the shared multi-destination path — the
+    // scheduler reaches it by cloning the passphrase out of its keychain `Secret` (schedule.rs), so
+    // that transient copy is owned (and zeroized) here rather than lingering on the stack.
+    let passphrase = zeroize::Zeroizing::new(passphrase);
     if targets.is_empty() {
         return Err(Error::Other("no backup destination selected".into()));
     }

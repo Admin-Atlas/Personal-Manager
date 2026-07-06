@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.38-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Steadier cloud syncing and rebuilds. If a sync can't fully reach one of your connected accounts, PM now marks that account as needing another try instead of quietly treating the partial pass as complete — so nothing gets skipped over. And if rebuilding the search index can't restore your cloud-indexed items, it now says so plainly rather than finishing as if all was well.",
+      "A little more careful with backup passphrases. The passphrase you type for an encrypted backup or restore is now wiped from memory as soon as PM is done with it, matching how PM already handles your vault passphrase.",
+    ],
+  },
+  {
     version: "2.92.37-alpha",
     date: "2026-07-06",
     highlights: [

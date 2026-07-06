@@ -43,6 +43,10 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
   // file lands. Null total (model download / warmup) keeps the bar an indeterminate sweep.
   const [total, setTotal] = useState<number | null>(null);
   const [processed, setProcessed] = useState(0);
+  // Items that failed to re-index this run (B3-7). A wholesale connector-manifest failure surfaces
+  // here as one synthetic `failed` event, so a rebuild that couldn't restore your cloud-indexed items
+  // reads as a partial success, not a clean one.
+  const [failedCount, setFailedCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
   // Callbacks via refs so the run effect can depend only on `open` (no churn when the parent
   // passes fresh inline closures each render).
@@ -60,6 +64,7 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
       setFiles([]);
       setTotal(null);
       setProcessed(0);
+      setFailedCount(0);
       setError(null);
       return;
     }
@@ -80,10 +85,13 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
               setFiles((prev) => [...prev, event.name]);
               break;
             case "done":
-            case "failed":
               // Each file's terminal event advances the determinate bar; the names roll into
               // the running list, and the final summary line is enough for the rest.
               setProcessed((n) => n + 1);
+              break;
+            case "failed":
+              setProcessed((n) => n + 1);
+              setFailedCount((n) => n + 1);
               break;
             default:
               break;
@@ -134,9 +142,16 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
           </div>
         )}
 
-        {phase === "done" && (
+        {phase === "done" && failedCount === 0 && (
           <p className="mt-4 text-sm text-[var(--st-quick)]">
             Done — your library is re-indexed with the new search language.
+          </p>
+        )}
+        {phase === "done" && failedCount > 0 && (
+          <p className="mt-4 text-sm text-st-due">
+            Re-indexed, but {failedCount} item{failedCount === 1 ? "" : "s"} couldn&apos;t be
+            restored this time — they&apos;ll be picked up on the next sync or rebuild. Nothing was
+            removed.
           </p>
         )}
         {phase === "error" && (

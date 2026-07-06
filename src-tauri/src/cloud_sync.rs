@@ -108,6 +108,13 @@ struct AccountWork<Item> {
     /// resumes next pass). Either way this flag makes phase 2 surface a coverage-incomplete note so the
     /// partial pass isn't mistaken for a clean one.
     coverage_incomplete: bool,
+    /// Set when phase-1 gather hit a soft (non-auth) error — a transient delta/list/reconcile failure
+    /// that left the item set possibly incomplete (F-29). Auth failures take the `auth_failed` path
+    /// instead. Phase 2 seeds `account_failed` from this so the account finalizes 'error' with its
+    /// cursor left unadvanced (retry next pass), rather than stamping a misleading 'ok' + advancing
+    /// the cursor past changes a failed gather never saw. Distinct from `coverage_incomplete`, which
+    /// is a *successful* but truncated pass.
+    gather_failed: bool,
 }
 
 /// The phase-2 resolution of one gathered work item: either a no-op to skip (a changes-feed entry that
@@ -365,8 +372,10 @@ async fn run_cloud_pass<C: CloudDriver>(
         // the account is stamped 'error' with its cursor left unadvanced instead of a misleading 'ok'.
         // Reset per account so one bad account doesn't taint the next (the global `failed` counter is
         // cross-account and can't gate this per-account decision). Mirrors the calendar sync's "check
-        // failures first" rule (F-29).
-        let mut account_failed = false;
+        // failures first" rule (F-29). Seeded from the phase-1 gather outcome: a transient gather error
+        // already means the pass is incomplete, so the same 'hold the cursor, flag error' applies even
+        // if every item that *was* gathered then applies cleanly.
+        let mut account_failed = w.gather_failed;
 
         // A whole-account auth failure fans every item out to `unreachable` (never mass deletion).
         if w.auth_failed {
@@ -1003,6 +1012,9 @@ impl CloudDriver for DriveDriver {
             }
         }
 
+        // A soft (non-auth) gather error means the delta/reconcile may be incomplete — flag it so
+        // phase 2 holds this account's cursor (F-29). Auth failures are carried separately.
+        let gather_failed = last_err.is_some() && !auth_failed;
         Ok((
             AccountWork {
                 email,
@@ -1012,6 +1024,7 @@ impl CloudDriver for DriveDriver {
                 extra_cursors,
                 auth_failed,
                 coverage_incomplete,
+                gather_failed,
             },
             last_err,
         ))
@@ -1294,6 +1307,9 @@ impl CloudDriver for OneDriveDriver {
             }
         }
 
+        // A soft (non-auth) gather error means the delta/reconcile may be incomplete — flag it so
+        // phase 2 holds this account's cursor (F-29). Auth failures are carried separately.
+        let gather_failed = last_err.is_some() && !auth_failed;
         Ok((
             AccountWork {
                 email,
@@ -1303,6 +1319,7 @@ impl CloudDriver for OneDriveDriver {
                 extra_cursors: Vec::new(),
                 auth_failed,
                 coverage_incomplete,
+                gather_failed,
             },
             last_err,
         ))
