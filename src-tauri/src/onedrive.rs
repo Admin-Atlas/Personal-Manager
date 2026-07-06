@@ -357,6 +357,11 @@ pub struct DriveItem {
     pub is_folder: bool,
     pub is_file: bool,
     pub web_url: Option<String>,
+    /// The containing folder, from Graph's `parentReference` — which carries the id AND the name
+    /// inline (unlike Drive, which resolves the folder name in a separate fetch). Both ride onto the
+    /// pointer as review context.
+    pub parent_id: Option<String>,
+    pub parent_name: Option<String>,
 }
 
 /// Lets a folder-scoped enumeration reconcile through the shared [`index_only::reconcile_enumeration`]
@@ -395,11 +400,12 @@ impl DriveItem {
             source_modified_at: self.modified_time.clone(),
             source_content_hash: self.content_hash(),
             body,
-            // OneDrive parent-folder parity is a deferred follow-up: Graph exposes the parent via
-            // `parentReference` (id + path), a different shape from Drive's `parents[]`, so it stays
-            // out of this PR. Files sync exactly as before, untagged.
-            source_parent_folder_id: None,
-            source_parent_folder_name: None,
+            // Parent-folder parity with Drive: Graph's `parentReference` carries the folder id AND its
+            // name inline (Drive resolves the name in a separate fetch), so both ride straight onto the
+            // pointer as review context — they never touch the chunker/embedder. A file at the drive
+            // root (no parentReference name) simply stays untagged, exactly as before.
+            source_parent_folder_id: self.parent_id.clone(),
+            source_parent_folder_name: self.parent_name.clone(),
         }
     }
 }
@@ -455,6 +461,16 @@ fn parse_item(v: &Value) -> Option<DriveItem> {
         is_folder,
         is_file,
         web_url: v.get("webUrl").and_then(Value::as_str).map(String::from),
+        parent_id: v
+            .get("parentReference")
+            .and_then(|p| p.get("id"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        parent_name: v
+            .get("parentReference")
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+            .map(String::from),
     })
 }
 
@@ -813,6 +829,8 @@ mod tests {
             is_folder: false,
             is_file: true,
             web_url: Some(format!("https://onedrive/{id}")),
+            parent_id: None,
+            parent_name: None,
         }
     }
 
@@ -906,17 +924,47 @@ mod tests {
     }
 
     #[test]
+    fn pointer_carries_the_parent_folder_for_parity_with_drive() {
+        // Graph's parentReference (id + name) rides onto the pointer as review context, like Drive's
+        // folder tag — never touching the chunker/embedder.
+        let item = parse_item(&serde_json::json!({
+            "id": "01F", "name": "A.pdf",
+            "file": {"mimeType": "application/pdf", "hashes": {"quickXorHash": "QX"}},
+            "webUrl": "https://onedrive/01F",
+            "parentReference": {"id": "01DPARENT", "name": "Reports"}
+        }))
+        .unwrap();
+        let ptr = item.pointer("onedrive:a@b.com:01F".into(), "body".into());
+        assert_eq!(ptr.source_parent_folder_id.as_deref(), Some("01DPARENT"));
+        assert_eq!(ptr.source_parent_folder_name.as_deref(), Some("Reports"));
+
+        // A file with no parentReference name stays untagged — untagged, never wrong.
+        let rootless = parse_item(&serde_json::json!({
+            "id": "01R", "name": "R.pdf",
+            "file": {"mimeType": "application/pdf"}, "webUrl": "https://onedrive/01R"
+        }))
+        .unwrap();
+        let rp = rootless.pointer("onedrive:a@b.com:01R".into(), "body".into());
+        assert!(rp.source_parent_folder_id.is_none());
+        assert!(rp.source_parent_folder_name.is_none());
+    }
+
+    #[test]
     fn parse_item_reads_file_folder_and_tombstone_shapes() {
         let f = serde_json::json!({
             "id": "01F", "name": "A.pdf",
             "file": {"mimeType": "application/pdf", "hashes": {"quickXorHash": "QX"}},
             "lastModifiedDateTime": "2026-06-27T00:00:00Z", "size": 99,
-            "webUrl": "https://onedrive/01F"
+            "webUrl": "https://onedrive/01F",
+            "parentReference": {"id": "01DPARENT", "name": "Reports"}
         });
         let parsed = parse_item(&f).unwrap();
         assert!(parsed.is_file && !parsed.is_folder);
         assert_eq!(parsed.mime_type, "application/pdf");
         assert_eq!(parsed.quick_xor_hash.as_deref(), Some("QX"));
+        // parentReference carries the folder id AND name inline (parity with Drive).
+        assert_eq!(parsed.parent_id.as_deref(), Some("01DPARENT"));
+        assert_eq!(parsed.parent_name.as_deref(), Some("Reports"));
 
         let folder =
             serde_json::json!({"id": "01D", "name": "Reports", "folder": {"childCount": 3}});
