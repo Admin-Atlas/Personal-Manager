@@ -345,27 +345,33 @@ pub fn set_time_zone(state: State<'_, AppState>, zone: String) -> Result<()> {
     db::set_setting(&conn, TIME_ZONE_KEY, zone)
 }
 
-/// Webview-owned UI preferences that may be persisted via `set_pref`. Holding the
-/// list here (rather than letting the webview write any key) keeps presentation
-/// state out of the schema-critical rows: the webview must never be able to
-/// rewrite e.g. `embedding_dim` and silently corrupt the index.
-const WRITABLE_PREFS: &[&str] = &["appearance", "pinboard", "dev_mode", "map", "project_ui"];
+/// The webview-owned UI preference blobs — the ONLY `settings` keys the webview may read or write.
+/// Holding the list here (rather than letting the webview touch any key) keeps schema-critical and
+/// sensitive rows out of reach: the webview must never rewrite e.g. `embedding_dim` (silently
+/// corrupting the index) NOR read e.g. the archived `learning_profile`, cursors, or model lists
+/// (I-04 — the read side was previously ungated). Read and write share one allowlist because the
+/// readable set is exactly the webview's own blobs.
+const WEBVIEW_PREFS: &[&str] = &["appearance", "pinboard", "dev_mode", "map", "project_ui"];
 
 /// Read a UI preference blob the webview previously stored (theme axes, pinboard
 /// layout). These live in the encrypted `settings` table — not the webview's
 /// `localStorage` — so they travel with the data folder when it's backed up or
-/// moved to another machine. Returns `None` when nothing is stored yet.
+/// moved to another machine. Returns `None` when nothing is stored yet. Gated on
+/// [`WEBVIEW_PREFS`] (I-04) so a compromised webview can't read arbitrary settings rows.
 #[tauri::command]
 pub fn get_pref(state: State<'_, AppState>, key: String) -> Result<Option<String>> {
+    if !WEBVIEW_PREFS.contains(&key.as_str()) {
+        return Err(Error::Other(format!("preference '{key}' is not readable")));
+    }
     let conn = state.conn()?;
     db::get_setting(&conn, &key)
 }
 
-/// Persist a UI preference blob (see [`get_pref`]). Restricted to [`WRITABLE_PREFS`]
+/// Persist a UI preference blob (see [`get_pref`]). Restricted to [`WEBVIEW_PREFS`]
 /// so the webview can only touch presentation state, never schema-critical keys.
 #[tauri::command]
 pub fn set_pref(state: State<'_, AppState>, key: String, value: String) -> Result<()> {
-    if !WRITABLE_PREFS.contains(&key.as_str()) {
+    if !WEBVIEW_PREFS.contains(&key.as_str()) {
         return Err(Error::Other(format!("preference '{key}' is not writable")));
     }
     let conn = state.conn()?;
@@ -577,6 +583,9 @@ pub fn retry_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()
 /// who never opt in; changing an existing passphrase is `change_vault_passphrase`.
 #[tauri::command]
 pub async fn create_shareable_vault(app: AppHandle, passphrase: String) -> Result<()> {
+    // I-03: hold the passphrase in a Zeroizing so its plaintext is wiped from memory on return
+    // (every derived key is already Zeroizing; the raw passphrase was the gap).
+    let passphrase = zeroize::Zeroizing::new(passphrase);
     if passphrase.trim().is_empty() {
         return Err(Error::Other("a passphrase is required".into()));
     }
@@ -608,6 +617,8 @@ pub async fn create_shareable_vault(app: AppHandle, passphrase: String) -> Resul
 /// crash-recoverable migration. Only valid for an already-shareable vault.
 #[tauri::command]
 pub async fn change_vault_passphrase(app: AppHandle, new_passphrase: String) -> Result<()> {
+    // I-03: wipe the passphrase plaintext from memory on return.
+    let new_passphrase = zeroize::Zeroizing::new(new_passphrase);
     if new_passphrase.trim().is_empty() {
         return Err(Error::Other("a passphrase is required".into()));
     }
@@ -696,6 +707,8 @@ pub async fn move_vault(app: AppHandle, folder: String) -> Result<()> {
 /// the derived key in this profile so the next launch is silent.
 #[tauri::command]
 pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: String) -> Result<()> {
+    // I-03: wipe the passphrase plaintext from memory on return.
+    let passphrase = zeroize::Zeroizing::new(passphrase);
     let resolved = vault::resolve(&app)?;
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata to unlock".into()))?;
@@ -718,6 +731,8 @@ pub fn open_existing_vault(
     folder: String,
     passphrase: Option<String>,
 ) -> Result<()> {
+    // I-03: wipe the passphrase plaintext from memory on return.
+    let passphrase = passphrase.map(zeroize::Zeroizing::new);
     let root = std::path::PathBuf::from(folder);
     let meta = vault::load_meta(&root)?
         .ok_or_else(|| Error::Other("no PM vault found in that folder".into()))?;
@@ -6386,6 +6401,28 @@ pub fn set_backup_destinations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webview_prefs_allowlist_excludes_sensitive_settings() {
+        // I-04: get_pref/set_pref gate on this list, so a compromised webview can read or write ONLY
+        // its own UI blobs. Lock it: the five UI keys are in, and schema-critical / sensitive rows are
+        // out — a future edit that accidentally adds one trips this test.
+        for ui in ["appearance", "pinboard", "dev_mode", "map", "project_ui"] {
+            assert!(WEBVIEW_PREFS.contains(&ui), "{ui} should be webview-owned");
+        }
+        for sensitive in [
+            "embedding_dim",
+            "embedding_model",
+            "learning_profile",
+            "last_backup_at",
+            "backup_gdrive_account",
+        ] {
+            assert!(
+                !WEBVIEW_PREFS.contains(&sensitive),
+                "{sensitive} must never be readable/writable from the webview"
+            );
+        }
+    }
 
     #[test]
     fn derive_title_takes_first_non_blank_line_capped() {

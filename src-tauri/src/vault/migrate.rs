@@ -37,14 +37,31 @@ const MARKDOWN_SUBDIR: &str = "vault";
 /// make shareable (Device to Passphrase, encrypt), make private (Passphrase to Device,
 /// decrypt), change passphrase (new passphrase), and move (location only). One plan can
 /// combine changes, e.g. make shareable and relocate at once.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MigrationPlan {
     pub target_key_mode: KeyMode,
-    /// Required (non-empty) when the target is Passphrase; ignored for Device.
-    pub new_passphrase: Option<String>,
+    /// Required (non-empty) when the target is Passphrase; ignored for Device. Held in a `Zeroizing`
+    /// so the passphrase plaintext is wiped from memory when the plan drops (I-03).
+    pub new_passphrase: Option<zeroize::Zeroizing<String>>,
     pub target_markdown: MarkdownEncryption,
     /// New vault root, or `None` to stay in place.
     pub target_location: Option<PathBuf>,
+}
+
+// Manual Debug (I-03): redact the passphrase so it can never leak into a log line, while keeping the
+// rest of the plan inspectable. The derived Debug this replaces would have printed the secret in full.
+impl std::fmt::Debug for MigrationPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrationPlan")
+            .field("target_key_mode", &self.target_key_mode)
+            .field(
+                "new_passphrase",
+                &self.new_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("target_markdown", &self.target_markdown)
+            .field("target_location", &self.target_location)
+            .finish()
+    }
 }
 
 impl MigrationPlan {
@@ -260,7 +277,7 @@ fn plan_new_key_and_meta(
             match plan
                 .new_passphrase
                 .as_deref()
-                .map(str::trim)
+                .map(|s| s.trim())
                 .filter(|p| !p.is_empty())
             {
                 // New passphrase set: derive a new key + meta, keeping the vault id.
@@ -518,10 +535,33 @@ mod tests {
     fn plan(mode: KeyMode, pass: Option<&str>, md: MarkdownEncryption) -> MigrationPlan {
         MigrationPlan {
             target_key_mode: mode,
-            new_passphrase: pass.map(String::from),
+            new_passphrase: pass.map(|p| zeroize::Zeroizing::new(p.to_string())),
             target_markdown: md,
             target_location: None,
         }
+    }
+
+    #[test]
+    fn debug_redacts_the_passphrase() {
+        // I-03: a plan must never print its passphrase, even if a `{:?}` ends up in a log line — the
+        // derived Debug this replaces would have leaked it verbatim.
+        let p = plan(
+            KeyMode::Passphrase,
+            Some("hunter2-super-secret"),
+            MarkdownEncryption::XChaCha20Poly1305,
+        );
+        let rendered = format!("{p:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the passphrase must be redacted in Debug output: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+        // A plan with no passphrase renders it as None, not "<redacted>".
+        let none = format!(
+            "{:?}",
+            plan(KeyMode::Device, None, MarkdownEncryption::None)
+        );
+        assert!(none.contains("new_passphrase: None"));
     }
 
     #[test]
