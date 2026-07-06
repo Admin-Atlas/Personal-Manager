@@ -174,8 +174,13 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     // returns NULL if any argument is NULL, so the empty-string sentinel (which sorts below any
     // ISO timestamp) lets the document date win cleanly. `importance` is now the manual override
     // (NULL = Auto / no tag); the old document-derived aggregate is gone.
+    // F-19: the overview was driven purely by `documents`, so a project with milestones but ZERO
+    // documents vanished from Focus — and, because `run_detection` reads this list, its deadline flags
+    // were pruned as stale. UNION in the document-less projects that still have a reason to surface (a
+    // milestone or a `last_touched` engagement stamp) with `doc_count = 0`; their milestones attach via
+    // the same `milestones_by_project` pass below (that pass was never document-gated).
     let mut stmt = conn.prepare(
-        "SELECT d.project, \
+        "SELECT d.project AS name, \
                 COUNT(*) AS doc_count, \
                 max(MAX(COALESCE(d.last_activity, d.ingested_at)), COALESCE(p.last_touched,'')) AS last_activity, \
                 p.deadline, p.size, p.blocked_by, p.parent, p.importance, \
@@ -184,7 +189,17 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
          FROM documents d \
          LEFT JOIN projects p ON p.name = d.project \
          GROUP BY d.project \
-         ORDER BY d.project",
+         UNION ALL \
+         SELECT p.name AS name, \
+                0 AS doc_count, \
+                p.last_touched AS last_activity, \
+                p.deadline, p.size, p.blocked_by, p.parent, p.importance, \
+                julianday(:today) - julianday(date(replace(COALESCE(p.last_touched,''),'Z',''))) AS days_since \
+         FROM projects p \
+         WHERE p.name NOT IN (SELECT project FROM documents WHERE project IS NOT NULL) \
+           AND (p.last_touched IS NOT NULL \
+                OR EXISTS (SELECT 1 FROM project_milestones m WHERE m.project_name = p.name)) \
+         ORDER BY name",
     )?;
 
     let rows = stmt.query_map(named_params![":today": today], |row| {
@@ -809,6 +824,27 @@ mod tests {
         let fresh = overview_for(&rows, "Fresh");
         assert_eq!(fresh.status, ProjectStatus::DueSoon);
         assert_eq!(fresh.milestones.len(), 1);
+    }
+
+    /// F-19: a project with milestones but ZERO documents still appears in the overview — so it shows in
+    /// Focus and, because `run_detection` reads this list, its deadline flags aren't pruned as stale.
+    /// Before the UNION such a project was invisible (the query was driven purely by `documents`).
+    #[test]
+    fn a_document_less_project_with_milestones_still_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // A project that exists ONLY through a milestone — no documents at all.
+        crate::milestones::add(&conn, "Orphan", "pitch", Some("2026-07-01".into()), None).unwrap();
+
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        let orphan = overview_for(&rows, "Orphan");
+        assert_eq!(orphan.doc_count, 0, "no documents, yet still surfaced");
+        assert_eq!(orphan.milestones.len(), 1, "its milestone is attached");
+        assert!(
+            orphan.governing_milestone.is_some(),
+            "its deadline governs, so Focus + flag detection can see it"
+        );
     }
 
     /// Importance is the MANUAL override only: a high-importance *document* must NOT set the

@@ -135,6 +135,10 @@ pub struct DraftFlag {
     pub threshold: Option<String>,
     pub artifact_ptr: Option<String>,
     pub artifact_url: Option<String>,
+    /// The occurrence this flag is about — a calendar event's start (F-18), so a resolved tombstone for
+    /// one occurrence of a recurring series (which shares one iCal UID) can be aged out when a strictly
+    /// later occurrence comes due. `None` for milestone flags: their anchor is already per-instance.
+    pub instance_at: Option<String>,
 }
 
 const FLAG_COLUMNS: &str = "id, anchor_kind, anchor, type, threshold, state, source, \
@@ -550,12 +554,13 @@ fn extract_json_object(s: &str) -> Option<&str> {
 /// flag's stable id whether it was inserted or already present.
 pub fn upsert_active(conn: &Connection, f: &DraftFlag) -> Result<i64> {
     conn.execute(
-        "INSERT INTO flags(anchor_kind, anchor, type, threshold, artifact_ptr, artifact_url) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+        "INSERT INTO flags(anchor_kind, anchor, type, threshold, artifact_ptr, artifact_url, instance_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
          ON CONFLICT(anchor_kind, anchor, type) DO UPDATE SET \
              threshold    = excluded.threshold, \
              artifact_ptr = excluded.artifact_ptr, \
              artifact_url = excluded.artifact_url, \
+             instance_at  = excluded.instance_at, \
              updated_at   = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
          WHERE flags.state = 'active'",
         params![
@@ -564,7 +569,8 @@ pub fn upsert_active(conn: &Connection, f: &DraftFlag) -> Result<i64> {
             f.r#type,
             f.threshold,
             f.artifact_ptr,
-            f.artifact_url
+            f.artifact_url,
+            f.instance_at
         ],
     )?;
     Ok(conn.query_row(
@@ -722,13 +728,20 @@ pub fn detect(projects: &[ProjectOverview], events: &[CalendarEvent], today: &st
             } else {
                 continue; // still comfortably ahead — no flag yet
             };
-            out.drafts
-                .push(draft_flag(ANCHOR_MILESTONE, &m.id.to_string(), flag_type));
+            out.drafts.push(draft_flag(
+                ANCHOR_MILESTONE,
+                &m.id.to_string(),
+                flag_type,
+                None,
+            ));
         }
     }
 
-    // Calendar-anchored: collapse each uid to its soonest upcoming instance, then classify once.
-    let mut soonest: HashMap<&str, f64> = HashMap::new();
+    // Calendar-anchored: collapse each uid to its soonest upcoming instance, then classify once. We keep
+    // that instance's START alongside its day-delta (F-18): it becomes the flag's `instance_at`, the key
+    // that lets a resolved tombstone for one occurrence of a recurring series be aged out when a strictly
+    // later occurrence comes due.
+    let mut soonest: HashMap<&str, (f64, &str)> = HashMap::new();
     for e in events {
         let Some(uid) = e.uid.as_deref() else {
             out.skipped_no_uid += 1;
@@ -740,13 +753,13 @@ pub fn detect(projects: &[ProjectOverview], events: &[CalendarEvent], today: &st
         soonest
             .entry(uid)
             .and_modify(|cur| {
-                if days < *cur {
-                    *cur = days;
+                if days < cur.0 {
+                    *cur = (days, e.start.as_str());
                 }
             })
-            .or_insert(days);
+            .or_insert((days, e.start.as_str()));
     }
-    for (uid, days) in soonest {
+    for (uid, (days, start)) in soonest {
         let flag_type = if days <= 0.0 {
             TYPE_HAPPENING_TODAY
         } else if days <= default_threshold_days(TYPE_PREPARE_AHEAD) {
@@ -754,7 +767,12 @@ pub fn detect(projects: &[ProjectOverview], events: &[CalendarEvent], today: &st
         } else {
             continue; // beyond the prepare-ahead lead — still just an agenda item
         };
-        out.drafts.push(draft_flag(ANCHOR_CALENDAR, uid, flag_type));
+        out.drafts.push(draft_flag(
+            ANCHOR_CALENDAR,
+            uid,
+            flag_type,
+            Some(start.to_string()),
+        ));
     }
 
     out.drafts.sort_by(|a, b| {
@@ -763,8 +781,14 @@ pub fn detect(projects: &[ProjectOverview], events: &[CalendarEvent], today: &st
     out
 }
 
-/// A detection-proposed draft: an `active` flag with no artifact pointer yet.
-fn draft_flag(anchor_kind: &str, anchor: &str, flag_type: &str) -> DraftFlag {
+/// A detection-proposed draft: an `active` flag with no artifact pointer yet. `instance_at` is the
+/// occurrence the flag is about (F-18) — the event start for calendar flags, `None` for milestone flags.
+fn draft_flag(
+    anchor_kind: &str,
+    anchor: &str,
+    flag_type: &str,
+    instance_at: Option<String>,
+) -> DraftFlag {
     DraftFlag {
         anchor_kind: anchor_kind.into(),
         anchor: anchor.into(),
@@ -772,6 +796,7 @@ fn draft_flag(anchor_kind: &str, anchor: &str, flag_type: &str) -> DraftFlag {
         threshold: None,
         artifact_ptr: None,
         artifact_url: None,
+        instance_at,
     }
 }
 
@@ -781,6 +806,9 @@ fn draft_flag(anchor_kind: &str, anchor: &str, flag_type: &str) -> DraftFlag {
 pub struct DetectionSummary {
     pub active: usize,
     pub pruned: usize,
+    /// Resolved calendar tombstones aged out this pass because a strictly later occurrence came due
+    /// (F-18). Surfaced, never silently swallowed.
+    pub aged: usize,
     pub skipped_no_uid: usize,
 }
 
@@ -810,6 +838,28 @@ pub fn detect_and_store(
         .collect();
 
     let tx = conn.unchecked_transaction()?;
+    // F-18: age out a resolved CALENDAR tombstone once detection is proposing a STRICTLY LATER
+    // occurrence of the same series. A recurring event shares one iCal UID, so resolving one occurrence
+    // must not suppress the next; the stored `instance_at` lets us tell "same occurrence, still upcoming"
+    // (keep suppressed — the draft's start equals the tombstone's) from "a new, later occurrence"
+    // (re-fire). Runs BEFORE the upsert so the freed `(anchor, type)` key is then re-inserted as a fresh
+    // active flag. Scoped to calendar + non-NULL stored instance_at, so milestone flags (per-instance
+    // anchors) and pre-v33 rows (NULL) are never re-fired.
+    let mut aged = 0usize;
+    for d in &det.drafts {
+        if d.anchor_kind != ANCHOR_CALENDAR {
+            continue;
+        }
+        let Some(instance_at) = &d.instance_at else {
+            continue;
+        };
+        aged += tx.execute(
+            "DELETE FROM flags \
+             WHERE anchor_kind = ?1 AND anchor = ?2 AND type = ?3 \
+               AND state = 'resolved' AND instance_at IS NOT NULL AND instance_at < ?4",
+            params![d.anchor_kind, d.anchor, d.r#type, instance_at],
+        )?;
+    }
     for d in &det.drafts {
         upsert_active(&tx, d)?;
     }
@@ -845,6 +895,7 @@ pub fn detect_and_store(
     Ok(DetectionSummary {
         active: list_active(conn, None)?.len(),
         pruned: stale.len(),
+        aged,
         skipped_no_uid: det.skipped_no_uid,
     })
 }
@@ -912,10 +963,10 @@ pub fn spawn_flag_detection_scheduler(app: AppHandle) {
             let today = clock::today_sql_in(zone);
             match run_detection(&conn, &today) {
                 Ok(s) => {
-                    if s.skipped_no_uid > 0 {
+                    if s.skipped_no_uid > 0 || s.aged > 0 {
                         eprintln!(
-                            "flag detection: {} active, {} pruned, {} calendar event(s) skipped (no uid)",
-                            s.active, s.pruned, s.skipped_no_uid
+                            "flag detection: {} active, {} pruned, {} recurring tombstone(s) aged out, {} calendar event(s) skipped (no uid)",
+                            s.active, s.pruned, s.aged, s.skipped_no_uid
                         );
                     }
                     let _ = db::set_setting(&conn, LAST_FLAG_SCAN_AT_KEY, &now.to_rfc3339());
@@ -946,6 +997,7 @@ mod tests {
             threshold: None,
             artifact_ptr: None,
             artifact_url: None,
+            instance_at: None,
         }
     }
 
@@ -1095,6 +1147,7 @@ mod tests {
             threshold: None,
             artifact_ptr: None,
             artifact_url: None,
+            instance_at: None,
         };
         upsert_active(&conn, &cal).unwrap();
 
@@ -1273,6 +1326,62 @@ mod tests {
         assert!(f10.user_confirmed);
     }
 
+    /// F-18: a resolved calendar tombstone for one occurrence of a recurring series must NOT suppress a
+    /// strictly later occurrence — the reconcile ages it out so the next recurrence re-fires.
+    #[test]
+    fn detect_and_store_ages_out_a_resolved_tombstone_for_a_later_occurrence() {
+        let (_dir, conn) = open_test_db();
+
+        // Pass 1: a prepare-ahead flag for the daily standup's soonest occurrence (07-05); user preps.
+        let e1 = vec![cal_event(Some("uid-daily"), "2026-07-05T09:00:00Z")];
+        detect_and_store(&conn, &[], &e1, TODAY).unwrap();
+        let f = list_active(&conn, Some(ANCHOR_CALENDAR))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.anchor == "uid-daily")
+            .expect("the first occurrence fires a prepare-ahead flag");
+        resolve(&conn, f.id, SOURCE_ASSERTION, None, None).unwrap();
+
+        // Pass 2: the NEXT occurrence (07-06) comes due. The tombstone is for the earlier occurrence, so
+        // it ages out and a fresh active flag re-fires — the bug was that it stayed suppressed forever.
+        let e2 = vec![cal_event(Some("uid-daily"), "2026-07-06T09:00:00Z")];
+        let s = detect_and_store(&conn, &[], &e2, TODAY).unwrap();
+        assert_eq!(s.aged, 1, "the earlier occurrence's tombstone is aged out");
+        let refired = list_active(&conn, Some(ANCHOR_CALENDAR))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.anchor == "uid-daily")
+            .expect("the next occurrence re-fires a fresh active flag");
+        assert_eq!(refired.state, STATE_ACTIVE);
+        assert_eq!(refired.r#type, TYPE_PREPARE_AHEAD);
+    }
+
+    /// F-18 negative: the SAME occurrence, still upcoming, stays suppressed after the user resolves it —
+    /// aging keys on a strictly-later instance, never re-firing the very occurrence just dismissed.
+    #[test]
+    fn detect_and_store_keeps_a_resolved_tombstone_for_the_same_occurrence() {
+        let (_dir, conn) = open_test_db();
+
+        let e = vec![cal_event(Some("uid-daily"), "2026-07-05T09:00:00Z")];
+        detect_and_store(&conn, &[], &e, TODAY).unwrap();
+        let f = list_active(&conn, Some(ANCHOR_CALENDAR))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.anchor == "uid-daily")
+            .unwrap();
+        resolve(&conn, f.id, SOURCE_ASSERTION, None, None).unwrap();
+
+        // Re-scan while the SAME occurrence (07-05) is still upcoming: no aging, no re-fire.
+        let s = detect_and_store(&conn, &[], &e, TODAY).unwrap();
+        assert_eq!(s.aged, 0, "the same occurrence is not aged out");
+        assert_eq!(
+            list_active(&conn, Some(ANCHOR_CALENDAR)).unwrap().len(),
+            0,
+            "the just-resolved occurrence stays quiet"
+        );
+        assert_eq!(get(&conn, f.id).unwrap().unwrap().state, STATE_RESOLVED);
+    }
+
     #[test]
     fn scan_due_respects_the_interval() {
         let now = DateTime::parse_from_rfc3339("2026-07-03T12:00:00Z")
@@ -1430,6 +1539,7 @@ mod tests {
                 threshold: None,
                 artifact_ptr: None,
                 artifact_url: None,
+                instance_at: None,
             },
         )
         .unwrap();
@@ -1480,6 +1590,7 @@ mod tests {
                 threshold: None,
                 artifact_ptr: None,
                 artifact_url: None,
+                instance_at: None,
             },
         )
         .unwrap();
@@ -1518,6 +1629,7 @@ mod tests {
                 threshold: None,
                 artifact_ptr: None,
                 artifact_url: None,
+                instance_at: None,
             },
         )
         .unwrap();
@@ -1539,6 +1651,7 @@ mod tests {
             threshold: None,
             artifact_ptr: None,
             artifact_url: None,
+            instance_at: None,
         };
         let fid = upsert_active(&conn, &d()).unwrap();
 

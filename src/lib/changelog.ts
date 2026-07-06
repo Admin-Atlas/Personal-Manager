@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.18-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Two fixes for what shows up in Focus. Reminders for recurring events now come back for each new occurrence: if you dismissed a “prepare ahead” nudge for, say, a weekly standup, PM used to read that as “never remind me about this event again” — it now correctly brings the nudge back for next week’s while staying quiet about the one you already handled. And a project that has deadlines but no documents yet no longer vanishes from Focus — its milestones surface, and earn their deadline reminders, just like a project you’ve already added files to.",
+    ],
+  },
+  {
     version: "2.92.17-alpha",
     date: "2026-07-06",
     highlights: [
