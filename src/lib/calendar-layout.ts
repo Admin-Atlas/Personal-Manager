@@ -66,6 +66,16 @@ export function minutesFromLocalMidnight(d: Date): number {
   return d.getHours() * 60 + d.getMinutes();
 }
 
+/** The minute-of-day (0..1440) a timed event's span should END at on the day grid. An event ending at
+ *  exactly 00:00 the next day ("…until midnight") must reach 1440 — the bottom of the grid day — not 0,
+ *  which collapses it to a 14px sliver (F-62). Mirrors the exclusive-midnight rule `eventDaySpan` uses.
+ *  A null `end` yields a default 30-minute block from `start`. */
+export function timedEndMinutes(start: Date, end: Date | null): number {
+  if (!end) return minutesFromLocalMidnight(start) + 30;
+  const endMin = minutesFromLocalMidnight(end);
+  return endMin === 0 && end.getTime() > start.getTime() ? 1440 : endMin;
+}
+
 // --- event → day span ----------------------------------------------------------------------------
 
 /** An event's inclusive local-day span. */

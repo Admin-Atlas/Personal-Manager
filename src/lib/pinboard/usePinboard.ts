@@ -112,12 +112,30 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     };
   }, []);
 
+  // Persist the board — DEBOUNCED (F-15). The board object changes on every keystroke (a note's text
+  // lives in it), and writing the whole JSON to the encrypted store each time is one IPC + SQLCipher
+  // write per character. Coalesce to a single write ~500 ms after the last change; a `boardRef` keeps
+  // the latest value so the trailing timer (and the unmount flush below) writes what's current.
+  const boardRef = useRef(board);
+  boardRef.current = board;
   useEffect(() => {
     if (!loaded.current) return;
-    setPref(PREF_KEY, JSON.stringify(board)).catch(() => {
-      /* ignore — the board just won't persist this change */
-    });
+    const handle = setTimeout(() => {
+      setPref(PREF_KEY, JSON.stringify(boardRef.current)).catch(() => {
+        /* ignore — the board just won't persist this change */
+      });
+    }, 500);
+    return () => clearTimeout(handle);
   }, [board]);
+  // Flush the latest board on unmount so a fast navigate-away/close doesn't drop the tail edit.
+  useEffect(
+    () => () => {
+      if (loaded.current) {
+        setPref(PREF_KEY, JSON.stringify(boardRef.current)).catch(() => {});
+      }
+    },
+    [],
+  );
 
   const addNote = useCallback(() => {
     setBoard((b) => {
