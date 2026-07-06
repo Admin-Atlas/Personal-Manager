@@ -950,6 +950,17 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_flags_state  ON flags(state);
     CREATE INDEX idx_flags_anchor ON flags(anchor_kind, anchor);
     "#,
+    // v33: per-flag instance timestamp (F-18) — the GC seam the v32 comment reserved. A calendar flag
+    // hangs off an iCal UID, which a RECURRING series SHARES across every occurrence, so resolving
+    // "prepare-ahead" once left a resolved tombstone that suppressed EVERY future occurrence forever.
+    // This records WHICH occurrence a flag is about (its event start); detection ages out a resolved
+    // calendar tombstone once it is proposing a STRICTLY LATER occurrence, so the next recurrence
+    // re-fires while the just-resolved one stays quiet. Additive + nullable (rule #3); NULL (a milestone
+    // flag — its anchor is already per-instance — or a row written before v33) is treated as "keep
+    // suppressed", so nothing resolved before this migration is retroactively re-fired.
+    r#"
+    ALTER TABLE flags ADD COLUMN instance_at TEXT;   -- occurrence this flag is about (event start); NULL = milestone flag or pre-v33
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -999,7 +1010,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 32,
+            version, 33,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1010,7 +1021,7 @@ mod tests {
              chat preference source + extraction cursor is v28; \
              Drive parent-folder tag + normalized source_account is v29; \
              spreadsheet ingestion table is v30; project activity log is v31; \
-             structured flag layer is v32)"
+             structured flag layer is v32; per-flag instance timestamp (F-18) is v33)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
