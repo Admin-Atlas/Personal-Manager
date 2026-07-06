@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.32-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood tidying. The small helper process PM uses to read and convert your files now has automated tests covering how it talks to the rest of the app — so a future change to that plumbing can't quietly break the exchange.",
+    ],
+  },
+  {
     version: "2.92.31-alpha",
     date: "2026-07-06",
     highlights: [
