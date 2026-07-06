@@ -39,6 +39,11 @@
   --accent-ink: oklch(0.16 0.024 46.3);
   --accent-soft: rgba(210, 130, 91, 0.15);
 
+  /* The one intentionally-fixed colour in the system (DESIGN_TOKENS §7): the modal / overlay scrim, a
+     neutral warm darkening that reads the same in every theme. Tokenised here (I-02) so the ad-hoc
+     copies in Modal / App / CommandPalette collapse to var(--scrim). */
+  --scrim: rgba(8, 6, 4, 0.5);
+
   --head: "Newsreader", Georgia, serif;
   --ui: "Hanken Grotesk", system-ui, sans-serif;
   --mono: "JetBrains Mono", monospace;

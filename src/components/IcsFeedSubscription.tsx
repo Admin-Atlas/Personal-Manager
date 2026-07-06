@@ -10,6 +10,7 @@ import {
   syncCalendar,
 } from "../lib/ipc";
 import type { CalendarOverview, IcsFeedInfo } from "../lib/types";
+import { formatWhen } from "../lib/format";
 import { Button, ConfirmDialog, Input } from "./ui";
 
 /**
@@ -314,9 +315,4 @@ function FeedGuide({ only }: { only?: "apple" }) {
       </div>
     </div>
   );
-}
-
-function formatWhen(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }

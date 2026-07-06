@@ -795,7 +795,7 @@ export default function App() {
             )}
 
             {showSettings && (
-              <div className="absolute inset-0 z-50" style={{ background: "rgba(8,6,4,0.5)" }}>
+              <div className="absolute inset-0 z-50" style={{ background: "var(--scrim)" }}>
                 <SettingsView
                   onboarding={false}
                   onClose={() => {

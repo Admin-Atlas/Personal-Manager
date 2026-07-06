@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.24-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Dates land on the right day. Milestone, deadline and pinboard-timeline dates could show up one day early if your computer's clock is set to a timezone behind UTC — they now render on their correct calendar day everywhere. Alongside that, some internal tidy-up: the “last synced” timestamps route through one shared helper, and the overlay dimming behind dialogs is now a single named colour.",
+    ],
+  },
+  {
     version: "2.92.23-alpha",
     date: "2026-07-06",
     highlights: [

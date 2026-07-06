@@ -27,7 +27,7 @@ import type {
   ProjectSize,
   ProjectStatus,
 } from "../lib/types";
-import { formatDate } from "../lib/format";
+import { formatDate, formatDateOnly } from "../lib/format";
 import { rankImportance } from "../lib/importance";
 import { Button, Card, Input, Skeleton, StatusBadge, Select } from "./ui";
 import { useDepth } from "../theme";
@@ -446,7 +446,7 @@ function ProjectCard({
                 {project.governing_milestone?.due_date && (
                   <span>
                     {project.governing_milestone.label}{" "}
-                    {formatDate(project.governing_milestone.due_date.slice(0, 10))}
+                    {formatDateOnly(project.governing_milestone.due_date.slice(0, 10))}
                     {project.milestones.length > 1 ? ` +${project.milestones.length - 1}` : ""}
                   </span>
                 )}
@@ -557,7 +557,7 @@ function MetaEditor({
             {proposal.size ? `size ${proposal.size}` : "no size"}
             {proposal.parent ? ` · part of ${proposal.parent}` : ""}
             {proposal.blocked_by ? ` · blocked by ${proposal.blocked_by}` : ""}
-            {proposal.deadline ? ` · due ${formatDate(proposal.deadline.slice(0, 10))}` : ""}
+            {proposal.deadline ? ` · due ${formatDateOnly(proposal.deadline.slice(0, 10))}` : ""}
           </p>
           {proposal.reasoning && <p className="mt-1 text-ink4">{proposal.reasoning}</p>}
         </div>
@@ -904,8 +904,8 @@ function Agenda({ events }: { events: CalendarEvent[] }) {
 function formatEventWhen(start: string, allDay?: boolean): string {
   const d = new Date(start);
   if (Number.isNaN(d.getTime())) return start.slice(0, 16);
-  const date = formatDate(start);
-  // All-day events have a plain date with no time component.
-  if (allDay || !start.includes("T")) return date;
-  return `${date} ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+  // All-day events carry a bare date — format from its own calendar day so it can't shift a day in a
+  // UTC-negative zone (F-14). A timed event keeps the timezone-aware local date + clock.
+  if (allDay || !start.includes("T")) return formatDateOnly(start);
+  return `${formatDate(start)} ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
 }

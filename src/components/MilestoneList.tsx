@@ -11,7 +11,7 @@ import {
   setMilestoneState,
   updateMilestone,
 } from "../lib/ipc";
-import { formatDate } from "../lib/format";
+import { formatDateOnly } from "../lib/format";
 import { Button, Input, Select } from "./ui";
 
 interface Props {
@@ -79,7 +79,7 @@ function MilestoneSummary({ milestones }: { milestones: Milestone[] }) {
       {milestones.map((m) => (
         <li key={m.id} className={m.state === "met" ? "line-through opacity-60" : ""}>
           {m.label}
-          {m.due_date ? ` · ${formatDate(m.due_date.slice(0, 10))}` : ""}
+          {m.due_date ? ` · ${formatDateOnly(m.due_date.slice(0, 10))}` : ""}
           {m.calendar_linked ? " 📅" : ""}
         </li>
       ))}
@@ -198,7 +198,7 @@ function MilestoneRow({
             }
           >
             <span className="truncate">
-              📅 {m.due_date ? formatDate(m.due_date.slice(0, 10)) : "—"}
+              📅 {m.due_date ? formatDateOnly(m.due_date.slice(0, 10)) : "—"}
             </span>
             {m.event_missing && <span className="shrink-0 text-st-due">⚠</span>}
             <Button
@@ -232,7 +232,7 @@ function MilestoneRow({
                 <option value="">📅</option>
                 {linkable.map((e) => (
                   <option key={e.id} value={e.uid!}>
-                    {e.summary} · {formatDate(e.start.slice(0, 10))}
+                    {e.summary} · {formatDateOnly(e.start.slice(0, 10))}
                   </option>
                 ))}
               </Select>

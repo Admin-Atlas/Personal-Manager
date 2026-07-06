@@ -12,7 +12,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
-import { formatDate } from "../lib/format";
+import { formatDateOnly } from "../lib/format";
 import {
   addMilestone,
   deleteMilestone,
@@ -846,7 +846,7 @@ function MilestoneColumn({
             m.event_missing ? "Linked event not found in your calendars" : "Synced from calendar"
           }
         >
-          📅 {m.due_date ? formatDate(msDate(m)) : "—"}
+          📅 {m.due_date ? formatDateOnly(msDate(m)) : "—"}
         </span>
       ) : (
         <input
@@ -936,7 +936,7 @@ function FreeformTimeline({
               type="date"
               value={it.date ?? ""}
               onChange={(e) => onUpdateItem(widget.id, it.id, { date: e.target.value })}
-              title={it.date ? formatDate(it.date) : "Set a date"}
+              title={it.date ? formatDateOnly(it.date) : "Set a date"}
               className="w-[7.5rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[10px] text-ink3 focus:border-accent focus:outline-none"
             />
             <input
@@ -947,7 +947,7 @@ function FreeformTimeline({
             />
             {showPower && it.date && (
               <span className="shrink-0 font-mono text-[9px] text-faint">
-                {formatDate(it.date)}
+                {formatDateOnly(it.date)}
               </span>
             )}
             <button

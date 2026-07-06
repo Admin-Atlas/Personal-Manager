@@ -44,6 +44,7 @@ import { StorageSettings } from "./StorageSettings";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
+import { formatWhen } from "../lib/format";
 import {
   useTheme,
   useDepth,
@@ -1513,12 +1514,6 @@ function LanguageCompareTable() {
       </tbody>
     </table>
   );
-}
-
-/** A friendly "when" for the learning-profile timestamp; falls back to the raw value. */
-function formatWhen(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
 /** Format a USD cost, or "—" when unknown (the model isn't in the price cache yet). */

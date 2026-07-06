@@ -20,6 +20,20 @@ export function formatDate(iso: string): string {
 }
 
 /**
+ * Format a DATE-ONLY value (`YYYY-MM-DD`, or an ISO timestamp whose calendar date is what matters) as
+ * DD-MM(-YYYY), built from the y/m/d fields directly. {@link formatDate} runs the string through
+ * `new Date`, which reads a bare `YYYY-MM-DD` as UTC **midnight** — a day early in UTC-negative zones
+ * (F-14). This takes the date components straight, so a milestone / deadline / all-day date renders on
+ * its own calendar day everywhere. A value that isn't a leading `YYYY-MM-DD` falls back to
+ * {@link formatDate} (which handles full timestamps and leaves junk as-is).
+ */
+export function formatDateOnly(value: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(value);
+  if (!m) return formatDate(value);
+  return formatDateLocal(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+}
+
+/**
  * Like {@link formatDate} but from a local `Date`'s own calendar fields — no ISO round-trip, which
  * would shift the day across timezones (a local day stringified to UTC can land a day earlier).
  * DD-MM, dropping the year in the current year. Used by the calendar view, which works in local days.

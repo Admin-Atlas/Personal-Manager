@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { formatDate, formatDateLocal, formatDateTime, formatWhen } from "./format";
+import { formatDate, formatDateOnly, formatDateLocal, formatDateTime, formatWhen } from "./format";
 
 // Dates are round-tripped through a *local* Date so the assertions hold regardless of the runner's
 // timezone: `new Date(y, m, d, 12).toISOString()` names one instant, and parsing it back lands on the
@@ -28,6 +28,28 @@ describe("formatDate", () => {
   it("returns an unparseable value unchanged", () => {
     expect(formatDate("not a date")).toBe("not a date");
     expect(formatDate("")).toBe("");
+  });
+});
+
+describe("formatDateOnly", () => {
+  it("parses a bare YYYY-MM-DD into the local calendar day (no UTC shift)", () => {
+    // F-14: formatDate('2024-03-05') reads UTC midnight and lands a day early in UTC-negative zones;
+    // formatDateOnly builds from the y/m/d fields, so it is stable in every timezone.
+    expect(formatDateOnly("2024-03-05")).toBe("05-03-2024");
+    expect(formatDateOnly("2023-12-31")).toBe("31-12-2023");
+  });
+
+  it("uses only the written date part of a full ISO timestamp", () => {
+    expect(formatDateOnly("2024-03-05T23:30:00Z")).toBe("05-03-2024");
+  });
+
+  it("drops the year in the current year", () => {
+    const y = new Date().getFullYear();
+    expect(formatDateOnly(`${y}-06-09`)).toBe("09-06");
+  });
+
+  it("falls back for a non-date value", () => {
+    expect(formatDateOnly("not a date")).toBe("not a date");
   });
 });
 
