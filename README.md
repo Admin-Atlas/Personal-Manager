@@ -25,48 +25,62 @@ in a separate, machine-local data directory (see [Where your data lives](#where-
 
 ## What PM does
 
-PM is built around two pillars. The capabilities below are representative, not
-exhaustive — features are added and refined release to release.
+PM is built around two pillars. This is a curated tour of what makes PM *distinctive* —
+not an exhaustive list; the in-app **What's New** is the complete, current record.
 
 ### The Archivist — your searchable second brain
 
-- **Ingest anything.** Drag files or a folder into the **Documents** view; each is
-  converted to Markdown, chunked, embedded locally, and indexed. The Markdown vault is
-  the rebuildable source of truth. Conversion and embeddings run on-device in a small
-  managed Python sidecar, set up automatically on first use.
-- **Grounded answers.** Ask a question and get an answer drawn from your own files,
-  with the source documents cited. Retrieval blends meaning and keywords so relevant
-  material surfaces even when your wording doesn't match the page.
-- **Sorting review.** PM proposes a project, tags, and importance for each new
-  document; you confirm or correct in one pass.
-- **Learns how you organise.** Your corrections distil into a short, readable profile
-  that feeds back into PM's suggestions and chat, so it organises more like you over
-  time.
+- **Ingest almost anything, on-device.** Drag in files, whole folders, photos (read with
+  on-device OCR) or spreadsheets (indexed row-by-row, not mangled into one blob) — each is
+  converted to Markdown, chunked, embedded and indexed locally in a managed Python sidecar,
+  set up automatically on first use. The Markdown vault is the rebuildable source of truth.
+- **Index your cloud and your computer without copying a thing.** Connect Google Drive,
+  OneDrive, or a folder on your own machine and PM indexes what's inside so it turns up in
+  search — reading each file only to index it, never importing the bytes. Local folders stay
+  live: edit a file and it re-indexes within seconds.
+- **Grounded answers, with citations.** Ask a question and get an answer drawn from your own
+  material, each source cited. Retrieval blends meaning and keywords — and works in
+  non-space-separated scripts like Chinese and Japanese — so the right passage surfaces even
+  when your wording doesn't match the page.
+- **Your conversations are a source too.** Chats with PM fold into the same searchable
+  memory: a decision or preference you mentioned weeks ago can resurface later, cited back to
+  the exact turn.
+- **Sorting review that learns you.** PM proposes a project, tags and importance for each new
+  document; you confirm or correct in one pass. Those corrections — and the names and aliases
+  you teach it — distil into a short, readable profile that shapes future suggestions.
 
 ### The Personal Assistant — one clean view
 
-- **Focus view.** Every project on one screen, each with a single honest status, plus
-  a short daily briefing that synthesises your real projects and agenda into "here's
-  your picture today."
-- **Per-project view.** Click in and everything narrows to that project: its files
-  beside a chat that answers only from them.
-- **Command palette.** A single keystroke (Ctrl/Cmd+K) to jump to any project, file,
-  or past conversation.
-- **Read-only calendar.** Optionally connect a calendar for an upcoming agenda,
-  schedule-aware chat answers, and an automatic "Due soon" when an event names a
-  project.
-- **Bring your own model.** Choose any model through OpenRouter, with separate
-  chat and background models, automatic fallback on rate limits, and an at-a-glance
-  view of what you're spending.
-- **Voice input.** Speak into the chat box and PM transcribes it **on your device**
-  into editable text — no audio leaves the machine.
-- **Make it yours.** A themeable interface (multiple visual styles, light/dark, accent
-  colour, and density), a document map, and a hover-to-explain help mode.
+- **Focus view.** Every project on one screen, each with a single honest status, plus a
+  short daily briefing that synthesises your real projects and agenda into "here's your
+  picture today."
+- **A "what needs your attention" layer.** Approaching deadlines, today's events and
+  prep-ahead nudges become stable, tracked items you can mark done — not a paragraph the
+  model rewrites each morning. Resolve one and it stays resolved.
+- **Milestones & deadlines** on each project feed straight into the briefing and Focus, and
+  the same conversation, chat or briefing all read from one honest picture of what matters.
+- **Per-project view.** Click in and everything narrows to that project: its files beside a
+  chat that answers only from them.
+- **A map of your knowledge.** See your documents laid out by meaning — related material
+  clusters together — as a navigable map you can explore.
+- **Read-only calendar.** Gather Google, Outlook and iCal calendars into one agenda with
+  Month/Week/Day/Year views, schedule-aware chat answers, and an automatic "Due soon" when an
+  event names a project.
+- **Bring your own model.** Choose any model through OpenRouter — separate chat and
+  background models, automatic fallback on rate limits, spend at a glance, and zero-data-
+  retention requested on every call.
+- **Voice input.** Speak into the chat box and PM transcribes it **on your device** into
+  editable text — no audio leaves the machine.
+- **Command palette.** A single keystroke (Ctrl/Cmd+K) to jump to any project, file, or past
+  conversation.
 
 ### Cross-cutting
 
 - **Private by design.** The local store is always encrypted, secrets live in the OS
   keychain, and ingested content is treated as untrusted data — never as instructions.
+- **Encrypted, restore-anywhere backups.** Pack your whole vault into a single
+  passphrase-protected file — on demand or on a schedule — straight to your own Proton Drive
+  or Google Drive, and restore it on any machine.
 - **Portable when you want it.** Keep a vault private to one device, or protect it with
   a passphrase to open it from another profile or machine; either way you can export
   everything to plain Markdown at any time. Encryption protects your notes; it never
