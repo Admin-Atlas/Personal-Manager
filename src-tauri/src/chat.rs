@@ -241,8 +241,11 @@ pub(crate) fn ensure_session(
 
 /// Record a completed turn-pair: append it to the session's vault file (authoritative truth, first), then
 /// upsert the session row. Best-effort by contract — the caller treats a failure as non-fatal because the
-/// committed `messages` rows are the backstop (card B's launch sweep reconciles any session whose messages
-/// run ahead of its vault). Holds the DB lock only for quick reads/writes, never across the file IO.
+/// committed `messages` rows are the backstop: card B's launch sweep reconciles any session whose messages
+/// run ahead of its vault, re-running the idempotent [`append_turn_pair`] for every pair past the index
+/// cursor before it indexes them (see `chat_index::reconcile_vault_pairs`), so a failed append here is
+/// self-healed into the file — truth — rather than silently lost on a later Rebuild. Holds the DB lock only
+/// for quick reads/writes, never across the file IO.
 pub(crate) fn record_turn_pair(
     state: &AppState,
     conversation_id: i64,

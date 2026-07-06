@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.16-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Sturdier chat history. When PM saves a message you or it just sent, it writes that message to a file on disk first — that file is the real record everything else is rebuilt from. If that one write ever hiccups (a momentarily locked or full drive), the message still lived in PM's working memory, but a later rebuild of the search index — which trusts the on-disk files — could quietly drop it. PM now double-checks, before it indexes, that every recent message is actually in its file, and re-writes any that slipped through. Nothing said in a conversation can fall between the two.",
+    ],
+  },
+  {
     version: "2.92.15-alpha",
     date: "2026-07-06",
     highlights: [
