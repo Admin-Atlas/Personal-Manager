@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.35-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood tidying. The shared logic behind PM's cloud connectors — how a Drive or OneDrive sync starts, stops, resumes and reports, and how each account row is drawn — now has an automated test net, so a future change there can't quietly break it.",
+    ],
+  },
+  {
     version: "2.92.34-alpha",
     date: "2026-07-06",
     highlights: [
