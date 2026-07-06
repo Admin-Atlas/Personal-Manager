@@ -650,6 +650,10 @@ export interface BackupReport {
   target_dir: string | null;
   /** The archive's creation timestamp (RFC3339), surfaced on restore. */
   created_at: string | null;
+  /** Destinations that failed this run while at least one other succeeded (F-22), as
+   *  `"<label>: <error>"` strings — for a non-blocking "backed up, but X failed" banner. Empty on a
+   *  clean run and always empty for a restore. */
+  failed_destinations: string[];
 }
 
 /** Snapshot of an in-flight backup/restore, so the UI resumes progress after navigating away. */
@@ -721,6 +725,11 @@ export interface BackupSchedule {
   gdrive_enabled: boolean;
   /** The Google account (email) chosen for backup, or null if none is set up. */
   gdrive_account: string | null;
+  /** Per-destination last-success stamps (F-22, RFC3339 or null) — distinct from `last_backup_at`
+   *  (the shared cadence clock), these reveal a destination that has gone stale while a sibling keeps
+   *  succeeding. */
+  proton_last_backup_at: string | null;
+  gdrive_last_backup_at: string | null;
 }
 
 /** A connected Google Drive account (mirrors the Rust `DriveAccount`) — for the backup account

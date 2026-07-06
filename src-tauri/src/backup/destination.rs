@@ -39,6 +39,17 @@ impl BackupDestination {
         }
     }
 
+    /// A STABLE machine key for this destination (never localised / renamed), used for the
+    /// per-destination `last_backup_at:<kind>` stamp (F-22) so a persistently-failing target's
+    /// freshness is tracked independently of a sibling that keeps succeeding. Matches the
+    /// `backup_proton_*` / `backup_gdrive_*` schedule-setting vocabulary.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Proton { .. } => "proton",
+            Self::GoogleDrive { .. } => "gdrive",
+        }
+    }
+
     /// Push the finished archive at `local` (whose basename is `archive_name`) to this destination.
     /// `app` is only needed by the Proton arm, which re-derives the shared `backup_cancel` flag
     /// inside its blocking task so a mid-upload Cancel is honoured (F-13); the Google arm ignores it.
@@ -119,4 +130,29 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| Error::Other(format!("backup task panicked: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_is_a_stable_machine_key_per_destination() {
+        // F-22: `kind` keys the per-destination `last_backup_at:<kind>` stamp, so it must be stable and
+        // never localised (unlike `label`) and must match the schedule's proton/gdrive vocabulary.
+        assert_eq!(
+            BackupDestination::Proton {
+                cli: PathBuf::from("proton-drive")
+            }
+            .kind(),
+            "proton"
+        );
+        assert_eq!(
+            BackupDestination::GoogleDrive {
+                token_key: "google_oauth_token_drive::me@x.com".into()
+            }
+            .kind(),
+            "gdrive"
+        );
+    }
 }
