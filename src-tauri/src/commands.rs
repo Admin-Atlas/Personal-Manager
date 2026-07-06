@@ -3163,6 +3163,10 @@ pub fn clear_google_client(state: State<'_, AppState>) -> Result<()> {
     }
     secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
     drive::forget_all_accounts(&conn).ok();
+    // F-38: the Google-Drive BACKUP destination rides on this same client, so tearing the client down
+    // must also disable it — otherwise the schedule keeps `gdrive_enabled` pointed at a now-tokenless
+    // account and every scheduled backup fails on it (eprintln-only, invisible on a GUI build).
+    crate::backup::schedule::clear_gdrive_destination(&conn).ok();
     secrets::clear_google_client()?;
     // Drop events for the now-removed Google calendars; selected ICS/Outlook events are kept.
     let active: Vec<String> = calendar::selected_calendars(&conn)?
@@ -5405,6 +5409,7 @@ pub async fn create_local_backup(
                         vault_id: Some(vault_id),
                         target_dir: None,
                         created_at: None,
+                        failed_destinations: Vec::new(),
                     },
                 },
             );
@@ -5520,6 +5525,7 @@ pub async fn restore_local_backup(
                 vault_id: Some(outcome.vault_id),
                 target_dir: Some(summary.target_dir.clone()),
                 created_at: Some(outcome.created_at),
+                failed_destinations: Vec::new(),
             },
         },
     );
@@ -5638,6 +5644,11 @@ pub struct BackupSchedule {
     pub gdrive_enabled: bool,
     /// The Google account chosen for backup (email), or null if none is set up.
     pub gdrive_account: Option<String>,
+    /// Per-destination last-success stamps (F-22, RFC3339 or null). Distinct from `last_backup_at`
+    /// (the shared cadence clock), these let Settings show that one destination has gone stale while a
+    /// sibling keeps succeeding — the silent-staleness the shared stamp hid.
+    pub proton_last_backup_at: Option<String>,
+    pub gdrive_last_backup_at: Option<String>,
 }
 
 /// Read the current automatic-backup schedule (cadence + retention + opt-in state + last run +
@@ -5661,6 +5672,14 @@ pub fn get_backup_schedule(state: State<'_, AppState>) -> Result<BackupSchedule>
         gdrive_enabled: setting_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, false),
         gdrive_account: crate::db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)?
             .filter(|s| !s.is_empty()),
+        proton_last_backup_at: crate::db::get_setting(
+            &conn,
+            &crate::backup::schedule::last_backup_at_key("proton"),
+        )?,
+        gdrive_last_backup_at: crate::db::get_setting(
+            &conn,
+            &crate::backup::schedule::last_backup_at_key("gdrive"),
+        )?,
     })
 }
 
@@ -5866,6 +5885,7 @@ pub(crate) async fn run_backup(
     let n = targets.len();
     let prefix = crate::backup::naming::archive_prefix(&vault_id);
     let mut any_ok = false;
+    let mut succeeded: Vec<&'static str> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     for (i, dest) in targets.iter().enumerate() {
         // Honour Cancel between destinations (F-13): a hit during one upload stops the fan-out
@@ -5884,6 +5904,7 @@ pub(crate) async fn run_backup(
         match dest.upload(app, &archive_path, &archive_name).await {
             Ok(()) => {
                 any_ok = true;
+                succeeded.push(dest.kind());
                 emit_backup_progress(
                     app,
                     BackupEvent::Phase {
@@ -5911,11 +5932,18 @@ pub(crate) async fn run_backup(
         // manual backup "counts") and Settings reflects it. Best-effort — a vault that locked
         // during the upload just leaves the stamp for next time.
         if let Ok(conn) = state.conn() {
-            let _ = crate::db::set_setting(
-                &conn,
-                crate::backup::schedule::LAST_BACKUP_AT_KEY,
-                &now.to_rfc3339(),
-            );
+            let stamp = now.to_rfc3339();
+            let _ =
+                crate::db::set_setting(&conn, crate::backup::schedule::LAST_BACKUP_AT_KEY, &stamp);
+            // F-22: also stamp each destination that succeeded THIS run under its own key, so a sibling
+            // that persistently fails goes visibly stale instead of hiding behind the shared stamp above.
+            for kind in &succeeded {
+                let _ = crate::db::set_setting(
+                    &conn,
+                    &crate::backup::schedule::last_backup_at_key(kind),
+                    &stamp,
+                );
+            }
         }
         if !failures.is_empty() {
             eprintln!("backup: some destinations failed: {}", failures.join("; "));
@@ -5928,6 +5956,9 @@ pub(crate) async fn run_backup(
                     vault_id: Some(vault_id.clone()),
                     target_dir: None,
                     created_at: None,
+                    // F-22: surface the partial failure so the UI can show a non-blocking banner rather
+                    // than a silent success. Empty on a clean run.
+                    failed_destinations: failures.clone(),
                 },
             },
         );
@@ -6072,6 +6103,7 @@ fn finalize_remote_restore(
                 vault_id: Some(outcome.vault_id),
                 target_dir: Some(summary.target_dir.clone()),
                 created_at: Some(outcome.created_at),
+                failed_destinations: Vec::new(),
             },
         },
     );

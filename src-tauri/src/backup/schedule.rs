@@ -32,8 +32,17 @@ pub const BACKUP_FREQUENCY_KEY: &str = "backup_frequency";
 /// Keep-last-N retention setting key (a positive integer, as text).
 pub const BACKUP_RETENTION_KEY: &str = "backup_retention_n";
 /// When the last successful (manual or scheduled) backup completed (RFC3339). Shared across
-/// destinations — it records "the last time at least one destination succeeded".
+/// destinations — it records "the last time at least one destination succeeded" (the cadence clock).
 pub const LAST_BACKUP_AT_KEY: &str = "last_backup_at";
+
+/// The PER-DESTINATION last-success stamp key (F-22). The shared [`LAST_BACKUP_AT_KEY`] advances when
+/// *any* destination succeeds, which masks a second destination that persistently fails — so each also
+/// records its own last success under `last_backup_at:<kind>` (see [`BackupDestination::kind`]). Reading
+/// these back lets Settings surface a destination that has gone silently stale.
+pub fn last_backup_at_key(kind: &str) -> String {
+    format!("{LAST_BACKUP_AT_KEY}:{kind}")
+}
+
 /// Default archives to keep if the user never set a number.
 pub const DEFAULT_RETENTION_N: u32 = 5;
 
@@ -51,6 +60,16 @@ pub fn setting_bool(conn: &rusqlite::Connection, key: &str, default: bool) -> bo
         Ok(Some(v)) => v == "true",
         _ => default,
     }
+}
+
+/// Disable the Google-Drive backup destination and forget its account (F-38). Called when the shared
+/// Google client is torn down ([`crate::commands::clear_google_client`]): otherwise the schedule keeps
+/// `gdrive_enabled` pointed at a now-tokenless account and every scheduled run fails on it. Additive to
+/// the existing disconnect path; leaves Proton untouched.
+pub fn clear_gdrive_destination(conn: &rusqlite::Connection) -> crate::error::Result<()> {
+    db::set_setting(conn, BACKUP_GDRIVE_ENABLED_KEY, "false")?;
+    db::set_setting(conn, BACKUP_GDRIVE_ACCOUNT_KEY, "")?;
+    Ok(())
 }
 
 /// Launch catch-up: wait up to `LAUNCH_WAIT_TICKS × LAUNCH_WAIT_SECS` (~5 min) for the vault to
@@ -345,5 +364,44 @@ mod tests {
             Frequency::Monthly,
             now
         ));
+    }
+
+    #[test]
+    fn last_backup_at_key_is_per_destination_and_distinct_from_the_shared_stamp() {
+        // F-22: each destination stamps its own success, so a persistently-failing sibling is not
+        // masked by the shared cadence clock.
+        assert_eq!(last_backup_at_key("proton"), "last_backup_at:proton");
+        assert_eq!(last_backup_at_key("gdrive"), "last_backup_at:gdrive");
+        assert_ne!(last_backup_at_key("gdrive"), LAST_BACKUP_AT_KEY);
+    }
+
+    #[test]
+    fn clearing_the_gdrive_destination_disables_it_and_forgets_the_account() {
+        // F-38: tearing down the shared Google client must also disable the Drive BACKUP destination,
+        // or the schedule keeps firing at a now-tokenless account. Proton is left untouched.
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        db::set_setting(&conn, BACKUP_GDRIVE_ENABLED_KEY, "true").unwrap();
+        db::set_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY, "me@example.com").unwrap();
+        db::set_setting(&conn, BACKUP_PROTON_ENABLED_KEY, "true").unwrap();
+
+        clear_gdrive_destination(&conn).unwrap();
+
+        assert!(
+            !setting_bool(&conn, BACKUP_GDRIVE_ENABLED_KEY, false),
+            "the Drive backup destination is disabled"
+        );
+        assert_eq!(
+            db::get_setting(&conn, BACKUP_GDRIVE_ACCOUNT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "the tokenless account is forgotten"
+        );
+        assert!(
+            setting_bool(&conn, BACKUP_PROTON_ENABLED_KEY, false),
+            "Proton is untouched"
+        );
     }
 }

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.19-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "More honest backups. If you back up to more than one place (say Proton Drive and Google Drive) and one of them quietly starts failing, PM no longer treats everything as fine just because the other succeeded — it now records each destination's last successful backup on its own, so a stale one can be spotted (a visible warning is coming next). And disconnecting your Google account now also switches off Google-Drive backups, instead of leaving them to fail silently against an account PM can no longer reach.",
+    ],
+  },
+  {
     version: "2.92.18-alpha",
     date: "2026-07-06",
     highlights: [

@@ -115,6 +115,11 @@ pub struct BackupReport {
     pub target_dir: Option<String>,
     /// The archive's creation timestamp (RFC3339), surfaced on restore.
     pub created_at: Option<String>,
+    /// Destinations that failed this run while at least one other succeeded (F-22), as
+    /// `"<label>: <error>"` strings — the UI shows a non-blocking "backed up, but X failed" banner.
+    /// Empty on a clean run and always empty for a restore.
+    #[serde(default)]
+    pub failed_destinations: Vec<String>,
 }
 
 /// A progress event broadcast on the global `backup://progress` channel. Detached from
