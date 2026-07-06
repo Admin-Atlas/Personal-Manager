@@ -303,8 +303,49 @@ pub fn spawn_watcher(app: AppHandle) {
     });
 }
 
+/// What a single [`tick`] decides to do from its cheap observations, before any disk effect.
+/// Splitting the decision out of `tick` lets the hand-off / heartbeat / take-over policy — the
+/// split-brain guard (B1-1) — be unit-tested without a running app. Only the fields relevant to
+/// `mode` are consulted (see [`next_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickAction {
+    /// Active + another instance asked for the baton → release + ack, close the store, curtain.
+    HandOff,
+    /// Active + the heartbeat interval elapsed → refresh our lockfile in place.
+    RefreshHeartbeat,
+    /// Requesting + the holder is gone → take over and lift the curtain.
+    TakeOver,
+    /// Nothing to do this tick.
+    Idle,
+}
+
+/// Pure tick policy. `foreign_request` / `heartbeat_due` are the two things an Active writer
+/// observes (a filed baton request, and whether its heartbeat is due); `holder_live` is what a
+/// Requesting instance observes (does the current holder still look alive). Each is consulted
+/// only in its owning mode, so the dummy `false`s the caller passes for the irrelevant ones
+/// cannot change the result. A foreign request outranks a due heartbeat — we finish and hand
+/// over rather than refresh a lock we're about to release. The heartbeat's *refresh outcome*
+/// (kept writing vs. force-taken out from under us) is decided inline in `tick`, since it is
+/// only known after `refresh` touches disk.
+fn next_action(
+    mode: LockMode,
+    foreign_request: bool,
+    heartbeat_due: bool,
+    holder_live: bool,
+) -> TickAction {
+    match mode {
+        LockMode::Active if foreign_request => TickAction::HandOff,
+        LockMode::Active if heartbeat_due => TickAction::RefreshHeartbeat,
+        LockMode::Active => TickAction::Idle,
+        LockMode::Requesting if holder_live => TickAction::Idle,
+        LockMode::Requesting => TickAction::TakeOver,
+        LockMode::Waiting => TickAction::Idle,
+    }
+}
+
 /// One watcher tick: refresh our heartbeat and hand the baton over if asked (when Active),
-/// or take it once the holder releases (when Requesting).
+/// or take it once the holder releases (when Requesting). Gathers the observations, lets the
+/// pure [`next_action`] pick the move, then applies its effect.
 fn tick(app: &AppHandle) -> Result<()> {
     let state = app.state::<AppState>();
     let state = state.inner();
@@ -319,10 +360,18 @@ fn tick(app: &AppHandle) -> Result<()> {
 
     match mode {
         LockMode::Active => {
-            // Another instance asked to take over → finish here (we're between commands),
-            // release + ack, close the store, and curtain ourselves.
-            if let Some(req) = lock::read_request(&root)? {
-                if req.requester_instance != id {
+            // The two Active observations, gathered in the original order (request first).
+            let req = lock::read_request(&root)?;
+            let foreign_request = req.as_ref().is_some_and(|r| r.requester_instance != id);
+            let heartbeat_due = {
+                let session = state.lock_session.lock().unwrap();
+                lock::now_ms().saturating_sub(session.last_heartbeat_ms)
+                    >= lock::HEARTBEAT_INTERVAL_SECS * 1000
+            };
+            match next_action(mode, foreign_request, heartbeat_due, false) {
+                TickAction::HandOff => {
+                    // Another instance asked to take over → finish here (we're between
+                    // commands), release + ack, close the store, and curtain ourselves.
                     lock::release(&root, &id)?;
                     lock::ack_baton(&root, &id)?;
                     close_store(state);
@@ -335,63 +384,114 @@ fn tick(app: &AppHandle) -> Result<()> {
                         "vault://curtain",
                         CurtainEvent {
                             reason: "handed-off",
-                            other_profile: Some(req.requester_instance),
+                            other_profile: req.map(|r| r.requester_instance),
                         },
                     );
-                    return Ok(());
                 }
-            }
-            // Otherwise keep the heartbeat fresh — but re-verify ownership first. If another
-            // profile force-took this vault while we were suspended past the stale threshold
-            // (B1-1), `refresh` reports lost ownership instead of clobbering the new owner's
-            // lockfile; we then step back exactly like a hand-off (close the store, curtain,
-            // go Waiting) rather than running as a second Active writer.
-            let now = lock::now_ms();
-            let mut session = state.lock_session.lock().unwrap();
-            if now.saturating_sub(session.last_heartbeat_ms) >= lock::HEARTBEAT_INTERVAL_SECS * 1000
-            {
-                let outcome = match session.lock.as_mut() {
-                    Some(lock) => Some(lock::refresh(&root, lock)?),
-                    None => None,
-                };
-                match outcome {
-                    Some(lock::RefreshOutcome::Refreshed) => {
-                        if let Some(hb) = session.lock.as_ref().map(|l| l.heartbeat_ms) {
-                            session.last_heartbeat_ms = hb;
+                TickAction::RefreshHeartbeat => {
+                    // Keep the heartbeat fresh — but re-verify ownership first. If another
+                    // profile force-took this vault while we were suspended past the stale
+                    // threshold (B1-1), `refresh` reports lost ownership instead of clobbering
+                    // the new owner's lockfile; we then step back exactly like a hand-off
+                    // (close the store, curtain, go Waiting) rather than running as a second
+                    // Active writer.
+                    let mut session = state.lock_session.lock().unwrap();
+                    let outcome = match session.lock.as_mut() {
+                        Some(lock) => Some(lock::refresh(&root, lock)?),
+                        None => None,
+                    };
+                    match outcome {
+                        Some(lock::RefreshOutcome::Refreshed) => {
+                            if let Some(hb) = session.lock.as_ref().map(|l| l.heartbeat_ms) {
+                                session.last_heartbeat_ms = hb;
+                            }
                         }
-                    }
-                    Some(lock::RefreshOutcome::LostOwnership(new_owner)) => {
-                        drop(session);
-                        close_store(state);
-                        {
-                            let mut session = state.lock_session.lock().unwrap();
-                            session.mode = Some(LockMode::Waiting);
-                            session.lock = None;
-                            session.other_profile = Some(new_owner.profile.clone());
+                        Some(lock::RefreshOutcome::LostOwnership(new_owner)) => {
+                            drop(session);
+                            close_store(state);
+                            {
+                                let mut session = state.lock_session.lock().unwrap();
+                                session.mode = Some(LockMode::Waiting);
+                                session.lock = None;
+                                session.other_profile = Some(new_owner.profile.clone());
+                            }
+                            // Reuse the "other-active" curtain: from the user's side this is
+                            // the same situation as finding another writer active on open.
+                            let _ = app.emit(
+                                "vault://curtain",
+                                CurtainEvent {
+                                    reason: "other-active",
+                                    other_profile: Some(new_owner.profile),
+                                },
+                            );
                         }
-                        // Reuse the "other-active" curtain: from the user's side this is the
-                        // same situation as finding another writer already active on open.
-                        let _ = app.emit(
-                            "vault://curtain",
-                            CurtainEvent {
-                                reason: "other-active",
-                                other_profile: Some(new_owner.profile),
-                            },
-                        );
-                        return Ok(());
+                        None => {}
                     }
-                    None => {}
                 }
+                // next_action never yields TakeOver for Active (and Idle is a no-op).
+                TickAction::TakeOver | TickAction::Idle => {}
             }
         }
         LockMode::Requesting => {
             // The holder released (or crashed) → take over and lift the curtain.
-            match lock::standing(&root, &id)? {
-                lock::Standing::HeldByLive(_) => {} // still waiting on the hand-off
-                _ => take_over(app, &root, &id)?,
+            let holder_live = matches!(lock::standing(&root, &id)?, lock::Standing::HeldByLive(_));
+            if next_action(mode, false, false, holder_live) == TickAction::TakeOver {
+                take_over(app, &root, &id)?;
             }
         }
         LockMode::Waiting => {} // curtained, user hasn't chosen to continue here
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_hands_off_when_another_instance_requests() {
+        // A foreign request wins even when the heartbeat is also due — we release rather than
+        // refresh a lock we're about to hand over.
+        assert_eq!(
+            next_action(LockMode::Active, true, false, false),
+            TickAction::HandOff
+        );
+        assert_eq!(
+            next_action(LockMode::Active, true, true, true),
+            TickAction::HandOff
+        );
+    }
+
+    #[test]
+    fn active_refreshes_only_when_due_and_unrequested() {
+        assert_eq!(
+            next_action(LockMode::Active, false, true, false),
+            TickAction::RefreshHeartbeat
+        );
+        assert_eq!(
+            next_action(LockMode::Active, false, false, false),
+            TickAction::Idle
+        );
+    }
+
+    #[test]
+    fn requesting_takes_over_once_the_holder_is_gone() {
+        assert_eq!(
+            next_action(LockMode::Requesting, false, false, true),
+            TickAction::Idle
+        );
+        assert_eq!(
+            next_action(LockMode::Requesting, false, false, false),
+            TickAction::TakeOver
+        );
+    }
+
+    #[test]
+    fn waiting_is_always_idle() {
+        // Curtained and passive: nothing this instance observes moves it until the user acts.
+        assert_eq!(
+            next_action(LockMode::Waiting, true, true, true),
+            TickAction::Idle
+        );
+    }
 }

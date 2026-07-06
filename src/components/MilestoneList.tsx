@@ -12,6 +12,7 @@ import {
   updateMilestone,
 } from "../lib/ipc";
 import { formatDateOnly } from "../lib/format";
+import { runMutation } from "../lib/runMutation";
 import { Button, Input, Select } from "./ui";
 
 interface Props {
@@ -37,6 +38,10 @@ export function MilestoneList({
   onChanged,
   readOnly = false,
 }: Props) {
+  // A single error line for the whole list: any row's failed mutation surfaces here instead
+  // of silently no-opping (F3-8). Declared before the read-only early return to keep the hook
+  // order stable.
+  const [error, setError] = useState<string | null>(null);
   if (readOnly) {
     return <MilestoneSummary milestones={milestones} />;
   }
@@ -56,18 +61,38 @@ export function MilestoneList({
           isLast={i === milestones.length - 1}
           events={calendarEvents}
           onChanged={onChanged}
-          onMove={async (dir) => {
+          onError={setError}
+          onMove={(dir) => {
             const j = i + dir;
             if (j < 0 || j >= milestones.length) return;
             const ids = milestones.map((x) => x.id);
             [ids[i], ids[j]] = [ids[j], ids[i]];
-            await reorderMilestones(project, ids);
-            onChanged();
+            void runMutation(async () => {
+              await reorderMilestones(project, ids);
+              onChanged();
+            }, setError);
           }}
         />
       ))}
-      <AddMilestone project={project} onChanged={onChanged} />
+      <AddMilestone project={project} onChanged={onChanged} onError={setError} />
+      {error && <MilestoneError message={error} />}
     </div>
+  );
+}
+
+/** A calm inline error line for a milestone mutation that the backend rejected. */
+function MilestoneError({ message }: { message: string }) {
+  return (
+    <p
+      role="alert"
+      className="rounded-[var(--radius-sm)] border px-3 py-2 text-xs text-st-due"
+      style={{
+        borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
+        background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
+      }}
+    >
+      {message}
+    </p>
   );
 }
 
@@ -93,6 +118,7 @@ function MilestoneRow({
   isLast,
   events,
   onChanged,
+  onError,
   onMove,
 }: {
   m: Milestone;
@@ -100,6 +126,7 @@ function MilestoneRow({
   isLast: boolean;
   events: CalendarEvent[];
   onChanged: () => void;
+  onError: (message: string | null) => void;
   onMove: (dir: -1 | 1) => void;
 }) {
   const [label, setLabel] = useState(m.label);
@@ -113,14 +140,18 @@ function MilestoneRow({
     const nextDate = m.calendar_linked ? null : date || null;
     const curDate = m.calendar_linked ? null : (m.due_date?.slice(0, 10) ?? null);
     if (nextLabel === m.label && nextDate === curDate) return;
-    await updateMilestone(m.id, nextLabel, nextDate);
-    onChanged();
+    await runMutation(async () => {
+      await updateMilestone(m.id, nextLabel, nextDate);
+      onChanged();
+    }, onError);
   }
 
   async function link(uid: string) {
     const ev = events.find((e) => e.uid === uid);
-    await setMilestoneEvent(m.id, uid, ev?.start.slice(0, 10) ?? null);
-    onChanged();
+    await runMutation(async () => {
+      await setMilestoneEvent(m.id, uid, ev?.start.slice(0, 10) ?? null);
+      onChanged();
+    }, onError);
   }
 
   // Two explicit lines so the row never has to side-scroll, however narrow the panel:
@@ -138,10 +169,12 @@ function MilestoneRow({
           type="checkbox"
           checked={met}
           title={met ? "Mark not done" : "Mark done"}
-          onChange={async () => {
-            await setMilestoneState(m.id, !met);
-            onChanged();
-          }}
+          onChange={() =>
+            void runMutation(async () => {
+              await setMilestoneState(m.id, !met);
+              onChanged();
+            }, onError)
+          }
           className="shrink-0 accent-[var(--accent)]"
         />
         <Input
@@ -173,10 +206,12 @@ function MilestoneRow({
           </Button>
           <Button
             variant="tertiary"
-            onClick={async () => {
-              await deleteMilestone(m.id);
-              onChanged();
-            }}
+            onClick={() =>
+              void runMutation(async () => {
+                await deleteMilestone(m.id);
+                onChanged();
+              }, onError)
+            }
             title="Remove milestone"
             className="px-1.5 py-0.5 hover:text-st-blocked"
           >
@@ -203,10 +238,12 @@ function MilestoneRow({
             {m.event_missing && <span className="shrink-0 text-st-due">⚠</span>}
             <Button
               variant="tertiary"
-              onClick={async () => {
-                await setMilestoneEvent(m.id, null, m.due_date?.slice(0, 10) ?? null);
-                onChanged();
-              }}
+              onClick={() =>
+                void runMutation(async () => {
+                  await setMilestoneEvent(m.id, null, m.due_date?.slice(0, 10) ?? null);
+                  onChanged();
+                }, onError)
+              }
               title="Unlink from calendar (date becomes editable)"
               className="shrink-0 px-1 py-0.5 text-[10px]"
             >
@@ -260,7 +297,15 @@ function DonePill() {
 }
 
 /** The "add a milestone" row at the foot of the list. */
-function AddMilestone({ project, onChanged }: { project: string; onChanged: () => void }) {
+function AddMilestone({
+  project,
+  onChanged,
+  onError,
+}: {
+  project: string;
+  onChanged: () => void;
+  onError: (message: string | null) => void;
+}) {
   const [label, setLabel] = useState("");
   const [date, setDate] = useState("");
   const [busy, setBusy] = useState(false);
@@ -268,14 +313,16 @@ function AddMilestone({ project, onChanged }: { project: string; onChanged: () =
   async function add() {
     if (!label.trim() && !date) return;
     setBusy(true);
-    try {
-      await addMilestone(project, label.trim() || "deadline", date || null, null);
+    const ok = await runMutation(
+      () => addMilestone(project, label.trim() || "deadline", date || null, null),
+      onError,
+    );
+    if (ok) {
       setLabel("");
       setDate("");
       onChanged();
-    } finally {
-      setBusy(false);
     }
+    setBusy(false);
   }
 
   // flex-wrap + min-w-0 basis: the name and date share the row when there's room and the

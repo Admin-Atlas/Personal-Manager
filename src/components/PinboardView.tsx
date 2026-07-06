@@ -13,6 +13,7 @@ import {
   type ReactNode,
 } from "react";
 import { formatDateOnly } from "../lib/format";
+import { runMutation } from "../lib/runMutation";
 import {
   addMilestone,
   deleteMilestone,
@@ -736,6 +737,7 @@ function BoundTimeline({
 }) {
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     let cancelled = false;
@@ -766,8 +768,10 @@ function BoundTimeline({
   });
 
   async function add() {
-    await addMilestone(project, "deadline", null, null);
-    refresh();
+    await runMutation(async () => {
+      await addMilestone(project, "deadline", null, null);
+      refresh();
+    }, setError);
   }
 
   return (
@@ -796,7 +800,13 @@ function BoundTimeline({
           <div className="pointer-events-none absolute inset-x-2 top-8 h-px bg-border2" />
           <div className="flex items-start gap-1 pb-1">
             {ordered.map((m) => (
-              <MilestoneColumn key={m.id} m={m} onChanged={refresh} showPower={showPower} />
+              <MilestoneColumn
+                key={m.id}
+                m={m}
+                onChanged={refresh}
+                onError={setError}
+                showPower={showPower}
+              />
             ))}
           </div>
         </div>
@@ -808,6 +818,11 @@ function BoundTimeline({
       >
         + Milestone
       </button>
+      {error && (
+        <p role="alert" className="mt-1 shrink-0 px-1 text-[10px] text-st-due">
+          {error}
+        </p>
+      )}
     </div>
   );
 }
@@ -818,10 +833,12 @@ function BoundTimeline({
 function MilestoneColumn({
   m,
   onChanged,
+  onError,
   showPower,
 }: {
   m: Milestone;
   onChanged: () => void;
+  onError: (message: string | null) => void;
   showPower: boolean;
 }) {
   const [label, setLabel] = useState(m.label);
@@ -837,8 +854,10 @@ function MilestoneColumn({
     const nextDate = m.calendar_linked ? null : date || null;
     const curDate = m.calendar_linked ? null : msDate(m) || null;
     if (nextLabel === m.label && nextDate === curDate) return;
-    await updateMilestone(m.id, nextLabel, nextDate);
-    onChanged();
+    await runMutation(async () => {
+      await updateMilestone(m.id, nextLabel, nextDate);
+      onChanged();
+    }, onError);
   }
 
   return (
@@ -862,10 +881,12 @@ function MilestoneColumn({
         />
       )}
       <button
-        onClick={async () => {
-          await setMilestoneState(m.id, !met);
-          onChanged();
-        }}
+        onClick={() =>
+          void runMutation(async () => {
+            await setMilestoneState(m.id, !met);
+            onChanged();
+          }, onError)
+        }
         title={met ? "Mark not done" : "Mark done"}
         aria-label={met ? "Mark not done" : "Mark done"}
         className="h-2.5 w-2.5 shrink-0 rounded-full border"
@@ -884,10 +905,12 @@ function MilestoneColumn({
         }`}
       />
       <button
-        onClick={async () => {
-          await deleteMilestone(m.id);
-          onChanged();
-        }}
+        onClick={() =>
+          void runMutation(async () => {
+            await deleteMilestone(m.id);
+            onChanged();
+          }, onError)
+        }
         aria-label="Remove milestone"
         className="text-[10px] text-ink4 hover:text-st-due"
       >

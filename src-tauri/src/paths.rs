@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::{AppHandle, Manager};
 
@@ -56,6 +56,20 @@ pub fn venv_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(data_dir(app)?.join("runtime").join("venv"))
 }
 
+/// Walk up from `start`, returning the `sidecar/` folder of the nearest ancestor that holds a
+/// `pm_sidecar.py`. This is the dev fallback: the binary sits under `src-tauri/target/<profile>/`
+/// and the repo root above it holds `sidecar/`. Split out of [`sidecar_source_dir`] so the walk
+/// is testable without a real executable path or app bundle.
+fn find_sidecar_up(start: &Path) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join("sidecar");
+        if candidate.join("pm_sidecar.py").exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Resolve the directory holding the sidecar script + requirements. Order:
 /// `PM_SIDECAR_DIR` (dev override, debug builds only) → the bundled resource dir
 /// → walking up from the executable for the repo's `sidecar/` folder (dev).
@@ -74,15 +88,69 @@ pub fn sidecar_source_dir(app: &AppHandle) -> Result<PathBuf> {
     // Dev: the binary sits under src-tauri/target/<profile>/; the repo root above
     // it holds `sidecar/`.
     if let Ok(exe) = std::env::current_exe() {
-        for ancestor in exe.ancestors() {
-            let candidate = ancestor.join("sidecar");
-            if candidate.join("pm_sidecar.py").exists() {
-                return Ok(candidate);
-            }
+        if let Some(dir) = find_sidecar_up(&exe) {
+            return Ok(dir);
         }
     }
 
     Err(Error::Other(
         "could not locate the sidecar/ folder (set PM_SIDECAR_DIR)".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drop a `sidecar/pm_sidecar.py` marker directly under `dir`.
+    fn touch_marker(dir: &Path) {
+        let sc = dir.join("sidecar");
+        std::fs::create_dir_all(&sc).unwrap();
+        std::fs::write(sc.join("pm_sidecar.py"), b"# marker").unwrap();
+    }
+
+    #[test]
+    fn walks_up_to_the_sidecar_dir_above_the_exe() {
+        let root = tempfile::tempdir().unwrap();
+        touch_marker(root.path());
+        // A lexical exe path a few levels below the marker — the dirs need not exist, the walk
+        // is purely lexical until it probes for the marker file.
+        let exe = root.path().join("target").join("debug").join("pm");
+        assert_eq!(
+            find_sidecar_up(&exe).unwrap(),
+            root.path().join("sidecar"),
+            "the walk finds the repo-root sidecar/ above the binary"
+        );
+    }
+
+    #[test]
+    fn finds_no_marker_inside_a_clean_subtree() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("a").join("b").join("pm");
+        // The walk is unbounded (it climbs past the temp dir to the filesystem root), so we
+        // can't assert `is_none()` without assuming nothing above the temp dir holds a marker.
+        // Assert the real invariant instead: with no marker in our own subtree, the walk never
+        // surfaces one from inside it.
+        if let Some(found) = find_sidecar_up(&exe) {
+            assert!(
+                !found.starts_with(root.path()),
+                "no sidecar/ exists in the clean subtree, but the walk returned {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nearest_ancestor_wins_over_a_higher_one() {
+        let root = tempfile::tempdir().unwrap();
+        let mid = root.path().join("mid");
+        std::fs::create_dir_all(&mid).unwrap();
+        touch_marker(root.path());
+        touch_marker(&mid);
+        let exe = mid.join("target").join("debug").join("pm");
+        assert_eq!(
+            find_sidecar_up(&exe).unwrap(),
+            mid.join("sidecar"),
+            "the closer sidecar/ shadows the one further up"
+        );
+    }
 }
