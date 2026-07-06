@@ -1717,4 +1717,119 @@ mod tests {
             .unwrap();
         assert_eq!(cursor, None, "extraction cursor defaults NULL");
     }
+
+    // --- T-05: the full migration ladder over real user data ----------------
+    // The tests above build old schemas by tearing the CURRENT one back down (only a
+    // couple of the 33 versions) — an imperfect teardown silently tests the wrong
+    // shape, and nothing carries realistic data end-to-end. This builds an AUTHENTIC
+    // v2 store from the real migration SQL, fills it with the precious,
+    // non-rebuildable kind of data (a chat + an indexed document), then drives every
+    // remaining rung to latest and asserts the data survived unchanged.
+
+    fn user_version(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Apply exactly the first `n` migrations (versions 1..=n) from the real
+    /// `MIGRATIONS` array — the genuine historical schema, not a teardown of the
+    /// current one.
+    fn apply_through(conn: &rusqlite::Connection, n: usize) {
+        for (i, sql) in super::MIGRATIONS.iter().take(n).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", (i + 1) as i64)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn full_ladder_from_v2_preserves_user_data() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        // Open UNMIGRATED, then apply only v1 + v2 → an authentic v2-shaped store.
+        let conn = crate::db::open_keyed(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        apply_through(&conn, 2);
+        assert_eq!(user_version(&conn), 2, "fixture starts at an authentic v2");
+
+        // v2-era user data: a chat conversation + its turns (the non-rebuildable kind),
+        // an indexed document + chunk, and the settings pinned at v2.
+        conn.execute_batch(
+            "INSERT INTO conversations(id, title) VALUES (1, 'Taxes 2025');
+             INSERT INTO messages(conversation_id, role, content)
+                 VALUES (1, 'user', 'when did I file?');
+             INSERT INTO messages(conversation_id, role, content)
+                 VALUES (1, 'assistant', 'You filed on 2025-01-15.');
+             INSERT INTO documents(vault_path, title, content_hash)
+                 VALUES ('vault/notes.md', 'Notes', 'hash-abc');
+             INSERT INTO chunks(document_id, ordinal, content, char_count)
+                 VALUES ((SELECT id FROM documents WHERE content_hash = 'hash-abc'),
+                         0, 'hello world', 11);",
+        )
+        .unwrap();
+
+        // Drive the FULL remaining ladder (v3 → latest) over that real data.
+        super::run(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::MIGRATIONS.len() as i64,
+            "reached the latest version"
+        );
+
+        // Every row survived every rung, values intact.
+        let title: String = conn
+            .query_row("SELECT title FROM conversations WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "Taxes 2025");
+        let turns: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages WHERE conversation_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(turns, 2, "both chat turns survived");
+        let answer: String = conn
+            .query_row(
+                "SELECT content FROM messages WHERE conversation_id = 1 AND role = 'assistant'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(answer, "You filed on 2025-01-15.");
+        let (doc_title, chunk): (String, String) = conn
+            .query_row(
+                "SELECT d.title, c.content FROM documents d JOIN chunks c ON c.document_id = d.id \
+                 WHERE d.content_hash = 'hash-abc'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(doc_title, "Notes");
+        assert_eq!(chunk, "hello world");
+
+        // v4's additive `project` column reached the pre-existing v2 row with its default.
+        let project: String = conn
+            .query_row(
+                "SELECT project FROM documents WHERE content_hash = 'hash-abc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            project, "Unsorted",
+            "v4 default applied to the pre-existing row"
+        );
+
+        // The embedding identity pinned at v2 survived.
+        let model: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "BAAI/bge-small-en-v1.5");
+    }
 }

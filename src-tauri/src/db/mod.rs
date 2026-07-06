@@ -263,6 +263,18 @@ fn register_sqlite_vec() {
 /// schema up to date. Returns an error if the key is wrong or the file is
 /// corrupt.
 pub fn open(path: &Path, key: &str) -> Result<Connection> {
+    let conn = open_keyed(path, key)?;
+    migrations::run(&conn)?;
+    Ok(conn)
+}
+
+/// Open + unlock the encrypted store WITHOUT running migrations: the returned
+/// connection is keyed, has sqlite-vec registered, WAL + foreign_keys on, and sits at
+/// whatever `user_version` the file carries (0 for a fresh file). [`open`] is this plus
+/// `migrations::run`. The split lets the migration-ladder test (T-05) build an
+/// authentic old-version store from the real migration SQL and drive the full ladder
+/// over real data, rather than tearing the current schema back down.
+fn open_keyed(path: &Path, key: &str) -> Result<Connection> {
     register_sqlite_vec();
     let conn = Connection::open(path)?;
 
@@ -313,7 +325,6 @@ pub fn open(path: &Path, key: &str) -> Result<Connection> {
     conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
-    migrations::run(&conn)?;
     Ok(conn)
 }
 
