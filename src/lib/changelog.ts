@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.33-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood tidying. PM now has a test that upgrades a database created by a much older version all the way to the current one, checking your chats, documents and settings come through every step intact — so a future change to how the database evolves can't quietly lose data.",
+    ],
+  },
+  {
     version: "2.92.32-alpha",
     date: "2026-07-06",
     highlights: [
