@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.22-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood security tidying. Your vault passphrase is now scrubbed from PM's working memory the moment it's finished with, instead of lingering there. And PM's interface layer can now only read the handful of look-and-feel settings it's meant to (theme, layout, and the like) — never other internal values.",
+    ],
+  },
+  {
     version: "2.92.21-alpha",
     date: "2026-07-06",
     highlights: [
