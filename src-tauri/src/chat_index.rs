@@ -27,6 +27,7 @@
 //! background job and the triviality gate are card 7B's second PR. Context assembly (C), the
 //! navigation pointer's UI (E), and learning-loop routing (F) are later cards.
 
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -37,6 +38,7 @@ use crate::error::Result;
 use crate::ingest::{self, DocMeta, SourceMeta};
 use crate::model_gateway::ModelGateway;
 use crate::splitter;
+use crate::vault::MarkdownCipher;
 use crate::{chat, registry, AppState};
 
 /// How long the launch sweep waits for the vault to unlock + the engine to be provisioned before
@@ -153,6 +155,14 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
         return Ok(Outcome::UpToDate);
     }
 
+    // 1b. Vault reconcile (F-11). The file is the authoritative truth a Rebuild reads; card A's
+    //     `record_turn_pair` writes it best-effort, so a failed append can leave a pair live in `messages`
+    //     — and thus about to be indexed from `messages` just below — yet absent from the file, which a
+    //     later Rebuild would then silently drop. Re-run the idempotent append for every pair past the
+    //     cursor so the file always carries at least what we are about to index. Off the lock (file IO); a
+    //     failure aborts the sweep with the cursor untouched, so the pair is retried next sweep.
+    reconcile_vault_pairs(state, &plan, &pairs)?;
+
     // 2. Resolve the vault's embedder + build the gateway (off the lock). Refuse a width the live index
     //    can't hold (a mid-switch vault re-indexes via Rebuild, not here).
     let (embedder, embed_batch) = {
@@ -223,6 +233,57 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
         turns: indexed_turns,
         chunks,
     })
+}
+
+/// F-11 — before indexing, ensure every completed pair we are about to index is present in the session's
+/// vault file, the truth a Rebuild reads. Card A's [`chat::record_turn_pair`] appends best-effort, so a
+/// failed append (locked/full disk, or a crash between the `messages` commit and the file write) can leave
+/// a pair indexed from `messages` yet missing from the file — which a later Rebuild would drop.
+/// [`chat::append_turn_pair`] is idempotent (keyed on the turn anchor): re-running it for every pair past
+/// the cursor is a no-op for the ones already written and a self-heal for any that are missing. Runs off
+/// the DB lock; a failure propagates and aborts the sweep with the cursor untouched, so the pair is retried
+/// next sweep — the same best-effort contract the index step already keeps.
+fn reconcile_vault_pairs(
+    state: &AppState,
+    plan: &SessionPlan,
+    pairs: &[chat::TurnPair],
+) -> Result<()> {
+    let (vault_dir, cipher) = state.markdown_io()?;
+    reconcile_vault_pairs_io(&vault_dir, &cipher, plan, pairs)
+}
+
+/// The file-IO core of [`reconcile_vault_pairs`], split out so the reconcile is unit-tested with a real
+/// cipher + temp vault and no `AppState`. Appends every pair idempotently, in the caller's (cursor-ascending)
+/// order. The front-matter arguments are consulted only when the file must be created — the rare case where
+/// even card A's first append never landed — and mirror exactly what `record_turn_pair` writes, so a
+/// self-healed file is indistinguishable from a normally-grown one.
+fn reconcile_vault_pairs_io(
+    vault_dir: &Path,
+    cipher: &MarkdownCipher,
+    plan: &SessionPlan,
+    pairs: &[chat::TurnPair],
+) -> Result<()> {
+    let project = plan
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("Unsorted");
+    for pair in pairs {
+        chat::append_turn_pair(
+            vault_dir,
+            cipher,
+            &plan.vault_path,
+            &plan.title,
+            plan.conversation_id,
+            &plan.scope,
+            project,
+            &plan.created_at,
+            &pair.at,
+            pair,
+        )?;
+    }
+    Ok(())
 }
 
 /// Mirror a re-evaluated chat's classification from the (already-committed) `documents` row into its vault
@@ -1289,5 +1350,104 @@ mod tests {
             .query_row("SELECT count(*) FROM chunk_vec", [], |r| r.get(0))
             .unwrap();
         assert_eq!(vec_total, 1, "only the kept chat's vector remains");
+    }
+
+    // --- F-11: the launch sweep's vault reconcile ---
+
+    fn reconcile_plan() -> SessionPlan {
+        SessionPlan {
+            conversation_id: 7,
+            document_id: None,
+            vault_path: "chat-test-7.md".to_string(),
+            scope: "general".to_string(),
+            title: "My chat".to_string(),
+            project: None,
+            created_at: "2026-06-28T10:00:00.000Z".to_string(),
+        }
+    }
+
+    fn reconcile_pair(turn_id: i64, at: &str, user: &str, assistant: &str) -> chat::TurnPair {
+        chat::TurnPair {
+            user: user.to_string(),
+            assistant: assistant.to_string(),
+            turn_id,
+            at: at.to_string(),
+        }
+    }
+
+    #[test]
+    fn launch_sweep_reconciles_a_vault_that_trails_its_messages() {
+        // F-11: card A appended pair 2 to the vault, but its append for pair 4 failed — pair 4 is live in
+        // `messages` and about to be indexed from there. Before F-11 the sweep indexed it yet never wrote it
+        // to the file, so a later Rebuild (file = truth) dropped it. The reconcile must re-append the missing
+        // pair, and be a pure no-op for the pair already present.
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = MarkdownCipher::plaintext("v");
+        let plan = reconcile_plan();
+        let path = dir.path().join(&plan.vault_path);
+        let read = |p: &std::path::Path| cipher.decode(&std::fs::read(p).unwrap(), p).unwrap();
+
+        let pairs = vec![
+            reconcile_pair(2, "2026-06-28T10:00:01.000Z", "hi", "hello"),
+            reconcile_pair(4, "2026-06-28T10:05:00.000Z", "more", "ok"),
+        ];
+
+        // Card A's successful append of pair 2 only (pair 4 never made it to the file).
+        reconcile_vault_pairs_io(dir.path(), &cipher, &plan, &pairs[..1]).unwrap();
+        let before = read(&path);
+        assert!(before.contains("<!-- turn 2 ·"));
+        assert!(
+            !before.contains("<!-- turn 4 ·"),
+            "pair 4 is missing from truth — the trailing gap the sweep must close"
+        );
+
+        // The launch sweep sees [2, 4] past the cursor and reconciles the file before indexing.
+        reconcile_vault_pairs_io(dir.path(), &cipher, &plan, &pairs).unwrap();
+        let after = read(&path);
+        assert_eq!(
+            after.matches("<!-- turn 2 ·").count(),
+            1,
+            "the already-present pair is not duplicated"
+        );
+        assert_eq!(
+            after.matches("<!-- turn 4 ·").count(),
+            1,
+            "the missing pair is self-healed into truth exactly once"
+        );
+        assert!(after.contains("**You:** more") && after.contains("**PM:** ok"));
+
+        // Idempotent: re-running the reconcile appends nothing.
+        reconcile_vault_pairs_io(dir.path(), &cipher, &plan, &pairs).unwrap();
+        assert_eq!(read(&path), after, "a second reconcile is a pure no-op");
+    }
+
+    #[test]
+    fn launch_sweep_reconcile_recreates_a_missing_vault_file() {
+        // The pathological case: even card A's first append never landed, so there is no file at all. The
+        // reconcile must create it with the correct chat front-matter (so a Rebuild reads it as a chat) plus
+        // the missing turn — never leave the pair indexed-but-untruthed.
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = MarkdownCipher::plaintext("v");
+        let plan = reconcile_plan();
+        let path = dir.path().join(&plan.vault_path);
+        assert!(!path.exists(), "no vault file yet");
+
+        let pairs = vec![reconcile_pair(2, "2026-06-28T10:00:01.000Z", "hi", "hello")];
+        reconcile_vault_pairs_io(dir.path(), &cipher, &plan, &pairs).unwrap();
+
+        let content = cipher
+            .decode(&std::fs::read(&path).unwrap(), &path)
+            .unwrap();
+        let (fields, body) = ingest::parse_frontmatter(&content).expect("front-matter parses");
+        assert_eq!(fields.get("source_type").map(String::as_str), Some("chat"));
+        assert_eq!(
+            fields.get("chat_scope").map(String::as_str),
+            Some("general")
+        );
+        assert_eq!(
+            fields.get("chat_conversation_id").map(String::as_str),
+            Some("7")
+        );
+        assert!(body.contains("**You:** hi") && body.contains("**PM:** hello"));
     }
 }
