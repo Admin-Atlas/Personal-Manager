@@ -1,10 +1,20 @@
 [package]
 name = "pm"
-version = "2.92.20-alpha"
+version = "2.92.21-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
 license = "AGPL-3.0-or-later"
+
+# F-53: the release binary bundles SQLCipher + OpenSSL + sqlite-vec at cargo defaults (no LTO,
+# 16 codegen units, symbols kept). Thin-LTO + a single codegen unit + stripped symbols shrink the
+# binary and can speed hot paths; the trade is a slower release compile. Size / build-time / runtime
+# impact is PENDING MEASUREMENT (per the goal directive — no numbers asserted). Debug builds and the
+# `just check` gate are unaffected (they use the dev profile).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [lib]
 # The `_lib` suffix keeps the lib name distinct from the bin name (required on Windows).

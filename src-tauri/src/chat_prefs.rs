@@ -296,7 +296,7 @@ pub fn spawn_extract_after_reply(app: AppHandle, conversation_id: i64) {
 
 /// The launch catch-up: once the vault is ready, extract from any session with turns added while the app
 /// was closed, then stop (the eager nudge handles live sessions).
-pub fn spawn_prefs_scheduler(app: AppHandle) {
+pub fn spawn_prefs_scheduler(app: AppHandle, launch_stagger: Duration) {
     tauri::async_runtime::spawn(async move {
         let mut ready_now = false;
         for _ in 0..LAUNCH_WAIT_TICKS {
@@ -307,6 +307,8 @@ pub fn spawn_prefs_scheduler(app: AppHandle) {
             tokio::time::sleep(Duration::from_secs(LAUNCH_WAIT_SECS)).await;
         }
         if ready_now {
+            // F-54: staggered so the launch passes don't all fire at once on unlock (see lib.rs).
+            tokio::time::sleep(launch_stagger).await;
             run_guarded(&app, |app| async move { reconcile_prefs(&app).await }).await;
         }
     });

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.21-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Calmer startup. When PM opens, several background catch-up jobs — re-indexing chats, refreshing running summaries and titles — used to all fire at the same moment right after unlock, making the first few seconds work harder than needed (especially waking the computer from sleep). They now take turns, so nothing piles up at once. There's also a behind-the-scenes build-tuning change whose effect we'll measure before the next release.",
+    ],
+  },
+  {
     version: "2.92.20-alpha",
     date: "2026-07-06",
     highlights: [
