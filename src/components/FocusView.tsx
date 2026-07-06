@@ -28,6 +28,7 @@ import type {
   ProjectStatus,
 } from "../lib/types";
 import { formatDate, formatDateOnly } from "../lib/format";
+import { runMutation } from "../lib/runMutation";
 import { rankImportance } from "../lib/importance";
 import { Button, Card, Input, Skeleton, StatusBadge, Select } from "./ui";
 import { useDepth } from "../theme";
@@ -506,22 +507,39 @@ function MetaEditor({
   const [blockedBy, setBlockedBy] = useState(project.blocked_by ?? "");
   const [parent, setParent] = useState(project.parent ?? "");
   const [saving, setSaving] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function applyProposal() {
-    if (!proposal) return;
+    if (!proposal || applying) return;
     setSize(proposal.size);
     if (proposal.blocked_by) setBlockedBy(proposal.blocked_by);
     if (proposal.parent) setParent(proposal.parent);
     // A proposed deadline becomes a milestone straight away (milestones persist live).
-    if (proposal.deadline) {
-      await addMilestone(project.name, "deadline", proposal.deadline.slice(0, 10), null);
+    if (!proposal.deadline) return;
+    const due = proposal.deadline.slice(0, 10);
+    // Skip if that deadline is already an unmet milestone: without this a second "Use it"
+    // (or clicking again after re-opening triage — the proposal persists) files a duplicate
+    // "deadline" that then competes for governing status (F3-9). The busy latch above closes
+    // the same gap for a fast double-click.
+    const alreadyFiled = project.milestones.some(
+      (m) => m.state !== "met" && m.label === "deadline" && m.due_date?.slice(0, 10) === due,
+    );
+    if (alreadyFiled) return;
+    setApplying(true);
+    const ok = await runMutation(async () => {
+      await addMilestone(project.name, "deadline", due, null);
       onChanged();
-    }
+    }, setError);
+    // Re-enable only to allow a retry after a failure. On success we stay latched: the deadline
+    // is filed but the parent's milestone list is refetched asynchronously, so re-enabling now
+    // would leave a window where a second click sees stale milestones and files a duplicate.
+    if (!ok) setApplying(false);
   }
 
   async function save() {
     setSaving(true);
-    try {
+    await runMutation(async () => {
       await setProjectMetadata(project.name, {
         size,
         importance,
@@ -529,9 +547,8 @@ function MetaEditor({
         parent: parent || null,
       });
       onSaved();
-    } finally {
-      setSaving(false);
-    }
+    }, setError);
+    setSaving(false);
   }
 
   return (
@@ -548,7 +565,8 @@ function MetaEditor({
             <span className="font-medium">AI suggestion</span>
             <button
               onClick={applyProposal}
-              className="rounded-[var(--radius-sm)] px-2 py-0.5 text-accent-text transition hover:bg-accent-soft"
+              disabled={applying}
+              className="rounded-[var(--radius-sm)] px-2 py-0.5 text-accent-text transition hover:bg-accent-soft disabled:opacity-50"
             >
               Use it
             </button>
@@ -614,6 +632,19 @@ function MetaEditor({
           />
         </div>
       </div>
+
+      {error && (
+        <div
+          role="alert"
+          className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2 text-xs text-st-due"
+          style={{
+            borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
+            background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
+          }}
+        >
+          {error}
+        </div>
+      )}
 
       <div className="mt-3 flex justify-end gap-2">
         <Button variant="primary" onClick={save} disabled={saving}>

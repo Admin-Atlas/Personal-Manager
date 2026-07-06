@@ -333,6 +333,28 @@ const FIXED_KEYS: &[&str] = &[
     MICROSOFT_CLIENT_ID,
 ];
 
+/// Every keychain key a wipe must delete: the fixed keys, then the dynamic per-account /
+/// per-vault keys reconstructed from ids the caller read out of the DB (in the same order the
+/// wipe applied them). Split out of [`wipe_all_secrets`] so the key-list construction — the
+/// correctness surface, where a forgotten fixed key or a wrong `::` prefix would leave a secret
+/// behind — is unit-testable without touching the live OS keychain.
+fn all_secret_keys(
+    token_keys: &[String],
+    google_client_emails: &[String],
+    vault_ids: &[String],
+) -> Vec<String> {
+    let mut keys: Vec<String> = FIXED_KEYS.iter().map(|k| (*k).to_string()).collect();
+    keys.extend(token_keys.iter().cloned());
+    for email in google_client_emails {
+        keys.push(format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"));
+        keys.push(format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"));
+    }
+    for id in vault_ids {
+        keys.push(vault_key_entry(id));
+    }
+    keys
+}
+
 /// Delete every PM secret from the OS keychain, returning how many entries were actually present and
 /// removed. `token_keys` are the fully-formed per-account OAuth token keys the caller built from
 /// connected accounts (Drive/Calendar/OneDrive/Outlook — via the public `*_PREFIX` constants);
@@ -357,19 +379,73 @@ pub fn wipe_all_secrets(
         }
     };
 
-    for k in FIXED_KEYS {
-        wipe(k);
-    }
-    for k in token_keys {
-        wipe(k);
-    }
-    for email in google_client_emails {
-        wipe(&format!("{GOOGLE_CLIENT_ID_PREFIX}{email}"));
-        wipe(&format!("{GOOGLE_CLIENT_SECRET_PREFIX}{email}"));
-    }
-    for id in vault_ids {
-        wipe(&vault_key_entry(id));
+    for key in all_secret_keys(token_keys, google_client_emails, vault_ids) {
+        wipe(&key);
     }
 
     deleted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_secret_keys_covers_every_fixed_key() {
+        let keys = all_secret_keys(&[], &[], &[]);
+        for fixed in FIXED_KEYS {
+            assert!(
+                keys.iter().any(|k| k == fixed),
+                "fixed key {fixed} must be in the wipe list"
+            );
+        }
+        assert_eq!(
+            keys.len(),
+            FIXED_KEYS.len(),
+            "with nothing connected the wipe list is exactly the fixed keys"
+        );
+    }
+
+    #[test]
+    fn all_secret_keys_reconstructs_the_dynamic_keys() {
+        let token_keys = vec![
+            format!("{GOOGLE_TOKEN_DRIVE_PREFIX}a@x.com"),
+            format!("{GOOGLE_TOKEN_CALENDAR_PREFIX}b@y.com"),
+        ];
+        let emails = vec!["ap@x.com".to_string()];
+        let vaults = vec!["vault-123".to_string()];
+        let keys = all_secret_keys(&token_keys, &emails, &vaults);
+
+        // Per-account OAuth token keys pass through verbatim.
+        assert!(keys.contains(&format!("{GOOGLE_TOKEN_DRIVE_PREFIX}a@x.com")));
+        assert!(keys.contains(&format!("{GOOGLE_TOKEN_CALENDAR_PREFIX}b@y.com")));
+        // A BYO-client account's id + secret carry the exact `::`-suffixed prefixes.
+        assert!(keys.contains(&"google_oauth_client_id::ap@x.com".to_string()));
+        assert!(keys.contains(&"google_oauth_client_secret::ap@x.com".to_string()));
+        // The cached vault key is `vault_key::{id}`.
+        assert!(keys.contains(&"vault_key::vault-123".to_string()));
+
+        assert_eq!(
+            keys.len(),
+            FIXED_KEYS.len() + token_keys.len() + 2 * emails.len() + vaults.len(),
+            "one key per fixed + token + (id,secret) per email + vault"
+        );
+    }
+
+    #[test]
+    fn all_secret_keys_has_no_duplicates() {
+        let keys = all_secret_keys(
+            &[format!("{GOOGLE_TOKEN_DRIVE_PREFIX}a@x.com")],
+            &["ap@x.com".to_string()],
+            &["v1".to_string()],
+        );
+        let mut deduped = keys.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            keys.len(),
+            "the wipe list must not delete the same key twice"
+        );
+    }
 }

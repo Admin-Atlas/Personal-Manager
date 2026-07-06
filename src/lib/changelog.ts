@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.41-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "When editing a milestone doesn't go through, PM now tells you. Adding, renaming, moving, ticking off, or removing a milestone — on a project's Focus view or a pinboard timeline — used to fail silently if something went wrong behind the scenes, looking like it worked until the next refresh quietly undid it. Now you see the error instead.",
+      "Clicking 'Use it' twice on an AI-suggested deadline no longer files it twice. The button now settles while the milestone is being added, and a deadline that's already on the project is skipped.",
+      "Under-the-hood tidying. Added tests around the vault hand-off between two computers sharing one vault, the sidecar lookup, and the 'Remove all data' keychain sweep — pinning behaviour that had none. No change to how anything works.",
+    ],
+  },
+  {
     version: "2.92.40-alpha",
     date: "2026-07-06",
     highlights: [
