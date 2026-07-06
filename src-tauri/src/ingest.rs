@@ -1196,19 +1196,38 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
 
     // Index-only documents have no Markdown file, so the walk above skipped them; restore them from
     // the encrypted manifest, re-embedded from their stored summaries (their bodies are remote). The
-    // gateway is already warmed and `chunk_vec` already sized, so this reuses both.
-    if let Ok((vault_root, manifest_cipher)) = state.manifest_io() {
-        match crate::index_only::rebuild_from_manifest(
-            &state,
-            &gateway,
-            &vault_root,
-            &manifest_cipher,
-        ) {
-            Ok((restored, idx_failed)) => {
-                ingested += restored;
-                failed += idx_failed;
-            }
-            Err(e) => eprintln!("index_only: manifest rebuild skipped ({e})"),
+    // gateway is already warmed and `chunk_vec` already sized, so this reuses both. A WHOLESALE failure
+    // here — the manifest can't be opened (a poisoned vault lock), or `rebuild_from_manifest` errors
+    // before it can count per-item (an undecryptable/corrupt manifest) — would otherwise vanish EVERY
+    // connector-indexed document from a Rebuild that still reports success, with only a stderr line
+    // (B3-7). Surface it as one synthetic Failed item and count it, so the run reports non-clean and the
+    // Documents view shows why. A vault with no manifest yet resolves to `Ok((0, 0))`, so this never
+    // fires on the common connector-free rebuild; per-item failures are already folded into `failed`.
+    let manifest_rebuild = state
+        .manifest_io()
+        .and_then(|(vault_root, manifest_cipher)| {
+            crate::index_only::rebuild_from_manifest(
+                &state,
+                &gateway,
+                &vault_root,
+                &manifest_cipher,
+            )
+        });
+    match manifest_rebuild {
+        Ok((restored, idx_failed)) => {
+            ingested += restored;
+            failed += idx_failed;
+        }
+        Err(e) => {
+            failed += 1;
+            let _ = on_event.send(IngestEvent::Started {
+                path: "connector-index".into(),
+                name: "Connector index".into(),
+            });
+            let _ = on_event.send(IngestEvent::Failed {
+                path: "connector-index".into(),
+                error: format!("couldn't restore connector-indexed items: {e}"),
+            });
         }
     }
 
