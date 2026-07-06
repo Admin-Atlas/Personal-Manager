@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.15-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood chat tidying. When you hit “Compress” to free up room in a long conversation at the same moment PM was already tidying that chat’s running summary in the background, the two could briefly step on each other and record the same stretch twice — that can no longer happen; whoever finishes first wins and the other steps aside cleanly. And if the document search that grounds an answer in your files ever fails, PM now leaves a note in its logs instead of quietly answering as if you had no documents at all.",
+    ],
+  },
+  {
     version: "2.92.14-alpha",
     date: "2026-07-06",
     highlights: [

@@ -1535,9 +1535,38 @@ async fn retrieve_grounding(
     })
     .await;
 
+    let (chunks, failure) = interpret_grounding(task);
+    if let Some(note) = failure {
+        // A broken retrieval stack (or a panic in the blocking task) must not silently make EVERY chat
+        // ungrounded with no trace (F-37). We keep the best-effort contract — still return an empty list so
+        // the turn answers ungrounded rather than erroring — but the failure is now observable.
+        eprintln!("retrieve_grounding: {note}");
+    }
+    chunks
+}
+
+/// Interpret the outcome of the off-runtime grounding task, keeping distinct the three cases the caller
+/// must not conflate (F-37): a clean result (use the chunks — an empty list here means "genuinely nothing
+/// to ground on"), a retrieval error inside the closure (`Ok(Err)` — the broken-stack case that would
+/// otherwise make every chat silently ungrounded), and a panic in the blocking task (`Err(JoinError)`).
+/// Both failure cases yield an empty chunk list — chat still falls back to answering ungrounded rather than
+/// erroring the turn — paired with a note the caller logs. Pure, so the split is unit-tested without a live
+/// retrieval stack.
+fn interpret_grounding(
+    task: std::result::Result<Result<Vec<RetrievedChunk>>, tokio::task::JoinError>,
+) -> (Vec<RetrievedChunk>, Option<String>) {
     match task {
-        Ok(Ok(chunks)) => chunks,
-        _ => Vec::new(),
+        Ok(Ok(chunks)) => (chunks, None),
+        Ok(Err(e)) => (
+            Vec::new(),
+            Some(format!("retrieval failed; answering ungrounded: {e}")),
+        ),
+        Err(e) => (
+            Vec::new(),
+            Some(format!(
+                "grounding task panicked; answering ungrounded: {e}"
+            )),
+        ),
     }
 }
 
@@ -6348,6 +6377,44 @@ mod tests {
             derive_title(&emoji).chars().filter(|c| *c == '🌍').count(),
             80
         );
+    }
+
+    #[test]
+    fn interpret_grounding_separates_success_from_a_silent_failure() {
+        // F-37: a broken retrieval stack must surface a note instead of collapsing into a silent empty list.
+        let chunk = RetrievedChunk {
+            chunk_id: 1,
+            document_id: 2,
+            title: "Doc".into(),
+            source_path: None,
+            vault_path: "vault/doc.md".into(),
+            heading: None,
+            content: "body".into(),
+            ordinal: 0,
+            source_type: None,
+            chat_turn_id: None,
+            chunk_at: None,
+            conversation_id: None,
+        };
+        // Clean success: the chunks flow through and nothing is logged.
+        let (chunks, note) = interpret_grounding(Ok(Ok(vec![chunk])));
+        assert_eq!(chunks.len(), 1);
+        assert!(note.is_none(), "a clean result logs nothing");
+
+        // Inner error (the broken-stack case): still empty so chat answers ungrounded, but NOT silent.
+        let (chunks, note) =
+            interpret_grounding(Ok(Err(Error::Other("vec0 dimension mismatch".into()))));
+        assert!(
+            chunks.is_empty(),
+            "a retrieval error still falls back to ungrounded (contract preserved)"
+        );
+        let note = note.expect("an inner error must surface a note, not vanish");
+        assert!(
+            note.contains("vec0 dimension mismatch"),
+            "the note carries the underlying cause for the log"
+        );
+        // The `Err(JoinError)` (panic) arm shares this code path; a JoinError can only be minted by a real
+        // panicking task, so it is exercised at runtime rather than synthesised here.
     }
 
     #[test]

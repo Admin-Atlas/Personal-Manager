@@ -76,6 +76,9 @@ pub(crate) enum Outcome {
 /// extension will advance to. Returned by [`pairs_to_summarise`]; `None` when the tail is within the window.
 struct SummaryPlan {
     existing_summary: Option<String>,
+    /// The cursor this span was planned from — passed back to [`apply_extension`] as the compare-and-swap
+    /// baseline so a concurrent fold that moved the cursor is detected instead of double-summarised (F-36).
+    prev_cursor: Option<i64>,
     segment: Vec<chat::TurnPair>,
     new_cursor: i64,
 }
@@ -111,6 +114,7 @@ fn pairs_to_summarise(conn: &Connection, conversation_id: i64) -> Result<Option<
         .turn_id;
     Ok(Some(SummaryPlan {
         existing_summary,
+        prev_cursor: cursor,
         new_cursor,
         segment,
     }))
@@ -159,22 +163,40 @@ fn render_summary_request(existing: Option<&str>, segment: &[chat::TurnPair]) ->
 /// transaction so the append is consistent) and advance the cursor to `new_cursor` — together, so a crash
 /// between the model call and this write simply re-summarises the same span next run (idempotent; never a
 /// double-advance). An empty `new_segment` (the model returned nothing usable) still advances the cursor so
-/// the handled span is not reconsidered forever. Pure DB logic — unit-tested without the model.
+/// the handled span is not reconsidered forever.
+///
+/// Compare-and-swap on the cursor (F-36): the caller passes `expected_cursor` — the
+/// `summary_covers_up_to_turn_id` it planned this span from — and we re-read the *current* cursor inside the
+/// transaction (the store is one mutex'd connection, so this tx holds the DB lock any racing writer needs).
+/// If they differ, another summary pass folded this span while our off-lock model call was in flight;
+/// appending now would double-summarise the overlap into the append-only summary and could even roll the
+/// cursor backward. In that case we make NO change and return `Ok(false)` so the caller re-plans from the
+/// advanced cursor. On a match we append + advance and return `Ok(true)`. Pure DB logic — unit-tested
+/// without the model.
 fn apply_extension(
     conn: &mut Connection,
     conversation_id: i64,
+    expected_cursor: Option<i64>,
     new_segment: &str,
     new_cursor: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let tx = conn.transaction()?;
-    let existing: Option<String> = tx
+    // Read summary AND the live cursor together, inside the tx.
+    let Some((existing, current_cursor)) = tx
         .query_row(
-            "SELECT summary FROM chat_sessions WHERE conversation_id = ?1",
+            "SELECT summary, summary_covers_up_to_turn_id FROM chat_sessions WHERE conversation_id = ?1",
             params![conversation_id],
-            |r| r.get(0),
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
         )
         .optional()?
-        .flatten();
+    else {
+        // The session row vanished (a delete raced this pass). Nothing to extend; not an error.
+        return Ok(false);
+    };
+    if current_cursor != expected_cursor {
+        // A concurrent pass advanced the cursor under us — skip cleanly (tx rolls back on drop).
+        return Ok(false);
+    }
     let segment = new_segment.trim();
     let combined = match existing.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(prior) if !segment.is_empty() => Some(format!("{prior}\n{segment}")),
@@ -188,7 +210,7 @@ fn apply_extension(
         params![combined, new_cursor, conversation_id],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// The current rolling summary for a conversation, if one exists. The read context assembly (PR2) consumes
@@ -238,16 +260,20 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
         let messages = render_summary_request(plan.existing_summary.as_deref(), &plan.segment);
         let completion = openrouter::complete(api_key.expose(), &models, &messages, false).await?;
 
-        // 4. Short write lock: append + advance the cursor together, and log the spend.
-        {
+        // 4. Short write lock: append + advance the cursor together (compare-and-swap on the cursor so a
+        //    racing compress can't double-fold the same span — F-36), and log the spend.
+        let applied = {
             let state = app.state::<AppState>();
             let mut conn = state.conn()?;
-            apply_extension(
+            let applied = apply_extension(
                 &mut conn,
                 conversation_id,
+                plan.prev_cursor,
                 &completion.text,
                 plan.new_cursor,
             )?;
+            // Log the spend regardless — the model call was made and billed even if a concurrent pass beat
+            // us to the write.
             let model = completion
                 .model
                 .as_deref()
@@ -262,8 +288,13 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
                     completion.usage.cost
                 ],
             );
+            applied
+        };
+        if applied {
+            total += plan.segment.len();
         }
-        total += plan.segment.len();
+        // If `!applied`, a concurrent pass advanced the cursor while our model call was in flight; the loop
+        // re-plans from the now-advanced cursor (forward progress guaranteed) on its next turn.
     }
     if total == 0 {
         Ok(Outcome::UpToDate)
@@ -374,32 +405,51 @@ pub(crate) async fn compress_now(
     let reclaimed_est =
         (context_budget::est_tokens(&raw_folded) - context_budget::est_tokens(&bullets)).max(0);
 
-    // 4. Short write lock: append + advance the cursor, optimistically drop the meter, log the spend.
-    {
+    // 4. Short write lock: append + advance the cursor (compare-and-swap on the cursor — F-36), optimistically
+    //    drop the meter, log the spend. Only when the swap succeeds: if a background extend folded this span
+    //    while our model call was in flight it already advanced the cursor, and appending our bullets now
+    //    would double-summarise the overlap.
+    let applied = {
         let state = app.state::<AppState>();
         let mut conn = state.conn()?;
-        apply_extension(&mut conn, conversation_id, &bullets, new_cursor)?;
-        if let Some(old) = snapshot.prev_prompt_tokens {
-            let optimistic = (old - reclaimed_est).max(0);
+        let applied = apply_extension(
+            &mut conn,
+            conversation_id,
+            snapshot.prev_cursor,
+            &bullets,
+            new_cursor,
+        )?;
+        if applied {
+            if let Some(old) = snapshot.prev_prompt_tokens {
+                let optimistic = (old - reclaimed_est).max(0);
+                let _ = conn.execute(
+                    "UPDATE chat_sessions SET last_prompt_tokens = ?1 WHERE conversation_id = ?2",
+                    params![optimistic, conversation_id],
+                );
+            }
+            let model = completion
+                .model
+                .as_deref()
+                .or_else(|| models.first().map(String::as_str));
             let _ = conn.execute(
-                "UPDATE chat_sessions SET last_prompt_tokens = ?1 WHERE conversation_id = ?2",
-                params![optimistic, conversation_id],
+                "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
+                 VALUES (?1, 'chat_compress', ?2, ?3, ?4)",
+                params![
+                    model,
+                    completion.usage.prompt_tokens,
+                    completion.usage.completion_tokens,
+                    completion.usage.cost
+                ],
             );
         }
-        let model = completion
-            .model
-            .as_deref()
-            .or_else(|| models.first().map(String::as_str));
-        let _ = conn.execute(
-            "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
-             VALUES (?1, 'chat_compress', ?2, ?3, ?4)",
-            params![
-                model,
-                completion.usage.prompt_tokens,
-                completion.usage.completion_tokens,
-                completion.usage.cost
-            ],
-        );
+        applied
+    };
+    if !applied {
+        // A background summary pass folded this span first (F-36). Nothing to reclaim now; report "nothing
+        // folded" so the alert stays as-is and the user can retry — the retry re-plans against the
+        // freshly-advanced cursor. We deliberately do NOT return a CompressResult carrying a now-stale Undo
+        // snapshot.
+        return Ok(None);
     }
 
     Ok(Some(CompressResult {
@@ -642,7 +692,17 @@ mod tests {
         // First fold: a None summary becomes the first segment, cursor advances.
         let plan = pairs_to_summarise(&conn, conv).unwrap().unwrap();
         let cursor1 = plan.new_cursor;
-        apply_extension(&mut conn, conv, "- Chose Atlas as the org name.", cursor1).unwrap();
+        assert!(
+            apply_extension(
+                &mut conn,
+                conv,
+                plan.prev_cursor,
+                "- Chose Atlas as the org name.",
+                cursor1
+            )
+            .unwrap(),
+            "cursor matches the plan ⇒ the fold applies"
+        );
         let (summary, cursor): (Option<String>, Option<i64>) = conn
             .query_row(
                 "SELECT summary, summary_covers_up_to_turn_id FROM chat_sessions WHERE conversation_id = ?1",
@@ -660,7 +720,15 @@ mod tests {
         );
 
         // A second fold APPENDS to the existing summary (never rewrites it) and the old line is preserved.
-        apply_extension(&mut conn, conv, "- Deadline is 15 August.", cursor1 + 100).unwrap();
+        // The cursor now sits at `cursor1`, so that is the compare-and-swap baseline.
+        assert!(apply_extension(
+            &mut conn,
+            conv,
+            Some(cursor1),
+            "- Deadline is 15 August.",
+            cursor1 + 100
+        )
+        .unwrap());
         let summary: String = conn
             .query_row(
                 "SELECT summary FROM chat_sessions WHERE conversation_id = ?1",
@@ -681,7 +749,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open_db(dir.path());
         let conv = session_with_pairs(&conn, Some("- Existing line."), Some(0), 0);
-        apply_extension(&mut conn, conv, "   \n  ", 42).unwrap();
+        assert!(apply_extension(&mut conn, conv, Some(0), "   \n  ", 42).unwrap());
         let (summary, cursor): (Option<String>, Option<i64>) = conn
             .query_row(
                 "SELECT summary, summary_covers_up_to_turn_id FROM chat_sessions WHERE conversation_id = ?1",
@@ -695,6 +763,63 @@ mod tests {
             "summary intact"
         );
         assert_eq!(cursor, Some(42), "cursor advanced past the handled span");
+    }
+
+    #[test]
+    fn apply_extension_skips_when_the_cursor_moved_underneath() {
+        // F-36: compress and the eager extend both read the cursor, then make an off-lock model call, then
+        // write. If one advanced the cursor while the other's call was in flight, the late writer must NOT
+        // append its (now-overlapping) segment into the append-only summary. The cursor mismatch catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        // A session that has already been summarised up to turn 10.
+        let conv = session_with_pairs(&conn, Some("- Original."), Some(10), 0);
+
+        // A late writer planned this span from an OLDER cursor (5) — the state moved on since it read.
+        let applied = apply_extension(
+            &mut conn,
+            conv,
+            Some(5),
+            "- Duplicate of an already-folded span.",
+            8,
+        )
+        .unwrap();
+        assert!(!applied, "stale baseline ⇒ no write");
+        let (summary, cursor): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT summary, summary_covers_up_to_turn_id FROM chat_sessions WHERE conversation_id = ?1",
+                params![conv],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            summary.as_deref(),
+            Some("- Original."),
+            "the summary is untouched — no double-fold"
+        );
+        assert_eq!(
+            cursor,
+            Some(10),
+            "and the cursor did not roll backward to 8"
+        );
+
+        // Positive control: a writer whose baseline matches the live cursor applies normally.
+        assert!(
+            apply_extension(&mut conn, conv, Some(10), "- A genuinely new decision.", 14).unwrap(),
+            "matching baseline ⇒ the fold applies"
+        );
+        let (summary, cursor): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT summary, summary_covers_up_to_turn_id FROM chat_sessions WHERE conversation_id = ?1",
+                params![conv],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            summary.as_deref(),
+            Some("- Original.\n- A genuinely new decision.")
+        );
+        assert_eq!(cursor, Some(14));
     }
 
     #[test]
