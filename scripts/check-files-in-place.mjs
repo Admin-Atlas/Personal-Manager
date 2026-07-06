@@ -105,6 +105,7 @@ const ALLOWED_ROOT = new Set([
   "tsconfig.json",
   "tsconfig.node.json",
   "vite.config.ts",
+  "vitest.config.ts", // T-07: the frontend test harness config (kept separate from vite.config.ts)
 ]);
 const rootEntries = new Set(tracked.map((f) => f.split("/")[0]));
 for (const entry of [...rootEntries].sort()) {

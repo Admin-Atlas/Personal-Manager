@@ -1,7 +1,7 @@
 {
   "name": "pm",
   "private": true,
-  "version": "2.92.22-alpha",
+  "version": "2.92.23-alpha",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "scripts": {
@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "lint": "eslint .",
-    "format": "prettier --check ."
+    "format": "prettier --check .",
+    "test": "vitest run"
   },
   "dependencies": {
     "@fontsource/hanken-grotesk": "^5.2.8",
@@ -47,6 +48,7 @@
     "tailwindcss": "^4.1.0",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.62.1",
-    "vite": "^8.1.3"
+    "vite": "^8.1.3",
+    "vitest": "^4.1.9"
   }
 }

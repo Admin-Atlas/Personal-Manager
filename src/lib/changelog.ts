@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.23-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood tidying: PM now runs an automated test safety-net over the small pieces of its interface that format your dates and clean up displayed text, so future changes to those can't quietly break them.",
+    ],
+  },
+  {
     version: "2.92.22-alpha",
     date: "2026-07-06",
     highlights: [

@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "2.92.22-alpha"
+version = "2.92.23-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
