@@ -46,8 +46,8 @@ repos:
         pass_filenames: false
         always_run: true
       - id: version-lockstep
-        name: version lockstep + changelog
-        entry: just version
+        name: version lockstep + bump (vs origin/main) + changelog
+        entry: just version-local
         language: system
         pass_filenames: false
         always_run: true

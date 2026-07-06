@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.34-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood tidying (developer-side only). PM's commit-time checks now also catch a forgotten version bump, its secret scanner now sweeps the whole project history rather than just the current files, and there's a new command for measuring test coverage. Nothing you'll see changes.",
+    ],
+  },
+  {
     version: "2.92.33-alpha",
     date: "2026-07-06",
     highlights: [

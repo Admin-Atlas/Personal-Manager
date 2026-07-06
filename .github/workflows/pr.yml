@@ -143,12 +143,15 @@ jobs:
       - name: Sidecar unit tests
         run: just sidecar-test
 
-  # --- secrets: gitleaks over the working tree ----------------------------
+  # --- secrets: gitleaks over the working tree AND git history ------------
   secrets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # Full history so `just gitleaks-history` can sweep every commit, not just
+          # the checked-out tree (a secret committed then deleted lingers in history).
+          fetch-depth: 0
           persist-credentials: false
       - name: Install gitleaks
         # The CLI binary (not the Action) — keeps the check identical to local
@@ -158,8 +161,10 @@ jobs:
             | tar -xz -C /usr/local/bin gitleaks
           gitleaks version
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
-      - name: Scan for secrets
+      - name: Scan the working tree for secrets
         run: just gitleaks
+      - name: Scan git history for secrets
+        run: just gitleaks-history
 
   # --- dependencies: CVEs + licences across all three ecosystems ----------
   dependencies:

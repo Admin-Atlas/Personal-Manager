@@ -23,7 +23,7 @@ default:
 check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
-check: check-fast frontend-test clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks zizmor
+check: check-fast frontend-test clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
 
 # Auto-apply every formatter (the writing counterpart to the --check recipes).
 fmt:
@@ -76,6 +76,11 @@ cargo-check: fetch-python
 rust-test: fetch-python
     cargo test --manifest-path {{manifest}}
 
+# Local-only test coverage for spotting blind spots (needs `cargo install cargo-llvm-cov`).
+# Deliberately NOT in `check` and never gated on a percentage — visibility, not a bar (T1-11).
+coverage: fetch-python
+    cargo llvm-cov --manifest-path {{manifest}}
+
 # --- sidecar (Python) -----------------------------------------------------
 
 ruff:
@@ -104,9 +109,17 @@ pip-audit:
 npm-audit:
     npm audit --audit-level=high
 
-# Secret scan of the working tree (config: .gitleaks.toml). CI scans the PR diff.
+# Secret scan of the WHOLE working tree — including git-ignored files, so it's the
+# sole net for a secret in an ignored path (config: .gitleaks.toml). CI runs this
+# same recipe over its checkout — it does NOT scan a diff (T1-12).
 gitleaks:
     gitleaks dir . --config .gitleaks.toml --redact --no-banner
+
+# Secret scan of git HISTORY (every commit) — `dir` mode above misses a secret that
+# was committed and later deleted, which lingers in history on a public repo. Fast
+# (the whole history is small); CI needs a full-depth checkout to see every commit (T1-12).
+gitleaks-history:
+    gitleaks git . --config .gitleaks.toml --redact --no-banner
 
 # Workflow-security audit (the pull_request_target / fork-secret class).
 zizmor:
@@ -117,6 +130,17 @@ zizmor:
 # Version lockstep + changelog; pass --base <ref> to require a bump, --tag <vX.Y.Z> to match a tag.
 version *args:
     node scripts/check-version-lockstep.mjs {{args}}
+
+# Pre-commit's version check: try the bumped-vs-base check against origin/main so a
+# forgotten bump is caught locally (not just in CI), but fall back to lockstep-only
+# with a warning when the ref isn't fetched — an offline commit isn't blocked (T1-10).
+version-local:
+    @if git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then \
+        node scripts/check-version-lockstep.mjs --base origin/main; \
+    else \
+        echo "version-local: origin/main not fetched — lockstep only (bump-vs-base deferred to CI)"; \
+        node scripts/check-version-lockstep.mjs; \
+    fi
 
 files:
     node scripts/check-files-in-place.mjs
