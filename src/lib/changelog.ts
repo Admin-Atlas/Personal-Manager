@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.29-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood release-safety tidying. PM's automated checks now compile the Windows build on every change, not only when a release is cut — so a Windows-only glitch is caught early instead of slipping into an update. And the release process now double-checks that each update was signed with the exact key your installed app trusts, so a signing mix-up can never quietly ship you an update your PM would refuse.",
+    ],
+  },
+  {
     version: "2.92.28-alpha",
     date: "2026-07-06",
     highlights: [

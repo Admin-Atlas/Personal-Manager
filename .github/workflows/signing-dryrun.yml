@@ -1,0 +1,48 @@
+name: Signing dry-run
+
+# A ~2-minute MANUAL check that the updater signing secret still matches the public
+# key pinned in tauri.conf.json (and therefore baked into every shipped desktop).
+# Run it after rotating TAURI_SIGNING_PRIVATE_KEY / its password, or after touching
+# the conf pubkey. It signs a throwaway file with the REAL key and asserts the
+# resulting signature's key-id equals the shipped pubkey's — the same check the
+# release publish job runs on the real installers (scripts/verify-updater-signatures.mjs),
+# but exercised WITHOUT cutting a release. This is the live harness for T-03: the PR
+# gate can't see the signing secret (by design — pr.yml is `pull_request`, never
+# `pull_request_target`), so a rotated/wrong key can only be caught here or at release.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      # The Tauri CLI reads the key + password from these env vars (see `tauri signer
+      # sign --help`), so nothing secret is passed on the command line. It writes
+      # dryrun/probe.bin.sig next to the file.
+      - name: Sign a throwaway file with the updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          mkdir -p dryrun
+          printf 'pm-signing-dry-run' > dryrun/probe.bin
+          npx tauri signer sign dryrun/probe.bin
+
+      - name: Signature was made by the key the desktops pin
+        env:
+          SIG_DIR: dryrun
+        run: node scripts/verify-updater-signatures.mjs
