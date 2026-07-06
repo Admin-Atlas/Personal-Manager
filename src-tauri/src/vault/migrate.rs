@@ -86,9 +86,21 @@ impl MigrationPlan {
 
 // --- recovery journal -------------------------------------------------------------
 
-/// Filename of the migration journal, written in the vault root while a migration is in
-/// flight so an interrupted one can be detected (and repaired) on the next launch.
+/// Filename of the migration journal. It lives in the per-profile **data dir** (next to the
+/// pointer), NOT inside the vault, so boot can always find it even while a migration is
+/// relocating the vault — an interrupted migration is detected (and repaired) on the next launch.
 pub const JOURNAL_FILENAME: &str = "vault.migration.json";
+
+/// Folder under the data dir holding the full, DECRYPTABLE pre-migration backup (DB snapshot +
+/// Markdown + meta) taken before the destructive in-place rekey — the rollback point. Removed once
+/// that phase commits, on rollback, and by a data wipe (`wipe.rs`).
+pub const MIGRATION_BACKUP_DIR: &str = "vault-migration-backup";
+
+/// The pre-migration backup folder for a given profile data dir. One expression, reused by the
+/// migration itself and by the wipe that must clear it (B1-4).
+pub fn backup_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(MIGRATION_BACKUP_DIR)
+}
 
 /// The ordered stages of a migration. The journal records the stage currently in
 /// progress; the metadata/pointer/keychain are flipped only after `Finalizing`, so a
@@ -126,13 +138,13 @@ pub struct MigrationJournal {
     pub target_location: Option<PathBuf>,
 }
 
-fn journal_path(vault_root: &Path) -> PathBuf {
-    vault_root.join(JOURNAL_FILENAME)
+fn journal_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(JOURNAL_FILENAME)
 }
 
 /// Read the migration journal if one is present (a migration was interrupted).
-pub fn read_journal(vault_root: &Path) -> Result<Option<MigrationJournal>> {
-    match std::fs::read(journal_path(vault_root)) {
+pub fn read_journal(data_dir: &Path) -> Result<Option<MigrationJournal>> {
+    match std::fs::read(journal_path(data_dir)) {
         Ok(bytes) => {
             let journal = serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Other(format!("{JOURNAL_FILENAME} is unreadable: {e}")))?;
@@ -145,9 +157,9 @@ pub fn read_journal(vault_root: &Path) -> Result<Option<MigrationJournal>> {
 
 /// Write the migration journal atomically (temp file + rename), so the journal itself
 /// can never be observed half-written.
-pub fn write_journal(vault_root: &Path, journal: &MigrationJournal) -> Result<()> {
-    std::fs::create_dir_all(vault_root)?;
-    let path = journal_path(vault_root);
+pub fn write_journal(data_dir: &Path, journal: &MigrationJournal) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let path = journal_path(data_dir);
     let json = serde_json::to_vec_pretty(journal)
         .map_err(|e| Error::Other(format!("could not encode {JOURNAL_FILENAME}: {e}")))?;
     let tmp = path.with_extension("json.tmp");
@@ -157,8 +169,8 @@ pub fn write_journal(vault_root: &Path, journal: &MigrationJournal) -> Result<()
 }
 
 /// Remove the journal once a migration finishes (or after a successful repair).
-pub fn clear_journal(vault_root: &Path) -> Result<()> {
-    match std::fs::remove_file(journal_path(vault_root)) {
+pub fn clear_journal(data_dir: &Path) -> Result<()> {
+    match std::fs::remove_file(journal_path(data_dir)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -357,7 +369,7 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<()> {
             let conn = state.conn()?;
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         }
-        let backup = data_dir.join("vault-migration-backup");
+        let backup = backup_dir(&data_dir);
         let _ = std::fs::remove_dir_all(&backup);
         std::fs::create_dir_all(&backup)?;
         {
@@ -620,6 +632,46 @@ mod tests {
         assert!(read_journal(dir.path()).unwrap().is_none());
         // Clearing again is a no-op, not an error.
         clear_journal(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn clearing_the_journal_at_the_wrong_dir_strands_it() {
+        // B1-4 regression: the journal lives at the DATA DIR, not the vault root. For a relocated
+        // vault the two differ, so clearing it at the vault root (the old `wipe` bug) is a silent
+        // no-op that leaves a stale journal to drive `recover()` on the next launch. This pins the
+        // path-sensitivity the wipe fix relies on: only clearing at the data dir removes it.
+        let data_dir = tempfile::tempdir().unwrap();
+        let vault_root = tempfile::tempdir().unwrap(); // a relocated vault's root ≠ the data dir
+        let j = MigrationJournal {
+            stage: MigrationStage::Rekeying,
+            started_at: "2026-06-24T00:00:00Z".into(),
+            from_root: vault_root.path().to_path_buf(),
+            backup_dir: Some(backup_dir(data_dir.path())),
+            target_location: None,
+        };
+        write_journal(data_dir.path(), &j).unwrap();
+
+        clear_journal(vault_root.path()).unwrap(); // the old bug: clears the wrong directory
+        assert!(
+            read_journal(data_dir.path()).unwrap().is_some(),
+            "clearing at the vault root leaves the data-dir journal behind"
+        );
+
+        clear_journal(data_dir.path()).unwrap(); // the fix: clear at the data dir
+        assert!(
+            read_journal(data_dir.path()).unwrap().is_none(),
+            "clearing at the data dir removes the journal"
+        );
+    }
+
+    #[test]
+    fn backup_dir_hangs_off_the_data_dir() {
+        // The backup folder is a single reused expression under the data dir (migration + wipe).
+        let data_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            backup_dir(data_dir.path()),
+            data_dir.path().join(MIGRATION_BACKUP_DIR)
+        );
     }
 
     #[test]

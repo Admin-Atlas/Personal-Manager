@@ -438,15 +438,18 @@ fn render_chat_frontmatter(
     )
 }
 
-/// Mirror a chat's re-evaluated classification (card F append re-eval) back into its vault front-matter, so
-/// the file and the `documents` row stay in agreement. A Rebuild reads the file as truth (card G re-embeds
-/// each chat `.md`), so a DB-only re-eval would otherwise be silently reverted on the next Rebuild. Patches
-/// ONLY the `importance:` and `reviewed:` scalars within the leading front-matter fence — the chat-identity
-/// fields (`source_type`, `chat_*`), the other org fields, and the turn body are left byte-for-byte intact.
-/// Best-effort by contract: the `documents` row is already authoritative; this only keeps the file in step.
+/// Mirror a chat's re-evaluated classification (card F append re-eval) — and, when the title is
+/// regenerated or the chat is renamed (B5-6), its `title:` — back into the vault front-matter, so the
+/// file and the `documents` row stay in agreement. A Rebuild reads the file as truth (card G re-embeds
+/// each chat `.md`), so a DB-only change would otherwise be silently reverted on the next Rebuild.
+/// Patches ONLY the `title:`/`importance:`/`reviewed:` scalars within the leading front-matter fence
+/// (and `title:` only when `title` is `Some`) — the chat-identity fields (`source_type`, `chat_*`),
+/// the other org fields, and the turn body are left byte-for-byte intact. Best-effort by contract:
+/// the `documents` row is already authoritative; this only keeps the file in step.
 pub(crate) fn rewrite_chat_classification(
     cipher: &MarkdownCipher,
     vault_file: &Path,
+    title: Option<&str>,
     importance: Option<&str>,
     reviewed: bool,
 ) -> Result<()> {
@@ -460,6 +463,9 @@ pub(crate) fn rewrite_chat_classification(
         if key == "---" {
             fence = if fence == 0 { 1 } else { 2 };
             out.push_str(line);
+        } else if fence == 1 && title.is_some() && key.starts_with("title:") {
+            // `title:` is YAML-quoted at birth (`render_chat_frontmatter`); quote it the same way here.
+            out.push_str(&format!("title: {}\n", ingest::yaml_quote(title.unwrap())));
         } else if fence == 1 && key.starts_with("importance:") {
             out.push_str(&format!("importance: {importance_val}\n"));
         } else if fence == 1 && key.starts_with("reviewed:") {
@@ -882,7 +888,7 @@ mod tests {
 
         // Re-file it (e.g. an already-filed general chat that got archived, now re-opened): importance set,
         // reviewed flipped.
-        rewrite_chat_classification(&cipher, &file, Some("archive"), true).unwrap();
+        rewrite_chat_classification(&cipher, &file, None, Some("archive"), true).unwrap();
         let content = cipher.read(&file).unwrap();
         let (fields, body) =
             ingest::parse_frontmatter(&content).expect("front-matter still parses");
@@ -891,6 +897,8 @@ mod tests {
             Some("archive")
         );
         assert_eq!(fields.get("reviewed").map(String::as_str), Some("true"));
+        // `title: None` leaves the title scalar exactly as it was.
+        assert_eq!(fields.get("title").map(String::as_str), Some("Hi"));
         // Identity + body untouched.
         assert_eq!(fields.get("source_type").map(String::as_str), Some("chat"));
         assert_eq!(
@@ -905,11 +913,56 @@ mod tests {
         assert!(body.contains("**You:** hi") && body.contains("**PM:** hello"));
 
         // Clearing importance renders `null`, and the turn body is still intact.
-        rewrite_chat_classification(&cipher, &file, None, false).unwrap();
+        rewrite_chat_classification(&cipher, &file, None, None, false).unwrap();
         let content = cipher.read(&file).unwrap();
         let (fields, _) = ingest::parse_frontmatter(&content).expect("parses");
         assert_eq!(fields.get("importance").map(String::as_str), Some("null"));
         assert_eq!(fields.get("reviewed").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn rewrite_chat_classification_patches_the_title_scalar() {
+        // B5-6: a generated/renamed title is mirrored into the vault front-matter so a Rebuild (which
+        // reads the file as truth) keeps it — and a colon-bearing title must be YAML-quoted, or the
+        // front-matter would no longer parse.
+        let cipher = MarkdownCipher::plaintext("v");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("chat-28-06-2026-abc.md");
+        let original = "---\n\
+             title: \"first message placeholder…\"\n\
+             content_hash: chat:7\n\
+             source_type: chat\n\
+             chat_conversation_id: 7\n\
+             chat_scope: general\n\
+             chat_source_id: chat:7\n\
+             project: Unsorted\n\
+             tags: []\n\
+             importance: null\n\
+             reviewed: false\n\
+             created_at: 2026-06-28T10:00:00.000Z\n\
+             ingested_at: 2026-06-28T10:00:00.000Z\n\
+             last_activity: 2026-06-28T10:00:00.000Z\n\
+             ---\n\n\
+             <!-- turn 2 · 2026-06-28 10:00 -->\n**You:** hi\n\n**PM:** hello\n";
+        cipher.write_to(&file, original).unwrap();
+
+        // A colon in the title exercises the yaml-quote path.
+        rewrite_chat_classification(&cipher, &file, Some("Q3: budget review"), None, false)
+            .unwrap();
+        let content = cipher.read(&file).unwrap();
+        let (fields, body) =
+            ingest::parse_frontmatter(&content).expect("front-matter still parses");
+        assert_eq!(
+            fields.get("title").map(String::as_str),
+            Some("Q3: budget review"),
+            "the new title lands and survives a re-parse (was YAML-quoted)"
+        );
+        // Everything else is byte-preserved: org scalars, identity, and the turn body.
+        assert_eq!(fields.get("importance").map(String::as_str), Some("null"));
+        assert_eq!(fields.get("reviewed").map(String::as_str), Some("false"));
+        assert_eq!(fields.get("source_type").map(String::as_str), Some("chat"));
+        assert_eq!(fields.get("project").map(String::as_str), Some("Unsorted"));
+        assert!(body.contains("**You:** hi") && body.contains("**PM:** hello"));
     }
 
     /// Card F routing: a general chat is born unsorted/unreviewed (heads to the review queue), a project

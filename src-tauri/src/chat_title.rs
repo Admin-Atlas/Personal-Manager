@@ -212,6 +212,14 @@ pub(crate) async fn generate_title(app: &AppHandle, conversation_id: i64) -> Res
         }
         applied
     };
+    // Mirror the generated title onto the linked chat document + its vault front-matter (B5-6), so the
+    // Documents list, citations, and a later Rebuild track it instead of the first-message placeholder.
+    // Off the write lock above; a no-op until the chat is indexed. Only when the title actually landed —
+    // if a rename raced in first (`applied == false`), that path did its own mirror.
+    if applied {
+        let state = app.state::<AppState>();
+        crate::chat_index::mirror_title(state.inner(), conversation_id, &title)?;
+    }
     Ok(applied)
 }
 
