@@ -60,7 +60,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
   }, [email]);
 
   useEffect(() => {
-    load();
+    void load();
   }, [load]);
 
   if (loading || scope == null) {

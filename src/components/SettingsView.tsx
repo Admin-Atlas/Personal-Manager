@@ -173,7 +173,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   }
 
   useEffect(() => {
-    (async () => {
+    void (async () => {
       try {
         setKeyAlreadySet(await hasOpenRouterKey());
         setBgKeyAlreadySet(await hasOpenRouterBackgroundKey());

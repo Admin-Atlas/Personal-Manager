@@ -90,7 +90,7 @@ export function CommandPalette({
   useEffect(() => {
     inputRef.current?.focus();
     let cancelled = false;
-    (async () => {
+    void (async () => {
       const [p, d, c] = await Promise.all([
         listProjectOverviews().catch(() => [] as ProjectOverview[]),
         listDocuments().catch(() => [] as Document[]),

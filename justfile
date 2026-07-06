@@ -41,8 +41,13 @@ prettier:
 eslint:
     npx eslint .
 
+# Type-check both TS projects: the app (src) and the Node-side config (vite.config.ts,
+# via the tsconfig.node.json project reference) — plain `tsc` only checks the root
+# project, so vite.config.ts went unchecked (T1-9). Two `-p` passes, not `tsc -b`:
+# build mode requires composite refs to emit, which --noEmit forbids (TS6310).
 tsc:
     npx tsc --noEmit
+    npx tsc -p tsconfig.node.json --noEmit
 
 # Frontend unit tests (vitest, scoped to src/lib/** — the pure invariant-bearing modules the audit
 # flagged as guarded by nothing: date formatting, the markdown sanitize allowlist) (T-07).

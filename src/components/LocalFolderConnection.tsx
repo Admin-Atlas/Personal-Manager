@@ -60,7 +60,7 @@ export function LocalFolderConnection() {
     }
   }, [setError]);
   useEffect(() => {
-    refreshRef.current = refresh;
+    refreshRef.current = () => void refresh();
   }, [refresh]);
 
   useEffect(() => {

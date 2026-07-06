@@ -42,12 +42,21 @@ export default tseslint.config(
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
-  // Frontend (browser).
+  // Frontend (browser). Type-aware for the one bug class tsc can't catch: dropped
+  // promises. Every backend call is an async `invoke` through src/lib/ipc.ts, so a
+  // forgotten await/.catch silently swallows an IPC error (and under StrictMode
+  // doubles a fire-and-forget effect). `projectService` turns on type info just for
+  // src/**; the rest of the type-aware set stays off — this is the promise floor,
+  // not full recommendedTypeChecked (T-08).
   {
     files: ["src/**/*.{ts,tsx}"],
     languageOptions: {
       ecmaVersion: 2022,
       globals: globals.browser,
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
     },
     plugins: {
       "react-hooks": reactHooks,
@@ -57,6 +66,11 @@ export default tseslint.config(
       "react-hooks/rules-of-hooks": "error",
       "react-hooks/exhaustive-deps": "warn",
       "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
+      "@typescript-eslint/no-floating-promises": "error",
+      "@typescript-eslint/no-misused-promises": [
+        "error",
+        { checksVoidReturn: { attributes: false } },
+      ],
     },
   },
   // Node tooling (build/check scripts, config files).

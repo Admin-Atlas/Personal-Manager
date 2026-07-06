@@ -46,7 +46,7 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
   }, []);
 
   useEffect(() => {
-    refresh();
+    void refresh();
   }, [refresh]);
 
   async function run(label: string, fn: () => Promise<void>) {
