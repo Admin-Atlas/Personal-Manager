@@ -49,6 +49,7 @@ import type {
   RestoreSummary,
 } from "../lib/types";
 import { formatDateTime } from "../lib/format";
+import { isOpaquePhase, describeFailures } from "../lib/backup";
 import { Button, Collapsible, Input } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 import { useDepth } from "../theme";
@@ -93,6 +94,9 @@ export function BackupSettings() {
   const [fraction, setFraction] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // Non-blocking "backed up, but some destinations failed" banner (F-22): distinct from `error`
+  // (the whole op failed) and `message` (clean success). Set from a finished run's report.
+  const [warning, setWarning] = useState<string | null>(null);
 
   // The passphrase that locks every backup (manual saves read it directly; "Remember on this
   // device" additionally stows it in the keychain for unattended scheduled runs).
@@ -216,6 +220,9 @@ export function BackupSettings() {
         setPhase(s.phase);
         setFraction(s.fraction);
         if (s.last_error) setError(s.last_error);
+        // Re-surface a partial-failure banner from the last finished run (F-22), so navigating
+        // away and back doesn't lose "backed up, but Google Drive failed".
+        if (s.last_report) setWarning(describeFailures(s.last_report.failed_destinations));
         // Re-offer the "switch to the restored vault" button after the panel was closed and
         // reopened: the backend still holds the staged restore (key + summary) for this session,
         // so we don't make the user redo the whole restore just because the UI unmounted.
@@ -228,10 +235,14 @@ export function BackupSettings() {
         setRunning(true);
         setPhase(e.phase);
         setFraction(e.fraction);
+        setWarning(null); // a fresh run started — drop any stale partial-failure banner
       } else if (e.type === "finished") {
         setRunning(false);
         setPhase(null);
         setFraction(1);
+        // F-22: some destinations may have failed while others succeeded (a partial success the
+        // backend still reports as "finished"). Surface them non-blockingly; null clears cleanly.
+        setWarning(describeFailures(e.report.failed_destinations));
       } else if (e.type === "failed") {
         setRunning(false);
         setPhase(null);
@@ -291,6 +302,7 @@ export function BackupSettings() {
   async function doBackup() {
     setError(null);
     setMessage(null);
+    setWarning(null); // a fresh backup supersedes any prior run's partial-failure notice
     let dest: string | null;
     try {
       dest = await saveFileDialog({
@@ -575,7 +587,10 @@ export function BackupSettings() {
         <div className="mt-3">
           <IngestProgress
             processed={Math.round(fraction * 100)}
-            total={100}
+            // F-45: the upload/download fraction is a coarse per-destination fan-out step (0 then 1
+            // for a single target), not real byte-progress — so shimmer (total=null) instead of a
+            // bar frozen at 0% through a minutes-long transfer.
+            total={isOpaquePhase(phase) ? null : 100}
             mode="percent"
             label={phase ? PHASE_LABEL[phase] : "Working"}
           />
@@ -588,6 +603,13 @@ export function BackupSettings() {
       )}
 
       {error && <p className="mt-2 break-words text-xs text-st-due">{error}</p>}
+      {/* F-22: a partial success (some destinations failed, at least one succeeded) — a non-blocking
+          notice in the shared warning-box idiom, kept separate from `error` (whole op failed). */}
+      {warning && (
+        <div className="mt-2 break-words rounded-[var(--radius)] border px-3 py-2 text-sm text-st-due">
+          {warning}
+        </div>
+      )}
       {message && <p className="mt-2 break-all text-xs text-st-quick">{message}</p>}
 
       {/* Shared restore result — surfaced here so either the file OR the Proton restore flow
