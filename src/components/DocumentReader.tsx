@@ -102,7 +102,7 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
     setShowChunks(false);
     setSpans(null);
     setLoading(true);
-    (async () => {
+    void (async () => {
       try {
         if (!known) return;
         if (doc.source_type === "photo") {

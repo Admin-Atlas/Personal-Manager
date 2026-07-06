@@ -165,7 +165,7 @@ export function DocumentsView({ onReviewClick }: Props) {
   const guideAutoOpened = useRef(false);
 
   useEffect(() => {
-    refresh();
+    void refresh();
     sidecarStatus()
       .then(setStatus)
       .catch(() => {});
@@ -194,12 +194,12 @@ export function DocumentsView({ onReviewClick }: Props) {
       } else if (payload.type === "drop") {
         setDragging(false);
         if (!busyRef.current && !installingOcrRef.current && payload.paths.length > 0) {
-          runIngest(payload.paths);
+          void runIngest(payload.paths);
         }
       }
     });
     return () => {
-      unlisten.then((fn) => fn());
+      void unlisten.then((fn) => fn());
     };
   }, []);
 
@@ -348,12 +348,12 @@ export function DocumentsView({ onReviewClick }: Props) {
 
   async function pickFiles() {
     const selected = await open({ multiple: true, directory: false });
-    if (selected) runIngest(Array.isArray(selected) ? selected : [selected]);
+    if (selected) void runIngest(Array.isArray(selected) ? selected : [selected]);
   }
 
   async function pickFolder() {
     const selected = await open({ directory: true });
-    if (selected) runIngest([selected as string]);
+    if (selected) void runIngest([selected as string]);
   }
 
   async function doRebuild() {

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.31-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood tidying. PM's code checks are stricter now: the linter understands types well enough to flag a background task whose errors would otherwise be silently dropped, and every such spot in the app was reviewed and made explicit. The type-checker also now covers PM's own build configuration, not just the app code.",
+    ],
+  },
+  {
     version: "2.92.30-alpha",
     date: "2026-07-06",
     highlights: [

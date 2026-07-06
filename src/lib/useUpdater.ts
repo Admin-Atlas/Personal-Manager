@@ -52,7 +52,7 @@ export function useUpdater(): AppUpdate {
   useEffect(() => {
     let cancelled = false;
 
-    (async () => {
+    void (async () => {
       let found: Update | null;
       try {
         found = await check();
@@ -97,7 +97,7 @@ export function useUpdater(): AppUpdate {
 
   const restart = useCallback(() => {
     if (!update) return;
-    (async () => {
+    void (async () => {
       setStatus("installing");
       setInstallFailed(false);
       try {

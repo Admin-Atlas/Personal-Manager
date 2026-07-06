@@ -221,7 +221,7 @@ export function CloudDriveConnection({
     }
   }, [meta, setError]);
   useEffect(() => {
-    refreshRef.current = refresh;
+    refreshRef.current = () => void refresh();
   }, [refresh]);
 
   // Refetch on mount, and whenever the parent group reports the shared client changed.
@@ -321,7 +321,7 @@ export function CloudDriveConnection({
                       defaultOpen={!a.last_synced_at}
                       title={<span className="text-xs text-ink3">{meta.scopeTitle}</span>}
                     >
-                      {meta.scopePicker(a.email, refresh)}
+                      {meta.scopePicker(a.email, () => void refresh())}
                     </Collapsible>
                   )}
                 </li>

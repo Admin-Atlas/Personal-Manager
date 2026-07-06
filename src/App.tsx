@@ -223,7 +223,7 @@ export default function App() {
   // hasn't seen yet. We persist the last-seen version so it shows exactly once
   // per upgrade; opening it (or closing the auto-shown one) marks it seen.
   useEffect(() => {
-    (async () => {
+    void (async () => {
       try {
         const version = await getVersion();
         setAppVersion(version);
@@ -242,7 +242,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    (async () => {
+    void (async () => {
       try {
         // The four boot reads are independent, so fetch them in ONE parallel batch rather than four
         // serial round-trips behind each other (F-09). `has_openrouter_key` reads the OS keychain,
@@ -678,7 +678,7 @@ export default function App() {
                     ? projectChat.openConversation
                     : (id) => {
                         setView("chat");
-                        selectConversation(id);
+                        void selectConversation(id);
                       }
                 }
                 onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
@@ -823,7 +823,7 @@ export default function App() {
                 onOpenProject={openProject}
                 onOpenConversation={(id) => {
                   setView("chat");
-                  selectConversation(id);
+                  void selectConversation(id);
                 }}
                 onNavigate={setView}
                 onOpenSettings={() => setShowSettings(true)}
