@@ -550,7 +550,7 @@ pub fn spawn_extend_after_reply(app: AppHandle, conversation_id: i64) {
 /// summary once (catching up any session whose eager nudge never ran — e.g. no key at the time, or the app
 /// closed first), then reconcile again whenever the user goes idle. Mirrors `chat_index::spawn_idle_indexer`
 /// but fully async (no sidecar/spawn_blocking — summarising is a network call).
-pub fn spawn_summary_scheduler(app: AppHandle) {
+pub fn spawn_summary_scheduler(app: AppHandle, launch_stagger: Duration) {
     tauri::async_runtime::spawn(async move {
         // Launch catch-up: wait (bounded) for the vault to unlock, then one reconcile pass.
         let mut ready_now = false;
@@ -562,6 +562,10 @@ pub fn spawn_summary_scheduler(app: AppHandle) {
             tokio::time::sleep(Duration::from_secs(LAUNCH_WAIT_SECS)).await;
         }
         if ready_now {
+            // F-54: stagger the launch pass so the four chat backstops (index/summary/title/prefs)
+            // don't thundering-herd at once on unlock (an embed sweep + three model calls). lib.rs
+            // assigns each a distinct offset; the index sweep runs first (no delay).
+            tokio::time::sleep(launch_stagger).await;
             run_guarded(&app, |app| async move { reconcile_summaries(&app).await }).await;
         }
 

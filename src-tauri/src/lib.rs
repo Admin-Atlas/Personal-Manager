@@ -761,6 +761,10 @@ pub fn run() {
             // engine to be provisioned, and never triggers a first-run engine build itself. The idle
             // indexer then keeps a live session progressively indexed during lulls (never competing with
             // active use), so nothing waits for the next launch.
+            // F-54: the four chat launch passes below (index / summary / title / prefs) all wait for the
+            // vault to unlock and would otherwise fire at once (an embed sweep + three model calls) —
+            // a thundering herd at t≈5s, worsened by wake-from-sleep making every backstop due together.
+            // Stagger them: the index sweep runs first, the other three at +30 / +60 / +90s after unlock.
             chat_index::spawn_launch_sweep(handle.clone());
             chat_index::spawn_idle_indexer(handle.clone());
 
@@ -768,7 +772,10 @@ pub fn run() {
             // pass folds any backlog that grew while the app was closed, then an idle backstop reconciles
             // during lulls. The eager per-conversation nudge fires from `send_message`; this scheduler is
             // the catch-up net for sessions whose nudge never ran (no key at the time, app closed first).
-            chat_summary::spawn_summary_scheduler(handle.clone());
+            chat_summary::spawn_summary_scheduler(
+                handle.clone(),
+                std::time::Duration::from_secs(30),
+            );
 
             // Automatic encrypted backups to Proton Drive (backup epic PR3): a launch catch-up +
             // idle backstop that backs up when due per the user's cadence and trims old archives.
@@ -791,12 +798,12 @@ pub fn run() {
             // Give each conversation a real 5-7 word title (board card 7E) once it has a few turns: a launch
             // pass titles any session that crossed the threshold while the app was closed (the eager
             // per-conversation nudge fires from `send_message`). Background, best-effort, single model call.
-            chat_title::spawn_title_scheduler(handle.clone());
+            chat_title::spawn_title_scheduler(handle.clone(), std::time::Duration::from_secs(60));
 
             // Capture preferences a user STATED in chat (board card 7F) as suggested Teach records: a
             // launch pass scans turns added while the app was closed (the eager per-conversation nudge
             // fires from `send_message`). Background, best-effort, explicit-only — never inferred.
-            chat_prefs::spawn_prefs_scheduler(handle.clone());
+            chat_prefs::spawn_prefs_scheduler(handle.clone(), std::time::Duration::from_secs(90));
 
             // Watch every tracked local folder (board card 6, PR2) for live changes: a debounced
             // filesystem watcher that re-embeds a saved file within seconds and keeps deletes/renames
