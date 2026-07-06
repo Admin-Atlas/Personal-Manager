@@ -852,27 +852,16 @@ export interface TsneStatus {
   installed: boolean;
 }
 
-/** Progress for the optional t-SNE component download (0..1, monotonic). Rendered as a percentage —
- *  a download has no file count — tiered by Depth (bar at minimal, bar + % at standard and power). */
-export interface TsneInstallEvent {
-  fraction: number;
-}
-
-/** Progress for the macOS interpreter download (0..1, monotonic). Only fires on macOS when no system
- *  Python was found and PM downloads a standalone one; rendered as a percentage like the t-SNE download. */
-export interface PythonInstallEvent {
+/** Progress for an optional component's install-download — t-SNE, photo-OCR, or the macOS Python fetch
+ *  (0..1, monotonic). Rendered as a percentage — a download has no file count — tiered by Depth (bar at
+ *  minimal, bar + % at standard and power). One shape for all three channels (X-D6). */
+export interface InstallProgressEvent {
   fraction: number;
 }
 
 /** Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed. */
 export interface OcrStatus {
   installed: boolean;
-}
-
-/** Progress for the optional OCR component download (0..1, monotonic). Rendered as a percentage, like
- *  the t-SNE download — there is no file count. */
-export interface OcrInstallEvent {
-  fraction: number;
 }
 
 /** One on-device component in the Storage manager (the venv, the t-SNE libraries, the photo-OCR

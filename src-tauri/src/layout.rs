@@ -79,13 +79,6 @@ fn emit(app: &AppHandle, ev: LayoutProgressEvent) {
     let _ = app.emit("layout://progress", ev);
 }
 
-/// Progress for the optional t-SNE component download (broadcast on `tsne://install`). The download
-/// has no file count, so `fraction` (0.0..=1.0, monotonic) is rendered as a percentage bar.
-#[derive(Clone, Serialize)]
-pub struct TsneInstallEvent {
-    fraction: f32,
-}
-
 /// Mutate the shared job snapshot, best-effort. Binds the lock guard to a named local first to
 /// sidestep the `if let` temporary-lifetime pitfall (same pattern as `with_drive_snap`).
 fn with_job(app: &AppHandle, f: impl FnOnce(&mut LayoutJobState)) {
@@ -109,7 +102,8 @@ struct Fingerprint {
     dim: usize,
     node_cap: usize,
     layout_version: u32,
-    /// Hash over the set of documents-with-vectors and their leaf-chunk counts.
+    /// Hash over the set of documents-with-vectors, their leaf-chunk counts, and a leaf-identity
+    /// marker (max leaf rowid) so a same-count content edit still invalidates the cache (B4-1).
     doc_set_hash: String,
 }
 
@@ -212,27 +206,42 @@ fn importance_ranks(conn: &Connection) -> Result<HashMap<i64, u8>> {
     Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
-/// Cheap signature of the document set (ids + leaf-chunk counts), without reading any vector blobs —
-/// so the freshness check on a warm cache stays fast. Archived documents (any source, chat included) are
-/// excluded here exactly as in [`document_vectors`], so archiving/un-archiving shifts the signature and
-/// invalidates the cache — the Map recomputes without the archived node.
-fn doc_signatures(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+/// Cheap signature of the document set (ids + leaf-chunk counts + a leaf-identity marker), without
+/// reading any vector blobs — so the freshness check on a warm cache stays fast. Archived documents
+/// (any source, chat included) are excluded here exactly as in [`document_vectors`], so archiving/
+/// un-archiving shifts the signature and invalidates the cache — the Map recomputes without the
+/// archived node.
+///
+/// The third column, `MAX(c.id)`, is the B4-1 fix: leaf `count` alone missed a *content* edit that
+/// re-chunked a document to the same number of leaves (common for small edits — same 256-token
+/// packing), so the Map kept placing that document by its old meaning forever. Re-ingest DELETEs then
+/// re-INSERTs a document's chunk rows, and `chunks.id` is `AUTOINCREMENT` (strictly monotonic, never
+/// reused), so the max leaf rowid always rises on re-ingest — flipping the hash even at constant leaf
+/// count. `MAX` (not `SUM`) also can't overflow the `i64` we read it back as.
+fn doc_signatures(conn: &Connection) -> Result<Vec<(i64, i64, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT c.document_id, count(*) \
+        "SELECT c.document_id, count(*), MAX(c.id) \
          FROM chunk_vec cv JOIN chunks c ON cv.rowid = c.id \
          JOIN documents d ON d.id = c.document_id \
          WHERE c.kind = 'leaf' AND d.importance IS NOT 'archive' \
          GROUP BY c.document_id ORDER BY c.document_id",
     )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn doc_set_hash(sigs: &[(i64, i64)]) -> String {
+fn doc_set_hash(sigs: &[(i64, i64, i64)]) -> String {
     let mut h = Sha256::new();
-    for (id, count) in sigs {
+    for (id, count, max_leaf_id) in sigs {
         h.update(id.to_le_bytes());
         h.update(count.to_le_bytes());
+        h.update(max_leaf_id.to_le_bytes());
     }
     hex::encode(h.finalize())
 }
@@ -557,7 +566,7 @@ pub async fn install_optional_tsne(app: AppHandle) -> Result<()> {
         app2.state::<AppState>()
             .sidecar
             .install_optional_tsne(move |fraction| {
-                let _ = progress_app.emit("tsne://install", TsneInstallEvent { fraction });
+                crate::commands::emit_install_progress(&progress_app, "tsne", fraction);
             })
     })
     .await
@@ -618,6 +627,7 @@ mod tests {
         // in every dimension, which L2-normalises to 1/sqrt(384) per component.
         let dim = db::vec0_dim(&conn).unwrap();
         let make_vec = |v: f64| format!("[{}]", vec![v.to_string(); dim].join(","));
+        let mut max_chunk_id = 0i64;
         for (ordinal, val) in [(0i64, 0.0f64), (1, 0.2)] {
             conn.execute(
                 "INSERT INTO chunks(document_id, ordinal, content, char_count, kind) \
@@ -626,6 +636,7 @@ mod tests {
             )
             .unwrap();
             let chunk_id = conn.last_insert_rowid();
+            max_chunk_id = chunk_id;
             conn.execute(
                 "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
                 params![chunk_id, make_vec(val)],
@@ -651,9 +662,10 @@ mod tests {
             );
         }
 
-        // The cheap signature path sees the same single document with two leaves.
+        // The cheap signature path sees the same single document with two leaves; the third element is
+        // the max leaf rowid (B4-1's re-ingest marker).
         let sigs = doc_signatures(&conn).unwrap();
-        assert_eq!(sigs, vec![(doc_id, 2)]);
+        assert_eq!(sigs, vec![(doc_id, 2, max_chunk_id)]);
     }
 
     /// Archive-as-outcome (card F): an archived document is hidden from the Map — absent from both the
@@ -665,8 +677,9 @@ mod tests {
         let dim = db::vec0_dim(&conn).unwrap();
         let make_vec = |v: f64| format!("[{}]", vec![v.to_string(); dim].join(","));
 
-        // One active document, one archived — each with a single leaf chunk + vector.
-        let add = |vault: &str, importance: &str, val: f64| -> i64 {
+        // One active document, one archived — each with a single leaf chunk + vector. Returns
+        // (doc_id, leaf_chunk_id) so the signature assert can name the max leaf rowid.
+        let add = |vault: &str, importance: &str, val: f64| -> (i64, i64) {
             conn.execute(
                 "INSERT INTO documents(vault_path, title, content_hash, project, importance) \
                  VALUES (?1, 'T', ?1, 'PM', ?2)",
@@ -686,9 +699,9 @@ mod tests {
                 params![chunk_id, make_vec(val)],
             )
             .unwrap();
-            doc_id
+            (doc_id, chunk_id)
         };
-        let active = add("active.md", "high", 0.1);
+        let (active, active_leaf) = add("active.md", "high", 0.1);
         add("archived.md", "archive", 0.2);
 
         let docs = document_vectors(&conn).unwrap();
@@ -698,8 +711,71 @@ mod tests {
         let sigs = doc_signatures(&conn).unwrap();
         assert_eq!(
             sigs,
-            vec![(active, 1)],
+            vec![(active, 1, active_leaf)],
             "archived doc absent from the signature too"
         );
+    }
+
+    /// B4-1: a content edit that re-chunks a document to the SAME number of leaves must still
+    /// invalidate the map cache. `(document_id, leaf_count)` alone missed it — the document id and the
+    /// leaf count are both unchanged — so the map kept placing the document by its old meaning. The
+    /// max-leaf-rowid marker catches it because re-ingest (`replace_chunks`) DELETEs then re-INSERTs the
+    /// chunks with fresh `AUTOINCREMENT` rowids, so the max leaf id strictly rises.
+    #[test]
+    fn same_leaf_count_content_edit_changes_the_doc_set_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("pm.sqlite"), KEY).unwrap();
+        let dim = db::vec0_dim(&conn).unwrap();
+        let make_vec = |v: f64| format!("[{}]", vec![v.to_string(); dim].join(","));
+
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, project, importance) \
+             VALUES ('a.md','A','h1','PM','high')",
+            [],
+        )
+        .unwrap();
+        let doc_id = conn.last_insert_rowid();
+
+        // Re-index the document with `n` fresh leaf chunks (+ vectors), exactly as `replace_chunks`
+        // does — delete the old chunk_vec/chunks rows, then insert new ones with new AUTOINCREMENT ids.
+        // Returns the resulting doc-set hash.
+        let reindex = |n: i64, val: f64| -> String {
+            conn.execute(
+                "DELETE FROM chunk_vec WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
+                params![doc_id],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM chunks WHERE document_id = ?1", params![doc_id])
+                .unwrap();
+            for ordinal in 0..n {
+                conn.execute(
+                    "INSERT INTO chunks(document_id, ordinal, content, char_count, kind) \
+                     VALUES (?1, ?2, 'c', 1, 'leaf')",
+                    params![doc_id, ordinal],
+                )
+                .unwrap();
+                let chunk_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO chunk_vec(rowid, embedding) VALUES (?1, ?2)",
+                    params![chunk_id, make_vec(val)],
+                )
+                .unwrap();
+            }
+            doc_set_hash(&doc_signatures(&conn).unwrap())
+        };
+
+        let before = reindex(2, 0.1);
+        // Re-ingest at the SAME leaf count (2) — only the chunk ids and vectors change.
+        let after = reindex(2, 0.9);
+        assert_ne!(
+            before, after,
+            "a same-leaf-count content edit must change the signature (B4-1)"
+        );
+
+        // Confirm it really was a constant-leaf-count edit: the count stayed 2, so it was the
+        // max-rowid marker — not the leaf count — that flipped the hash.
+        let sigs = doc_signatures(&conn).unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].1, 2, "leaf count unchanged across the edit");
     }
 }

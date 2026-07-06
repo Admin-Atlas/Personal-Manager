@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.39-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "The knowledge map keeps up with your edits. When you change what's inside a document, PM now re-places it on the map to match its new meaning — previously a small edit that didn't change the document's length could leave it sitting in its old spot until something else on the map shifted.",
+      "Under-the-hood tidying. PM now reuses a single connection when talking to your chat models instead of opening a fresh one for every request, and the progress bars for the optional downloads (the knowledge-map reducer, photo text recognition, and the Mac Python setup) all run through one shared piece of plumbing. No change to how any of it looks or works.",
+    ],
+  },
+  {
     version: "2.92.38-alpha",
     date: "2026-07-06",
     highlights: [

@@ -13,6 +13,22 @@ use crate::error::{Error, Result};
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const MODELS_ENDPOINT: &str = "https://openrouter.ai/api/v1/models";
 
+/// One shared HTTP client for every OpenRouter call (F-16). A fresh `Client::builder().build()` per
+/// request threw away the connection pool each time; a single `LazyLock` client reuses pooled TLS
+/// connections across catalogue fetches, streamed chats, and background completions. It carries only
+/// the two client-level bounds that suit all three sites — `connect_timeout` (establishing the socket)
+/// and `read_timeout` (silence *between* chunks, reset on every byte received). The per-request TOTAL
+/// deadline is deliberately NOT here: it differs per call (30 s catalogue, 120 s `complete`, and none
+/// for a healthy stream — see `stream_chat`), so each site sets its own `.timeout()` on the request
+/// builder. Building a client that only sets timeouts is effectively infallible, hence `expect`.
+static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()
+        .expect("reqwest client with static timeouts should build")
+});
+
 #[derive(Serialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -131,10 +147,9 @@ pub async fn fetch_catalogue() -> Result<Vec<ModelDetail>> {
         input_modalities: Vec<String>,
     }
 
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?
+    let response = HTTP
         .get(MODELS_ENDPOINT)
+        .timeout(std::time::Duration::from_secs(30))
         .header(
             "HTTP-Referer",
             "https://github.com/Admin-Atlas/Personal-Manager",
@@ -336,12 +351,11 @@ where
     // meant to bound a hung connection, not a healthy slow stream. Replace it with the two signals that
     // actually indicate a dead connection: `connect_timeout` bounds establishing the socket, and
     // `read_timeout` bounds *silence between chunks* — it resets on every byte received, so steady tokens
-    // never trip it however long the reply, while a genuinely stalled stream still aborts. Non-streaming
-    // `complete` keeps its total deadline: there the whole answer arrives at once, so a total bound fits.
-    let response = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .read_timeout(std::time::Duration::from_secs(120))
-        .build()?
+    // never trip it however long the reply, while a genuinely stalled stream still aborts. Those two
+    // bounds now live on the shared `HTTP` client (F-16), so this request just adds NO total `.timeout()`.
+    // Non-streaming `complete` keeps its total deadline via its own per-request `.timeout()`: there the
+    // whole answer arrives at once, so a total bound fits.
+    let response = HTTP
         .post(ENDPOINT)
         .bearer_auth(api_key)
         // Optional attribution headers OpenRouter recognises.
@@ -465,10 +479,10 @@ pub async fn complete(
     // Background callers cache from message 0 (their stable system instruction); `false` ⇒ no breakpoint.
     let body = chat_body(models, messages, false, cache_prefix.then_some(0));
 
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?
+    let response = HTTP
         .post(ENDPOINT)
+        // A total deadline fits here (unlike `stream_chat`): the whole answer arrives at once.
+        .timeout(std::time::Duration::from_secs(120))
         .bearer_auth(api_key)
         .header(
             "HTTP-Referer",

@@ -19,7 +19,7 @@
 use std::path::Path;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::{Error, Result};
 use crate::AppState;
@@ -258,13 +258,6 @@ pub struct OcrStatus {
     installed: bool,
 }
 
-/// Progress for the optional OCR component download (broadcast on `ocr://install`). Like the t-SNE
-/// download it has no file count, so `fraction` (0.0..=1.0, monotonic) renders as a percentage bar.
-#[derive(Clone, Serialize)]
-pub struct OcrInstallEvent {
-    fraction: f32,
-}
-
 /// Whether the optional photo-OCR component is installed in the managed venv. Cheap (a marker read),
 /// so the UI can check it before a photo drop and the Storage tab can show the install/remove state.
 #[tauri::command]
@@ -286,7 +279,7 @@ pub async fn install_optional_ocr(app: AppHandle) -> Result<()> {
         app2.state::<AppState>()
             .sidecar
             .install_optional_ocr(move |fraction| {
-                let _ = progress_app.emit("ocr://install", OcrInstallEvent { fraction });
+                crate::commands::emit_install_progress(&progress_app, "ocr", fraction);
             })
     })
     .await

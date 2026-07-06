@@ -1643,13 +1643,24 @@ pub fn sidecar_status(state: State<'_, AppState>) -> SidecarStatus {
     state.sidecar.status()
 }
 
-/// Progress for the macOS interpreter download (broadcast on `python://install`).
-/// Like the t-SNE/OCR downloads it has no file count, so `fraction` (0.0..=1.0,
-/// monotonic) renders as a percentage bar. Only ever fires on macOS when no system
-/// Python was found; every other platform / setup goes straight to the venv build.
+/// Progress for an optional-component download, broadcast on `<component>://install` — i.e.
+/// `python://install` (the macOS interpreter fetch), `tsne://install`, and `ocr://install`. None of
+/// these downloads has a file count, so `fraction` (0.0..=1.0, monotonic) renders as a percentage bar.
+/// One shape + one emit helper for all three (X-D6); the per-component structs it replaced were
+/// byte-identical. The python leg only ever fires on macOS when no system Python was found.
 #[derive(Clone, Serialize)]
-pub struct PythonInstallEvent {
+pub struct InstallProgressEvent {
     fraction: f32,
+}
+
+/// Emit optional-component install progress on the `<component>://install` channel. Fire-and-forget
+/// (a dropped event costs a progress tick, never the install). Shared by `ensure_sidecar` (python),
+/// `install_optional_tsne`, and `install_optional_ocr` so the channel name is built exactly one way.
+pub fn emit_install_progress(app: &AppHandle, component: &str, fraction: f32) {
+    let _ = app.emit(
+        &format!("{component}://install"),
+        InstallProgressEvent { fraction },
+    );
 }
 
 /// Provision the managed venv if needed (slow on first run). Run off the async
@@ -1662,7 +1673,7 @@ pub async fn ensure_sidecar(app: AppHandle) -> Result<()> {
         app.state::<AppState>()
             .sidecar
             .ensure_installed_with_progress(move |fraction| {
-                let _ = progress_app.emit("python://install", PythonInstallEvent { fraction });
+                emit_install_progress(&progress_app, "python", fraction);
             })
     })
     .await
