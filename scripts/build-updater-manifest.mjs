@@ -45,10 +45,22 @@ const files = walk(ARTIFACTS_DIR);
 const urlFor = (file) =>
   `https://github.com/${RELEASES_REPO}/releases/download/${TAG}/${basename(file)}`;
 
-/** Find the updater artifact matching `suffix` plus its sibling `.sig`. */
+/**
+ * Find the one updater artifact matching `suffix` plus its sibling `.sig`.
+ * Requires EXACTLY one match: a stale re-run with leftover artifacts, or a future
+ * second Windows arch, would otherwise make the readdir-ordered pick silently
+ * arbitrary — so throw and turn that into a loud publish failure (audit T1-13).
+ */
 function pair(suffix) {
-  const artifact = files.find((f) => f.endsWith(suffix) && !f.endsWith(".sig"));
-  if (!artifact) return null;
+  const matches = files.filter((f) => f.endsWith(suffix) && !f.endsWith(".sig"));
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    throw new Error(
+      `Ambiguous updater artifact for "${suffix}": ${matches.map((f) => basename(f)).join(", ")} — ` +
+        "expected exactly one candidate",
+    );
+  }
+  const [artifact] = matches;
   const sig = files.find((f) => f === `${artifact}.sig`);
   if (!sig) throw new Error(`Found ${basename(artifact)} but no matching .sig`);
   return { url: urlFor(artifact), signature: readFileSync(sig, "utf8").trim() };
