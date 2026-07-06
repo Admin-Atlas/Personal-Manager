@@ -20,7 +20,7 @@ default:
 # --- aggregates -----------------------------------------------------------
 
 # The fast subset (formatting, types, lint, bespoke gates) — what pre-commit runs.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks zizmor
@@ -118,6 +118,17 @@ files:
 
 headers:
     node scripts/check-spdx-headers.mjs
+
+# Licence allow-lists agree: everything deny.toml permits (PR gate) is attributable
+# in about.toml's accepted set (release NOTICE), so NOTICE generation can't hit an
+# unexpected licence after signing (T-02).
+license-subset:
+    node scripts/check-license-subset.mjs
+
+# Every `just check` recipe is wired into pr.yml, so a gate added here can't silently
+# skip CI until pr.yml is separately edited (T-04).
+ci-membership:
+    node scripts/check-ci-membership.mjs
 
 # --- release-only ---------------------------------------------------------
 

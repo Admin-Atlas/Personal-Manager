@@ -238,3 +238,7 @@ jobs:
         run: just files
       - name: SPDX headers + licence integrity
         run: just headers
+      - name: Licence allow-lists agree (deny ⊆ about)
+        run: just license-subset
+      - name: CI membership (justfile ⊆ pr.yml)
+        run: just ci-membership

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.30-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Under-the-hood tidying. Two of PM's own safety checks now keep each other honest — one makes sure the two internal lists of allowed software licences stay in agreement, and another makes sure every check that runs while building PM also runs in its automated online checks, so neither can quietly fall out of coverage.",
+    ],
+  },
+  {
     version: "2.92.29-alpha",
     date: "2026-07-06",
     highlights: [
