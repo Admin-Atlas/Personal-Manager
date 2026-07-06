@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PM",
-  "version": "2.92.19-alpha",
+  "version": "2.92.20-alpha",
   "identifier": "org.itsatlas.pm",
   "build": {
     "beforeDevCommand": "npm run dev",
