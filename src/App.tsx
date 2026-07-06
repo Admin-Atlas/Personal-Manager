@@ -464,9 +464,12 @@ export default function App() {
   }, [keySet]);
 
   async function selectConversation(id: number) {
+    activeIdRef.current = id; // adopt synchronously so a racing later selection wins the post-await guard
     setActiveId(id);
     chat.clearTransient(); // drop any in-flight stream's UI from the conversation we're leaving
-    chat.setMessages(await getMessages(id));
+    const msgs = await getMessages(id);
+    if (activeIdRef.current !== id) return; // a newer selectConversation landed mid-fetch — don't clobber it
+    chat.setMessages(msgs);
   }
 
   // A chat citation clicked anywhere opens that archived conversation in the global chat view,

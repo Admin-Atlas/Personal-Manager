@@ -106,6 +106,10 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [bgKey, setBgKey] = useState("");
   const [chatModels, setChatModelsState] = useState<string[]>([]);
   const [backgroundModels, setBackgroundModelsState] = useState<string[]>([]);
+  // True once getSettings() has populated the model lists. Save gates on this (not a non-empty
+  // list) so deliberately clearing a role to "use the default" persists, while a save that races
+  // ahead of the initial load still can't clobber the backend defaults with the empty init state.
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [chatAuto, setChatAuto] = useState(false);
   const [backgroundAuto, setBackgroundAuto] = useState(false);
   const [keyAlreadySet, setKeyAlreadySet] = useState(false);
@@ -178,6 +182,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
         setBackgroundModelsState(settings.background_models);
         setChatAuto(settings.chat_auto_switch);
         setBackgroundAuto(settings.background_auto_switch);
+        setSettingsLoaded(true); // model lists now reflect the backend — clearing them can persist
+
         if (settings.time_zone) {
           setTimeZoneState(settings.time_zone);
           setTzAuto(settings.time_zone === detectTimeZone());
@@ -452,10 +458,13 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
         setBgKey("");
         setBgKeyAlreadySet(true);
       }
-      // Don't persist an empty list — before the settings load resolves (or on a
-      // fresh install) that would overwrite the backend's defaults with nothing.
-      if (chatModels.length > 0) await setChatModels(chatModels);
-      if (backgroundModels.length > 0) await setBackgroundModels(backgroundModels);
+      // Persist the model lists only once they've loaded from the backend — gating on the load
+      // flag (not a non-empty list) lets the user clear a role back to "use the default" and have
+      // it stick, while still refusing to overwrite the defaults with the empty pre-load state.
+      if (settingsLoaded) {
+        await setChatModels(chatModels);
+        await setBackgroundModels(backgroundModels);
+      }
       await setChatAutoSwitch(chatAuto);
       await setBackgroundAutoSwitch(backgroundAuto);
       await setTimeZone(tzAuto ? detectTimeZone() : timeZone);

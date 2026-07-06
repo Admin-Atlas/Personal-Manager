@@ -153,6 +153,11 @@ export function DocumentsView({ onReviewClick }: Props) {
   busyRef.current = busy;
   const installingOcrRef = useRef(false);
   installingOcrRef.current = installingOcr;
+  // Same staleness trap: startIngest runs from the once-registered drop listener's closure, so
+  // reading `copyPhotosToVault` directly there sees the first render's value (photos silently not
+  // copied even after the box is ticked). Read the live value through a ref.
+  const copyPhotosRef = useRef(copyPhotosToVault);
+  copyPhotosRef.current = copyPhotosToVault;
 
   // Pop the troubleshooting guide once each time setup enters an error state,
   // resetting when it leaves so a later failure reopens it (and closing it once
@@ -303,7 +308,7 @@ export function DocumentsView({ onReviewClick }: Props) {
     setError(null);
     setPrep(null);
     try {
-      await ingestPaths(paths, handleEvent, copyPhotosToVault);
+      await ingestPaths(paths, handleEvent, copyPhotosRef.current);
       setStatus(await sidecarStatus());
     } catch (e) {
       setError(String(e));
