@@ -220,9 +220,36 @@ def clean_text(value):
     return value.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
 
+# The largest source file the sidecar will read for conversion / spreadsheet / image analysis
+# (F-57). A file past this would balloon the child's memory (the reader materialises it) before the
+# 64 MiB response-line cap could ever trip — an OOM on the 8 GB target. Rust pre-flights the same
+# limit before it even asks; this is the in-process backstop. Kept in sync with sidecar.rs
+# MAX_SIDECAR_INPUT_BYTES.
+MAX_INPUT_FILE_BYTES = 128 * 1024 * 1024
+
+
+def _guard_file_size(path):
+    """Refuse an over-cap input file (F-57) with a clean error instead of OOMing the child. main()
+    turns the raised ValueError into an `{ok: false, error}` reply the Rust side surfaces. A missing
+    or unreadable file is NOT this guard's concern — it returns quietly so the handler's own path
+    handling (e.g. analyze_image's graceful nulls) still applies."""
+    import os
+
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size > MAX_INPUT_FILE_BYTES:
+        raise ValueError(
+            f"file is too large to process ({size // (1024 * 1024)} MiB; "
+            f"the limit is {MAX_INPUT_FILE_BYTES // (1024 * 1024)} MiB)"
+        )
+
+
 def do_convert(params):
     """Convert one file to Markdown. Returns its text and a best-effort title."""
     path = params["path"]
+    _guard_file_size(path)
     result = get_markitdown().convert(path)
     title = (getattr(result, "title", None) or "").strip()
     return {
@@ -447,6 +474,7 @@ def do_analyze_image(params):
     image (e.g. HEIC without pillow-heif) yields nulls; Rust falls back to a filename/ingest date.
     """
     path = params["path"]
+    _guard_file_size(path)
     run_ocr = bool(params.get("run_ocr", False))
     width = height = None
     capture_date = lat = lon = None
@@ -461,8 +489,16 @@ def do_analyze_image(params):
     ocr_text = ""
     ocr_ran = False
     if run_ocr:
-        ocr_text = _run_ocr(get_ocr_engine(), img, path)
-        ocr_ran = True
+        try:
+            ocr_text = _run_ocr(get_ocr_engine(), img, path)
+            ocr_ran = True
+        except Exception as exc:
+            # F-56: a broken/offline OCR component must degrade to EXIF-only, not fail the whole
+            # photo ingest. The metadata gathered above is intact; Rust reads ocr_ran=false.
+            sys.stderr.write(f"pm_sidecar: OCR failed for {path!r}, keeping EXIF only: {exc}\n")
+            sys.stderr.flush()
+            ocr_text = ""
+            ocr_ran = False
 
     return {
         "ocr_text": clean_text(ocr_text),
@@ -647,12 +683,27 @@ def _build_sheet(name, rows_iter):
     }
 
 
+def _csv_encoding(path):
+    """Pick a text encoding for a CSV: UTF-8 (BOM-aware) if the head decodes, else cp1252 — Excel's
+    Windows default (F-55). Prevents a non-UTF-8 export from failing the whole ingest with a
+    UnicodeDecodeError. The caller opens with errors='replace' so a stray byte past the sampled head
+    still degrades to a replacement char rather than raising mid-parse."""
+    with open(path, "rb") as fh:
+        head = fh.read(65536)
+    try:
+        head.decode("utf-8-sig")
+        return "utf-8-sig"
+    except UnicodeDecodeError:
+        return "cp1252"
+
+
 def _sheets_from_csv(path):
-    """A CSV is a single sheet named after the file; delimiter is sniffed (falls back to comma)."""
+    """A CSV is a single sheet named after the file; delimiter is sniffed (falls back to comma).
+    Encoding is UTF-8 with a cp1252 fallback (F-55) so an Excel export doesn't crash ingest."""
     import csv
     import os
 
-    fh = open(path, "r", encoding="utf-8-sig", newline="")
+    fh = open(path, "r", encoding=_csv_encoding(path), errors="replace", newline="")
     try:
         sample = fh.read(65536)
         fh.seek(0)
@@ -720,6 +771,7 @@ def do_analyze_spreadsheet(params):
     these into a metadata chunk + self-describing row chunks. Cell text is untrusted data — cleaned,
     never executed."""
     path = params["path"]
+    _guard_file_size(path)
     ext = (params.get("ext") or "").lower().lstrip(".")
     if ext in ("xlsx", "xlsm"):
         sheets = _sheets_from_xlsx(path)

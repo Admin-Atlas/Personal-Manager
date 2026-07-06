@@ -214,6 +214,29 @@ class AnalyzeImageTest(unittest.TestCase):
         self.assertIsNone(out["width"])
         self.assertIsNone(out["capture_date"])
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("PIL") is not None,
+        "Pillow not installed (image decode is a local-only check)",
+    )
+    def test_broken_ocr_degrades_to_exif_only(self):
+        # F-56: if the OCR component is broken/offline (engine load or call raises), photo ingest
+        # must still return dimensions/EXIF with ocr_ran=false, not fail the whole file.
+        import tempfile
+
+        from PIL import Image
+
+        def _boom():
+            raise RuntimeError("rapidocr models missing")
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/shot.png"
+            Image.new("RGB", (12, 8), (1, 2, 3)).save(path)
+            with mock.patch.object(S, "get_ocr_engine", _boom):
+                out = S.do_analyze_image({"path": path, "run_ocr": True})
+        self.assertEqual(out["ocr_ran"], False, "a broken OCR engine degrades, not crashes")
+        self.assertEqual(out["ocr_text"], "")
+        self.assertEqual((out["width"], out["height"]), (12, 8), "dimensions still read")
+
 
 class SpreadsheetTest(unittest.TestCase):
     """The dedicated spreadsheet processor that bypasses MarkItDown. The type heuristic and the CSV
@@ -282,6 +305,33 @@ class SpreadsheetTest(unittest.TestCase):
         sheet = out["sheets"][0]
         self.assertEqual(sheet["headers"], ["A", "B"])
         self.assertEqual(sheet["rows"], [["1", "2"], ["3", "4"]])
+
+    def test_cp1252_csv_does_not_crash_ingest(self):
+        # F-55: an Excel export saved as Windows-1252 (é = 0xE9) must not fail the whole ingest
+        # with a UnicodeDecodeError — it falls back to cp1252 and decodes the accented text.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/latin1.csv"
+            with open(path, "w", encoding="cp1252", newline="") as fh:
+                fh.write("Name,Note\nRené,café\n")
+            out = S.do_analyze_spreadsheet({"path": path, "ext": "csv"})
+        sheet = out["sheets"][0]
+        self.assertEqual(sheet["headers"], ["Name", "Note"])
+        self.assertEqual(sheet["rows"][0], ["René", "café"])
+
+    def test_oversized_input_is_refused(self):
+        # F-57: a file past the cap is refused with a clear error, not an OOM. Shrink the cap so a
+        # tiny file trips it; do_analyze_spreadsheet raises, which main() turns into {ok: false}.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/big.csv"
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("A,B\n1,2\n")
+            with mock.patch.object(S, "MAX_INPUT_FILE_BYTES", 4):
+                with self.assertRaises(ValueError):
+                    S.do_analyze_spreadsheet({"path": path, "ext": "csv"})
 
     @unittest.skipUnless(
         importlib.util.find_spec("openpyxl") is not None,

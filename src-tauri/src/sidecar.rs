@@ -65,6 +65,37 @@ use crate::error::{Error, Result};
 /// legitimate reply.
 const MAX_SIDECAR_LINE: usize = 64 * 1024 * 1024;
 
+/// The largest source file the sidecar will read for convert / image / spreadsheet analysis (F-57). A
+/// file past this balloons the Python child's memory (the reader materialises it) before the reply cap
+/// above could ever trip — an OOM on the 8 GB target. Pre-flighted in Rust so the work is refused before
+/// the child is even asked; the sidecar refuses it too (defense in depth). Keep in sync with
+/// `pm_sidecar.py` `MAX_INPUT_FILE_BYTES`.
+const MAX_SIDECAR_INPUT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Refuse an over-cap input file before handing its path to the sidecar (F-57), with a clear message
+/// rather than a wedged/OOM'd child. A missing/unreadable file is NOT this guard's concern — it passes
+/// through so the call reports the real IO error (and the Python side keeps its own graceful handling,
+/// e.g. `analyze_image`'s null metadata for an unreadable image).
+fn guard_input_size(path: &Path) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(m) => check_input_size(m.len()),
+        Err(_) => Ok(()),
+    }
+}
+
+/// The pure size check behind [`guard_input_size`], split out so the cap logic is unit-tested without
+/// materialising a multi-hundred-MB file.
+fn check_input_size(size: u64) -> Result<()> {
+    if size > MAX_SIDECAR_INPUT_BYTES {
+        return Err(Error::Other(format!(
+            "file is too large to process ({} MiB; the limit is {} MiB)",
+            size / (1024 * 1024),
+            MAX_SIDECAR_INPUT_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
 /// How many non-matching stdout lines we'll skip while waiting for our reply before
 /// giving up and respawning. With the monotonic request id a stale/old line can
 /// never match, so anything skipped is noise; this bounds a chatty or wedged child
@@ -566,6 +597,7 @@ impl SidecarManager {
 
     /// Convert a file to Markdown. Returns `(markdown, title)`.
     pub fn convert(&self, path: &Path) -> Result<(String, String)> {
+        guard_input_size(path)?;
         let result = self.request("convert", json!({ "path": path.to_string_lossy() }))?;
         let markdown = result["markdown"].as_str().unwrap_or_default().to_string();
         let title = result["title"].as_str().unwrap_or_default().to_string();
@@ -725,6 +757,7 @@ impl SidecarManager {
     /// are fast and fully local. Blocking, like every sidecar call. EXIF/OCR output is untrusted data —
     /// scored/indexed, never executed.
     pub fn analyze_image(&self, path: &Path, run_ocr: bool) -> Result<ImageAnalysis> {
+        guard_input_size(path)?;
         let result = self.request(
             "analyze_image",
             json!({ "path": path.to_string_lossy(), "run_ocr": run_ocr }),
@@ -756,6 +789,7 @@ impl SidecarManager {
         path: &Path,
         ext: &str,
     ) -> Result<Vec<crate::spreadsheets::SheetData>> {
+        guard_input_size(path)?;
         let result = self.request(
             "analyze_spreadsheet",
             json!({ "path": path.to_string_lossy(), "ext": ext }),
@@ -1640,6 +1674,15 @@ mod tests {
     #[test]
     fn optional_ocr_marker_matches_pins() {
         assert_eq!(OPTIONAL_OCR_PINS.join(";"), OPTIONAL_OCR_MARKER);
+    }
+
+    #[test]
+    fn input_size_guard_rejects_over_cap_files() {
+        // F-57: exactly at the cap is fine; one byte over is refused, so a 500 MB file is pre-flighted
+        // out before it can balloon the Python child's memory.
+        assert!(check_input_size(0).is_ok());
+        assert!(check_input_size(MAX_SIDECAR_INPUT_BYTES).is_ok());
+        assert!(check_input_size(MAX_SIDECAR_INPUT_BYTES + 1).is_err());
     }
 
     #[test]

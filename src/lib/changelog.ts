@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.20-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Messier files import cleanly. A spreadsheet or CSV exported from Excel in the older Windows text encoding used to fail to import (accented names and symbols tripped it up) — PM now reads those correctly. If the optional read-text-in-images component is broken or missing, importing a photo now still records its date, location and dimensions instead of failing the whole photo. And an accidentally-enormous file (say a multi-hundred-megabyte text file) is now turned away with a clear message rather than risking PM running out of memory.",
+    ],
+  },
+  {
     version: "2.92.19-alpha",
     date: "2026-07-06",
     highlights: [
