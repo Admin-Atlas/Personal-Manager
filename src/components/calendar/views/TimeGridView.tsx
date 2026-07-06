@@ -18,6 +18,7 @@ import {
   isMultiDay,
   minutesFromLocalMidnight,
   parseLocal,
+  timedEndMinutes,
   startOfDay,
   type TimedInput,
 } from "../../../lib/calendar-layout";
@@ -114,7 +115,7 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
         const start = parseLocal(ev.start, false)!;
         const end = ev.end ? parseLocal(ev.end, false) : null;
         const startMin = minutesFromLocalMidnight(start);
-        const endMin = end ? minutesFromLocalMidnight(end) : startMin + 30;
+        const endMin = timedEndMinutes(start, end);
         return { id: ev.id, startMin, endMin };
       });
       const placed = assignColumns(inputs);

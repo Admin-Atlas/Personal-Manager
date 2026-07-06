@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.25-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Smoother calendar and pinboard. Editing a pinboard note no longer writes to disk on every keystroke — PM waits until you pause typing. Your calendar's background refresh now only rewrites its stored events when something has actually changed, instead of every 15 minutes regardless. And a timed event that runs until midnight (say 8pm–midnight) shows as a full block on the day grid, not a thin sliver.",
+    ],
+  },
+  {
     version: "2.92.24-alpha",
     date: "2026-07-06",
     highlights: [

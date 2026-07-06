@@ -941,12 +941,59 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// Replace one calendar's mirrored events with a freshly fetched set.
+/// The `settings` key prefix for a calendar's last-mirrored event-set hash (F-49).
+const CALENDAR_EVENTS_HASH_PREFIX: &str = "calendar_events_hash:";
+
+/// A stable, order-INDEPENDENT digest of a calendar's mirrored event set (F-49). Every field written to
+/// `calendar_events` is included, so any real change flips the hash; the per-event lines are sorted so a
+/// reordered-but-identical fetch (providers don't guarantee order) still matches. `\u{1f}` (unit
+/// separator) delimits fields so no value can forge a boundary.
+fn events_hash(events: &[CalendarEvent]) -> String {
+    let mut lines: Vec<String> = events
+        .iter()
+        .map(|e| {
+            format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                e.id,
+                e.summary,
+                e.description.as_deref().unwrap_or(""),
+                e.location.as_deref().unwrap_or(""),
+                e.start,
+                e.end.as_deref().unwrap_or(""),
+                e.all_day,
+                e.html_link.as_deref().unwrap_or(""),
+                e.uid.as_deref().unwrap_or(""),
+            )
+        })
+        .collect();
+    lines.sort();
+    crate::ingest::hex_digest(lines.join("\n").as_bytes())
+}
+
+/// Replace one calendar's mirrored events with a freshly fetched set. Skips the delete+reinsert entirely
+/// when the fetched set already matches what's mirrored (F-49): the provider is re-polled every ~15 min,
+/// and without this every poll rewrites every row — continuous WAL churn — even when nothing changed.
 pub fn replace_events(
     conn: &Connection,
     calendar_id: &str,
     events: &[CalendarEvent],
 ) -> Result<()> {
+    // F-49: skip when unchanged. The stored per-calendar hash tells us the set is identical; the row
+    // count then confirms the rows are actually present, so a stale hash left by an external delete
+    // (e.g. `prune_unselected`) can't wrongly suppress a re-insert — the skip is self-correcting.
+    let hash = events_hash(events);
+    let key = format!("{CALENDAR_EVENTS_HASH_PREFIX}{calendar_id}");
+    if crate::db::get_setting(conn, &key)?.as_deref() == Some(hash.as_str()) {
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM calendar_events WHERE calendar_id = ?1",
+            params![calendar_id],
+            |r| r.get(0),
+        )?;
+        if count == events.len() as i64 {
+            return Ok(());
+        }
+    }
+
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "DELETE FROM calendar_events WHERE calendar_id = ?1",
@@ -978,6 +1025,7 @@ pub fn replace_events(
         )?;
     }
     tx.commit()?;
+    crate::db::set_setting(conn, &key, &hash)?;
     Ok(())
 }
 
@@ -1170,6 +1218,87 @@ fn contains_subslice(hay: &[String], needle: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn ev(id: &str, summary: &str, start: &str) -> CalendarEvent {
+        CalendarEvent {
+            id: id.into(),
+            calendar_id: "cal-1".into(),
+            summary: summary.into(),
+            description: None,
+            location: None,
+            start: start.into(),
+            end: None,
+            all_day: false,
+            html_link: None,
+            uid: None,
+        }
+    }
+
+    #[test]
+    fn events_hash_is_order_independent_and_change_sensitive() {
+        // F-49: reordering the same set must NOT change the hash (providers don't guarantee order), but
+        // any real field change must.
+        let set1 = vec![
+            ev("1", "Standup", "2026-07-06T09:00:00Z"),
+            ev("2", "Review", "2026-07-06T14:00:00Z"),
+        ];
+        let reordered = vec![
+            ev("2", "Review", "2026-07-06T14:00:00Z"),
+            ev("1", "Standup", "2026-07-06T09:00:00Z"),
+        ];
+        assert_eq!(events_hash(&set1), events_hash(&reordered));
+
+        let changed = vec![
+            ev("1", "Standup", "2026-07-06T09:00:00Z"),
+            ev("2", "Review (moved)", "2026-07-06T14:00:00Z"),
+        ];
+        assert_ne!(events_hash(&set1), events_hash(&changed));
+    }
+
+    #[test]
+    fn replace_events_skips_an_unchanged_resync_but_self_heals_a_cleared_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let events = vec![ev("1", "Standup", "2026-07-06T09:00:00Z")];
+        replace_events(&conn, "cal-1", &events).unwrap();
+
+        // Tamper with the mirrored row, then re-sync the SAME set. If it skips (F-49) the tamper
+        // survives — proof the delete+reinsert never ran; a rewrite would erase the marker.
+        conn.execute(
+            "UPDATE calendar_events SET summary = 'TAMPERED' WHERE id = '1'",
+            [],
+        )
+        .unwrap();
+        replace_events(&conn, "cal-1", &events).unwrap();
+        let summary: String = conn
+            .query_row(
+                "SELECT summary FROM calendar_events WHERE id = '1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            summary, "TAMPERED",
+            "an unchanged re-sync skips the rewrite"
+        );
+
+        // A stale hash (rows deleted out-of-band, e.g. prune_unselected) must NOT suppress the re-insert.
+        conn.execute("DELETE FROM calendar_events", []).unwrap();
+        replace_events(&conn, "cal-1", &events).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM calendar_events WHERE calendar_id = 'cal-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "the count-guard re-inserts when the mirror was cleared"
+        );
+    }
 
     #[test]
     fn clip_truncates_only_when_over_the_cap() {
