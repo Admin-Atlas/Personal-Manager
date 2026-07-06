@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.37-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Behind the scenes: refreshed the project's README so its feature tour reflects what PM has grown into — indexing your cloud and local files without copying them, chats becoming searchable, the daily attention layer, the knowledge map, and encrypted restore-anywhere backups among them. No change to how you use PM.",
+    ],
+  },
+  {
     version: "2.92.36-alpha",
     date: "2026-07-06",
     highlights: [
