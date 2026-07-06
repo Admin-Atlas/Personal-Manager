@@ -877,10 +877,12 @@ pub fn run() {
             #[cfg(debug_assertions)]
             commands::dev_apply_change_event,
             commands::list_documents,
+            commands::get_document,
             commands::search_documents,
             commands::transcribe_audio,
             commands::list_projects,
             commands::review_queue,
+            commands::review_queue_count,
             commands::propose_metadata,
             commands::commit_review,
             commands::set_document_metadata,

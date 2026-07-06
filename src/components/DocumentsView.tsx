@@ -773,6 +773,10 @@ export function DocumentsView({ onReviewClick }: Props) {
                     <Fragment key={doc.id}>
                       <tr
                         onClick={() => openReader(doc)}
+                        // F-48: let the browser skip layout/paint for off-screen rows (the table isn't
+                        // virtualized and grows with connector estates). `contain-intrinsic-size` reserves
+                        // a row-height placeholder so the scrollbar stays stable.
+                        style={{ contentVisibility: "auto", containIntrinsicSize: "auto 41px" }}
                         className={`cursor-pointer border-b border-rule hover:bg-surface ${
                           readerDoc?.id === doc.id ? "bg-accent-soft" : ""
                         }`}

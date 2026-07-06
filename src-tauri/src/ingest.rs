@@ -1810,6 +1810,16 @@ pub fn review_queue(conn: &Connection) -> Result<Vec<Document>> {
     Ok(rows)
 }
 
+/// Just the COUNT of documents awaiting review — for the sidebar badge, so the whole queue isn't
+/// materialised (rows + columns) only to read its length on every view change (F-47).
+pub fn review_queue_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM documents WHERE reviewed = 0",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn load_document(conn: &Connection, id: i64) -> Result<Document> {
     Ok(conn.query_row(
         &format!("SELECT {DOCUMENT_COLUMNS} FROM documents d WHERE d.id = ?1"),

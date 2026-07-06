@@ -1925,6 +1925,14 @@ pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<Document>> {
     ingest::list_documents(&conn)
 }
 
+/// Fetch a single document by id — the reader's "open by citation id" path uses this instead of
+/// refetching the entire document list to resolve one id (F-48), which scales with connector estates.
+#[tauri::command]
+pub fn get_document(state: State<'_, AppState>, id: i64) -> Result<Document> {
+    let conn = state.conn()?;
+    ingest::load_document(&conn, id)
+}
+
 /// Direct hybrid search over the store — the retrieval loop exposed on its own
 /// (a search surface, and the way to verify exact-term recall independently of
 /// chat). Embeds the query via the sidecar, so it ensures the engine is set up.
@@ -2042,6 +2050,14 @@ pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<String>> {
 pub fn review_queue(state: State<'_, AppState>) -> Result<Vec<Document>> {
     let conn = state.conn()?;
     ingest::review_queue(&conn)
+}
+
+/// The COUNT of documents awaiting review — the sidebar badge reads this instead of fetching the whole
+/// queue just to take its `.length` on every view change (F-47).
+#[tauri::command]
+pub fn review_queue_count(state: State<'_, AppState>) -> Result<i64> {
+    let conn = state.conn()?;
+    ingest::review_queue_count(&conn)
 }
 
 /// Append a document's Drive parent-folder as one plain-text line to the global filing profile — the
