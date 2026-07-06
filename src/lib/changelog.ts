@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.26-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Snappier chat and Documents. A long chat no longer re-renders every earlier message as a reply streams in, and you can scroll up to re-read while a reply is still arriving (it only auto-follows when you're already at the bottom). Opening a document from a citation fetches just that one document instead of the whole list, and the Documents table skips drawing rows you've scrolled past — both stay quick as your library grows.",
+    ],
+  },
+  {
     version: "2.92.25-alpha",
     date: "2026-07-06",
     highlights: [

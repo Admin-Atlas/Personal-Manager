@@ -57,7 +57,7 @@ import {
   resumeDriveSync,
   resumeLocalFolderSync,
   resumeOneDriveSync,
-  reviewQueue,
+  reviewQueueCount,
   setChatModels,
   setConversationProject,
   setHelpMode,
@@ -365,7 +365,7 @@ export default function App() {
 
   const refreshReviewCount = useCallback(async () => {
     try {
-      setReviewCount((await reviewQueue()).length);
+      setReviewCount(await reviewQueueCount());
     } catch {
       /* count is a hint; ignore failures */
     }

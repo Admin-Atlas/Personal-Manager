@@ -11,7 +11,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import type { Document } from "./types";
-import { listDocuments, vaultStatus } from "./ipc";
+import { getDocument, vaultStatus } from "./ipc";
 import { DocumentReader } from "../components/DocumentReader";
 
 interface ReaderState {
@@ -49,14 +49,11 @@ export function ReaderProvider({ view, children }: { view: string; children: Rea
   const openReader = useCallback((doc: Document) => setCurrent(doc), []);
   const closeReader = useCallback(() => setCurrent(null), []);
   const openReaderById = useCallback((id: number) => {
-    // The reader needs the full Document (source type, external ref, project…); a citation has only
-    // the id, so resolve it from the list every surface already loads. No dedicated single-doc getter
-    // exists, and the list is small — reuse it rather than add a backend command.
-    listDocuments()
-      .then((all) => {
-        const doc = all.find((d) => d.id === id);
-        if (doc) setCurrent(doc);
-      })
+    // The reader needs the full Document (source type, external ref, project…); a citation carries only
+    // the id, so fetch just that one document (F-48) rather than materialising the whole list — which
+    // grows with connector estates — to find one row.
+    getDocument(id)
+      .then(setCurrent)
       .catch(() => {});
   }, []);
 

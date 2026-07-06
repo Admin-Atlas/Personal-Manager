@@ -342,6 +342,8 @@ export const sidecarStatus = () => invoke<SidecarStatus>("sidecar_status");
 export const ensureSidecar = () => invoke<void>("ensure_sidecar");
 
 export const listDocuments = () => invoke<Document[]>("list_documents");
+/** Fetch one document by id (F-48) — resolves a citation id without refetching the whole list. */
+export const getDocument = (id: number) => invoke<Document>("get_document", { id });
 
 /** What a pinboard note became after ingest (source id `note:<widgetId>`). */
 export interface NoteIngest {
@@ -455,6 +457,8 @@ export const listProjects = () => invoke<string[]>("list_projects");
 
 /** Documents still awaiting the sorting review (`reviewed = false`). */
 export const reviewQueue = () => invoke<Document[]>("review_queue");
+/** Just the review-queue length for the sidebar badge (F-47) — avoids materialising the whole queue. */
+export const reviewQueueCount = () => invoke<number>("review_queue_count");
 
 /** Ask the AI to propose project/tags/importance for the unreviewed documents,
  *  streaming each proposal back as it's ready. Pass `documentIds` to scope it. */

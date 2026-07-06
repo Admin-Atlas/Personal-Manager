@@ -1,7 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import type { Citation, Message } from "../lib/types";
 import { useDepth } from "../theme";
 import { useReader } from "../lib/reader";
@@ -159,17 +167,21 @@ function Sources({
 
 /** One message and, for a grounded assistant turn, its sources — wired so an inline
  *  `[n]` marker scrolls to and flashes source n. `highlight` flashes the whole turn when a chat
- *  citation navigated here to it (card 7E PR3); `blockRef` lets the parent scroll it into view. */
-function MessageBlock({
+ *  citation navigated here to it (card 7E PR3); `registerBlock` lets the parent scroll it into view. */
+// Memoised (F-50): while a reply streams, ChatView re-renders on every token — without this every
+// prior turn's MessageBlock would re-render too. `registerBlock` and `onOpenChatCitation` are passed as
+// STABLE callbacks and `highlight` is a plain bool, so a settled turn's props don't change token-to-token
+// and React skips it. `message` is referentially stable (it comes from the unchanged `messages` array).
+const MessageBlock = memo(function MessageBlock({
   message,
   onOpenChatCitation,
   highlight,
-  blockRef,
+  registerBlock,
 }: {
   message: Message;
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
   highlight?: boolean;
-  blockRef?: (el: HTMLDivElement | null) => void;
+  registerBlock: (id: number, el: HTMLDivElement | null) => void;
 }) {
   const { atLeast } = useDepth();
   const itemRefs = useRef<(HTMLLIElement | null)[]>([]);
@@ -188,7 +200,7 @@ function MessageBlock({
 
   return (
     <div
-      ref={blockRef}
+      ref={(el) => registerBlock(message.id, el)}
       className={`flex flex-col gap-1.5 rounded-[var(--radius)] transition-shadow duration-500 motion-reduce:transition-none ${
         highlight ? "ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]" : ""
       }`}
@@ -209,7 +221,7 @@ function MessageBlock({
       )}
     </div>
   );
-}
+});
 
 export function ChatView({ messages, streaming, onOpenChatCitation, focusTurn }: Props) {
   const endRef = useRef<HTMLDivElement>(null);
@@ -221,10 +233,35 @@ export function ChatView({ messages, streaming, onOpenChatCitation, focusTurn }:
   // streaming in) doesn't yank the scroll back up to the old cited turn. Keyed on the nonce, not the
   // turn id, so re-clicking the *same* citation (fresh nonce) re-fires while streaming replies don't.
   const lastNonceRef = useRef<number | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Stable callbacks so memoised MessageBlocks don't re-render every streaming token (F-50). The
+  // citation handler reads the latest prop through a ref, so it stays referentially stable even if the
+  // parent passes a fresh function each render.
+  const onCiteRef = useRef(onOpenChatCitation);
+  onCiteRef.current = onOpenChatCitation;
+  const openCitation = useCallback(
+    (conversationId: number, turnId: number | null) => onCiteRef.current?.(conversationId, turnId),
+    [],
+  );
+  const registerBlock = useCallback((id: number, el: HTMLDivElement | null) => {
+    if (el) blockRefs.current.set(id, el);
+    else blockRefs.current.delete(id);
+  }, []);
+
+  // Snap to the newest turn when the message set changes (a new turn, or a conversation just opened).
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, streaming]);
+  }, [messages]);
+  // While a reply streams, only stay pinned to the bottom if the user is ALREADY near it — so they can
+  // scroll up to read earlier turns mid-stream without being dragged back down every token (F-50).
+  useEffect(() => {
+    if (streaming === null) return;
+    const el = scrollRef.current;
+    if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 120) {
+      endRef.current?.scrollIntoView({ behavior: "auto" });
+    }
+  }, [streaming]);
 
   // Arrive on a cited turn: scroll it into view and flash it once (mirrors ProjectView's file focus).
   // Depends on `messages` too, so it still fires when the target conversation's turns load a tick after
@@ -249,7 +286,7 @@ export function ChatView({ messages, streaming, onOpenChatCitation, focusTurn }:
     atLeast("standard") && streaming === null ? resumeMarkerDate(messages, Date.now()) : null;
 
   return (
-    <div className="flex-1 overflow-y-auto">
+    <div ref={scrollRef} className="flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-6">
         {empty && (
           <div className="mt-24 text-center text-ink3">
@@ -267,12 +304,9 @@ export function ChatView({ messages, streaming, onOpenChatCitation, focusTurn }:
           <MessageBlock
             key={m.id}
             message={m}
-            onOpenChatCitation={onOpenChatCitation}
+            onOpenChatCitation={openCitation}
             highlight={flashMsg === m.id}
-            blockRef={(el) => {
-              if (el) blockRefs.current.set(m.id, el);
-              else blockRefs.current.delete(m.id);
-            }}
+            registerBlock={registerBlock}
           />
         ))}
         {streaming !== null && <Bubble role="assistant" content={streaming} />}
