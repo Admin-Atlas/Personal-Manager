@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.17-alpha",
+    date: "2026-07-06",
+    highlights: [
+      "Snappier search on big pastes, and a sturdier index fingerprint. Dropping a very large block of text into a search or chat used to make PM briefly grind while it built a keyword query out of every single word — that keyword step is now bounded, so search stays quick no matter how much you paste. And under the hood, the fingerprint PM uses to decide when your search index needs rebuilding now covers two settings it was missing, so a future change to how results are ranked or text is tokenised will correctly offer a one-time rebuild instead of quietly drifting out of sync.",
+    ],
+  },
+  {
     version: "2.92.16-alpha",
     date: "2026-07-06",
     highlights: [

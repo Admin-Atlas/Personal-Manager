@@ -357,44 +357,40 @@ fn keyword_search(
 }
 
 /// The most bigram phrases a single multilingual query contributes to one MATCH expression. A long
-/// CJK paste would otherwise expand into ~one phrase per character and could blow past FTS5's
-/// expression limits; capping (after dedupe) keeps the expression bounded. This guards only the new
-/// multilingual path — the principled term cap for *all* scripts is a separate finding (F-32).
-const MULTILINGUAL_TERM_CAP: usize = 64;
+/// The cap on the number of distinct quoted phrases in one generated FTS5 MATCH expression, for
+/// **every** script (F-32). Pasting a wall of text — or a long space-less CJK run — would otherwise
+/// expand into thousands of OR-ed phrases and stall the keyword branch for seconds *while the DB
+/// mutex is held* (and can blow past FTS5's own expression limits). 64 deduped terms is far more
+/// than any genuine search carries, and bounds the expression regardless of input size.
+const FTS_TERM_CAP: usize = 64;
 
-/// Turn arbitrary user text into a safe FTS5 MATCH expression: keep alphanumeric
-/// runs, quote each as a phrase, and OR them together. Returns `None` if nothing
-/// usable remains, so the caller skips the keyword branch rather than hitting an
-/// `fts5: syntax error` on stray punctuation.
+/// Turn arbitrary user text into a safe FTS5 MATCH expression: tokenise, lowercase, quote each token
+/// as a phrase (the injection/syntax safety untrusted query text relies on), **dedupe and cap**
+/// ([`FTS_TERM_CAP`], F-32), and OR them together. Returns `None` if nothing usable remains, so the
+/// caller skips the keyword branch rather than hitting an `fts5: syntax error` on stray punctuation.
 ///
-/// On a multilingual vault (F-33) the terms come from [`crate::fts_segment::fts_tokens`] instead —
-/// the same segmentation the index stored — so a space-less CJK run becomes OR-ed bigram phrases
-/// that actually match, while Latin words in the same query stay whole. The non-multilingual path
-/// is left byte-for-byte identical, so English/default vaults produce exactly the MATCH string they
-/// did before and never change behaviour.
+/// Only the *tokeniser* differs by script. The default path splits on non-alphanumerics — so
+/// English/default vaults produce exactly the phrases they did before (dedupe is a no-op for a normal
+/// query with distinct words; the cap only bites a pathological paste). A multilingual vault (F-33)
+/// tokenises via [`crate::fts_segment::fts_tokens`] — the same segmentation the index stored — so a
+/// space-less CJK run becomes OR-ed bigram phrases that actually match, while Latin words in the same
+/// query stay whole.
 fn fts_query(text: &str, multilingual: bool) -> Option<String> {
-    if !multilingual {
-        let terms: Vec<String> = text
-            .split(|c: char| !c.is_alphanumeric())
+    let tokens: Vec<String> = if multilingual {
+        crate::fts_segment::fts_tokens(text)
+    } else {
+        text.split(|c: char| !c.is_alphanumeric())
             .filter(|t| !t.is_empty())
-            .map(|t| format!("\"{}\"", t.to_lowercase()))
-            .collect();
-        return if terms.is_empty() {
-            None
-        } else {
-            Some(terms.join(" OR "))
-        };
-    }
-    // Multilingual: dedupe (overlapping bigrams repeat) and cap so a long paste can't build a
-    // pathological expression. Each token stays a quoted phrase, preserving the injection/syntax
-    // safety the English path relies on for untrusted query text.
+            .map(str::to_string)
+            .collect()
+    };
     let mut seen = std::collections::HashSet::new();
     let mut terms: Vec<String> = Vec::new();
-    for token in crate::fts_segment::fts_tokens(text) {
+    for token in tokens {
         let lowered = token.to_lowercase();
         if seen.insert(lowered.clone()) {
             terms.push(format!("\"{lowered}\""));
-            if terms.len() >= MULTILINGUAL_TERM_CAP {
+            if terms.len() >= FTS_TERM_CAP {
                 break;
             }
         }
@@ -773,6 +769,33 @@ mod tests {
         );
         // Overlapping bigrams dedupe rather than repeat.
         assert_eq!(fts_query("好好好", true).as_deref(), Some("\"好好\""));
+    }
+
+    #[test]
+    fn fts_query_dedupes_and_caps_every_script() {
+        // F-32: the default (English) path now dedupes + caps just like the multilingual one, so a long
+        // paste can't build a multi-second, thousands-of-terms OR-expression under the DB mutex.
+        // Repeated words collapse to one phrase (a semantically identical MATCH, bounded size).
+        assert_eq!(
+            fts_query("spam spam spam eggs", false).as_deref(),
+            Some("\"spam\" OR \"eggs\"")
+        );
+        // A paste of 500 distinct words is capped to exactly FTS_TERM_CAP quoted phrases.
+        let many: String = (0..500).map(|i| format!("w{i} ")).collect();
+        let q = fts_query(&many, false).expect("some terms survive");
+        assert_eq!(
+            q.matches(" OR ").count() + 1,
+            FTS_TERM_CAP,
+            "the English path is bounded by FTS_TERM_CAP regardless of input size"
+        );
+        // The multilingual path shares the same cap (it always had one; F-32 unifies the bound).
+        let cjk: String = (0..500).map(|_| '好').collect();
+        let qm = fts_query(&cjk, true).expect("some bigrams survive");
+        let multilingual_terms = qm.matches(" OR ").count() + 1;
+        assert!(
+            multilingual_terms <= FTS_TERM_CAP,
+            "the multilingual path stays within the same cap"
+        );
     }
 
     #[test]

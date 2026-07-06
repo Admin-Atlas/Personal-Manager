@@ -16,11 +16,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::registry;
+use crate::retrieval;
 use crate::splitter;
 
 /// Format version of the stamp itself (distinct from the splitter version it carries). Bump if
 /// the *meaning* of a stamp field changes in a way equality wouldn't otherwise catch.
 const STAMP_VERSION: u32 = 1;
+
+/// The base tokeniser `chunks_fts` is built with today (F-34). The FTS5 table is created with no
+/// `tokenize=` clause, so it uses the built-in `unicode61`; only the *segmentation* layer above it
+/// (`fts_segmentation`, F-33) was stamped before, leaving a change to the base tokeniser itself able
+/// to slip past Rebuild-on-mismatch. Kept as one const so a future migration that rebuilds the FTS
+/// table with a different tokeniser has a single place to update, which then trips the stamp — see the
+/// `CREATE VIRTUAL TABLE chunks_fts` DDL in `db/migrations.rs`.
+const FTS_TOKENIZER: &str = "unicode61";
 
 /// The index-time configuration of a vault. Equality is field-wise: any difference means the
 /// stored index no longer matches what this build would produce, so a Rebuild is offered.
@@ -53,6 +62,13 @@ pub struct RetrievalConfig {
     /// and forcing every vault to rebuild.
     #[serde(default = "default_fts_segmentation")]
     pub fts_segmentation: String,
+    /// The base `chunks_fts` tokeniser descriptor ([`FTS_TOKENIZER`], F-34). The segmentation field
+    /// above captures the CJK layer; this captures the tokeniser under it, so a change to the FTS
+    /// table's tokeniser DDL now trips Rebuild-on-mismatch too. Serde-defaulted to today's value, so a
+    /// stamp written before this field still equals the current one (English **and** multilingual
+    /// vaults) — no vault sees a spurious Rebuild from adding it.
+    #[serde(default = "default_fts_tokenizer")]
+    pub fts_tokenizer: String,
 }
 
 /// The pre-field value: a stamp written before FTS segmentation existed described a plain
@@ -60,6 +76,13 @@ pub struct RetrievalConfig {
 /// English vault produces today and therefore never triggers a spurious Rebuild.
 fn default_fts_segmentation() -> String {
     "none".to_string()
+}
+
+/// The pre-field value: a stamp written before the base tokeniser was stamped described the same
+/// `unicode61` FTS index the build produces today, so it defaults to [`FTS_TOKENIZER`] and never
+/// triggers a spurious Rebuild.
+fn default_fts_tokenizer() -> String {
+    FTS_TOKENIZER.to_string()
 }
 
 impl RetrievalConfig {
@@ -77,7 +100,15 @@ impl RetrievalConfig {
             splitter_version: splitter::SPLITTER_VERSION,
             embedder_id: embedder.id.to_string(),
             dimension: embedder.dimension,
-            index_params: "hybrid-rrf-k60-recency90".to_string(),
+            // Derived from the owning retrieval consts (F-34), not a hand-typed literal — a change to
+            // the RRF constant or the recency half-life now flows into the stamp and offers a Rebuild.
+            // Formats byte-identically to the previous "hybrid-rrf-k60-recency90" (f64 Display drops the
+            // trailing .0), so existing vaults see no spurious mismatch.
+            index_params: format!(
+                "hybrid-rrf-k{}-recency{}",
+                retrieval::RRF_K,
+                retrieval::HALF_LIFE_DAYS
+            ),
             // Gated on the registry capability, never a model id (model-agnostic). This is the
             // whole delta that makes ONLY multilingual vaults rebuild for F-33 — no STAMP_VERSION
             // bump, which would drag English vaults into a rebuild too.
@@ -86,6 +117,8 @@ impl RetrievalConfig {
             } else {
                 "none".to_string()
             },
+            // The base tokeniser under the segmentation layer (F-34); same for every vault today.
+            fts_tokenizer: FTS_TOKENIZER.to_string(),
         }
     }
 
@@ -175,6 +208,42 @@ mod tests {
     fn segmentation_difference_alone_breaks_equality() {
         let mut other = RetrievalConfig::current();
         other.fts_segmentation = "cjk-bigram-v1".to_string();
+        assert_ne!(other, RetrievalConfig::current());
+    }
+
+    #[test]
+    fn index_params_is_derived_and_byte_stable() {
+        // F-34: index_params is now derived from the owning retrieval consts (RRF_K, HALF_LIFE_DAYS)
+        // rather than a hand-typed literal — but it MUST reproduce the exact historical string, or every
+        // existing vault would see a spurious stamp mismatch and be dragged into a Rebuild.
+        assert_eq!(
+            RetrievalConfig::current().index_params,
+            "hybrid-rrf-k60-recency90"
+        );
+    }
+
+    #[test]
+    fn a_stamp_written_before_the_tokenizer_field_defaults_to_unicode61() {
+        // Same load-bearing serde default as fts_segmentation: a stamp serialized before fts_tokenizer
+        // existed must deserialize to the current base tokeniser (not fail to parse), and still compare
+        // equal to the current stamp so no vault rebuilds merely because the field was added.
+        let mut value = serde_json::to_value(RetrievalConfig::current()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fts_tokenizer")
+            .expect("field present in the current serialization");
+        let back: RetrievalConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(back.fts_tokenizer, "unicode61");
+        assert_eq!(back, RetrievalConfig::current());
+    }
+
+    #[test]
+    fn tokenizer_difference_alone_breaks_equality() {
+        // A future migration that rebuilt chunks_fts with a different tokeniser would change this field
+        // and therefore offer the one-time Rebuild — the whole point of stamping it (F-34).
+        let mut other = RetrievalConfig::current();
+        other.fts_tokenizer = "porter-unicode61".to_string();
         assert_ne!(other, RetrievalConfig::current());
     }
 
