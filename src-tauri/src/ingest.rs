@@ -918,6 +918,16 @@ pub fn ingest_note_document(
         ),
     };
 
+    // The note is named by its widget id, which arrives over IPC. Restrict it to a conservative id
+    // charset so the derived name is always a single, ordinary filename inside the vault and can't
+    // point anywhere else. Real ids (a UUID, or the `w-…` fallback) are unaffected.
+    if widget_id.is_empty()
+        || !widget_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(Error::Other("invalid note id".into()));
+    }
     // Name the file by the stable widget id so an edit overwrites the same file.
     let vault_name = cipher.on_disk_name(&format!("note-{widget_id}.md"));
     let vault_file = vault.join(&vault_name);
