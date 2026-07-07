@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.55-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "A batch of reliability fixes. PM no longer churns files inside ignored folders (like node_modules or .git) in and out of a tracked local folder; a folder too large to list in one pass keeps its extra files instead of dropping them; and a folder whose sync hits an error now says so, instead of showing 'all good'. Preferences you state in a long chat are no longer skipped when there's a backlog. A spreadsheet column name containing a '|' no longer breaks its table, and 'you're prepared' no longer shows on the wrong occurrence of a repeating event.",
+    ],
+  },
+  {
     version: "2.92.54-alpha",
     date: "2026-07-07",
     highlights: [

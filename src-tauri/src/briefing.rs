@@ -154,10 +154,19 @@ pub fn build_flag_snapshot(
 
     // Resolution-as-enrichment: a resolved prepare-ahead means the user is already set for that
     // event, so its still-active happening-today line says "you're prepared" instead of nagging.
-    let resolved_prep_by_anchor: HashMap<(&str, &str), &Flag> = resolved_prep
+    let resolved_prep_by_anchor: HashMap<(&str, &str, Option<&str>), &Flag> = resolved_prep
         .iter()
         .filter(|f| f.r#type == flags::TYPE_PREPARE_AHEAD)
-        .map(|f| ((f.anchor_kind.as_str(), f.anchor.as_str()), f))
+        .map(|f| {
+            (
+                (
+                    f.anchor_kind.as_str(),
+                    f.anchor.as_str(),
+                    f.instance_at.as_deref(),
+                ),
+                f,
+            )
+        })
         .collect();
 
     let mut overdue = Vec::new();
@@ -178,9 +187,11 @@ pub fn build_flag_snapshot(
             }
             flags::TYPE_HAPPENING_TODAY => {
                 if let Some(mut line) = event_line(&event_by_uid, &f.anchor, zone, true) {
-                    if let Some(prep) =
-                        resolved_prep_by_anchor.get(&(f.anchor_kind.as_str(), f.anchor.as_str()))
-                    {
+                    if let Some(prep) = resolved_prep_by_anchor.get(&(
+                        f.anchor_kind.as_str(),
+                        f.anchor.as_str(),
+                        f.instance_at.as_deref(),
+                    )) {
                         line.push_str(&prepared_suffix(prep));
                     }
                     today_events.push(line);
@@ -442,6 +453,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             resolved_at: None,
+            instance_at: None,
         }
     }
 

@@ -123,6 +123,10 @@ pub struct Flag {
     pub created_at: String,
     pub updated_at: String,
     pub resolved_at: Option<String>,
+    /// The specific occurrence this flag is about (a timed event's start), so a resolved prep on one
+    /// occurrence of a recurring event doesn't annotate another. `None` for a milestone flag (already
+    /// per-instance) or a row written before this column existed.
+    pub instance_at: Option<String>,
 }
 
 /// A flag proposed by detection, before it is persisted. `upsert_active` inserts it or
@@ -142,7 +146,8 @@ pub struct DraftFlag {
 }
 
 const FLAG_COLUMNS: &str = "id, anchor_kind, anchor, type, threshold, state, source, \
-     confidence, user_confirmed, artifact_ptr, artifact_url, created_at, updated_at, resolved_at";
+     confidence, user_confirmed, artifact_ptr, artifact_url, created_at, updated_at, resolved_at, \
+     instance_at";
 
 fn row_to_flag(r: &rusqlite::Row) -> rusqlite::Result<Flag> {
     Ok(Flag {
@@ -160,6 +165,7 @@ fn row_to_flag(r: &rusqlite::Row) -> rusqlite::Result<Flag> {
         created_at: r.get(11)?,
         updated_at: r.get(12)?,
         resolved_at: r.get(13)?,
+        instance_at: r.get(14)?,
     })
 }
 
