@@ -588,7 +588,8 @@ export default function App() {
   // and sidebar tag reflect it.
   function handleUpgrade(modelId: string) {
     const rest = (settings?.chat_models ?? []).filter((m) => m !== modelId);
-    setChatModels([modelId, ...rest])
+    // Return the promise so the context meter can re-read AFTER the switch has landed.
+    return setChatModels([modelId, ...rest])
       .then(refreshSettings)
       .catch(() => {});
   }

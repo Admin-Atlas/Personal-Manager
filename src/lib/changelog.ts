@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.53-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Glitch-free fast switching. Rapidly switching between conversations or documents no longer lets a slow background load land on the wrong one — the context meter, the chunk overlay, and the document chunk panel now ignore results for a view you've already moved on from. And after switching the chat to a larger-context model, the meter refreshes once the switch has actually taken effect. No change to how anything works.",
+    ],
+  },
+  {
     version: "2.92.52-alpha",
     date: "2026-07-07",
     highlights: [

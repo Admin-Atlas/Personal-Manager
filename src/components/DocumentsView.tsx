@@ -132,6 +132,10 @@ export function DocumentsView({ onReviewClick }: Props) {
     }
   }
 
+  // Latest open-chunks doc id, so a late chunk fetch that resolves after the user opened another
+  // doc's chunks is dropped rather than shown under the wrong document.
+  const chunksForRef = useRef(chunksFor);
+  chunksForRef.current = chunksFor;
   async function toggleChunks(docId: number) {
     if (chunksFor === docId) {
       setChunksFor(null);
@@ -141,7 +145,9 @@ export function DocumentsView({ onReviewClick }: Props) {
     setChunksFor(docId);
     setChunkPage(null);
     try {
-      setChunkPage(await devDocumentChunks(docId));
+      const page = await devDocumentChunks(docId);
+      // Drop a late result if the user has since opened a different doc's chunks (or closed them).
+      if (chunksForRef.current === docId) setChunkPage(page);
     } catch {
       /* read-only diagnostic — leave the panel empty on failure */
     }

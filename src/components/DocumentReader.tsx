@@ -6,6 +6,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type { ChunkSpan, Document, ImageData } from "../lib/types";
@@ -83,6 +84,10 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [showChunks, setShowChunks] = useState(false);
   const [spans, setSpans] = useState<ChunkSpan[] | null>(null);
+  // Latest doc id, so a slow chunk-spans fetch that resolves after the reader moved to another
+  // document is dropped rather than painted over the new one.
+  const docIdRef = useRef(doc.id);
+  docIdRef.current = doc.id;
   const [width, setWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem(READER_WIDTH_KEY));
     return Number.isFinite(saved) && saved > 0 ? saved : READER_DEFAULT_WIDTH;
@@ -193,11 +198,13 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
     const next = !showChunks;
     setShowChunks(next);
     if (next && spans == null) {
+      const forDoc = doc.id;
       try {
-        setSpans(await documentChunkSpans(doc.id));
+        const s = await documentChunkSpans(forDoc);
+        if (docIdRef.current === forDoc) setSpans(s);
       } catch {
         // Read-only diagnostic — drop back to the plain reader on failure.
-        setShowChunks(false);
+        if (docIdRef.current === forDoc) setShowChunks(false);
       }
     }
   }
