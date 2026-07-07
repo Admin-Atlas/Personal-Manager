@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.42-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Your documents and calendar entries can't dress themselves up as PM's own formatting. When PM cites sources in an answer, or lists your agenda, the text inside a document or a calendar event is now kept clearly separate from PM's own citation numbers and agenda lines — so nothing you've saved can be made to look like it came from PM itself.",
+    ],
+  },
+  {
     version: "2.92.41-alpha",
     date: "2026-07-06",
     highlights: [
