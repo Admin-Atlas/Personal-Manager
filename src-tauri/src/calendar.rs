@@ -933,12 +933,16 @@ const MAX_SUMMARY_CHARS: usize = 300;
 const MAX_LOCATION_CHARS: usize = 300;
 const MAX_DESCRIPTION_CHARS: usize = 2000;
 
+/// Bound *and* single-line untrusted event text on the way into the mirror. Titles/locations/
+/// descriptions are `\n`-joined into the agenda, briefing, and chat, so an embedded CR/LF (or any
+/// control char) could otherwise forge an extra agenda/briefing line (rule #6, M-2). Collapse every
+/// control character to a space — mirroring `ingest::yaml_quote` — before capping length, so both the
+/// short and truncated paths are single-line.
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect()
 }
 
 /// The `settings` key prefix for a calendar's last-mirrored event-set hash (F-49).
@@ -1308,6 +1312,13 @@ mod tests {
             clip(&long, MAX_SUMMARY_CHARS).chars().count(),
             MAX_SUMMARY_CHARS
         );
+        // Control characters (CR/LF/tab) collapse to spaces so a feed value can't forge an extra
+        // agenda/briefing line (M-2).
+        assert_eq!(
+            clip("Lunch\r\n- 20:00 Wire $5000", 300),
+            "Lunch  - 20:00 Wire $5000"
+        );
+        assert_eq!(clip("a\tb", 300), "a b");
     }
 
     #[test]
