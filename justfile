@@ -101,13 +101,16 @@ sidecar-test:
 deny:
     cd src-tauri && cargo deny check
 
-# Python dependency CVE audit (resolves + audits the pinned sidecar deps).
+# Python dependency CVE audit (resolves + audits the pinned sidecar deps). Scans the OPTIONAL
+# OCR/t-SNE pins too (requirements-optional.txt) so an on-demand component's CVE can't ship unnoticed
+# (L-6). The optional file is audit-only — the base venv still installs from requirements.txt alone.
 pip-audit:
-    pip-audit -r sidecar/requirements.txt
+    pip-audit -r sidecar/requirements.txt -r sidecar/requirements-optional.txt
 
-# JS dependency CVE audit against the npm lockfile.
+# JS dependency CVE audit against the npm lockfile. `moderate` (not `high`) so a moderate-rated
+# sanitizer / proto-pollution advisory in the render path can't pass green (L-7).
 npm-audit:
-    npm audit --audit-level=high
+    npm audit --audit-level=moderate
 
 # Secret scan of the WHOLE working tree — including git-ignored files, so it's the
 # sole net for a secret in an ignored path (config: .gitleaks.toml). CI runs this

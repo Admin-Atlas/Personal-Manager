@@ -1676,6 +1676,31 @@ mod tests {
         assert_eq!(OPTIONAL_OCR_PINS.join(";"), OPTIONAL_OCR_MARKER);
     }
 
+    /// L-6: the audit-only `sidecar/requirements-optional.txt` (which `just pip-audit` scans) must list
+    /// exactly the optional pins whose source of truth is `OPTIONAL_TSNE_PIN` + `OPTIONAL_OCR_PINS`, so
+    /// a bumped/added optional pin can't silently escape CVE scanning.
+    #[test]
+    fn optional_requirements_file_matches_the_pins() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sidecar/requirements-optional.txt"
+        );
+        let contents = std::fs::read_to_string(path)
+            .expect("sidecar/requirements-optional.txt must exist for the pip-audit scan (L-6)");
+        let listed: Vec<String> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect();
+        let mut expected = vec![OPTIONAL_TSNE_PIN.to_string()];
+        expected.extend(OPTIONAL_OCR_PINS.iter().map(|s| s.to_string()));
+        assert_eq!(
+            listed, expected,
+            "requirements-optional.txt must list exactly the optional pins, in order"
+        );
+    }
+
     #[test]
     fn input_size_guard_rejects_over_cap_files() {
         // F-57: exactly at the cap is fine; one byte over is refused, so a 500 MB file is pre-flighted
