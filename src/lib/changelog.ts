@@ -8,7 +8,7 @@
 // ┌─────────────────────────────────────────────────────────────────────────┐
 // │ RELEASE CHECKLIST: add a new entry at the TOP for every release, with the │
 // │ version matching package.json / tauri.conf.json / Cargo.toml. Newest      │
-// │ first. See docs/RELEASING.md.                                             │
+// │ first. See RELEASING.md (repo root).                                      │
 // └─────────────────────────────────────────────────────────────────────────┘
 
 export interface ChangelogEntry {
@@ -18,6 +18,27 @@ export interface ChangelogEntry {
 }
 
 export const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "3.0.0-alpha",
+    date: "2026-07-08",
+    highlights: [
+      "PM 3.0.0 rolls up everything since the last public release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
+      "Connect your clouds — Google Drive and OneDrive are indexed in place: what's in them turns up in your search, and nothing is copied out of your drive.",
+      "Watch folders on this computer — point PM at a folder and it keeps itself current as you work; an edit is searchable within seconds.",
+      "A real calendar — Google (several accounts), Outlook and iCal subscriptions together, in Month, Week, Day, Year and Agenda views.",
+      "Chats are part of your memory — past conversations become searchable, answers cite the exact turn they drew from, chats name themselves, and each project keeps its own.",
+      "A briefing that tracks instead of narrates — deadlines, today's events and prep-ahead nudges are real items you can mark done, or just tell it “the deck is done” in plain words.",
+      "Projects with real milestones — several dated deadlines per project, priorities you set (or PM infers for projects other work waits on), and a sortable Focus view.",
+      "Encrypted backups — your whole vault in one passphrase-protected file, on demand or on a schedule, to your own Proton Drive or Google Drive.",
+      "A map of your knowledge — your documents arranged by meaning on a fast, navigable canvas.",
+      "A built-in reader — click any document, or any source a chat answer cites, and read it right there; cloud items fetch their full text on demand.",
+      "Photos and spreadsheets, done properly — screenshots read with on-device text recognition; spreadsheets indexed row by row, with one-click full import for Google Sheets.",
+      "A Pinboard that keeps up — notes with real formatting, timelines linked to real projects, and one-click ingest of a note into your vault.",
+      "Teach PM your world — merge and rename project names for good, and keep structured preferences that PM applies exactly where they fit.",
+      "Sharper search — structure-aware chunking, a re-ranking second pass, multilingual vaults, and proper Chinese/Japanese/Korean keyword search.",
+      "Quality of life — a calm new monochrome look with a sun-following Auto mode, a Storage tab to reclaim space, one-click Mac setup, a tidy uninstall, and a read-only Developer mode for the curious.",
+    ],
+  },
   {
     version: "2.92.57-alpha",
     date: "2026-07-07",
