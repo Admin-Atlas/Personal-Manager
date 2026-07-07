@@ -12,8 +12,10 @@ A local-first desktop app that **archives your knowledge so you can find and use
 and **gives you one clean view of everything you have going on**. Your data stays on
 your device: the local database (settings, search index, metadata) is always
 encrypted, and your documents live in a Markdown vault you can keep private to this
-device or protect with a passphrase and carry between machines. The only traffic that
-leaves is the model API call — and, if you connect one, a read-only calendar fetch.
+device or protect with a passphrase and carry between machines. Little leaves your device:
+the model API calls that power chat, a launch-time update check, a one-time first-run download
+of PM's local models, and — only if you set them up — a read-only calendar fetch and encrypted
+backups to your own cloud.
 
 This repo is the **application code**. Your personal data is never committed — it lives
 in a separate, machine-local data directory (see [Where your data lives](#where-your-data-lives)).
@@ -198,10 +200,13 @@ it up:
 - A **passphrase-protected vault** additionally encrypts each Markdown file at rest,
   so it stays protected even when shared or carried to another machine.
 
-Either way, you can export everything to plain Markdown whenever you like. The only
-outbound traffic is the model call (and an optional read-only calendar fetch). The repo
-holds code only — see [`SECURITY.md`](SECURITY.md) for the security policy and how to
-report an issue privately.
+Either way, you can export everything to plain Markdown whenever you like. Outbound traffic
+is limited and enumerable: the model API calls that power chat; a check for updates on launch
+(and the download if you accept one); a one-time first-run download of PM's on-device models
+and Python dependencies; and — only if you turn them on — a read-only calendar fetch and
+encrypted backups to your chosen cloud (Proton Drive or Google Drive). Nothing else leaves the
+machine: there is no telemetry, analytics, or crash reporting. The repo holds code only — see
+[`SECURITY.md`](SECURITY.md) for the security policy and how to report an issue privately.
 
 ## Contributing & releasing
 

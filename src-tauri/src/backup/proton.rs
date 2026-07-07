@@ -716,7 +716,7 @@ mod tests {
     /// A real `filesystem list --json` node captured from the CLI (2026-07-02), so the parser
     /// is pinned to the actual serialized shape, not a guess.
     const CAPTURED_FILE_NODE: &str = r#"[
-{"uid":"scope~aaa","parentUid":"scope~bbb","name":{"ok":true,"value":"pm-backup-20260702T161659Z.pmbackup"},"keyAuthor":{"ok":true,"value":"Projects.BobbyYu@proton.me"},"directRole":"admin","ownedBy":{"email":"Projects.BobbyYu@proton.me"},"type":"file","mediaType":"application/octet-stream","isShared":false,"creationTime":"2026-07-02T16:17:02.000Z","totalStorageSize":0,"activeRevision":{"ok":true,"value":{"uid":"rev","state":"active","storageSize":84,"claimedSize":4096,"claimedDigests":{"sha1":"abc","sha1Verified":false}}}}
+{"uid":"scope~aaa","parentUid":"scope~bbb","name":{"ok":true,"value":"pm-backup-20260702T161659Z.pmbackup"},"keyAuthor":{"ok":true,"value":"me@proton.me"},"directRole":"admin","ownedBy":{"email":"me@proton.me"},"type":"file","mediaType":"application/octet-stream","isShared":false,"creationTime":"2026-07-02T16:17:02.000Z","totalStorageSize":0,"activeRevision":{"ok":true,"value":{"uid":"rev","state":"active","storageSize":84,"claimedSize":4096,"claimedDigests":{"sha1":"abc","sha1Verified":false}}}}
 ]"#;
 
     #[test]
@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(entries[0].size, Some(4096));
         assert_eq!(
             first_owner_email(CAPTURED_FILE_NODE).as_deref(),
-            Some("Projects.BobbyYu@proton.me")
+            Some("me@proton.me")
         );
     }
 

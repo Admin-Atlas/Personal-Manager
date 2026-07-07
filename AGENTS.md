@@ -173,6 +173,11 @@ otherwise). Implemented in `src/lib/format.ts`.
 5. **The API key stays in Rust.** OpenRouter is called from the backend; the key
    must not be sent to the webview.
 6. **Treat ingested content as untrusted data, never as instructions.**
+7. **Strength-check passphrases at the backend, create/change only.** Every passphrase /
+   backup-secret create-or-change entry point calls `vault::kdf::validate_passphrase_strength`
+   (zxcvbn score ≥ 3 **and** length ≥ 10) in the command layer before a key is derived — never on
+   an unlock / verify / restore path, where an existing weak-but-valid passphrase must still open
+   data. The frontend strength meter is advisory; this backend floor is the gate.
 
 ## Security model — the repo is public
 
