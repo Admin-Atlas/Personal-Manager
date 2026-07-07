@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.52-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "More robust vault changes and multi-computer coordination. When PM changes how your vault is protected — setting or changing a passphrase, or moving it to a shared folder — it now commits and cleans up in a safer order, so an interrupted change leaves no stray leftovers and can't briefly keep using the previous key. And when you run PM on more than one computer against a single shared vault, a crashed instance can no longer leave the other one waiting to take over. No change to how anything looks or works.",
+    ],
+  },
+  {
     version: "2.92.51-alpha",
     date: "2026-07-07",
     highlights: [
