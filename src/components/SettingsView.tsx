@@ -476,7 +476,9 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       // First-run: if the user opted into a shareable vault, convert the fresh (empty)
       // device vault now that the key is saved. Device-only needs nothing — it's default.
       if (onboarding && vaultMode === "shareable") {
-        await createShareableVault(vaultPass.trim());
+        // Send the passphrase exactly as typed — spaces included. Trimming here (but not on
+        // the unlock path) would derive a different key at unlock and lock the user out.
+        await createShareableVault(vaultPass);
       }
       onClose();
     } catch (e) {

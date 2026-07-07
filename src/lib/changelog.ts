@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.49-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Fixed a rare lockout when setting up a shareable vault. If your vault passphrase began or ended with a space, PM could store it one way but check it another and then refuse to unlock. PM now uses your passphrase exactly as typed — spaces and all — on every screen. Existing vaults are unaffected.",
+    ],
+  },
+  {
     version: "2.92.48-alpha",
     date: "2026-07-07",
     highlights: [
