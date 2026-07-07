@@ -1,0 +1,9 @@
+# Scanned-but-not-installed: the OPTIONAL sidecar components' pins (L-6). These are kept OUT of
+# requirements.txt on purpose so the base venv's `.ready` hash — and existing users' venvs — stay
+# untouched (see the comments in requirements.txt and sidecar.rs). This file is AUDIT-ONLY: nothing in
+# Rust reads it. The pins' source of truth stays in sidecar.rs (OPTIONAL_TSNE_PIN / OPTIONAL_OCR_PINS),
+# and the `optional_requirements_file_matches_the_pins` unit test keeps this file in lockstep with them.
+# `just pip-audit` scans it alongside requirements.txt so an OCR / t-SNE CVE can't ship unnoticed.
+openTSNE==1.0.4
+rapidocr==3.9.0
+pillow-heif==1.4.0

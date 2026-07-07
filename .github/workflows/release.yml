@@ -332,6 +332,22 @@ jobs:
           SIG_DIR: artifacts
         run: node scripts/verify-updater-signatures.mjs
 
+      # Publish a SHA256SUMS manifest so a manual downloader of the raw installers can verify
+      # integrity (the minisign .sig is updater-only, not a per-file checksum). NOT Authenticode —
+      # OS code-signing is blocked on Atlas incorporation (L-9). Runs BEFORE "Publish release": that
+      # step's find sweeps every non-.sig / non-latest.json file in artifacts/, so writing
+      # artifacts/SHA256SUMS here auto-includes it in the uploaded assets.
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd artifacts
+          # Checksum every published asset by basename (assets merge flat here), excluding the
+          # signatures and the sums file itself.
+          find . -maxdepth 1 -type f ! -name '*.sig' ! -name 'SHA256SUMS' -printf '%P\0' \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.47-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Under-the-hood tidying. Each PM release now publishes a checksum file so you can verify an installer you downloaded by hand; the optional add-on components (photo text recognition, the knowledge-map reducer) are now covered by the same dependency security scanning as the core, and that scanning flags a wider range of advisories. No change to how anything works.",
+    ],
+  },
+  {
     version: "2.92.46-alpha",
     date: "2026-07-07",
     highlights: [
