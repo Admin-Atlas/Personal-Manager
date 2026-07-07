@@ -3,7 +3,7 @@
 
 //! Spreadsheet ingestion (board card: Spreadsheet Processing).
 //!
-//! `.xlsx/.xls/.csv` are a dedicated ingestion path that REUSES the document pipeline wholesale but
+//! `.xlsx/.csv` are a dedicated ingestion path that REUSES the document pipeline wholesale but
 //! BYPASSES MarkItDown (which flattens a sheet into one Markdown pipe table the generic chunker then
 //! slices arbitrarily, stripping every row of its header context). Instead the Python sidecar's
 //! `analyze_spreadsheet` parses values-only into per-sheet structure ([`SheetData`]) and this module

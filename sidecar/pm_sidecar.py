@@ -45,6 +45,18 @@ import traceback
 # to errors; genuine extraction failures still surface.
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
+# H-1 subset: harden the stdlib XML parser against entity-expansion / XXE before any parser that
+# might use it (openpyxl's stdlib fallback when reading an .xlsx). Best-effort — a partial venv
+# without defusedxml proceeds rather than breaking ingest. This patches the STDLIB parser only; when
+# lxml is present openpyxl may use it instead, but lxml resolves no external entities and caps
+# entity expansion by default, so the .xlsx path stays safe either way.
+try:
+    import defusedxml
+
+    defusedxml.defuse_stdlib()
+except Exception:
+    pass
+
 # The default embedder + dimension (the English model). PR 2 makes embedding
 # model-parameterised: Rust sends the selected model id (and, for a custom model
 # not bundled in fastembed, a registration spec) per request, so a vault can use a
@@ -227,6 +239,13 @@ def clean_text(value):
 # limit before it even asks; this is the in-process backstop. Kept in sync with sidecar.rs
 # MAX_SIDECAR_INPUT_BYTES.
 MAX_INPUT_FILE_BYTES = 128 * 1024 * 1024
+
+# An .xlsx is a zip; openpyxl inflates its worksheet / shared-strings XML. The 128 MiB input cap
+# above bounds the on-disk (compressed) size, NOT the inflated size, so a zip-bomb .xlsx could still
+# balloon memory past it. Reject a workbook whose declared uncompressed size, or inflation ratio,
+# is implausible for a real spreadsheet before openpyxl reads it (H-1 subset).
+MAX_INFLATED_XLSX_BYTES = 1024 * 1024 * 1024  # 1 GiB total uncompressed
+MAX_XLSX_INFLATION_RATIO = 200  # uncompressed : compressed
 
 
 def _guard_file_size(path):
@@ -514,7 +533,7 @@ def do_analyze_image(params):
 
 # ---- spreadsheet ingestion (dedicated processor; bypasses MarkItDown) --------
 #
-# .xlsx/.xls/.csv are routed here by Rust instead of through MarkItDown, which would
+# .xlsx/.csv are routed here by Rust instead of through MarkItDown, which would
 # flatten them into one Markdown pipe table the generic chunker then slices badly
 # (rows lose their header context). We read VALUES ONLY — no formula evaluation, no
 # styling — and hand Rust a per-sheet structure it shapes into a metadata chunk plus
@@ -565,7 +584,7 @@ def _parse_date(value):
 
 def _cell_type(value):
     """Classify one cell into 'int' | 'float' | 'date' | 'bool' | 'string', or None when empty.
-    Native types from openpyxl/xlrd (int/float/datetime/bool) are honoured directly; a string (all
+    Native types from openpyxl (int/float/datetime/bool) are honoured directly; a string (all
     a CSV yields) is try-parsed. Empty/None returns None so it never sways the column's type."""
     import datetime
 
@@ -719,11 +738,39 @@ def _sheets_from_csv(path):
         fh.close()
 
 
+def _guard_xlsx_inflation(path):
+    """Refuse a zip-bomb .xlsx before openpyxl inflates it (H-1 subset). Sums the archive's DECLARED
+    uncompressed and compressed sizes (cheap — no decompression) and rejects when the total
+    uncompressed size, or the inflation ratio, is implausible for a real spreadsheet. openpyxl's
+    `read_only=True` streams rows lazily, so the main eager cost this bounds is the shared-strings
+    table. A non-zip file returns quietly — openpyxl raises its own clean error."""
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            uncompressed = sum(i.file_size for i in zf.infolist())
+            compressed = sum(i.compress_size for i in zf.infolist())
+    except zipfile.BadZipFile:
+        return
+    if uncompressed > MAX_INFLATED_XLSX_BYTES:
+        raise ValueError(
+            f"spreadsheet expands to too much data "
+            f"({uncompressed // (1024 * 1024)} MiB uncompressed; "
+            f"the limit is {MAX_INFLATED_XLSX_BYTES // (1024 * 1024)} MiB)"
+        )
+    if compressed > 0 and uncompressed // compressed > MAX_XLSX_INFLATION_RATIO:
+        raise ValueError(
+            f"spreadsheet compression ratio is implausibly high "
+            f"({uncompressed // compressed}x; the limit is {MAX_XLSX_INFLATION_RATIO}x)"
+        )
+
+
 def _sheets_from_xlsx(path):
     """Every worksheet in an .xlsx/.xlsm. `data_only=True` returns cached VALUES (never formulas);
     `read_only=True` streams rows so a large workbook stays memory-bounded."""
     from openpyxl import load_workbook
 
+    _guard_xlsx_inflation(path)
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
         out = []
@@ -736,48 +783,18 @@ def _sheets_from_xlsx(path):
         wb.close()
 
 
-def _sheets_from_xls(path):
-    """Every sheet in a legacy .xls via xlrd. Date cells are Excel serial numbers, so convert the
-    ones xlrd flags as dates back to datetimes (values only — no formula/style extraction)."""
-    import xlrd
-
-    book = xlrd.open_workbook(path)
-    out = []
-    for sh in book.sheets():
-
-        def _rows(sh=sh, book=book):
-            for r in range(sh.nrows):
-                cells = []
-                for c in range(sh.ncols):
-                    val = sh.cell_value(r, c)
-                    if sh.cell_type(r, c) == xlrd.XL_CELL_DATE:
-                        try:
-                            val = xlrd.xldate_as_datetime(val, book.datemode)
-                        except Exception:
-                            pass
-                    cells.append(val)
-                yield cells
-
-        sheet = _build_sheet(sh.name, _rows())
-        if sheet:
-            out.append(sheet)
-    return out
-
-
 def do_analyze_spreadsheet(params):
-    """Parse a spreadsheet (.xlsx/.xls/.csv) into per-sheet structure for the dedicated ingest path,
+    """Parse a spreadsheet (.xlsx/.csv) into per-sheet structure for the dedicated ingest path,
     bypassing MarkItDown. Reads VALUES ONLY — no formula evaluation, no styling. Each sheet reports
     its headers, TRUE row_count, per-column inferred types, an optional date range, and up to
     SPREADSHEET_ROW_CAP stringified rows (`truncated` set when the sheet had more). Rust shapes
     these into a metadata chunk + self-describing row chunks. Cell text is untrusted data — cleaned,
-    never executed."""
+    never executed. Legacy .xls is not supported (its xlrd parser surface was dropped, H-1)."""
     path = params["path"]
     _guard_file_size(path)
     ext = (params.get("ext") or "").lower().lstrip(".")
     if ext in ("xlsx", "xlsm"):
         sheets = _sheets_from_xlsx(path)
-    elif ext == "xls":
-        sheets = _sheets_from_xls(path)
     elif ext == "csv":
         sheets = _sheets_from_csv(path)
     else:

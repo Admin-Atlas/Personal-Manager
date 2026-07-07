@@ -818,7 +818,7 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE documents ADD COLUMN source_parent_folder_name TEXT;
     ALTER TABLE documents ADD COLUMN source_account TEXT;
     "#,
-    // v30: spreadsheet ingestion (board card: Spreadsheet Processing). `.xlsx/.xls/.csv` become a
+    // v30: spreadsheet ingestion (board card: Spreadsheet Processing). `.xlsx/.csv` become a
     // dedicated ingest path that BYPASSES MarkItDown; a spreadsheet lands as a `documents` row with
     // `source_type='spreadsheet'` (so the existing split/embed/FTS/vector/retrieval/Map/citation/
     // rebuild/deletion machinery works unchanged) PLUS a row in the NEW `spreadsheets` satellite table.

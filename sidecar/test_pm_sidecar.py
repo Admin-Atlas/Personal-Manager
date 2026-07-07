@@ -244,8 +244,8 @@ class AnalyzeImageTest(unittest.TestCase):
 
 class SpreadsheetTest(unittest.TestCase):
     """The dedicated spreadsheet processor that bypasses MarkItDown. The type heuristic and the CSV
-    path are pure/stdlib, so they run in CI; the .xlsx/.xls readers need openpyxl/xlrd and are
-    skipped where those aren't installed (they never download anything)."""
+    path are pure/stdlib, so they run in CI; the .xlsx reader needs openpyxl and is skipped where it
+    isn't installed (it never downloads anything). Legacy .xls is no longer supported."""
 
     def test_infer_column_type_heuristic(self):
         self.assertEqual(S.infer_column_type(["1", "2", "3"]), "int")
@@ -360,6 +360,20 @@ class SpreadsheetTest(unittest.TestCase):
             out = S.do_analyze_spreadsheet({"path": path, "ext": "xlsx"})
         self.assertEqual([s["name"] for s in out["sheets"]], ["Budget", "Team"])
         self.assertEqual(out["sheets"][0]["inferred_types"], ["string", "int"])
+
+    def test_xlsx_inflation_guard_rejects_a_zip_bomb(self):
+        # Pure stdlib (no openpyxl), so it runs in CI: a highly compressible zip member has an
+        # inflation ratio far above the cap and must be refused before openpyxl reads it (H-1).
+        import tempfile
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/bomb.xlsx"
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # ~4 MiB of zeros deflates to a few KiB — a ratio far above the 200x limit.
+                zf.writestr("xl/sharedStrings.xml", b"\0" * (4 * 1024 * 1024))
+            with self.assertRaises(ValueError):
+                S._guard_xlsx_inflation(path)
 
 
 # --- the protocol loop itself (driven as a real subprocess) ---------------

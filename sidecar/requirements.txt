@@ -24,18 +24,24 @@
 # on first use; the extra image deps (opencv/shapely/pyclipper) and pillow-heif ship
 # binary wheels for both the bundled 3.12 release interpreter and dev 3.14.
 #
-#   openpyxl / xlrd — spreadsheet parsing for the dedicated .xlsx/.xls/.csv ingest
-#     path (board card: Spreadsheet Processing). Those extensions BYPASS MarkItDown
-#     now — routed to the sidecar's `analyze_spreadsheet`, which reads values-only
-#     with openpyxl (.xlsx) / xlrd (.xls) and stdlib `csv` (.csv). Both were already
-#     present TRANSITIVELY via markitdown[xlsx,xls]; since MarkItDown is no longer
-#     invoked for spreadsheets we pin them explicitly as first-class deps rather than
-#     leaning on that transitivity. Both are pure-Python (no compiler), so they add no
-#     build burden and co-resolve cleanly on the bundled 3.12 and dev 3.14. NO pandas:
-#     column types come from a lightweight try-parse heuristic in the sidecar, so
-#     pandas' (unreliable, on messy CSVs) dtype inference buys nothing for real weight.
-markitdown[pdf,docx,pptx,xlsx,xls,outlook]==0.1.6
+#   openpyxl — spreadsheet parsing for the dedicated .xlsx/.csv ingest path (board card:
+#     Spreadsheet Processing). Those extensions BYPASS MarkItDown now — routed to the sidecar's
+#     `analyze_spreadsheet`, which reads values-only with openpyxl (.xlsx) and stdlib `csv` (.csv).
+#     openpyxl was already present transitively via markitdown[xlsx]; since MarkItDown is no longer
+#     invoked for spreadsheets we pin it explicitly as a first-class dep. Pure-Python (no compiler),
+#     co-resolves cleanly on the bundled 3.12 and dev 3.14. NO pandas: column types come from a
+#     lightweight try-parse heuristic in the sidecar, so pandas' (unreliable, on messy CSVs) dtype
+#     inference buys nothing for real weight. Legacy .xls (xlrd) was DROPPED — the xlrd parser is a
+#     security liability on untrusted files (H-1) and .xls is effectively obsolete.
+#
+#   pillow — pinned explicitly (it arrives transitively via markitdown's image/PDF path and the
+#     sidecar's own EXIF/dimension reader) so a security-patched version is enforced rather than
+#     whatever the resolver happens to pick.
+#   defusedxml — hardens the stdlib XML parser (openpyxl's fallback) against entity-expansion / XXE
+#     from a malicious .xlsx (H-1 subset). Pure-Python; applied once at sidecar import.
+markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.6
 fastembed==0.8.0
 faster-whisper==1.2.1
 openpyxl==3.1.5
-xlrd==2.0.1
+pillow==12.3.0
+defusedxml==0.7.1

@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.46-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Spreadsheet reading is hardened against booby-trapped files. When PM reads an Excel (.xlsx) spreadsheet, it now guards against one crafted to balloon memory or abuse its internal XML, on top of the existing size limits. Normal spreadsheets are unaffected.",
+      "PM no longer reads legacy .xls spreadsheets. The decades-old Excel format needs a parser with a weak safety record on untrusted files, so PM now handles only modern .xlsx and .csv. Your .xls files stay on disk untouched — re-save one as .xlsx and PM will index it. Any .xls files already indexed drop out of search on the next sync.",
+    ],
+  },
+  {
     version: "2.92.45-alpha",
     date: "2026-07-07",
     highlights: [
