@@ -778,11 +778,11 @@ impl SidecarManager {
         })
     }
 
-    /// Parse a spreadsheet (`.xlsx`/`.xls`/`.csv`) into per-sheet structure for the dedicated ingest
+    /// Parse a spreadsheet (`.xlsx`/`.csv`) into per-sheet structure for the dedicated ingest
     /// path, bypassing MarkItDown. Values only — no formula evaluation, no styling. Each sheet reports
     /// its headers, TRUE row count, per-column inferred types, an optional date range, and up to the
     /// sidecar's row cap of stringified rows (flagged `truncated` when it had more). `ext` selects the
-    /// reader (openpyxl / xlrd / stdlib csv). Blocking, like every sidecar call; cell text is untrusted
+    /// reader (openpyxl / stdlib csv). Blocking, like every sidecar call; cell text is untrusted
     /// data — indexed, never executed.
     pub fn analyze_spreadsheet(
         &self,

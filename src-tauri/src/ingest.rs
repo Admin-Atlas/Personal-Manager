@@ -30,7 +30,7 @@ use crate::vault::MarkdownCipher;
 use crate::AppState;
 
 /// Extensions MarkItDown handles well. Anything else is skipped (still findable
-/// on disk, just not ingested). Lower-case, no dot. Spreadsheet types (`xlsx`/`xls`/`csv`) are
+/// on disk, just not ingested). Lower-case, no dot. Spreadsheet types (`xlsx`/`csv`) are
 /// DELIBERATELY absent — they route to [`ingest_spreadsheet`] instead (a dedicated processor that
 /// bypasses MarkItDown), the same way `PHOTO_EXTS` routes images to the photo pipeline.
 const SUPPORTED: &[&str] = &[
@@ -48,7 +48,8 @@ const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic"];
 /// instead of MarkItDown — the sidecar parses them values-only into a metadata chunk + self-describing
 /// row chunks (see [`crate::spreadsheets`]). Like `PHOTO_EXTS`, these are NOT in `SUPPORTED`, so a
 /// spreadsheet only ingests via this branch and can never fall back to a MarkItDown pipe-table dump.
-const SPREADSHEET_EXTS: &[&str] = &["xlsx", "xls", "csv"];
+/// Legacy `.xls` was dropped with the xlrd parser surface (H-1 subset) — only modern `.xlsx` and `.csv`.
+const SPREADSHEET_EXTS: &[&str] = &["xlsx", "csv"];
 
 /// Per-run ingest options threaded from the command. `copy_photos_to_vault` is the drag-drop opt-in
 /// to save an original image into `vault/photos/` (default off).
