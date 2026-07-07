@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.54-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Deadlines and calendar dates respect your time zone at the day boundary. A calendar-linked milestone or a project's 'Due soon' countdown near midnight is now counted on the date you actually see it, in your own zone — so nothing reads a day early or late when your zone is far from UTC. No change to how anything looks.",
+    ],
+  },
+  {
     version: "2.92.53-alpha",
     date: "2026-07-07",
     highlights: [

@@ -129,6 +129,10 @@ pub fn governing_info(milestones: &[Milestone], today: &str) -> Option<Governing
 /// expand to many rows sharing a UID), falling back to the latest past instance so an
 /// overdue calendar milestone still governs. Computed once per `list_overviews`.
 pub fn calendar_dates_by_uid(conn: &Connection, today: &str) -> Result<HashMap<String, String>> {
+    // Bucket each event by the civil date the USER sees it on (its zone-local date), not its raw UTC
+    // date — otherwise a timed event near midnight resolves a calendar-linked milestone to the wrong
+    // day west/east of UTC. `today` is already the zone-local date, so the two agree.
+    let zone = crate::commands::resolve_zone(conn);
     let mut stmt = conn.prepare(
         "SELECT uid, start FROM calendar_events WHERE uid IS NOT NULL AND start IS NOT NULL",
     )?;
@@ -140,7 +144,7 @@ pub fn calendar_dates_by_uid(conn: &Connection, today: &str) -> Result<HashMap<S
     let mut past: HashMap<String, String> = HashMap::new();
     for row in rows {
         let (uid, start) = row?;
-        let date = start.get(0..10).unwrap_or(start.as_str()).to_string();
+        let date = crate::clock::zone_date_of(&start, zone);
         if date.as_str() >= today {
             let keep = match upcoming.get(&uid) {
                 Some(cur) => date < *cur,
