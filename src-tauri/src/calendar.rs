@@ -15,7 +15,7 @@
 //!
 //! Everything Google sends is untrusted DATA, never instructions (rule #6).
 
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -285,11 +285,24 @@ pub async fn sync_feed(
     // whose host now resolves to a private address — must not be fetched.
     validate_feed_url(&feed.url)?;
 
+    // M-6: resolve the host ONCE, screen every address, and PIN the survivors onto the client, so the
+    // address the guard vetted is the exact one reqwest dials — closing the add-time → fetch-time
+    // DNS-rebinding TOCTOU. The URL is left unchanged, so the Host header and TLS SNI stay correct. A
+    // same-host redirect reuses this pin; a cross-host redirect is still re-screened by the policy below.
+    let parsed = reqwest::Url::parse(&feed.url).map_err(|e| Error::Other(e.to_string()))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| Error::Other("That calendar URL has no host.".into()))?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let pinned = resolve_and_screen(&host, port)?;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         // No cleartext, even via a redirect, and re-check every redirect hop's
         // host so a public URL can't bounce us onto an internal one.
         .https_only(true)
+        .resolve_to_addrs(&host, &pinned)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
                 return attempt.error("too many redirects");
@@ -363,11 +376,48 @@ fn validate_feed_url(raw: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// Resolve `host` to concrete socket addresses and screen every one against the private/loopback/
+/// link-local block-list, returning the survivors (M-6). The fetch path pins these onto the client so
+/// the address the guard screened is the exact one reqwest dials — closing the add-time → fetch-time
+/// DNS-rebinding TOCTOU. A literal-IP host is screened directly. Unlike [`host_is_blocked`] (the lenient
+/// add-time guard), this is the strict fetch-time gate: an unresolvable host, or one where any resolved
+/// address is blocked, is an error.
+fn resolve_and_screen(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let blocked = || {
+        Error::Other(
+            "That calendar URL points at a private or local address, which isn't allowed.".into(),
+        )
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        if ip_is_blocked(ip) {
+            return Err(blocked());
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| Error::Other("Couldn't resolve that calendar URL's host.".into()))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(Error::Other(
+            "Couldn't resolve that calendar URL's host.".into(),
+        ));
+    }
+    // Fail closed: if ANY resolved address is non-public, refuse the whole host — a rebinding resolver
+    // that returns one public + one private answer must not slip through on the private one.
+    if addrs.iter().any(|a| ip_is_blocked(a.ip())) {
+        return Err(blocked());
+    }
+    Ok(addrs)
+}
+
 /// True if `host` is — or resolves to — a non-public address. An unresolvable
 /// hostname is allowed here (the fetch will simply fail later); we don't want to
-/// reject a legitimate feed added while briefly offline. Note: this is best-effort
-/// against DNS-rebinding (reqwest re-resolves at fetch time), but it blocks the
-/// common literal-IP SSRF targets and internal names that resolve privately.
+/// reject a legitimate feed added while briefly offline. This is the lenient add-time guard;
+/// the fetch pins its address via [`resolve_and_screen`], so the initial request is not
+/// subject to DNS-rebinding. It blocks the common literal-IP SSRF targets and internal names
+/// that resolve privately, and still re-screens each redirect hop.
 fn host_is_blocked(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<IpAddr>() {
@@ -1342,6 +1392,20 @@ mod tests {
         assert!(validate_feed_url("https://[::1]/feed.ics").is_err());
         // A public literal IP over https is allowed (and needs no DNS lookup).
         assert!(validate_feed_url("https://93.184.216.34/feed.ics").is_ok());
+    }
+
+    #[test]
+    fn resolve_and_screen_pins_public_literals_and_rejects_private_ones() {
+        // A public literal IP is pinned to exactly that address:port (no DNS, no rebinding surface).
+        assert_eq!(
+            resolve_and_screen("93.184.216.34", 443).unwrap(),
+            vec![SocketAddr::new("93.184.216.34".parse().unwrap(), 443)]
+        );
+        // Private / loopback / link-local (cloud metadata) literals are refused (M-6, SSRF).
+        assert!(resolve_and_screen("127.0.0.1", 443).is_err());
+        assert!(resolve_and_screen("10.0.0.5", 443).is_err());
+        assert!(resolve_and_screen("169.254.169.254", 443).is_err());
+        assert!(resolve_and_screen("[::1]", 443).is_err());
     }
 
     #[test]

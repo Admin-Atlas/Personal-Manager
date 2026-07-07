@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.45-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Calendar feed subscriptions are hardened against a network redirection trick. When PM fetches a calendar (.ics) feed, it now pins the exact address it already verified is safe — so a malicious feed can't quietly point PM at an address inside your own network between when you add the feed and when it's fetched. Normal feeds are unaffected.",
+    ],
+  },
+  {
     version: "2.92.44-alpha",
     date: "2026-07-07",
     highlights: [
