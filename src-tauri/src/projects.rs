@@ -244,7 +244,8 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     // Load the upcoming events once (a small set) for the zero-setup fallback: a project
     // with NO milestones still flips Due-soon from a name-matched calendar event, exactly
     // as before. Empty when not connected, so the focus view is unchanged without it.
-    let events = calendar::upcoming_events(conn, calendar::AGENDA_DAYS, 250).unwrap_or_default();
+    let events =
+        calendar::upcoming_events(conn, calendar::AGENDA_DAYS, 250, today).unwrap_or_default();
     // For the calendar-event Due-soon fallback below: count the delta in the user's zone (as the
     // milestone path does), not from the raw UTC instant, so the day boundary matches what the user sees.
     let zone = crate::commands::resolve_zone(conn);

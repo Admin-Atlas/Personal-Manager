@@ -139,9 +139,10 @@ export function ProjectView({
       .then((all) => setDocuments(all.filter((d) => d.project === project)))
       .catch((e) => chat.setError(String(e)));
     refreshMilestones();
-    // Upcoming events feed the milestone link picker (empty when no calendar connected).
+    // Upcoming events feed the milestone link picker (empty when no calendar connected). Drop events
+    // that already ended today — the agenda greys those, but linking targets stay strictly upcoming.
     listCalendarEvents()
-      .then(setCalendarEvents)
+      .then((evts) => setCalendarEvents(evts.filter((e) => !e.ended)))
       .catch(() => setCalendarEvents([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);

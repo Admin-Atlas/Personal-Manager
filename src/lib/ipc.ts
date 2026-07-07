@@ -7,6 +7,7 @@ import type {
   AppLockStatus,
   BackupEntry,
   BackupEvent,
+  AgendaEvent,
   BackupSchedule,
   BackupState,
   CalendarAccount,
@@ -638,8 +639,9 @@ export const clearGoogleClient = () => invoke<void>("clear_google_client");
 /** Pull events from every selected calendar (all providers) into the local mirror; returns the count. */
 export const syncCalendar = () => invoke<number>("sync_calendar");
 
-/** Upcoming events in the mirror, for the focus-view agenda. */
-export const listCalendarEvents = () => invoke<CalendarEvent[]>("list_calendar_events");
+/** Upcoming events in the mirror, for the focus-view agenda. Each carries `ended`: the agenda widens
+ *  the strict gate to also list events that finished earlier today so the view can grey them. */
+export const listCalendarEvents = () => invoke<AgendaEvent[]>("list_calendar_events");
 
 /** Every mirrored event across the widened band (previous month → ~a year ahead), for the unified
  *  calendar view (card 8). The client filters to the visible range + locally-hidden calendars. */
