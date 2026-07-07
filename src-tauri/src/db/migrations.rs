@@ -275,12 +275,14 @@ const MIGRATIONS: &[&str] = &[
         SELECT id, canonical_name FROM entities WHERE type = 'project';
     -- Point every document at its entity, resolved by its current canonical project string. Every
     -- distinct project string just became an entity, so no document is left unresolved.
+    -- guard:allow — preserving backfill: fills the freshly-added, all-NULL entity_id; overwrites nothing.
     UPDATE documents SET entity_id = (
         SELECT e.id FROM entities e WHERE e.type = 'project' AND e.canonical_name = documents.project
     );
     -- Attach existing triage rows to the same entity (additive; `name` stays the PK). A `projects`
     -- row with no surviving documents simply keeps a NULL entity_id (harmless — the focus view is
     -- driven by `documents`).
+    -- guard:allow — preserving backfill (freshly-added entity_id); overwrites nothing.
     UPDATE projects SET entity_id = (
         SELECT e.id FROM entities e WHERE e.type = 'project' AND e.canonical_name = projects.name
     );
@@ -522,11 +524,13 @@ const MIGRATIONS: &[&str] = &[
     // ON DELETE CASCADE, so disconnecting an account drops its access rows (the connector then
     // soft-flags any drive no remaining account can reach).
     //
-    // Rebuild on next sync: drop the existing per-account shared-drive documents (+ their chunks / fts
-    // / vec rows) so the next sync re-creates them once under the new namespace — they're index-only
-    // (pointers + summaries, never file bytes) and a first sync re-enumerates anyway, so nothing real
-    // is lost. Clearing every Drive account's delta cursor forces that re-baseline (My Drive
-    // re-enumerates too, reconciling its unchanged items as no-op Updates — no duplicates).
+    // Existing per-account shared-drive pointers are RE-KEYED in place to the new namespace, not
+    // dropped: rule #3 requires an old→new mapping that preserves every user classification (and the
+    // embeddings ride along for free). Where two accounts had indexed the same drive, the second row
+    // collides on the source_id unique index and is left at its old id for the next sync's reconcile
+    // to retire. Clearing every Drive account's delta cursor forces a re-baseline under the new
+    // namespace (My Drive re-enumerates as no-op Updates; each shared drive is indexed once, by its
+    // owner) — reconciling the rare lingering twin away.
     r#"
     CREATE TABLE shared_drive_access (
         drive_id   TEXT NOT NULL,
@@ -539,15 +543,15 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_shared_drive_access_drive   ON shared_drive_access(drive_id);
     CREATE INDEX idx_shared_drive_access_account ON shared_drive_access(account_id);
 
-    DELETE FROM chunk_vec  WHERE rowid IN (
-        SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id
-        WHERE d.source_type = 'index_only' AND d.source_id LIKE 'gdrive:%:sd:%');
-    DELETE FROM chunks_fts WHERE rowid IN (
-        SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id
-        WHERE d.source_type = 'index_only' AND d.source_id LIKE 'gdrive:%:sd:%');
-    DELETE FROM chunks WHERE document_id IN (
-        SELECT id FROM documents WHERE source_type = 'index_only' AND source_id LIKE 'gdrive:%:sd:%');
-    DELETE FROM documents WHERE source_type = 'index_only' AND source_id LIKE 'gdrive:%:sd:%';
+    -- guard:allow — rule-#3 preserving re-key (old→new source_id mapping; no DELETE, no data-column
+    -- overwrite). `substr(id, instr(id,':sd:')+4)` keeps `<driveId>:<fileId>` verbatim, so the row —
+    -- its classification (project/importance/reviewed/entity_id) AND its embedding — survives intact.
+    -- Where two accounts indexed the same drive the second row would collide on the source_id unique
+    -- index; OR IGNORE leaves that twin at its old id for the next sync's reconcile to retire (it is a
+    -- pointer, not file bytes, and the surviving copy keeps its label — nothing real is lost).
+    UPDATE OR IGNORE documents
+       SET source_id = 'gdrive:sd:' || substr(source_id, instr(source_id, ':sd:') + 4)
+     WHERE source_type = 'index_only' AND source_id LIKE 'gdrive:%:sd:%';
 
     UPDATE connector_sources SET cursor = NULL WHERE provider = 'google' AND service = 'drive';
     "#,
@@ -1041,6 +1045,98 @@ mod tests {
         assert_eq!(mode, "index_only");
         assert_eq!(state, "ok");
         assert_eq!(cursor, None);
+    }
+
+    /// Rule #3 enforcement: a migration must never silently drop, clear, or rewrite user data. This
+    /// walks every migration statement and rejects a statement-LEADING destructive verb against a
+    /// persistent user-data table. It anchors on the first keyword of each line (not a substring), so
+    /// an `ON DELETE CASCADE` constraint clause inside a `CREATE TABLE` never trips it — that DELETE
+    /// is mid-line. It would have caught v19's original `DELETE FROM documents`.
+    ///
+    /// Three narrow, principled exceptions:
+    ///   * `DELETE FROM` a rebuild-clearable derived index (`chunk_vec` / `chunks_fts` / `chunks`) — a
+    ///     Rebuild reconstructs these from `documents`, so clearing them loses nothing durable.
+    ///   * `UPDATE sqlite_master` (a `writable_schema` CHECK-relaxation patch: edits stored DDL text,
+    ///     moves no user rows) or `UPDATE connector_sources SET cursor` (a re-baseline reset — cursors
+    ///     are ephemeral sync state, not user data).
+    ///   * a statement a human has explicitly blessed with a `guard:allow` sentinel comment on the
+    ///     line(s) immediately above it — used ONLY for a rule-#3 *preserving* UPDATE (a re-key, or a
+    ///     freshly-added-column backfill that overwrites nothing). A DELETE/DROP is never excusable
+    ///     this way: user rows are re-keyed with UPDATE, never deleted.
+    #[test]
+    fn migrations_never_destroy_user_data() {
+        // Derived indexes a Rebuild can reconstruct from `documents` — safe to `DELETE FROM`.
+        const REBUILD_CLEARABLE: &[&str] = &["chunk_vec", "chunks_fts", "chunks"];
+        // Schema-catalog / ephemeral-state tables an UPDATE may touch without a sentinel.
+        const UPDATE_METADATA: &[&str] = &["sqlite_master", "sqlite_schema"];
+
+        for (i, migration) in super::MIGRATIONS.iter().enumerate() {
+            // A `guard:allow` sentinel comment arms the *next* statement line, then is consumed.
+            let mut armed = false;
+            for raw in migration.lines() {
+                let line = raw.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if line.starts_with("--") {
+                    if line.contains("guard:allow") {
+                        armed = true;
+                    }
+                    continue; // comments never disarm a pending sentinel
+                }
+                let lower = line.to_ascii_lowercase();
+                let first = lower.split_whitespace().next().unwrap_or("");
+
+                // DROP TABLE / ALTER … DROP: table or column loss, never allowed in a migration.
+                assert!(
+                    !lower.starts_with("drop table"),
+                    "MIGRATIONS[{i}]: `DROP TABLE` destroys user data (rule #3): {line}"
+                );
+                assert!(
+                    !(first == "alter" && lower.contains(" drop ")),
+                    "MIGRATIONS[{i}]: `ALTER TABLE … DROP` loses a column (rule #3): {line}"
+                );
+
+                // DELETE FROM <t>: only the rebuild-clearable derived indexes. A sentinel does NOT
+                // excuse deleting user rows — re-key with UPDATE instead.
+                if lower.starts_with("delete from") {
+                    let table = lower.split_whitespace().nth(2).unwrap_or("");
+                    assert!(
+                        REBUILD_CLEARABLE.contains(&table),
+                        "MIGRATIONS[{i}]: `DELETE FROM {table}` removes user rows (rule #3). Only \
+                         {REBUILD_CLEARABLE:?} are rebuild-clearable; re-key with UPDATE, never DELETE."
+                    );
+                    armed = false;
+                    continue;
+                }
+
+                // UPDATE <t>: metadata / cursor resets, or an explicitly-blessed preserving write.
+                if first == "update" {
+                    // Skip an optional `OR IGNORE` / `OR REPLACE` conflict clause to find the table.
+                    let mut toks = lower.split_whitespace().skip(1).peekable();
+                    if toks.peek() == Some(&"or") {
+                        toks.next();
+                        toks.next();
+                    }
+                    let table = toks.next().unwrap_or("");
+                    let allowed = UPDATE_METADATA.contains(&table)
+                        || (table == "connector_sources" && lower.contains("set cursor"))
+                        || armed;
+                    assert!(
+                        allowed,
+                        "MIGRATIONS[{i}]: `UPDATE {table}` writes a persistent table with no \
+                         `guard:allow` sentinel. If it is a rule-#3 preserving re-key/backfill, mark \
+                         it; otherwise it may clobber user data: {line}"
+                    );
+                    armed = false;
+                    continue;
+                }
+
+                // Any other statement (CREATE / INSERT / ALTER … ADD / PRAGMA / SELECT …) consumes a
+                // pending sentinel without using it, so a sentinel only ever covers the next line.
+                armed = false;
+            }
+        }
     }
 
     /// v18 lands the multi-provider calendar foundation: the `calendars` registry (cascading from a
