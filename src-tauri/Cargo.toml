@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "2.92.42-alpha"
+version = "2.92.43-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -77,6 +77,11 @@ blake3 = "1"
 # of the archive is cryptographically detectable on restore.
 chacha20poly1305 = { version = "0.10", features = ["stream"] }
 uuid = { version = "1", features = ["v4"] }
+# Passphrase strength floor for every vault/backup create-or-change entry point
+# (`vault::kdf::validate_passphrase_strength`, M-4): the same zxcvbn model the UI meter
+# shows, so the backend gate and the frontend hint agree. `default-features = false` drops
+# the unused `builder` (derive_builder) helper.
+zxcvbn = { version = "3", default-features = false }
 # Open the system browser for the OAuth consent screen (handles per-OS URL quirks).
 open = "5"
 

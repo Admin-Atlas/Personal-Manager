@@ -847,6 +847,7 @@ pub fn run() {
             commands::unlock_vault,
             commands::open_existing_vault,
             commands::forget_vault_passphrase,
+            commands::score_passphrase,
             commands::link_vault_account,
             commands::vault_lock_status,
             commands::continue_here,

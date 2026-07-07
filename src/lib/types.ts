@@ -639,6 +639,22 @@ export interface DriveSyncState {
 
 // --- Encrypted backup (Proton Drive / user cloud) — PR1 local `.pmbackup` archive + restore ---
 
+/** Strength of a candidate passphrase, from the `score_passphrase` command (M-4). Mirrors the
+ *  backend floor (`validate_passphrase_strength`) so the meter and the gate agree. Advisory — the
+ *  command layer is the real check. */
+export interface PassphraseScore {
+  /** zxcvbn strength, 0 (weakest) .. 4 (strongest). */
+  score: number;
+  /** True iff it clears the create/change floor (length AND score). */
+  acceptable: boolean;
+  /** Non-empty but below the length floor. */
+  too_short: boolean;
+  /** A short human warning when weak, else null. */
+  warning: string | null;
+  /** Actionable suggestions to strengthen it. */
+  suggestions: string[];
+}
+
 /** Which stage a backup/restore is in (mirrors the Rust `BackupPhase`). */
 export type BackupPhase = "snapshot" | "pack" | "upload" | "download" | "restore" | "validate";
 

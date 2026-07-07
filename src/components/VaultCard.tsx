@@ -20,8 +20,9 @@ import {
   moveVault,
   vaultStatus,
 } from "../lib/ipc";
-import type { VaultStatus } from "../lib/types";
+import type { PassphraseScore, VaultStatus } from "../lib/types";
 import { Button, Input } from "./ui";
+import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 
 /** Which inline form/confirmation is currently open (only one at a time). */
 type Pending = "share" | "change" | "private" | "link" | null;
@@ -31,6 +32,7 @@ export function VaultCard() {
   const [pending, setPending] = useState<Pending>(null);
   const [pass, setPass] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [passScore, setPassScore] = useState<PassphraseScore | null>(null);
   const [account, setAccount] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -52,8 +54,13 @@ export function VaultCard() {
     setPending(null);
     setPass("");
     setConfirm("");
+    setPassScore(null);
     setAccount("");
   }
+
+  // A create/change passphrase clears the meter's floor unless the meter explicitly says it's too
+  // weak — a scoring hiccup (null) never soft-locks the button; the backend floor is the real gate.
+  const strongEnough = passScore?.acceptable !== false;
 
   /** Run a backend transition, then reset the form and reload status. */
   async function run(action: () => Promise<unknown>, success: string) {
@@ -143,10 +150,11 @@ export function VaultCard() {
                 value={confirm}
                 onChange={(e) => setConfirm(e.target.value)}
               />
+              <PassphraseStrengthMeter passphrase={pass} onScored={setPassScore} />
               <div className="flex gap-2">
                 <Button
                   variant="primary"
-                  disabled={busy || !passphrasesMatch}
+                  disabled={busy || !passphrasesMatch || !strongEnough}
                   onClick={() =>
                     run(() => createShareableVault(pass), "This vault is now shareable.")
                   }
@@ -215,10 +223,11 @@ export function VaultCard() {
                 value={confirm}
                 onChange={(e) => setConfirm(e.target.value)}
               />
+              <PassphraseStrengthMeter passphrase={pass} onScored={setPassScore} />
               <div className="flex gap-2">
                 <Button
                   variant="primary"
-                  disabled={busy || !passphrasesMatch}
+                  disabled={busy || !passphrasesMatch || !strongEnough}
                   onClick={() => run(() => changeVaultPassphrase(pass), "Passphrase changed.")}
                 >
                   {busy ? "Working…" : "Change passphrase"}

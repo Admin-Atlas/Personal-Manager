@@ -111,7 +111,7 @@ pub fn pack(
     {
         let mut file = tmp.as_file().try_clone()?;
         let header_json = format::write_header(&mut file, flags, &header)?;
-        let aad = format::aad(&header_json);
+        let aad = format::aad(flags, &header_json);
         let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_slice()));
         let aead_w =
             format::ChunkedAeadWriter::new(file, cipher, &nonce_prefix, aad, header.chunk_size)?;

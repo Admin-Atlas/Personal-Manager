@@ -23,6 +23,41 @@ pub const SALT_LEN: usize = 16;
 /// The only Argon2 version we emit/accept: 0x13 (== 19), i.e. Argon2 v1.3.
 const ARGON2_VERSION: u32 = 0x13;
 
+/// Minimum passphrase length for any create/change entry point (M-4). Checked before the zxcvbn
+/// estimate so a trivially short passphrase gets a clear, specific message.
+pub const MIN_PASSPHRASE_LEN: usize = 10;
+/// Minimum zxcvbn strength score (0..=4). 3 = "safely unguessable" against an offline slow-hash
+/// attack — the right floor for a passphrase whose ciphertext (a backup that embeds the raw DB key,
+/// or a shareable vault) can leave the machine, since Argon2id calibration can't rescue a tiny space.
+pub const MIN_PASSPHRASE_SCORE: u8 = 3;
+
+/// Enforce the passphrase strength floor at the COMMAND layer — the single source of truth every
+/// create-or-change entry point (vault creation/change, backup create, stored backup passphrase,
+/// Proton/Google Drive push) calls before a key is derived (M-4). The frontend meter is advisory; this
+/// is the gate.
+///
+/// NEVER call this on an unlock/verify/restore path: an old, weak-but-valid passphrase must still open
+/// existing data. Returns a clear, user-facing message on rejection.
+pub fn validate_passphrase_strength(passphrase: &str) -> Result<()> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
+        return Err(Error::Other(format!(
+            "passphrase is too short — use at least {MIN_PASSPHRASE_LEN} characters"
+        )));
+    }
+    let estimate = zxcvbn::zxcvbn(passphrase, &[]);
+    if u8::from(estimate.score()) < MIN_PASSPHRASE_SCORE {
+        let hint = estimate
+            .feedback()
+            .and_then(|f| f.warning())
+            .map(|w| format!(" ({w})"))
+            .unwrap_or_default();
+        return Err(Error::Other(format!(
+            "passphrase is too easy to guess — make it longer or less predictable{hint}"
+        )));
+    }
+    Ok(())
+}
+
 /// Argon2id cost parameters. These are **not secret** — they live in
 /// `vault-meta.json` alongside the salt so any profile/machine can reproduce the
 /// key. Stored as plain numbers (not a PHC string) because we own the salt+params.
@@ -155,5 +190,21 @@ fn measure_ms(params: &KdfParams) -> u64 {
     match derive_master("calibration-probe", &salt, params) {
         Ok(_) => start.elapsed().as_millis() as u64,
         Err(_) => u64::MAX,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strength_floor_rejects_short_and_weak_accepts_strong() {
+        // Below the length floor, regardless of character mix.
+        assert!(validate_passphrase_strength("aB3$x").is_err());
+        // Long enough but trivially guessable (fails the zxcvbn score floor).
+        assert!(validate_passphrase_strength("password12").is_err());
+        assert!(validate_passphrase_strength("1234567890").is_err());
+        // A genuine passphrase clears both the length and the score floor.
+        assert!(validate_passphrase_strength("correct horse battery staple").is_ok());
     }
 }
