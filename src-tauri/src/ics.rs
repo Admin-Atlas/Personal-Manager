@@ -150,7 +150,7 @@ fn expand_vevent(
         .map(|e| e - start_anchor)
         .or_else(|| find(block, "DURATION").and_then(parse_duration));
     let effective_end = end_anchor
-        .or_else(|| dur.map(|d| start_anchor + d))
+        .or_else(|| dur.and_then(|d| start_anchor.checked_add_signed(d)))
         .unwrap_or(start_anchor);
 
     let mut starts: Vec<DateTime<Utc>> = if block.iter().any(|l| l.starts_with("RRULE")) {
@@ -309,7 +309,14 @@ fn rrule_spec_utc_fallback(block: &[String], tz: ChronoTz) -> Option<String> {
 }
 
 /// Parse an RFC 5545 DURATION value (`P1DT2H`, `-PT30M`, `P2W`) to a `chrono::Duration`.
+///
+/// Every unit is folded in with checked arithmetic and the total is bounded, so an extreme or
+/// malformed value is treated as malformed (`None`) rather than pushing the accumulation — or the
+/// later instant math — out of range.
 fn parse_duration(value: &str) -> Option<Duration> {
+    // No real calendar event runs a century; a larger (or overflowing) value is treated as malformed.
+    const MAX_DURATION_SECS: i64 = 100 * 366 * 86_400;
+
     let v = value.trim();
     let (sign, rest) = match v.strip_prefix('-') {
         Some(r) => (-1i64, r),
@@ -320,32 +327,37 @@ fn parse_duration(value: &str) -> Option<Duration> {
     let mut num = String::new();
     let mut in_time = false;
     let mut saw_any = false;
+    // Fold `<num><unit>` into `secs` without ever overflowing i64.
+    let acc = |secs: i64, num: &str, unit_secs: i64| -> Option<i64> {
+        let n = num.parse::<i64>().ok()?;
+        secs.checked_add(n.checked_mul(unit_secs)?)
+    };
     for c in rest.chars() {
         match c {
             'T' => in_time = true,
             '0'..='9' => num.push(c),
             'W' => {
-                secs += num.parse::<i64>().ok()? * 7 * 86_400;
+                secs = acc(secs, &num, 7 * 86_400)?;
                 num.clear();
                 saw_any = true;
             }
             'D' => {
-                secs += num.parse::<i64>().ok()? * 86_400;
+                secs = acc(secs, &num, 86_400)?;
                 num.clear();
                 saw_any = true;
             }
             'H' if in_time => {
-                secs += num.parse::<i64>().ok()? * 3_600;
+                secs = acc(secs, &num, 3_600)?;
                 num.clear();
                 saw_any = true;
             }
             'M' if in_time => {
-                secs += num.parse::<i64>().ok()? * 60;
+                secs = acc(secs, &num, 60)?;
                 num.clear();
                 saw_any = true;
             }
             'S' if in_time => {
-                secs += num.parse::<i64>().ok()?;
+                secs = acc(secs, &num, 1)?;
                 num.clear();
                 saw_any = true;
             }
@@ -356,7 +368,10 @@ fn parse_duration(value: &str) -> Option<Duration> {
     if !num.is_empty() || !saw_any {
         return None;
     }
-    Some(Duration::seconds(sign * secs))
+    if secs > MAX_DURATION_SECS {
+        return None;
+    }
+    Duration::try_seconds(sign * secs)
 }
 
 // Builds a CalendarEvent from its already-parsed parts; the many fields are the
@@ -378,16 +393,19 @@ fn make_event(
         // that zone before formatting the date, so an all-day event reads as the same
         // calendar day in every zone (UTC formatting would drift it east of UTC).
         let s = start_utc.with_timezone(&tz).format("%Y-%m-%d").to_string();
-        let e = dur.map(|d| {
-            (start_utc + d)
-                .with_timezone(&tz)
-                .format("%Y-%m-%d")
-                .to_string()
+        let e = dur.and_then(|d| {
+            start_utc
+                .checked_add_signed(d)
+                .map(|end| end.with_timezone(&tz).format("%Y-%m-%d").to_string())
         });
         (s, e)
     } else {
         let s = start_utc.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let e = dur.map(|d| (start_utc + d).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        let e = dur.and_then(|d| {
+            start_utc
+                .checked_add_signed(d)
+                .map(|end| end.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        });
         (s, e)
     };
     CalendarEvent {
@@ -525,6 +543,20 @@ mod tests {
         assert_eq!(events[0].end.as_deref(), Some("2026-06-15T09:30:00Z"));
         assert!(!events[0].all_day);
         assert_eq!(events[0].calendar_id, "feed1");
+    }
+
+    #[test]
+    fn an_overflowing_duration_is_dropped_not_panicked() {
+        // A DURATION whose magnitude overflows the unit accumulation (here i64::MAX days) must be
+        // treated as malformed, never crash the whole calendar sync. The event still parses; with no
+        // usable duration it renders as a zero-length point (no end).
+        let feed = "BEGIN:VEVENT\nUID:e\nSUMMARY:Evil\n\
+                    DTSTART:20260615T090000Z\nDURATION:P9223372036854775807D\nEND:VEVENT";
+        let (s, e) = window();
+        let events = parse_feed_within(feed, "f", s, e, ChronoTz::UTC);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].start, "2026-06-15T09:00:00Z");
+        assert_eq!(events[0].end, None);
     }
 
     #[test]

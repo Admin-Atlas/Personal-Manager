@@ -285,55 +285,73 @@ pub async fn sync_feed(
     // whose host now resolves to a private address — must not be fetched.
     validate_feed_url(&feed.url)?;
 
-    // M-6: resolve the host ONCE, screen every address, and PIN the survivors onto the client, so the
-    // address the guard vetted is the exact one reqwest dials — closing the add-time → fetch-time
-    // DNS-rebinding TOCTOU. The URL is left unchanged, so the Host header and TLS SNI stay correct. A
-    // same-host redirect reuses this pin; a cross-host redirect is still re-screened by the policy below.
-    let parsed = reqwest::Url::parse(&feed.url).map_err(|e| Error::Other(e.to_string()))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| Error::Other("That calendar URL has no host.".into()))?
-        .to_string();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let pinned = resolve_and_screen(&host, port)?;
+    // M-6: fetch the feed following any redirects OURSELVES, so every hop — the first request and each
+    // redirect target — is resolved, screened against the private/loopback block-list, and PINNED onto
+    // a single-hop client before we dial it. That makes the address we vetted the exact one reqwest
+    // connects to, with no automatic (and unpinned) redirect resolution in between; reqwest's own
+    // redirect following is therefore disabled. The URL is left unchanged so Host and TLS SNI stay
+    // correct. Fail closed: an unresolvable or non-public hop is an error, never a silent skip.
+    const MAX_REDIRECTS: usize = 5;
+    let mut next_url = feed.url.clone();
+    let mut hops = 0usize;
+    let text = loop {
+        let parsed = reqwest::Url::parse(&next_url).map_err(|e| Error::Other(e.to_string()))?;
+        if parsed.scheme() != "https" {
+            return Err(Error::Other(
+                "Calendar feeds must use https:// (an http link would expose the feed address)."
+                    .into(),
+            ));
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| Error::Other("That calendar URL has no host.".into()))?
+            .to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let pinned = resolve_and_screen(&host, port)?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        // No cleartext, even via a redirect, and re-check every redirect hop's
-        // host so a public URL can't bounce us onto an internal one.
-        .https_only(true)
-        .resolve_to_addrs(&host, &pinned)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
-                return attempt.error("too many redirects");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .https_only(true)
+            .resolve_to_addrs(&host, &pinned)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let resp = client
+            .get(parsed.clone())
+            .header(reqwest::header::ACCEPT, "text/calendar")
+            .send()
+            .await?;
+
+        if resp.status().is_redirection() {
+            hops += 1;
+            if hops > MAX_REDIRECTS {
+                return Err(Error::Other(
+                    "That calendar feed redirected too many times.".into(),
+                ));
             }
-            // Decide before consuming `attempt`: follow only if the next hop's host
-            // is present and not a private/loopback address.
-            let host_ok = attempt
-                .url()
-                .host_str()
-                .map(|h| !host_is_blocked(h))
-                .unwrap_or(false);
-            if host_ok {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .build()?;
-    let resp = client
-        .get(&feed.url)
-        .header(reqwest::header::ACCEPT, "text/calendar")
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        return Err(Error::Other(format!(
-            "Calendar feed “{}” returned {}. Check the URL.",
-            feed.label,
-            resp.status()
-        )));
-    }
-    let text = read_capped(resp, MAX_FEED_BYTES).await?;
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    Error::Other("That calendar feed sent an invalid redirect.".into())
+                })?;
+            // Resolve the Location against the URL we just fetched (handles a relative target); the
+            // next loop iteration screens + pins it exactly like the first request.
+            next_url = parsed
+                .join(location)
+                .map_err(|e| Error::Other(e.to_string()))?
+                .to_string();
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Other(format!(
+                "Calendar feed “{}” returned {}. Check the URL.",
+                feed.label,
+                resp.status()
+            )));
+        }
+        break read_capped(resp, MAX_FEED_BYTES).await?;
+    };
     let (win_start, win_end) = parse_window(time_min, time_max)?;
     Ok(ics::parse_feed_within(
         &text, &feed.id, win_start, win_end, tz,
@@ -414,10 +432,11 @@ fn resolve_and_screen(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
 
 /// True if `host` is — or resolves to — a non-public address. An unresolvable
 /// hostname is allowed here (the fetch will simply fail later); we don't want to
-/// reject a legitimate feed added while briefly offline. This is the lenient add-time guard;
-/// the fetch pins its address via [`resolve_and_screen`], so the initial request is not
-/// subject to DNS-rebinding. It blocks the common literal-IP SSRF targets and internal names
-/// that resolve privately, and still re-screens each redirect hop.
+/// reject a legitimate feed added while briefly offline. This is the lenient add-time PRE-check
+/// only — it blocks the common literal-IP targets and internal names that resolve privately so the
+/// user gets a fast, friendly error. The authoritative gate is the fetch path, which screens AND pins
+/// every hop (the first request and each redirect) via [`resolve_and_screen`] and fails closed — so
+/// this pre-check being lenient about an unresolvable host is safe.
 fn host_is_blocked(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<IpAddr>() {

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.51-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Sturdier handling of calendar feeds and pinboard notes. PM is now more resilient to unusual or malformed calendar (.ics) data, follows calendar-feed redirects more carefully, and is stricter about the internal filename it derives for a note. Normal feeds and notes are unaffected — no change to how anything looks or works.",
+    ],
+  },
+  {
     version: "2.92.50-alpha",
     date: "2026-07-07",
     highlights: [
