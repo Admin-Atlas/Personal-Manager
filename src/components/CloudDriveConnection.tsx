@@ -39,6 +39,11 @@ import { SharedDrivesManager } from "./DriveSharedDrives";
 import { OneDriveFolders } from "./OneDriveFolders";
 import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
 
+/** Microsoft's app-access management page. Microsoft has no programmatic token revocation (unlike
+ *  Google's RFC-7009 revoke), so disconnecting only forgets the local token — fully removing PM's
+ *  access is done by the user here (L-3). */
+const MICROSOFT_APPS_URL = "https://account.live.com/consent/Manage";
+
 /** The two OAuth cloud-drive providers. Google Drive and OneDrive are near-identical index-only
  *  connectors — one provider-parameterised component serves both (the Calendar-connector pattern). */
 type CloudProvider = "google" | "microsoft";
@@ -261,6 +266,21 @@ export function CloudDriveConnection({
     <div data-help={meta.help}>
       <span className="text-sm font-medium text-ink">{meta.title}</span>
       <p className="mt-1 text-xs text-ink4">{meta.blurb}</p>
+      {provider === "microsoft" && (
+        <p className="mt-1 text-xs text-ink4">
+          Disconnecting forgets PM&rsquo;s access on this device. Microsoft can&rsquo;t revoke an
+          app&rsquo;s access from within the app, so to fully remove it, manage app access at{" "}
+          <a
+            href={MICROSOFT_APPS_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="underline hover:text-ink2"
+          >
+            account.live.com
+          </a>
+          .
+        </p>
+      )}
 
       {!configured ? (
         <p className="mt-2 text-xs text-ink4">

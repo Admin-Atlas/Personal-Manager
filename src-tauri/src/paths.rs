@@ -59,7 +59,10 @@ pub fn venv_dir(app: &AppHandle) -> Result<PathBuf> {
 /// Walk up from `start`, returning the `sidecar/` folder of the nearest ancestor that holds a
 /// `pm_sidecar.py`. This is the dev fallback: the binary sits under `src-tauri/target/<profile>/`
 /// and the repo root above it holds `sidecar/`. Split out of [`sidecar_source_dir`] so the walk
-/// is testable without a real executable path or app bundle.
+/// is testable without a real executable path or app bundle. **Debug-only (M-5):** a release build
+/// never walks `current_exe()` ancestors, so a planted `sidecar/pm_sidecar.py` above the installed
+/// binary can't be picked up and run.
+#[cfg(debug_assertions)]
 fn find_sidecar_up(start: &Path) -> Option<PathBuf> {
     for ancestor in start.ancestors() {
         let candidate = ancestor.join("sidecar");
@@ -71,8 +74,9 @@ fn find_sidecar_up(start: &Path) -> Option<PathBuf> {
 }
 
 /// Resolve the directory holding the sidecar script + requirements. Order:
-/// `PM_SIDECAR_DIR` (dev override, debug builds only) → the bundled resource dir
-/// → walking up from the executable for the repo's `sidecar/` folder (dev).
+/// `PM_SIDECAR_DIR` (dev override, debug builds only) → the bundled resource dir → (debug builds
+/// only) walking up from the executable for the repo's `sidecar/` folder. In a **release** build a
+/// missing bundled resource hard-errors rather than walking `current_exe()` ancestors (M-5).
 pub fn sidecar_source_dir(app: &AppHandle) -> Result<PathBuf> {
     if let Some(dir) = dev_override("PM_SIDECAR_DIR") {
         return Ok(PathBuf::from(dir));
@@ -85,8 +89,12 @@ pub fn sidecar_source_dir(app: &AppHandle) -> Result<PathBuf> {
         }
     }
 
-    // Dev: the binary sits under src-tauri/target/<profile>/; the repo root above
-    // it holds `sidecar/`.
+    // Dev only (M-5): the binary sits under src-tauri/target/<profile>/; the repo root above it holds
+    // `sidecar/`. Gated to debug builds so a release install with a missing/corrupt bundled resource
+    // hard-errors here instead of walking `current_exe()` ancestors — on Windows that walk can reach
+    // `C:\`, where Authenticated Users may create folders, letting a planted `C:\sidecar\pm_sidecar.py`
+    // run as the user.
+    #[cfg(debug_assertions)]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = find_sidecar_up(&exe) {
             return Ok(dir);

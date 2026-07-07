@@ -702,8 +702,17 @@ pub fn run() {
 
             // The sidecar source folder is optional at boot — chat works without
             // it; ingestion surfaces a clear error if it (or Python) is missing.
-            let source_dir =
-                paths::sidecar_source_dir(handle).unwrap_or_else(|_| PathBuf::from("sidecar"));
+            // M-5: `sidecar_source_dir` hard-errors in release when the bundled resource is missing.
+            // Fall back to the ABSOLUTE resource path, never a CWD-relative "sidecar" an unprivileged
+            // process could plant — if `pm_sidecar.py` isn't there, ingestion fails cleanly and chat
+            // still works.
+            let source_dir = paths::sidecar_source_dir(handle).unwrap_or_else(|_| {
+                handle
+                    .path()
+                    .resource_dir()
+                    .map(|r| r.join("sidecar"))
+                    .unwrap_or_else(|_| PathBuf::from("sidecar"))
+            });
             let venv_dir = paths::venv_dir(handle)?;
             let sidecar = SidecarManager::new(SidecarPaths {
                 source_dir,

@@ -18,6 +18,11 @@ import { Button, ConfirmDialog, Skeleton } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
 import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
 
+/** Microsoft's app-access management page. Microsoft has no programmatic token revocation (unlike
+ *  Google's RFC-7009 revoke), so disconnecting can only forget the local token — fully removing PM's
+ *  access is done by the user here (L-3). */
+const MICROSOFT_APPS_URL = "https://account.live.com/consent/Manage";
+
 /** The two read-only OAuth calendar providers. Apple has no desktop OAuth, so it stays a subscription
  *  (see {@link "./IcsFeedSubscription"}). */
 type Provider = "google" | "microsoft";
@@ -251,6 +256,21 @@ export function CalendarConnection({
       )}
 
       {note && <p className="mt-2 text-xs text-st-quick">{note}</p>}
+      {provider === "microsoft" && (
+        <p className="mt-2 text-xs text-ink4">
+          Disconnecting forgets PM&rsquo;s access on this device. Microsoft can&rsquo;t revoke an
+          app&rsquo;s access from within the app, so to fully remove it, manage app access at{" "}
+          <a
+            href={MICROSOFT_APPS_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="underline hover:text-ink2"
+          >
+            account.live.com
+          </a>
+          .
+        </p>
+      )}
       {error &&
         (apiDisabled ? (
           <div

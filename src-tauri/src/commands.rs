@@ -3116,7 +3116,14 @@ pub async fn connect_google_calendar_account(
 /// Disconnect one Google Calendar account: drop its registry source (cascading its calendars +
 /// mirrored events) and forget its token plus any per-account (Advanced-Protection) client.
 #[tauri::command]
-pub fn disconnect_google_calendar_account(state: State<'_, AppState>, email: String) -> Result<()> {
+pub async fn disconnect_google_calendar_account(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<()> {
+    // L-3: sever the grant at Google's end BEFORE forgetting the local token (best-effort, like wipe).
+    if let Ok(Some(blob)) = secrets::get_google_token_for(&google_calendar_token_key(&email)) {
+        let _ = google::revoke(blob.expose()).await;
+    }
     let conn = state.conn()?;
     // Clear the OAuth token FIRST and propagate a real failure (a locked keychain): dropping the DB
     // source before an un-clearable token would orphan the token with no source left to re-clear it.
@@ -3547,7 +3554,13 @@ pub async fn connect_drive(
 /// Disconnect one Drive account: forget its token and registry row, and soft-flag its indexed items
 /// `unreachable` (kept findable — never a hard delete).
 #[tauri::command]
-pub fn disconnect_drive(state: State<'_, AppState>, email: String) -> Result<()> {
+pub async fn disconnect_drive(state: State<'_, AppState>, email: String) -> Result<()> {
+    // L-3: sever the grant at Google's end BEFORE forgetting the local token — best-effort, exactly
+    // like "Remove PM data" (wipe.rs). Revoking the refresh token drops PM from the account's
+    // Connected-apps list; without it the grant lingers at Google until the token expires naturally.
+    if let Ok(Some(blob)) = secrets::get_google_token_for(&drive::account_token_key(&email)) {
+        let _ = google::revoke(blob.expose()).await;
+    }
     {
         let conn = state.conn()?;
         drive::forget_account(&conn, &email)?;
