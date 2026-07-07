@@ -7,6 +7,15 @@
 //! verbatim on every unlock so the same passphrase derives the identical key on any
 //! machine, regardless of speed (spec §2.2). Never hardcode the cost on the read
 //! path — always use the stored params.
+//!
+//! ## Passphrase policy — the single home for both rules
+//! 1. **No normalization, ever.** The passphrase is hashed as exact bytes on every path —
+//!    create, change, unlock, verify, restore. Leading/trailing whitespace is significant; no
+//!    call site (backend or frontend) may trim or normalize, or a vault created with a padded
+//!    passphrase would fail to unlock. Locked by a unit test below.
+//! 2. **Strength floor at create/change only.** [`validate_passphrase_strength`] gates every
+//!    create-or-change entry point (never unlock/verify/restore, where an existing
+//!    weak-but-valid passphrase must still open data).
 
 use std::time::Instant;
 
@@ -206,5 +215,20 @@ mod tests {
         assert!(validate_passphrase_strength("1234567890").is_err());
         // A genuine passphrase clears both the length and the score floor.
         assert!(validate_passphrase_strength("correct horse battery staple").is_ok());
+    }
+
+    #[test]
+    fn derive_master_hashes_raw_bytes_without_normalization() {
+        // Rule 1 of the passphrase policy: exact bytes, no trimming anywhere. A passphrase that
+        // differs only by surrounding whitespace must derive a DIFFERENT key — otherwise a padded
+        // passphrase could unlock a vault created with the trimmed form, or (as the onboarding bug
+        // showed) lock the user out. Lock it here so no call site can silently reintroduce a trim.
+        // Random per run, generated once and shared by both derivations — the assertion holds for
+        // any salt, so we don't pin a literal (a hard-coded salt trips cryptographic-value scanners).
+        let salt: [u8; SALT_LEN] = crate::vault::random_array().expect("test RNG");
+        let params = KdfParams::at(64, 1); // tiny cost — this test cares about bytes, not timing
+        let bare = derive_master("correct horse battery staple", &salt, &params).unwrap();
+        let padded = derive_master("  correct horse battery staple  ", &salt, &params).unwrap();
+        assert_ne!(&bare[..], &padded[..]);
     }
 }
