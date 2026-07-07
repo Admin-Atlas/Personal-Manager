@@ -7,9 +7,12 @@ no bug bounty.
 
 ## Threat model (the short version)
 
-PM is **local-first**: your data lives on your own machine, and the only traffic
-that leaves is the model API call (and, if you connect one, a read-only calendar
-fetch). At rest, the **SQLCipher store** (settings, search index) is encrypted with
+PM is **local-first**: your data lives on your own machine. Outbound traffic is limited and
+enumerable — the model API calls that power chat; a launch-time update check against the
+signed release feed (and the download if you accept an update); a one-time first-run download
+of PM's on-device models and Python dependencies; and, only if you configure them, a read-only
+calendar fetch and encrypted backups to your own cloud. There is no telemetry, analytics, or
+crash reporting. At rest, the **SQLCipher store** (settings, search index) is encrypted with
 a key held in the OS keychain; your **documents live in a plaintext Markdown vault**,
 so their at-rest protection relies on your own OS full-disk encryption (BitLocker /
 FileVault) — a deliberate choice to keep your notes openable by any tool, not a gap

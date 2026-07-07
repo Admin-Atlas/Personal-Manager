@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn multi_sheet_workbook_sections_each_sheet() {
         let a = sheet("Budget", &["Project"], vec![vec!["Atlas"]], 1);
-        let b = sheet("Team", &["Name"], vec![vec!["Ramit"]], 1);
+        let b = sheet("Team", &["Name"], vec![vec!["Alex"]], 1);
         let (body, record) = to_markdown(&[a, b]).unwrap();
         assert!(body.contains("## Sheet: Budget"));
         assert!(body.contains("## Sheet: Team"));

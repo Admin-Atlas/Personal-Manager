@@ -355,7 +355,7 @@ class SpreadsheetTest(unittest.TestCase):
             ws1.append(["Atlas", 1200])
             ws2 = wb.create_sheet("Team")
             ws2.append(["Name"])
-            ws2.append(["Ramit"])
+            ws2.append(["Alex"])
             wb.save(path)
             out = S.do_analyze_spreadsheet({"path": path, "ext": "xlsx"})
         self.assertEqual([s["name"] for s in out["sheets"]], ["Budget", "Team"])

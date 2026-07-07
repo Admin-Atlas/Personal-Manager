@@ -852,7 +852,7 @@ mod tests {
                 at: "2026-06-28T10:00:00.000Z".into(),
             },
             chat::TurnPair {
-                user: "and tell Mats".into(),
+                user: "and tell Alex".into(),
                 assistant: "Will do.".into(),
                 turn_id: 4,
                 at: "2026-06-28T10:01:00.000Z".into(),

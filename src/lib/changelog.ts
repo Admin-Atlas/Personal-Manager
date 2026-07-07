@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.48-alpha",
+    date: "2026-07-07",
+    highlights: [
+      'Clearer about what leaves your device. The README and security policy now spell out the full, short list of network traffic PM makes — model calls, an update check, a one-time first-run download of its local models, and any calendar or encrypted backups you set up — so "local-first" is stated precisely. Internal test data also had a few sample names tidied up. No change to how anything works.',
+    ],
+  },
+  {
     version: "2.92.47-alpha",
     date: "2026-07-07",
     highlights: [

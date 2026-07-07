@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn name_match_is_token_based_not_substring() {
-        assert!(name_matches("PM", "PM sync with Ramit"));
+        assert!(name_matches("PM", "PM sync with Alex"));
         assert!(name_matches("Roadmap", "Plan the Roadmap review"));
         // "PM" must NOT match a "3pm" time token.
         assert!(!name_matches("PM", "Dentist at 3pm"));
