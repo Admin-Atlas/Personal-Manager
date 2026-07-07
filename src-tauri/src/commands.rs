@@ -3460,11 +3460,14 @@ pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<Calend
     calendar::list_all_events(&conn)
 }
 
-/// The upcoming events in the mirror, for the focus-view agenda.
+/// The upcoming events in the mirror, for the focus-view agenda. Each row carries `ended` — the agenda
+/// widens the strict "not yet ended" gate to keep events that finished earlier today (in the user's
+/// zone) so the view can show them de-emphasised until the user's local midnight.
 #[tauri::command]
-pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<CalendarEvent>> {
+pub fn list_calendar_events(state: State<'_, AppState>) -> Result<Vec<calendar::AgendaEvent>> {
     let conn = state.conn()?;
-    calendar::list_upcoming(&conn, calendar::AGENDA_DAYS)
+    let zone = resolve_zone(&conn);
+    calendar::focus_agenda(&conn, calendar::AGENDA_DAYS, zone)
 }
 
 // --- Google Drive (index-only connector, board card 4A) ---
@@ -4590,7 +4593,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         let now = clock::now_local_iso(zone);
         let today = clock::today_sql_in(zone);
         let projects = projects::list_overviews(&conn, &today)?;
-        let events = calendar::list_upcoming(&conn, briefing::BRIEFING_AGENDA_DAYS)?;
+        let events = calendar::list_upcoming(&conn, briefing::BRIEFING_AGENDA_DAYS, &today)?;
         // Evaluate the structured flag layer BEFORE rendering (card 9): reconcile the stored flag
         // set to the current projects + calendar, then render the ACTIVE (unresolved) flags as the
         // briefing's facts. Best-effort — a detection hiccup must never fail the briefing, so a

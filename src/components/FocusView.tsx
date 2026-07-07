@@ -18,6 +18,7 @@ import {
 } from "../lib/ipc";
 import { MilestoneList } from "./MilestoneList";
 import type {
+  AgendaEvent,
   CalendarEvent,
   DailyBriefing,
   FocusRoute,
@@ -122,7 +123,7 @@ function readSort(): Sort {
 // from it: revisits render instantly, then the mount effect revalidates in the
 // background. Memory-only (cleared on app reload), so the first open still loads.
 let cachedProjects: ProjectOverview[] | null = null;
-let cachedEvents: CalendarEvent[] = [];
+let cachedEvents: AgendaEvent[] = [];
 let cachedBriefing: DailyBriefing | null = null;
 // The focus box's in-progress text and any staged suggestion (a pending confirm / a note) must outlive a
 // tab switch too — the whole view unmounts, so component-local state would be dropped. Same lifetime as
@@ -143,8 +144,9 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   /** AI proposals keyed by project name, populated by "Suggest attributes". */
   const [proposals, setProposals] = useState<Record<string, ProjectProposal>>({});
   const [proposing, setProposing] = useState(false);
-  /** Upcoming calendar events for the agenda (empty when not connected). */
-  const [events, setEvents] = useState<CalendarEvent[]>(() => cachedEvents);
+  /** Focus-agenda events (empty when not connected). Includes events that ended earlier today, tagged
+   *  `ended` — the Agenda greys those; every other consumer takes the strict `upcoming` subset below. */
+  const [events, setEvents] = useState<AgendaEvent[]>(() => cachedEvents);
   /** The daily briefing (Step 7); null until loaded, then refreshed when stale. */
   const [briefing, setBriefing] = useState<DailyBriefing | null>(() => cachedBriefing);
   const [briefingBusy, setBriefingBusy] = useState(false);
@@ -243,6 +245,9 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   }, []);
 
   const names = useMemo(() => projects.map((p) => p.name), [projects]);
+  // The strict "not yet ended" subset for name-matching and milestone linking — those surfaces must
+  // never see an event that already ended today (only the Agenda greys and shows those).
+  const upcoming = useMemo(() => events.filter((e) => !e.ended), [events]);
   // How the project list is ordered. Defaults to "Smart" (status precedence); remembered per-device.
   const [sort, setSort] = useState<Sort>(() => readSort());
   useEffect(() => {
@@ -365,7 +370,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
                     key={p.name}
                     project={p}
                     otherProjects={names.filter((n) => n !== p.name)}
-                    events={events}
+                    events={upcoming}
                     proposal={proposals[p.name]}
                     editing={editing === p.name}
                     onEdit={() => setEditing(editing === p.name ? null : p.name)}
@@ -905,8 +910,9 @@ function ConfirmRow({
   );
 }
 
-/** The "Upcoming" agenda — the next handful of events from connected calendars. */
-function Agenda({ events }: { events: CalendarEvent[] }) {
+/** The "Upcoming" agenda — the next handful of events from connected calendars. An event that already
+ *  ended today stays listed (a real day stays visible until its own midnight) but greyed. */
+function Agenda({ events }: { events: AgendaEvent[] }) {
   const shown = events.slice(0, 8);
   return (
     <Card className="mb-5 px-4 py-3" data-help="focus-agenda">
@@ -915,12 +921,16 @@ function Agenda({ events }: { events: CalendarEvent[] }) {
       </h2>
       <ul className="flex flex-col gap-1.5">
         {shown.map((e) => (
-          <li key={e.id} className="flex items-baseline gap-3 text-sm">
+          <li
+            key={e.id}
+            className={`flex items-baseline gap-3 text-sm${e.ended ? " opacity-45" : ""}`}
+          >
             <span className="w-32 shrink-0 font-mono text-xs text-ink3">
               {formatEventWhen(e.start, e.all_day)}
             </span>
             <span className="truncate text-ink2">{e.summary}</span>
             {e.location && <span className="truncate text-xs text-ink4">{e.location}</span>}
+            {e.ended && <span className="shrink-0 text-xs text-ink4">ended</span>}
           </li>
         ))}
       </ul>

@@ -260,7 +260,7 @@ fn active_labeled(
         .flat_map(|(project, ms)| ms.iter().map(move |m| (m.id, (project.as_str(), m))))
         .collect();
     // Recurrences share a uid → keep the soonest instance for display, mirroring the briefing join.
-    let events = calendar::list_upcoming(conn, DETECT_EVENT_WINDOW_DAYS)?;
+    let events = calendar::list_upcoming(conn, DETECT_EVENT_WINDOW_DAYS, today)?;
     let mut event_by_uid: HashMap<&str, &CalendarEvent> = HashMap::new();
     for e in &events {
         if let Some(uid) = e.uid.as_deref() {
@@ -912,7 +912,7 @@ pub fn detect_and_store(
 /// agree on the flag set.
 pub fn run_detection(conn: &Connection, today: &str) -> Result<DetectionSummary> {
     let projects = projects::list_overviews(conn, today)?;
-    let events = calendar::list_upcoming(conn, DETECT_EVENT_WINDOW_DAYS)?;
+    let events = calendar::list_upcoming(conn, DETECT_EVENT_WINDOW_DAYS, today)?;
     detect_and_store(conn, &projects, &events, today)
 }
 

@@ -11,7 +11,7 @@
 //! once in Rust and the SQL stays pure. Each public fn has an `*_at` twin taking an
 //! injected `DateTime<Utc>`, so the zone math unit-tests without a real clock.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, LocalResult, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 
 /// The user's civil date in `zone` at instant `now` (e.g. `2026-06-22`) — the single
@@ -33,6 +33,40 @@ pub fn today_sql_in(zone: Tz) -> String {
 /// [`today_sql_in`] with an injected instant (test seam).
 pub fn today_sql_in_at(zone: Tz, now: DateTime<Utc>) -> String {
     today_in_at(zone, now).format("%Y-%m-%d").to_string()
+}
+
+/// The start of the user's civil day — their most recent local midnight — as a UTC instant in
+/// SQLite's `YYYY-MM-DD HH:MM:SS` form. `julianday(:day_start)` is that boundary as an *absolute*
+/// instant, so a stored timed `end` compares against it offset-correctly. Contrast [`today_sql_in`],
+/// a civil DATE (00:00 *UTC*) for whole-day delta math: this one is the true instant the user's day
+/// began, so the focus agenda can keep an event that ended earlier *today* without a UTC-midnight skew.
+pub fn day_start_utc_in(zone: Tz) -> String {
+    day_start_utc_in_at(zone, Utc::now())
+}
+
+/// [`day_start_utc_in`] with an injected instant (test seam).
+pub fn day_start_utc_in_at(zone: Tz, now: DateTime<Utc>) -> String {
+    let midnight = today_in_at(zone, now)
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time");
+    // Map naive local midnight back to a UTC instant. On the rare zone where the clock springs
+    // forward across midnight itself, 00:00 doesn't exist — step to the first valid local instant;
+    // on a fall-back fold, take the earlier occurrence. Never panic, and stay within the civil day.
+    let local = match zone.from_local_datetime(&midnight) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+        LocalResult::None => zone
+            .from_local_datetime(
+                &today_in_at(zone, now)
+                    .and_hms_opt(1, 0, 0)
+                    .expect("01:00:00 is a valid time"),
+            )
+            .earliest()
+            .unwrap_or_else(|| now.with_timezone(&zone)),
+    };
+    local
+        .with_timezone(&Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 /// The user's wall-clock "now" as `%Y-%m-%dT%H:%M` in `zone` — what the briefing
@@ -102,6 +136,35 @@ mod tests {
         // An all-day date has no instant — its leading date is returned unchanged in every zone.
         assert_eq!(zone_date_of("2026-06-20", Sydney), "2026-06-20");
         assert_eq!(zone_date_of("2026-06-20", Tz::UTC), "2026-06-20");
+    }
+
+    #[test]
+    fn day_start_is_local_midnight_expressed_in_utc() {
+        use chrono_tz::America::New_York;
+        use chrono_tz::Australia::Sydney;
+        // 2026-06-22 03:00 UTC. In New York (EDT, -04) it's still the 21st at 23:00, so the user's day
+        // began at 2026-06-21 00:00 local = 2026-06-21 04:00 UTC.
+        let now = Utc.with_ymd_and_hms(2026, 6, 22, 3, 0, 0).unwrap();
+        assert_eq!(day_start_utc_in_at(New_York, now), "2026-06-21 04:00:00");
+        // Same instant in Sydney (AEST, +10) is the 22nd at 13:00, so its midnight is 2026-06-22 00:00
+        // local = 2026-06-21 14:00 UTC — east of UTC, the local day starts before UTC midnight.
+        assert_eq!(day_start_utc_in_at(Sydney, now), "2026-06-21 14:00:00");
+        // In UTC itself the civil day starts exactly at UTC midnight.
+        assert_eq!(day_start_utc_in_at(Tz::UTC, now), "2026-06-22 00:00:00");
+    }
+
+    #[test]
+    fn day_start_survives_a_midnight_dst_transition() {
+        // Some zones spring forward at midnight (e.g. parts of Brazil historically). The helper must
+        // resolve a non-existent 00:00 to a real instant rather than panicking; asserting only that it
+        // returns a parseable UTC datetime keeps the test independent of any single zone's rules.
+        use chrono_tz::America::Sao_Paulo;
+        let now = Utc.with_ymd_and_hms(2018, 11, 4, 6, 0, 0).unwrap();
+        let s = day_start_utc_in_at(Sao_Paulo, now);
+        assert!(
+            DateTime::parse_from_str(&format!("{s} +0000"), "%Y-%m-%d %H:%M:%S %z").is_ok(),
+            "expected a parseable UTC instant, got {s:?}"
+        );
     }
 
     #[test]

@@ -76,10 +76,23 @@ pub struct CalendarMatch {
 }
 
 /// An upcoming (or still-in-progress) calendar event, as returned by [`upcoming_events`] and shared
-/// by the focus agenda, the chat preamble, and project name-matching. The day delta to its start is
-/// now computed by the consumer in the user's zone (so it matches the milestone path), not here.
+/// by the chat preamble, project name-matching, the briefing, and flag detection under the strict
+/// "not yet ended" gate. The day delta to its start is now computed by the consumer in the user's
+/// zone (so it matches the milestone path), not here.
 pub struct UpcomingEvent {
     pub event: CalendarEvent,
+}
+
+/// A focus-agenda row: an event plus whether it has already ended. [`focus_agenda`] widens the strict
+/// gate to also keep events that ended *earlier today* (in the user's zone), flagging them so the view
+/// can de-emphasise them — a real day stays visible until its own end, then greys, and disappears at
+/// the user's local midnight. `ended` is `end < now` (the true instant); it is never true on the strict
+/// path, which only the focus view widens.
+#[derive(Serialize)]
+pub struct AgendaEvent {
+    #[serde(flatten)]
+    pub event: CalendarEvent,
+    pub ended: bool,
 }
 
 /// A calendar as returned by Google's `calendarList`, before PM's selection is applied.
@@ -1121,25 +1134,41 @@ pub fn clear_all_events(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Upcoming events (not yet ended, starting within `days`), soonest first, with the
-/// day delta to each start computed in SQL. Unparseable dates are excluded.
-pub fn upcoming_events(conn: &Connection, days: i64, limit: usize) -> Result<Vec<UpcomingEvent>> {
+/// The shared forward-agenda read. Events starting within `days` and not yet past the day boundary,
+/// soonest first, deduped by iCal UID; unparseable dates are excluded.
+///
+/// The boundary is the *user's* civil day, not UTC's. `today` is their local date (`YYYY-MM-DD`, from
+/// [`crate::clock::today_sql_in`]) so an all-day event is kept for exactly the days it civilly spans —
+/// dropping at the user's midnight, never a UTC-midnight skew that would shed it while it's still today
+/// (west of UTC) or keep it hours into tomorrow (east). A timed event is compared as an absolute
+/// instant: it must not have ended before `floor`. `floor` is the SQLite time-string that instant
+/// gate uses — `"now"` for the strict "not yet ended" gate every consumer shares, or the user's
+/// local-midnight instant ([`crate::clock::day_start_utc_in`]) for the focus agenda, which also keeps
+/// events that ended earlier today. Each row reports `ended` (`end < now`) so the view can grey a
+/// finished-but-still-today event; on the strict path nothing with `end < now` survives, so it's false.
+fn agenda_query(
+    conn: &Connection,
+    days: i64,
+    limit: usize,
+    today: &str,
+    floor: &str,
+) -> Result<Vec<AgendaEvent>> {
     let horizon = format!("+{days} days");
-    // An all-day event with no explicit end has a date-only `start`; `julianday` reads that as
-    // 00:00 UTC, so a plain `COALESCE(end, start) >= now` would drop it the instant UTC passes
-    // midnight — while it's still "today". Treat a no-end all-day event as ending start-of-next-day.
     let mut stmt = conn.prepare(
-        "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid \
+        "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
+                (all_day = 0 AND julianday(COALESCE(end, start)) < julianday('now')) AS ended \
          FROM calendar_events \
-         WHERE julianday(COALESCE(end, CASE WHEN all_day = 1 THEN datetime(start, '+1 day') ELSE start END)) \
-                 >= julianday('now') \
-           AND julianday(start) <= julianday('now', ?1) \
+         WHERE (CASE WHEN all_day = 1 \
+                     THEN date(COALESCE(end, date(start, '+1 day'))) > ?1 \
+                     ELSE julianday(COALESCE(end, start)) >= julianday(?2) END) \
+           AND julianday(start) <= julianday(?1, ?3) \
          ORDER BY start \
-         LIMIT ?2",
+         LIMIT ?4",
     )?;
-    let rows = stmt.query_map(params![horizon, limit as i64], |r| {
+    let rows = stmt.query_map(params![today, floor, horizon, limit as i64], |r| {
         let all_day: i64 = r.get(7)?;
-        Ok(UpcomingEvent {
+        let ended: i64 = r.get(10)?;
+        Ok(AgendaEvent {
             event: CalendarEvent {
                 id: r.get(0)?,
                 calendar_id: r.get(1)?,
@@ -1152,6 +1181,7 @@ pub fn upcoming_events(conn: &Connection, days: i64, limit: usize) -> Result<Vec
                 html_link: r.get(8)?,
                 uid: r.get(9)?,
             },
+            ended: ended != 0,
         })
     })?;
     let collected = rows
@@ -1163,19 +1193,47 @@ pub fn upcoming_events(conn: &Connection, days: i64, limit: usize) -> Result<Vec
     let mut seen = std::collections::HashSet::new();
     Ok(collected
         .into_iter()
-        .filter(|u| match &u.event.uid {
+        .filter(|a| match &a.event.uid {
             Some(uid) if !uid.is_empty() => seen.insert(uid.clone()),
             _ => true,
         })
         .collect())
 }
 
-/// The agenda for the focus view (plain event list, capped for display).
-pub fn list_upcoming(conn: &Connection, days: i64) -> Result<Vec<CalendarEvent>> {
-    Ok(upcoming_events(conn, days, 250)?
+/// Upcoming events under the strict "not yet ended" gate (chat preamble, project name-match, briefing,
+/// flag detection), soonest first. `today` is the user's civil date ([`crate::clock::today_sql_in`]).
+pub fn upcoming_events(
+    conn: &Connection,
+    days: i64,
+    limit: usize,
+    today: &str,
+) -> Result<Vec<UpcomingEvent>> {
+    Ok(agenda_query(conn, days, limit, today, "now")?
+        .into_iter()
+        .map(|a| UpcomingEvent { event: a.event })
+        .collect())
+}
+
+/// The strict forward agenda as a plain event list (briefing + flag detection), capped for display.
+pub fn list_upcoming(conn: &Connection, days: i64, today: &str) -> Result<Vec<CalendarEvent>> {
+    Ok(upcoming_events(conn, days, 250, today)?
         .into_iter()
         .map(|u| u.event)
         .collect())
+}
+
+/// The focus-view agenda: the strict forward list widened to also carry events that ended earlier
+/// *today* in the user's zone, each tagged `ended` so the view can de-emphasise it. Both the civil-day
+/// boundary and the "earlier today" floor are resolved from `zone` here, so the caller just passes the
+/// user's zone.
+pub fn focus_agenda(conn: &Connection, days: i64, zone: chrono_tz::Tz) -> Result<Vec<AgendaEvent>> {
+    agenda_query(
+        conn,
+        days,
+        250,
+        &clock::today_sql_in(zone),
+        &clock::day_start_utc_in(zone),
+    )
 }
 
 /// Every mirrored event, for the unified calendar VIEW (card 8): the whole synced band — the
@@ -1210,7 +1268,7 @@ pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
 /// A compact agenda preamble for chat, or `None` when there's nothing upcoming.
 /// Framed as untrusted DATA so the model never treats an event title as a command.
 pub fn agenda_preamble(conn: &Connection, days: i64, tz: chrono_tz::Tz) -> Result<Option<String>> {
-    let events = upcoming_events(conn, days, MAX_AGENDA_EVENTS)?;
+    let events = upcoming_events(conn, days, MAX_AGENDA_EVENTS, &clock::today_sql_in(tz))?;
     if events.is_empty() {
         return Ok(None);
     }
@@ -1509,5 +1567,52 @@ mod tests {
         assert_eq!(events[1].summary, "(no title)");
         assert!(events[1].all_day);
         assert_eq!(events[1].uid, None);
+    }
+
+    #[test]
+    fn agenda_gate_is_civil_day_and_focus_keeps_ended_today() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        // Rows positioned relative to the real 'now', so the assertions hold whenever the test runs: a
+        // timed event that ended an hour ago, one still ahead, and two all-day events (today / yesterday).
+        conn.execute_batch(
+            "INSERT INTO calendar_events (id, calendar_id, summary, start, end, all_day) VALUES \
+               ('past',      'cal-1', 'Ended earlier', datetime('now','-3 hours'), datetime('now','-1 hours'), 0), \
+               ('future',    'cal-1', 'Upcoming',      datetime('now','+1 hours'), datetime('now','+2 hours'), 0), \
+               ('today',     'cal-1', 'All day today', date('now'),                NULL,                       1), \
+               ('yesterday', 'cal-1', 'All day past',  date('now','-1 day'),       NULL,                       1);",
+        )
+        .unwrap();
+        let today: String = conn
+            .query_row("SELECT date('now')", [], |r| r.get(0))
+            .unwrap();
+        // The focus floor is the user's local midnight; here, any instant safely before 'past' ended.
+        let floor: String = conn
+            .query_row("SELECT datetime('now','-6 hours')", [], |r| r.get(0))
+            .unwrap();
+        let ids =
+            |rows: &[AgendaEvent]| rows.iter().map(|a| a.event.id.clone()).collect::<Vec<_>>();
+
+        // Strict gate ("not yet ended"): the finished event and yesterday's all-day are gone; today's
+        // all-day and the upcoming timed event remain, and nothing is flagged ended.
+        let strict = agenda_query(&conn, 30, 250, &today, "now").unwrap();
+        let strict_ids = ids(&strict);
+        assert!(strict_ids.contains(&"future".to_string()));
+        assert!(strict_ids.contains(&"today".to_string()));
+        assert!(!strict_ids.contains(&"past".to_string()));
+        assert!(!strict_ids.contains(&"yesterday".to_string()));
+        assert!(strict.iter().all(|a| !a.ended));
+
+        // Focus gate widens to keep the event that ended earlier today, flagged `ended` for greying;
+        // yesterday's all-day still drops at the civil boundary, and the upcoming one is unaffected.
+        let focus = agenda_query(&conn, 30, 250, &today, &floor).unwrap();
+        let focus_ids = ids(&focus);
+        assert!(focus_ids.contains(&"past".to_string()));
+        assert!(focus_ids.contains(&"future".to_string()));
+        assert!(focus_ids.contains(&"today".to_string()));
+        assert!(!focus_ids.contains(&"yesterday".to_string()));
+        assert!(focus.iter().find(|a| a.event.id == "past").unwrap().ended);
+        assert!(!focus.iter().find(|a| a.event.id == "future").unwrap().ended);
+        assert!(!focus.iter().find(|a| a.event.id == "today").unwrap().ended);
     }
 }

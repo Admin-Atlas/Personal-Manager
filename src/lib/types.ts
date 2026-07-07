@@ -938,6 +938,14 @@ export interface CalendarEvent {
   uid: string | null;
 }
 
+/** A focus-agenda row: a mirrored event plus whether it has already ended. The focus agenda widens
+ *  the strict "not yet ended" gate to also list events that finished earlier today (in the user's
+ *  zone); `ended` (`end < now`) is true for exactly those, so the view can show them de-emphasised
+ *  until the user's local midnight. Every other consumer keeps the strict gate and never sees them. */
+export interface AgendaEvent extends CalendarEvent {
+  ended: boolean;
+}
+
 /** The upcoming event that named a project (shown on its focus card). */
 export interface CalendarMatch {
   summary: string;

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.56-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Your calendar agenda now follows your own day, not UTC's. An all-day event stays on the agenda for exactly the day you see it — no vanishing before midnight or lingering into tomorrow when your zone is far from UTC — and the same day-boundary now applies to the schedule your chat and project matching read. On the Focus view, an event that already finished today stays listed but greyed until your local midnight, so today still looks like a full day. No setup — it uses the time zone you've already set.",
+    ],
+  },
+  {
     version: "2.92.55-alpha",
     date: "2026-07-07",
     highlights: [
