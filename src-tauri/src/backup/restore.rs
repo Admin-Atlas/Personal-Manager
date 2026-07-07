@@ -90,7 +90,7 @@ pub fn restore(
     // --- header (cleartext) → derive key --------------------------------------------
     let mut file =
         File::open(src).map_err(|_| Error::Other("could not open the backup file".into()))?;
-    let (_flags, header_json, header) = format::read_header(&mut file)?;
+    let (flags, header_json, header) = format::read_header(&mut file)?;
     if header.cipher != format::CIPHER_ID {
         return Err(Error::Other("unsupported backup cipher".into()));
     }
@@ -107,7 +107,7 @@ pub fn restore(
     let nonce_prefix = B64
         .decode(&header.stream_nonce_prefix_b64)
         .map_err(|e| Error::Other(format!("corrupt backup nonce: {e}")))?;
-    let aad = format::aad(&header_json);
+    let aad = format::aad(flags, &header_json);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_slice()));
 
     // Progress is metered on archive (ciphertext) bytes consumed, whose total we know.

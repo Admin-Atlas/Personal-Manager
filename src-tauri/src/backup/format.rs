@@ -78,7 +78,7 @@ pub struct KdfBlock {
 }
 
 /// Write the cleartext container header and return the exact JSON bytes, so the caller
-/// can bind them to the payload as AAD (`aad(&bytes)`).
+/// can bind them to the payload as AAD (`aad(flags, &bytes)`).
 pub fn write_header<W: Write>(w: &mut W, flags: u16, header: &Header) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(header)
         .map_err(|e| Error::Other(format!("could not encode backup header: {e}")))?;
@@ -128,6 +128,14 @@ pub fn read_header<R: Read>(r: &mut R) -> Result<(u16, Vec<u8>, Header)> {
     r.read_exact(&mut json)?;
     let header: Header = serde_json::from_slice(&json)
         .map_err(|e| Error::Other(format!("corrupt backup header: {e}")))?;
+    // L-4: the format version is recorded twice — the binary preamble (checked above) and the JSON
+    // copy. Assert they agree so a header body claiming a different version can't slip past the reader.
+    if header.format_version != version {
+        return Err(Error::Other(format!(
+            "corrupt backup header (format version mismatch: outer {version}, inner {})",
+            header.format_version
+        )));
+    }
     // Bound the (attacker-controlled) chunk size before it feeds the frame allocation cap.
     if header.chunk_size == 0 || header.chunk_size > MAX_CHUNK_SIZE {
         return Err(Error::Other(
@@ -137,11 +145,18 @@ pub fn read_header<R: Read>(r: &mut R) -> Result<(u16, Vec<u8>, Header)> {
     Ok((flags, json, header))
 }
 
-/// Additional authenticated data binding the whole cleartext header to the encrypted
-/// payload: `blake3(header_json)`. Any tampering with the header (e.g. swapping the KDF
-/// params) changes the AAD and fails every chunk's authentication.
-pub fn aad(header_json: &[u8]) -> [u8; 32] {
-    *blake3::hash(header_json).as_bytes()
+/// Additional authenticated data binding the WHOLE cleartext preamble to the encrypted
+/// payload: `blake3(MAGIC ‖ FORMAT_VERSION ‖ flags ‖ header_json)`. Covering the binary
+/// preamble — not just the JSON — makes the format version and the provenance flags
+/// (`FLAG_*`) tamper-evident too (L-4): any change to them alters the AAD and so fails
+/// every chunk's authentication, rather than being silently accepted on restore.
+pub fn aad(flags: u16, header_json: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(MAGIC);
+    h.update(&FORMAT_VERSION.to_le_bytes());
+    h.update(&flags.to_le_bytes());
+    h.update(header_json);
+    *h.finalize().as_bytes()
 }
 
 // ---- chunked STREAM writer/reader ---------------------------------------------------
@@ -410,8 +425,13 @@ mod tests {
         assert_eq!(flags, FLAG_DB_KEY_EMBEDDED);
         assert_eq!(json, written_json);
         assert_eq!(back, h);
-        // The AAD is a pure function of the header bytes.
-        assert_eq!(aad(&json), aad(&written_json));
+        // The AAD is a pure function of the flags + header bytes.
+        assert_eq!(aad(flags, &json), aad(FLAG_DB_KEY_EMBEDDED, &written_json));
+        // L-4: the flags are now bound into the AAD, so tampering with them changes it.
+        assert_ne!(
+            aad(flags, &json),
+            aad(flags ^ FLAG_SOURCE_MD_ENCRYPTED, &json)
+        );
     }
 
     #[test]

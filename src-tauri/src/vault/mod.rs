@@ -49,6 +49,9 @@ const META_SCHEMA: u32 = 1;
 /// BLAKE3 derive_key context for the Markdown-at-rest subkey — distinct from every
 /// other use of the master key, so the Markdown key never equals the DB key.
 const MARKDOWN_SUBKEY_CONTEXT: &str = "org.itsatlas.pm markdown-at-rest subkey v1";
+/// BLAKE3 derive_key context for the vault-meta authentication subkey (M-3) — distinct from the DB
+/// key, the Markdown subkey, and the verifier, so the MAC key is independent of every other use.
+const META_MAC_CONTEXT: &str = "org.itsatlas.pm vault-meta auth subkey v1";
 /// Recorded in the meta so every profile agrees on how the Markdown subkey is made.
 const MARKDOWN_SUBKEY_SCHEME: &str = "blake3-derive-key";
 /// Target Argon2id derivation time when creating a shareable vault (~mid of the
@@ -153,6 +156,12 @@ pub struct VaultMeta {
     pub verifier: Option<Verifier>,
     #[serde(default)]
     pub markdown: MarkdownPolicy,
+    /// Keyed BLAKE3 MAC (hex) over the authenticated meta fields, under a master subkey (M-3).
+    /// Absent on a legacy vault written before meta authentication; stamped on the first authenticated
+    /// open and enforced thereafter. `skip_serializing_if`/`default` keep older files loading and keep
+    /// the MAC out of its own input.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub meta_mac: Option<String>,
 }
 
 impl VaultMeta {
@@ -168,6 +177,8 @@ impl VaultMeta {
             kdf: None,
             verifier: None,
             markdown: MarkdownPolicy::default(),
+            // Stamped lazily on the first authenticated open (the device key isn't created yet here).
+            meta_mac: None,
         }
     }
 }
@@ -215,6 +226,99 @@ pub fn ensure_device_meta(vault_root: &Path) -> Result<VaultMeta> {
     let meta = VaultMeta::new_device();
     store_meta(vault_root, &meta)?;
     Ok(meta)
+}
+
+/// What [`authenticate_meta`] did on open — surfaced so a caller can show a non-blocking warning (M-3).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MetaAuthReport {
+    /// A passphrase vault whose Markdown policy had been downgraded to plaintext was forced back to
+    /// encrypted (and the on-disk meta repaired).
+    pub downgrade_corrected: bool,
+    /// The stored meta MAC did not match — the metadata was altered outside PM.
+    pub mac_mismatch: bool,
+}
+
+impl MetaAuthReport {
+    /// Whether anything happened that the user should be told about (a legacy stamp is silent).
+    pub fn needs_warning(&self) -> bool {
+        self.downgrade_corrected || self.mac_mismatch
+    }
+
+    /// A short, user-facing warning line, or `None` when there is nothing to report.
+    pub fn warning(&self) -> Option<String> {
+        if self.downgrade_corrected {
+            Some(
+                "This vault's \"encrypt notes at rest\" setting had been switched off outside PM. \
+                 PM has turned it back on, so your notes stay encrypted. If you didn't change it, \
+                 check who can reach the vault folder."
+                    .into(),
+            )
+        } else if self.mac_mismatch {
+            Some(
+                "This vault's metadata failed its integrity check — it was altered outside PM. \
+                 PM has re-secured it. If you didn't change it, check who can reach the vault folder."
+                    .into(),
+            )
+        } else {
+            None
+        }
+    }
+}
+
+/// The keyed BLAKE3 MAC over the authenticated meta fields (everything EXCEPT the MAC itself), under a
+/// dedicated subkey of the master. Deterministic: serde serializes struct fields in declaration order,
+/// and the MAC field is cleared before serialization so it never covers itself.
+fn meta_mac(meta: &VaultMeta, master: &[u8; KEY_LEN]) -> Result<blake3::Hash> {
+    let mut bare = meta.clone();
+    bare.meta_mac = None;
+    let bytes = serde_json::to_vec(&bare).map_err(|e| {
+        Error::Other(format!(
+            "could not encode vault meta for authentication: {e}"
+        ))
+    })?;
+    let subkey = blake3::derive_key(META_MAC_CONTEXT, master);
+    Ok(blake3::keyed_hash(&subkey, &bytes))
+}
+
+/// Authenticate the non-secret `vault-meta.json` against a keyed MAC under a master subkey, and repair a
+/// silently-downgraded Markdown policy (M-3). `master` MUST already be authenticated by the caller (the
+/// DB opened, or the passphrase verifier passed) — this is the first point where that trust exists.
+///
+/// Additive + backward-compatible: a legacy vault with no stored MAC is stamped on this first
+/// authenticated open, and enforced thereafter. On any repair the corrected meta is persisted so the
+/// on-disk file is durably safe. Never hard-fails — the master is trusted, so we correct-and-continue
+/// rather than lock the user out of their own data. The returned report drives a non-blocking warning.
+pub fn authenticate_meta(
+    vault_root: &Path,
+    meta: &VaultMeta,
+    master: &[u8; KEY_LEN],
+) -> Result<MetaAuthReport> {
+    let mut report = MetaAuthReport::default();
+    let legacy = meta.meta_mac.is_none();
+    if let Some(stored_hex) = &meta.meta_mac {
+        let stored = blake3::Hash::from_hex(stored_hex.as_str())
+            .map_err(|e| Error::Other(format!("corrupt vault-meta authentication tag: {e}")))?;
+        // blake3::Hash equality is constant-time.
+        if meta_mac(meta, master)? != stored {
+            report.mac_mismatch = true;
+        }
+    }
+    // Repair a copy we can persist; the live cipher is already forced safe by `from_meta`.
+    let mut fixed = meta.clone();
+    if fixed.key_mode == KeyMode::Passphrase
+        && fixed.markdown.encryption == MarkdownEncryption::None
+    {
+        fixed.markdown.encryption = MarkdownEncryption::XChaCha20Poly1305;
+        fixed.markdown.subkey = MARKDOWN_SUBKEY_SCHEME.to_string();
+        report.downgrade_corrected = true;
+    }
+    // Stamp a legacy vault, or re-secure after a downgrade / tamper. A clean, already-stamped vault is
+    // a pure verify with no write.
+    if legacy || report.downgrade_corrected || report.mac_mismatch {
+        fixed.meta_mac = Some(meta_mac(&fixed, master)?.to_hex().to_string());
+        store_meta(vault_root, &fixed)?;
+    }
+    Ok(report)
 }
 
 /// The resolved on-disk locations of a vault, after consulting the per-profile
@@ -339,13 +443,21 @@ impl MarkdownCipher {
     /// Markdown subkey is derived only when the policy calls for encryption, so a
     /// device vault never holds a Markdown key it won't use.
     pub fn from_meta(meta: &VaultMeta, master: &[u8; KEY_LEN]) -> Self {
-        let subkey = match meta.markdown.encryption {
+        // M-3: a passphrase (shareable) vault MUST encrypt Markdown at rest — its folder is reachable
+        // by other accounts, so plaintext there is a confidentiality downgrade. Enforce the invariant at
+        // the point of use, regardless of what `vault-meta.json` claims, so a tampered `encryption:none`
+        // can never turn new notes into cleartext — even on the same open that repairs the meta.
+        let encryption = match meta.key_mode {
+            KeyMode::Passphrase => MarkdownEncryption::XChaCha20Poly1305,
+            KeyMode::Device => meta.markdown.encryption,
+        };
+        let subkey = match encryption {
             MarkdownEncryption::None => None,
             MarkdownEncryption::XChaCha20Poly1305 => Some(markdown_subkey(master)),
         };
         Self {
             vault_id: meta.vault_id.clone(),
-            encryption: meta.markdown.encryption,
+            encryption,
             subkey,
         }
     }
@@ -521,6 +633,8 @@ fn build_passphrase_meta(
             encryption: MarkdownEncryption::XChaCha20Poly1305,
             subkey: MARKDOWN_SUBKEY_SCHEME.to_string(),
         },
+        // Stamped on the first authenticated open (uniform with the device path).
+        meta_mac: None,
     };
     Ok((meta, master))
 }
@@ -556,7 +670,7 @@ pub fn open_with_passphrase(
     resolved: &ResolvedVault,
     meta: &VaultMeta,
     passphrase: &str,
-) -> Result<(Connection, Secret)> {
+) -> Result<(Connection, Secret, MetaAuthReport)> {
     let master = derive_master_from_passphrase(meta, passphrase)?;
     let verifier = meta
         .verifier
@@ -565,9 +679,12 @@ pub fn open_with_passphrase(
     if !verifier::check(verifier, &master)? {
         return Err(Error::Other("wrong passphrase".into()));
     }
+    // The passphrase is now proven, so the master is trusted — the first point at which we can
+    // authenticate + repair the non-secret meta (M-3). The report drives a non-blocking UI warning.
+    let report = authenticate_meta(&resolved.vault_root, meta, &master)?;
     let key = db_key_hex(&master);
     let conn = db::open(&resolved.db_path, key.expose())?;
-    Ok((conn, key))
+    Ok((conn, key, report))
 }
 
 /// The 64-hex DB key this profile should open a vault with, or `None` if the vault is a
@@ -621,6 +738,7 @@ pub fn open_at_boot(
                 if let Ok(conn) = db::open(&resolved.db_path, device_key.expose()) {
                     secrets::clear_cached_vault_key(&meta.vault_id)?;
                     let master = master_from_db_key_hex(device_key.expose())?;
+                    log_meta_auth(&resolved.vault_root, meta, &master);
                     return Ok(Some((conn, master)));
                 }
             }
@@ -630,7 +748,22 @@ pub fn open_at_boot(
         }
     };
     let master = master_from_db_key_hex(key.expose())?;
+    log_meta_auth(&resolved.vault_root, meta, &master);
     Ok(Some((conn, master)))
+}
+
+/// Authenticate + repair the meta on the boot/reopen path, logging a warning (there is no UI at boot).
+/// Best-effort: an authentication or persist failure must not abort opening a vault the master already
+/// unlocked, so it is logged rather than propagated (the live cipher is safe regardless, via `from_meta`).
+fn log_meta_auth(vault_root: &Path, meta: &VaultMeta, master: &[u8; KEY_LEN]) {
+    match authenticate_meta(vault_root, meta, master) {
+        Ok(report) => {
+            if let Some(w) = report.warning() {
+                eprintln!("vault: {w}");
+            }
+        }
+        Err(e) => eprintln!("vault: meta authentication could not complete: {e}"),
+    }
 }
 
 #[cfg(test)]
@@ -772,7 +905,7 @@ mod tests {
             crate::db::open(&resolved.db_path, key.expose()).unwrap();
         }
         // The right passphrase opens it and yields the same key.
-        let (conn, key2) = open_with_passphrase(&resolved, &meta, "open-sesame").unwrap();
+        let (conn, key2, _report) = open_with_passphrase(&resolved, &meta, "open-sesame").unwrap();
         assert_eq!(key2.expose(), db_key_hex(&master).expose());
         drop(conn);
         // The wrong passphrase fails at the verifier, before SQLCipher.
@@ -790,13 +923,76 @@ mod tests {
 
     #[test]
     fn cipher_from_meta_derives_key_only_when_encryption_on() {
-        let (mut meta, master) = build_passphrase_meta("pw", cheap_params()).unwrap();
+        // Use a DEVICE meta for the off case: a passphrase vault is now always forced on (M-3), so
+        // only a device vault honours an `encryption: none` policy.
+        let master = [5u8; KEY_LEN];
+        let mut meta = VaultMeta::new_device();
         meta.markdown.encryption = MarkdownEncryption::None;
         let off = MarkdownCipher::from_meta(&meta, &master);
         assert!(!off.encryption_on() && off.subkey.is_none());
         meta.markdown.encryption = MarkdownEncryption::XChaCha20Poly1305;
         let on = MarkdownCipher::from_meta(&meta, &master);
         assert!(on.encryption_on() && on.subkey.is_some());
+    }
+
+    #[test]
+    fn from_meta_forces_encryption_for_a_passphrase_vault_even_if_meta_says_none() {
+        // M-3: a downgraded/tampered passphrase meta claiming plaintext must still encrypt at rest.
+        let (mut meta, master) = build_passphrase_meta("pw", cheap_params()).unwrap();
+        meta.markdown.encryption = MarkdownEncryption::None;
+        let cipher = MarkdownCipher::from_meta(&meta, &master);
+        assert!(cipher.encryption_on());
+        assert!(cipher.subkey.is_some());
+    }
+
+    #[test]
+    fn authenticate_meta_stamps_legacy_then_enforces_and_repairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (meta, master) = build_passphrase_meta("pw", cheap_params()).unwrap();
+        store_meta(dir.path(), &meta).unwrap();
+        assert!(meta.meta_mac.is_none(), "a fresh vault carries no MAC yet");
+
+        // First authenticated open: a legacy (unstamped) vault gets its MAC written, silently.
+        let r1 = authenticate_meta(dir.path(), &meta, &master).unwrap();
+        assert!(!r1.needs_warning());
+        let stamped = load_meta(dir.path()).unwrap().unwrap();
+        assert!(
+            stamped.meta_mac.is_some(),
+            "legacy vault stamped on first open"
+        );
+
+        // A clean, already-stamped vault verifies with no repair and no warning.
+        let r2 = authenticate_meta(dir.path(), &stamped, &master).unwrap();
+        assert!(!r2.needs_warning());
+
+        // Tamper the on-disk meta: flip Markdown encryption off, leaving the now-stale MAC in place.
+        let mut downgraded = stamped.clone();
+        downgraded.markdown.encryption = MarkdownEncryption::None;
+        let r3 = authenticate_meta(dir.path(), &downgraded, &master).unwrap();
+        assert!(r3.downgrade_corrected, "the plaintext downgrade is caught");
+        assert!(
+            r3.mac_mismatch,
+            "the stale MAC no longer matches the tampered fields"
+        );
+
+        // The persisted meta is re-secured: encryption forced back on and a fresh, valid MAC.
+        let repaired = load_meta(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            repaired.markdown.encryption,
+            MarkdownEncryption::XChaCha20Poly1305
+        );
+        let r4 = authenticate_meta(dir.path(), &repaired, &master).unwrap();
+        assert!(!r4.needs_warning(), "the re-secured meta verifies cleanly");
+    }
+
+    #[test]
+    fn meta_mac_rejects_a_wrong_master() {
+        let (meta, master) = build_passphrase_meta("pw", cheap_params()).unwrap();
+        let other = [0xabu8; KEY_LEN];
+        assert_ne!(
+            meta_mac(&meta, &master).unwrap(),
+            meta_mac(&meta, &other).unwrap()
+        );
     }
 
     #[test]

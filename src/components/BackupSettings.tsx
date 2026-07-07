@@ -44,6 +44,7 @@ import type {
   BackupPhase,
   BackupSchedule,
   GdriveBackupStatus,
+  PassphraseScore,
   ProtonCliStatus,
   ProtonConnStatus,
   RestoreSummary,
@@ -51,6 +52,7 @@ import type {
 import { formatDateTime } from "../lib/format";
 import { isOpaquePhase, describeFailures } from "../lib/backup";
 import { Button, Collapsible, Input } from "./ui";
+import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { IngestProgress } from "./IngestProgress";
 import { useDepth } from "../theme";
 
@@ -70,21 +72,6 @@ const FREQ_LABEL: Record<BackupSchedule["frequency"], string> = {
   monthly: "Monthly",
 };
 
-/** A tiny, honest strength hint — length first (the biggest factor for a passphrase), with a
- *  nudge toward variety. Not a security oracle; just discourages a 4-char passphrase. */
-function strength(pass: string): { label: string; tone: string } {
-  if (pass.length === 0) return { label: "", tone: "" };
-  const classes =
-    (/[a-z]/.test(pass) ? 1 : 0) +
-    (/[A-Z]/.test(pass) ? 1 : 0) +
-    (/[0-9]/.test(pass) ? 1 : 0) +
-    (/[^A-Za-z0-9]/.test(pass) ? 1 : 0);
-  if (pass.length < 8) return { label: "Too short", tone: "text-st-due" };
-  if (pass.length >= 16 || (pass.length >= 12 && classes >= 3))
-    return { label: "Strong", tone: "text-st-quick" };
-  return { label: "OK — longer is better", tone: "text-ink3" };
-}
-
 export function BackupSettings() {
   const { showPower } = useDepth();
 
@@ -102,6 +89,7 @@ export function BackupSettings() {
   // device" additionally stows it in the keychain for unattended scheduled runs).
   const [pass, setPass] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [passScore, setPassScore] = useState<PassphraseScore | null>(null);
 
   // Restore form.
   const [restoreSrc, setRestoreSrc] = useState<string | null>(null);
@@ -255,11 +243,13 @@ export function BackupSettings() {
     };
   }, []);
 
-  const backupValid = pass.length >= 8 && pass === confirm && !running;
+  // The backend floor (validate_passphrase_strength) is the real gate; here we block a KNOWN-weak
+  // passphrase (immediate feedback) while a scoring hiccup (null) never soft-locks the buttons.
+  const backupValid =
+    pass.length > 0 && pass === confirm && !running && passScore?.acceptable !== false;
   // A single "any op in flight" gate so connect/disconnect and backup/restore are mutually
   // exclusive in the UI — e.g. Disconnect must be disabled during an upload it would kill.
   const busy = running || protonBusy || gdriveBusy;
-  const st = strength(pass);
   const passphraseStored = schedule?.passphrase_stored ?? false;
   const protonConnected = !!(proton?.installed && conn?.connected);
   const gdriveGranted = !!gdrive?.has_write_scope;
@@ -654,12 +644,10 @@ export function BackupSettings() {
             value={confirm}
             onChange={(e) => setConfirm(e.currentTarget.value)}
           />
-          <div className="flex items-center justify-between">
-            {st.label ? <span className={`text-xs ${st.tone}`}>{st.label}</span> : <span />}
-            {confirm.length > 0 && pass !== confirm && (
-              <span className="text-xs text-st-due">Passphrases don&rsquo;t match</span>
-            )}
-          </div>
+          <PassphraseStrengthMeter passphrase={pass} onScored={setPassScore} />
+          {confirm.length > 0 && pass !== confirm && (
+            <span className="text-xs text-st-due">Passphrases don&rsquo;t match</span>
+          )}
 
           {/* "Remember" stores the KEY (not the data) in the OS keychain — the distinction the
               tab has to make unmistakable, since a passphrase and a .pmbackup are different things. */}
@@ -715,7 +703,7 @@ export function BackupSettings() {
           </div>
           {!backupValid && !running && (
             <p className="text-xs text-ink4">
-              Enter a matching passphrase (8+ characters) above to enable these buttons.
+              Enter a matching, strong passphrase (10+ characters) above to enable these buttons.
             </p>
           )}
           {backupValid && !protonConnected && !gdriveGranted && (

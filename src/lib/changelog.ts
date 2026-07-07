@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.43-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Stronger protection for the passphrases that lock your data. When you set a passphrase for a shareable vault or an encrypted backup, PM now checks it's genuinely hard to guess — with a live strength meter as you type — and won't accept a weak one. Your existing passphrases still open everything exactly as before; this only applies when you set or change one.",
+      "A shared vault can't be quietly downgraded. If a vault you share between computers has its 'keep notes encrypted at rest' setting changed behind your back, PM now notices when it opens the vault, switches encryption back on, and tells you — so your notes never silently start saving as plain text.",
+    ],
+  },
+  {
     version: "2.92.42-alpha",
     date: "2026-07-07",
     highlights: [

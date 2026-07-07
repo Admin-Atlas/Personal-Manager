@@ -53,6 +53,7 @@ import {
   markActivity,
   onVaultAcquired,
   onVaultCurtain,
+  onVaultMetaWarning,
   openUrl,
   resumeDriveSync,
   resumeLocalFolderSync,
@@ -84,6 +85,9 @@ export default function App() {
   // active writer, `vaultLock.active` is false and the curtain shows over everything.
   const [vaultLock, setVaultLock] = useState<VaultLockStatus | null>(null);
   const [curtainReason, setCurtainReason] = useState<"other-active" | "handed-off">("other-active");
+  // A non-blocking notice when a vault's metadata was repaired on open (M-3): a downgraded
+  // encryption policy PM forced back on, or a failed integrity check. Dismissible.
+  const [metaWarning, setMetaWarning] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [view, setView] = useState<View>("focus");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
@@ -334,6 +338,13 @@ export default function App() {
       offAcquired?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- subscribe once for the app's life
+  }, []);
+
+  // M-3: surface the backend's non-blocking warning when a vault's metadata was repaired on open.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    void onVaultMetaWarning((message) => setMetaWarning(message)).then((o) => (off = o));
+    return () => off?.();
   }, []);
 
   // While curtained, poll the lock so the holder going stale surfaces the force-take option.
@@ -659,6 +670,20 @@ export default function App() {
       <ReaderProvider view={view}>
         <div className={`flex h-full flex-col bg-bg text-ink ${helpMode ? "help-mode" : ""}`}>
           <UpdateBanner update={update} />
+          {metaWarning && (
+            <div
+              role="alert"
+              className="flex items-start justify-between gap-3 border-b border-border bg-accent-soft px-4 py-2 text-sm text-ink2"
+            >
+              <span>{metaWarning}</span>
+              <button
+                className="shrink-0 font-medium text-ink3 underline underline-offset-2 hover:text-ink"
+                onClick={() => setMetaWarning(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           <div
             className={`relative flex flex-1 overflow-hidden ${leftBar.resizing ? "select-none" : ""}`}
           >

@@ -589,6 +589,9 @@ pub async fn create_shareable_vault(app: AppHandle, passphrase: String) -> Resul
     if passphrase.trim().is_empty() {
         return Err(Error::Other("a passphrase is required".into()));
     }
+    // M-4: enforce the strength floor here in the command layer — a shareable vault's Markdown is
+    // reachable by other accounts, so a weak passphrase is a real exposure. Create/change only.
+    vault::kdf::validate_passphrase_strength(&passphrase)?;
     {
         let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
             .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
@@ -622,6 +625,8 @@ pub async fn change_vault_passphrase(app: AppHandle, new_passphrase: String) -> 
     if new_passphrase.trim().is_empty() {
         return Err(Error::Other("a passphrase is required".into()));
     }
+    // M-4: strength floor on the new passphrase (create/change only — the unlock path is untouched).
+    vault::kdf::validate_passphrase_strength(&new_passphrase)?;
     {
         let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
             .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
@@ -703,6 +708,14 @@ pub async fn move_vault(app: AppHandle, folder: String) -> Result<()> {
     Ok(())
 }
 
+/// Surface a non-blocking warning to the UI when the vault meta was repaired on open (M-3): a
+/// silently-downgraded Markdown-encryption policy that PM forced back on, or a failed integrity check.
+fn emit_vault_meta_warning(app: &AppHandle, report: &vault::MetaAuthReport) {
+    if let Some(msg) = report.warning() {
+        let _ = app.emit("vault://meta-warning", msg);
+    }
+}
+
 /// Unlock the current (passphrase) vault: derive + verify, open the store, and cache
 /// the derived key in this profile so the next launch is silent.
 #[tauri::command]
@@ -712,12 +725,14 @@ pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: Stri
     let resolved = vault::resolve(&app)?;
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata to unlock".into()))?;
-    let (conn, key) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
+    let (conn, key, meta_report) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
     secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
     let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
     state.open_session(conn, runtime)?;
     // Now that the store is open, engage the cooperative writer lock for this vault.
     lock_session::engage(&app)?;
+    // M-3: if the meta was repaired on open, tell the user (non-blocking).
+    emit_vault_meta_warning(&app, &meta_report);
     Ok(())
 }
 
@@ -753,9 +768,12 @@ pub fn open_existing_vault(
             let passphrase = passphrase.ok_or_else(|| {
                 Error::Other("a passphrase is required to open this vault".into())
             })?;
-            let (conn, key) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
+            let (conn, key, meta_report) =
+                vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
             secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
             let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
+            // M-3: warn (non-blocking) if opening this vault had to repair its meta.
+            emit_vault_meta_warning(&app, &meta_report);
             (conn, runtime)
         }
     };
@@ -784,6 +802,59 @@ pub fn forget_vault_passphrase(app: AppHandle) -> Result<()> {
     }
     secrets::clear_cached_vault_key(&meta.vault_id)?;
     Ok(())
+}
+
+/// The strength of a candidate passphrase, for the create/change UI meter (M-4). Mirrors the backend
+/// floor (`vault::kdf::validate_passphrase_strength`) so the hint the user sees and the gate that
+/// actually blocks agree.
+#[derive(serde::Serialize)]
+pub struct PassphraseScore {
+    /// zxcvbn strength, 0 (weakest) .. 4 (strongest).
+    pub score: u8,
+    /// True iff it clears the create/change floor (length AND score).
+    pub acceptable: bool,
+    /// Non-empty but below the length floor (so the UI can say "too short" specifically).
+    pub too_short: bool,
+    /// A short human warning when weak, else null.
+    pub warning: Option<String>,
+    /// Actionable suggestions to strengthen it.
+    pub suggestions: Vec<String>,
+}
+
+/// Score a candidate passphrase for the UI strength meter, using the SAME zxcvbn model as the backend
+/// floor (M-4). Never derives a key or unlocks anything — purely advisory; the command-layer floor is
+/// the real check. The passphrase is zeroized on return and never logged.
+#[tauri::command]
+pub fn score_passphrase(passphrase: String) -> PassphraseScore {
+    let passphrase = zeroize::Zeroizing::new(passphrase);
+    let len = passphrase.chars().count();
+    if len == 0 {
+        return PassphraseScore {
+            score: 0,
+            acceptable: false,
+            too_short: false,
+            warning: None,
+            suggestions: Vec::new(),
+        };
+    }
+    let estimate = zxcvbn::zxcvbn(&passphrase, &[]);
+    let score = u8::from(estimate.score());
+    let too_short = len < vault::kdf::MIN_PASSPHRASE_LEN;
+    let acceptable = !too_short && score >= vault::kdf::MIN_PASSPHRASE_SCORE;
+    let (warning, suggestions) = match estimate.feedback() {
+        Some(f) => (
+            f.warning().map(|w| w.to_string()),
+            f.suggestions().iter().map(|s| s.to_string()).collect(),
+        ),
+        None => (None, Vec::new()),
+    };
+    PassphraseScore {
+        score,
+        acceptable,
+        too_short,
+        warning,
+        suggestions,
+    }
 }
 
 /// Grant another account on this machine access to the shared vault folder — the
@@ -5388,6 +5459,8 @@ pub async fn create_local_backup(
     if passphrase.is_empty() {
         return Err(Error::Other("a backup passphrase is required".into()));
     }
+    // M-4: strength floor before packing — the archive embeds the raw DB key and is portable.
+    vault::kdf::validate_passphrase_strength(&passphrase)?;
     let _busy = BusyGuard::acquire(&state.backup_busy)
         .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
     state.backup_cancel.store(false, Ordering::SeqCst);
@@ -5769,9 +5842,15 @@ pub fn set_backup_schedule(
 /// opt-in — manual backups never read this.
 #[tauri::command]
 pub fn set_backup_passphrase(passphrase: String) -> Result<()> {
+    // I-03/L-1: wipe the passphrase plaintext from memory on return (the keychain write borrows it).
+    let passphrase = zeroize::Zeroizing::new(passphrase);
     if passphrase.is_empty() {
         return Err(Error::Other("a backup passphrase is required".into()));
     }
+    // M-4: strength floor at the storage seam. The scheduler reads this stored passphrase and hands it
+    // to run_backup for unattended backups, so validating here covers scheduled runs — and keeps the
+    // floor off run_backup itself, which must still accept an already-stored (pre-floor) passphrase.
+    vault::kdf::validate_passphrase_strength(&passphrase)?;
     secrets::set_backup_passphrase(&passphrase)
 }
 
@@ -6052,6 +6131,8 @@ pub async fn backup_to_proton(app: AppHandle, passphrase: String) -> Result<()> 
     if passphrase.is_empty() {
         return Err(Error::Other("a backup passphrase is required".into()));
     }
+    // M-4: strength floor before the archive (which embeds the raw DB key) leaves the machine.
+    vault::kdf::validate_passphrase_strength(&passphrase)?;
     let cli = require_proton_cli()?;
     run_backup(
         &app,
@@ -6073,6 +6154,8 @@ pub async fn restore_from_proton(
     name: String,
     passphrase: String,
 ) -> Result<RestoreSummary> {
+    // I-03/L-1: wipe the passphrase plaintext on return (it is consumed by the blocking restore below).
+    let passphrase = zeroize::Zeroizing::new(passphrase);
     if passphrase.is_empty() {
         return Err(Error::Other("the backup passphrase is required".into()));
     }
@@ -6304,6 +6387,8 @@ pub async fn backup_to_gdrive(app: AppHandle, passphrase: String) -> Result<()> 
     if passphrase.is_empty() {
         return Err(Error::Other("a backup passphrase is required".into()));
     }
+    // M-4: strength floor before the archive (which embeds the raw DB key) leaves the machine.
+    vault::kdf::validate_passphrase_strength(&passphrase)?;
     let token_key = gdrive_backup_token_key(&app)?;
     run_backup(
         &app,
@@ -6324,6 +6409,8 @@ pub async fn restore_from_gdrive(
     name: String,
     passphrase: String,
 ) -> Result<RestoreSummary> {
+    // I-03/L-1: wipe the passphrase plaintext on return (it is consumed by the blocking restore below).
+    let passphrase = zeroize::Zeroizing::new(passphrase);
     if passphrase.is_empty() {
         return Err(Error::Other("the backup passphrase is required".into()));
     }

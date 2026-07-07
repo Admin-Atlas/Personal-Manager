@@ -18,6 +18,7 @@ import type {
   CompressSnapshot,
   ContextStatus,
   Conversation,
+  PassphraseScore,
   CostSummary,
   DailyBriefing,
   DevRetrievalExplain,
@@ -197,6 +198,16 @@ export const moveVault = (folder: string) => invoke<void>("move_vault", { folder
 /** Unlock the current passphrase vault for this session and cache the key on this
  *  profile, so the next launch is silent. */
 export const unlockVault = (passphrase: string) => invoke<void>("unlock_vault", { passphrase });
+
+/** Score a candidate passphrase for the create/change strength meter (M-4). Advisory — the backend
+ *  `validate_passphrase_strength` floor is the real gate; this just mirrors it so the meter agrees. */
+export const scorePassphrase = (passphrase: string) =>
+  invoke<PassphraseScore>("score_passphrase", { passphrase });
+
+/** Subscribe to the non-blocking warning emitted when a vault's metadata was repaired on open (M-3):
+ *  a silently-downgraded encryption policy that PM forced back on, or a failed integrity check. */
+export const onVaultMetaWarning = (handler: (message: string) => void): Promise<UnlistenFn> =>
+  listen<string>("vault://meta-warning", (e) => handler(e.payload));
 
 /** Point this profile at an existing vault folder (a shared one) and open it. */
 export const openExistingVault = (folder: string, passphrase?: string | null) =>
