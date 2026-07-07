@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.50-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "An extra safeguard so updates never touch your saved work. PM now verifies automatically, on every build, that a database upgrade step can't delete or overwrite the projects, priorities and notes you've added — a belt-and-braces backstop behind the existing rule that updates only ever add to your data. No change to how anything looks or works.",
+    ],
+  },
+  {
     version: "2.92.49-alpha",
     date: "2026-07-07",
     highlights: [
