@@ -906,6 +906,10 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
     let mut issues_truncated = false;
     let mut cancelled = false;
     let mut last_err: Option<Error> = None;
+    // Batch the manifest rewrite across the whole walk: each reconcile only commits DB rows, and the
+    // encrypted manifest is flushed every MANIFEST_FLUSH_EVERY items + once after the loop, not per file
+    // (which was O(n²) over a pass). A mid-walk bail is caught by the flusher's Drop.
+    let mut manifest_flush = connector_sync::ManifestFlusher::new(app);
 
     'folders: for w in &work {
         if local_sync_cancelled(app) {
@@ -921,7 +925,7 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
                 },
                 None,
             );
-            apply_local_actions_off_lock(app, actions, None).await?;
+            manifest_flush.note(apply_local_actions_off_lock(app, actions, None).await?)?;
             {
                 let state = app.state::<AppState>();
                 let conn = state.conn()?;
@@ -966,7 +970,7 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
             }
             let name = f.rel_path.clone();
             let known = w.known.get(&f.source_id).cloned();
-            match reconcile_present_file(app, f, known.as_ref()).await? {
+            match reconcile_present_file(app, f, known.as_ref(), &mut manifest_flush).await? {
                 PresentOutcome::Indexed => indexed += 1,
                 PresentOutcome::Updated => updated += 1,
                 PresentOutcome::NoChange => {}
@@ -1019,7 +1023,7 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
                     cancelled = true;
                     break 'folders;
                 }
-                reconcile_deleted_item(app, source_id, item).await?;
+                reconcile_deleted_item(app, source_id, item, &mut manifest_flush).await?;
                 removed += 1;
                 processed += 1;
                 emit_local_progress(
@@ -1041,6 +1045,10 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
             finalize_or_flag(&conn, &w.key, folder_failed)?;
         }
     }
+
+    // Persist the tail of the batched manifest — reached on a normal finish AND a Stop that broke the
+    // loop. A hard `?` bail earlier is covered by the flusher's Drop (bounded to < MANIFEST_FLUSH_EVERY).
+    manifest_flush.flush()?;
 
     let report = LocalSyncReport {
         indexed,
@@ -1088,6 +1096,7 @@ async fn reconcile_present_file(
     app: &AppHandle,
     file: &LocalFile,
     known: Option<&KnownItem>,
+    flusher: &mut connector_sync::ManifestFlusher,
 ) -> Result<PresentOutcome> {
     let path_str = file.abs_path.to_string_lossy().to_string();
 
@@ -1109,7 +1118,7 @@ async fn reconcile_present_file(
             },
             cur_state.as_ref(),
         );
-        apply_local_actions_off_lock(app, actions, None).await?;
+        flusher.note(apply_local_actions_off_lock(app, actions, None).await?)?;
     }
     // It moved (same OS id, new path) → update the stored ref, keeping classification.
     if let Some(newref) = &plan.renamed_to {
@@ -1120,7 +1129,7 @@ async fn reconcile_present_file(
             },
             cur_state.as_ref(),
         );
-        apply_local_actions_off_lock(app, actions, None).await?;
+        flusher.note(apply_local_actions_off_lock(app, actions, None).await?)?;
     }
     // Content unchanged (same mtime) and not new → the state work above (if any) is all there was.
     if !plan.content_maybe_changed {
@@ -1164,7 +1173,7 @@ async fn reconcile_present_file(
     if needs_body {
         match build_local_pointer(app, file, &hash, current_iso.clone()).await {
             Ok(Some(input)) => {
-                apply_local_actions_off_lock(app, actions, Some(input)).await?;
+                flusher.note(apply_local_actions_off_lock(app, actions, Some(input)).await?)?;
                 Ok(match category {
                     connector_sync::ActionKind::Indexed => PresentOutcome::Indexed,
                     connector_sync::ActionKind::Updated => PresentOutcome::Updated,
@@ -1188,7 +1197,12 @@ async fn reconcile_present_file(
 /// Reconcile ONE deleted local item → soft `source_missing` (kept findable, never a hard drop), via
 /// the shared reducer. Shared by the walk (a known id the walk no longer found) and the watcher (a
 /// remove event resolved to its item by external ref).
-async fn reconcile_deleted_item(app: &AppHandle, source_id: &str, known: &KnownItem) -> Result<()> {
+async fn reconcile_deleted_item(
+    app: &AppHandle,
+    source_id: &str,
+    known: &KnownItem,
+    flusher: &mut connector_sync::ManifestFlusher,
+) -> Result<()> {
     let cur_state = known.to_item_state(source_id);
     let actions = index_only::react(
         index_only::ChangeEvent::Delete {
@@ -1196,7 +1210,7 @@ async fn reconcile_deleted_item(app: &AppHandle, source_id: &str, known: &KnownI
         },
         Some(&cur_state),
     );
-    apply_local_actions_off_lock(app, actions, None).await
+    flusher.note(apply_local_actions_off_lock(app, actions, None).await?)
 }
 
 /// Read + convert a local file's body via the sidecar (off the DB lock), returning the foundation's
@@ -1246,12 +1260,13 @@ async fn build_local_pointer(
 
 /// [`connector_sync::apply_connector_actions`] on a blocking thread, awaited — so the async driver
 /// never runs the sidecar on the runtime. Local applies per file mid-pass, so it needs the async form
-/// (the cloud engines spawn_blocking the shared apply inline).
+/// (the cloud engines spawn_blocking the shared apply inline). Returns whether the mirror changed, so
+/// the caller can note it against its [`connector_sync::ManifestFlusher`] and defer the manifest write.
 async fn apply_local_actions_off_lock(
     app: &AppHandle,
     actions: Vec<index_only::Action>,
     fetched: Option<index_only::PointerInput>,
-) -> Result<()> {
+) -> Result<bool> {
     let app2 = app.clone();
     tokio::task::spawn_blocking(move || {
         connector_sync::apply_connector_actions(&app2, &actions, fetched)
@@ -1527,8 +1542,12 @@ async fn upsert_local_path(
         let conn = state.conn()?;
         known_item(&conn, &source_id)?
     };
+    // A single watcher event: flush its manifest change immediately (no O(n²) loop to batch here).
+    let mut manifest_flush = connector_sync::ManifestFlusher::new(app);
+    let outcome = reconcile_present_file(app, &file, known.as_ref(), &mut manifest_flush).await?;
+    manifest_flush.flush()?;
     Ok(matches!(
-        reconcile_present_file(app, &file, known.as_ref()).await?,
+        outcome,
         PresentOutcome::Indexed | PresentOutcome::Updated
     ))
 }
@@ -1552,7 +1571,10 @@ async fn remove_local_path(
     let Some((source_id, known)) = found else {
         return Ok(false);
     };
-    reconcile_deleted_item(app, &source_id, &known).await?;
+    // A single watcher event: flush its manifest change immediately (no O(n²) loop to batch here).
+    let mut manifest_flush = connector_sync::ManifestFlusher::new(app);
+    reconcile_deleted_item(app, &source_id, &known, &mut manifest_flush).await?;
+    manifest_flush.flush()?;
     Ok(true)
 }
 

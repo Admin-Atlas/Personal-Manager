@@ -1911,14 +1911,12 @@ pub async fn dev_apply_change_event(
             source_state: index_only::SourceState::from_db(&sstate),
         });
         let actions = index_only::react(event, item_state.as_ref());
-        index_only::apply_actions(
-            &state,
-            &gateway,
-            &vault_root,
-            &manifest_cipher,
-            &actions,
-            fetched.as_ref(),
-        )
+        // A single dev event: apply, then flush its manifest change immediately (no batch loop here).
+        if index_only::apply_actions(&state, &gateway, &actions, fetched.as_ref())? {
+            let conn = state.conn()?;
+            index_only::write_synced(&conn, &vault_root, &manifest_cipher)?;
+        }
+        Ok(())
     })
     .await
     .map_err(|e| Error::Other(format!("dev change task panicked: {e}")))?

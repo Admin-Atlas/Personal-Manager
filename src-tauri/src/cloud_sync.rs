@@ -359,6 +359,10 @@ async fn run_cloud_pass<C: CloudDriver>(
     let mut cancelled = false;
     // Per-pass driver state (Drive's parent-folder-name memo; `()` for OneDrive).
     let mut folder_cache = C::FolderCache::default();
+    // Batch the encrypted manifest rewrite across the pass: `apply_connector_actions` now only commits
+    // DB rows, and we flush the manifest every MANIFEST_FLUSH_EVERY items + once after the loop, instead
+    // of once per item (which was O(n²) over a pass). A mid-pass bail is caught by the flusher's Drop.
+    let mut manifest_flush = connector_sync::ManifestFlusher::new(app);
 
     'accounts: for w in &work {
         // Stop requested (before this account, or after finishing the previous one)? Halt — keeping
@@ -386,10 +390,13 @@ async fn run_cloud_pass<C: CloudDriver>(
                 None,
             );
             let app2 = app.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(Ok(dirtied)) = tokio::task::spawn_blocking(move || {
                 connector_sync::apply_connector_actions(&app2, &actions, None)
             })
-            .await;
+            .await
+            {
+                manifest_flush.note(dirtied)?;
+            }
             let state = app.state::<AppState>();
             let conn = state.conn()?;
             C::set_error_state(&conn, &w.email)?;
@@ -528,12 +535,15 @@ async fn run_cloud_pass<C: CloudDriver>(
                 ))
             })?;
             match apply {
-                Ok(()) => match category {
-                    connector_sync::ActionKind::Indexed => indexed += 1,
-                    connector_sync::ActionKind::Updated => updated += 1,
-                    connector_sync::ActionKind::Removed => removed += 1,
-                    connector_sync::ActionKind::Other => skipped += 1,
-                },
+                Ok(dirtied) => {
+                    manifest_flush.note(dirtied)?;
+                    match category {
+                        connector_sync::ActionKind::Indexed => indexed += 1,
+                        connector_sync::ActionKind::Updated => updated += 1,
+                        connector_sync::ActionKind::Removed => removed += 1,
+                        connector_sync::ActionKind::Other => skipped += 1,
+                    }
+                }
                 Err(e) => {
                     failed += 1;
                     record_issue(
@@ -579,6 +589,10 @@ async fn run_cloud_pass<C: CloudDriver>(
             C::finalize_or_flag(&conn, w, account_failed)?;
         }
     }
+
+    // Persist the tail of the batched manifest — reached on a normal finish AND on a Stop that broke the
+    // loop. A hard `?` bail earlier is covered by the flusher's Drop (bounded to < MANIFEST_FLUSH_EVERY).
+    manifest_flush.flush()?;
 
     let report = CloudSyncReport {
         indexed,

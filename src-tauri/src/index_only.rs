@@ -36,6 +36,15 @@ const MANIFEST_SCHEMA: u32 = 1;
 /// Filename of the encrypted index-only manifest, at the data-home root next to `pm.sqlite` and
 /// `entities.pmrules`.
 pub const MANIFEST_FILENAME: &str = "index-only.pmindex";
+
+/// How many mirror-changing items a bulk sync may ingest between manifest rewrites. Each
+/// [`write_synced`] is an O(n) read-merge-encrypt-write of the WHOLE manifest, so writing it once per
+/// item made a pass O(n²); a connector loop instead batches through [`crate::connector_sync::ManifestFlusher`],
+/// flushing every `MANIFEST_FLUSH_EVERY` items and once at the end. The bound also caps the crash-exposed
+/// window: a crash between flushes leaves at most this many committed DB rows without a manifest entry,
+/// which [`reconcile_on_open`] self-heals from the mirror on next open (and the interrupted account's
+/// cursor stays unadvanced, so the items re-observe anyway).
+pub const MANIFEST_FLUSH_EVERY: usize = 256;
 /// AAD stem binding the manifest ciphertext to its logical identity. MUST differ from the rules
 /// file's stem (`"entities"`): both files share the same vault subkey + id, so the distinct stem is
 /// the only thing stopping one file's ciphertext from authenticating against the other's reader.
@@ -416,15 +425,13 @@ fn embed_and_index(
 }
 
 /// Register a source as an index-only document: chunk + embed its body (fetched once), store the leaf
-/// embeddings + a short summary + the pointer, and persist its classification to the encrypted
-/// manifest. Writes NO Markdown vault file. The new document enters the review queue (project
-/// Unsorted, `reviewed = false`), exactly like a freshly imported file — index-only is a mode, not a
-/// separate pipeline.
+/// embeddings + a short summary + the pointer. Commits the DB row only — the portable manifest is
+/// rewritten by the caller's batched flush, not per item (see [`MANIFEST_FLUSH_EVERY`]). Writes NO
+/// Markdown vault file. The new document enters the review queue (project Unsorted, `reviewed =
+/// false`), exactly like a freshly imported file — index-only is a mode, not a separate pipeline.
 pub fn register_pointer(
     state: &AppState,
     gateway: &ModelGateway<'_>,
-    vault_root: &Path,
-    cipher: &ManifestCipher,
     input: PointerInput,
 ) -> Result<ingest::Document> {
     let body = input.body.trim();
@@ -494,12 +501,11 @@ pub fn register_pointer(
         crate::entities::resolve_project(&conn, &meta.project, false)?.is_some()
     };
     let document = embed_and_index(state, gateway, body, &meta)?;
-    // Persist the new item's classification to the portable manifest — a best-effort skip would lose
-    // it on the next Rebuild, so a failure here propagates.
-    {
-        let conn = state.conn()?;
-        write_synced(&conn, vault_root, cipher)?;
-    }
+    // The DB row is now committed; the portable manifest is NOT written here. The caller batches that
+    // rewrite ([`apply_actions`] reports it dirtied the mirror, and the connector loop flushes every
+    // `MANIFEST_FLUSH_EVERY` items via `ManifestFlusher`) — writing it per item made a bulk sync O(n²).
+    // A crash before the next flush leaves this committed row absent from the file; `reconcile_on_open`
+    // unions it back from the mirror on next open, so the classification is never lost.
     // Structural guarantee (mirror ⊆ rules after any mint, mirroring `ingest::rebuild`'s own sync):
     // if this item created a new project entity, keep the portable rules file current. Best-effort +
     // gated on an actual mint, so a normal (Unsorted) sync writes nothing.
@@ -1041,25 +1047,25 @@ fn set_external_ref(conn: &Connection, source_id: &str, external_ref: Option<&st
     Ok(())
 }
 
-/// Perform the [`Action`]s [`react`] produced, against the live store + manifest. `fetched` is the
-/// connector-supplied current content for the item an `IngestNew`/`ReEmbed` concerns (the dev
-/// affordance passes a pasted body). State/pointer transitions are short synchronous DB writes; a
-/// re-embed runs the sidecar OFF the DB lock, exactly like ingest. The manifest is re-synced once at
-/// the end if anything changed (an `IngestNew` syncs itself via [`register_pointer`]).
+/// Perform the [`Action`]s [`react`] produced against the live store. `fetched` is the connector-
+/// supplied current content for the item an `IngestNew`/`ReEmbed` concerns (the dev affordance passes a
+/// pasted body). State/pointer transitions are short synchronous DB writes; a re-embed runs the sidecar
+/// OFF the DB lock, exactly like ingest. Returns whether the mirror changed (`dirtied`) so the caller
+/// can rewrite the portable manifest on its own batched cadence — this fn never writes the manifest,
+/// which lets a bulk sync flush once per `MANIFEST_FLUSH_EVERY` items instead of once per item (O(n²)).
 pub fn apply_actions(
     state: &AppState,
     gateway: &ModelGateway<'_>,
-    vault_root: &Path,
-    cipher: &ManifestCipher,
     actions: &[Action],
     fetched: Option<&PointerInput>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut changed = false;
     for action in actions {
         match action {
             Action::IngestNew { source_id } => {
                 let input = require_fetched(fetched, source_id)?.clone();
-                register_pointer(state, gateway, vault_root, cipher, input)?;
+                register_pointer(state, gateway, input)?;
+                changed = true;
             }
             Action::ReEmbed {
                 source_id,
@@ -1099,11 +1105,7 @@ pub fn apply_actions(
             Action::Noop => {}
         }
     }
-    if changed {
-        let conn = state.conn()?;
-        write_synced(&conn, vault_root, cipher)?;
-    }
-    Ok(())
+    Ok(changed)
 }
 
 #[cfg(test)]
