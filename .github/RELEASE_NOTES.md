@@ -1,4 +1,4 @@
-PM desktop release.
+PM desktop release — **v3.0.0-alpha**.
 
 ## Install
 
@@ -25,25 +25,56 @@ message). To open it once:
 >
 > This is a one-time step per version and goes away once PM is notarized.
 
-Once you're on a release build, updates download and install from inside the app — no need
-to revisit this page for each version.
+## Already have PM? You don't need this page
 
-## What's new in 2.1.2-alpha
+PM updates itself. Open your installed copy and it downloads this version quietly in
+the background, then shows a small banner — click **Restart now** (or later, whenever
+suits you) and you're on the new version. Your documents, projects, chats and settings
+all stay exactly as they are.
 
-**Shared & portable vaults.** PM can now protect your vault with a passphrase you
-choose, instead of tying it to a single Windows account — so the same vault can be
-opened from another profile on the machine.
+**🍎 If the banner says the update couldn't apply** (possible on macOS while PM is
+unsigned): download the `.dmg` above and drag **PM** to **Applications** again, choosing
+**Replace** when asked. Everything you have is kept — just replace the old copy rather
+than keeping two around.
 
-- **Portable, never locked in.** A passphrase vault keeps its Markdown encrypted at
-  rest, and you can export everything to plain Markdown anytime with your passphrase —
-  encryption protects your notes, it doesn't lock you in.
-- **Safe to share.** Only one profile writes at a time: if PM is open elsewhere, you
-  get a calm "Continue here?" hand-off rather than two copies racing over your data.
-- **Manage it in Settings → Vault.** Make a vault shareable or private again, change
-  the passphrase, move it to a shared folder, link another account, or export to
-  plaintext — each runs through one crash-safe migration.
-- **Zero-friction by default.** Don't opt in and nothing changes: your vault stays
-  private to this device, with its key in the OS keychain.
+## What's new in 3.0.0-alpha
+
+This release rolls up everything since v2.1.2 — here's the tour at a glance:
+
+- **Connect your clouds.** Google Drive and OneDrive are indexed in place: what's in
+  them turns up in your search, and nothing is copied out of your drive.
+- **Watch folders on this computer.** Point PM at a folder and it keeps itself current
+  as you work — an edit is searchable within seconds.
+- **A real calendar.** Google (several accounts), Outlook and iCal subscriptions
+  together, in Month, Week, Day, Year and Agenda views.
+- **Chats are part of your memory.** Past conversations become searchable, answers cite
+  the exact turn they drew from, chats name themselves, and each project keeps its own.
+- **A briefing that tracks instead of narrates.** Deadlines, today's events and
+  prep-ahead nudges are real items you can mark done — or just tell it "the deck is
+  done" in plain words.
+- **Projects with real milestones.** Several dated deadlines per project, priorities you
+  set (or PM infers for projects other work waits on), and a sortable Focus view.
+- **Encrypted backups.** Your whole vault in one passphrase-protected file, on demand or
+  on a schedule, to your own Proton Drive or Google Drive.
+- **A map of your knowledge.** Your documents arranged by meaning on a fast, navigable
+  canvas.
+- **A built-in reader.** Click any document — or any source a chat answer cites — and
+  read it right there; cloud items fetch their full text on demand.
+- **Photos and spreadsheets, done properly.** Screenshots read with on-device text
+  recognition; spreadsheets indexed row by row, with one-click full import for Google
+  Sheets.
+- **A Pinboard that keeps up.** Notes with real formatting, timelines linked to real
+  projects, and one-click ingest of a note into your vault.
+- **Teach PM your world.** Merge and rename project names for good, and keep structured
+  preferences that PM applies exactly where they fit.
+- **Sharper search.** Structure-aware chunking, a re-ranking second pass, multilingual
+  vaults, and proper Chinese/Japanese/Korean keyword search.
+- **Quality of life.** A calm new monochrome look with a sun-following Auto mode, a
+  Storage tab to reclaim space, one-click Mac setup, a tidy uninstall, and a read-only
+  Developer mode for the curious.
+
+Every line above has its full story inside the app: open **What's New** from the
+sidebar for the release-by-release detail.
 
 > This is an **alpha**: expect rough edges, and please report anything that bites.
 

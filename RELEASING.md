@@ -133,7 +133,17 @@ is where you want it and not merging anything new for the moment.
 ### 2. Open the release PR — the version bump *(an agent may prepare this, then stops)*
 
 On a branch, set **all** lockstep files to the release version (regenerating the
-locks) and roll the accumulated per-PR "What's New" entries into the release notes.
+locks) and roll the accumulated per-PR "What's New" entries into the release notes —
+which live in **two places**, both part of this PR:
+
+- **`src/lib/changelog.ts`** — add the release's entry at the top: an at-a-glance
+  digest of the accumulated per-PR entries (which stay below it as the detail).
+  The lockstep gate reads this top entry, so a missing one fails the version check.
+- **`.github/RELEASE_NOTES.md`** — update the version and the "What's new" digest.
+  This file **is** the GitHub Release page (the publish job passes it as
+  `--notes-file`), so it must carry the install and self-update instructions a
+  downloader needs, written for non-technical readers.
+
 Open the PR. **Stop here — do not merge.**
 
 > A whole PR for a version string feels heavy, but direct pushes to `main` are
@@ -191,6 +201,14 @@ Two checks:
 2. The real one: take an **existing install on an older version** and confirm it
    **sees the update and applies it**.
 
+What a healthy update looks like: the app checks the feed **once, at launch** (there
+is no mid-session poll — a copy that was already running won't notice until it's
+reopened), downloads in the background, then shows a banner; clicking **Restart now**
+applies the update and relaunches on the new version. On an **unsigned macOS** build
+the in-place apply can be refused by Gatekeeper — the banner then degrades to a
+manual-download link. That fallback appearing is the app working as designed, not a
+broken release; the Windows path must apply in-place.
+
 > "The release page looks right" is **not** the test. The entire value of signed
 > auto-update is that installed copies trust and pull it. A release whose manifest the
 > updater can't resolve fails *silently* — users simply never get prompted.
@@ -241,10 +259,20 @@ git push origin v2.0.4-alpha                 # CI ships it (maintainer's go-ahea
   secret, with a secure password manager as the offline copy of record. Local
   development (`tauri dev`) never needs it. Never move it into the repo tree — not a
   committed file, a git-ignored file, or a workflow `env:` value.
-- **Pre-release flag vs. "latest".** `-alpha` tags are typically marked pre-release.
-  GitHub's "Latest" badge skips pre-releases, which can change what the updater treats
-  as newest depending on how its endpoint resolves "latest" — so always run step 6's
-  update test to confirm the updater still finds pre-releases.
+- **Never flag a PM release as "pre-release" on GitHub.** The updater feed is
+  `releases/latest/download/latest.json`, and GitHub resolves `latest` to the newest
+  release that is **not** flagged pre-release (or draft). Flag one and every installed
+  copy silently stops seeing new versions until a newer *unflagged* release exists.
+  The `-alpha` suffix belongs in the version string and tag only; CI's
+  `gh release create` deliberately publishes **without** the pre-release flag — don't
+  "correct" that in the web UI afterwards, however natural it looks for an alpha.
+  Step 6's update test is what proves the feed still resolves.
+- **Re-running a failed release.** If the workflow fails after the tag exists (flaky
+  runner, transient network), don't invent a new version — re-dispatch the same tag:
+  `gh workflow run release.yml -f tag=vX.Y.Z`. If a partial GitHub Release was already
+  created, delete it first so the publish step can recreate it cleanly. Only a release
+  that never published is safe to re-run this way — once installs have *seen* a
+  published release, fixes roll forward instead (see above).
 - **Don't invent versions or dependency strings.** Use the **real** values from the
   repo. Made-up versions and made-up dependency versions are a recurring failure mode —
   if you're unsure, read the file, don't guess.
