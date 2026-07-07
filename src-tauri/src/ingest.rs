@@ -2508,16 +2508,35 @@ pub(crate) struct DocMeta {
 const MAX_WALK_DEPTH: usize = 32;
 const MAX_COLLECTED_FILES: usize = 100_000;
 
+/// Whether `path` is a symlink whose target resolves OUTSIDE `root` (L-2). A symlinked file is
+/// indexed like any other, but if it points out of the tracked/dropped tree it would pull unrelated
+/// content (e.g. `~/.ssh/id_rsa`) into the index — so reject it. A non-symlink file reached by
+/// descending from `root` is inherently inside it; only symlinks can escape. If containment can't be
+/// verified (a canonicalization failure), err on the side of rejecting.
+pub(crate) fn symlink_escapes_root(path: &Path, root: &Path) -> bool {
+    let is_symlink = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        return false;
+    }
+    match (std::fs::canonicalize(path), std::fs::canonicalize(root)) {
+        (Ok(real), Ok(real_root)) => !real.starts_with(&real_root),
+        _ => true,
+    }
+}
+
 /// Recursively collect files from the given paths (folders are walked).
 fn collect_files(inputs: &[String]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for input in inputs {
-        collect_into(Path::new(input), &mut files, 0);
+        let root = Path::new(input);
+        collect_into(root, root, &mut files, 0);
     }
     files
 }
 
-fn collect_into(path: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+fn collect_into(root: &Path, path: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if out.len() >= MAX_COLLECTED_FILES {
         return;
     }
@@ -2537,14 +2556,18 @@ fn collect_into(path: &Path, out: &mut Vec<PathBuf>, depth: usize) {
         }
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
-                collect_into(&entry.path(), out, depth + 1);
+                collect_into(root, &entry.path(), out, depth + 1);
                 if out.len() >= MAX_COLLECTED_FILES {
                     break;
                 }
             }
         }
     } else if path.is_file() {
-        out.push(path.to_path_buf());
+        // L-2: a symlinked file that resolves outside the dropped tree would pull unrelated content
+        // into the index — skip it. (A file the user drops *directly* is its own root, so it stays.)
+        if !symlink_escapes_root(path, root) {
+            out.push(path.to_path_buf());
+        }
     }
 }
 
@@ -2779,6 +2802,42 @@ impl OptionalExists for std::result::Result<(), rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_regular_file_is_never_a_symlink_escape() {
+        // The common case: a real file reached by walking the tree is inherently inside root (L-2).
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.txt");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(!symlink_escapes_root(&f, dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_root_escapes_but_one_inside_does_not() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let inside = root.join("real.txt");
+        std::fs::write(&inside, b"ok").unwrap();
+
+        let escape = root.join("escape");
+        symlink(&outside, &escape).unwrap();
+        let local = root.join("local");
+        symlink(&inside, &local).unwrap();
+
+        assert!(
+            symlink_escapes_root(&escape, &root),
+            "a symlink pointing outside root is an escape (L-2)"
+        );
+        assert!(
+            !symlink_escapes_root(&local, &root),
+            "a symlink pointing inside root is allowed"
+        );
+    }
 
     #[test]
     fn warmup_ok_requires_the_exact_expected_width() {

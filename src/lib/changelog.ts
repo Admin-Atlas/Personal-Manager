@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.44-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Disconnecting a Google account now fully cuts off PM's access. When you disconnect a Google Drive or Calendar account, PM tells Google to sever the connection — so PM drops off your account's connected-apps list right away, instead of lingering until the sign-in expires on its own. Microsoft accounts (which can't be revoked from inside an app) now show a one-click link to finish removing access yourself.",
+      "Under-the-hood hardening. A release build of PM is stricter about where it looks for its bundled helper program, and it no longer follows a shortcut (symlink) that points outside a folder you're indexing — so indexing a folder can't quietly pull in files from elsewhere on your disk. No change to how anything looks or works.",
+    ],
+  },
+  {
     version: "2.92.43-alpha",
     date: "2026-07-07",
     highlights: [

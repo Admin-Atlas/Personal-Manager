@@ -213,6 +213,10 @@ fn walk_into(root: &Path, path: &Path, key: &str, out: &mut Vec<LocalFile>, dept
     if !should_index(path, size, hidden) {
         return;
     }
+    // L-2: skip a symlinked file whose target resolves outside the tracked folder root.
+    if ingest::symlink_escapes_root(path, root) {
+        return;
+    }
     let file_id = file_identity(path, root);
     let rel_path = path
         .strip_prefix(root)
@@ -1435,6 +1439,10 @@ async fn upsert_local_path(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     if !should_index(path, meta.len(), name.starts_with('.')) {
+        return Ok(false);
+    }
+    // L-2: skip a symlinked file whose target resolves outside the tracked folder root.
+    if ingest::symlink_escapes_root(path, &root) {
         return Ok(false);
     }
     let file_id = file_identity(path, &root);
