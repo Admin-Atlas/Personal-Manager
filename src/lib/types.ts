@@ -978,6 +978,8 @@ export interface Flag {
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
+  /** The occurrence this flag is about (a timed event's start); null for a milestone or pre-v33 flag. */
+  instance_at: string | null;
 }
 
 /** Where the polymorphic focus box routes one line the user typed (board card 9, decisions 6–7): a

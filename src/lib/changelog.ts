@@ -19,6 +19,34 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.55-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "A batch of reliability fixes. PM no longer churns files inside ignored folders (like node_modules or .git) in and out of a tracked local folder; a folder too large to list in one pass keeps its extra files instead of dropping them; and a folder whose sync hits an error now says so, instead of showing 'all good'. Preferences you state in a long chat are no longer skipped when there's a backlog. A spreadsheet column name containing a '|' no longer breaks its table, and 'you're prepared' no longer shows on the wrong occurrence of a repeating event.",
+    ],
+  },
+  {
+    version: "2.92.54-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Deadlines and calendar dates respect your time zone at the day boundary. A calendar-linked milestone or a project's 'Due soon' countdown near midnight is now counted on the date you actually see it, in your own zone — so nothing reads a day early or late when your zone is far from UTC. No change to how anything looks.",
+    ],
+  },
+  {
+    version: "2.92.53-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Glitch-free fast switching. Rapidly switching between conversations or documents no longer lets a slow background load land on the wrong one — the context meter, the chunk overlay, and the document chunk panel now ignore results for a view you've already moved on from. And after switching the chat to a larger-context model, the meter refreshes once the switch has actually taken effect. No change to how anything works.",
+    ],
+  },
+  {
+    version: "2.92.52-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "More robust vault changes and multi-computer coordination. When PM changes how your vault is protected — setting or changing a passphrase, or moving it to a shared folder — it now commits and cleans up in a safer order, so an interrupted change leaves no stray leftovers and can't briefly keep using the previous key. And when you run PM on more than one computer against a single shared vault, a crashed instance can no longer leave the other one waiting to take over. No change to how anything looks or works.",
+    ],
+  },
+  {
     version: "2.92.51-alpha",
     date: "2026-07-07",
     highlights: [

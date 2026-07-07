@@ -47,7 +47,7 @@ interface Props {
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
   /** Switch chat to a larger-context model (the meter's Upgrade action). The same App handler the
    *  global chat uses — chat models are a single global setting, so both meters upgrade the same way. */
-  onUpgrade: (modelId: string) => void;
+  onUpgrade: (modelId: string) => void | Promise<void>;
   onBack: () => void;
 }
 

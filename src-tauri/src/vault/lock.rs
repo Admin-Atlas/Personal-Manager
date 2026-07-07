@@ -26,6 +26,11 @@ pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 /// A lock whose heartbeat is older than this is treated as abandoned (a crashed
 /// owner); only then may a second instance force-take it, and only with a warning.
 pub const STALE_AFTER_SECS: u64 = 30;
+/// A baton request older than this is treated as abandoned — the requester likely gave up or crashed
+/// without clearing it. Comfortably above the normal hand-off latency (a few `TICK_INTERVAL_MS`) and
+/// below `STALE_AFTER_SECS`, so a live request always wins yet a dead one can't curtain the only live
+/// writer forever.
+pub const REQUEST_TTL_SECS: u64 = 20;
 
 const LOCK_FILE: &str = "vault.lock";
 const REQUEST_FILE: &str = "vault.baton-request";
@@ -231,6 +236,13 @@ pub fn read_request(vault_root: &Path) -> Result<Option<BatonRequest>> {
     read_json(&request_path(vault_root))
 }
 
+/// True if a filed baton request is recent enough to still act on — its requester is plausibly still
+/// alive and waiting. A stale request is ignored so a crashed requester (or a leftover request an
+/// `acquire` didn't clear) can't force the active writer to hand the baton off to nobody.
+pub fn request_is_fresh(req: &BatonRequest, now_ms: u64) -> bool {
+    now_ms.saturating_sub(req.requested_at_ms) <= REQUEST_TTL_SECS * 1000
+}
+
 /// The active instance acknowledges it has released the lock.
 pub fn ack_baton(vault_root: &Path, by_instance: &str) -> Result<()> {
     write_json_atomic(
@@ -273,6 +285,21 @@ mod tests {
         let old = lock_with_heartbeat("a", now - (STALE_AFTER_SECS * 1000 + 1));
         assert!(!is_stale(&fresh, now));
         assert!(is_stale(&old, now));
+    }
+
+    #[test]
+    fn request_freshness_uses_the_ttl() {
+        let now = 1_000_000;
+        let recent = BatonRequest {
+            requester_instance: "b".into(),
+            requested_at_ms: now - 5_000, // 5s ago
+        };
+        let abandoned = BatonRequest {
+            requester_instance: "b".into(),
+            requested_at_ms: now - (REQUEST_TTL_SECS * 1000 + 1),
+        };
+        assert!(request_is_fresh(&recent, now));
+        assert!(!request_is_fresh(&abandoned, now));
     }
 
     #[test]

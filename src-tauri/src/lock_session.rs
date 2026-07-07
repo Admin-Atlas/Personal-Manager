@@ -134,6 +134,10 @@ pub fn engage(app: &AppHandle) -> Result<()> {
     match lock::standing(&root, &id)? {
         lock::Standing::Free | lock::Standing::Owned => {
             let lock = lock::acquire(&root, &id, &os_profile())?;
+            // Clear any leftover baton request/ack from a prior session (e.g. a requester that
+            // crashed): otherwise a stale request would make our very first watcher tick hand the
+            // baton off to nobody. A fresh Active writer starts clean — as force_take already does.
+            lock::clear_baton_files(&root)?;
             set_active(state, root, lock);
         }
         lock::Standing::HeldByStale(_) => {
@@ -362,7 +366,11 @@ fn tick(app: &AppHandle) -> Result<()> {
         LockMode::Active => {
             // The two Active observations, gathered in the original order (request first).
             let req = lock::read_request(&root)?;
-            let foreign_request = req.as_ref().is_some_and(|r| r.requester_instance != id);
+            // A request only counts if it's foreign AND still fresh — a leftover request from a
+            // crashed requester must not curtain the only live writer (see request_is_fresh).
+            let foreign_request = req.as_ref().is_some_and(|r| {
+                r.requester_instance != id && lock::request_is_fresh(r, lock::now_ms())
+            });
             let heartbeat_due = {
                 let session = state.lock_session.lock().unwrap();
                 lock::now_ms().saturating_sub(session.last_heartbeat_ms)

@@ -61,6 +61,18 @@ pub fn to_zone_display(start: &str, zone: Tz) -> String {
     }
 }
 
+/// The civil date (`YYYY-MM-DD`) of a stored event `start`, in `zone`. A timed instant (RFC3339) is
+/// converted to the user's zone first — so `2026-06-20T23:00:00Z` reads as the 21st in a zone east of
+/// UTC and the 20th to its west — while an all-day `YYYY-MM-DD` (or any non-instant) keeps its leading
+/// date unchanged. Unlike [`today_sql_in`] ("what is today"), this answers "what civil date is THIS
+/// stored instant" in the user's zone, so a calendar-linked date lands on the day the user sees it.
+pub fn zone_date_of(start: &str, zone: Tz) -> String {
+    match DateTime::parse_from_rfc3339(start) {
+        Ok(dt) => dt.with_timezone(&zone).format("%Y-%m-%d").to_string(),
+        Err(_) => start.get(0..10).unwrap_or(start).to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +90,18 @@ mod tests {
         assert_eq!(today_sql_in_at(New_York, now), "2026-06-21");
         // The very same instant is already the 22nd in UTC — proving the split.
         assert_eq!(today_sql_in_at(Tz::UTC, now), "2026-06-22");
+    }
+
+    #[test]
+    fn zone_date_of_localizes_timed_instants_but_not_all_day() {
+        use chrono_tz::America::New_York;
+        use chrono_tz::Australia::Sydney;
+        // 23:00Z on the 20th is already the 21st in Sydney (east of UTC) but still the 20th in New York.
+        assert_eq!(zone_date_of("2026-06-20T23:00:00Z", Sydney), "2026-06-21");
+        assert_eq!(zone_date_of("2026-06-20T23:00:00Z", New_York), "2026-06-20");
+        // An all-day date has no instant — its leading date is returned unchanged in every zone.
+        assert_eq!(zone_date_of("2026-06-20", Sydney), "2026-06-20");
+        assert_eq!(zone_date_of("2026-06-20", Tz::UTC), "2026-06-20");
     }
 
     #[test]

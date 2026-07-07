@@ -247,6 +247,39 @@ pub(crate) fn delete_vault_artifacts(root: &Path) {
     let _ = std::fs::remove_file(meta_path(root));
 }
 
+/// A tiny provenance marker PM drops into a relocation destination while a move is in flight, so
+/// [`recover`] can positively tell a copy it created from a folder the user picked that already
+/// held their files. Removed once the move commits.
+const VAULT_MARKER: &str = ".pm-vault";
+
+/// Discard a migration's partial destination copy WITHOUT ever bulk-removing a folder the user may
+/// have chosen. Strips only the vault artifacts we would have written, then removes the container dir
+/// only when our [`VAULT_MARKER`] proves PM created it AND, after the strip, it is empty. Fail closed
+/// on a missing marker, a symlink/reparse point, a non-empty dir, or any I/O error: a stranded partial
+/// copy is inert (the pointer commits elsewhere), whereas deleting a user's folder is not.
+fn discard_partial_target(target: &Path) {
+    delete_vault_artifacts(target);
+    let marker = target.join(VAULT_MARKER);
+    if !marker.exists() {
+        return; // no marker ⇒ can't prove this is ours ⇒ leave it entirely
+    }
+    if std::fs::remove_file(&marker).is_err() {
+        return;
+    }
+    // Never follow a symlink/reparse point out of the intended location.
+    match std::fs::symlink_metadata(target) {
+        Ok(m) if !m.file_type().is_symlink() => {}
+        _ => return,
+    }
+    // Remove the container only if stripping our artifacts left it empty, so any other files the
+    // user kept there are always preserved.
+    if let Ok(mut entries) = std::fs::read_dir(target) {
+        if entries.next().is_none() {
+            let _ = std::fs::remove_dir(target);
+        }
+    }
+}
+
 /// Restore a full backup over a vault root, discarding whatever an interrupted migration
 /// left there (the live DB/Markdown may be half-rekeyed/converted). The destination
 /// artifacts are cleared first so a rename-during-convert can't leave both forms behind.
@@ -404,19 +437,28 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<()> {
             tx.commit()?;
         }
 
-        // Commit the in-place phase. Metadata first (so the on-disk identity matches the
-        // new key), then clear the rollback point, then the keychain — see update_keychain.
+        // Commit the in-place phase. Write the new on-disk identity, then swap the live session onto
+        // the new key BEFORE the two best-effort cleanups below — so a failure in either can't leave
+        // the running session on the OLD cipher, which would keep writing Markdown under the previous
+        // key until the next restart. (The connection is still open + valid at this root; the new
+        // master moves both the Markdown and rules-file subkeys, and set_vault_runtime reconciles the
+        // rules file under the new key.)
         journal.stage = MigrationStage::Finalizing;
         write_journal(&data_dir, &journal)?;
         store_meta(&resolved.vault_root, &new_meta)?;
-        clear_journal(&data_dir)?;
-        let _ = std::fs::remove_dir_all(&backup);
-        update_keychain(&new_meta, &new_key)?;
-
-        // The connection is still open + valid at this root; just swap the session runtime (the
-        // new master moves both the Markdown subkey and the rules-file subkey). set_vault_runtime
-        // reconciles the rules file under the new key.
         state.set_vault_runtime(VaultRuntime::build(&resolved, &new_meta, &new_master))?;
+        // Remove the decryptable pre-migration backup BEFORE clearing the journal: a crash between
+        // the two must not strand a full recoverable copy that recover() (which keys off the journal)
+        // would then never see. Until the journal is cleared, recover() still finishes the cleanup.
+        let _ = std::fs::remove_dir_all(&backup);
+        clear_journal(&data_dir)?;
+        // The keychain cache is a convenience only; a failure costs at most one extra passphrase
+        // prompt (see update_keychain), so it must never abort a migration that has already committed.
+        if let Err(e) = update_keychain(&new_meta, &new_key) {
+            eprintln!(
+                "vault: could not cache the new vault key ({e}); you may be prompted to unlock once"
+            );
+        }
     }
 
     // ---- Phase B: relocate (no key change; source kept until the pointer flips) ----
@@ -478,10 +520,15 @@ fn relocate(
     }
     drop(state.take_conn()?);
     copy_vault_artifacts(from_root, to_root)?;
+    // Drop a provenance marker so that, if the move is interrupted before it commits, recover() can
+    // positively identify this destination copy as PM's own rather than inferring it from contents.
+    let _ = std::fs::write(to_root.join(VAULT_MARKER), b"pm-vault\n");
     // Commit the move: point this profile at the new root, then clear the journal.
     pointer::store(data_dir, &pointer::VaultPointer::new(to_root.to_path_buf()))?;
     clear_journal(data_dir)?;
     delete_vault_artifacts(from_root);
+    // The move has committed — this is now the live vault, no longer a discardable partial copy.
+    let _ = std::fs::remove_file(to_root.join(VAULT_MARKER));
     // Reopen at the new location with the (possibly new) key, building the session runtime (both
     // Markdown + rules ciphers) from the master; open_session reconciles the rules file there.
     let conn = db::open(&to_root.join(DB_FILENAME), new_key.expose())?;
@@ -519,7 +566,9 @@ pub fn recover(app: &AppHandle) -> Result<()> {
             }
             if let Some(target) = journal.target_location.as_ref() {
                 if target != &journal.from_root {
-                    let _ = std::fs::remove_dir_all(target);
+                    // Phase B never ran in this arm, so we created nothing at `target`; discard only
+                    // acts if our marker is present (it won't be), leaving a user-picked folder alone.
+                    discard_partial_target(target);
                 }
             }
         }
@@ -528,9 +577,15 @@ pub fn recover(app: &AppHandle) -> Result<()> {
         MigrationStage::Relocating => {
             let now = resolve(app)?.vault_root;
             match journal.target_location.as_ref() {
-                Some(target) if &now == target => delete_vault_artifacts(&journal.from_root),
+                Some(target) if &now == target => {
+                    delete_vault_artifacts(&journal.from_root);
+                    // Committed to `target`; drop any leftover in-flight marker from the live vault.
+                    let _ = std::fs::remove_file(target.join(VAULT_MARKER));
+                }
                 Some(target) => {
-                    let _ = std::fs::remove_dir_all(target);
+                    // The move didn't commit to `target`; discard the partial copy we made there
+                    // (marker-gated, so a user's folder is never bulk-removed).
+                    discard_partial_target(target);
                 }
                 None => {}
             }

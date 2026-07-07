@@ -152,20 +152,22 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
         let Some(cursor) = cursor else {
             return Ok(0);
         };
-        let pairs = chat::completed_turn_pairs_after(&conn, conversation_id, cursor)?;
+        let mut pairs = chat::completed_turn_pairs_after(&conn, conversation_id, cursor)?;
+        // Bound the work per run on a large backlog, OLDEST-first (pairs are ordered by id): keep the
+        // oldest MAX_EXTRACT_PAIRS so the cursor advances only over turns we actually scan — the newer
+        // overflow stays unscanned and is picked up next run, instead of being skipped past forever.
+        if pairs.len() > MAX_EXTRACT_PAIRS {
+            let deferred = pairs.len() - MAX_EXTRACT_PAIRS;
+            eprintln!(
+                "chat-prefs: session {conversation_id} has a backlog — scanning the {MAX_EXTRACT_PAIRS} \
+                 oldest unscanned turns for stated preferences, deferring {deferred} newer ones to the next run"
+            );
+            pairs.truncate(MAX_EXTRACT_PAIRS);
+        }
         let Some(cursor_to) = pairs.iter().map(|p| p.turn_id).max() else {
             return Ok(0); // caught up
         };
-        let mut user_turns = extractable_user_turns(&pairs);
-        // Bound the prompt on a large backlog: keep the most-recent turns, and say what was skipped.
-        if user_turns.len() > MAX_EXTRACT_PAIRS {
-            let skipped = user_turns.len() - MAX_EXTRACT_PAIRS;
-            eprintln!(
-                "chat-prefs: session {conversation_id} has a backlog — scanning the {MAX_EXTRACT_PAIRS} \
-                 most recent turns for stated preferences, skipping {skipped} older ones"
-            );
-            user_turns = user_turns.split_off(skipped);
-        }
+        let user_turns = extractable_user_turns(&pairs);
         (cursor_to, user_turns)
     };
 

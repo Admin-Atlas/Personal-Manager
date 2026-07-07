@@ -193,10 +193,12 @@ pub fn run(
                 let _ = on_event.send(IngestEvent::Done { document });
                 // Gentle mode: breathe between files so indexing doesn't pin the CPU continuously.
                 // Re-read each file (cheap) so flipping Fast/Gentle mid-import takes effect at once.
-                let pause_ms = {
-                    let conn = state.conn()?;
-                    crate::db::indexing_pause_ms(&conn)
-                };
+                // Best-effort: a transient lock failure here must not abort the whole import (and skip
+                // the terminal Finished event) — just skip the pause for this file.
+                let pause_ms = state
+                    .conn()
+                    .map(|conn| crate::db::indexing_pause_ms(&conn))
+                    .unwrap_or(0);
                 if pause_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(pause_ms));
                 }

@@ -164,15 +164,26 @@ pub fn should_index(path: &Path, size: u64, hidden: bool) -> bool {
 /// Recursively collect the indexable files under `root`, keyed by OS file id. Skips ignored/hidden
 /// directories, unsupported extensions, over-cap files, and (below the top level) directory symlinks —
 /// the same cycle/scope guards the drag-drop walk uses. `root` itself must be a directory.
-pub fn walk(root: &Path) -> Vec<LocalFile> {
+/// Returns the collected files and whether the walk was TRUNCATED at `MAX_COLLECTED_FILES` — an
+/// incomplete enumeration, on which the caller must NOT infer deletions from a file's absence.
+pub fn walk(root: &Path) -> (Vec<LocalFile>, bool) {
     let key = folder_key(root);
     let mut out = Vec::new();
-    walk_into(root, root, &key, &mut out, 0);
-    out
+    let mut truncated = false;
+    walk_into(root, root, &key, &mut out, 0, &mut truncated);
+    (out, truncated)
 }
 
-fn walk_into(root: &Path, path: &Path, key: &str, out: &mut Vec<LocalFile>, depth: usize) {
+fn walk_into(
+    root: &Path,
+    path: &Path,
+    key: &str,
+    out: &mut Vec<LocalFile>,
+    depth: usize,
+    truncated: &mut bool,
+) {
     if out.len() >= MAX_COLLECTED_FILES {
+        *truncated = true;
         return;
     }
     let name = path
@@ -197,8 +208,9 @@ fn walk_into(root: &Path, path: &Path, key: &str, out: &mut Vec<LocalFile>, dept
         }
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
-                walk_into(root, &entry.path(), key, out, depth + 1);
+                walk_into(root, &entry.path(), key, out, depth + 1, truncated);
                 if out.len() >= MAX_COLLECTED_FILES {
+                    *truncated = true;
                     break;
                 }
             }
@@ -528,6 +540,20 @@ pub fn finalize_sync(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Finalize a folder pass honoring failures: a clean pass records the time + state 'ok' (via
+/// [`finalize_sync`]); a pass with ANY failed item is stamped 'error' so the failure isn't hidden
+/// behind a misleading 'ok' — the item retries next sync (mirrors the cloud connectors, F-29).
+pub fn finalize_or_flag(conn: &Connection, key: &str, failed: bool) -> Result<()> {
+    if !failed {
+        return finalize_sync(conn, key);
+    }
+    conn.execute(
+        "UPDATE connector_sources SET state = 'error' WHERE id = ?1",
+        params![folder_source_id(key)],
+    )?;
+    Ok(())
+}
+
 /// Stop tracking a folder: soft-flag its items `unreachable` (kept findable, never hard-deleted — the
 /// summaries stay searchable offline) and drop the registry row. Mirrors a cloud `disconnect`.
 pub fn remove_folder(conn: &Connection, key: &str) -> Result<()> {
@@ -790,6 +816,8 @@ struct FolderWork {
     files: Vec<LocalFile>,
     known: std::collections::HashMap<String, KnownItem>,
     missing: bool,
+    /// The walk hit `MAX_COLLECTED_FILES` — an incomplete enumeration; don't infer deletions from it.
+    truncated: bool,
 }
 
 /// One sync pass: walk each folder off the lock, then reconcile it against the known set. Split out so
@@ -838,11 +866,12 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
                 files: Vec::new(),
                 known,
                 missing: true,
+                truncated: false,
             });
             continue;
         }
         let root2 = root.clone();
-        let files = tokio::task::spawn_blocking(move || walk(&root2))
+        let (files, truncated) = tokio::task::spawn_blocking(move || walk(&root2))
             .await
             .map_err(|e| Error::Other(format!("local walk task panicked: {e}")))?;
         work.push(FolderWork {
@@ -851,6 +880,7 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
             files,
             known,
             missing: false,
+            truncated,
         });
     }
 
@@ -909,6 +939,21 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
             continue;
         }
 
+        // Per-folder failure gate (mirrors the cloud connectors, F-29): any failed item flags this
+        // folder 'error' at finalize instead of a misleading 'ok', so the item retries next sync.
+        let mut folder_failed = false;
+        // A truncated walk (hit the file cap) is an INCOMPLETE enumeration: surface it and, below, skip
+        // inferring deletions from absence so past-cap files aren't soft-deleted every sync.
+        if w.truncated {
+            record_local_issue(
+                &mut issues,
+                &mut issues_truncated,
+                &w.root.to_string_lossy(),
+                "This folder has more files than one sync can list at once; nothing was removed, and \
+                 the rest is picked up on the next sync.",
+            );
+        }
+
         let present: std::collections::HashSet<String> =
             w.files.iter().map(|f| f.source_id.clone()).collect();
 
@@ -936,6 +981,7 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
                 }
                 PresentOutcome::Failed(reason) => {
                     failed += 1;
+                    folder_failed = true;
                     record_local_issue(&mut issues, &mut issues_truncated, &name, &reason);
                     last_err = Some(Error::Other(reason));
                 }
@@ -962,33 +1008,37 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
             }
         }
 
-        // Deletions: known items no longer present → soft `source_missing` (kept findable).
-        for (source_id, item) in &w.known {
-            if present.contains(source_id) {
-                continue;
+        // Deletions: known items no longer present → soft `source_missing` (kept findable). SKIPPED when
+        // the walk was truncated — an incomplete enumeration must not read a past-cap file as deleted.
+        if !w.truncated {
+            for (source_id, item) in &w.known {
+                if present.contains(source_id) {
+                    continue;
+                }
+                if local_sync_cancelled(app) {
+                    cancelled = true;
+                    break 'folders;
+                }
+                reconcile_deleted_item(app, source_id, item).await?;
+                removed += 1;
+                processed += 1;
+                emit_local_progress(
+                    app,
+                    LocalSyncEvent::Item {
+                        processed,
+                        total,
+                        name: source_id.clone(),
+                    },
+                );
             }
-            if local_sync_cancelled(app) {
-                cancelled = true;
-                break 'folders;
-            }
-            reconcile_deleted_item(app, source_id, item).await?;
-            removed += 1;
-            processed += 1;
-            emit_local_progress(
-                app,
-                LocalSyncEvent::Item {
-                    processed,
-                    total,
-                    name: source_id.clone(),
-                },
-            );
         }
 
-        // Stamp the healthy pass.
+        // Finalize, honoring any failure: a clean pass records the time + 'ok'; a pass with any failed
+        // item is flagged 'error' so it isn't hidden behind a misleading 'ok' (F-29).
         {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            finalize_sync(&conn, &w.key)?;
+            finalize_or_flag(&conn, &w.key, folder_failed)?;
         }
     }
 
@@ -1441,6 +1491,20 @@ async fn upsert_local_path(
     if !should_index(path, meta.len(), name.starts_with('.')) {
         return Ok(false);
     }
+    // Match the periodic walk's DIRECTORY guards too (not just should_index's file guards): never index
+    // a file the walk would skip — one inside an ignored dir (node_modules/.git/…) or below the depth
+    // cap — or the next walk (which does skip it) soft-deletes it → ok↔source_missing thrash.
+    if let Ok(rel) = path.strip_prefix(&root) {
+        let comps: Vec<_> = rel.components().collect();
+        let dir_count = comps.len().saturating_sub(1); // components minus the file name
+        if comps.len() > MAX_WALK_DEPTH
+            || comps.iter().take(dir_count).any(|c| {
+                matches!(c, std::path::Component::Normal(os) if is_ignored_dir(&os.to_string_lossy()))
+            })
+        {
+            return Ok(false);
+        }
+    }
     // L-2: skip a symlinked file whose target resolves outside the tracked folder root.
     if ingest::symlink_escapes_root(path, &root) {
         return Ok(false);
@@ -1607,6 +1671,7 @@ mod tests {
         std::fs::write(git.join("config.txt"), b"vcs").unwrap(); // ignored dir
 
         let mut rels: Vec<String> = walk(root)
+            .0
             .into_iter()
             .map(|f| f.rel_path.replace('\\', "/"))
             .collect();
@@ -1618,6 +1683,7 @@ mod tests {
         // Every item is namespaced under this folder's key.
         let key = folder_key(root);
         assert!(walk(root)
+            .0
             .iter()
             .all(|f| f.source_id.starts_with(&format!("local:{key}:"))));
     }

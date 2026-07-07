@@ -163,7 +163,14 @@ fn folded_row(headers: &[String], row: &[String]) -> String {
 /// to land in a single chunk rather than being sliced. A literal `|` in a cell is escaped so it can't
 /// break the table.
 fn render_table(headers: &[String], rows: &[Vec<String>]) -> String {
-    let mut s = format!("| {} |\n", headers.join(" | "));
+    // Escape a literal `|` in a header the same way body cells are (below), so a pipe in a column
+    // name can't inject a spurious column and misalign the table.
+    let head = headers
+        .iter()
+        .map(|h| h.replace('|', "\\|"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut s = format!("| {head} |\n");
     s.push_str(&format!(
         "| {} |\n",
         headers

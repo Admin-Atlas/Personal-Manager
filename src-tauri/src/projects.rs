@@ -245,6 +245,9 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     // with NO milestones still flips Due-soon from a name-matched calendar event, exactly
     // as before. Empty when not connected, so the focus view is unchanged without it.
     let events = calendar::upcoming_events(conn, calendar::AGENDA_DAYS, 250).unwrap_or_default();
+    // For the calendar-event Due-soon fallback below: count the delta in the user's zone (as the
+    // milestone path does), not from the raw UTC instant, so the day boundary matches what the user sees.
+    let zone = crate::commands::resolve_zone(conn);
 
     let mut out = Vec::new();
     for (name, doc_count, last_activity, deadline, size, blocked_by, parent, importance, dsince) in
@@ -258,7 +261,9 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
         let (deadline_days, calendar_event) = if project_milestones.is_empty() {
             let matched = calendar::nearest_match(&name, &events);
             (
-                matched.map(|m| m.days_until),
+                matched.and_then(|m| {
+                    milestones::days_until(today, &crate::clock::zone_date_of(&m.event.start, zone))
+                }),
                 matched.map(|m| CalendarMatch {
                     summary: m.event.summary.clone(),
                     start: m.event.start.clone(),

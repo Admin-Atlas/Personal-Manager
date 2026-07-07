@@ -75,11 +75,11 @@ pub struct CalendarMatch {
     pub start: String,
 }
 
-/// An upcoming event paired with the day delta to its start (computed in SQL so the
-/// matching/agenda logic needs no date parsing in Rust).
+/// An upcoming (or still-in-progress) calendar event, as returned by [`upcoming_events`] and shared
+/// by the focus agenda, the chat preamble, and project name-matching. The day delta to its start is
+/// now computed by the consumer in the user's zone (so it matches the milestone path), not here.
 pub struct UpcomingEvent {
     pub event: CalendarEvent,
-    pub days_until: f64,
 }
 
 /// A calendar as returned by Google's `calendarList`, before PM's selection is applied.
@@ -1129,8 +1129,7 @@ pub fn upcoming_events(conn: &Connection, days: i64, limit: usize) -> Result<Vec
     // 00:00 UTC, so a plain `COALESCE(end, start) >= now` would drop it the instant UTC passes
     // midnight — while it's still "today". Treat a no-end all-day event as ending start-of-next-day.
     let mut stmt = conn.prepare(
-        "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
-                julianday(start) - julianday('now') AS days_until \
+        "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid \
          FROM calendar_events \
          WHERE julianday(COALESCE(end, CASE WHEN all_day = 1 THEN datetime(start, '+1 day') ELSE start END)) \
                  >= julianday('now') \
@@ -1153,7 +1152,6 @@ pub fn upcoming_events(conn: &Connection, days: i64, limit: usize) -> Result<Vec
                 html_link: r.get(8)?,
                 uid: r.get(9)?,
             },
-            days_until: r.get(10)?,
         })
     })?;
     let collected = rows
@@ -1446,7 +1444,7 @@ mod tests {
         assert!(!ip_is_blocked("93.184.216.34".parse().unwrap()));
     }
 
-    fn upcoming(summary: &str, days_until: f64) -> UpcomingEvent {
+    fn upcoming(summary: &str) -> UpcomingEvent {
         UpcomingEvent {
             event: CalendarEvent {
                 id: "c:1".into(),
@@ -1460,7 +1458,6 @@ mod tests {
                 html_link: None,
                 uid: None,
             },
-            days_until,
         }
     }
 
@@ -1485,13 +1482,12 @@ mod tests {
     #[test]
     fn nearest_match_returns_the_soonest_titled_event() {
         let events = vec![
-            upcoming("Standup", 0.5),
-            upcoming("Roadmap kickoff", 2.0),
-            upcoming("Roadmap review", 5.0),
+            upcoming("Standup"),
+            upcoming("Roadmap kickoff"),
+            upcoming("Roadmap review"),
         ];
         let hit = nearest_match("Roadmap", &events).unwrap();
         assert_eq!(hit.event.summary, "Roadmap kickoff");
-        assert_eq!(hit.days_until, 2.0);
         assert!(nearest_match("Marketing", &events).is_none());
     }
 

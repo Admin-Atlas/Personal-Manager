@@ -11,7 +11,7 @@
 //
 // Thresholds live in Rust (`context_budget`) — this component only renders what the status reports.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { chatContextStatus, compressChat, revertCompress } from "../lib/ipc";
 import type { CompressResult, ContextStatus } from "../lib/types";
 import { useDepth } from "../theme/depth";
@@ -22,8 +22,9 @@ interface Props {
   conversationId: number | null;
   /** Changes when a new turn lands (message count) so the meter re-reads the freshly-measured usage. */
   refreshKey: number;
-  /** Switch the chat to a larger-context model. Delegated to the host (which owns settings). */
-  onUpgrade: (modelId: string) => void;
+  /** Switch the chat to a larger-context model. Delegated to the host (which owns settings). May
+   *  return a promise that resolves once the switch has landed, so the meter can re-read then. */
+  onUpgrade: (modelId: string) => void | Promise<void>;
 }
 
 /** Compact token counts: 980 → "980", 12_300 → "12k", 1_000_000 → "1M". */
@@ -67,14 +68,23 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
   const [reverting, setReverting] = useState(false);
   const [preview, setPreview] = useState<CompressResult | null>(null);
 
+  // Latest conversation id, so a status read that resolves after the conversation switched is
+  // dropped rather than overwriting the current conversation's meter.
+  const conversationIdRef = useRef(conversationId);
+  conversationIdRef.current = conversationId;
   const refresh = useCallback(() => {
     if (conversationId == null) {
       setStatus(null);
       return;
     }
-    chatContextStatus(conversationId)
-      .then((s) => setStatus(s))
-      .catch(() => setStatus(null));
+    const forConv = conversationId;
+    chatContextStatus(forConv)
+      .then((s) => {
+        if (conversationIdRef.current === forConv) setStatus(s);
+      })
+      .catch(() => {
+        if (conversationIdRef.current === forConv) setStatus(null);
+      });
   }, [conversationId]);
 
   // Re-read on conversation switch and after each new turn (and close the panel on switch).
@@ -211,11 +221,12 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
                   <Button
                     key={m.id}
                     variant="secondary"
-                    onClick={() => {
-                      onUpgrade(m.id);
+                    onClick={async () => {
                       setPanelOpen(false);
-                      // The host re-reads settings; refresh once the switch has landed.
-                      setTimeout(refresh, 0);
+                      // Wait for the switch to actually land (onUpgrade resolves after the host
+                      // writes + reloads settings), THEN re-read — a setTimeout would race it.
+                      await onUpgrade(m.id);
+                      refresh();
                     }}
                     title={`${m.name || m.id} · ${formatTokens(m.context_length)} context`}
                   >
