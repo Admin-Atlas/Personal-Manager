@@ -260,17 +260,18 @@ pub fn action_category(actions: &[index_only::Action]) -> ActionKind {
     }
 }
 
-/// Run a reducer's actions against the store + manifest, on a blocking thread (the index-only
-/// executor embeds via the sidecar). One copy for all three connectors — Drive, OneDrive, and the
-/// local folder ran byte-for-byte identical copies before this consolidation. Mirrors
-/// `dev_apply_change_event`'s execution shape.
+/// Run a reducer's actions against the store on a blocking thread (the index-only executor embeds via
+/// the sidecar), returning whether the mirror changed (`dirtied`). One copy for all three connectors —
+/// Drive, OneDrive, and the local folder ran byte-for-byte identical copies before this consolidation.
+/// Does NOT write the portable manifest: the caller drives that through a [`ManifestFlusher`], so a
+/// bulk pass rewrites the manifest once per `MANIFEST_FLUSH_EVERY` items instead of once per item.
+/// Mirrors `dev_apply_change_event`'s execution shape.
 pub fn apply_connector_actions(
     app: &AppHandle,
     actions: &[index_only::Action],
     fetched: Option<index_only::PointerInput>,
-) -> Result<()> {
+) -> Result<bool> {
     let state = app.state::<AppState>();
-    let (vault_root, cipher) = state.manifest_io()?;
     // Gentle mode caps the embedding batch to bound peak memory. This runs once per item, so reading
     // it here also makes gentle batching engage mid-sync (alongside the per-item pause).
     let gateway = {
@@ -279,19 +280,163 @@ pub fn apply_connector_actions(
             .gateway_for_write(&conn)?
             .with_embed_batch(db::indexing_embed_batch(&conn))
     };
-    index_only::apply_actions(
-        state.inner(),
-        &gateway,
-        &vault_root,
-        &cipher,
-        actions,
-        fetched.as_ref(),
-    )
+    index_only::apply_actions(state.inner(), &gateway, actions, fetched.as_ref())
+}
+
+/// Rewrite the index-only manifest now from the current DB mirror — the batched replacement for the
+/// old per-item write inside `register_pointer`. Idempotent (writes the current mirror∪file union), so
+/// re-running it is harmless; that's what lets [`ManifestFlusher`] flush on a bound and again at the end.
+fn flush_manifest(app: &AppHandle) -> Result<()> {
+    let state = app.state::<AppState>();
+    let (vault_root, cipher) = state.manifest_io()?;
+    let conn = state.conn()?;
+    index_only::write_synced(&conn, &vault_root, &cipher)?;
+    Ok(())
+}
+
+/// Batches index-only manifest rewrites across a sync pass. `apply_connector_actions` now only commits
+/// DB rows; the encrypted manifest — an O(n) read-merge-encrypt-write each time, so writing it per item
+/// made a pass O(n²) — is rewritten here every [`index_only::MANIFEST_FLUSH_EVERY`] items and once at
+/// the end. Crash safety is unchanged in outcome: a crash between flushes leaves committed DB rows
+/// without a manifest entry, which [`index_only::reconcile_on_open`] self-heals from the mirror on next
+/// open (and the interrupted account's cursor stays unadvanced, so those items re-observe anyway). The
+/// [`Drop`] flush is the belt-and-suspenders that bounds the exposure to `< MANIFEST_FLUSH_EVERY` items
+/// even when an early return, `?`-propagated error, or panic mid-pass skips the explicit [`Self::flush`].
+pub struct ManifestFlusher {
+    /// The write action — `flush_manifest(app)` in production; a counter in tests. Boxed so the cadence
+    /// logic (window, reset, the Drop safety net) is unit-testable without a live app + sidecar.
+    flush_fn: Box<dyn FnMut() -> Result<()> + Send>,
+    /// Mirror-changing items applied since the last flush (reset on each write).
+    pending: usize,
+}
+
+impl ManifestFlusher {
+    pub fn new(app: &AppHandle) -> Self {
+        let app = app.clone();
+        Self::with_flush(Box::new(move || flush_manifest(&app)))
+    }
+
+    fn with_flush(flush_fn: Box<dyn FnMut() -> Result<()> + Send>) -> Self {
+        Self {
+            flush_fn,
+            pending: 0,
+        }
+    }
+
+    /// Record that an applied item did (`dirtied`) or didn't change the mirror; write the manifest if
+    /// the batch window is now full. Call after each `apply_connector_actions`.
+    pub fn note(&mut self, dirtied: bool) -> Result<()> {
+        if dirtied {
+            self.pending += 1;
+        }
+        if self.pending >= index_only::MANIFEST_FLUSH_EVERY {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Write the manifest now if anything is pending, resetting the window. Call at the end of a pass
+    /// (and after a single watcher/dev event) so the tail is persisted with its error surfaced.
+    pub fn flush(&mut self) -> Result<()> {
+        if self.pending > 0 {
+            (self.flush_fn)()?;
+            self.pending = 0;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ManifestFlusher {
+    fn drop(&mut self) {
+        // Safety net for an early return / `?`-propagated error / panic that skipped `flush()`: persist
+        // the remainder best-effort so a bail strands at most a boot self-heal, never lost data. Errors
+        // can only be logged here; `reconcile_on_open` re-derives the manifest from the mirror regardless.
+        if self.pending > 0 {
+            if let Err(e) = (self.flush_fn)() {
+                eprintln!(
+                    "index_only: manifest flush during cleanup failed ({e}); reconcile_on_open will heal it"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A `ManifestFlusher` whose write just bumps a shared counter, so the batching cadence is testable
+    /// without a live app + sidecar. Returns the flusher and the count of writes it has performed.
+    fn counting_flusher() -> (ManifestFlusher, Arc<AtomicUsize>) {
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let seen = flushes.clone();
+        let flusher = ManifestFlusher::with_flush(Box::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        (flusher, flushes)
+    }
+
+    #[test]
+    fn manifest_flusher_writes_once_per_window_and_never_on_no_change() {
+        let (mut flusher, flushes) = counting_flusher();
+        // Items that didn't change the mirror never advance the window.
+        for _ in 0..1000 {
+            flusher.note(false).unwrap();
+        }
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            0,
+            "no-change items don't flush"
+        );
+        // Exactly one window's worth of changes triggers exactly one write, and the window resets.
+        for _ in 0..index_only::MANIFEST_FLUSH_EVERY {
+            flusher.note(true).unwrap();
+        }
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "a full window flushes once"
+        );
+        // A partial window doesn't write until the explicit end-of-pass flush.
+        for _ in 0..10 {
+            flusher.note(true).unwrap();
+        }
+        assert_eq!(flushes.load(Ordering::SeqCst), 1, "a partial window holds");
+        flusher.flush().unwrap();
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            2,
+            "end-of-pass flush writes the tail"
+        );
+        // A second flush with nothing pending is a no-op, and so is Drop.
+        flusher.flush().unwrap();
+        drop(flusher);
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            2,
+            "no spurious writes when nothing is pending"
+        );
+    }
+
+    #[test]
+    fn manifest_flusher_drop_persists_an_unflushed_remainder() {
+        // The belt-and-suspenders: an early return / `?` bail that skips `flush()` must still persist
+        // what was ingested (bounded to < one window), so a mid-pass failure strands nothing beyond it.
+        let (flusher, flushes) = counting_flusher();
+        {
+            let mut f = flusher;
+            f.note(true).unwrap(); // one pending, below the window — no explicit flush (simulated bail)
+            assert_eq!(flushes.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "Drop flushed the un-flushed remainder"
+        );
+    }
 
     /// A minimal snapshot standing in for the real `*SyncState`s — same single-flight fields, plus a
     /// stand-in target/counters so `reset_for_rerun` has something to clear.

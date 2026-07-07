@@ -1,7 +1,7 @@
 {
   "name": "pm",
   "private": true,
-  "version": "2.92.56-alpha",
+  "version": "2.92.57-alpha",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "scripts": {

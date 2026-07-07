@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "2.92.57-alpha",
+    date: "2026-07-07",
+    highlights: [
+      "Faster first-time indexing of large connected folders. Building the index for a big Google Drive, OneDrive, or local folder no longer slows down the further it gets — the encrypted index is now saved in batches instead of being fully rewritten after every single file, so a folder with thousands of items indexes in a fraction of the time. Nothing changes about what gets indexed or how it's sorted, and an interrupted sync still picks up cleanly where it left off.",
+    ],
+  },
+  {
     version: "2.92.56-alpha",
     date: "2026-07-07",
     highlights: [
