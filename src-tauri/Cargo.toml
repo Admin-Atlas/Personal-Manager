@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.0.0-alpha"
+version = "3.0.1-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -11,6 +11,14 @@ license = "AGPL-3.0-or-later"
 # binary and can speed hot paths; the trade is a slower release compile. Size / build-time / runtime
 # impact is PENDING MEASUREMENT (per the goal directive — no numbers asserted). Debug builds and the
 # `just check` gate are unaffected (they use the dev profile).
+# Incremental compilation is disabled for dev builds. On this large crate every rebuild minted a
+# fresh per-fingerprint `target/debug/incremental/<crate>-<hash>` directory (each ~1–1.5 GB) that
+# Cargo never garbage-collected, so the cache grew unbounded (~300 GB observed). Turning it off
+# trades a slightly slower warm rebuild for a bounded target dir; correctness and the `just check`
+# gate are unaffected. Contributors who want incremental back can override locally in .cargo/config.toml.
+[profile.dev]
+incremental = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

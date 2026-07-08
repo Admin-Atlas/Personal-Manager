@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.0.1-alpha",
+    date: "2026-07-08",
+    highlights: [
+      "Under-the-hood tidying: development builds no longer leave behind an ever-growing compiler cache that could quietly swallow hundreds of gigabytes of disk. Nothing changes for you day to day.",
+    ],
+  },
+  {
     version: "3.0.0-alpha",
     date: "2026-07-08",
     highlights: [
