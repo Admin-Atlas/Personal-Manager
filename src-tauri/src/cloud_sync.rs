@@ -19,6 +19,7 @@
 //! the whole generic pass future must be `Send`, and the explicit bound makes that provable through the
 //! generic `C`.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -27,7 +28,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{Error, Result};
-use crate::{connector_sync, db, drive, index_only, onedrive, AppState};
+use crate::{connector_sync, db, drive, index_only, ingest, onedrive, AppState};
 
 // --- unified report / progress types (shared by both cloud connectors) ---------------------------
 
@@ -271,6 +272,57 @@ fn record_issue(issues: &mut Vec<CloudSyncIssue>, truncated: &mut bool, name: &s
     } else {
         *truncated = true;
     }
+}
+
+// --- shared fetch-body helpers (the connectors' byte-identical tails, hoisted like the types above) --
+
+/// The trimmed text, or `None` when it's empty — both connectors' "did the fetch/convert yield
+/// anything indexable?" filter.
+pub(crate) fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Stage downloaded bytes to a temp file named with the source's extension, so the sidecar
+/// (MarkItDown) picks the right converter. Content-addressed so a re-fetch reuses the name; removed
+/// by the caller after conversion. `prefix` keeps each connector's temp files recognisable
+/// (`pm-drive-` / `pm-onedrive-`).
+pub(crate) fn stage_temp(prefix: &str, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 8)
+        .unwrap_or("bin");
+    let digest = ingest::hex_digest(bytes);
+    let path = std::env::temp_dir().join(format!("{prefix}{}.{ext}", &digest[..16]));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// The shared tail of both connectors' `FetchPlan::DownloadBinary` arms: take the download's
+/// outcome, stage the bytes to a temp file, convert via the sidecar, remove the temp, and return
+/// the non-empty markdown. Never holds the DB lock.
+pub(crate) fn convert_downloaded_binary(
+    state: &AppState,
+    temp_prefix: &str,
+    name: &str,
+    downloaded: Result<Vec<u8>>,
+) -> Result<Option<String>> {
+    let bytes = match downloaded {
+        Ok(b) => b,
+        // An over-cap download is a skip (kept findable via its title), not a hard error.
+        Err(e) if e.to_string().contains("too large") => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let tmp = stage_temp(temp_prefix, name, &bytes)?;
+    let converted = state.sidecar.convert(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let (markdown, _title) = converted?;
+    Ok(non_empty(&markdown))
 }
 
 /// Drive both cloud sync engines: the detached, single-flight, crash-resumable lifecycle around one

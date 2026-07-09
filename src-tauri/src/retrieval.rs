@@ -299,14 +299,13 @@ fn vector_search(conn: &Connection, embedding: &[f32], limit: usize) -> Result<V
     if embedding.is_empty() {
         return Ok(Vec::new());
     }
-    // Serialized exactly as ingestion stores it (see ingest::index_document).
-    let json = serde_json::to_string(embedding)
-        .map_err(|e| Error::Other(format!("encode query embedding: {e}")))?;
+    // Bound in the same raw-f32-blob encoding ingestion stores (see ingest::embedding_blob).
+    let blob = crate::ingest::embedding_blob(embedding);
     let mut stmt = conn.prepare(
         "SELECT rowid FROM chunk_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(params![json, limit as i64], |row| row.get::<_, i64>(0))?
+        .query_map(params![blob, limit as i64], |row| row.get::<_, i64>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -322,13 +321,12 @@ fn vector_search_scored(
     if embedding.is_empty() {
         return Ok(Vec::new());
     }
-    let json = serde_json::to_string(embedding)
-        .map_err(|e| Error::Other(format!("encode query embedding: {e}")))?;
+    let blob = crate::ingest::embedding_blob(embedding);
     let mut stmt = conn.prepare(
         "SELECT rowid, distance FROM chunk_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(params![json, limit as i64], |row| {
+        .query_map(params![blob, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -665,7 +663,7 @@ pub fn citations_from(chunks: &[RetrievedChunk]) -> Vec<Citation> {
         if seen.insert(c.document_id) {
             // A chat citation carries the first-seen turn's pointer so the UI can reopen that
             // conversation at the exact turn; a plain document leaves the chat fields empty.
-            let is_chat = c.source_type.as_deref() == Some("chat");
+            let is_chat = c.source_type.as_deref() == Some(crate::ingest::SOURCE_TYPE_CHAT);
             out.push(Citation {
                 document_id: c.document_id,
                 title: c.title.clone(),

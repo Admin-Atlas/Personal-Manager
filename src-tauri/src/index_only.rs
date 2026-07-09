@@ -278,23 +278,78 @@ pub fn forget_source(vault_root: &Path, cipher: &ManifestCipher, source_id: &str
 /// Apply the portable classification in `manifest` onto the matching index-only rows (the file is the
 /// source of truth for classification), re-resolving each item's `entity_id` from its canonical name
 /// through the rules mirror. Rows present in the file but absent from the DB are left untouched —
-/// they await a Rebuild, which re-embeds them from their summary (we can't embed here).
+/// they await a Rebuild, which re-embeds them from their summary (we can't embed here). Runs on every
+/// boot/unlock, so the common already-in-sync row is detected up front and skipped: the existence
+/// probe reads the row's current values and the UPDATE only fires when something actually differs.
 fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<()> {
+    /// The row's current values for every column the UPDATE below writes (minus `entity_id`, which
+    /// is re-resolved fresh each pass and compared alongside).
+    struct CurrentRow {
+        project: Option<String>,
+        tags: Option<String>,
+        importance: Option<String>,
+        reviewed: Option<i64>,
+        last_activity: Option<String>,
+        external_ref: Option<String>,
+        source_modified_at: Option<String>,
+        source_content_hash: Option<String>,
+        source_state: Option<String>,
+        stored_summary: Option<String>,
+        title: Option<String>,
+        entity_id: Option<i64>,
+    }
     for it in &manifest.items {
-        let exists = conn
+        let current = conn
             .query_row(
-                "SELECT 1 FROM documents WHERE source_id = ?1 AND source_type = ?2",
+                "SELECT project, tags, importance, reviewed, last_activity, external_ref, \
+                        source_modified_at, source_content_hash, source_state, stored_summary, \
+                        title, entity_id \
+                 FROM documents WHERE source_id = ?1 AND source_type = ?2",
                 params![it.source_id, ingest::SOURCE_TYPE_INDEX_ONLY],
-                |_| Ok(()),
+                |r| {
+                    Ok(CurrentRow {
+                        project: r.get(0)?,
+                        tags: r.get(1)?,
+                        importance: r.get(2)?,
+                        reviewed: r.get(3)?,
+                        last_activity: r.get(4)?,
+                        external_ref: r.get(5)?,
+                        source_modified_at: r.get(6)?,
+                        source_content_hash: r.get(7)?,
+                        source_state: r.get(8)?,
+                        stored_summary: r.get(9)?,
+                        title: r.get(10)?,
+                        entity_id: r.get(11)?,
+                    })
+                },
             )
-            .optional()?
-            .is_some();
-        if !exists {
+            .optional()?;
+        let Some(current) = current else {
             continue;
-        }
+        };
+        // Always re-resolve (never skipped even when the rest matches): the boot reconcile runs
+        // AFTER the entity-rules reconcile precisely so an alias edit from another machine re-points
+        // items — and `resolve_project(.., true)` also recreates a missing project entity.
         let entity_id = crate::entities::resolve_project(conn, &it.project, true)?;
         let tags_json = serde_json::to_string(&it.tags)
             .map_err(|e| Error::Other(format!("encode tags: {e}")))?;
+        // Compares EVERY column the UPDATE writes, so any drift still rewrites exactly as before;
+        // the every-boot in-sync case becomes read-only.
+        let unchanged = current.project.as_deref() == Some(it.project.as_str())
+            && current.tags.as_deref() == Some(tags_json.as_str())
+            && current.importance == it.importance
+            && current.reviewed == Some(it.reviewed as i64)
+            && current.last_activity == it.last_activity
+            && current.external_ref == it.external_ref
+            && current.source_modified_at == it.source_modified_at
+            && current.source_content_hash == it.source_content_hash
+            && current.source_state.as_deref() == Some(it.source_state.as_str())
+            && current.stored_summary == it.stored_summary
+            && current.title.as_deref() == Some(it.title.as_str())
+            && current.entity_id == entity_id;
+        if unchanged {
+            continue;
+        }
         conn.execute(
             "UPDATE documents SET project = ?2, tags = ?3, importance = ?4, reviewed = ?5, \
                     last_activity = ?6, external_ref = ?7, source_modified_at = ?8, \
@@ -689,6 +744,69 @@ pub struct ItemState {
     pub source_modified_at: Option<String>,
     pub source_content_hash: Option<String>,
     pub source_state: SourceState,
+}
+
+/// One item's persisted sync-pointer columns exactly as stored (raw `source_state` string,
+/// `external_ref` included) — the superset every connector's per-item lookup needs. The local-folder
+/// watcher consumes this shape directly (its `KnownItem` keeps the raw state string); the cloud
+/// connectors go through [`read_item_state`] for the reducer's [`ItemState`] view.
+pub(crate) struct RawItemState {
+    pub external_ref: Option<String>,
+    pub source_modified_at: Option<String>,
+    pub source_content_hash: Option<String>,
+    pub source_state: String,
+}
+
+/// The ONE per-item state lookup behind `drive`/`onedrive`/`localfolder` (their three copies were
+/// near-identical, differing only in a hidden `source_type` filter). `include_promoted` makes that
+/// difference explicit at each call site:
+///
+/// * `false` (OneDrive, local folders): only a live `source_type = 'index_only'` row counts.
+/// * `true` (Drive): match on `source_id` ALONE, so a document **promoted to a full local import**
+///   (`crate::ingest::promote_spreadsheet` flips its `source_type` off `index_only` but keeps the
+///   `gdrive:` source id as a claim marker) is still seen as the item's current state — the sync
+///   reducer then treats the promoted file as present-and-reachable (an `Add` re-fires as a `Noop`,
+///   never re-ingesting a second, index-only copy). Only index-only and promoted-Drive docs ever
+///   carry a `gdrive:` id, so the wider match can't pull in an unrelated row.
+pub(crate) fn read_raw_item_state(
+    conn: &Connection,
+    source_id: &str,
+    include_promoted: bool,
+) -> Result<Option<RawItemState>> {
+    let sql = if include_promoted {
+        "SELECT external_ref, source_modified_at, source_content_hash, source_state \
+         FROM documents WHERE source_id = ?1"
+    } else {
+        "SELECT external_ref, source_modified_at, source_content_hash, source_state \
+         FROM documents WHERE source_id = ?1 AND source_type = 'index_only'"
+    };
+    conn.query_row(sql, params![source_id], |r| {
+        Ok(RawItemState {
+            external_ref: r.get(0)?,
+            source_modified_at: r.get(1)?,
+            source_content_hash: r.get(2)?,
+            source_state: r.get(3)?,
+        })
+    })
+    .optional()
+    .map_err(Error::from)
+}
+
+/// [`read_raw_item_state`] mapped into the reducer's [`ItemState`] — the shape the cloud
+/// connectors' `read_item_state` delegates return.
+pub(crate) fn read_item_state(
+    conn: &Connection,
+    source_id: &str,
+    include_promoted: bool,
+) -> Result<Option<ItemState>> {
+    Ok(
+        read_raw_item_state(conn, source_id, include_promoted)?.map(|raw| ItemState {
+            source_id: source_id.to_string(),
+            source_modified_at: raw.source_modified_at,
+            source_content_hash: raw.source_content_hash,
+            source_state: SourceState::from_db(&raw.source_state),
+        }),
+    )
 }
 
 /// A change reported by some source, normalised. Connectors translate their native events (a notify

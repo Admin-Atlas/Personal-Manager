@@ -29,10 +29,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cloud_sync::{convert_downloaded_binary, non_empty, stage_temp};
 use crate::error::{Error, Result};
 use crate::google::{self, Token};
-use crate::index_only::{self, ChangeEvent, ItemState, SourceState};
-use crate::{connector_sync, ingest, secrets, AppState};
+use crate::index_only::{self, ChangeEvent, ItemState};
+use crate::{connector_sync, secrets, AppState};
 
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
 /// Google Sheets API v4 base — used ONLY for the metadata-only Google Sheets index (tab names + each
@@ -77,7 +78,7 @@ const SERVICE: &str = "drive";
 
 /// The keychain token key for one Drive account (`<prefix><email>`).
 pub fn account_token_key(email: &str) -> String {
-    format!("{}{}", secrets::GOOGLE_TOKEN_DRIVE_PREFIX, email)
+    secrets::token_key_for(PROVIDER, SERVICE, email).expect("google/drive is a token-bearing pair")
 }
 
 /// The `connector_sources.id` for one account, and the item-id namespace prefix.
@@ -482,36 +483,16 @@ pub fn forget_all_accounts(conn: &Connection) -> Result<()> {
 /// The persisted state of a Drive item, in the shape the foundation's reducer needs (or `None` if the
 /// source id has never been seen).
 ///
-/// Matches on `source_id` ALONE — deliberately NOT restricted to `source_type = 'index_only'` — so a
-/// document that was **promoted to a full local import** (["import fully"](crate::ingest::promote_spreadsheet),
-/// which flips its `source_type` off `index_only` but keeps the Drive `source_id` as a claim marker) is
-/// still seen as the item's current state. That makes the sync reducer treat the promoted file as
-/// present-and-reachable: an `Add` re-fires as a `Noop` (never re-ingesting a second, index-only copy)
-/// instead of an `IngestNew`. Only index-only and promoted-Drive docs ever carry a `gdrive:` id, so
-/// widening the match can't pull in an unrelated row.
+/// Matches on `source_id` ALONE (`include_promoted`) — deliberately NOT restricted to
+/// `source_type = 'index_only'` — so a document that was **promoted to a full local import**
+/// (["import fully"](crate::ingest::promote_spreadsheet), which flips its `source_type` off
+/// `index_only` but keeps the Drive `source_id` as a claim marker) is still seen as the item's
+/// current state. That makes the sync reducer treat the promoted file as present-and-reachable: an
+/// `Add` re-fires as a `Noop` (never re-ingesting a second, index-only copy) instead of an
+/// `IngestNew`. Only index-only and promoted-Drive docs ever carry a `gdrive:` id, so widening the
+/// match can't pull in an unrelated row.
 pub fn read_item_state(conn: &Connection, source_id: &str) -> Result<Option<ItemState>> {
-    conn.query_row(
-        "SELECT source_modified_at, source_content_hash, source_state \
-         FROM documents WHERE source_id = ?1",
-        params![source_id],
-        |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        },
-    )
-    .optional()
-    .map_err(Error::from)
-    .map(|opt| {
-        opt.map(|(modified, hash, state)| ItemState {
-            source_id: source_id.to_string(),
-            source_modified_at: modified,
-            source_content_hash: hash,
-            source_state: SourceState::from_db(&state),
-        })
-    })
+    index_only::read_item_state(conn, source_id, /* include_promoted */ true)
 }
 
 // --- per-account indexing scope (which drives/folders to index) ----------------------------------
@@ -1335,7 +1316,7 @@ pub async fn export_sheet_xlsx(token_key: &str, file: &DriveFile) -> Result<Path
     }
     // Force an `.xlsx` name (the Sheet's own name has no extension) so `stage_temp` tags the temp file
     // correctly for the extension-routed sidecar parser.
-    stage_temp("export.xlsx", &bytes)
+    stage_temp("pm-drive-", "export.xlsx", &bytes)
 }
 
 /// Resolve a folder id to its display name — the label a synced file is tagged with. A folder is just
@@ -1418,17 +1399,8 @@ pub async fn fetch_body(
                 "{DRIVE_API}/files/{}?alt=media&supportsAllDrives=true",
                 file.id
             );
-            let bytes = match google::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await {
-                Ok(b) => b,
-                // An over-cap download is a skip (kept findable via its title), not a hard error.
-                Err(e) if e.to_string().contains("too large") => return Ok(None),
-                Err(e) => return Err(e),
-            };
-            let tmp = stage_temp(&file.name, &bytes)?;
-            let converted = state.sidecar.convert(&tmp);
-            let _ = std::fs::remove_file(&tmp);
-            let (markdown, _title) = converted?;
-            Ok(non_empty(&markdown))
+            let downloaded = google::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await;
+            convert_downloaded_binary(state, "pm-drive-", &file.name, downloaded)
         }
         FetchPlan::SheetMetadata => fetch_sheet_metadata(token_key, file).await,
     }
@@ -1621,29 +1593,8 @@ fn sheet_error_fallback_body(file: &DriveFile, err: &Error) -> Option<String> {
     }
 }
 
-fn non_empty(s: &str) -> Option<String> {
-    let t = s.trim();
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
-    }
-}
-
-/// Stage downloaded bytes to a temp file named with the source's extension, so the sidecar
-/// (MarkItDown) picks the right converter. Content-addressed so a re-fetch reuses the name; removed
-/// by the caller after conversion.
-fn stage_temp(name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let ext = std::path::Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .filter(|e| e.len() <= 8)
-        .unwrap_or("bin");
-    let digest = ingest::hex_digest(bytes);
-    let path = std::env::temp_dir().join(format!("pm-drive-{}.{ext}", &digest[..16]));
-    std::fs::write(&path, bytes)?;
-    Ok(path)
-}
+// `non_empty` / `stage_temp` / the DownloadBinary convert tail now live in [`crate::cloud_sync`]
+// (shared with OneDrive — the copies differed only in the temp-file prefix, passed as `pm-drive-`).
 
 // The sync progress event, report, and not-indexed issue types now live unified (shared with OneDrive)
 // as `CloudSyncEvent` / `CloudSyncReport` / `CloudSyncIssue` in [`crate::cloud_sync`] — the two
@@ -1652,6 +1603,7 @@ fn stage_temp(name: &str, bytes: &[u8]) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index_only::SourceState;
 
     fn file(id: &str, mime: &str, md5: Option<&str>, modified: &str) -> DriveFile {
         DriveFile {

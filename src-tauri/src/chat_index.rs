@@ -178,13 +178,22 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
     )
     .with_embed_batch(embed_batch);
 
-    // 3. Chunk + embed each SUBSTANTIVE new pair. The triviality gate (card B's lean firehose filter)
-    //    skips pure-acknowledgement/greeting pairs from the index — they are never chunked, so they can't
-    //    pollute retrieval — while the cursor still advances past them below (they are handled, not
-    //    reconsidered). The per-pair content-hash seed keeps leaf UIDs unique across turns (two
-    //    single-paragraph turns would otherwise collide) yet stable on a rebuild.
+    // 3. Chunk each SUBSTANTIVE new pair, then embed the whole sweep's leaf texts in ONE gateway
+    //    call. The triviality gate (card B's lean firehose filter) skips pure-acknowledgement/greeting
+    //    pairs from the index — they are never chunked, so they can't pollute retrieval — while the
+    //    cursor still advances past them below (they are handled, not reconsidered). The per-pair
+    //    content-hash seed keeps leaf UIDs unique across turns (two single-paragraph turns would
+    //    otherwise collide) yet stable on a rebuild. Batching the embed collapses one sidecar
+    //    round-trip per pair into one per sweep (the gateway sub-batches by byte budget internally);
+    //    error semantics are unchanged — any embed failure still aborts the whole sweep with the
+    //    cursor untouched, exactly as a per-pair failure did (nothing lands outside the one
+    //    transaction below).
     let chat_hash = chat::content_hash(conversation_id);
-    let mut segments: Vec<IndexedSegment> = Vec::with_capacity(pairs.len());
+    // Each entry: one pair's (turn_id, at, chunks, leaf count) — the count partitions the batched
+    // embedding vector back into per-pair segments.
+    let mut pending: Vec<(i64, String, Vec<splitter::Chunk>, usize)> =
+        Vec::with_capacity(pairs.len());
+    let mut texts: Vec<String> = Vec::new();
     for pair in &pairs {
         if matches!(chat::triviality(pair), chat::Triviality::Trivial) {
             continue;
@@ -192,16 +201,28 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
         let body = render_authored_segment(pair);
         let seed = format!("{chat_hash}:{}", pair.turn_id);
         let chunks = ingest::split_document(&gateway, &body, &plan.title, &seed)?;
-        let texts = ingest::leaf_embed_texts(&chunks);
+        let leaf_texts = ingest::leaf_embed_texts(&chunks);
+        let leaves = leaf_texts.len();
+        texts.extend(leaf_texts);
+        pending.push((pair.turn_id, pair.at.clone(), chunks, leaves));
+    }
+    let embeddings = if texts.is_empty() {
+        Vec::new()
+    } else {
         let embeddings = gateway.embed_documents(&texts)?;
         ingest::check_embeddings(&embeddings, texts.len(), gateway.embedder().dimension)?;
-        segments.push(IndexedSegment {
-            turn_id: pair.turn_id,
-            at: pair.at.clone(),
+        embeddings
+    };
+    let mut remaining = embeddings.into_iter();
+    let segments: Vec<IndexedSegment> = pending
+        .into_iter()
+        .map(|(turn_id, at, chunks, leaves)| IndexedSegment {
+            turn_id,
+            at,
             chunks,
-            embeddings,
-        });
-    }
+            embeddings: remaining.by_ref().take(leaves).collect(),
+        })
+        .collect();
 
     // 4. Land it all in one transaction. The cursor advances to the newest pair PROCESSED — including any
     //    trivial pairs that were skipped — so a stretch of small talk is never re-examined every sweep.

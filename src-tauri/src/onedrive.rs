@@ -22,16 +22,15 @@
 //! My-Drive scope model in [`crate::drive`]. There is one drive per account (no shared-drive corpus),
 //! so item ids stay in the single `onedrive:<email>:<itemId>` namespace.
 
-use std::path::PathBuf;
-
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cloud_sync::{convert_downloaded_binary, non_empty};
 use crate::error::{Error, Result};
-use crate::index_only::{self, ChangeEvent, ItemState, SourceState};
+use crate::index_only::{self, ChangeEvent, ItemState};
 use crate::microsoft;
-use crate::{connector_sync, ingest, secrets, AppState};
+use crate::{connector_sync, secrets, AppState};
 
 /// Cap on a single fetched file body (25 MiB) so one huge file can't balloon memory; an over-cap file
 /// is skipped with a surfaced note rather than indexed.
@@ -51,7 +50,8 @@ const SERVICE: &str = "onedrive";
 
 /// The keychain token key for one OneDrive account (`<prefix><email>`).
 pub fn account_token_key(email: &str) -> String {
-    format!("{}{}", secrets::MICROSOFT_TOKEN_ONEDRIVE_PREFIX, email)
+    secrets::token_key_for(PROVIDER, SERVICE, email)
+        .expect("microsoft/onedrive is a token-bearing pair")
 }
 
 /// The `connector_sources.id` for one account, and the item-id namespace prefix.
@@ -182,30 +182,10 @@ pub fn forget_all_accounts(conn: &Connection) -> Result<()> {
 }
 
 /// The persisted state of a OneDrive item, in the shape the foundation's reducer needs (or `None` if
-/// the source id has never been seen).
+/// the source id has never been seen). Unlike Drive, only a live index-only row counts (OneDrive has
+/// no promote-in-place flow claiming its source ids).
 pub fn read_item_state(conn: &Connection, source_id: &str) -> Result<Option<ItemState>> {
-    conn.query_row(
-        "SELECT source_modified_at, source_content_hash, source_state \
-         FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
-        params![source_id],
-        |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        },
-    )
-    .optional()
-    .map_err(Error::from)
-    .map(|opt| {
-        opt.map(|(modified, hash, state)| ItemState {
-            source_id: source_id.to_string(),
-            source_modified_at: modified,
-            source_content_hash: hash,
-            source_state: SourceState::from_db(&state),
-        })
-    })
+    index_only::read_item_state(conn, source_id, /* include_promoted */ false)
 }
 
 // --- delta cursor + per-account scope ------------------------------------------------------------
@@ -769,45 +749,14 @@ pub async fn fetch_body(
                 microsoft::GRAPH_API,
                 item.id
             );
-            let bytes = match microsoft::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await
-            {
-                Ok(b) => b,
-                // An over-cap download is a skip (kept findable via its title), not a hard error.
-                Err(e) if e.to_string().contains("too large") => return Ok(None),
-                Err(e) => return Err(e),
-            };
-            let tmp = stage_temp(&item.name, &bytes)?;
-            let converted = state.sidecar.convert(&tmp);
-            let _ = std::fs::remove_file(&tmp);
-            let (markdown, _title) = converted?;
-            Ok(non_empty(&markdown))
+            let downloaded = microsoft::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await;
+            convert_downloaded_binary(state, "pm-onedrive-", &item.name, downloaded)
         }
     }
 }
 
-fn non_empty(s: &str) -> Option<String> {
-    let t = s.trim();
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
-    }
-}
-
-/// Stage downloaded bytes to a temp file named with the source's extension, so the sidecar
-/// (MarkItDown) picks the right converter. Content-addressed so a re-fetch reuses the name; removed by
-/// the caller after conversion.
-fn stage_temp(name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let ext = std::path::Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .filter(|e| e.len() <= 8)
-        .unwrap_or("bin");
-    let digest = ingest::hex_digest(bytes);
-    let path = std::env::temp_dir().join(format!("pm-onedrive-{}.{ext}", &digest[..16]));
-    std::fs::write(&path, bytes)?;
-    Ok(path)
-}
+// `non_empty` / `stage_temp` / the DownloadBinary convert tail now live in [`crate::cloud_sync`]
+// (shared with Drive — the copies differed only in the temp-file prefix, passed as `pm-onedrive-`).
 
 // The sync progress event, report, and not-indexed issue types now live unified (shared with Drive) as
 // `CloudSyncEvent` / `CloudSyncReport` / `CloudSyncIssue` in [`crate::cloud_sync`] — the two providers'

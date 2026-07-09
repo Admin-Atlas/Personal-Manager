@@ -258,16 +258,26 @@ pub fn selectable_embedders() -> Vec<ModelEntry> {
 }
 
 /// Prepend the embedder's role-appropriate retrieval prefix to each text (e5's `query: ` /
-/// `passage: `). A no-op for symmetric models. The one place prefixes are applied, so the sidecar
-/// embeds raw text and a custom (non-auto-prefixing) model still gets the right input.
-pub fn apply_prefix(embedder: &ModelEntry, role: EmbedRole, texts: &[String]) -> Vec<String> {
+/// `passage: `). A no-op for symmetric models — returned borrowed (`Cow::Borrowed`), so the common
+/// English-default path never copies a document's worth of chunk texts. The one place prefixes are
+/// applied, so the sidecar embeds raw text and a custom (non-auto-prefixing) model still gets the
+/// right input.
+pub fn apply_prefix<'a>(
+    embedder: &ModelEntry,
+    role: EmbedRole,
+    texts: &'a [String],
+) -> std::borrow::Cow<'a, [String]> {
     let prefix = match role {
         EmbedRole::Query => embedder.query_prefix,
         EmbedRole::Passage => embedder.passage_prefix,
     };
     match prefix {
-        Some(p) => texts.iter().map(|t| format!("{p}{t}")).collect(),
-        None => texts.to_vec(),
+        Some(p) => texts
+            .iter()
+            .map(|t| format!("{p}{t}"))
+            .collect::<Vec<_>>()
+            .into(),
+        None => texts.into(),
     }
 }
 
