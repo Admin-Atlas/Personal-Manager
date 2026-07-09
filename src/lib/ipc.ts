@@ -65,7 +65,6 @@ import type {
   ReviewDecision,
   ReviewEvent,
   RestoreSummary,
-  RetrievedChunk,
   SemanticLayout,
   Settings,
   SharedDrive,
@@ -209,10 +208,6 @@ export const scorePassphrase = (passphrase: string) =>
  *  a silently-downgraded encryption policy that PM forced back on, or a failed integrity check. */
 export const onVaultMetaWarning = (handler: (message: string) => void): Promise<UnlistenFn> =>
   listen<string>("vault://meta-warning", (e) => handler(e.payload));
-
-/** Point this profile at an existing vault folder (a shared one) and open it. */
-export const openExistingVault = (folder: string, passphrase?: string | null) =>
-  invoke<void>("open_existing_vault", { folder, passphrase: passphrase ?? null });
 
 /** Forget this profile's cached passphrase key, so it's asked for again next launch.
  *  Does not lock the current session. */
@@ -386,10 +381,6 @@ export const devApplyChangeEvent = (
   externalRef: string | null,
 ) => invoke<void>("dev_apply_change_event", { kind, sourceId, title, body, externalRef });
 
-/** Hybrid search over the store, returning the top-k matching chunks. */
-export const searchDocuments = (query: string, k?: number) =>
-  invoke<RetrievedChunk[]>("search_documents", { query, k });
-
 /** Transcribe a recorded voice clip to text, fully on-device via the sidecar's
  *  Whisper model. `audioBase64` is the standard-base64 of the recording bytes. */
 export const transcribeAudio = (audioBase64: string) =>
@@ -513,10 +504,6 @@ export const renameEntity = (entityId: number, newName: string) =>
  *  The headline action — folds a name variant into its canonical so it never recurs. */
 export const mergeEntities = (fromId: number, intoId: number) =>
   invoke<void>("merge_entities", { fromId, intoId });
-
-/** Point one document at a different existing entity — the misfile/reassignment case. */
-export const reassignDocument = (documentId: number, entityId: number) =>
-  invoke<void>("reassign_document", { documentId, entityId });
 
 // --- Personal Assistant: focus view & projects (Step 5, spec §4) ---
 
@@ -652,9 +639,6 @@ export const listAllCalendarEvents = () => invoke<CalendarEvent[]>("list_all_cal
 /** The Drive connector's state: whether the shared Google client is set up + connected accounts. */
 export const driveStatus = () => invoke<DriveStatus>("drive_status");
 
-/** The connected Drive accounts (each independent). */
-export const listDriveAccounts = () => invoke<DriveAccount[]>("list_drive_accounts");
-
 /** Connect a Google Drive account — opens the browser; resolves with the connected account. Pass an
  *  account's own project `clientId`/`clientSecret` to sign in with it (Advanced-Protection path);
  *  omit both to use the shared group client. */
@@ -717,9 +701,6 @@ export const clearMicrosoftClient = () => invoke<void>("clear_microsoft_client")
 
 /** The OneDrive connector's state: whether the Microsoft client is set up + connected accounts. */
 export const oneDriveStatus = () => invoke<OneDriveStatus>("onedrive_status");
-
-/** The connected OneDrive accounts (each independent). */
-export const listOneDriveAccounts = () => invoke<OneDriveAccount[]>("list_onedrive_accounts");
 
 /** Connect a Microsoft OneDrive account — opens the browser; resolves with the connected account. */
 export const connectOneDrive = () => invoke<OneDriveAccount>("connect_onedrive");
@@ -819,9 +800,6 @@ export const optionalTsneStatus = () => invoke<TsneStatus>("optional_tsne_status
 
 /** Install the optional t-SNE reducer into the managed venv, then recompute the layout with it. */
 export const installOptionalTsne = () => invoke<void>("install_optional_tsne");
-
-/** Remove the optional t-SNE reducer from the venv (the "delete" action), then recompute with PCA. */
-export const uninstallOptionalTsne = () => invoke<void>("uninstall_optional_tsne");
 
 /** Whether the optional photo-OCR component (rapidocr + pillow-heif) is installed. */
 export const optionalOcrStatus = () => invoke<OcrStatus>("optional_ocr_status");

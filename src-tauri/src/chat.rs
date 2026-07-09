@@ -120,9 +120,6 @@ pub(crate) fn discard_dangling_user_turn(conn: &Connection, conversation_id: i64
 /// (pass `None` for "from the beginning"), in chronological order. A trailing user message with no reply
 /// yet is **excluded** — only complete pairs are returned. This is the cursor-driven read card B embeds
 /// from and card C summarises from: "is there content past the cursor?" never "is the conversation done?".
-// Card 7A lands this read primitive as part of the turn-model substrate; the indexer that consumes it is
-// card 7B. Tested here, wired there.
-#[allow(dead_code)]
 pub(crate) fn completed_turn_pairs_after(
     conn: &Connection,
     conversation_id: i64,

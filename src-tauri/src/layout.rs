@@ -580,26 +580,6 @@ pub async fn install_optional_tsne(app: AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Remove the optional t-SNE component (the "delete" action), then recompute the layout with PCA in the
-/// background. Blocking uninstall runs off the async runtime; errors surface to the caller so Settings
-/// can show them.
-#[tauri::command]
-pub async fn uninstall_optional_tsne(app: AppHandle) -> Result<()> {
-    let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        app2.state::<AppState>().sidecar.uninstall_optional_tsne()
-    })
-    .await
-    .map_err(|e| Error::Other(format!("t-SNE uninstall task panicked: {e}")))??;
-
-    // t-SNE is gone (or disabled) — refresh the layout with PCA.
-    let app3 = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = precompute_semantic_layout(&app3, true, true).await;
-    });
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

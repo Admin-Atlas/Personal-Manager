@@ -213,18 +213,6 @@ export interface Citation {
   dated?: string | null;
 }
 
-/** A chunk returned by hybrid search (the `search_documents` command). */
-export interface RetrievedChunk {
-  chunk_id: number;
-  document_id: number;
-  title: string;
-  source_path: string | null;
-  vault_path: string;
-  heading: string | null;
-  content: string;
-  ordinal: number;
-}
-
 export type ChatEvent =
   | { type: "token"; text: string }
   | { type: "done"; message_id: number; content: string; citations: Citation[] }

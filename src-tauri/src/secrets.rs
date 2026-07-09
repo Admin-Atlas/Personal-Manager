@@ -221,6 +221,23 @@ pub const MICROSOFT_TOKEN_ONEDRIVE_PREFIX: &str = "microsoft_oauth_token_onedriv
 /// id (shared with OneDrive — no new client setup), one token blob per connected account.
 pub const MICROSOFT_TOKEN_CALENDAR_PREFIX: &str = "microsoft_oauth_token_calendar::";
 
+/// The per-account keychain token key (`<prefix><email>`) for a token-bearing
+/// `connector_sources` (provider, service) pair — the single owner of the mapping, which the
+/// connectors' `account_token_key` helpers and the wipe's key reconstruction all delegate to so
+/// the strings can never drift apart. These strings are keychain identity: changing one orphans
+/// every stored token (same class of one-way door as the bundle id). `None` for source kinds
+/// that hold no OAuth token (Apple subscriptions, local folders).
+pub fn token_key_for(provider: &str, service: &str, email: &str) -> Option<String> {
+    let prefix = match (provider, service) {
+        ("google", "drive") => GOOGLE_TOKEN_DRIVE_PREFIX,
+        ("google", "calendar") => GOOGLE_TOKEN_CALENDAR_PREFIX,
+        ("microsoft", "onedrive") => MICROSOFT_TOKEN_ONEDRIVE_PREFIX,
+        ("microsoft", "calendar") => MICROSOFT_TOKEN_CALENDAR_PREFIX,
+        _ => return None,
+    };
+    Some(format!("{prefix}{email}"))
+}
+
 pub fn get_microsoft_client_id() -> Result<Option<String>> {
     get(MICROSOFT_CLIENT_ID)
 }

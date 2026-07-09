@@ -26,6 +26,16 @@ pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     .map_err(Error::from)
 }
 
+/// Read a `settings` value stored as an RFC3339 timestamp, as UTC. Missing, unreadable, and
+/// unparseable all read as `None` — the scheduler callers treat "no valid stamp" as "never ran".
+pub fn get_setting_time(conn: &Connection, key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    get_setting(conn, key)
+        .ok()
+        .flatten()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
 /// Upsert a value into the `settings` key/value table.
 pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(

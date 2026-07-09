@@ -213,22 +213,6 @@ fn apply_extension(
     Ok(true)
 }
 
-/// The current rolling summary for a conversation, if one exists. The read context assembly (PR2) consumes
-/// to seat the summary in the cache-stable prompt prefix.
-// Lands the read primitive here in PR1 alongside the engine that writes it; the assembly that consumes it
-// is PR2. Tested here, wired there.
-#[allow(dead_code)]
-pub(crate) fn current_summary(conn: &Connection, conversation_id: i64) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT summary FROM chat_sessions WHERE conversation_id = ?1",
-            params![conversation_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten())
-}
-
 /// Fully reconcile ONE conversation's summary: fold every batch that has scrolled out of the window into
 /// the summary, looping until the tail is back within the window. Normally one batch (an active chat trips
 /// the trigger once every `BATCH` turns); the loop is what lets a launch catch-up drain a backlog that grew
@@ -824,22 +808,6 @@ mod tests {
             Some("- Original.\n- A genuinely new decision.")
         );
         assert_eq!(cursor, Some(14));
-    }
-
-    #[test]
-    fn current_summary_reads_back_what_was_stored() {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = open_db(dir.path());
-        let conv = session_with_pairs(&conn, Some("- A decision."), Some(3), 0);
-        assert_eq!(
-            current_summary(&conn, conv).unwrap().as_deref(),
-            Some("- A decision.")
-        );
-        // A conversation with no session row reads back None, never an error.
-        conn.execute("INSERT INTO conversations DEFAULT VALUES", [])
-            .unwrap();
-        let bare = conn.last_insert_rowid();
-        assert_eq!(current_summary(&conn, bare).unwrap(), None);
     }
 
     #[test]

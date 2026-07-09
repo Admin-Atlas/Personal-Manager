@@ -36,7 +36,8 @@ const SELECT_EVENT: &str =
 
 /// The keychain token key for one Outlook calendar account (`<prefix><email>`).
 pub fn account_token_key(email: &str) -> String {
-    format!("{}{}", secrets::MICROSOFT_TOKEN_CALENDAR_PREFIX, email)
+    secrets::token_key_for("microsoft", "calendar", email)
+        .expect("microsoft/calendar is a token-bearing pair")
 }
 
 /// The `connector_sources.id` (and `calendars.source_id`) for one Outlook account.
@@ -59,19 +60,17 @@ pub async fn list_calendars(token_key: &str) -> Result<Vec<RawCalendarInput>> {
         "{}/me/calendars?$select=id,name,color,isDefaultCalendar&$top=200",
         microsoft::GRAPH_API
     );
-    let mut all = Vec::new();
-    let mut next = Some(url);
-    let mut pages = 0;
-    while let Some(u) = next {
-        if pages >= MAX_PAGES {
-            break;
+    // Graph's `@odata.nextLink` IS the page cursor (a full URL); the first page uses the initial
+    // URL. The page guard is a pure runaway backstop, so the truncated flag is discarded.
+    let (all, _truncated) = crate::connector_sync::paginate(MAX_PAGES, |cursor| {
+        let url = url.as_str();
+        async move {
+            let u = cursor.unwrap_or_else(|| url.to_string());
+            let v = microsoft::authorized_get(token_key, &u).await?;
+            Ok(parse_calendar_list(&v))
         }
-        pages += 1;
-        let v = microsoft::authorized_get(token_key, &u).await?;
-        let (cals, n) = parse_calendar_list(&v);
-        all.extend(cals);
-        next = n;
-    }
+    })
+    .await?;
     Ok(all)
 }
 
@@ -101,19 +100,18 @@ pub async fn fetch_events(
         .append_pair("$orderby", "start/dateTime")
         .append_pair("$top", &PAGE_SIZE.to_string());
 
-    let mut next = Some(url.to_string());
-    let mut out = Vec::new();
-    let mut pages = 0;
-    while let Some(u) = next {
-        if pages >= MAX_PAGES {
-            break;
+    // `@odata.nextLink` is the cursor here too; the guard stays a silent backstop (flag discarded),
+    // matching the prior behaviour.
+    let initial = url.to_string();
+    let (out, _truncated) = crate::connector_sync::paginate(MAX_PAGES, |cursor| {
+        let initial = initial.as_str();
+        async move {
+            let u = cursor.unwrap_or_else(|| initial.to_string());
+            let v = microsoft::authorized_get(token_key, &u).await?;
+            Ok(parse_events(mirror_calendar_id, &v))
         }
-        pages += 1;
-        let v = microsoft::authorized_get(token_key, &u).await?;
-        let (events, n) = parse_events(mirror_calendar_id, &v);
-        out.extend(events);
-        next = n;
-    }
+    })
+    .await?;
     Ok(out)
 }
 

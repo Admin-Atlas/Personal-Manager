@@ -956,11 +956,7 @@ pub fn spawn_flag_detection_scheduler(app: AppHandle) {
             }
             let Ok(conn) = state.conn() else { continue };
 
-            let last_at = db::get_setting(&conn, LAST_FLAG_SCAN_AT_KEY)
-                .ok()
-                .flatten()
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|d| d.with_timezone(&Utc));
+            let last_at = db::get_setting_time(&conn, LAST_FLAG_SCAN_AT_KEY);
             let now = Utc::now();
             if !scan_due(last_at, now) {
                 continue;

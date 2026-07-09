@@ -112,33 +112,19 @@ fn enumerate_oauth_accounts(conn: &rusqlite::Connection) -> Result<Vec<OauthAcco
     let mut out = Vec::new();
     for row in rows {
         let (provider, service, email) = row?;
-        let account = match (provider.as_str(), service.as_str()) {
-            ("google", "drive") => Some(OauthAccount {
-                token_key: format!("{}{}", secrets::GOOGLE_TOKEN_DRIVE_PREFIX, email),
-                email,
-                provider: Provider::Google,
-            }),
-            ("google", "calendar") => Some(OauthAccount {
-                token_key: format!("{}{}", secrets::GOOGLE_TOKEN_CALENDAR_PREFIX, email),
-                email,
-                provider: Provider::Google,
-            }),
-            ("microsoft", "onedrive") => Some(OauthAccount {
-                token_key: format!("{}{}", secrets::MICROSOFT_TOKEN_ONEDRIVE_PREFIX, email),
-                email,
-                provider: Provider::Microsoft,
-            }),
-            ("microsoft", "calendar") => Some(OauthAccount {
-                token_key: format!("{}{}", secrets::MICROSOFT_TOKEN_CALENDAR_PREFIX, email),
-                email,
-                provider: Provider::Microsoft,
-            }),
-            // Apple subscriptions / local folders hold no OAuth token in the keychain.
-            _ => None,
+        // Apple subscriptions / local folders hold no OAuth token in the keychain.
+        let Some(token_key) = secrets::token_key_for(&provider, &service, &email) else {
+            continue;
         };
-        if let Some(a) = account {
-            out.push(a);
-        }
+        out.push(OauthAccount {
+            token_key,
+            email,
+            provider: if provider == "google" {
+                Provider::Google
+            } else {
+                Provider::Microsoft
+            },
+        });
     }
     Ok(out)
 }

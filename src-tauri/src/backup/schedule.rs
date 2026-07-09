@@ -206,11 +206,7 @@ async fn maybe_run_scheduled_backup(app: &AppHandle) {
             .flatten()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(DEFAULT_RETENTION_N);
-        let last_at = db::get_setting(&conn, LAST_BACKUP_AT_KEY)
-            .ok()
-            .flatten()
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&Utc));
+        let last_at = db::get_setting_time(&conn, LAST_BACKUP_AT_KEY);
         (freq, retention_n, last_at)
     };
 

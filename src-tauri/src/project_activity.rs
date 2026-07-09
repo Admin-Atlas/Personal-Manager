@@ -152,11 +152,7 @@ pub fn spawn_rollup_scheduler(app: AppHandle) {
             }
             let Ok(conn) = state.conn() else { continue };
 
-            let last_at = db::get_setting(&conn, LAST_ROLLUP_AT_KEY)
-                .ok()
-                .flatten()
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|d| d.with_timezone(&Utc));
+            let last_at = db::get_setting_time(&conn, LAST_ROLLUP_AT_KEY);
             let now = Utc::now();
             if !rollup_due(last_at, now) {
                 continue;
