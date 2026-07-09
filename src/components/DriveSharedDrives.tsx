@@ -9,7 +9,8 @@ import {
   listDriveSharedDrives,
   setDriveScope,
 } from "../lib/ipc";
-import type { DriveFolder, DriveScope, SharedDrive, SharedSelection } from "../lib/types";
+import type { DriveScope, SharedDrive, SharedSelection } from "../lib/types";
+import { FolderPicker } from "./FolderPicker";
 import { SegmentedControl } from "./ui";
 
 /** Sentinel `driveId` the folder picker passes to walk the **personal** My Drive (matches the
@@ -171,7 +172,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
               ]}
             />
             {!myWhole && (
-              <FolderPicker
+              <DriveFolderPicker
                 email={email}
                 driveId={MY_DRIVE_ROOT}
                 selected={scope.my_drive_folders ?? []}
@@ -229,7 +230,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
                         ]}
                       />
                       {!whole && (
-                        <FolderPicker
+                        <DriveFolderPicker
                           email={email}
                           driveId={d.id}
                           selected={sel.folders ?? []}
@@ -255,9 +256,10 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
   );
 }
 
-/** Lazy folder tree for one drive — `driveId` is a shared drive's id (its root == the drive id) or
- *  the `MY_DRIVE_ROOT` sentinel for the personal My Drive; either way it's also the top `parentId`. */
-function FolderPicker({
+/** Lazy folder tree for one drive (the shared {@link FolderPicker}) — `driveId` is a shared drive's
+ *  id (its root == the drive id) or the `MY_DRIVE_ROOT` sentinel for the personal My Drive; either
+ *  way it doubles as the top-level parent, so the picker's `null` root maps to it. */
+function DriveFolderPicker({
   email,
   driveId,
   selected,
@@ -268,122 +270,17 @@ function FolderPicker({
   selected: string[];
   onToggle: (folderId: string, checked: boolean) => void;
 }) {
-  return (
-    <div className="mt-2 max-h-56 overflow-auto rounded-[var(--radius)] bg-surface p-1">
-      <FolderChildren
-        email={email}
-        driveId={driveId}
-        parentId={driveId}
-        selected={selected}
-        onToggle={onToggle}
-        depth={0}
-      />
-      <p className="px-1 pt-1 text-[10px] text-ink4">
-        Picking a folder indexes everything inside it (subfolders included).
-      </p>
-    </div>
+  // Stable per (email, driveId) so the picker's lazy-load effects don't refire on every render.
+  const loadChildren = useCallback(
+    (parentId: string | null) => listDriveFolders(email, driveId, parentId ?? driveId),
+    [email, driveId],
   );
-}
-
-/** One lazily-loaded level of the folder tree (children of `parentId`). */
-function FolderChildren({
-  email,
-  driveId,
-  parentId,
-  selected,
-  onToggle,
-  depth,
-}: {
-  email: string;
-  driveId: string;
-  parentId: string;
-  selected: string[];
-  onToggle: (folderId: string, checked: boolean) => void;
-  depth: number;
-}) {
-  const [folders, setFolders] = useState<DriveFolder[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    listDriveFolders(email, driveId, parentId)
-      .then((f) => active && setFolders(f))
-      .catch((e) => active && setError(String(e)));
-    return () => {
-      active = false;
-    };
-  }, [email, driveId, parentId]);
-
-  if (error) return <p className="px-2 py-1 text-xs text-st-due">{error}</p>;
-  if (folders == null) return <p className="px-2 py-1 text-xs text-ink4">Loading…</p>;
-  if (folders.length === 0)
-    return depth === 0 ? <p className="px-2 py-1 text-xs text-ink4">No subfolders.</p> : null;
-
   return (
-    <ul>
-      {folders.map((f) => (
-        <FolderNode
-          key={f.id}
-          email={email}
-          driveId={driveId}
-          folder={f}
-          selected={selected}
-          onToggle={onToggle}
-          depth={depth}
-        />
-      ))}
-    </ul>
-  );
-}
-
-/** One folder row: a checkbox + an expand caret that lazy-loads its subfolders. */
-function FolderNode({
-  email,
-  driveId,
-  folder,
-  selected,
-  onToggle,
-  depth,
-}: {
-  email: string;
-  driveId: string;
-  folder: DriveFolder;
-  selected: string[];
-  onToggle: (folderId: string, checked: boolean) => void;
-  depth: number;
-}) {
-  const [open, setOpen] = useState(false);
-  const checked = selected.includes(folder.id);
-  return (
-    <li>
-      <div className="flex items-center gap-1 text-xs" style={{ paddingLeft: depth * 12 }}>
-        <button
-          type="button"
-          aria-label={open ? "Collapse folder" : "Expand folder"}
-          onClick={() => setOpen((o) => !o)}
-          className="w-4 shrink-0 text-ink4 hover:text-ink2"
-        >
-          {open ? "▾" : "▸"}
-        </button>
-        <label className="flex items-center gap-1.5 py-0.5">
-          <input
-            type="checkbox"
-            checked={checked}
-            onChange={(e) => onToggle(folder.id, e.target.checked)}
-          />
-          <span className="truncate text-ink2">{folder.name}</span>
-        </label>
-      </div>
-      {open && (
-        <FolderChildren
-          email={email}
-          driveId={driveId}
-          parentId={folder.id}
-          selected={selected}
-          onToggle={onToggle}
-          depth={depth + 1}
-        />
-      )}
-    </li>
+    <FolderPicker
+      className="mt-2"
+      loadChildren={loadChildren}
+      selected={selected}
+      onToggle={onToggle}
+    />
   );
 }

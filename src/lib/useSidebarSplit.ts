@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getPref, setPref } from "./ipc";
+import { clamp } from "./math";
 
 // The project sidebar's vertical split: the fraction of height given to the Milestones panel
 // (top), with the project's Files filling the rest (bottom). Per board card 7E this is a *hard*
@@ -15,8 +16,6 @@ const PREF_KEY = "project_ui";
 const DEFAULT_FRAC = 0.5; // card default: even 50-50 split
 const MIN_FRAC = 0.2;
 const MAX_FRAC = 0.8;
-
-const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 function readLs(): number | null {
   try {

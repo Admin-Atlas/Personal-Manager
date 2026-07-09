@@ -223,10 +223,12 @@ export function DocumentsView({ onReviewClick }: Props) {
 
   async function refresh() {
     try {
-      setDocuments(await listDocuments());
       // A retrieval-config change (new chunking/splitter/model) flags a one-time Rebuild;
       // re-reading here also clears the banner once a rebuild has brought the index in line.
-      const vs = await vaultStatus().catch(() => null);
+      // The two reads are independent, so they go out in parallel; a vault-status failure is
+      // tolerated (no banner), while a documents failure surfaces as before.
+      const [docs, vs] = await Promise.all([listDocuments(), vaultStatus().catch(() => null)]);
+      setDocuments(docs);
       setRebuildNeeded(vs?.retrieval_rebuild_needed ?? false);
     } catch (e) {
       setError(String(e));

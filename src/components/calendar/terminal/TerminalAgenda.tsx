@@ -16,6 +16,7 @@ import {
   eventDaySpan,
   groupEventsFromDay,
   startOfDay,
+  weekdayShort,
 } from "../../../lib/calendar-layout";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -33,10 +34,6 @@ interface Props {
 interface DayRow {
   day: Date;
   items: CalendarEvent[];
-}
-
-function weekdayShort(d: Date): string {
-  return d.toLocaleDateString(undefined, { weekday: "short" });
 }
 
 /** The row's time cell for `ev` on `day`: `all-day`, a continuation arrow for a multi-day event whose

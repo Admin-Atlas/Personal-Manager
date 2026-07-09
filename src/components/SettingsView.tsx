@@ -46,6 +46,13 @@ import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { formatWhen } from "../lib/format";
 import {
+  MAP_COHESION_KEY,
+  MAP_MODE_KEY,
+  readMapCohesion,
+  readMapMode,
+  type MapLayoutMode,
+} from "../lib/mapPrefs";
+import {
   useTheme,
   useDepth,
   ACCENTS,
@@ -136,16 +143,11 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   // Memory map (the Map tab): the default grouping (per-device, shared with the Map header toggle via
   // localStorage), the node cap (a vault-travelling pref the backend reads), and the optional t-SNE
   // component's install state.
-  const [mapGrouping, setMapGrouping] = useState<"semantic" | "project">(() =>
-    localStorage.getItem("pm.map.layoutMode") === "semantic" ? "semantic" : "project",
-  );
+  const [mapGrouping, setMapGrouping] = useState<MapLayoutMode>(readMapMode);
   const [mapNodeCap, setMapNodeCap] = useState(1000);
   // Project cohesion (0 = pure meaning, the default; ≤0.5) — a render-time blend, so it lives in
   // localStorage like the grouping pref, not in the backend layout fingerprint.
-  const [mapCohesion, setMapCohesion] = useState<number>(() => {
-    const r = Number(localStorage.getItem("pm.map.cohesion"));
-    return Number.isFinite(r) ? Math.max(0, Math.min(0.5, r)) : 0;
-  });
+  const [mapCohesion, setMapCohesion] = useState<number>(readMapCohesion);
   const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
   // Whether to *use* t-SNE when it's installed (vs falling back to PCA). Default true; lives in the
   // `map` pref alongside nodeCap, so the backend reads it for the layout fingerprint.
@@ -271,14 +273,14 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     };
   }, [onboarding]);
 
-  function changeMapGrouping(next: "semantic" | "project") {
+  function changeMapGrouping(next: MapLayoutMode) {
     setMapGrouping(next);
-    localStorage.setItem("pm.map.layoutMode", next); // shared with the Map header toggle
+    localStorage.setItem(MAP_MODE_KEY, next); // shared with the Map header toggle
   }
 
   function changeMapCohesion(next: number) {
     setMapCohesion(next);
-    localStorage.setItem("pm.map.cohesion", String(next)); // shared with the Map's cohesion control
+    localStorage.setItem(MAP_COHESION_KEY, String(next)); // shared with the Map's cohesion control
   }
 
   // The `map` pref is one blob (`{ nodeCap, tsneEnabled }`), both part of the layout fingerprint —

@@ -11,6 +11,7 @@ import {
 } from "../lib/ipc";
 import type { CalendarOverview, IcsFeedInfo } from "../lib/types";
 import { formatWhen } from "../lib/format";
+import { useBusyRun } from "../lib/useBusyRun";
 import { Button, ConfirmDialog, Input } from "./ui";
 
 /**
@@ -30,9 +31,8 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
   const [feedLabel, setFeedLabel] = useState("");
   const [feedUrl, setFeedUrl] = useState("");
   const [showGuide, setShowGuide] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
+  const { busy, error, setError, run: runBusy } = useBusyRun();
   const [note, setNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{ id: string; label: string } | null>(null);
 
   const refresh = useCallback(async () => {
@@ -43,23 +43,17 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+    // setError is a stable useState setter (via useBusyRun) — listed to satisfy exhaustive-deps.
+  }, [setError]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
-  async function run(label: string, fn: () => Promise<void>) {
-    setBusy(label);
-    setError(null);
+  // Each action starts with a clean note line (the shared latch already clears the error).
+  function run(label: string, fn: () => Promise<void>) {
     setNote(null);
-    try {
-      await fn();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(null);
-    }
+    return runBusy(label, fn);
   }
 
   const addFeed = () =>

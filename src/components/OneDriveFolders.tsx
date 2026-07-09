@@ -3,7 +3,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getOneDriveScope, listOneDriveFolders, setOneDriveScope } from "../lib/ipc";
-import type { OneDriveFolder, OneDriveScope } from "../lib/types";
+import type { OneDriveScope } from "../lib/types";
+import { FolderPicker } from "./FolderPicker";
 import { SegmentedControl } from "./ui";
 
 /**
@@ -38,6 +39,13 @@ export function OneDriveFolders({ email, onSaved }: { email: string; onSaved: ()
       setLoading(false);
     }
   }, [email]);
+
+  // Loader for the shared FolderPicker: OneDrive has one drive, so `null` (the picker's root) passes
+  // straight through. Stable per email so the picker's lazy-load effects don't refire every render.
+  const loadChildren = useCallback(
+    (parentId: string | null) => listOneDriveFolders(email, parentId),
+    [email],
+  );
 
   useEffect(() => {
     void load();
@@ -99,7 +107,12 @@ export function OneDriveFolders({ email, onSaved }: { email: string; onSaved: ()
         ]}
       />
       {!whole && (
-        <FolderPicker email={email} selected={scope.folders ?? []} onToggle={toggleFolder} />
+        <FolderPicker
+          className="mt-1"
+          loadChildren={loadChildren}
+          selected={scope.folders ?? []}
+          onToggle={toggleFolder}
+        />
       )}
 
       {error && <p className="text-xs text-st-due">{error}</p>}
@@ -109,128 +122,5 @@ export function OneDriveFolders({ email, onSaved }: { email: string; onSaved: ()
         <span className="text-ink3">Sync now</span> above.
       </p>
     </div>
-  );
-}
-
-/** Lazy folder tree rooted at the drive root (`parentId = null`). */
-function FolderPicker({
-  email,
-  selected,
-  onToggle,
-}: {
-  email: string;
-  selected: string[];
-  onToggle: (folderId: string, checked: boolean) => void;
-}) {
-  return (
-    <div className="mt-1 max-h-56 overflow-auto rounded-[var(--radius)] bg-surface p-1">
-      <FolderChildren
-        email={email}
-        parentId={null}
-        selected={selected}
-        onToggle={onToggle}
-        depth={0}
-      />
-      <p className="px-1 pt-1 text-[10px] text-ink4">
-        Picking a folder indexes everything inside it (subfolders included).
-      </p>
-    </div>
-  );
-}
-
-/** One lazily-loaded level of the folder tree (children of `parentId`; `null` = the drive root). */
-function FolderChildren({
-  email,
-  parentId,
-  selected,
-  onToggle,
-  depth,
-}: {
-  email: string;
-  parentId: string | null;
-  selected: string[];
-  onToggle: (folderId: string, checked: boolean) => void;
-  depth: number;
-}) {
-  const [folders, setFolders] = useState<OneDriveFolder[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    listOneDriveFolders(email, parentId)
-      .then((f) => active && setFolders(f))
-      .catch((e) => active && setError(String(e)));
-    return () => {
-      active = false;
-    };
-  }, [email, parentId]);
-
-  if (error) return <p className="px-2 py-1 text-xs text-st-due">{error}</p>;
-  if (folders == null) return <p className="px-2 py-1 text-xs text-ink4">Loading…</p>;
-  if (folders.length === 0)
-    return depth === 0 ? <p className="px-2 py-1 text-xs text-ink4">No subfolders.</p> : null;
-
-  return (
-    <ul>
-      {folders.map((f) => (
-        <FolderNode
-          key={f.id}
-          email={email}
-          folder={f}
-          selected={selected}
-          onToggle={onToggle}
-          depth={depth}
-        />
-      ))}
-    </ul>
-  );
-}
-
-/** One folder row: a checkbox + an expand caret that lazy-loads its subfolders. */
-function FolderNode({
-  email,
-  folder,
-  selected,
-  onToggle,
-  depth,
-}: {
-  email: string;
-  folder: OneDriveFolder;
-  selected: string[];
-  onToggle: (folderId: string, checked: boolean) => void;
-  depth: number;
-}) {
-  const [open, setOpen] = useState(false);
-  const checked = selected.includes(folder.id);
-  return (
-    <li>
-      <div className="flex items-center gap-1 text-xs" style={{ paddingLeft: depth * 12 }}>
-        <button
-          type="button"
-          aria-label={open ? "Collapse folder" : "Expand folder"}
-          onClick={() => setOpen((o) => !o)}
-          className="w-4 shrink-0 text-ink4 hover:text-ink2"
-        >
-          {open ? "▾" : "▸"}
-        </button>
-        <label className="flex items-center gap-1.5 py-0.5">
-          <input
-            type="checkbox"
-            checked={checked}
-            onChange={(e) => onToggle(folder.id, e.target.checked)}
-          />
-          <span className="truncate text-ink2">{folder.name}</span>
-        </label>
-      </div>
-      {open && (
-        <FolderChildren
-          email={email}
-          parentId={folder.id}
-          selected={selected}
-          onToggle={onToggle}
-          depth={depth + 1}
-        />
-      )}
-    </li>
   );
 }

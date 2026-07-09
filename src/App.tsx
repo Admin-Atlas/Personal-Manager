@@ -293,8 +293,10 @@ export default function App() {
     setVaultNeedsUnlock(false);
     setLoading(true);
     try {
-      setVault(await vaultStatus().catch(() => null));
-      const has = await hasOpenRouterKey();
+      // Independent reads in one parallel batch, same shape as the boot effect above: a vault-status
+      // failure is tolerated (null), a keychain failure still surfaces through the catch.
+      const [vs, has] = await Promise.all([vaultStatus().catch(() => null), hasOpenRouterKey()]);
+      setVault(vs);
       setKeySet(has);
       // Passphrase-vault cold start also lands on Focus, so defer messages identically (F-09).
       if (has) await refreshConversations(true, true);
@@ -310,8 +312,12 @@ export default function App() {
   async function becomeActiveWriter() {
     setLoading(true);
     try {
-      setVaultLock(await vaultLockStatus().catch(() => null));
-      const has = await hasOpenRouterKey();
+      // Same parallel-batch shape as the boot effect (the two reads are independent).
+      const [writerLock, has] = await Promise.all([
+        vaultLockStatus().catch(() => null),
+        hasOpenRouterKey(),
+      ]);
+      setVaultLock(writerLock);
       setKeySet(has);
       if (has) await refreshConversations(true);
     } catch (e) {

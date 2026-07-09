@@ -6,11 +6,8 @@
 // so the fiddly parts (all-day exclusive ends, midnight/DST boundaries, overlap clustering) are
 // deterministic and testable in isolation; the view components only position what these return.
 
+import { pad2 } from "./format";
 import type { CalendarEvent } from "./types";
-
-function pad2(n: number): string {
-  return String(n).padStart(2, "0");
-}
 
 // --- local-day helpers ---------------------------------------------------------------------------
 
@@ -40,20 +37,6 @@ export function addDays(d: Date, n: number): Date {
 /** Local `YYYY-MM-DD` key for bucketing events into days. */
 export function dayKey(d: Date): string {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-}
-
-/** Whole local days in `[start, end]` inclusive (by calendar day). Bounded against bad data. */
-export function eachDayInRange(start: Date, end: Date): Date[] {
-  const out: Date[] = [];
-  let cur = startOfDay(start);
-  const last = startOfDay(end).getTime();
-  let guard = 0;
-  while (cur.getTime() <= last && guard < 2000) {
-    out.push(cur);
-    cur = addDays(cur, 1);
-    guard++;
-  }
-  return out;
 }
 
 /** Whole-day difference `b - a` in local calendar days (rounding absorbs the 23/25h DST days). */
@@ -110,6 +93,11 @@ export function eventDaySpan(ev: CalendarEvent): DaySpan | null {
     }
   }
   return { startDay, endDay };
+}
+
+/** Locale short weekday name ("Mon"), shared by both agendas so the day header never drifts. */
+export function weekdayShort(d: Date): string {
+  return d.toLocaleDateString(undefined, { weekday: "short" });
 }
 
 /** Ordering for a day's event list: all-day events first, then by start instant (ISO strings sort
@@ -223,22 +211,6 @@ export function assignColumns(events: TimedInput[]): ColumnPlacement[] {
   return events.map((e) => {
     const info = lanes.get(e.id) ?? { lane: 0, lanes: 1 };
     return { id: e.id, lane: info.lane, lanes: info.lanes };
-  });
-}
-
-export interface CascadePlacement {
-  id: string;
-  lane: number;
-  clusterSize: number;
-}
-
-/** Cascade: same lane data as columns, but later lanes inset + stack (rendered full-width-minus-inset
- *  with a drop shadow, higher lane on top). */
-export function assignCascade(events: TimedInput[]): CascadePlacement[] {
-  const lanes = layoutLanes(events);
-  return events.map((e) => {
-    const info = lanes.get(e.id) ?? { lane: 0, lanes: 1 };
-    return { id: e.id, lane: info.lane, clusterSize: info.lanes };
   });
 }
 

@@ -7,6 +7,7 @@
 
 import type { Calendar, CalendarAccount } from "../../lib/types";
 import type { CalendarRange, CalendarViewMode } from "../../lib/calendarPrefs";
+import { formatClockIso } from "../../lib/format";
 import { useDepth, useTheme } from "../../theme";
 import { Button, SegmentedControl, type SegOption } from "../ui";
 import { CalendarsDropdown } from "./CalendarsDropdown";
@@ -51,14 +52,6 @@ const RANGE_OPTIONS: SegOption<CalendarRange>[] = [
   { value: "full", label: "24h" },
 ];
 
-/** Local clock time of the last successful sync, or null. */
-function syncLabel(iso: string | null): string | null {
-  if (!iso) return null;
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-}
-
 export function CalendarHeader({
   view,
   availableViews,
@@ -82,7 +75,8 @@ export function CalendarHeader({
 }: Props) {
   const { showMeta } = useDepth();
   const { system } = useTheme();
-  const synced = syncLabel(lastSync);
+  // Local clock time of the last successful sync; null when unset or unparseable.
+  const synced = lastSync ? formatClockIso(lastSync) || null : null;
   // The Work/Day/24h scale only drives the pixel time-grid (Slate/Editorial). Terminal renders
   // Week/Day as a mono agenda with no vertical scale, so the control has nothing to act on there.
   const showRange = (view === "week" || view === "day") && system !== "terminal";

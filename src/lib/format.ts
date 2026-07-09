@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /** Zero-pad a number to at least two digits. */
-function pad2(n: number): string {
+export function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
@@ -79,4 +79,14 @@ export function formatDateTime(iso: string): string {
 export function formatWhen(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+/** A byte count as an exact human size ("1.4 GB"). (StorageSettings keeps its own `formatSize` —
+ *  that one deliberately floors at MB and marks estimates with `~`.) */
+export function formatBytes(n: number): string {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  const v = n / Math.pow(1024, i);
+  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
 }

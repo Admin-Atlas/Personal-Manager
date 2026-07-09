@@ -3,6 +3,7 @@
 
 import { useState } from "react";
 import { clearGoogleClient, setGoogleClient } from "../lib/ipc";
+import { useBusyRun } from "../lib/useBusyRun";
 import { Button, ConfirmDialog, Input } from "./ui";
 
 /**
@@ -27,31 +28,23 @@ export function GoogleCredentialBlock({
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [showSetup, setShowSetup] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { busy, error, run } = useBusyRun();
   const [confirmClear, setConfirmClear] = useState(false);
 
-  async function run(label: string, fn: () => Promise<void>) {
-    setBusy(label);
-    setError(null);
-    try {
-      await fn();
-      await onChange();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(null);
-    }
-  }
-
+  // The host refresh rides inside the mutation so its failure surfaces on the same error line.
   const saveCreds = () =>
     run("save", async () => {
       await setGoogleClient(clientId.trim(), clientSecret.trim());
       setClientId("");
       setClientSecret("");
+      await onChange();
     });
 
-  const clearCreds = () => run("clear", () => clearGoogleClient());
+  const clearCreds = () =>
+    run("clear", async () => {
+      await clearGoogleClient();
+      await onChange();
+    });
 
   return (
     <div data-help="connectors-google-client">
