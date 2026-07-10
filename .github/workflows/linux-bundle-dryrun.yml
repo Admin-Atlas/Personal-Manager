@@ -1,0 +1,105 @@
+name: Linux bundle dry-run
+
+# Proves the Linux packaging lane WITHOUT cutting a release and WITHOUT any
+# secret: builds the real AppImage + rpm bundles (including the fetched,
+# SHA-pinned interpreter) and runs the same bundled-interpreter smoke the
+# release job runs. Signing uses a THROWAWAY key generated in-run — the
+# bundler requires one because createUpdaterArtifacts is on — so this proves
+# the .sig artifacts are produced, deliberately NOT that they match the
+# shipped pubkey (that's signing-dryrun.yml / the release publish gate).
+#
+# Runs automatically on PRs that touch the Linux packaging surface (so the
+# lane is proven BEFORE such a PR merges — this is what answers "does rpm
+# accept the -alpha version label"), and manually any time via dispatch.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src-tauri/tauri.linux.conf.json"
+      - "scripts/fetch-python.mjs"
+      - ".github/workflows/linux-bundle-dryrun.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    # Pinned to match release.yml's Linux build leg: the runner's distro sets the
+    # AppImage's glibc floor (see the matrix comment there).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        # zizmor impostor-commit ignore: dtolnay force-pushes `stable`, orphaning our
+        # vetted immutable pin (see release.yml for the full rationale).
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust) # zizmor: ignore[impostor-commit]
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux Tauri build dependencies
+        # libfuse2: linuxdeploy (the AppImage assembler tauri-bundler downloads) is
+        # itself an AppImage; runner images stopped shipping FUSE2 and the bundler
+        # dies with a bare "failed to run linuxdeploy" without it.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev libfuse2
+
+      - run: npm ci
+
+      - name: Generate a throwaway updater signing key
+        # createUpdaterArtifacts makes `tauri build` demand a private key. PRs can't
+        # see the real secret (by design), so sign with a fresh key that never
+        # leaves this run — the point is that bundling + .sig emission WORK, not
+        # whose key it is. The key file is a SINGLE base64 line with no trailing
+        # newline, so it goes into GITHUB_ENV as a plain KEY=value line ($(…)
+        # strips any trailing newline); a <<EOF heredoc would never find its
+        # delimiter on a newline-less file.
+        run: |
+          npx tauri signer generate -w "$RUNNER_TEMP/dryrun.key" --password ""
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/dryrun.key")"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
+          } >> "$GITHUB_ENV"
+
+      - name: Build AppImage + rpm
+        env:
+          # Belt-and-braces with libfuse2 above: run the AppImage tooling
+          # (linuxdeploy + plugins) by self-extraction, never FUSE-mounting.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          # linuxdeploy strips every binary/lib it deploys; strip errors on some
+          # of them (webkit libs among the usual suspects) and linuxdeploy then
+          # exits nonzero, which tauri reports only as "failed to run
+          # linuxdeploy". The binaries are already release-built; skip the strip.
+          NO_STRIP: "true"
+        # --verbose so a bundler failure prints linuxdeploy's own output instead
+        # of the bare one-liner.
+        run: npm run tauri build -- --verbose --bundles appimage,rpm
+
+      # The same script release.yml runs (single source — the two can't drift).
+      - name: Smoke-test the bundled interpreter
+        shell: bash
+        run: bash scripts/smoke-bundled-python.sh src-tauri/target/release/bundle
+
+      - name: Assert both artifacts exist (with the AppImage's updater .sig)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=src-tauri/target/release/bundle
+          ls -l "$base"/appimage/ "$base"/rpm/
+          test -n "$(find "$base"/appimage -name '*.AppImage' -print -quit)"
+          test -n "$(find "$base"/appimage -name '*.AppImage.sig' -print -quit)"
+          test -n "$(find "$base"/rpm -name '*.rpm' -print -quit)"
+          echo "Linux bundle dry-run passed."

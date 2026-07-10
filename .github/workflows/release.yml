@@ -86,6 +86,13 @@ jobs:
             args: ""
           - os: macos-latest
             args: "--target universal-apple-darwin"
+          # Pinned, NOT ubuntu-latest: the AppImage bundles webkit/gtk but never
+          # glibc, so the build runner's distro sets the artifact's glibc floor.
+          # Building on the oldest supported LTS keeps the AppImage running on
+          # Ubuntu 22.04 / Debian 12-era systems; `-latest` would silently raise
+          # the floor whenever GitHub re-points the alias. Bump deliberately.
+          - os: ubuntu-22.04
+            args: ""
     runs-on: ${{ matrix.os }}
     env:
       # Empty until the secret is set. Its presence is what flips the notarization-key
@@ -119,6 +126,17 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Install Linux Tauri build dependencies
+        # Same GTK/WebKit dev stack the pr.yml rust job proves, plus libdbus-1-dev
+        # (the keyring crate's Secret Service backend links system libdbus) and
+        # libfuse2 (linuxdeploy — the AppImage assembler tauri-bundler downloads —
+        # is itself an AppImage; runner images stopped shipping FUSE2 and the
+        # bundler dies with a bare "failed to run linuxdeploy" without it).
+        if: startsWith(matrix.os, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev libfuse2
+
       - run: npm ci
 
       # macOS Developer-ID signing + notarization is DORMANT until the Apple secrets exist
@@ -140,7 +158,7 @@ jobs:
       # v2.0.0-alpha release hit exactly this). We detect the secret in an isolated step
       # (its env stays local to the step, never leaking an empty value to the build) and
       # branch the build on the result. `steps.apple.outputs.enabled` is "" on Windows
-      # (step skipped), so Windows always takes the unsigned path below.
+      # and Linux (step skipped), so both always take the unsigned path below.
       - name: Detect Apple signing
         id: apple
         if: matrix.os == 'macos-latest'
@@ -162,6 +180,12 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Linux only (inert elsewhere): run the AppImage tooling by
+          # self-extraction, never FUSE-mounting — belt-and-braces with libfuse2 —
+          # and skip linuxdeploy's strip pass, which errors on some deployed libs
+          # and surfaces only as a bare "failed to run linuxdeploy".
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
 
       # Switched on automatically once the Apple secrets exist — no code change needed.
       # APPLE_API_KEY_PATH is exported by the notarization-key step above when configured.
@@ -210,6 +234,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "the created venv's python could not import its standard library." }
           Write-Host "bundled-interpreter clean-profile smoke test passed."
 
+      # Same clean-profile guard as the Windows step above, for the Linux bundle
+      # (shared with linux-bundle-dryrun.yml so the two can't drift; the script
+      # anchors to the bundle dir so it can't validate tauri-build's compile-time
+      # resource copy by mistake).
+      - name: Smoke-test the bundled interpreter (Linux)
+        if: startsWith(matrix.os, 'ubuntu-')
+        shell: bash
+        run: bash scripts/smoke-bundled-python.sh src-tauri/target/release/bundle
+
       - name: Stage Windows artifacts
         if: matrix.os == 'windows-latest'
         shell: bash
@@ -228,6 +261,18 @@ jobs:
           cp "$base"/macos/*.app.tar.gz.sig staged/
           cp "$base"/dmg/*.dmg staged/ || true
 
+      # AppImage (+ its updater .sig — the only Linux format Tauri's updater
+      # handles) and the rpm as a plain dnf-installable asset.
+      - name: Stage Linux artifacts
+        if: startsWith(matrix.os, 'ubuntu-')
+        shell: bash
+        run: |
+          mkdir -p staged
+          base=src-tauri/target/release/bundle
+          cp "$base"/appimage/*.AppImage staged/
+          cp "$base"/appimage/*.AppImage.sig staged/
+          cp "$base"/rpm/*.rpm staged/
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bundle-${{ matrix.os }}
@@ -236,17 +281,18 @@ jobs:
 
   # --- sidecar-deps smoke: the pinned requirements resolve + import -------
   # Proves requirements.txt installs and imports on each SHIPPED OS (Windows +
-  # macOS) against Python 3.12 — the version Windows now BUNDLES (python-build-
-  # standalone, fetched into the bundle by scripts/fetch-python.mjs) and the floor
-  # macOS still provisions its runtime venv against. Catches a dep that can't
-  # resolve before a release does. (The bundled interpreter is a prebuilt binary,
-  # so the build runners still need no Python toolchain to compile.)
+  # macOS + Linux) against Python 3.12 — the version Windows and Linux BUNDLE
+  # (python-build-standalone, fetched into the bundle by scripts/fetch-python.mjs)
+  # and the floor macOS still provisions its runtime venv against. Catches a dep
+  # that can't resolve before a release does. (The bundled interpreter is a
+  # prebuilt binary, so the build runners still need no Python toolchain to
+  # compile.)
   python-smoke:
     needs: guards
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

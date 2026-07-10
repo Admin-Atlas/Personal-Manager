@@ -57,10 +57,12 @@ frontend-test:
 # --- backend (Rust) -------------------------------------------------------
 
 # Fetch the bundled standalone interpreter before anything that compiles the
-# crate. On Windows the merged tauri.windows.conf.json bundles `src-tauri/python/`
-# as a resource, so the Tauri build script needs it present; this fetches it
-# (idempotent — skips if current). A NO-OP on Linux/macOS, where the Windows
-# config isn't merged, so the Linux CI rust job stays network-free.
+# crate. On Windows and Linux the merged tauri.<platform>.conf.json bundles
+# `src-tauri/python/` as a resource, so the Tauri build script needs it present;
+# this fetches it (idempotent — the .pm-pyver stamp skips when current, so it's
+# a one-time ~70 MB download per machine; CI runners re-download each run since
+# nothing caches src-tauri/python). A NO-OP on macOS, which downloads its
+# interpreter at runtime instead (python_fetch.rs).
 fetch-python:
     node scripts/fetch-python.mjs
 

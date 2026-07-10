@@ -79,6 +79,11 @@ if (mac) {
   platforms["darwin-aarch64"] = mac;
 }
 
+// Linux: the AppImage is the only format Tauri's updater handles (the rpm is a
+// plain release asset, updated via dnf/manually).
+const linux = pair(".AppImage");
+if (linux) platforms["linux-x86_64"] = linux;
+
 if (Object.keys(platforms).length === 0) {
   throw new Error(`No updater artifacts found under ${ARTIFACTS_DIR}`);
 }
