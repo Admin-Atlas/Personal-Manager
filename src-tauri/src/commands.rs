@@ -401,10 +401,11 @@ pub fn app_lock_status(state: State<'_, AppState>) -> Result<AppLockStatus> {
     let verified = state
         .app_unlocked
         .load(std::sync::atomic::Ordering::Relaxed);
+    let available = applock::available();
     Ok(AppLockStatus {
         enabled,
-        available: applock::available(),
-        locked: applock::should_lock(enabled, verified),
+        available,
+        locked: applock::should_lock(enabled, available, verified),
     })
 }
 

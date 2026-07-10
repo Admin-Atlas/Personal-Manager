@@ -11,17 +11,18 @@
 //! (withhold the DB key until verification succeeds) is documented as deferred to v4
 //! in `docs/DECISIONS.md`.
 
-use crate::error::Result;
-// `Error` is only constructed in the Windows and macOS platform modules below; on
-// other targets (e.g. Linux CI) it would be an unused import.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 use crate::error::Error;
+use crate::error::Result;
 
-/// Pure policy: should the UI be locked right now? Locked iff the feature is enabled
-/// *and* the user hasn't verified yet this session. Kept separate from the OS call so
-/// the decision is unit-testable without a real biometric prompt.
-pub fn should_lock(enabled: bool, verified_this_session: bool) -> bool {
-    enabled && !verified_this_session
+/// Pure policy: should the UI be locked right now? Locked iff the feature is enabled,
+/// this OS can actually run a verification, *and* the user hasn't verified yet this
+/// session. Availability is part of the decision because the enabled flag is a settings
+/// row that travels inside a `.pmbackup`: a backup made on Windows with the lock on and
+/// restored on Linux/macOS must open normally (the preference stays stored and re-arms
+/// on a capable machine), not sit behind a prompt that can never succeed. Kept separate
+/// from the OS call so the decision is unit-testable without a real biometric prompt.
+pub fn should_lock(enabled: bool, available: bool, verified_this_session: bool) -> bool {
+    enabled && available && !verified_this_session
 }
 
 // --- Windows: Windows Hello via UserConsentVerifier ---------------------------------
@@ -162,20 +163,26 @@ mod platform {
     }
 }
 
-// --- Other (Linux dev): no OS primitive wired ---------------------------------------
+// --- Linux / other: stub, flagged for a real backend --------------------------------
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod platform {
     use super::Result;
 
-    /// Dev only (the real targets are Windows/macOS). No Linux biometric primitive is
-    /// wired, so treat verification as a no-op pass; the toggle stays usable for UI dev.
+    /// No Linux verification backend is wired yet (polkit/fprintd — tracked on the
+    /// "Hard biometric / passkey key-gating" board card). Report unavailable, exactly
+    /// like the macOS stub: the Settings toggle stays disabled, and an
+    /// `app_lock_enabled` restored from another OS's backup is inert here rather than
+    /// a gate that any keypress used to satisfy (the old stub returned `Ok(true)`,
+    /// which also silently passed the wipe identity check).
     pub fn available() -> bool {
-        true
+        false
     }
 
     pub fn verify(_window_handle: isize, _message: &str) -> Result<bool> {
-        Ok(true)
+        Err(super::Error::Other(
+            "biometric app-lock isn't implemented on Linux yet".into(),
+        ))
     }
 }
 
@@ -186,10 +193,22 @@ mod tests {
     use super::should_lock;
 
     #[test]
-    fn locks_only_when_enabled_and_unverified() {
-        assert!(should_lock(true, false), "enabled + unverified → locked");
-        assert!(!should_lock(true, true), "verified this session → unlocked");
-        assert!(!should_lock(false, false), "disabled → never locked");
-        assert!(!should_lock(false, true), "disabled → never locked");
+    fn locks_only_when_enabled_available_and_unverified() {
+        assert!(
+            should_lock(true, true, false),
+            "enabled + available + unverified → locked"
+        );
+        assert!(
+            !should_lock(true, true, true),
+            "verified this session → unlocked"
+        );
+        assert!(
+            !should_lock(true, false, false),
+            "enabled but this OS can't verify (e.g. a Windows backup restored on \
+             Linux/macOS) → never locked"
+        );
+        assert!(!should_lock(false, true, false), "disabled → never locked");
+        assert!(!should_lock(false, false, false), "disabled → never locked");
+        assert!(!should_lock(false, true, true), "disabled → never locked");
     }
 }

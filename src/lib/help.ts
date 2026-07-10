@@ -244,7 +244,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-app-lock": {
     title: "App lock",
-    body: "Optionally require an OS check — Windows Hello (face, fingerprint, or PIN) — before PM opens. It's a convenience lock for the window only: your store is always encrypted at rest, so this isn't a second password on your data. It's off until you turn it on, only available where your device can actually verify, and takes effect the next time you open PM. If your device can't verify, you can still get in — you're never locked out of your own app.",
+    body: "Optionally require an OS check before PM opens — Windows Hello (face, fingerprint, or PIN) on Windows; not available on macOS or Linux yet. It's a convenience lock for the window only: your store is always encrypted at rest, so this isn't a second password on your data. It's off until you turn it on, only available where your device can actually verify, and takes effect the next time you open PM. If your device can't verify, you can still get in — you're never locked out of your own app.",
   },
   "settings-connectors": {
     title: "Connectors",
