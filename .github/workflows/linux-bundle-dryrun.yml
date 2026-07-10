@@ -79,7 +79,14 @@ jobs:
           # Belt-and-braces with libfuse2 above: run the AppImage tooling
           # (linuxdeploy + plugins) by self-extraction, never FUSE-mounting.
           APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: npm run tauri build -- --bundles appimage,rpm
+          # linuxdeploy strips every binary/lib it deploys; strip errors on some
+          # of them (webkit libs among the usual suspects) and linuxdeploy then
+          # exits nonzero, which tauri reports only as "failed to run
+          # linuxdeploy". The binaries are already release-built; skip the strip.
+          NO_STRIP: "true"
+        # --verbose so a bundler failure prints linuxdeploy's own output instead
+        # of the bare one-liner.
+        run: npm run tauri build -- --verbose --bundles appimage,rpm
 
       # The same script release.yml runs (single source — the two can't drift).
       - name: Smoke-test the bundled interpreter

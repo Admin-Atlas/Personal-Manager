@@ -181,8 +181,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Linux only (inert elsewhere): run the AppImage tooling by
-          # self-extraction, never FUSE-mounting — belt-and-braces with libfuse2.
+          # self-extraction, never FUSE-mounting — belt-and-braces with libfuse2 —
+          # and skip linuxdeploy's strip pass, which errors on some deployed libs
+          # and surfaces only as a bare "failed to run linuxdeploy".
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
 
       # Switched on automatically once the Apple secrets exist — no code change needed.
       # APPLE_API_KEY_PATH is exported by the notarization-key step above when configured.
