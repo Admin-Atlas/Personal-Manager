@@ -11,7 +11,10 @@
 //   1. LOCKSTEP   — all six version-bearing files carry one identical value.
 //   2. BUMPED      (--base <ref>) — that value is strictly greater, by semver,
 //                  than the base branch's, so every PR moves the number.
-//   3. TAG MATCH   (--tag <vX.Y.Z>) — that value equals the release tag.
+//   3. TAG MATCH   (--tag <vX.Y.Z>) — that value equals the release tag, AND the
+//                  .github/RELEASE_NOTES.md header names the same version (that
+//                  file is the published release body; a stale header would ship
+//                  the wrong notes to downloaders — as v3.0.2-alpha nearly did).
 //
 // The matching "What's New" entry is covered for free: src/lib/changelog.ts is
 // one of the six, and we read its TOP entry — so a bump with no new changelog
@@ -81,6 +84,16 @@ function fromChangelog(rel) {
   const after = txt.slice(txt.indexOf("export const CHANGELOG"));
   const m = after.match(/version:\s*"([^"]+)"/);
   return required(m && m[1], `${rel} (newest CHANGELOG entry)`);
+}
+
+/**
+ * The version named in the RELEASE_NOTES.md header (e.g. `… — **v3.0.2-alpha**.`).
+ * The `**v` bold-with-v marker uniquely picks the header out of the body, which
+ * mentions other versions in prose without that exact wrapper. Release-gate only.
+ */
+function fromReleaseNotes(rel) {
+  const m = read(rel).match(/\*\*v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)\*\*/);
+  return required(m && m[1], `${rel} header (expected a "… **vX.Y.Z**" marker)`);
 }
 
 const SOURCES = [
@@ -217,6 +230,25 @@ if (tag) {
     );
   }
   console.log(`✓ tag: ${current} matches ${tag}`);
+
+  // The published release body must name the version being shipped. This runs
+  // only at release (with --tag), never in the PR gate — RELEASE_NOTES.md is a
+  // single-release template that legitimately lags the tree between releases,
+  // and is only refreshed inside the bumping release PR.
+  let notesVersion;
+  try {
+    notesVersion = fromReleaseNotes(".github/RELEASE_NOTES.md");
+  } catch (err) {
+    fail(err.message);
+  }
+  if (notesVersion !== tagVersion) {
+    fail(
+      `.github/RELEASE_NOTES.md names v${notesVersion} but the release tag is ${tag} ` +
+        `(expected v${tagVersion}). Update the release notes to the version being shipped ` +
+        `before tagging, so downloaders don't read stale notes.`,
+    );
+  }
+  console.log(`✓ release notes: header names ${tag}`);
 }
 
 console.log("");
