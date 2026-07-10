@@ -118,7 +118,7 @@ For a full tour of the architecture and the rules for working in this repo, see
   `python3`/`python`, and common macOS locations (Homebrew, python.org) — so even a
   Finder-launched app finds one off its stripped PATH. It also rebuilds the venv if that
   interpreter is older than 3.10. Set `PM_PYTHON` only for an unusual setup. (Packaged
-  **Windows** release builds **bundle** a standalone interpreter at build time —
+  **Windows and Linux** release builds **bundle** a standalone interpreter at build time —
   `npm run tauri build` fetches it via [`scripts/fetch-python.mjs`](scripts/fetch-python.mjs)
   — so end users need no Python install. On **macOS**, packaged apps instead **download** a
   pinned standalone interpreter into PM's data directory on first run **only if** no suitable
@@ -131,8 +131,12 @@ For a full tour of the architecture and the rules for working in this repo, see
 - **Tauri OS prerequisites:** see <https://tauri.app/start/prerequisites/>
   - Windows: Microsoft C++ Build Tools + WebView2 (preinstalled on Win 11)
   - macOS: Xcode Command Line Tools
-  - Linux (dev): `libwebkit2gtk-4.1-dev`, `librsvg2-dev`, `libssl-dev`,
-    `build-essential`, `libayatana-appindicator3-dev`
+  - Linux (dev, Debian/Ubuntu names): `libwebkit2gtk-4.1-dev`, `librsvg2-dev`, `libssl-dev`,
+    `build-essential`, `libayatana-appindicator3-dev`, `libdbus-1-dev`
+    (Fedora: `webkit2gtk4.1-devel gtk3-devel librsvg2-devel openssl-devel dbus-devel`).
+    On a fresh Windows or Linux clone, run `just fetch-python` (or any `just` compile
+    recipe) once before `npm run tauri dev` or a raw `cargo check` — the Tauri build
+    script requires the bundled-interpreter resource (`src-tauri/python/`) to exist.
 
 ## Run it
 
@@ -167,6 +171,55 @@ Gatekeeper (**Open Anyway**); the release notes spell this out for downloaders. 
 macOS Apple-signing pipeline is already wired and dormant: add the `APPLE_*` GitHub
 Actions secrets and macOS builds sign + notarize automatically, with no code change.
 
+## Installing on Linux
+
+Two formats ship per release, both x86_64:
+
+- **AppImage** (recommended — it auto-updates like the Windows build): download,
+  `chmod +x PM_*.AppImage`, run. If your distro lacks FUSE (recent Fedora minimal
+  installs), either `sudo dnf install fuse` or run with `--appimage-extract-and-run`.
+- **rpm** (Fedora/RHEL): `sudo dnf install ./PM-*.rpm`. Package-manager installs update
+  via the next release's rpm — the in-app auto-updater only covers the AppImage.
+
+Two Linux-specific notes:
+
+- **Secrets need a running keychain.** PM stores its encryption keys in the
+  freedesktop Secret Service — KWallet (KDE) or GNOME Keyring — over D-Bus. Every
+  mainstream desktop provides one; expect a one-time wallet/keyring prompt on first
+  launch. On a minimal window-manager setup you must run one yourself, or PM cannot
+  store the key that protects its database.
+- **Uninstalling** (rpm removal or deleting the AppImage) leaves PM's data —
+  including the multi-hundred-MB regenerable `runtime/` (Python venv + models) —
+  under `~/.local/share/Personal Manager`. Free it from **Settings → Storage**, use
+  **Settings → Remove PM data** before uninstalling, or delete the folder by hand.
+  (An rpm `%postun` script is deliberately not used: it runs as root and can't safely
+  enumerate per-user data.)
+
+## Moving between computers (Windows ↔ Linux ↔ macOS)
+
+Your vault travels with an encrypted **backup** (Settings → Backup): one
+passphrase-protected `.pmbackup` file containing the database, the Markdown vault, and
+your settings. The archive is fully cross-platform — its only lock is the passphrase
+you set (the app-lock plays no role in backups).
+
+On the new machine: install PM, then **Settings → Backup → Restore** (from a copied
+file, or straight from Proton Drive / Google Drive), enter the passphrase, and
+**Switch to restored vault**. The store's encryption key travels inside the encrypted
+archive and is re-seeded into the new machine's keychain automatically.
+
+What doesn't travel (by design — re-add on the new machine):
+
+- **API keys and cloud sign-ins** (OpenRouter, Google/Microsoft, iCal URLs) stay in
+  the old machine's keychain — re-enter/reconnect them.
+- **Watched local folders** point at paths on the old machine, so they show as
+  unreachable — remove and re-add them by their new paths. Until you do, their
+  already-indexed content **remains searchable and citable** (embeddings and
+  summaries live in the database); only opening the full original file needs the
+  files present.
+- **App lock** re-arms only where the OS can verify (it reads as "not available on
+  Linux yet" — you're never locked out by a restored setting).
+- The Python runtime and on-device models re-download on first use.
+
 ## Useful commands
 
 ```bash
@@ -183,6 +236,7 @@ source of truth). The folder is named **`Personal Manager`** for easy backup:
 
 - Windows: `%LOCALAPPDATA%\Personal Manager`
 - macOS: `~/Library/Application Support/Personal Manager`
+- Linux: `~/.local/share/Personal Manager`
 
 The folder name is deliberately decoupled from the app's bundle identifier
 (`org.itsatlas.pm`, which stays fixed because the OS keychain is keyed to it). Override
@@ -196,7 +250,7 @@ live in the OS keychain. The Markdown vault's at-rest protection depends on how 
 it up:
 
 - A **device vault** (the default) stores Markdown as plaintext on disk and relies on
-  your OS full-disk encryption (BitLocker / FileVault) — so enable that.
+  your OS full-disk encryption (BitLocker / FileVault / LUKS) — so enable that.
 - A **passphrase-protected vault** additionally encrypts each Markdown file at rest,
   so it stays protected even when shared or carried to another machine.
 

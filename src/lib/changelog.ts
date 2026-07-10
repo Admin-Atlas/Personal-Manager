@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.2.0-alpha",
+    date: "2026-07-10",
+    highlights: [
+      "PM now ships for Linux (x86_64): an auto-updating AppImage — the recommended install — and an rpm for Fedora-family systems. Both carry everything PM needs, including its own Python, so the document engine works out of the box with nothing to install.",
+      "Linux releases are built, checked, and published by the same pipeline as Windows and macOS, and the AppImage auto-updates exactly like the Windows app.",
+      'New in the README: a Linux install guide and a step-by-step "moving between computers" guide — your encrypted backup is the whole migration, on any OS pair.',
+      "For the technically curious: the AppImage teaches the document engine to survive relaunches (AppImages mount at a random path each launch, so PM parks its bundled Python in your data folder), and a new no-secrets dry-run workflow proves the whole Linux packaging lane on every packaging change.",
+    ],
+  },
+  {
     version: "3.1.0-alpha",
     date: "2026-07-10",
     highlights: [

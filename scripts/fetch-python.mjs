@@ -4,33 +4,35 @@
 // Fetch the bundled, relocatable CPython for the packaged app (spec §4.6).
 //
 // PM's document sidecar needs Python. Rather than require the user to install
-// it, the Windows build SHIPS a standalone interpreter (from python-build-
-// standalone — the same relocatable builds `uv` uses) as a Tauri resource, and
-// provisions the managed venv against it at first ingest. This script downloads
-// that interpreter at BUILD time and unpacks it to `src-tauri/python/`, which
-// `tauri.windows.conf.json` then bundles into the NSIS installer.
+// it, the Windows and Linux builds SHIP a standalone interpreter (from python-
+// build-standalone — the same relocatable builds `uv` uses) as a Tauri resource,
+// and provision the managed venv against it at first ingest. This script
+// downloads that interpreter at BUILD time and unpacks it to `src-tauri/python/`,
+// which `tauri.windows.conf.json` / `tauri.linux.conf.json` then bundle into the
+// NSIS installer / AppImage+rpm.
 //
 // It is wired into `build.beforeBuildCommand`, so a plain `npm run tauri build`
 // always has the interpreter — locally and in CI alike, one wiring point. The
 // build runner needs NO Python toolchain (we fetch a prebuilt binary, never
 // compile), so the "no Python in CI to build" rule still holds.
 //
-// SCOPE: Windows only. macOS bundling is deferred (no universal2 build; unsigned
-// venv dylibs need signing — see docs/MACOS-SIGNING.md). On any non-Windows host
-// this is a no-op so the macOS/dev build proceeds exactly as before (system
-// Python fallback). The interpreter is a fetched runtime artifact, never
-// committed (it is git-ignored and asserted-untracked by check-files-in-place).
+// SCOPE: Windows + Linux (x86_64). macOS bundling is deferred (no universal2
+// build; unsigned venv dylibs need signing — see docs/MACOS-SIGNING.md); there
+// the app downloads a private interpreter at runtime instead (python_fetch.rs),
+// so on macOS this stays a no-op. The interpreter is a fetched runtime artifact,
+// never committed (git-ignored and asserted-untracked by check-files-in-place).
 //
-// Integrity: the release tag, asset, and SHA-256 are pinned below (taken from the
-// release's signed SHA256SUMS). The download is verified against that hash before
-// it is unpacked — a tampered or truncated download fails loudly, no
-// trust-on-first-use.
+// Integrity: the release tag, per-platform asset, and SHA-256 are pinned below
+// (taken from the release's signed SHA256SUMS). The download is verified against
+// that hash before it is unpacked — a tampered or truncated download fails
+// loudly, no trust-on-first-use.
 //
 // Pure Node built-ins (global fetch + node:crypto), ESM, no dependencies.
-// Extraction uses the Windows system bsdtar (System32\tar.exe, present on
+// Extraction on Windows uses the system bsdtar (System32\tar.exe, present on
 // Windows 10 1803+ and the windows-latest runner) addressed by absolute path —
 // not bare `tar` — so a GNU/MSYS tar on PATH (e.g. under Git Bash), which
-// misreads a `C:\…` path as a remote host, can't shadow it.
+// misreads a `C:\…` path as a remote host, can't shadow it. Linux uses the
+// system tar (GNU tar is universal there).
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -41,16 +43,40 @@ import { dirname, join } from "node:path";
 
 // ---- the pin -------------------------------------------------------------
 // CPython 3.12 matches the `python-smoke` CI job (broad wheel availability for
-// the three pinned sidecar deps). To advance: pick a new python-build-standalone
-// release, update all four fields from its SHA256SUMS, and bump the changelog.
+// the three pinned sidecar deps). One release tag for every platform, and the
+// runtime-download pin in src-tauri/src/python_fetch.rs (macOS) is kept in
+// lockstep with it. To advance: pick a new python-build-standalone release,
+// update the tag + every asset hash from its SHA256SUMS, and bump the changelog.
 const PY_VERSION = "3.12.13";
 const PBS_TAG = "20260610";
-const ASSET = `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-pc-windows-msvc-install_only.tar.gz`;
-const SHA256 = "f5e4d9f856567493776f3d1e832c939fbaba5dcbcc5e0492a82ecfceea83b316";
+
+// Per-platform asset + hash + the interpreter path that proves a good unpack.
+// `install_only` archives unpack to a top-level `python/` dir: `python.exe`
+// (plus Lib/, DLLs/) on Windows; `bin/python3` (plus lib/) on Linux.
+const PLATFORMS = {
+  win32: {
+    asset: `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-pc-windows-msvc-install_only.tar.gz`,
+    sha256: "f5e4d9f856567493776f3d1e832c939fbaba5dcbcc5e0492a82ecfceea83b316",
+    interpreter: ["python.exe"],
+  },
+  linux: {
+    asset: `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz`,
+    sha256: "c218f50baeb2c06a30c2f03db5986b2bad6ab7c8a52faad2d5a59bda0677b93a",
+    interpreter: ["bin", "python3"],
+  },
+};
+
+const platform = PLATFORMS[process.platform];
+if (!platform) {
+  console.log(
+    `fetch-python: no bundled interpreter for ${process.platform} — skipping ` +
+      `(macOS downloads a private copy at runtime instead; dev builds fall back to system Python).`,
+  );
+  process.exit(0);
+}
+const { asset: ASSET, sha256: SHA256 } = platform;
 const URL = `https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${ASSET}`;
 
-// `install_only` archives unpack to a top-level `python/` dir holding
-// `python.exe` (plus Lib/, DLLs/, a bundled pip/venv, and LICENSE.txt).
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const destParent = join(repoRoot, "src-tauri");
 const destDir = join(destParent, "python");
@@ -58,15 +84,7 @@ const stampFile = join(destDir, ".pm-pyver");
 // Stamp identity = version+tag+hash, so any change to the pin forces a re-fetch.
 const STAMP = `${PY_VERSION}+${PBS_TAG} ${SHA256}`;
 
-if (process.platform !== "win32") {
-  console.log(
-    `fetch-python: bundled interpreter is Windows-only for now; skipping on ${process.platform} ` +
-      `(the build falls back to system Python, unchanged).`,
-  );
-  process.exit(0);
-}
-
-const exe = join(destDir, "python.exe");
+const exe = join(destDir, ...platform.interpreter);
 if (existsSync(exe) && existsSync(stampFile) && readFileSync(stampFile, "utf8").trim() === STAMP) {
   console.log(`fetch-python: ${ASSET} already present and verified — skipping.`);
   process.exit(0);
@@ -93,7 +111,10 @@ try {
   // Replace any stale interpreter wholesale (e.g. after a pin bump), then unpack.
   rmSync(destDir, { recursive: true, force: true });
   mkdirSync(destParent, { recursive: true });
-  const sysTar = join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+  const sysTar =
+    process.platform === "win32"
+      ? join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")
+      : "/usr/bin/tar";
   const tarExe = existsSync(sysTar) ? sysTar : "tar";
   execFileSync(tarExe, ["-xzf", archive, "-C", destParent], { stdio: "inherit" });
 

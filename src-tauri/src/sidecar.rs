@@ -229,14 +229,126 @@ impl SidecarPaths {
         self.venv_dir.parent().map(|p| p.join("models"))
     }
 
-    /// Where a runtime-downloaded macOS interpreter is unpacked — a sibling of the
-    /// venv under `runtime/`, so it lives inside PM's data dir and uninstalls with
-    /// it. macOS-only fallback (see [`crate::python_fetch`]); Windows/Linux never
-    /// populate this, so the method is legitimately unused there.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Where a standalone interpreter that must live OUTSIDE the install lands — a
+    /// sibling of the venv under `runtime/`, so it lives inside PM's data dir and
+    /// uninstalls with it. Two producers share the location (and its teardown):
+    /// the macOS runtime download ([`crate::python_fetch`]) and the Linux AppImage
+    /// stable copy ([`Self::stable_bundled_python`]). Windows never populates it.
+    #[cfg_attr(windows, allow(dead_code))]
     fn downloaded_python_dir(&self) -> Option<PathBuf> {
         self.venv_dir.parent().map(|p| p.join("python-standalone"))
     }
+
+    /// Linux: the stable home for the bundled interpreter when the app runs out of
+    /// an AppImage. AppImages mount their squashfs at a randomized
+    /// `/tmp/.mount_XXXXXX` per launch, and a venv records its base interpreter by
+    /// path (the `bin/python` symlink and `pyvenv.cfg`'s `home=`) — so a venv built
+    /// straight against the mounted resource dir works on the FIRST launch and
+    /// breaks on the second. Materialize the bundled `python/` tree into
+    /// `runtime/python-standalone/python/` (stamp-keyed by the `.pm-pyver` file
+    /// fetch-python ships in the tree, so a pin bump re-copies) and build the venv
+    /// against that instead. rpm and dev installs return `None`: their resource
+    /// dir is already a stable path.
+    #[cfg(target_os = "linux")]
+    fn stable_bundled_python(&self, bundled_exe: &Path) -> std::io::Result<Option<PathBuf>> {
+        if !running_from_appimage(
+            std::env::var("APPDIR").ok().as_deref(),
+            std::env::var("APPIMAGE").ok().as_deref(),
+        ) {
+            return Ok(None);
+        }
+        // bundled exe = <mount>/…/python/bin/python3 → ancestors().nth(2) is the
+        // `python/` tree root fetch-python unpacked.
+        let (Some(src_tree), Some(dest_parent)) =
+            (bundled_exe.ancestors().nth(2), self.downloaded_python_dir())
+        else {
+            return Ok(None);
+        };
+        let dest_tree = dest_parent.join("python");
+        let copied_exe = dest_tree.join("bin").join("python3");
+        let stamp = |dir: &Path| std::fs::read_to_string(dir.join(".pm-pyver")).ok();
+        let src_stamp = stamp(src_tree);
+        if stable_copy_current(src_stamp.as_deref(), stamp(&dest_tree).as_deref())
+            && copied_exe.exists()
+        {
+            return Ok(Some(copied_exe));
+        }
+        match std::fs::remove_dir_all(&dest_tree) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        // copy_tree skips `.pm-pyver`; it is written LAST, below, so an interrupted
+        // copy (kill / OOM / power loss mid-tree) can never leave a stamped-but-torn
+        // tree that the currency check above would then trust forever — the same
+        // write-the-marker-last ordering fetch-python.mjs and `.pm-ready` use.
+        copy_tree(src_tree, &dest_tree)?;
+        if !copied_exe.exists() {
+            return Err(std::io::Error::other(format!(
+                "copied the bundled interpreter to {} but bin/python3 is missing",
+                dest_tree.display()
+            )));
+        }
+        let Some(src_stamp) = src_stamp else {
+            return Err(std::io::Error::other(format!(
+                "the bundled interpreter at {} has no .pm-pyver stamp — a packaging \
+                 bug (fetch-python.mjs always writes one)",
+                src_tree.display()
+            )));
+        };
+        std::fs::write(dest_tree.join(".pm-pyver"), src_stamp)?;
+        Ok(Some(copied_exe))
+    }
+}
+
+/// True when this process runs out of a mounted AppImage (either env var is set by
+/// the AppImage runtime). Pure over the env values so the decision is unit-testable.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn running_from_appimage(appdir: Option<&str>, appimage: Option<&str>) -> bool {
+    appdir.is_some_and(|v| !v.is_empty()) || appimage.is_some_and(|v| !v.is_empty())
+}
+
+/// Whether an existing stable interpreter copy matches the bundled tree, by the
+/// `.pm-pyver` stamp (version+tag+hash — see scripts/fetch-python.mjs). Missing or
+/// empty stamps read as stale, so a half-finished copy is always redone.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stable_copy_current(bundled_stamp: Option<&str>, copied_stamp: Option<&str>) -> bool {
+    match (bundled_stamp, copied_stamp) {
+        (Some(b), Some(c)) => !b.trim().is_empty() && b.trim() == c.trim(),
+        _ => false,
+    }
+}
+
+/// Recursive copy for the bundled interpreter tree. `fs::copy` preserves the unix
+/// exec bits; the standalone tree's relative symlinks (e.g. `bin/python3` →
+/// `python3.12`) are recreated as symlinks so they stay valid inside the copy.
+/// Deliberately SKIPS `.pm-pyver` at any depth: the caller writes the stamp only
+/// after the whole copy succeeded (see [`SidecarPaths::stable_bundled_python`]).
+#[cfg(target_os = "linux")]
+fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_name() == ".pm-pyver" {
+            continue;
+        }
+        let ty = entry.file_type()?;
+        let to = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else if ty.is_symlink() {
+            let target = std::fs::read_link(entry.path())?;
+            match std::fs::remove_file(&to) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            std::os::unix::fs::symlink(target, &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Status reported to the UI so first-run setup is visible.
@@ -510,6 +622,24 @@ impl SidecarManager {
             // cause instead.
             preflight_interpreter(&p)?;
             if detect_python_version(&p).is_some_and(meets_min) {
+                // Linux: when running out of an AppImage, the resource dir is a
+                // transient mount — hand the venv a stable copy instead, or the
+                // venv dies on the second launch (see stable_bundled_python).
+                #[cfg(target_os = "linux")]
+                match self.paths.stable_bundled_python(&p) {
+                    Ok(Some(stable)) => return Ok(stable),
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(ProvisionError {
+                            kind: SidecarErrorKind::Unknown,
+                            source: Error::Other(format!(
+                                "PM couldn't copy its bundled Python out of the AppImage \
+                                 into its data folder (needed so the document engine \
+                                 survives relaunches): {e}"
+                            )),
+                        });
+                    }
+                }
                 return Ok(p);
             }
         }
@@ -1807,6 +1937,36 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
 
         assert_eq!(paths_with_source(source_dir).bundled_python(), None);
+    }
+
+    #[test]
+    fn appimage_detection_needs_a_nonempty_env_var() {
+        use super::running_from_appimage;
+        assert!(running_from_appimage(Some("/tmp/.mount_PMx1y2"), None));
+        assert!(running_from_appimage(None, Some("/home/bobby/PM.AppImage")));
+        assert!(!running_from_appimage(None, None), "rpm/dev install");
+        // An empty var (e.g. exported blank by a wrapper script) is not an AppImage.
+        assert!(!running_from_appimage(Some(""), Some("")));
+    }
+
+    #[test]
+    fn stable_copy_stamp_comparison_treats_missing_or_empty_as_stale() {
+        use super::stable_copy_current;
+        let stamp = "3.12.13+20260610 c218f50b";
+        assert!(stable_copy_current(Some(stamp), Some(stamp)));
+        assert!(stable_copy_current(
+            Some(stamp),
+            Some("3.12.13+20260610 c218f50b\n")
+        ));
+        // Pin bump → re-copy.
+        assert!(!stable_copy_current(
+            Some("3.12.14+20270101 abc"),
+            Some(stamp)
+        ));
+        // Half-finished or absent copies always redo.
+        assert!(!stable_copy_current(Some(stamp), None));
+        assert!(!stable_copy_current(None, Some(stamp)));
+        assert!(!stable_copy_current(Some(""), Some("")));
     }
 
     #[test]
