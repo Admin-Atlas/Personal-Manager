@@ -36,7 +36,15 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -53,6 +61,15 @@ const PBS_TAG = "20260610";
 // Per-platform asset + hash + the interpreter path that proves a good unpack.
 // `install_only` archives unpack to a top-level `python/` dir: `python.exe`
 // (plus Lib/, DLLs/) on Windows; `bin/python3` (plus lib/) on Linux.
+//
+// Linux additionally PRUNES the tcl/tk/tkinter family after extraction. Two
+// reasons: (1) required — linuxdeploy walks every ELF in the AppDir and fails
+// on `_tkinter`'s `libtcl9.0.so` dependency (it resolves through the module's
+// $ORIGIN rpath, which linuxdeploy doesn't follow), killing the AppImage
+// bundle; (2) lean — the sidecar is headless (markitdown / fastembed /
+// faster-whisper), nothing imports tkinter, and the family is ~25 MB of dead
+// weight. `pruneRev` is folded into the stamp so editing the prune list forces
+// a re-extract on machines holding an older tree.
 const PLATFORMS = {
   win32: {
     asset: `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-pc-windows-msvc-install_only.tar.gz`,
@@ -63,6 +80,20 @@ const PLATFORMS = {
     asset: `cpython-${PY_VERSION}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz`,
     sha256: "c218f50baeb2c06a30c2f03db5986b2bad6ab7c8a52faad2d5a59bda0677b93a",
     interpreter: ["bin", "python3"],
+    pruneRev: " prune1",
+    prune: {
+      // Exact stdlib entries (rmSync force ignores any that don't exist).
+      paths: [
+        "lib/python3.12/lib-dynload/_tkinter.cpython-312-x86_64-linux-gnu.so",
+        "lib/python3.12/tkinter",
+        "lib/python3.12/idlelib",
+        "lib/python3.12/turtledemo",
+        "lib/python3.12/turtle.py",
+      ],
+      // Everything in lib/ belonging to the tcl/tk runtime (libtcl9.0.so,
+      // libtcl9tk9.0.so, tcl9.0/, tk9.0/, itcl4.3.5/, thread3.0.4/, …).
+      libPrefixes: ["libtcl", "libtk", "tcl", "tk", "itcl", "thread"],
+    },
   },
 };
 
@@ -81,8 +112,9 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const destParent = join(repoRoot, "src-tauri");
 const destDir = join(destParent, "python");
 const stampFile = join(destDir, ".pm-pyver");
-// Stamp identity = version+tag+hash, so any change to the pin forces a re-fetch.
-const STAMP = `${PY_VERSION}+${PBS_TAG} ${SHA256}`;
+// Stamp identity = version+tag+hash (+ prune revision where one applies), so any
+// change to the pin or the prune list forces a re-fetch.
+const STAMP = `${PY_VERSION}+${PBS_TAG} ${SHA256}${platform.pruneRev ?? ""}`;
 
 const exe = join(destDir, ...platform.interpreter);
 if (existsSync(exe) && existsSync(stampFile) && readFileSync(stampFile, "utf8").trim() === STAMP) {
@@ -121,6 +153,22 @@ try {
   if (!existsSync(exe)) {
     throw new Error(`unpacked archive but ${exe} is missing — unexpected archive layout`);
   }
+
+  if (platform.prune) {
+    for (const rel of platform.prune.paths) {
+      rmSync(join(destDir, rel), { recursive: true, force: true });
+    }
+    const libDir = join(destDir, "lib");
+    for (const name of readdirSync(libDir)) {
+      if (platform.prune.libPrefixes.some((p) => name.startsWith(p))) {
+        rmSync(join(libDir, name), { recursive: true, force: true });
+      }
+    }
+    console.log(`fetch-python: pruned the tcl/tk/tkinter family from the bundle.`);
+  }
+
+  // Stamp LAST, after unpack + prune both succeeded, so an interrupted run can
+  // never leave a stamped-but-wrong tree that the skip check above would trust.
   writeFileSync(stampFile, `${STAMP}\n`);
   console.log(`fetch-python: ready at ${destDir}`);
 } finally {
