@@ -50,9 +50,12 @@ jobs:
           workspaces: src-tauri
 
       - name: Install Linux Tauri build dependencies
+        # libfuse2: linuxdeploy (the AppImage assembler tauri-bundler downloads) is
+        # itself an AppImage; runner images stopped shipping FUSE2 and the bundler
+        # dies with a bare "failed to run linuxdeploy" without it.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev libfuse2
 
       - run: npm ci
 
@@ -72,6 +75,10 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build AppImage + rpm
+        env:
+          # Belt-and-braces with libfuse2 above: run the AppImage tooling
+          # (linuxdeploy + plugins) by self-extraction, never FUSE-mounting.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: npm run tauri build -- --bundles appimage,rpm
 
       # The same script release.yml runs (single source — the two can't drift).

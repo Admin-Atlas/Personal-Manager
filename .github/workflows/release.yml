@@ -128,11 +128,14 @@ jobs:
 
       - name: Install Linux Tauri build dependencies
         # Same GTK/WebKit dev stack the pr.yml rust job proves, plus libdbus-1-dev
-        # (the keyring crate's Secret Service backend links system libdbus).
+        # (the keyring crate's Secret Service backend links system libdbus) and
+        # libfuse2 (linuxdeploy — the AppImage assembler tauri-bundler downloads —
+        # is itself an AppImage; runner images stopped shipping FUSE2 and the
+        # bundler dies with a bare "failed to run linuxdeploy" without it).
         if: startsWith(matrix.os, 'ubuntu-')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev libfuse2
 
       - run: npm ci
 
@@ -177,6 +180,9 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Linux only (inert elsewhere): run the AppImage tooling by
+          # self-extraction, never FUSE-mounting — belt-and-braces with libfuse2.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
 
       # Switched on automatically once the Apple secrets exist — no code change needed.
       # APPLE_API_KEY_PATH is exported by the notarization-key step above when configured.
