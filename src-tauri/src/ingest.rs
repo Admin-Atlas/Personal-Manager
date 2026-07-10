@@ -1586,10 +1586,9 @@ fn insert_fts_row(tx: &Connection, rowid: i64, text: &str, multilingual: bool) -
     } else {
         text.into()
     };
-    tx.execute(
-        "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
-        params![rowid, content.as_ref()],
-    )?;
+    // Cached: this runs once per leaf inside the ingest loops, so don't re-parse the SQL per row.
+    tx.prepare_cached("INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)")?
+        .execute(params![rowid, content.as_ref()])?;
     Ok(())
 }
 
@@ -1614,42 +1613,41 @@ pub(crate) fn append_chat_chunks(
     let mut uid_to_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     let mut leaf_idx = 0usize;
     let mut ordinal = start_ordinal;
+    // Cached statements: prepared once per connection, re-bound per chunk (not re-parsed per row).
+    let mut insert_chunk = tx.prepare_cached(
+        "INSERT INTO chunks \
+         (document_id, ordinal, heading, content, char_count, uid, parent_id, kind, \
+          start_offset, end_offset, chat_turn_id, chunk_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    let mut insert_vec =
+        tx.prepare_cached("INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)")?;
     for chunk in chunks {
         let parent_id = chunk
             .parent_uid
             .as_deref()
             .and_then(|uid| uid_to_id.get(uid).copied());
-        tx.execute(
-            "INSERT INTO chunks \
-             (document_id, ordinal, heading, content, char_count, uid, parent_id, kind, \
-              start_offset, end_offset, chat_turn_id, chunk_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                doc_id,
-                ordinal,
-                chunk.heading,
-                chunk.display_content,
-                chunk.display_content.chars().count() as i64,
-                chunk.uid,
-                parent_id,
-                chunk.kind.as_str(),
-                chunk.start_offset as i64,
-                chunk.end_offset as i64,
-                chat_turn_id,
-                chunk_at,
-            ],
-        )?;
+        insert_chunk.execute(params![
+            doc_id,
+            ordinal,
+            chunk.heading,
+            chunk.display_content,
+            chunk.display_content.chars().count() as i64,
+            chunk.uid,
+            parent_id,
+            chunk.kind.as_str(),
+            chunk.start_offset as i64,
+            chunk.end_offset as i64,
+            chat_turn_id,
+            chunk_at,
+        ])?;
         let chunk_id = tx.last_insert_rowid();
         uid_to_id.insert(&chunk.uid, chunk_id);
         ordinal += 1;
 
         if chunk.kind == ChunkKind::Leaf {
-            let vector = serde_json::to_string(&embeddings[leaf_idx])
-                .map_err(|e| Error::Other(format!("encode embedding: {e}")))?;
-            tx.execute(
-                "INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)",
-                params![chunk_id, vector],
-            )?;
+            let vector = embedding_blob(&embeddings[leaf_idx]);
+            insert_vec.execute(params![chunk_id, vector])?;
             insert_fts_row(tx, chunk_id, &chunk.embed_content, multilingual)?;
             leaf_idx += 1;
         }
@@ -1677,6 +1675,14 @@ fn insert_chunks(
     let mut uid_to_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     let mut leaf_idx = 0usize;
     let mut first_leaf_id: Option<i64> = None;
+    // Cached statements: prepared once per connection, re-bound per chunk (not re-parsed per row).
+    let mut insert_chunk = tx.prepare_cached(
+        "INSERT INTO chunks \
+         (document_id, ordinal, heading, content, char_count, uid, parent_id, kind, start_offset, end_offset) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    let mut insert_vec =
+        tx.prepare_cached("INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)")?;
     for (ordinal, chunk) in chunks.iter().enumerate() {
         let parent_id = chunk
             .parent_uid
@@ -1687,33 +1693,24 @@ fn insert_chunks(
         } else {
             &chunk.display_content
         };
-        tx.execute(
-            "INSERT INTO chunks \
-             (document_id, ordinal, heading, content, char_count, uid, parent_id, kind, start_offset, end_offset) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                doc_id,
-                ordinal as i64,
-                chunk.heading,
-                content,
-                content.chars().count() as i64,
-                chunk.uid,
-                parent_id,
-                chunk.kind.as_str(),
-                chunk.start_offset as i64,
-                chunk.end_offset as i64,
-            ],
-        )?;
+        insert_chunk.execute(params![
+            doc_id,
+            ordinal as i64,
+            chunk.heading,
+            content,
+            content.chars().count() as i64,
+            chunk.uid,
+            parent_id,
+            chunk.kind.as_str(),
+            chunk.start_offset as i64,
+            chunk.end_offset as i64,
+        ])?;
         let chunk_id = tx.last_insert_rowid();
         uid_to_id.insert(&chunk.uid, chunk_id);
 
         if chunk.kind == ChunkKind::Leaf {
-            let vector = serde_json::to_string(&embeddings[leaf_idx])
-                .map_err(|e| Error::Other(format!("encode embedding: {e}")))?;
-            tx.execute(
-                "INSERT INTO chunk_vec (rowid, embedding) VALUES (?1, ?2)",
-                params![chunk_id, vector],
-            )?;
+            let vector = embedding_blob(&embeddings[leaf_idx]);
+            insert_vec.execute(params![chunk_id, vector])?;
             // Vault docs index the heading-prepended text so keyword search benefits from the
             // breadcrumb, while `chunks.content` stays clean for display + citations. Index-only
             // docs index nothing here — keeping the body out of the index — and become
@@ -2727,6 +2724,20 @@ pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+/// Encode a vector as the raw little-endian `f32` blob sqlite-vec accepts natively (its
+/// `fvec_from_value` memcpys any BLOB whose byte length is a multiple of 4 — here exactly 4×dim).
+/// vec0 stores parsed float32 regardless of the input encoding, so blob-bound rows and the older
+/// JSON-text-bound rows are byte-identical at rest and interchangeable at query time; binding the
+/// blob just skips a JSON round-trip per vector. The one encoding for every `chunk_vec` write and
+/// KNN `MATCH` bind (see `retrieval::vector_search`).
+pub(crate) fn embedding_blob(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * 4);
+    for f in vector {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
 }
 
 /// Refuse an embedder whose vector width the vault's **live** `chunk_vec` can't hold. Used by

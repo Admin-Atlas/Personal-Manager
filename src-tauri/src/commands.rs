@@ -736,55 +736,6 @@ pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: Stri
     Ok(())
 }
 
-/// Point this profile at an existing vault folder (e.g. a shared one) and open it.
-/// Device-only vaults are bound to their originating profile's keychain, so they can't
-/// be opened here — they must be converted to shareable first.
-#[tauri::command]
-pub fn open_existing_vault(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    folder: String,
-    passphrase: Option<String>,
-) -> Result<()> {
-    // I-03: wipe the passphrase plaintext from memory on return.
-    let passphrase = passphrase.map(zeroize::Zeroizing::new);
-    let root = std::path::PathBuf::from(folder);
-    let meta = vault::load_meta(&root)?
-        .ok_or_else(|| Error::Other("no PM vault found in that folder".into()))?;
-    let resolved = vault::ResolvedVault {
-        db_path: root.join("pm.sqlite"),
-        markdown_dir: root.join("vault"),
-        vault_root: root.clone(),
-    };
-    let (conn, runtime) = match meta.key_mode {
-        vault::KeyMode::Device => {
-            return Err(Error::Other(
-                "that vault is device-only and tied to the profile that created it; \
-                 convert it to shareable first"
-                    .into(),
-            ))
-        }
-        vault::KeyMode::Passphrase => {
-            let passphrase = passphrase.ok_or_else(|| {
-                Error::Other("a passphrase is required to open this vault".into())
-            })?;
-            let (conn, key, meta_report) =
-                vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
-            secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
-            let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
-            // M-3: warn (non-blocking) if opening this vault had to repair its meta.
-            emit_vault_meta_warning(&app, &meta_report);
-            (conn, runtime)
-        }
-    };
-    // Point this profile here so the next launch opens it directly.
-    let data_dir = paths::data_dir(&app)?;
-    vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
-    state.open_session(conn, runtime)?;
-    lock_session::engage(&app)?;
-    Ok(())
-}
-
 /// Forget this profile's cached key for the current vault, so the passphrase is needed
 /// again next launch. Does not lock the current session (the store stays open until exit).
 #[tauri::command]
@@ -2019,60 +1970,12 @@ pub fn get_document(state: State<'_, AppState>, id: i64) -> Result<Document> {
     ingest::load_document(&conn, id)
 }
 
-/// Direct hybrid search over the store — the retrieval loop exposed on its own
-/// (a search surface, and the way to verify exact-term recall independently of
-/// chat). Embeds the query via the sidecar, so it ensures the engine is set up.
-#[tauri::command]
-pub async fn search_documents(
-    app: AppHandle,
-    query: String,
-    k: Option<usize>,
-) -> Result<Vec<RetrievedChunk>> {
-    const MAX_K: usize = 50;
-    let k = k.unwrap_or(retrieval::DEFAULT_TOP_K).min(MAX_K);
-    tokio::task::spawn_blocking(move || -> Result<Vec<RetrievedChunk>> {
-        let query = query.trim().to_string();
-        if query.is_empty() {
-            return Ok(Vec::new());
-        }
-        let state = app.state::<AppState>();
-        state.sidecar.ensure_installed()?;
-
-        // Resolve models + the reranking toggle in one short lock, then drop it so neither the
-        // query embed nor the rerank holds the DB lock across a sidecar call (#4).
-        let (gateway, rerank_on) = {
-            let conn = state.conn()?;
-            (state.gateway(&conn)?, crate::db::reranking_enabled(&conn)?)
-        };
-        let embeddings = gateway.embed_query(std::slice::from_ref(&query))?;
-        let query_vec = embeddings.into_iter().next().unwrap_or_default();
-
-        let q = retrieval::RetrieveQuery {
-            text: &query,
-            embedding: &query_vec,
-            k,
-            filters: retrieval::Filters::default(),
-            strategy: retrieval::Strategy::HybridRrf,
-            multilingual: gateway.embedder().multilingual,
-        };
-        // Fuse under the lock, then rerank off it (the cross-encoder is a sidecar call).
-        let fused = {
-            let conn = state.conn()?;
-            retrieval::retrieve_fused(&conn, &q)?
-        };
-        let reranker = rerank_on.then_some(&gateway as &dyn retrieval::Reranker);
-        retrieval::rerank(reranker, &query, fused)
-    })
-    .await
-    .map_err(|e| Error::Other(format!("search task panicked: {e}")))?
-}
-
 /// Transcribe a recorded voice clip to text for the chat box (spec §4 P1 — voice
 /// input). The webview records the clip and sends it base64-encoded; we decode it
 /// to a temp file inside the data dir, transcribe it locally via the sidecar's
 /// Whisper model, and delete the file. An explicit user action, so it ensures the
-/// engine is installed first (mirrors `search_documents`). Fully on-device — the
-/// audio never leaves the machine. All blocking, so it runs off the async runtime.
+/// engine is installed first. Fully on-device — the audio never leaves the
+/// machine. All blocking, so it runs off the async runtime.
 #[tauri::command]
 pub async fn transcribe_audio(app: AppHandle, audio_base64: String) -> Result<String> {
     use base64::Engine;
@@ -2345,7 +2248,6 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, rules_cipher) = state.rules_io()?;
         let (_, manifest_cipher) = state.manifest_io()?;
-        let now = iso_now(&state)?;
 
         // The whole pass is all-or-nothing: corrections, alias rules, vault rewrites, and the
         // `reviewed` flags commit together, or the DB transaction rolls back and every vault file
@@ -2353,6 +2255,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         // leave earlier docs marked reviewed (dropped from the queue on retry, their corrections
         // never re-logged) and mid-batch vault/DB drift.
         let mut conn = state.conn()?;
+        let now = ingest::iso_now(&conn)?;
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
@@ -2449,13 +2352,13 @@ pub async fn set_document_metadata(
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, rules_cipher) = state.rules_io()?;
         let (_, manifest_cipher) = state.manifest_io()?;
-        let now = iso_now(&state)?;
 
         // Log the correction + rewrite the vault file + update the row atomically, restoring the
         // vault file (and rules file) if the DB side fails (the file writes land first). This is a
         // *reassignment* (one document moves), not a merge: no alias rule is captured — the prior
         // value is the document's own canonical, not a model-proposed variant.
         let mut conn = state.conn()?;
+        let now = ingest::iso_now(&conn)?;
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
@@ -2723,46 +2626,6 @@ pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Resul
     .await
 }
 
-/// Point one document at a different existing entity — the *misfile* case (a reassignment, not a
-/// merge). Rewrites that document's frontmatter + cache to the target canonical.
-#[tauri::command]
-pub async fn reassign_document(app: AppHandle, document_id: i64, entity_id: i64) -> Result<()> {
-    spawn_entity_mutation(
-        app,
-        move |tx, vault, cipher, vault_root, manifest_cipher| {
-            entities::reassign_document(tx, document_id, entity_id)?;
-            let canonical = entities::canonical_name(tx, entity_id)?;
-            let (tags_json, importance, reviewed, last_activity): (
-                String,
-                Option<String>,
-                i64,
-                String,
-            ) = tx.query_row(
-                "SELECT tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
-                 FROM documents WHERE id = ?1",
-                params![document_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
-            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-            Ok(vec![ingest::write_document_truth(
-                tx,
-                vault,
-                cipher,
-                document_id,
-                &canonical,
-                &tags,
-                importance.as_deref(),
-                reviewed != 0,
-                &last_activity,
-                vault_root,
-                manifest_cipher,
-                ingest::FilingActivity::Record,
-            )?])
-        },
-    )
-    .await
-}
-
 // --- personal assistant: projects & focus view (Step 5) ---
 
 /// Every active project with its triage metadata and one derived status — the
@@ -3001,7 +2864,8 @@ pub fn reorder_milestones(
 
 /// The per-account Google Calendar keychain token key (`google_oauth_token_calendar::<email>`).
 fn google_calendar_token_key(email: &str) -> String {
-    format!("{}{}", secrets::GOOGLE_TOKEN_CALENDAR_PREFIX, email)
+    secrets::token_key_for("google", "calendar", email)
+        .expect("google/calendar is a token-bearing pair")
 }
 
 /// Everything the Connectors → Calendar UI needs in one read: which provider clients are configured,
@@ -3403,8 +3267,29 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let mut failed_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_err: Option<Error> = None;
 
-    for cal in &calendars {
-        match sync_one_calendar(&app, cal, &feed_by_id, &time_min, &time_max, tz).await {
+    // Fetch a few calendars at a time (the fetch half holds no DB lock; each `replace_events`
+    // write inside stays its own short lock). `buffered` keeps results in calendar order, so the
+    // per-calendar accounting below matches the old sequential loop.
+    use futures_util::stream::StreamExt;
+    const CALENDAR_FETCH_CONCURRENCY: usize = 3;
+    // The futures are collected eagerly (they're inert until polled) so the stream holds plain
+    // future values — leaving the mapping closure inside the stream type trips a higher-ranked
+    // `FnOnce` inference error in the generated command wrapper. The re-borrows keep each
+    // `async move` block owning only references (`move` alone would swallow `app` whole).
+    let fetches: Vec<_> = calendars
+        .iter()
+        .map(|cal| {
+            let (app, feed_by_id) = (&app, &feed_by_id);
+            let (time_min, time_max) = (&time_min, &time_max);
+            async move {
+                let r = sync_one_calendar(app, cal, feed_by_id, time_min, time_max, tz).await;
+                (cal, r)
+            }
+        })
+        .collect();
+    let mut results = futures_util::stream::iter(fetches).buffered(CALENDAR_FETCH_CONCURRENCY);
+    while let Some((cal, result)) = results.next().await {
+        match result {
             Ok(n) => {
                 total += n;
                 ok_sources.insert(cal.source_id.clone());
@@ -3485,12 +3370,6 @@ pub fn drive_status(state: State<'_, AppState>) -> Result<DriveStatus> {
         oauth_client_configured: google::has_client()?,
         accounts: drive::list_accounts(&conn)?,
     })
-}
-
-#[tauri::command]
-pub fn list_drive_accounts(state: State<'_, AppState>) -> Result<Vec<drive::DriveAccount>> {
-    let conn = state.conn()?;
-    drive::list_accounts(&conn)
 }
 
 /// Normalize the optional per-account client (id + secret) passed at connect time into
@@ -3619,15 +3498,46 @@ pub fn set_drive_scope(
     drive::set_scope(&conn, &email, &scope)
 }
 
+/// Clone a sync-state snapshot out of its mutex (`what` names the sync in the poisoned-lock error).
+/// Shared by the three `*_sync_status` commands.
+fn sync_snapshot<T: Clone>(state: &std::sync::Mutex<T>, what: &str) -> Result<T> {
+    state
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|_| Error::Other(format!("{what} sync state poisoned")))
+}
+
+/// Shared engine behind the three `resume_*_sync` commands: read the connector's pending-sync
+/// marker, bail when there's nothing to resume or a sync is already running this session (don't
+/// stack), then hand the marker's parsed target (account/folder; `None` = all) to `spawn`.
+/// Returns whether a resume was kicked off.
+fn resume_pending_sync(
+    app: AppHandle,
+    pending_key: &str,
+    is_running: impl FnOnce(&AppState) -> bool,
+    spawn: impl FnOnce(AppHandle, Option<String>),
+) -> Result<bool> {
+    let marker: Option<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, pending_key)?
+    };
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    if is_running(&app.state::<AppState>()) {
+        return Ok(false);
+    }
+    let target: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
+    spawn(app, target);
+    Ok(true)
+}
+
 /// The currently-running Drive sync snapshot (empty / `running:false` when idle), so the Settings UI
 /// can resume showing progress after the user leaves and returns.
 #[tauri::command]
 pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncState> {
-    state
-        .drive_sync
-        .lock()
-        .map(|s| s.clone())
-        .map_err(|_| Error::Other("drive sync state poisoned".into()))
+    sync_snapshot(&state.drive_sync, "drive")
 }
 
 /// Sync one Drive account (or every account when `account` is `None`) into the index-only store. See
@@ -3651,30 +3561,16 @@ pub fn stop_drive_sync(state: State<'_, AppState>) -> Result<()> {
 /// was left — it never re-embeds what's already there. No marker → nothing to resume.
 #[tauri::command]
 pub fn resume_drive_sync(app: AppHandle) -> Result<bool> {
-    let marker: Option<String> = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        db::get_setting(&conn, cloud_sync::DRIVE_SYNC_PENDING_KEY)?
-    };
-    let Some(marker) = marker else {
-        return Ok(false);
-    };
-    // Don't stack on a sync the user may already have started this session.
-    let running = app
-        .state::<AppState>()
-        .drive_sync
-        .lock()
-        .map(|s| s.running)
-        .unwrap_or(false);
-    if running {
-        return Ok(false);
-    }
-    let account: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
-    let app2 = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = cloud_sync::drive_sync_core(&app2, account).await;
-    });
-    Ok(true)
+    resume_pending_sync(
+        app,
+        cloud_sync::DRIVE_SYNC_PENDING_KEY,
+        |st| st.drive_sync.lock().map(|s| s.running).unwrap_or(false),
+        |app, account| {
+            tauri::async_runtime::spawn(async move {
+                let _ = cloud_sync::drive_sync_core(&app, account).await;
+            });
+        },
+    )
 }
 
 /// Register a local folder to index (the path comes from the frontend's native folder picker). Returns
@@ -3708,11 +3604,7 @@ pub fn list_local_folders(state: State<'_, AppState>) -> Result<Vec<localfolder:
 /// The currently-running local-folder sync snapshot, so the UI resumes progress after navigating away.
 #[tauri::command]
 pub fn local_folder_sync_status(state: State<'_, AppState>) -> Result<crate::LocalFolderSyncState> {
-    state
-        .local_sync
-        .lock()
-        .map(|s| s.clone())
-        .map_err(|_| Error::Other("local sync state poisoned".into()))
+    sync_snapshot(&state.local_sync, "local")
 }
 
 /// Ask the running local-folder sync to stop after the current file (already-indexed files are kept).
@@ -3733,29 +3625,16 @@ pub async fn sync_local_folder(app: AppHandle, folder: Option<String>) -> Result
 /// as they went, so a resumed pass only does the work that was left.
 #[tauri::command]
 pub fn resume_local_folder_sync(app: AppHandle) -> Result<bool> {
-    let marker: Option<String> = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        db::get_setting(&conn, localfolder::LOCAL_SYNC_PENDING_KEY)?
-    };
-    let Some(marker) = marker else {
-        return Ok(false);
-    };
-    let running = app
-        .state::<AppState>()
-        .local_sync
-        .lock()
-        .map(|s| s.running)
-        .unwrap_or(false);
-    if running {
-        return Ok(false);
-    }
-    let folder: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
-    let app2 = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = localfolder::local_sync_core(&app2, folder).await;
-    });
-    Ok(true)
+    resume_pending_sync(
+        app,
+        localfolder::LOCAL_SYNC_PENDING_KEY,
+        |st| st.local_sync.lock().map(|s| s.running).unwrap_or(false),
+        |app, folder| {
+            tauri::async_runtime::spawn(async move {
+                let _ = localfolder::local_sync_core(&app, folder).await;
+            });
+        },
+    )
 }
 
 /// Fetch an index-only document's full body live from its source (Drive), for the "show full text"
@@ -3776,7 +3655,7 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?
     };
-    if source_type != "index_only" {
+    if source_type != ingest::SOURCE_TYPE_INDEX_ONLY {
         return Err(Error::Other(
             "This document is stored locally — open it directly.".into(),
         ));
@@ -3869,7 +3748,7 @@ pub async fn promote_index_only(app: AppHandle, doc_id: i64) -> Result<Document>
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?
     };
-    if source_type != "index_only" {
+    if source_type != ingest::SOURCE_TYPE_INDEX_ONLY {
         return Err(Error::Other(
             "This document is already imported locally.".into(),
         ));
@@ -4010,7 +3889,7 @@ pub fn read_document_body(state: State<'_, AppState>, doc_id: i64) -> Result<Str
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?
     };
-    if source_type == "index_only" {
+    if source_type == ingest::SOURCE_TYPE_INDEX_ONLY {
         // No local body — the reader shows the offline summary alongside an "Open source" affordance.
         return Ok(stored_summary.unwrap_or_default());
     }
@@ -4251,14 +4130,6 @@ pub fn onedrive_status(state: State<'_, AppState>) -> Result<OneDriveStatus> {
     })
 }
 
-#[tauri::command]
-pub fn list_onedrive_accounts(
-    state: State<'_, AppState>,
-) -> Result<Vec<onedrive::OneDriveAccount>> {
-    let conn = state.conn()?;
-    onedrive::list_accounts(&conn)
-}
-
 /// Save the user's BYO Microsoft client id (public client — no secret). Keychain-only; provider-level
 /// (shared by every OneDrive account). Setting it connects nothing on its own.
 #[tauri::command]
@@ -4342,11 +4213,7 @@ pub fn set_onedrive_scope(
 /// The currently-running OneDrive sync snapshot, so the Settings UI can resume showing progress.
 #[tauri::command]
 pub fn onedrive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncState> {
-    state
-        .onedrive_sync
-        .lock()
-        .map(|s| s.clone())
-        .map_err(|_| Error::Other("onedrive sync state poisoned".into()))
+    sync_snapshot(&state.onedrive_sync, "onedrive")
 }
 
 /// Sync one OneDrive account (or every account when `account` is `None`). The command the UI's
@@ -4366,29 +4233,16 @@ pub fn stop_onedrive_sync(state: State<'_, AppState>) -> Result<()> {
 /// Resume a OneDrive sync a previous app session started but didn't finish. Called once on launch.
 #[tauri::command]
 pub fn resume_onedrive_sync(app: AppHandle) -> Result<bool> {
-    let marker: Option<String> = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        db::get_setting(&conn, cloud_sync::ONEDRIVE_SYNC_PENDING_KEY)?
-    };
-    let Some(marker) = marker else {
-        return Ok(false);
-    };
-    let running = app
-        .state::<AppState>()
-        .onedrive_sync
-        .lock()
-        .map(|s| s.running)
-        .unwrap_or(false);
-    if running {
-        return Ok(false);
-    }
-    let account: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
-    let app2 = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = cloud_sync::onedrive_sync_core(&app2, account).await;
-    });
-    Ok(true)
+    resume_pending_sync(
+        app,
+        cloud_sync::ONEDRIVE_SYNC_PENDING_KEY,
+        |st| st.onedrive_sync.lock().map(|s| s.running).unwrap_or(false),
+        |app, account| {
+            tauri::async_runtime::spawn(async move {
+                let _ = cloud_sync::onedrive_sync_core(&app, account).await;
+            });
+        },
+    )
 }
 
 // --- structured preferences (§4.5 — the typed model that replaces the Learning-You blob) ---
@@ -4409,7 +4263,9 @@ async fn migrate_preferences_once(app: AppHandle) -> Result<()> {
         let blob = db::get_setting(&conn, preferences::LEGACY_PROFILE_KEY)?.unwrap_or_default();
         if blob.trim().is_empty() {
             // Nothing to migrate — stamp the flag so we don't re-read an empty blob each launch.
-            let now = iso_now(&state)?;
+            // Every fresh vault takes this branch on first boot; re-locking the state here (the old
+            // `iso_now(&state)`) self-deadlocked the non-reentrant DB mutex and froze the whole app.
+            let now = ingest::iso_now(&conn)?;
             db::set_setting(&conn, preferences::MIGRATED_FLAG_KEY, &now)?;
             return Ok(());
         }
@@ -4425,8 +4281,8 @@ async fn migrate_preferences_once(app: AppHandle) -> Result<()> {
     let drafts = preferences::distill_blob(api_key.expose(), &models, &blob).await?;
 
     let state = app.state::<AppState>();
-    let now = iso_now(&state)?;
     let conn = state.conn()?;
+    let now = ingest::iso_now(&conn)?;
     let tx = conn.unchecked_transaction()?;
     for d in &drafts {
         // The blob has no entity to resolve a project against, so distilled records are global/
@@ -4621,8 +4477,8 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         briefing::generate(api_key.expose(), &models, &snapshot, profile.as_deref()).await?;
 
     let state = app.state::<AppState>();
-    let now = iso_now(&state)?;
     let conn = state.conn()?;
+    let now = ingest::iso_now(&conn)?;
     log_usage(
         &conn,
         "background",
@@ -5180,16 +5036,10 @@ fn total_cost(rows: &[ModelSpend]) -> Option<f64> {
 }
 
 // --- helpers ---
-
-/// Current UTC time in the store's ISO8601 format (matches ingest timestamps).
-fn iso_now(state: &AppState) -> Result<String> {
-    let conn = state.conn()?;
-    Ok(
-        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
-            r.get(0)
-        })?,
-    )
-}
+// NOTE: there is deliberately no `iso_now(&AppState)` helper here. One existed and took
+// `state.conn()` internally, which self-deadlocked the non-reentrant DB mutex when called
+// with the guard already held (it froze every fresh-vault boot). Use `ingest::iso_now(&conn)`
+// with the connection you already hold.
 
 /// Resolve the user's stored IANA zone to a `chrono_tz::Tz`. Falls back to UTC when
 /// the key is unset, empty, or unparseable — chrono `Local` only yields an offset
@@ -5624,66 +5474,15 @@ pub async fn restore_local_backup(
     .await
     .map_err(|e| Error::Other(format!("restore task panicked: {e}")))?;
 
-    let outcome = match result {
-        Ok(o) => o,
-        Err(e) => {
-            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
-                "Restore cancelled.".to_string()
-            } else {
-                e.to_string()
-            };
-            emit_backup_progress(
-                &app,
-                BackupEvent::Failed {
-                    message: msg.clone(),
-                },
-            );
-            return Err(Error::Other(msg));
-        }
-    };
-
-    // Stash the restored vault's key IN MEMORY (never the keychain yet), keyed by the
-    // restored folder. `switch_to_vault` promotes it into the keychain only when the user
-    // commits — so a restore the user inspects but never switches to can't overwrite the
-    // LIVE vault's cached key (which would brick it if the archive held an older key).
-    let target_dir = outcome.target_dir.to_string_lossy().to_string();
-    if let Ok(mut pending) = state.pending_restore_keys.lock() {
-        pending.insert(target_dir.clone(), outcome.db_key_hex);
-    }
-
-    let summary = RestoreSummary {
-        vault_id: outcome.vault_id.clone(),
-        key_mode: outcome.key_mode,
-        markdown_encryption: outcome.markdown_encryption,
-        app_version: outcome.app_version,
-        created_at: outcome.created_at.clone(),
-        target_dir,
-    };
-    // Park the summary so a remounted Backup panel can re-offer "switch to it" without a re-restore
-    // (the key above already survives the remount; this is just the display companion).
-    if let Ok(mut snap) = state.backup_state.lock() {
-        snap.pending_restore = Some(summary.clone());
-    }
-    emit_backup_progress(
-        &app,
-        BackupEvent::Finished {
-            report: BackupReport {
-                kind: BackupKind::Restore,
-                vault_id: Some(outcome.vault_id),
-                target_dir: Some(summary.target_dir.clone()),
-                created_at: Some(outcome.created_at),
-                failed_destinations: Vec::new(),
-            },
-        },
-    );
-    Ok(summary)
+    let outcome = unwrap_restore_result(&app, &state, result)?;
+    Ok(finalize_restore(&app, &state, outcome))
 }
 
 /// Point this profile at a restored (or otherwise relocated) vault folder and open it.
 /// This is the deliberate commit point of a restore: it promotes the key stashed in memory
 /// by `restore_local_backup` into this device's keychain (`vault_key::<id>`), then opens.
-/// Unlike `open_existing_vault`, this works for a device-source vault too — no passphrase is
-/// needed because the restore recovered the key.
+/// Works for a device-source vault too — no passphrase is needed because the restore
+/// recovered the key.
 #[tauri::command]
 pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: String) -> Result<()> {
     let root = std::path::PathBuf::from(&folder);
@@ -5714,7 +5513,7 @@ pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: Strin
     let runtime = VaultRuntime::build(&resolved, &meta, &master);
     // Point this profile here, then install the new session — `open_session` swaps `db`
     // + `vault` together and drops the old connection, so there's no locked-in-between
-    // window (mirrors `open_existing_vault`). The next launch reads the pointer directly.
+    // window. The next launch reads the pointer directly.
     let data_dir = paths::data_dir(&app)?;
     vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
     state.open_session(conn, runtime)?;
@@ -6210,33 +6009,40 @@ pub async fn restore_from_proton(
     .await
     .map_err(|e| Error::Other(format!("restore task panicked: {e}")))?;
 
-    let outcome = match result {
-        Ok(o) => o,
-        Err(e) => {
-            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
-                "Restore cancelled.".to_string()
-            } else {
-                e.to_string()
-            };
-            emit_backup_progress(
-                &app,
-                BackupEvent::Failed {
-                    message: msg.clone(),
-                },
-            );
-            return Err(Error::Other(msg));
-        }
-    };
-
-    Ok(finalize_remote_restore(&app, &state, outcome))
+    let outcome = unwrap_restore_result(&app, &state, result)?;
+    Ok(finalize_restore(&app, &state, outcome))
 }
 
-/// Finish a remote (Proton / Google Drive) restore: stash the restored key IN MEMORY only
-/// (`switch_to_vault` promotes it to the keychain on commit — a restore never touches the live
-/// vault), build + park the summary so a remounted Backup panel can re-offer "switch to it", and
-/// emit the detached `Finished` event. Shared by `restore_from_proton` and `restore_from_gdrive`,
-/// which differ only in how they pull the archive down.
-fn finalize_remote_restore(
+/// Unwrap a finished restore task's result: on failure, report a user-initiated cancel as a
+/// cancel (not whatever incidental error the pipeline hit when the flag flipped), emit the
+/// detached `Failed` event, and surface the error. Shared by all three restore commands.
+fn unwrap_restore_result(
+    app: &AppHandle,
+    state: &AppState,
+    result: Result<crate::backup::restore::RestoreOutcome>,
+) -> Result<crate::backup::restore::RestoreOutcome> {
+    result.map_err(|e| {
+        let msg = if state.backup_cancel.load(Ordering::SeqCst) {
+            "Restore cancelled.".to_string()
+        } else {
+            e.to_string()
+        };
+        emit_backup_progress(
+            app,
+            BackupEvent::Failed {
+                message: msg.clone(),
+            },
+        );
+        Error::Other(msg)
+    })
+}
+
+/// Finish a restore (local file, Proton, or Google Drive): stash the restored key IN MEMORY only
+/// (`switch_to_vault` promotes it to the keychain on commit — a restore the user inspects but
+/// never switches to can't overwrite the LIVE vault's cached key), build + park the summary so a
+/// remounted Backup panel can re-offer "switch to it", and emit the detached `Finished` event.
+/// Shared by the three restore commands, which differ only in how they obtain the archive.
+fn finalize_restore(
     app: &AppHandle,
     state: &AppState,
     outcome: crate::backup::restore::RestoreOutcome,
@@ -6486,24 +6292,8 @@ pub async fn restore_from_gdrive(
     .map_err(|e| Error::Other(format!("restore task panicked: {e}")))?;
     drop(dl);
 
-    let outcome = match result {
-        Ok(o) => o,
-        Err(e) => {
-            let msg = if state.backup_cancel.load(Ordering::SeqCst) {
-                "Restore cancelled.".to_string()
-            } else {
-                e.to_string()
-            };
-            emit_backup_progress(
-                &app,
-                BackupEvent::Failed {
-                    message: msg.clone(),
-                },
-            );
-            return Err(Error::Other(msg));
-        }
-    };
-    Ok(finalize_remote_restore(&app, &state, outcome))
+    let outcome = unwrap_restore_result(&app, &state, result)?;
+    Ok(finalize_restore(&app, &state, outcome))
 }
 
 /// Enable/disable each backup destination for scheduled runs. Enabling Google Drive requires a

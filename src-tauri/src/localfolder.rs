@@ -592,23 +592,20 @@ pub fn known_items(conn: &Connection, key: &str) -> Result<HashMap<String, Known
 }
 
 /// The persisted state of a single already-indexed item, keyed by its source id — the watcher's
-/// per-event lookup (the on-demand walk loads the whole set up front instead). `None` = never indexed.
+/// per-event lookup (the on-demand walk loads the whole set up front instead). `None` = never
+/// indexed. The shared foundation lookup, kept to live index-only rows (like OneDrive; only Drive
+/// widens to promoted rows).
 pub fn known_item(conn: &Connection, source_id: &str) -> Result<Option<KnownItem>> {
-    conn.query_row(
-        "SELECT external_ref, source_modified_at, source_content_hash, source_state \
-         FROM documents WHERE source_id = ?1 AND source_type = 'index_only'",
-        params![source_id],
-        |r| {
-            Ok(KnownItem {
-                external_ref: r.get(0)?,
-                modified_at: r.get(1)?,
-                content_hash: r.get(2)?,
-                source_state: r.get(3)?,
-            })
-        },
+    Ok(
+        index_only::read_raw_item_state(conn, source_id, /* include_promoted */ false)?.map(
+            |raw| KnownItem {
+                external_ref: raw.external_ref,
+                modified_at: raw.source_modified_at,
+                content_hash: raw.source_content_hash,
+                source_state: raw.source_state,
+            },
+        ),
     )
-    .optional()
-    .map_err(Into::into)
 }
 
 /// Find the indexed item a now-vanished path belonged to, by its stored `external_ref` (the absolute

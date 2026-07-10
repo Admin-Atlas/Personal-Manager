@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -452,7 +453,11 @@ function formatForKey(e: ReactKeyboardEvent<HTMLTextAreaElement>): FormatAction 
   return null;
 }
 
-function NoteBody({
+// Memoised: a drag/resize sets state on every pointermove, re-rendering the whole board — without
+// memo each note would re-run the react-markdown pipeline per tick. All props are stable across a
+// drag (widget objects are only replaced when edited; the usePinboard mutators and refreshDocs are
+// stable useCallbacks; `status` comes out of a map rebuilt only on refetch).
+const NoteBody = memo(function NoteBody({
   widget,
   onChange,
   status,
@@ -642,7 +647,7 @@ function NoteBody({
       </div>
     </div>
   );
-}
+});
 
 function BulletIcon() {
   return (
@@ -703,8 +708,9 @@ interface TimelineBodyProps {
 }
 
 /** A timeline is either *bound* to a real project — showing and editing that project's live
- *  milestones, which flow to the brief + Focus — or a freeform scratch list (the default). */
-function TimelineBody(props: TimelineBodyProps) {
+ *  milestones, which flow to the brief + Focus — or a freeform scratch list (the default).
+ *  Memoised for the same board-wide drag re-renders as NoteBody (all props are stable). */
+const TimelineBody = memo(function TimelineBody(props: TimelineBodyProps) {
   if (props.widget.project) {
     return (
       <BoundTimeline
@@ -715,7 +721,7 @@ function TimelineBody(props: TimelineBodyProps) {
     );
   }
   return <FreeformTimeline {...props} />;
-}
+});
 
 /** A milestone's effective date as YYYY-MM-DD, or "" when undated. */
 function msDate(m: Milestone): string {

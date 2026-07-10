@@ -10,14 +10,6 @@
 /** The calendar's view modes. Day = the N-day time grid with N=1 (see PR2). */
 export type CalendarViewMode = "month" | "week" | "day" | "year" | "agenda";
 
-export const CALENDAR_VIEW_MODES: readonly CalendarViewMode[] = [
-  "month",
-  "week",
-  "day",
-  "year",
-  "agenda",
-];
-
 /** The time-grid vertical scale (Week/Day only): the visible hour band + row height. The grid always
  *  spans a scrollable full 24h — `work` opens tall and scrolled to 08:00 (business hours), `day`
  *  opens framed on 08:00–20:00 with rows stretched to fill the body exactly (a daytime-only *default

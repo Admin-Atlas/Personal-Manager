@@ -19,6 +19,7 @@
 import { useState } from "react";
 import { exit } from "@tauri-apps/plugin-process";
 import { confirmWipeIdentity, wipePmData } from "../lib/ipc";
+import { formatBytes } from "../lib/format";
 import type { WipeReport } from "../lib/types";
 import { Button, Input, Modal } from "./ui";
 
@@ -94,14 +95,6 @@ const ITEMS: Item[] = [
     consequence: "Resets the interface to its defaults.",
   },
 ];
-
-function formatBytes(n: number): string {
-  if (!n) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
-  const v = n / Math.pow(1024, i);
-  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
-}
 
 export function RemovePmData({ biometricAvailable }: Props) {
   const [stage, setStage] = useState<Stage>("locked");

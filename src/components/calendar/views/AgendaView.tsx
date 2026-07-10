@@ -8,7 +8,7 @@
 import { useMemo } from "react";
 import type { CalendarEvent } from "../../../lib/types";
 import { formatClockIso, formatDateLocal } from "../../../lib/format";
-import { dayKey, groupEventsFromDay, startOfDay } from "../../../lib/calendar-layout";
+import { dayKey, groupEventsFromDay, startOfDay, weekdayShort } from "../../../lib/calendar-layout";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
 
@@ -18,10 +18,6 @@ interface Props {
   /** Show events on/after this day — including a multi-day event still running through it. */
   fromDay: Date;
   colorOf: (calendarId: string) => string;
-}
-
-function weekdayShort(d: Date): string {
-  return d.toLocaleDateString(undefined, { weekday: "short" });
 }
 
 /** An event's clock time for the agenda row: the local start time, or "all-day". */

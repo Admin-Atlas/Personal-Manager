@@ -150,34 +150,28 @@ pub async fn fetch_events(
     // Follow `nextPageToken` so the wide mirror band isn't silently truncated at one page — over a
     // year a single daily-recurring series alone exceeds 250 expanded instances. `singleEvents` +
     // `orderBy=startTime` keep the pages start-ordered, so appending preserves order.
-    let mut out = Vec::new();
-    let mut page_token: Option<String> = None;
-    let mut pages = 0;
-    loop {
-        pages += 1;
+    let (out, truncated) = crate::connector_sync::paginate(MAX_PAGES, |page_token| {
         let mut url = base.clone();
-        if let Some(tok) = &page_token {
-            url.query_pairs_mut().append_pair("pageToken", tok);
+        async move {
+            if let Some(tok) = &page_token {
+                url.query_pairs_mut().append_pair("pageToken", tok);
+            }
+            let value = google::authorized_get(token_key, url.as_str()).await?;
+            let next = value
+                .get("nextPageToken")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Ok((parse_events(mirror_calendar_id, &value), next))
         }
-        let value = google::authorized_get(token_key, url.as_str()).await?;
-        out.extend(parse_events(mirror_calendar_id, &value));
-        page_token = value
-            .get("nextPageToken")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if page_token.is_none() {
-            break;
-        }
-        // Runaway guard (~25k events/calendar). If we stop here with a page token still
-        // pending, the mirror is being truncated — log it rather than silently
-        // overwriting with a partial set (no realistic personal calendar hits this).
-        if pages >= MAX_PAGES {
-            eprintln!(
-                "calendar: '{mirror_calendar_id}' hit the {MAX_PAGES}-page fetch cap with more \
-                 pages pending; its mirror may be truncated this sync"
-            );
-            break;
-        }
+    })
+    .await?;
+    // Runaway guard tripped (~25k events/calendar): the mirror is being truncated — log it rather
+    // than silently overwriting with a partial set (no realistic personal calendar hits this).
+    if truncated {
+        eprintln!(
+            "calendar: '{mirror_calendar_id}' hit the {MAX_PAGES}-page fetch cap with more \
+             pages pending; its mirror may be truncated this sync"
+        );
     }
     Ok(out)
 }

@@ -152,33 +152,38 @@ async fn list_files_with_ids(
 ) -> Result<Vec<(String, String, Option<u64>)>> {
     let q = in_folder_query(folder_id);
     let fields = "nextPageToken,files(id,name,size,createdTime)";
-    let mut out = Vec::new();
-    let mut page: Option<String> = None;
-    for _ in 0..MAX_PAGES {
-        let url = files_list_url(&q, fields, page.as_deref())?;
-        let resp = google::authorized_send(&http_client()?, token_key, |c, bearer| {
-            c.get(&url).bearer_auth(bearer)
-        })
-        .await?;
-        if !resp.status().is_success() {
-            return Err(drive_error(resp, "listing backups").await);
-        }
-        let list: FileList = resp.json().await?;
-        for f in list.files {
-            if let Some(name) = f.name {
-                out.push((f.id, name, f.size.and_then(|s| s.parse::<u64>().ok())));
+    let (out, truncated) = crate::connector_sync::paginate(MAX_PAGES, |page| {
+        let q = q.as_str();
+        async move {
+            let url = files_list_url(q, fields, page.as_deref())?;
+            let resp = google::authorized_send(&http_client()?, token_key, |c, bearer| {
+                c.get(&url).bearer_auth(bearer)
+            })
+            .await?;
+            if !resp.status().is_success() {
+                return Err(drive_error(resp, "listing backups").await);
             }
+            let list: FileList = resp.json().await?;
+            let items = list
+                .files
+                .into_iter()
+                .filter_map(|f| {
+                    f.name
+                        .map(|name| (f.id, name, f.size.and_then(|s| s.parse::<u64>().ok())))
+                })
+                .collect();
+            Ok((items, list.next_page_token))
         }
-        match list.next_page_token {
-            Some(t) => page = Some(t),
-            None => return Ok(out),
-        }
+    })
+    .await?;
+    if truncated {
+        // Backstop tripped — surface it rather than silently returning a partial listing
+        // (retention would then under-count and never trim).
+        return Err(Error::Other(
+            "Google Drive returned too many pages listing backups".into(),
+        ));
     }
-    // Backstop tripped — surface it rather than silently returning a partial listing (retention
-    // would then under-count and never trim).
-    Err(Error::Other(
-        "Google Drive returned too many pages listing backups".into(),
-    ))
+    Ok(out)
 }
 
 /// Ensure PM's backup folder exists and return its id (idempotent — check then create). With

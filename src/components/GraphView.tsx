@@ -15,6 +15,13 @@ import {
 } from "../lib/ipc";
 import { formatDate } from "../lib/format";
 import {
+  MAP_COHESION_KEY,
+  MAP_MODE_KEY,
+  readMapCohesion,
+  readMapMode,
+  type MapLayoutMode,
+} from "../lib/mapPrefs";
+import {
   buildSemanticLayout,
   getProjectLayout,
   type BaseLayout,
@@ -39,20 +46,8 @@ import { graphColor, useTheme, useDepth } from "../theme";
  * toggle is a redraw, not a relayout.
  */
 
-type LayoutMode = "project" | "semantic";
-const MODE_KEY = "pm.map.layoutMode";
-const COHESION_KEY = "pm.map.cohesion";
+// Arrangement + cohesion prefs live in lib/mapPrefs (shared with the Settings → Map section).
 const LABELS_KEY = "pm.map.labels";
-
-function initialMode(): LayoutMode {
-  return localStorage.getItem(MODE_KEY) === "semantic" ? "semantic" : "project";
-}
-
-/** Project-cohesion weight (0 = pure meaning, the default; ≤0.5). Per-device, like the mode pref. */
-function initialCohesion(): number {
-  const raw = Number(localStorage.getItem(COHESION_KEY));
-  return Number.isFinite(raw) ? Math.max(0, Math.min(0.5, raw)) : 0;
-}
 
 /** Show each document's file name on its node? Off by default (keeps a dense map clean); per-device. */
 function initialShowLabels(): boolean {
@@ -120,15 +115,15 @@ function fitTransform(bounds: Bounds, w: number, h: number): Transform {
 const isDashed = (doc?: Document) => !!doc && (!doc.reviewed || doc.source_type === "index_only");
 
 export function GraphView({ onOpenProject }: { onOpenProject?: (project: string) => void }) {
-  const { mode } = useTheme();
+  const { mode, system, accent } = useTheme();
   const [documents, setDocuments] = useState<Document[]>([]);
   const [base, setBase] = useState<BaseLayout | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<Document | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const [layoutMode, setLayoutMode] = useState<LayoutMode>(initialMode);
-  const [cohesion, setCohesion] = useState<number>(initialCohesion);
+  const [layoutMode, setLayoutMode] = useState<MapLayoutMode>(readMapMode);
+  const [cohesion, setCohesion] = useState<number>(readMapCohesion);
   const [showLabels, setShowLabels] = useState<boolean>(initialShowLabels);
   const [semantic, setSemantic] = useState<SemanticLayout | null>(null);
   const [computing, setComputing] = useState(false);
@@ -154,6 +149,14 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     lastY: number;
     moved: boolean;
   } | null>(null);
+  // The canvas colour snapshot, cached across frames: getComputedStyle + six getPropertyValue reads
+  // per rAF is real work while panning/zooming. The token values are a pure function of
+  // (system, mode, accent) — the mono accent even swaps the neutral ramp — so the cache is dropped
+  // whenever any of those change and the next draw re-snapshots the fresh custom properties.
+  const themeColorsRef = useRef<ThemeColors | null>(null);
+  useEffect(() => {
+    themeColorsRef.current = null;
+  }, [mode, system, accent]);
 
   useEffect(() => {
     listDocuments()
@@ -172,10 +175,10 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
 
   // Persist the chosen arrangement + cohesion (per-device, like the theme/depth prefs).
   useEffect(() => {
-    localStorage.setItem(MODE_KEY, layoutMode);
+    localStorage.setItem(MAP_MODE_KEY, layoutMode);
   }, [layoutMode]);
   useEffect(() => {
-    localStorage.setItem(COHESION_KEY, String(cohesion));
+    localStorage.setItem(MAP_COHESION_KEY, String(cohesion));
   }, [cohesion]);
   useEffect(() => {
     localStorage.setItem(LABELS_KEY, showLabels ? "1" : "0");
@@ -316,7 +319,13 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     const t = viewRef.current;
     const sx = (x: number) => x * t.scale + t.offsetX;
     const sy = (y: number) => y * t.scale + t.offsetY;
-    const colors = readThemeColors();
+    // Don't latch a mid-swap snapshot: if any token read empty (its fallback), leave the cache
+    // unset so the next frame re-reads — matching how the per-frame read used to self-heal.
+    let colors = themeColorsRef.current;
+    if (!colors) {
+      colors = readThemeColors();
+      if (!Object.values(colors).includes(THEME_FALLBACK)) themeColorsRef.current = colors;
+    }
 
     // Edges (project mode only; one path, single stroke). Node radii scale with the fit (size =
     // content volume, a real signal); stroke/edge widths stay fixed in screen pixels as crisp chrome.

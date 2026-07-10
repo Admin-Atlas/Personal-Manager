@@ -14,6 +14,7 @@ import {
 import type { Calendar, CalendarAccount, CalendarOverview } from "../lib/types";
 import { useDevMode } from "../lib/capabilities";
 import { formatWhen } from "../lib/format";
+import { useBusyRun } from "../lib/useBusyRun";
 import { Button, ConfirmDialog, Skeleton } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
 import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
@@ -79,9 +80,8 @@ export function CalendarConnection({
   const meta = PROVIDER_META[provider];
   const { devMode } = useDevMode();
   const [overview, setOverview] = useState<CalendarOverview | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const { busy, error, setError, run: runBusy } = useBusyRun();
   const [note, setNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [confirmEmail, setConfirmEmail] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -90,24 +90,18 @@ export function CalendarConnection({
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+    // setError is a stable useState setter (via useBusyRun) — listed to satisfy exhaustive-deps.
+  }, [setError]);
 
   // Refetch on mount, and whenever the parent group reports the shared client changed.
   useEffect(() => {
     void refresh();
   }, [refresh, refreshSignal]);
 
-  async function run(label: string, fn: () => Promise<void>) {
-    setBusy(label);
-    setError(null);
+  // Each action starts with a clean note line (the shared latch already clears the error).
+  function run(label: string, fn: () => Promise<void>) {
     setNote(null);
-    try {
-      await fn();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(null);
-    }
+    return runBusy(label, fn);
   }
 
   const configured =

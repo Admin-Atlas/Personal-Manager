@@ -26,7 +26,6 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::photos::ImageAnalysis;
 use crate::registry::{ModelEntry, Pooling, Source};
@@ -132,6 +131,37 @@ const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.0", "pillow-heif==1.4.0"];
 /// The marker's expected contents — the OCR pins joined, so a future bump re-installs. Kept in sync
 /// with [`OPTIONAL_OCR_PINS`]; the `optional_ocr_marker_matches_pins` test guards the join.
 const OPTIONAL_OCR_MARKER: &str = "rapidocr==3.9.0;pillow-heif==1.4.0";
+
+/// One on-demand pip component (t-SNE / photo-OCR). The per-component ready/install/uninstall
+/// operations differ only in these fields, so they share one implementation each
+/// (`optional_ready` / `install_optional` / `uninstall_optional` on [`SidecarManager`]); the
+/// public per-component methods are one-line delegates.
+struct OptionalComponent {
+    /// The venv marker recording the installed pins (`.pm-tsne` / `.pm-ocr`).
+    marker: fn(&SidecarPaths) -> PathBuf,
+    /// What a current marker must hold — and what a fresh install stamps.
+    stamp: &'static str,
+    /// The `pip install` pins.
+    pins: &'static [&'static str],
+    /// The packages `pip uninstall` removes. Only the top-level ones: heavier transitive deps are
+    /// deliberately LEFT in place so a removal can never break the base venv by pulling a package
+    /// something else relies on (see the public delegates' docs for each component's cascade).
+    uninstall: &'static [&'static str],
+}
+
+const OPTIONAL_TSNE_COMPONENT: OptionalComponent = OptionalComponent {
+    marker: SidecarPaths::tsne_marker,
+    stamp: OPTIONAL_TSNE_PIN,
+    pins: &[OPTIONAL_TSNE_PIN],
+    uninstall: &["openTSNE"],
+};
+
+const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
+    marker: SidecarPaths::ocr_marker,
+    stamp: OPTIONAL_OCR_MARKER,
+    pins: OPTIONAL_OCR_PINS,
+    uninstall: &["rapidocr", "pillow-heif"],
+};
 
 /// Where the sidecar script and its requirements live, and where the venv goes.
 pub struct SidecarPaths {
@@ -548,7 +578,7 @@ impl SidecarManager {
 
     fn requirements_hash(&self) -> Result<String> {
         let bytes = std::fs::read(self.paths.requirements())?;
-        Ok(hex_digest(&bytes))
+        Ok(crate::ingest::hex_digest(&bytes))
     }
 
     fn is_ready_marker_current(&self) -> Result<bool> {
@@ -840,29 +870,77 @@ impl SidecarManager {
     /// Whether the OPTIONAL t-SNE reducer is installed in this venv at the pinned version. Cheap (a
     /// marker read) so it can be polled on every layout request to decide PCA-vs-t-SNE.
     pub fn optional_tsne_ready(&self) -> bool {
+        self.optional_ready(&OPTIONAL_TSNE_COMPONENT)
+    }
+
+    /// Install the OPTIONAL t-SNE reducer (openTSNE) into the managed venv on demand — the shared
+    /// [`Self::install_optional`] flow with the t-SNE marker + pin. openTSNE pulls scikit-learn +
+    /// scipy (numpy is already present via fastembed). The download has no file-count, so the UI
+    /// renders `on_progress` as a percentage.
+    pub fn install_optional_tsne(&self, on_progress: impl FnMut(f32)) -> Result<()> {
+        self.install_optional(&OPTIONAL_TSNE_COMPONENT, on_progress)
+    }
+
+    /// Remove the OPTIONAL t-SNE component again (the "delete" action) — the shared
+    /// [`Self::uninstall_optional`] flow. Only openTSNE is removed: its heavier transitive deps
+    /// (scipy / scikit-learn) are left in place; a later re-install is then quick. Once the marker is
+    /// gone the map falls back to PCA.
+    pub fn uninstall_optional_tsne(&self) -> Result<()> {
+        self.uninstall_optional(&OPTIONAL_TSNE_COMPONENT)
+    }
+
+    /// Whether the OPTIONAL photo-OCR component is installed in this venv at the pinned versions.
+    /// Cheap (a marker read) so the ingest path can check it per photo to decide whether to request
+    /// OCR, and so Settings can show the install/remove state.
+    pub fn optional_ocr_ready(&self) -> bool {
+        self.optional_ready(&OPTIONAL_OCR_COMPONENT)
+    }
+
+    /// Install the OPTIONAL photo-OCR component (rapidocr + pillow-heif) into the managed venv on
+    /// demand — the shared [`Self::install_optional`] flow with the OCR marker + pins.
+    pub fn install_optional_ocr(&self, on_progress: impl FnMut(f32)) -> Result<()> {
+        self.install_optional(&OPTIONAL_OCR_COMPONENT, on_progress)
+    }
+
+    /// Remove the OPTIONAL photo-OCR component (the "delete" action) — the shared
+    /// [`Self::uninstall_optional`] flow. Only rapidocr + pillow-heif are removed: the heavier
+    /// transitive image deps (opencv / shapely / pyclipper) are LEFT in place here; the Storage
+    /// manager (components.rs) does the guarded cascade that reclaims them. Once the marker is gone,
+    /// future photos ingest EXIF-only.
+    pub fn uninstall_optional_ocr(&self) -> Result<()> {
+        self.uninstall_optional(&OPTIONAL_OCR_COMPONENT)
+    }
+
+    /// Shared readiness check for an [`OptionalComponent`]: the venv exists and the component's
+    /// marker holds exactly the pinned stamp (so a pin bump reads as not-installed and re-installs).
+    fn optional_ready(&self, component: &OptionalComponent) -> bool {
         self.paths.venv_python().exists()
-            && std::fs::read_to_string(self.paths.tsne_marker())
-                .map(|s| s.trim() == OPTIONAL_TSNE_PIN)
+            && std::fs::read_to_string((component.marker)(&self.paths))
+                .map(|s| s.trim() == component.stamp)
                 .unwrap_or(false)
     }
 
-    /// Install the OPTIONAL t-SNE reducer (openTSNE) into the managed venv on demand. The base venv
-    /// must exist first, so this provisions it if needed, then `pip install`s the pin and stamps the
-    /// t-SNE marker. Blocking and slow (a download); serialised by the install lock. Idempotent — a
-    /// no-op once the marker is current.
+    /// Shared install flow for an [`OptionalComponent`]. The base venv must exist first, so this
+    /// provisions it if needed, then `pip install`s the pins and stamps the marker. Blocking and
+    /// slow (a download); serialised by the install lock. Idempotent — a no-op once the marker is
+    /// current.
     ///
-    /// `on_progress` is called with a monotonic `0.0..=1.0` fraction as the install advances (derived
-    /// from pip's `Collecting/Downloading/Installing` markers — see [`pip_phase_fraction`]), so the
-    /// Map and Settings can show a real progress bar instead of an indeterminate spinner. The download
-    /// has no file-count, so the UI renders this as a percentage.
-    pub fn install_optional_tsne(&self, mut on_progress: impl FnMut(f32)) -> Result<()> {
+    /// `on_progress` is called with a monotonic `0.0..=1.0` fraction as the install advances
+    /// (derived from pip's `Collecting/Downloading/Installing` markers — see
+    /// [`pip_phase_fraction`]), so the UI can show a real progress bar instead of an indeterminate
+    /// spinner.
+    fn install_optional(
+        &self,
+        component: &OptionalComponent,
+        mut on_progress: impl FnMut(f32),
+    ) -> Result<()> {
         on_progress(0.03);
-        // openTSNE goes into the base venv, which must exist with its requirements first.
+        // The optional pins go into the base venv, which must exist with its requirements first.
         self.ensure_installed()?;
         on_progress(0.10);
 
         let _install = self.install.lock().unwrap();
-        if self.optional_tsne_ready() {
+        if self.optional_ready(component) {
             on_progress(1.0);
             return Ok(());
         }
@@ -872,96 +950,13 @@ impl SidecarManager {
         // byte bar) we can parse; the side-thread stderr drain in run_pip_streaming avoids a deadlock.
         let mut downloads = 0u32;
         let mut last = 0.10f32;
-        run_pip_streaming(
-            &py,
-            &[
-                "install",
-                "--disable-pip-version-check",
-                "--progress-bar",
-                "off",
-                OPTIONAL_TSNE_PIN,
-            ],
-            |line| {
-                if let Some(f) = pip_phase_fraction(line, &mut downloads) {
-                    if f > last {
-                        last = f;
-                        on_progress(f);
-                    }
-                }
-            },
-        )?;
-
-        std::fs::write(self.paths.tsne_marker(), OPTIONAL_TSNE_PIN)?;
-        on_progress(1.0);
-        Ok(())
-    }
-
-    /// Remove the OPTIONAL t-SNE component again (the "delete" action). Drops the marker first — that
-    /// alone disables t-SNE (`optional_tsne_ready` then reports false and the map falls back to PCA) —
-    /// then `pip uninstall`s openTSNE to reclaim space. Only openTSNE is removed: its heavier transitive
-    /// deps (scipy / scikit-learn) are left in place so we can never accidentally break the base venv by
-    /// pulling a package something else relies on; a later re-install is then quick. Idempotent.
-    pub fn uninstall_optional_tsne(&self) -> Result<()> {
-        let _install = self.install.lock().unwrap();
-        // Drop the marker first so the feature is off even if the pip call below fails.
-        let _ = std::fs::remove_file(self.paths.tsne_marker());
-        let py = self.paths.venv_python();
-        if !py.exists() {
-            return Ok(());
-        }
-        let mut pip = Command::new(&py);
-        pip.args([
-            "-m",
-            "pip",
-            "uninstall",
-            "-y",
-            "--disable-pip-version-check",
-            "openTSNE",
-        ]);
-        clean_python_env(&mut pip);
-        no_window(&mut pip);
-        // Best-effort: the marker is already gone, so a pip hiccup just leaves the (unused) package on
-        // disk rather than failing the user's "remove".
-        let _ = run_command(&mut pip, "pip uninstall openTSNE");
-        Ok(())
-    }
-
-    /// Whether the OPTIONAL photo-OCR component is installed in this venv at the pinned versions.
-    /// Cheap (a marker read) so the ingest path can check it per photo to decide whether to request
-    /// OCR, and so Settings can show the install/remove state.
-    pub fn optional_ocr_ready(&self) -> bool {
-        self.paths.venv_python().exists()
-            && std::fs::read_to_string(self.paths.ocr_marker())
-                .map(|s| s.trim() == OPTIONAL_OCR_MARKER)
-                .unwrap_or(false)
-    }
-
-    /// Install the OPTIONAL photo-OCR component (rapidocr + pillow-heif) into the managed venv on
-    /// demand — provisions the base venv first if needed, `pip install`s the pins, then stamps the OCR
-    /// marker. Blocking and slow (a download); serialised by the install lock. Idempotent — a no-op
-    /// once the marker is current. `on_progress` reports a monotonic `0.0..=1.0` fraction (from pip's
-    /// phase markers, see [`pip_phase_fraction`]) so Settings can show a real percentage bar.
-    pub fn install_optional_ocr(&self, mut on_progress: impl FnMut(f32)) -> Result<()> {
-        on_progress(0.03);
-        self.ensure_installed()?;
-        on_progress(0.10);
-
-        let _install = self.install.lock().unwrap();
-        if self.optional_ocr_ready() {
-            on_progress(1.0);
-            return Ok(());
-        }
-
-        let py = self.paths.venv_python();
-        let mut downloads = 0u32;
-        let mut last = 0.10f32;
         let mut args: Vec<&str> = vec![
             "install",
             "--disable-pip-version-check",
             "--progress-bar",
             "off",
         ];
-        args.extend_from_slice(OPTIONAL_OCR_PINS);
+        args.extend_from_slice(component.pins);
         run_pip_streaming(&py, &args, |line| {
             if let Some(f) = pip_phase_fraction(line, &mut downloads) {
                 if f > last {
@@ -971,20 +966,18 @@ impl SidecarManager {
             }
         })?;
 
-        std::fs::write(self.paths.ocr_marker(), OPTIONAL_OCR_MARKER)?;
+        std::fs::write((component.marker)(&self.paths), component.stamp)?;
         on_progress(1.0);
         Ok(())
     }
 
-    /// Remove the OPTIONAL photo-OCR component (the "delete" action). Drops the marker first — that
-    /// alone disables OCR (`optional_ocr_ready` then reports false and future photos ingest EXIF-only)
-    /// — then `pip uninstall`s rapidocr + pillow-heif. Like the t-SNE removal, the heavier transitive
-    /// image deps (opencv / shapely / pyclipper) are LEFT in place here so we can never break the base
-    /// venv; the Storage manager (components.rs) does the guarded cascade that reclaims them. Idempotent.
-    pub fn uninstall_optional_ocr(&self) -> Result<()> {
+    /// Shared removal flow for an [`OptionalComponent`]. Drops the marker first — that alone
+    /// disables the feature (`optional_ready` then reports false) — then `pip uninstall`s the
+    /// component's top-level packages to reclaim space. Idempotent.
+    fn uninstall_optional(&self, component: &OptionalComponent) -> Result<()> {
         let _install = self.install.lock().unwrap();
         // Drop the marker first so the feature is off even if the pip call below fails.
-        let _ = std::fs::remove_file(self.paths.ocr_marker());
+        let _ = std::fs::remove_file((component.marker)(&self.paths));
         let py = self.paths.venv_python();
         if !py.exists() {
             return Ok(());
@@ -996,14 +989,16 @@ impl SidecarManager {
             "uninstall",
             "-y",
             "--disable-pip-version-check",
-            "rapidocr",
-            "pillow-heif",
         ]);
+        pip.args(component.uninstall);
         clean_python_env(&mut pip);
         no_window(&mut pip);
         // Best-effort: the marker is already gone, so a pip hiccup just leaves the (unused) packages
         // on disk rather than failing the user's "remove".
-        let _ = run_command(&mut pip, "pip uninstall rapidocr pillow-heif");
+        let _ = run_command(
+            &mut pip,
+            &format!("pip uninstall {}", component.uninstall.join(" ")),
+        );
         Ok(())
     }
 
@@ -1256,12 +1251,6 @@ fn request_timeout(method: &str) -> std::time::Duration {
         // Any other (or future) method: a safe, generous default.
         _ => Duration::from_secs(10 * 60),
     }
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 /// markitdown 0.1.6 (see requirements.txt) needs Python >= 3.10, so the venv's
