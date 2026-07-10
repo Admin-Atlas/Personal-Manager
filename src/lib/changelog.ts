@@ -22,6 +22,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     version: "3.0.2-alpha",
     date: "2026-07-10",
     highlights: [
+      "Fixed: a brand-new vault could freeze PM moments after its very first launch — the window went grey and “Not Responding” and never recovered. First starts now boot cleanly.",
       "Under-the-hood tidying across the whole app: a codebase-wide cleanup pass that removes duplicated code and trims wasted work. A few things get snappier along the way — dragging notes on the pinboard, panning the knowledge map, importing documents, and calendar sync with several accounts.",
     ],
   },

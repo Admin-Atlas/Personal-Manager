@@ -2248,7 +2248,6 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, rules_cipher) = state.rules_io()?;
         let (_, manifest_cipher) = state.manifest_io()?;
-        let now = iso_now(&state)?;
 
         // The whole pass is all-or-nothing: corrections, alias rules, vault rewrites, and the
         // `reviewed` flags commit together, or the DB transaction rolls back and every vault file
@@ -2256,6 +2255,7 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
         // leave earlier docs marked reviewed (dropped from the queue on retry, their corrections
         // never re-logged) and mid-batch vault/DB drift.
         let mut conn = state.conn()?;
+        let now = ingest::iso_now(&conn)?;
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
@@ -2352,13 +2352,13 @@ pub async fn set_document_metadata(
         let (vault, cipher) = state.markdown_io()?;
         let (vault_root, rules_cipher) = state.rules_io()?;
         let (_, manifest_cipher) = state.manifest_io()?;
-        let now = iso_now(&state)?;
 
         // Log the correction + rewrite the vault file + update the row atomically, restoring the
         // vault file (and rules file) if the DB side fails (the file writes land first). This is a
         // *reassignment* (one document moves), not a merge: no alias rule is captured — the prior
         // value is the document's own canonical, not a model-proposed variant.
         let mut conn = state.conn()?;
+        let now = ingest::iso_now(&conn)?;
         let tx = conn.transaction()?;
         let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
@@ -4263,7 +4263,9 @@ async fn migrate_preferences_once(app: AppHandle) -> Result<()> {
         let blob = db::get_setting(&conn, preferences::LEGACY_PROFILE_KEY)?.unwrap_or_default();
         if blob.trim().is_empty() {
             // Nothing to migrate — stamp the flag so we don't re-read an empty blob each launch.
-            let now = iso_now(&state)?;
+            // Every fresh vault takes this branch on first boot; re-locking the state here (the old
+            // `iso_now(&state)`) self-deadlocked the non-reentrant DB mutex and froze the whole app.
+            let now = ingest::iso_now(&conn)?;
             db::set_setting(&conn, preferences::MIGRATED_FLAG_KEY, &now)?;
             return Ok(());
         }
@@ -4279,8 +4281,8 @@ async fn migrate_preferences_once(app: AppHandle) -> Result<()> {
     let drafts = preferences::distill_blob(api_key.expose(), &models, &blob).await?;
 
     let state = app.state::<AppState>();
-    let now = iso_now(&state)?;
     let conn = state.conn()?;
+    let now = ingest::iso_now(&conn)?;
     let tx = conn.unchecked_transaction()?;
     for d in &drafts {
         // The blob has no entity to resolve a project against, so distilled records are global/
@@ -4475,8 +4477,8 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         briefing::generate(api_key.expose(), &models, &snapshot, profile.as_deref()).await?;
 
     let state = app.state::<AppState>();
-    let now = iso_now(&state)?;
     let conn = state.conn()?;
+    let now = ingest::iso_now(&conn)?;
     log_usage(
         &conn,
         "background",
@@ -5034,16 +5036,10 @@ fn total_cost(rows: &[ModelSpend]) -> Option<f64> {
 }
 
 // --- helpers ---
-
-/// Current UTC time in the store's ISO8601 format (matches ingest timestamps).
-fn iso_now(state: &AppState) -> Result<String> {
-    let conn = state.conn()?;
-    Ok(
-        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
-            r.get(0)
-        })?,
-    )
-}
+// NOTE: there is deliberately no `iso_now(&AppState)` helper here. One existed and took
+// `state.conn()` internally, which self-deadlocked the non-reentrant DB mutex when called
+// with the guard already held (it froze every fresh-vault boot). Use `ingest::iso_now(&conn)`
+// with the connection you already hold.
 
 /// Resolve the user's stored IANA zone to a `chrono_tz::Tz`. Falls back to UTC when
 /// the key is unset, empty, or unparseable — chrono `Local` only yields an offset
