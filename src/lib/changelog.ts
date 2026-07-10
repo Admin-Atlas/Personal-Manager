@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.0.3-alpha",
+    date: "2026-07-10",
+    highlights: [
+      "Under-the-hood: our release tooling now double-checks that the notes shown on a version's download page match the version actually being shipped, so a release can't go out with the wrong notes attached. Nothing changes for you day to day.",
+    ],
+  },
+  {
     version: "3.0.2-alpha",
     date: "2026-07-10",
     highlights: [
