@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.0.3-alpha",
+    date: "2026-07-10",
+    highlights: [
+      "Fixed: a brand-new vault could freeze PM moments after its very first launch — the window went grey and “Not Responding” and never recovered. First starts now boot cleanly.",
+    ],
+  },
+  {
     version: "3.0.1-alpha",
     date: "2026-07-08",
     highlights: [
