@@ -17,6 +17,16 @@ import type { SidecarErrorKind } from "./types";
 export const IS_MAC =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
+/** True on desktop Linux (WebKitGTK reports e.g. "X11; Linux x86_64"). Checked after
+ *  IS_MAC so an iPadOS UA can never fall through here. */
+export const IS_LINUX =
+  typeof navigator !== "undefined" && !IS_MAC && /Linux/.test(navigator.userAgent);
+
+/** The three desktops PM ships on; Windows is the fallback (matches the old binary
+ *  Mac-vs-not detection, so nothing changes where Linux isn't involved). */
+export type SetupPlatform = "windows" | "mac" | "linux";
+export const PLATFORM: SetupPlatform = IS_MAC ? "mac" : IS_LINUX ? "linux" : "windows";
+
 /** "install" is the proactive, not-yet-installed case; the rest are failures. */
 export type SetupGuideMode = SidecarErrorKind | "install";
 
@@ -26,10 +36,10 @@ export interface SetupGuide {
   steps: string[];
 }
 
-export function guideFor(mode: SetupGuideMode, isMac: boolean): SetupGuide {
+export function guideFor(mode: SetupGuideMode, platform: SetupPlatform): SetupGuide {
   switch (mode) {
     case "install":
-      return isMac
+      return platform === "mac"
         ? {
             title: "Set up the document engine",
             summary:
@@ -39,6 +49,8 @@ export function guideFor(mode: SetupGuideMode, isMac: boolean): SetupGuide {
             ],
           }
         : {
+            // Windows and Linux both ship a bundled interpreter, so setup is fully
+            // self-contained on both.
             title: "Set up the document engine",
             summary:
               "PM converts and indexes your documents on your device using a small Python engine. Setting it up is a one-time step.",
@@ -53,25 +65,39 @@ export function guideFor(mode: SetupGuideMode, isMac: boolean): SetupGuide {
         mode === "python_too_old"
           ? "PM's document engine needs Python 3.10 or newer, and the Python on this computer is older. (macOS ships an old Python, so this is common on a fresh Mac.)"
           : "PM's document engine needs Python 3.10 or newer, and PM couldn't find a suitable one on this computer.";
-      return isMac
-        ? {
-            title: "PM needs a newer Python",
-            summary,
-            steps: [
-              "Install Python 3.10 or newer — run `brew install python@3.12`, or download it from python.org and run the installer.",
-              "Click Retry below. PM checks the usual install locations automatically — you don't need the Terminal or any environment variables.",
-              "Still stuck? Open Technical details below to see exactly what PM found.",
-            ],
-          }
-        : {
-            title: "PM needs a newer Python",
-            summary,
-            steps: [
-              "Install Python 3.10 or newer from python.org — tick “Add python.exe to PATH” in the installer.",
-              "Click Retry below.",
-              "Unusual setup? You can point PM at a specific interpreter with the PM_PYTHON environment variable.",
-            ],
-          };
+      if (platform === "mac") {
+        return {
+          title: "PM needs a newer Python",
+          summary,
+          steps: [
+            "Install Python 3.10 or newer — run `brew install python@3.12`, or download it from python.org and run the installer.",
+            "Click Retry below. PM checks the usual install locations automatically — you don't need the Terminal or any environment variables.",
+            "Still stuck? Open Technical details below to see exactly what PM found.",
+          ],
+        };
+      }
+      if (platform === "linux") {
+        // Only reachable if the bundled interpreter is missing/broken (then
+        // packaging_bug is the more likely classification) or on a from-source build.
+        return {
+          title: "PM needs a newer Python",
+          summary,
+          steps: [
+            "Install Python 3.10 or newer with your package manager — Fedora: `sudo dnf install python3`; Debian/Ubuntu: `sudo apt install python3`.",
+            "Click Retry below.",
+            "Unusual setup? You can point PM at a specific interpreter with the PM_PYTHON environment variable.",
+          ],
+        };
+      }
+      return {
+        title: "PM needs a newer Python",
+        summary,
+        steps: [
+          "Install Python 3.10 or newer from python.org — tick “Add python.exe to PATH” in the installer.",
+          "Click Retry below.",
+          "Unusual setup? You can point PM at a specific interpreter with the PM_PYTHON environment variable.",
+        ],
+      };
     }
 
     case "python_download_failed":

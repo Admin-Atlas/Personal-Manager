@@ -10,7 +10,10 @@
 //!
 //! Windows uses `icacls`: strip inherited ACEs and grant Full, inheritable access to
 //! the current user, the Administrators group, and any explicitly linked accounts.
-//! macOS is a flagged stub (shared vaults are weaker there; the UI says so).
+//! Linux uses plain POSIX permissions plus ACLs: `chmod 700` on the vault root denies
+//! traversal to every other account (children are unreachable regardless of their own
+//! modes), and `setfacl` re-admits explicitly linked accounts. macOS is a flagged stub
+//! (shared vaults are weaker there; the UI says so).
 
 // --- Windows: icacls --------------------------------------------------------------
 
@@ -141,27 +144,134 @@ mod platform {
     }
 }
 
-// --- macOS / other: flagged stub --------------------------------------------------
+// --- Linux: chmod 700 + POSIX ACLs via setfacl -------------------------------------
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::path::Path;
+    use std::process::Command;
+
+    use crate::error::{Error, Result};
+
+    /// The `setfacl` argument list granting one account read/write plus
+    /// search-on-directories (`X`), both as an effective ACE on everything that exists
+    /// (`-R -m`) and as a default ACE on directories (`-d -m`) so new children inherit
+    /// it. Pure so the shape is unit-testable without touching a filesystem.
+    fn setfacl_args(principal: &str) -> Vec<String> {
+        let p = principal.trim();
+        vec![
+            "-R".to_string(),
+            "-m".to_string(),
+            format!("u:{p}:rwX"),
+            "-d".to_string(),
+            "-m".to_string(),
+            format!("u:{p}:rwX"),
+        ]
+    }
+
+    /// Run `setfacl` against `dir`, mapping "command not found" to an actionable
+    /// message (the tool ships in the `acl` package, present by default on Fedora but
+    /// not guaranteed everywhere).
+    fn run_setfacl(dir: &Path, args: &[String]) -> Result<()> {
+        let out = Command::new("setfacl")
+            .args(args)
+            .arg(dir)
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::Other(
+                        "setfacl was not found — install the 'acl' package (e.g. sudo dnf \
+                         install acl) to link another account"
+                            .into(),
+                    )
+                } else {
+                    Error::Other(format!("could not run setfacl: {e}"))
+                }
+            })?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(Error::Other(format!(
+                "setfacl failed: {}",
+                err.trim().lines().last().unwrap_or("(no output)")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Lock a shared vault folder down to its owner: `chmod 700` on the root denies
+    /// every other account traversal (children become unreachable regardless of their
+    /// own modes), then `setfacl` re-admits any explicitly linked accounts.
+    pub fn restrict_to_owner(dir: &Path, extra_principals: &[String]) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| Error::Other(format!("could not chmod the vault folder: {e}")))?;
+        for p in extra_principals {
+            if !p.trim().is_empty() {
+                run_setfacl(dir, &setfacl_args(p))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Additively grant one more account (the Settings "link a second account" field)
+    /// access, without disturbing the owner lockdown. The ACL mask `setfacl` recomputes
+    /// re-admits the account through the 700 root.
+    pub fn grant_access(dir: &Path, principal: &str) -> Result<()> {
+        if principal.trim().is_empty() {
+            return Err(Error::Other("an account name or uid is required".into()));
+        }
+        run_setfacl(dir, &setfacl_args(principal))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::setfacl_args;
+
+        #[test]
+        fn setfacl_args_grant_effective_and_default_aces() {
+            assert_eq!(
+                setfacl_args("alice"),
+                ["-R", "-m", "u:alice:rwX", "-d", "-m", "u:alice:rwX"]
+            );
+            // Whitespace from a pasted value is trimmed.
+            assert_eq!(
+                setfacl_args("  1001  "),
+                ["-R", "-m", "u:1001:rwX", "-d", "-m", "u:1001:rwX"]
+            );
+        }
+
+        #[test]
+        fn restrict_to_owner_chmods_the_root_to_700() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            super::restrict_to_owner(dir.path(), &[]).unwrap();
+            let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+    }
+}
+
+// --- macOS: flagged stub ------------------------------------------------------------
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     use std::path::Path;
 
     use crate::error::{Error, Result};
 
-    /// Folder ACLs aren't wired outside Windows in this release. Encryption is still the
-    /// real protection, so callers treat this as a warning. On macOS this is the flagged
-    /// stub — TODO(mac, deferred): `chmod 700` + a `chmod +a` ACE for the linked account.
+    /// Folder ACLs aren't wired on macOS in this release. Encryption is still the
+    /// real protection, so callers treat this as a warning. TODO(mac, deferred):
+    /// `chmod 700` + a `chmod +a` ACE for the linked account.
     pub fn restrict_to_owner(_dir: &Path, _extra_principals: &[String]) -> Result<()> {
         Err(Error::Other(
-            "shared-folder ACLs are only applied on Windows in this release".into(),
+            "shared-folder ACLs aren't applied on macOS in this release".into(),
         ))
     }
 
-    /// See [`restrict_to_owner`]: not implemented off Windows.
+    /// See [`restrict_to_owner`]: not implemented on macOS.
     pub fn grant_access(_dir: &Path, _principal: &str) -> Result<()> {
         Err(Error::Other(
-            "shared-folder ACLs are only applied on Windows in this release".into(),
+            "shared-folder ACLs aren't applied on macOS in this release".into(),
         ))
     }
 }

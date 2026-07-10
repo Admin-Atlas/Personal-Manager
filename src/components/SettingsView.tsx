@@ -45,6 +45,7 @@ import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { formatWhen } from "../lib/format";
+import { IS_LINUX } from "../lib/setupGuide";
 import {
   MAP_COHESION_KEY,
   MAP_MODE_KEY,
@@ -1296,8 +1297,16 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     <p className="mt-1 text-xs text-ink4">
                       {appLock?.available
                         ? "Require Windows Hello (face, fingerprint, or PIN) to open PM. A convenience lock for the window — your store is always encrypted at rest. Takes effect next time you open PM."
-                        : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
+                        : IS_LINUX
+                          ? "Not available on Linux yet. Your store is always encrypted at rest."
+                          : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
                     </p>
+                    {appLock?.enabled && !appLock.available && (
+                      <p className="mt-1 text-xs text-ink4">
+                        App lock is on, but this device can't verify — PM opens without it here. The
+                        setting stays saved and re-arms on a device that can verify.
+                      </p>
+                    )}
                   </div>
                   <button
                     type="button"
@@ -1305,6 +1314,13 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     aria-checked={appLock?.enabled ?? false}
                     aria-label="App lock"
                     disabled={!appLock?.available}
+                    title={
+                      appLock?.available
+                        ? undefined
+                        : IS_LINUX
+                          ? "Feature not available on Linux yet"
+                          : "Not available on this device"
+                    }
                     onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
                     className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                       appLock?.enabled ? "bg-accent" : "bg-surface"
@@ -1342,7 +1358,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       <p className="mt-1 text-xs text-ink4">
                         Your documents in the Markdown vault are stored unencrypted so any tool can
                         read them. To protect them when your machine is off or logged out, turn on
-                        full-disk encryption (BitLocker on Windows, FileVault on macOS).
+                        full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on
+                        Linux).
                       </p>
                     </Collapsible>
                   </div>

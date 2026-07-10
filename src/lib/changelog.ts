@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.1.0-alpha",
+    date: "2026-07-10",
+    highlights: [
+      "Groundwork for Linux (first of a short series): on Linux, PM now keeps its secrets in your desktop's real keychain (KWallet or GNOME Keyring), so the key that protects your store survives a reboot — the load-bearing first step toward a supported Linux app. Nothing changes on Windows or macOS.",
+      "The app-lock switch on Linux now says honestly that it isn't available yet, instead of offering a lock that any keypress would satisfy. A real Linux lock is on the roadmap.",
+      "Fixed: restoring a backup made with the app lock turned on, onto a computer that can't run the verification (a Mac today, a Linux machine tomorrow), no longer shows a lock screen that can never pass — PM opens normally, tells you the lock is inactive on this device, and the setting re-arms on a machine that can verify.",
+      "Shared vaults on Linux now get an OS-level folder lockdown (owner-only access, linked accounts re-admitted) — the same defence-in-depth Windows applies with file ACLs.",
+    ],
+  },
+  {
     version: "3.0.3-alpha",
     date: "2026-07-10",
     highlights: [

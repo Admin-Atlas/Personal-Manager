@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.0.3-alpha"
+version = "3.1.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -119,7 +119,14 @@ futures-util = "0.3"
 tauri-plugin-single-instance = "2"
 
 # OS keychain for all secrets (API key, DB key). Per-platform native backends;
-# Linux uses kernel keyutils only for local dev (Windows/macOS are the real targets).
+# Linux uses the freedesktop Secret Service over the session D-Bus (KWallet on KDE,
+# GNOME Keyring elsewhere) — the one persistent store the desktop actually provides.
+# NOT `linux-native` (kernel keyutils): that keyring is cleared on reboot, so the DB
+# key minted at first boot would vanish and the SQLCipher store would be permanently
+# unreadable at next launch. The sync backend links the system libdbus (a hard
+# desktop dependency anyway); the plain (unencrypted) D-Bus session is a decision —
+# same-user callers can query the unlocked daemon regardless, so DH session
+# encryption buys nothing against the actual threat model.
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 # Windows Hello for the optional, opt-in app-lock (a soft UI gate — see applock.rs).
@@ -137,5 +144,5 @@ windows-future = "0.2"
 keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["linux-native"] }
+keyring = { version = "3", features = ["sync-secret-service"] }
 

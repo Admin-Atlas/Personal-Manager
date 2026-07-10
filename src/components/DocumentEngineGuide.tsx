@@ -18,7 +18,7 @@ import { useDepth } from "../theme";
 import type { SidecarStatus } from "../lib/types";
 import { onPythonInstall } from "../lib/ipc";
 import { CHANGELOG } from "../lib/changelog";
-import { guideFor, IS_MAC, type SetupGuideMode } from "../lib/setupGuide";
+import { guideFor, PLATFORM, type SetupGuideMode } from "../lib/setupGuide";
 
 const REPO_URL = "https://github.com/Admin-Atlas/Personal-Manager";
 
@@ -54,7 +54,8 @@ function withCode(text: string) {
 function buildReportUrl(detail: string | null): string {
   const version = CHANGELOG[0]?.version ?? "unknown";
   const ua = typeof navigator !== "undefined" ? navigator.userAgent : "unknown";
-  const title = `Windows: document engine failed to start (bundled Python incomplete) — v${version}`;
+  const os = PLATFORM === "mac" ? "macOS" : PLATFORM === "linux" ? "Linux" : "Windows";
+  const title = `${os}: document engine failed to start (bundled Python incomplete) — v${version}`;
   const body = [
     "**What happened**",
     "PM's document engine couldn't start, and PM classified it as a packaging bug.",
@@ -97,7 +98,7 @@ export function DocumentEngineGuide({ open, onClose, status, busy, onRetry }: Pr
   const kind = status?.state === "error" ? status.kind : null;
   const isPackagingBug = kind === "packaging_bug";
   const mode: SetupGuideMode = isError ? status.kind : "install";
-  const guide = guideFor(mode, IS_MAC);
+  const guide = guideFor(mode, PLATFORM);
   const actionLabel = isError ? "Retry setup" : "Set it up now";
   const rawMessage = status?.state === "error" ? status.message : null;
   // A packaging bug isn't locally fixable — route the user to a pre-filled report
