@@ -909,6 +909,17 @@ export const wipePmData = (selection: WipeSelection) =>
  *  at all (the caller treats that like a cancel). No session side effect. */
 export const confirmWipeIdentity = () => invoke<boolean>("confirm_wipe_identity");
 
+/** Recover from a bricked boot (the store is present but its key was lost, so it fails to open with
+ *  "wrong key or corrupt file"): delete the unreadable store + metadata so the next launch starts a
+ *  clean, empty vault. Only permitted while a boot open-error is actually carried; keychain secrets
+ *  (API keys, etc.) are left intact. The caller relaunches the app afterwards. */
+export const resetAfterOpenError = () => invoke<void>("reset_after_open_error");
+
+/** After a full "remove PM completely" wipe, launch the Windows uninstaller (which also removes the
+ *  leftover data + WebView2 folders) so nothing of PM remains, then the caller exits. Rejects on
+ *  non-Windows or a dev build with no installed uninstaller — the data is already gone regardless. */
+export const launchUninstaller = () => invoke<void>("launch_uninstaller");
+
 // --- Encrypted backup (Proton Drive / user cloud) — PR1 local `.pmbackup` archive + restore ---
 
 /** Create an encrypted, portable `.pmbackup` at `destPath`, protected by `passphrase`. Runs detached;

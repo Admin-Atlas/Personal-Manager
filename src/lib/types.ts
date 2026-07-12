@@ -102,6 +102,9 @@ export interface WipeReport {
   keychainDeleted: number;
   /** True when the store or keychain was touched, so the app can't keep running and must close. */
   quitRequired: boolean;
+  /** True when EVERY class was removed — a "remove PM completely" wipe. The UI then launches the
+   *  Windows uninstaller so nothing of PM remains on the machine. */
+  fullPurge: boolean;
 }
 
 // --- Shared & portable vaults (spec §2–6) ---

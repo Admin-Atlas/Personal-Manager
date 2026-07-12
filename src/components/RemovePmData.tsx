@@ -16,9 +16,9 @@
 // here in the webview. Backups are deliberately NOT deletable here — the UI directs the user to the
 // backup destination (Proton / Google Drive) to remove those at the source.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { exit } from "@tauri-apps/plugin-process";
-import { confirmWipeIdentity, wipePmData } from "../lib/ipc";
+import { confirmWipeIdentity, launchUninstaller, wipePmData } from "../lib/ipc";
 import { formatBytes } from "../lib/format";
 import type { WipeReport } from "../lib/types";
 import { Button, Input, Modal } from "./ui";
@@ -75,15 +75,16 @@ const ITEMS: Item[] = [
     key: "vaultAndDb",
     label: "Vault & database",
     detail:
-      "Every document, note, chat, project and setting — your Markdown vault and its encrypted store.",
-    consequence: "Permanent. Everything you've put into PM is gone unless you have a backup.",
+      "Every document, note, chat and project — plus everything stored in the database: which cloud accounts and folders you've connected, your model choices, and your preferences. This is your Markdown vault and its encrypted store.",
+    consequence:
+      "Permanent. Everything you've put into PM — and every connection and setting — is gone unless you have a backup.",
     danger: true,
   },
   {
     key: "keychain",
     label: "Saved keys & sign-ins",
     detail:
-      "Your API keys, the database key, the backup passphrase, and every connected Google / Microsoft account, all held in the OS keychain.",
+      "The secrets in your OS keychain: your API keys, the database key, the backup passphrase, and the sign-in tokens for connected Google / Microsoft accounts. (Which accounts you connected is recorded in the database above — this removes the keys, not that list.)",
     consequence:
       "Revokes PM's Google access and forgets every key. Microsoft access is finished separately at account.live.com.",
     danger: true,
@@ -103,6 +104,11 @@ export function RemovePmData({ biometricAvailable }: Props) {
   const [verifying, setVerifying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<WipeReport | null>(null);
+  // A full wipe ("remove PM completely") finishes by launching the Windows uninstaller and exiting.
+  // `uninstallHint` holds a fallback message if that can't run (a dev build / no installed
+  // uninstaller); `finishingRef` guards the auto-launch so it fires exactly once.
+  const [uninstallHint, setUninstallHint] = useState<string | null>(null);
+  const finishingRef = useRef(false);
 
   const anySelected = sel.regenerable || sel.vaultAndDb || sel.keychain || sel.localStorage;
   const selectedItems = ITEMS.filter((i) => sel[i.key]);
@@ -110,6 +116,12 @@ export function RemovePmData({ biometricAvailable }: Props) {
   // can never be opened again. We therefore FORCE "Vault & database" on whenever "Saved keys" is
   // selected — the vault checkbox is locked on in that case — and keep the warning explaining why.
   const vaultForcedByKeychain = sel.keychain;
+  // A full wipe auto-launches the uninstaller and exits — but not past anything the user must still
+  // act on. A connected Microsoft account has no programmatic revoke (only its local token is
+  // deleted), and this screen is the ONLY place that tells them to finish at account.live.com; an
+  // unreachable Google grant is similar. When either is present, wait for the explicit click.
+  const actionRequired =
+    (report?.microsoftAccounts.length ?? 0) > 0 || (report?.googleRevokeFailures ?? 0) > 0;
 
   function reset() {
     setSel(EMPTY_SELECTION);
@@ -179,6 +191,31 @@ export function RemovePmData({ biometricAvailable }: Props) {
       setStage("type"); // back to the last gate so they can retry or cancel
     }
   }
+
+  // Finish a full "remove PM completely" wipe: launch the Windows uninstaller (it clears the program
+  // files and the leftover data/webview folders) and exit. If it can't run (dev build / no installed
+  // uninstaller), leave a hint — the user's data is already gone, so they just finish via the OS.
+  async function finishUninstall() {
+    if (finishingRef.current) return;
+    finishingRef.current = true;
+    try {
+      await launchUninstaller();
+    } catch (e) {
+      finishingRef.current = false;
+      setUninstallHint(String(e));
+      return;
+    }
+    await exit(0);
+  }
+
+  // Auto-launch the uninstaller as soon as a full wipe reports success — unless there's a revoke
+  // reminder the user must read first, in which case wait for their "Finish uninstall" click.
+  useEffect(() => {
+    if (stage === "done" && report?.fullPurge && !uninstallHint && !actionRequired) {
+      void finishUninstall();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, report, uninstallHint, actionRequired]);
 
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-remove-data">
@@ -393,7 +430,9 @@ export function RemovePmData({ biometricAvailable }: Props) {
             </>
           ) : (
             <>
-              <h2 className="font-head text-base font-semibold text-ink">PM data removed</h2>
+              <h2 className="font-head text-base font-semibold text-ink">
+                {report?.fullPurge ? "Removing PM from this machine…" : "PM data removed"}
+              </h2>
               <ul className="mt-3 space-y-1 text-sm text-ink3">
                 {(report?.removed ?? []).map((r) => (
                   <li key={r}>• {r}</li>
@@ -431,8 +470,32 @@ export function RemovePmData({ biometricAvailable }: Props) {
                   )}
                 </div>
               )}
+              {report?.fullPurge &&
+                (uninstallHint ? (
+                  <p className="mt-3 text-xs text-st-due">
+                    Your data is removed. Finish uninstalling PM from Windows Settings → Apps to
+                    clear the last of it.
+                  </p>
+                ) : actionRequired ? (
+                  <p className="mt-3 text-xs text-ink3">
+                    Your data is gone. Finish the access step noted above first, then choose “Finish
+                    uninstall” to remove PM completely and close it.
+                  </p>
+                ) : (
+                  <p className="mt-3 text-xs text-ink4">
+                    Your data is gone. Finishing the uninstall now — this window will close, and the
+                    uninstaller clears the rest.
+                  </p>
+                ))}
               <div className="mt-5 flex justify-end gap-2">
-                {report?.quitRequired ? (
+                {report?.fullPurge ? (
+                  <Button
+                    variant="primary"
+                    onClick={() => void (uninstallHint ? exit(0) : finishUninstall())}
+                  >
+                    {uninstallHint ? "Close PM" : "Finish uninstall"}
+                  </Button>
+                ) : report?.quitRequired ? (
                   <Button variant="primary" onClick={() => void exit(0)}>
                     Close PM
                   </Button>

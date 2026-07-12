@@ -13,16 +13,31 @@
 ; Settings -> Storage tab frees, and nothing the user would miss (it re-downloads on
 ; next use). This is the counterpart to the app's "Remove PM data" flow.
 ;
-; Deliberately LEFT untouched, so uninstall -> reinstall keeps everything:
+; Deliberately LEFT untouched on a NORMAL uninstall, so uninstall -> reinstall keeps everything:
 ;   * the Markdown vault and the encrypted database (the real user data),
 ;   * OS-keychain secrets (DB key, API keys, OAuth tokens),
-;   * browser-side local storage (UI preferences).
-; A full "remove PM from this machine" wipe of those is offered inside the app, behind
-; several confirmations, rather than silently on uninstall.
+;   * browser-side local storage (UI preferences, in the WebView2 folder).
 ;
-; $LOCALAPPDATA resolves to the uninstalling user's local AppData (PM installs
-; per-user), matching where the app itself resolves its data dir.
+; EXCEPTION - a full "remove PM completely" wipe inside the app (Settings -> Data &
+; Security, behind several confirmations) deletes the user data itself, then drops a
+; marker file in the WebView2 folder and launches this uninstaller. When that marker is
+; present we ALSO purge the two folders the running app couldn't remove itself: its data
+; dir (as a backstop, in case a stray handle blocked the app's own delete) and the in-use
+; WebView2 folder. The marker lives OUTSIDE the data dir precisely so it survives the app
+; clearing that dir; the app also clears any stale marker on a normal boot, so a cancelled
+; full-uninstall can never make a later ordinary uninstall purge a still-wanted install.
+;
+; $LOCALAPPDATA resolves to the uninstalling user's local AppData (PM installs per-user),
+; matching where the app itself resolves its data + WebView2 dirs. The identifier
+; "org.itsatlas.pm" is fixed (renaming it orphans the keychain; see src-tauri/src/paths.rs).
 
 !macro NSIS_HOOK_POSTUNINSTALL
-  RMDir /r "$LOCALAPPDATA\Personal Manager\runtime"
+  IfFileExists "$LOCALAPPDATA\org.itsatlas.pm\.pm-uninstall-purge" pm_purge_all pm_keep_data
+  pm_purge_all:
+    RMDir /r "$LOCALAPPDATA\Personal Manager"
+    RMDir /r "$LOCALAPPDATA\org.itsatlas.pm"
+    Goto pm_purge_done
+  pm_keep_data:
+    RMDir /r "$LOCALAPPDATA\Personal Manager\runtime"
+  pm_purge_done:
 !macroend

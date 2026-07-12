@@ -56,6 +56,42 @@ pub fn venv_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(data_dir(app)?.join("runtime").join("venv"))
 }
 
+/// The WebView2 (Edge runtime) user-data folder Tauri gives the app on Windows:
+/// `%LOCALAPPDATA%\<identifier>` (holding `EBWebView/` — the webview cache + this app's
+/// `localStorage`/IndexedDB). It sits OUTSIDE the "Personal Manager" data dir, under the
+/// bundle identifier, so a "remove PM completely" flow has to clear it too. The identifier is
+/// fixed (`org.itsatlas.pm`; renaming it orphans the keychain — see [`data_dir`]).
+pub fn webview_data_dir(app: &AppHandle) -> Result<PathBuf> {
+    let base = app
+        .path()
+        .local_data_dir()
+        .map_err(|e| Error::Other(format!("could not resolve local data dir: {e}")))?;
+    Ok(base.join(&app.config().identifier))
+}
+
+/// Filename of the marker a full "remove PM completely" wipe drops in [`webview_data_dir`] so the
+/// NSIS uninstaller's post-uninstall hook knows to purge the leftover data + webview folders (a
+/// normal uninstall leaves user data for a reinstall). It lives in the webview folder — which the
+/// running app can't delete but the uninstaller can, after PM has exited — so it survives the app
+/// deleting its own data dir. Cleared on every normal boot ([`clear_stale_uninstall_purge_marker`])
+/// so a cancelled uninstall can never purge a later, still-wanted install.
+pub const UNINSTALL_PURGE_MARKER: &str = ".pm-uninstall-purge";
+
+/// Path to the full-uninstall purge marker (see [`UNINSTALL_PURGE_MARKER`]).
+pub fn uninstall_purge_marker(app: &AppHandle) -> Result<PathBuf> {
+    Ok(webview_data_dir(app)?.join(UNINSTALL_PURGE_MARKER))
+}
+
+/// Delete a stale full-uninstall purge marker at boot. It's only meant to bridge the seconds
+/// between a full wipe and the uninstaller running; if the app is booting normally the user kept
+/// (or reinstalled) PM, so any leftover marker must go or a future *ordinary* uninstall would
+/// wrongly purge their data. Best-effort — an absent marker or unreadable folder is a no-op.
+pub fn clear_stale_uninstall_purge_marker(app: &AppHandle) {
+    if let Ok(marker) = uninstall_purge_marker(app) {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
 /// Walk up from `start`, returning the `sidecar/` folder of the nearest ancestor that holds a
 /// `pm_sidecar.py`. This is the dev fallback: the binary sits under `src-tauri/target/<profile>/`
 /// and the repo root above it holds `sidecar/`. Split out of [`sidecar_source_dir`] so the walk

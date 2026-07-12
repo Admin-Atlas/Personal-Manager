@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.3.0-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "Fixed an important issue with “Remove PM data”: if the removal was interrupted — for example by a force-quit, or antivirus briefly locking the file — PM could end up unable to open your vault, stuck on the “couldn’t open your vault” screen with no way forward. Removal now works in a safe order and, if the vault file can’t be deleted, stops without changing anything so you can simply try again.",
+      "Added a “Start fresh” option on the “couldn’t open your vault” screen. If the vault ever genuinely can’t be opened, you can now safely reset and set PM up again from there — you’re never stuck. (Your saved keys and sign-ins are kept.)",
+      "Choosing to remove everything now uninstalls PM completely: after clearing your data it hands off to the Windows uninstaller and leaves nothing of PM behind on your computer.",
+      "Clearer wording on the “Remove PM data” screen about what each choice deletes — your connected accounts and model preferences are stored in the database, so they’re removed with “Vault & database”, while “Saved keys & sign-ins” clears the keys and tokens themselves.",
+    ],
+  },
+  {
     version: "3.2.1-alpha",
     date: "2026-07-12",
     highlights: [

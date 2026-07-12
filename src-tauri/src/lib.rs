@@ -672,6 +672,11 @@ pub fn run() {
                 wipe::sweep_restore_staging(&data_dir, &resolved.vault_root);
             }
 
+            // If a prior full "remove PM completely" wipe armed the uninstaller's purge marker but the
+            // uninstall didn't happen (cancelled), we're booting normally — the user kept/reinstalled
+            // PM — so clear the stale marker or a later *ordinary* uninstall would wrongly purge data.
+            paths::clear_stale_uninstall_purge_marker(handle);
+
             // Metadata exists from creation (device-mode on a fresh install; spec §6).
             // A device vault opens now with the keychain key; a passphrase/shareable
             // vault opens only if this profile cached its key, otherwise the store stays
@@ -984,6 +989,9 @@ pub fn run() {
             // the Windows uninstaller's automatic `runtime/` cleanup.
             wipe::wipe_pm_data,
             wipe::confirm_wipe_identity,
+            // Recover a bricked boot (store present, key lost) and finish a full self-uninstall.
+            wipe::reset_after_open_error,
+            wipe::launch_uninstaller,
             // Encrypted portable backup: local `.pmbackup` archive/restore, plus two off-machine
             // destinations that share the compress→encrypt core and the one schedule — Proton Drive
             // (via its CLI) and Google Drive (via the Drive v3 REST API).
