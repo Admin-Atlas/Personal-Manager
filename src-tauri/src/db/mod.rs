@@ -269,6 +269,15 @@ fn register_sqlite_vec() {
     });
 }
 
+/// The message [`open`] reports for a genuine, non-transient open failure — a wrong key or a
+/// corrupt file, as opposed to a recoverable transient lock / disk-I/O error, which get distinct
+/// messages (see the error-code mapping in [`open_keyed`]). This one is deterministic: the store
+/// will never open, so it — and ONLY it — is what the boot-error "Start fresh" recovery keys on
+/// before it deletes an unreadable store (`wipe::reset_after_open_error`). Sharing the literal
+/// keeps the two in lockstep so a message tweak can never silently arm deletion for a transient
+/// failure (or disarm it for a real brick).
+pub const WRONG_KEY_OR_CORRUPT_MSG: &str = "could not open database (wrong key or corrupt file)";
+
 /// Open the encrypted store, unlock it with the raw 256-bit key, and bring the
 /// schema up to date. Returns an error if the key is wrong or the file is
 /// corrupt.
@@ -327,7 +336,7 @@ fn open_keyed(path: &Path, key: &str) -> Result<Connection> {
                 Some(ErrorCode::SystemIoFailure) => {
                     Error::Other(format!("could not read the database file (disk I/O error): {e}"))
                 }
-                _ => Error::Other("could not open database (wrong key or corrupt file)".into()),
+                _ => Error::Other(WRONG_KEY_OR_CORRUPT_MSG.into()),
             }
         })?;
 

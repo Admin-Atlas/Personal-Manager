@@ -6,11 +6,20 @@
 // disk I/O blip — rather than being locked. It offers Retry (db::open's message is already
 // friendly and retryable) so a passing hiccup no longer aborts the whole app. Distinct from
 // VaultUnlock: there is nothing to type here — the key is fine, the file was just unavailable.
+//
+// It also offers a last-resort "Start fresh": if the store genuinely can't be opened (its key was
+// lost — e.g. an interrupted "Remove PM data" — so a fresh boot key can't decrypt it, and Retry
+// loops forever), this deletes the unreadable store and relaunches into a clean first-run, so the
+// user is never trapped. Guarded by a type-to-confirm because it permanently discards the vault.
 
 import { useState } from "react";
-import { retryOpenVault } from "../lib/ipc";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { resetAfterOpenError, retryOpenVault } from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
-import { Button } from "./ui";
+import { Button, Input } from "./ui";
+
+/** The phrase the user types to arm the destructive "Start fresh" recovery. */
+const RESET_PHRASE = "Start fresh";
 
 export function VaultOpenError({
   status,
@@ -21,9 +30,13 @@ export function VaultOpenError({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(status.open_error);
+  // The destructive escape hatch, revealed only if the user asks for it.
+  const [showReset, setShowReset] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [resetting, setResetting] = useState(false);
 
   async function retry() {
-    if (busy) return;
+    if (busy || resetting) return;
     setBusy(true);
     setError(null);
     try {
@@ -32,6 +45,21 @@ export function VaultOpenError({
     } catch (e) {
       setError(String(e));
       setBusy(false);
+    }
+  }
+
+  // Delete the unreadable store and relaunch into a clean first-run. Permanent — gated by the
+  // type-to-confirm above the button — but the only way out when the store can't be decrypted.
+  async function startFresh() {
+    if (resetting || confirmText !== RESET_PHRASE) return;
+    setResetting(true);
+    setError(null);
+    try {
+      await resetAfterOpenError();
+      await relaunch();
+    } catch (e) {
+      setError(String(e));
+      setResetting(false);
     }
   }
 
@@ -68,9 +96,70 @@ export function VaultOpenError({
         </p>
       )}
 
-      <Button variant="primary" disabled={busy} onClick={() => void retry()}>
+      <Button variant="primary" disabled={busy || resetting} onClick={() => void retry()}>
         {busy ? "Trying again…" : "Try again"}
       </Button>
+
+      {!showReset ? (
+        <button
+          className="text-xs text-ink4 underline underline-offset-2 hover:text-ink3"
+          disabled={busy || resetting}
+          onClick={() => {
+            setError(null);
+            setShowReset(true);
+          }}
+        >
+          Still won't open?
+        </button>
+      ) : (
+        <div className="w-full max-w-xs rounded-[var(--radius)] border border-border bg-surface p-3 text-left">
+          <p className="text-xs text-ink3">
+            Try “Try again” a few times first — a vault that&apos;s only momentarily locked (often
+            by antivirus or Windows Search) opens once the file is free. If it truly never opens,
+            the vault is damaged and can&apos;t be recovered on this device. You can start fresh —
+            this <span className="font-medium text-st-due">permanently deletes the vault</span> and
+            sets PM up again from scratch. Your saved keys and sign-ins are kept.
+          </p>
+          <p className="mt-2 text-xs text-ink4">
+            Type <span className="font-mono font-medium text-ink2">{RESET_PHRASE}</span> to confirm.
+          </p>
+          <Input
+            value={confirmText}
+            onChange={(e) => setConfirmText(e.target.value)}
+            placeholder={RESET_PHRASE}
+            autoComplete="off"
+            className="mt-2"
+            disabled={resetting}
+          />
+          <div className="mt-3 flex justify-end gap-2">
+            <Button
+              variant="tertiary"
+              disabled={resetting}
+              onClick={() => {
+                setShowReset(false);
+                setConfirmText("");
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              disabled={resetting || confirmText !== RESET_PHRASE}
+              onClick={() => void startFresh()}
+              style={
+                confirmText === RESET_PHRASE
+                  ? {
+                      background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+                      color: "var(--st-due)",
+                    }
+                  : undefined
+              }
+            >
+              {resetting ? "Starting fresh…" : "Delete vault & start fresh"}
+            </Button>
+          </div>
+        </div>
+      )}
 
       {status.location && (
         <p className="max-w-xs break-all text-xs text-faint">{status.location}</p>
