@@ -8,7 +8,7 @@
 // without it), which is exactly why there is no "open anyway" escape: there's no backdoor.
 
 import { useState } from "react";
-import { unlockVault } from "../lib/ipc";
+import { detachFromSharedVault, unlockVault } from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
 import { Button, Input } from "./ui";
 
@@ -30,6 +30,22 @@ export function VaultUnlock({
     try {
       await unlockVault(pass);
       onUnlocked(); // this gate unmounts on success
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  }
+
+  // A joined (pointed) vault the user can't unlock — the owner changed the passphrase and didn't
+  // share it, or revoked access — needs a way out that isn't "guess forever". Step back to a vault
+  // of your own; the shared folder is untouched and can be rejoined later.
+  async function detach() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await detachFromSharedVault();
+      window.location.reload();
     } catch (e) {
       setError(String(e));
       setBusy(false);
@@ -95,6 +111,16 @@ export function VaultUnlock({
           {busy ? "Unlocking…" : "Unlock"}
         </Button>
       </form>
+
+      {status?.pointed_root && (
+        <button
+          className="text-xs text-ink4 underline underline-offset-2 hover:text-ink3"
+          disabled={busy}
+          onClick={() => void detach()}
+        >
+          Can't unlock? Use a vault on this account instead
+        </button>
+      )}
 
       {status?.location && (
         <p className="max-w-xs break-all text-xs text-faint">{status.location}</p>

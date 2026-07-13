@@ -14,7 +14,7 @@
 
 import { useState } from "react";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { resetAfterOpenError, retryOpenVault } from "../lib/ipc";
+import { detachFromSharedVault, resetAfterOpenError, retryOpenVault } from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
 import { Button, Input } from "./ui";
 
@@ -42,6 +42,23 @@ export function VaultOpenError({
     try {
       await retryOpenVault();
       onResolved(); // reload the deferred boot state; this gate unmounts once the store opens
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  }
+
+  // A joined/moved vault that stopped answering: step back to a vault on this account
+  // (clear the pointer — the shared folder itself is untouched) and reboot the webview
+  // on it. The safe exit for a joiner whose access was revoked or whose owner made the
+  // vault private (issue #337).
+  async function detach() {
+    if (busy || resetting) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await detachFromSharedVault();
+      window.location.reload();
     } catch (e) {
       setError(String(e));
       setBusy(false);
@@ -100,7 +117,22 @@ export function VaultOpenError({
         {busy ? "Trying again…" : "Try again"}
       </Button>
 
-      {!showReset ? (
+      {status.pointed_root && (
+        <div className="max-w-xs">
+          <Button variant="secondary" disabled={busy || resetting} onClick={() => void detach()}>
+            Use a vault on this account instead
+          </Button>
+          <p className="mt-1 text-xs text-ink4">
+            PM points at a shared folder right now. This steps back to a vault of your own — the
+            shared folder isn't touched, and you can rejoin it any time from Settings.
+          </p>
+        </div>
+      )}
+
+      {/* The destructive "Start fresh" recovery is only for THIS profile's own vault. A pointed
+          (shared/joined) vault belongs to a folder we don't own — deleting it could destroy
+          another account's data — so it's hidden there; detach above is the way out. */}
+      {status.pointed_root ? null : !showReset ? (
         <button
           className="text-xs text-ink4 underline underline-offset-2 hover:text-ink3"
           disabled={busy || resetting}

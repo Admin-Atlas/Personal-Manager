@@ -559,8 +559,21 @@ pub fn reset_after_open_error(app: AppHandle, state: State<'_, AppState>) -> Res
         ));
     }
 
-    let resolved = vault::resolve(&app)?;
     let data_dir = paths::data_dir(&app)?;
+    // Never delete a vault this profile only POINTS at (a joined/shared vault): the folder isn't
+    // ours to destroy, and the owner still opens it fine. A pointed vault that stops answering
+    // (owner made it private, revoked access, changed the passphrase) is recovered by stepping
+    // back to a local vault — `detach_from_shared_vault` — not by wiping the shared folder.
+    if vault::pointer::load(&data_dir)?.is_some() {
+        return Err(Error::Other(
+            "This vault lives in a shared folder that PM is only pointed at, so it can't be reset \
+             from here — it may belong to another account. Use \"Use a vault on this account \
+             instead\" to step back to your own vault; the shared folder is left untouched."
+                .into(),
+        ));
+    }
+
+    let resolved = vault::resolve(&app)?;
     // The store never opened, so there's no live connection — but be safe.
     let _ = state.take_conn();
     if !remove_db_files_retrying(&resolved.db_path) {

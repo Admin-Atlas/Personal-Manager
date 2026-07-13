@@ -131,6 +131,47 @@ export interface VaultStatus {
    *  search-indexer file lock, disk I/O) — distinct from a locked passphrase vault, which sets
    *  `needs_unlock` instead. The app shows a Retry surface; null in the normal case. */
   open_error: string | null;
+  /** The folder this profile's pointer names, when one is set (a moved or joined vault) —
+   *  lets the UI offer "go back to a local vault" when that folder stops answering. */
+  pointed_root: string | null;
+}
+
+/** Non-fatal warnings from a vault operation (a folder-ACL or discovery-marker hiccup);
+ *  the operation itself succeeded and encryption still protects the vault. */
+export interface VaultOpOutcome {
+  warnings: string[];
+}
+
+/** Result of joining a shared vault: whether this instance came up as the active writer
+ *  (false ⇒ the other account holds it and the curtain shows), plus non-fatal warnings. */
+export interface AdoptOutcome {
+  active_writer: boolean;
+  warnings: string[];
+}
+
+/** One shared vault another account has advertised on this machine (non-secret; the
+ *  passphrase remains the real gate — joining re-validates everything). */
+export interface SharedVaultAd {
+  schema: number;
+  vault_id: string;
+  vault_root: string;
+  label: string;
+  owner?: string | null;
+  updated_at: string;
+}
+
+/** The suggested cross-account location for a shared vault. `path` is null on platforms
+ *  without a machine-wide default (the UI falls back to a folder pick). */
+export interface SuggestedLocation {
+  path: string | null;
+  writable: boolean;
+}
+
+/** One local Windows account, for the share wizard's "who can open it" picker. */
+export interface LocalAccount {
+  name: string;
+  sid: string;
+  is_current: boolean;
 }
 
 /** Cooperative single-writer state for a shared vault. `active` = this instance is the

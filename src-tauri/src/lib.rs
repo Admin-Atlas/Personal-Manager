@@ -661,7 +661,20 @@ pub fn run() {
             vault::migrate::recover(handle)?;
             // Resolve where this profile's vault lives — pointer-aware, but defaulting
             // to the per-profile data dir when no pointer is set (today's behaviour).
-            let resolved = vault::resolve(handle)?;
+            // Resolved by hand (not `vault::resolve`) because a POINTED root that stopped
+            // answering must degrade to a locked boot below, not abort setup here.
+            let data_dir = paths::data_dir(handle)?;
+            let boot_pointer = vault::pointer::load(&data_dir)?;
+            let resolved = vault::resolve_layout(&data_dir, boot_pointer.as_ref());
+            let root_dirs_ready = std::fs::create_dir_all(&resolved.vault_root)
+                .and_then(|()| std::fs::create_dir_all(&resolved.markdown_dir))
+                .map_err(|e| e.to_string());
+            if boot_pointer.is_none() {
+                // The default location must be creatable — that failure is fatal, as before.
+                if let Err(e) = &root_dirs_ready {
+                    return Err(error::Error::Other(e.clone()).into());
+                }
+            }
 
             // GC abandoned restore staging before opening: each `restored-vaults/restore-*` is a full,
             // decryptable vault copy left by a restore-and-inspect. A copy the user didn't switch to
@@ -677,31 +690,78 @@ pub fn run() {
             // PM — so clear the stale marker or a later *ordinary* uninstall would wrongly purge data.
             paths::clear_stale_uninstall_purge_marker(handle);
 
-            // Metadata exists from creation (device-mode on a fresh install; spec §6).
-            // A device vault opens now with the keychain key; a passphrase/shareable
-            // vault opens only if this profile cached its key, otherwise the store stays
-            // locked (None) and the UI prompts to unlock before any DB command runs.
-            let meta = vault::ensure_device_meta(&resolved.vault_root)?;
+            // Decide what to do about metadata (spec §6). At the DEFAULT location a
+            // fresh profile still gets its zero-friction device vault; behind a POINTER,
+            // missing or unreachable metadata boots LOCKED with the detail carried —
+            // never a fresh empty vault silently minted where the shared one should be
+            // (the failure that made a broken join look like "all my data vanished").
+            let meta_load = match &root_dirs_ready {
+                Ok(()) => vault::load_meta(&resolved.vault_root).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let boot_meta = vault::boot_meta_decision(boot_pointer.is_some(), meta_load)
+                .map_err(error::Error::Other)?;
+            let open_attempt = match boot_meta {
+                vault::BootMeta::UseExisting(meta) => Ok(*meta),
+                vault::BootMeta::CreateDeviceDefault => {
+                    Ok(vault::ensure_device_meta(&resolved.vault_root)?)
+                }
+                vault::BootMeta::PointedVaultMissing(detail) => Err(format!(
+                    "your shared vault at {} isn't reachable: {detail} — its owner may need \
+                     to re-add this account, or you can go back to a vault on this account \
+                     from Settings",
+                    resolved.vault_root.display()
+                )),
+            };
             // On a successful open we also get the Markdown cipher; pair it with the
             // resolved Markdown dir as the session's vault runtime. A locked
             // (passphrase, uncached) vault leaves both `None` until an unlock command.
-            let (conn, vault_runtime, boot_open_error) = match vault::open_at_boot(&resolved, &meta)
-            {
-                Ok(Some((conn, master))) => (
-                    Some(conn),
-                    Some(VaultRuntime::build(&resolved, &meta, &master)),
-                    None,
-                ),
-                Ok(None) => (None, None, None),
-                // A boot-time open failure (a transient AV/search-indexer file lock, disk I/O)
-                // must NOT abort the whole app — `db::open` already maps these to friendly,
-                // retryable messages. Degrade to a not-opened store and carry the message so the
-                // UI can offer Retry, exactly like a locked vault (B1-6). Only a genuinely
-                // corrupt store then needs a manual fix, instead of every transient hiccup.
-                Err(e) => {
-                    let msg = e.to_string();
-                    eprintln!("vault: boot open failed, starting locked with Retry: {msg}");
-                    (None, None, Some(msg))
+            // A device vault opens now with the keychain key; a passphrase/shareable
+            // vault opens only if this profile cached its key.
+            let (conn, vault_runtime, boot_open_error) = match &open_attempt {
+                Ok(meta) => match vault::open_at_boot(&resolved, meta) {
+                    Ok(Some((conn, master))) => {
+                        // Self-heal the discovery marker for an open shared vault living
+                        // outside the profile (best-effort; a wiped ProgramData grows it
+                        // back, and identical content skips the write).
+                        if meta.key_mode == vault::KeyMode::Passphrase
+                            && !resolved.vault_root.starts_with(&data_dir)
+                        {
+                            if let Some(ads) = vault::advert::ads_dir() {
+                                let ad = vault::advert::SharedVaultAd::for_vault(
+                                    &meta.vault_id,
+                                    &resolved.vault_root,
+                                );
+                                if let Err(e) = vault::advert::publish(&ads, &ad) {
+                                    eprintln!(
+                                        "vault: could not refresh the shared-vault marker: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        (
+                            Some(conn),
+                            Some(VaultRuntime::build(&resolved, meta, &master)),
+                            None,
+                        )
+                    }
+                    Ok(None) => (None, None, None),
+                    // A boot-time open failure (a transient AV/search-indexer file lock, disk I/O)
+                    // must NOT abort the whole app — `db::open` already maps these to friendly,
+                    // retryable messages. Degrade to a not-opened store and carry the message so the
+                    // UI can offer Retry, exactly like a locked vault (B1-6). Only a genuinely
+                    // corrupt store then needs a manual fix, instead of every transient hiccup.
+                    Err(e) => {
+                        let msg = e.to_string();
+                        eprintln!("vault: boot open failed, starting locked with Retry: {msg}");
+                        (None, None, Some(msg))
+                    }
+                },
+                // The pointed vault is missing/unreachable: boot locked, carrying the
+                // specific story so the UI can offer Retry or "go back to a local vault".
+                Err(msg) => {
+                    eprintln!("vault: {msg}");
+                    (None, None, Some(msg.clone()))
                 }
             };
 
@@ -862,6 +922,11 @@ pub fn run() {
             commands::forget_vault_passphrase,
             commands::score_passphrase,
             commands::link_vault_account,
+            commands::list_shared_vaults,
+            commands::adopt_shared_vault,
+            commands::detach_from_shared_vault,
+            commands::suggest_shared_vault_location,
+            commands::list_local_accounts,
             commands::vault_lock_status,
             commands::continue_here,
             commands::force_take_vault,

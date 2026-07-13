@@ -316,7 +316,15 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-vault": {
     title: "Vault mode",
-    body: "Whether this vault is private to this device or shareable — protected by a passphrase so you can safely copy it to another machine and open it there. Making it shareable can also encrypt your Markdown at rest. A private vault is tied to this device's keychain; a shareable one travels with its passphrase, and there's no way in without it, so keep it safe.",
+    body: "Whether this vault is private to this device or shared. A private vault is tied to this device's keychain — zero friction, nothing to remember. Sharing protects it with a passphrase instead and moves it where other Windows accounts on this PC can reach it, so the same documents, chats, and projects open from each account (one writes at a time; PM hands over cleanly). The passphrase is the only way in and can't be recovered, so keep it safe. A shared vault also encrypts your Markdown at rest, and you can copy it to another machine and open it there with the same passphrase.",
+  },
+  "settings-vault-share": {
+    title: "Share with other accounts",
+    body: "A short guided flow: pick a passphrase, PM moves the vault to a spot every account on this PC can reach, and you choose which accounts may open it. When they next launch PM on their account, it offers this vault by name — they join with just the passphrase. Their AI key and cloud sign-ins stay their own; each person reconnects those as themselves.",
+  },
+  "settings-vault-join": {
+    title: "Open an existing shared vault",
+    body: "Point PM at a shared vault folder on this PC (or a vault copied from another machine) and open it with its passphrase. PM switches to that vault; whatever you were using stays on disk, set aside, and you can go back to it any time. If PM can't reach the folder, the vault's owner needs to add your account first under Manage sharing.",
   },
   "settings-backup": {
     title: "Encrypted backup",

@@ -74,7 +74,12 @@ import type {
   StorageReport,
   SyncEvent,
   TsneStatus,
+  AdoptOutcome,
+  LocalAccount,
+  SharedVaultAd,
+  SuggestedLocation,
   VaultLockStatus,
+  VaultOpOutcome,
   VaultStatus,
   WipeReport,
   WipeSelection,
@@ -183,19 +188,27 @@ export const vaultStatus = () => invoke<VaultStatus>("vault_status");
 export const retryOpenVault = () => invoke<void>("retry_open_vault");
 
 /** Convert this device vault into a shareable, passphrase-protected one (re-keys the
- *  store and encrypts the Markdown via the one migration routine). */
-export const createShareableVault = (passphrase: string) =>
-  invoke<void>("create_shareable_vault", { passphrase });
+ *  store and encrypts the Markdown via the one migration routine). Pass `targetLocation`
+ *  to also move it to a cross-account-reachable folder in the SAME crash-recoverable
+ *  migration — the guided share flow always does, since a shareable vault left in the
+ *  per-user profile folder is unreachable by every other account. */
+export const createShareableVault = (passphrase: string, targetLocation?: string) =>
+  invoke<VaultOpOutcome>("create_shareable_vault", {
+    passphrase,
+    targetLocation: targetLocation ?? null,
+  });
 
 /** Change a shareable vault's passphrase: re-derive the key and re-encrypt the Markdown. */
 export const changeVaultPassphrase = (newPassphrase: string) =>
-  invoke<void>("change_vault_passphrase", { newPassphrase });
+  invoke<VaultOpOutcome>("change_vault_passphrase", { newPassphrase });
 
-/** Make a shareable vault private again: re-key to a device key and decrypt the Markdown. */
-export const makeVaultPrivate = () => invoke<void>("make_vault_private");
+/** Make a shareable vault private again: re-key to a device key and decrypt the Markdown
+ *  (also withdraws the discovery marker other accounts see). */
+export const makeVaultPrivate = () => invoke<VaultOpOutcome>("make_vault_private");
 
-/** Move the vault to another folder (e.g. a shared location), keeping key + policy. */
-export const moveVault = (folder: string) => invoke<void>("move_vault", { folder });
+/** Move the vault to another folder (e.g. a shared location), keeping key + policy.
+ *  Refuses a folder that already holds a different vault — join that one instead. */
+export const moveVault = (folder: string) => invoke<VaultOpOutcome>("move_vault", { folder });
 
 /** Unlock the current passphrase vault for this session and cache the key on this
  *  profile, so the next launch is silent. */
@@ -216,9 +229,33 @@ export const onVaultMetaWarning = (handler: (message: string) => void): Promise<
 export const forgetVaultPassphrase = () => invoke<void>("forget_vault_passphrase");
 
 /** Grant another account on this machine access to the shared vault folder (a name or
- *  SID). Only meaningful for a shareable vault; a clear error otherwise. */
+ *  SID). Requires a shareable vault that has moved OUT of this profile's private folder
+ *  (an ACE inside the profile is unreachable for other accounts); a clear error otherwise. */
 export const linkVaultAccount = (account: string) =>
-  invoke<void>("link_vault_account", { account });
+  invoke<VaultOpOutcome>("link_vault_account", { account });
+
+/** The shared vaults other accounts have advertised on this machine, filtered to ones this
+ *  profile could join. Empty off-Windows (no machine-wide discovery folder there). */
+export const listSharedVaults = () => invoke<SharedVaultAd[]>("list_shared_vaults");
+
+/** Join an existing shared vault: unlock `folder` with the passphrase, cache the key for
+ *  silent launches, and point this profile at it. The previous vault is set aside on disk,
+ *  never deleted — `detachFromSharedVault` brings it back. */
+export const adoptSharedVault = (folder: string, passphrase: string) =>
+  invoke<AdoptOutcome>("adopt_shared_vault", { folder, passphrase });
+
+/** Leave the shared vault: clear this profile's pointer and reopen the local vault that
+ *  was set aside at join time. The shared folder itself is untouched. */
+export const detachFromSharedVault = () => invoke<void>("detach_from_shared_vault");
+
+/** Where a shared vault should live so every account can reach it (null path ⇒ ask the
+ *  user to pick a folder), plus whether that base looks writable from here. */
+export const suggestSharedVaultLocation = () =>
+  invoke<SuggestedLocation>("suggest_shared_vault_location");
+
+/** The enabled local Windows accounts for the share wizard's picker; empty on failure or
+ *  off-Windows (the UI falls back to the manual name/SID field). */
+export const listLocalAccounts = () => invoke<LocalAccount[]>("list_local_accounts");
 
 /** Export the Markdown vault as plaintext `.md` into `destDir` — the "never locked in"
  *  escape hatch (decrypts with the in-session key). Returns the number of files written. */

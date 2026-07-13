@@ -56,9 +56,21 @@ mod platform {
         sid.starts_with("S-1-").then_some(sid)
     }
 
+    /// Format one `icacls /remove:g` principal — the removal counterpart of
+    /// [`grant_arg`] (SIDs use the `*S-1-...` form; no rights suffix on removal).
+    fn remove_arg(principal: &str) -> String {
+        let p = principal.trim();
+        if p.starts_with("S-1-") {
+            format!("*{p}")
+        } else {
+            p.to_string()
+        }
+    }
+
     /// Resolve the current user's SID (so the lockdown grants *this* account, by a
-    /// stable identifier rather than a localizable name).
-    fn current_user_sid() -> Result<String> {
+    /// stable identifier rather than a localizable name). Public so the local-accounts
+    /// picker can mark which enumerated account is the caller.
+    pub fn current_user_sid() -> Result<String> {
         let out = Command::new("whoami")
             .args(["/user", "/fo", "csv", "/nh"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -120,9 +132,21 @@ mod platform {
         run_icacls(dir, &["/grant:r".to_string(), grant_arg(principal)])
     }
 
+    /// Remove a principal's EXPLICIT ACEs from `dir` (recursively, via `run_icacls`'s
+    /// `/T`). This is the piece [`restrict_to_owner`] can't do on its own: `/grant:r`
+    /// only replaces the principals it names, so an account granted earlier keeps its
+    /// explicit (inheritable) ACE unless it is removed by name here. Removing a principal
+    /// that holds no ACE is a harmless no-op, so this is idempotent.
+    pub fn revoke_access(dir: &Path, principal: &str) -> Result<()> {
+        if principal.trim().is_empty() {
+            return Err(Error::Other("an account name or SID is required".into()));
+        }
+        run_icacls(dir, &["/remove:g".to_string(), remove_arg(principal)])
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::{grant_arg, parse_sid_from_csv};
+        use super::{grant_arg, parse_sid_from_csv, remove_arg};
 
         #[test]
         fn grant_arg_uses_star_for_sids_and_bare_for_names() {
@@ -130,6 +154,13 @@ mod platform {
             assert_eq!(grant_arg("PC\\alice"), "PC\\alice:(OI)(CI)F");
             // Whitespace from a pasted value is trimmed.
             assert_eq!(grant_arg("  S-1-5-21-7  "), "*S-1-5-21-7:(OI)(CI)F");
+        }
+
+        #[test]
+        fn remove_arg_mirrors_grant_arg_without_a_rights_suffix() {
+            assert_eq!(remove_arg("S-1-5-21-7"), "*S-1-5-21-7");
+            assert_eq!(remove_arg("PC\\alice"), "PC\\alice");
+            assert_eq!(remove_arg("  S-1-5-21-7  "), "*S-1-5-21-7");
         }
 
         #[test]
@@ -223,9 +254,34 @@ mod platform {
         run_setfacl(dir, &setfacl_args(principal))
     }
 
+    /// The `setfacl` argument list REMOVING one account's effective and default ACEs —
+    /// the removal counterpart of [`setfacl_args`]. Pure so the shape is unit-testable.
+    fn setfacl_remove_args(principal: &str) -> Vec<String> {
+        let p = principal.trim();
+        vec![
+            "-R".to_string(),
+            "-x".to_string(),
+            format!("u:{p}"),
+            "-d".to_string(),
+            "-x".to_string(),
+            format!("u:{p}"),
+        ]
+    }
+
+    /// Remove a previously linked account's ACEs. The 700 root already denies traversal
+    /// to everyone but the owner, but a make-private that leaves the vault in a shared
+    /// folder should also strip the explicit ACL entries the account was granted, so this
+    /// is called alongside the owner lockdown. `setfacl -x` on an absent entry is a no-op.
+    pub fn revoke_access(dir: &Path, principal: &str) -> Result<()> {
+        if principal.trim().is_empty() {
+            return Err(Error::Other("an account name or uid is required".into()));
+        }
+        run_setfacl(dir, &setfacl_remove_args(principal))
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::setfacl_args;
+        use super::{setfacl_args, setfacl_remove_args};
 
         #[test]
         fn setfacl_args_grant_effective_and_default_aces() {
@@ -237,6 +293,14 @@ mod platform {
             assert_eq!(
                 setfacl_args("  1001  "),
                 ["-R", "-m", "u:1001:rwX", "-d", "-m", "u:1001:rwX"]
+            );
+        }
+
+        #[test]
+        fn setfacl_remove_args_drop_effective_and_default_aces() {
+            assert_eq!(
+                setfacl_remove_args(" alice "),
+                ["-R", "-x", "u:alice", "-d", "-x", "u:alice"]
             );
         }
 
@@ -274,6 +338,15 @@ mod platform {
             "shared-folder ACLs aren't applied on macOS in this release".into(),
         ))
     }
+
+    /// See [`restrict_to_owner`]: not implemented on macOS.
+    pub fn revoke_access(_dir: &Path, _principal: &str) -> Result<()> {
+        Err(Error::Other(
+            "shared-folder ACLs aren't applied on macOS in this release".into(),
+        ))
+    }
 }
 
-pub use platform::{grant_access, restrict_to_owner};
+#[cfg(windows)]
+pub use platform::current_user_sid;
+pub use platform::{grant_access, restrict_to_owner, revoke_access};

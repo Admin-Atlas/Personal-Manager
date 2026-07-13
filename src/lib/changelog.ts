@@ -19,6 +19,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.6.1-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "Sharing your vault with another Windows account on this PC actually works now — and it's one guided flow. Before, “make shareable”, “move vault”, and “link account” were three separate steps that quietly left the vault somewhere other accounts could never reach. Now “Share with other accounts…” walks you through it: choose a passphrase, PM moves the vault to a spot every account can reach, and you pick who may open it from a list of this PC's accounts (no more hunting for SIDs — though you still can).",
+      "Joining is now one screen. The first time PM opens on the other account, it spots the shared vault and offers it by name — enter the passphrase and everything shared is there: documents, chats, projects, calendars. Anything already on that account is kept safely aside, never deleted. There's also “Open an existing shared vault…” in Settings for joining by folder.",
+      "After joining, PM explains what stays personal: your own AI key and your own cloud sign-ins (they never travel between Windows accounts). A note on the Connectors tab shows exactly what to reconnect, and everything already indexed stays findable meanwhile.",
+      "Safety nets all around: PM refuses to move a vault onto a different vault (no more silent overwrites), linked accounts survive later moves, a shared vault that stops answering gets a clear explanation with a one-click way back to a vault of your own, and a passphrase changed on the other account simply asks you for the new one instead of acting broken.",
+      "The changelog no longer pops up on a brand-new install pretending something changed — it now only appears after a real update.",
+    ],
+  },
+  {
     version: "3.6.0-alpha",
     date: "2026-07-13",
     highlights: [

@@ -155,21 +155,16 @@ fn is_ignored_dir(name: &str) -> bool {
     name.starts_with('.') || IGNORE_DIRS.contains(&name)
 }
 
-/// A path's `Normal` components, lower-cased on the case-insensitive desktops (Windows/macOS). Used to
-/// compare a walked path against a stored exclude entry independently of separator style (`/` vs `\`)
-/// and on-disk letter case — the walk yields real OS-case, OS-separator paths while excludes are stored
-/// root-relative with `/` from the picker.
+/// A path's `Normal` components, lower-cased. Used to compare a walked path against a stored exclude
+/// entry independently of separator style (`/` vs `\`) and on-disk letter case — the walk yields real
+/// OS-case, OS-separator paths while excludes are stored root-relative with `/` from the picker. The
+/// lower-casing is unconditional (not gated on the case-insensitive desktops) so the match honours the
+/// documented "case never trips it" contract on every platform; the result is used only for this
+/// comparison, never to store or display a path, so the real on-disk case is preserved everywhere.
 fn normalized_components(p: &Path) -> Vec<String> {
     p.components()
         .filter_map(|c| match c {
-            std::path::Component::Normal(os) => {
-                let s = os.to_string_lossy();
-                Some(if cfg!(any(windows, target_os = "macos")) {
-                    s.to_lowercase()
-                } else {
-                    s.into_owned()
-                })
-            }
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().to_lowercase()),
             _ => None,
         })
         .collect()

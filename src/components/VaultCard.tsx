@@ -3,29 +3,32 @@
 
 // The Settings "Vault" card (spec §2–6): shows whether the vault is device-only or a
 // shareable, passphrase-protected one, and drives every transition through the backend's
-// one migration routine. Markdown encryption is forced on (and the toggle hidden) for a
-// shareable vault, because once it can be opened from another account folder isolation no
-// longer protects the notes. The plaintext export is always offered — the promise that
-// the user is never locked in.
+// one migration routine. Sharing with other Windows accounts is a single guided flow
+// (ShareVaultWizard) — passphrase, move to a reachable folder, and account grants in the
+// one order that can't strand the vault in the profile dir (issue #337); joining an
+// existing shared vault is the "Open an existing shared vault…" form. Markdown
+// encryption is forced on (and the toggle hidden) for a shareable vault, because once it
+// can be opened from another account folder isolation no longer protects the notes. The
+// plaintext export is always offered — the promise that the user is never locked in.
 
 import { useEffect, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
+  adoptSharedVault,
   changeVaultPassphrase,
-  createShareableVault,
   exportPlaintextMarkdown,
   forgetVaultPassphrase,
-  linkVaultAccount,
   makeVaultPrivate,
-  moveVault,
   vaultStatus,
 } from "../lib/ipc";
 import type { PassphraseScore, VaultStatus } from "../lib/types";
 import { Button, Input } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
+import { ShareVaultWizard } from "./ShareVaultWizard";
+import { markJustJoinedVault } from "../lib/joinedVault";
 
 /** Which inline form/confirmation is currently open (only one at a time). */
-type Pending = "share" | "change" | "private" | "link" | null;
+type Pending = "change" | "private" | "adopt" | null;
 
 export function VaultCard() {
   const [status, setStatus] = useState<VaultStatus | null>(null);
@@ -33,7 +36,8 @@ export function VaultCard() {
   const [pass, setPass] = useState("");
   const [confirm, setConfirm] = useState("");
   const [passScore, setPassScore] = useState<PassphraseScore | null>(null);
-  const [account, setAccount] = useState("");
+  const [adoptFolder, setAdoptFolder] = useState<string | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
@@ -55,7 +59,7 @@ export function VaultCard() {
     setPass("");
     setConfirm("");
     setPassScore(null);
-    setAccount("");
+    setAdoptFolder(null);
   }
 
   // A create/change passphrase clears the meter's floor unless the meter explicitly says it's too
@@ -84,6 +88,11 @@ export function VaultCard() {
     return typeof picked === "string" ? picked : null;
   }
 
+  async function pickAdoptFolder() {
+    const dir = await pickFolder();
+    if (dir) setAdoptFolder(dir);
+  }
+
   async function exportPlaintext() {
     const dir = await pickFolder();
     if (!dir) return;
@@ -100,10 +109,23 @@ export function VaultCard() {
     }
   }
 
-  async function moveTo() {
-    const dir = await pickFolder();
-    if (!dir) return;
-    await run(() => moveVault(dir), `Vault moved to ${dir}`);
+  /** Join an existing shared vault from this account: unlock + point this profile at
+   *  it, then reload the whole webview so every view reboots on the new store (the same
+   *  pattern as the backup-restore switch). The previous vault stays on disk, set aside. */
+  async function adopt() {
+    if (!adoptFolder) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await adoptSharedVault(adoptFolder, pass);
+      // Explain what stays personal (own key + sign-ins) on the Connectors tab after the reload,
+      // exactly like the boot-time join gate.
+      markJustJoinedVault();
+      window.location.reload();
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
   }
 
   const passphrasesMatch = pass.length > 0 && pass === confirm;
@@ -124,49 +146,17 @@ export function VaultCard() {
         </p>
       )}
 
-      {/* Device-only → offer to make shareable. */}
+      {/* Device-only → the guided share flow (passphrase → shared folder → accounts). */}
       {status && !shareable && (
         <div className="mt-3">
-          {pending !== "share" ? (
-            <Button variant="secondary" onClick={() => setPending("share")} disabled={busy}>
-              Make shareable…
-            </Button>
-          ) : (
-            <div className="space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
-              <p className="text-xs text-ink4">
-                Choose a passphrase. It derives the encryption key, so it's never stored and can't
-                be recovered — any profile or machine that knows it can open this vault.
-              </p>
-              <Input
-                type="password"
-                placeholder="Passphrase"
-                value={pass}
-                onChange={(e) => setPass(e.target.value)}
-                autoFocus
-              />
-              <Input
-                type="password"
-                placeholder="Confirm passphrase"
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-              />
-              <PassphraseStrengthMeter passphrase={pass} onScored={setPassScore} />
-              <div className="flex gap-2">
-                <Button
-                  variant="primary"
-                  disabled={busy || !passphrasesMatch || !strongEnough}
-                  onClick={() =>
-                    run(() => createShareableVault(pass), "This vault is now shareable.")
-                  }
-                >
-                  {busy ? "Working…" : "Make shareable"}
-                </Button>
-                <Button variant="tertiary" onClick={reset} disabled={busy}>
-                  Cancel
-                </Button>
-              </div>
-            </div>
-          )}
+          <Button
+            variant="secondary"
+            onClick={() => setWizardOpen(true)}
+            disabled={busy}
+            data-help="settings-vault-share"
+          >
+            Share with other accounts…
+          </Button>
         </div>
       )}
 
@@ -179,14 +169,16 @@ export function VaultCard() {
           </p>
 
           <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => setWizardOpen(true)}
+              disabled={busy}
+              data-help="settings-vault-share"
+            >
+              Manage sharing…
+            </Button>
             <Button variant="secondary" onClick={() => setPending("change")} disabled={busy}>
               Change passphrase…
-            </Button>
-            <Button variant="secondary" onClick={moveTo} disabled={busy}>
-              Move vault…
-            </Button>
-            <Button variant="secondary" onClick={() => setPending("link")} disabled={busy}>
-              Link another account…
             </Button>
             <Button variant="secondary" onClick={() => setPending("private")} disabled={busy}>
               Make private…
@@ -239,58 +231,6 @@ export function VaultCard() {
             </div>
           )}
 
-          {pending === "link" && (
-            <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
-              <p className="text-xs text-ink4">
-                Grant another Windows account access to the shared vault folder. Enter the account's{" "}
-                <strong>name</strong> or <strong>SID</strong> — <em>not</em> a profile path like{" "}
-                <span className="rounded-[var(--radius-sm)] bg-bg px-1 py-0.5 font-mono text-[0.85em] text-ink">
-                  C:\Users\name
-                </span>
-                .
-              </p>
-              <p className="text-xs text-ink4">
-                To find either, open <strong>PowerShell</strong> (Win+X → Terminal) and run:
-              </p>
-              <pre className="overflow-x-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-bg px-3 py-2 font-mono text-xs text-ink3">
-                Get-LocalUser | Select Name, SID
-              </pre>
-              <ul className="ml-4 list-disc space-y-1 text-xs text-ink4">
-                <li>
-                  <strong>Account name</strong> — <span className="font-mono">PC\alice</span>. Easy
-                  to read, but breaks if the account is ever renamed.
-                </li>
-                <li>
-                  <strong>SID</strong> — <span className="font-mono">S-1-5-21-…</span>. A stable ID
-                  that survives renames. Recommended — paste the whole string.
-                </li>
-              </ul>
-              <Input
-                placeholder="Account name or SID"
-                value={account}
-                onChange={(e) => setAccount(e.target.value)}
-                autoFocus
-              />
-              <div className="flex gap-2">
-                <Button
-                  variant="primary"
-                  disabled={busy || account.trim().length === 0}
-                  onClick={() =>
-                    run(
-                      () => linkVaultAccount(account.trim()),
-                      "Account linked to the vault folder.",
-                    )
-                  }
-                >
-                  {busy ? "Working…" : "Link account"}
-                </Button>
-                <Button variant="tertiary" onClick={reset} disabled={busy}>
-                  Cancel
-                </Button>
-              </div>
-            </div>
-          )}
-
           {pending === "private" && (
             <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
               <p className="text-xs text-ink4">
@@ -317,6 +257,49 @@ export function VaultCard() {
         </>
       )}
 
+      {/* Always available: join a shared vault someone else set up on this PC. */}
+      <div className="mt-3" data-help="settings-vault-join">
+        {pending !== "adopt" ? (
+          <Button variant="tertiary" onClick={() => setPending("adopt")} disabled={busy}>
+            Open an existing shared vault…
+          </Button>
+        ) : (
+          <div className="space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
+            <p className="text-xs text-ink4">
+              Point PM at a shared vault folder someone set up on this PC (or a copied vault) and
+              open it with its passphrase. PM switches to that vault; the one you're using now is
+              kept on disk, set aside — nothing is deleted.
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="secondary" onClick={() => void pickAdoptFolder()} disabled={busy}>
+                Choose the vault folder…
+              </Button>
+              {adoptFolder && (
+                <span className="break-all font-mono text-xs text-ink3">{adoptFolder}</span>
+              )}
+            </div>
+            <Input
+              type="password"
+              placeholder="Vault passphrase"
+              value={pass}
+              onChange={(e) => setPass(e.target.value)}
+            />
+            <div className="flex gap-2">
+              <Button
+                variant="primary"
+                disabled={busy || !adoptFolder || pass.length === 0}
+                onClick={() => void adopt()}
+              >
+                {busy ? "Joining…" : "Open shared vault"}
+              </Button>
+              <Button variant="tertiary" onClick={reset} disabled={busy}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Always available: the portability escape hatch. */}
       <p className="mt-3 text-xs text-ink4">
         Your files stay yours. Export to plaintext Markdown anytime with your passphrase —
@@ -330,6 +313,13 @@ export function VaultCard() {
 
       {error && <p className="mt-2 break-all text-xs text-st-due">{error}</p>}
       {msg && <p className="mt-2 break-all text-xs text-faint">{msg}</p>}
+
+      <ShareVaultWizard
+        open={wizardOpen}
+        onClose={() => setWizardOpen(false)}
+        status={status}
+        onChanged={refresh}
+      />
     </div>
   );
 }

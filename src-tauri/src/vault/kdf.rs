@@ -32,6 +32,16 @@ pub const SALT_LEN: usize = 16;
 /// The only Argon2 version we emit/accept: 0x13 (== 19), i.e. Argon2 v1.3.
 const ARGON2_VERSION: u32 = 0x13;
 
+/// Upper bound on the Argon2 memory cost we will honour from a `vault-meta.json` (1 GiB).
+/// Our own calibration never exceeds 256 MiB, so this never rejects a genuine PM vault — it
+/// exists to stop a HOSTILE meta (an attacker plants an advertisement pointing at a folder whose
+/// meta sets m_cost to hundreds of GiB) from OOM-aborting PM the instant a victim tries to join.
+const MAX_M_COST_KIB: u32 = 1024 * 1024;
+/// Upper bound on the time cost (passes) we will honour — calibration caps at 10.
+const MAX_T_COST: u32 = 64;
+/// Upper bound on parallelism (lanes) we will honour — calibration fixes this at 1.
+const MAX_P_COST: u32 = 16;
+
 /// Minimum passphrase length for any create/change entry point (M-4). Checked before the zxcvbn
 /// estimate so a trivially short passphrase gets a clear, specific message.
 pub const MIN_PASSPHRASE_LEN: usize = 10;
@@ -99,6 +109,16 @@ impl KdfParams {
                 "unsupported Argon2 version in vault-meta.json: {}",
                 self.version
             )));
+        }
+        // Reject absurd cost params (a hostile meta from an untrusted advertised folder) before
+        // Argon2 tries to allocate — otherwise a multi-hundred-GiB m_cost OOM-aborts PM at join.
+        if self.m_cost_kib > MAX_M_COST_KIB || self.t_cost > MAX_T_COST || self.p_cost > MAX_P_COST
+        {
+            return Err(Error::Other(
+                "this vault's security settings are outside the supported range — it may be \
+                 damaged or not a genuine PM vault"
+                    .into(),
+            ));
         }
         let params = Params::new(
             self.m_cost_kib,
@@ -215,6 +235,19 @@ mod tests {
         assert!(validate_passphrase_strength("1234567890").is_err());
         // A genuine passphrase clears both the length and the score floor.
         assert!(validate_passphrase_strength("correct horse battery staple").is_ok());
+    }
+
+    #[test]
+    fn absurd_cost_params_are_rejected_before_derivation() {
+        // A hostile advertised folder could carry a meta with a multi-hundred-GiB memory cost to
+        // OOM-abort PM the moment a victim joins. Such params must be refused cleanly, while our
+        // own calibrated params (well under the caps) still derive fine.
+        let salt: [u8; SALT_LEN] = crate::vault::random_array().expect("test RNG");
+        let mut hostile = KdfParams::at(64, 1);
+        hostile.m_cost_kib = 256 * 1024 * 1024; // 256 GiB
+        assert!(derive_master("whatever", &salt, &hostile).is_err());
+        // Our real calibration stays under every cap.
+        assert!(derive_master("whatever", &salt, &calibrate(1)).is_ok());
     }
 
     #[test]

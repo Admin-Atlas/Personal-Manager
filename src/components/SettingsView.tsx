@@ -6,7 +6,6 @@ import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   appLockStatus,
   costSummary,
-  createShareableVault,
   exportAllData,
   getPref,
   getSettings,
@@ -31,6 +30,7 @@ import {
   setReranking,
   setTimeZone,
   setVaultEmbedder,
+  vaultStatus,
 } from "../lib/ipc";
 import { useHelp } from "../lib/help";
 import { BackupSettings } from "./BackupSettings";
@@ -131,12 +131,11 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [appLock, setAppLockState] = useState<AppLockStatus | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportMsg, setExportMsg] = useState<string | null>(null);
-  // First-run vault choice (onboarding only). Default device-only = today's zero-friction
-  // path; "shareable" derives the key from a passphrase so the vault can be opened from
-  // other profiles. Applied once, after the API key is saved.
-  const [vaultMode, setVaultMode] = useState<"device" | "shareable">("device");
-  const [vaultPass, setVaultPass] = useState("");
-  const [vaultConfirm, setVaultConfirm] = useState("");
+  // Onboarding on a JOINED shared vault (issue #337): the vault already exists and its search
+  // language travels with it, so the language chooser is replaced by a short "what's yours alone"
+  // checklist and `set_vault_embedder` is suppressed. (First-run always creates a device vault;
+  // sharing happens later through the guided wizard.)
+  const [joinedVault, setJoinedVault] = useState(false);
   // Query-time reranking toggle (default on; stateless — never triggers a Rebuild).
   const [reranking, setRerankingState] = useState(true);
   // Indexing speed: "fast" (default) or "gentle" (paced for low-end machines).
@@ -216,6 +215,17 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
         setEmbedderId(lo.selected);
       } catch {
         /* ignore — the picker / language line simply won't show */
+      }
+      // Onboarding after joining a shared vault: the vault is already passphrase-mode,
+      // so the vault/language choosers don't apply (best-effort — a status failure just
+      // shows the standard onboarding).
+      if (onboarding) {
+        try {
+          const vs = await vaultStatus();
+          setJoinedVault(vs.mode === "passphrase");
+        } catch {
+          /* ignore — standard onboarding */
+        }
       }
     })();
   }, [onboarding]);
@@ -440,12 +450,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     }
   }
 
-  // A shareable first-run vault needs a passphrase that matches its confirmation.
-  const vaultChoiceValid =
-    !onboarding ||
-    vaultMode === "device" ||
-    (vaultPass.trim().length > 0 && vaultPass === vaultConfirm);
-  const canSave = !saving && (keyAlreadySet || key.trim().length > 0) && vaultChoiceValid;
+  const canSave = !saving && (keyAlreadySet || key.trim().length > 0);
 
   async function save() {
     setSaving(true);
@@ -472,17 +477,22 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       await setBackgroundAutoSwitch(backgroundAuto);
       await setTimeZone(tzAuto ? detectTimeZone() : timeZone);
       // First-run: record the chosen search language on the still-empty vault (only if the user
-      // changed it from the default). Must happen before any documents exist.
-      if (onboarding && langOpts && embedderId && embedderId !== langOpts.selected) {
+      // changed it from the default). Must happen before any documents exist. A JOINED vault
+      // already has both a language and a passphrase — its choosers aren't shown, and neither
+      // call may run against it (issue #337).
+      if (
+        onboarding &&
+        !joinedVault &&
+        langOpts &&
+        embedderId &&
+        embedderId !== langOpts.selected
+      ) {
         await setVaultEmbedder(embedderId);
       }
-      // First-run: if the user opted into a shareable vault, convert the fresh (empty)
-      // device vault now that the key is saved. Device-only needs nothing — it's default.
-      if (onboarding && vaultMode === "shareable") {
-        // Send the passphrase exactly as typed — spaces included. Trimming here (but not on
-        // the unlock path) would derive a different key at unlock and lock the user out.
-        await createShareableVault(vaultPass);
-      }
+      // First-run always creates a device vault (the recommended default). Sharing with other
+      // Windows accounts is set up afterwards via the guided wizard, which moves the vault to a
+      // reachable folder — so onboarding can never strand a "shareable" vault inside this
+      // profile's private folder, unreachable by every other account (the issue #337 trap).
       onClose();
     } catch (e) {
       setError(String(e));
@@ -570,53 +580,45 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
             />
           </div>
 
-          <div className="mt-5 border-t border-border pt-4">
-            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-              Your vault
-            </label>
-            <p className="mt-1 text-xs text-ink4">
-              Your documents and notes live in one encrypted store. Choose how it's protected — you
-              can change this anytime in Settings.
-            </p>
-            <div className="mt-3">
-              <SegmentedControl
-                value={vaultMode}
-                onChange={setVaultMode}
-                options={[
-                  { value: "device", label: "This device only" },
-                  { value: "shareable", label: "Shareable" },
-                ]}
-              />
+          {joinedVault ? (
+            <div className="mt-5 border-t border-border pt-4">
+              <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                Your vault
+              </label>
+              <p className="mt-1 text-xs text-ink4">
+                You're connected to the shared vault — its documents, chats, and projects are
+                already here, and its search language travels with it.
+              </p>
+              <p className="mt-2 text-xs text-ink4">Two things are yours alone on this account:</p>
+              <ul className="ml-4 mt-1 list-disc space-y-1 text-xs text-ink4">
+                <li>
+                  Your own <strong>OpenRouter key</strong> (above) — AI features wake up once it's
+                  saved. Keys never travel between Windows accounts.
+                </li>
+                <li>
+                  Your own <strong>sign-ins</strong> — reconnect Drive, OneDrive, and calendars
+                  under Settings → Connectors when you're ready.
+                </li>
+              </ul>
             </div>
-            <p className="mt-2 text-xs text-faint">
-              {vaultMode === "device"
-                ? "Recommended. The key stays in this device's keychain — zero friction, nothing to remember."
-                : "Protected by a passphrase you choose, so the same vault can be opened from another Windows account (and your Markdown is encrypted at rest). The passphrase can't be recovered — if you forget it, the vault can't be opened."}
-            </p>
-            {vaultMode === "shareable" && (
-              <div className="mt-3 space-y-2">
-                <Input
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder="Passphrase"
-                  value={vaultPass}
-                  onChange={(e) => setVaultPass(e.target.value)}
-                />
-                <Input
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder="Confirm passphrase"
-                  value={vaultConfirm}
-                  onChange={(e) => setVaultConfirm(e.target.value)}
-                />
-                {vaultPass.length > 0 && vaultPass !== vaultConfirm && (
-                  <p className="text-xs text-st-due">Passphrases don't match.</p>
-                )}
-              </div>
-            )}
-          </div>
+          ) : (
+            <div className="mt-5 border-t border-border pt-4">
+              <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+                Your vault
+              </label>
+              <p className="mt-1 text-xs text-ink4">
+                Your documents and notes live in one encrypted store on this device — the key stays
+                in this device's keychain, so there's nothing to remember.
+              </p>
+              <p className="mt-2 text-xs text-faint">
+                Want to open the same vault from another Windows account on this PC? Set that up
+                anytime after setup under Settings → Data &amp; Security → Share with other
+                accounts.
+              </p>
+            </div>
+          )}
 
-          {langOpts && langOpts.options.length > 1 && (
+          {!joinedVault && langOpts && langOpts.options.length > 1 && (
             <div className="mt-5 border-t border-border pt-4">
               <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
                 Search language
