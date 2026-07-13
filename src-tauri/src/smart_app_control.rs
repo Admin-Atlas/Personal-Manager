@@ -20,6 +20,13 @@
 use serde::Serialize;
 
 /// Smart App Control enforcement state, as reported by the OS.
+///
+/// Only the Windows `query_state` constructs `Off`/`Enforced`/`Evaluation` (from the
+/// registry DWORD); the non-Windows build always returns `Unknown`, so on that target the
+/// other variants are unconstructed and clippy's `-D warnings` would flag them `dead_code`.
+/// Suppress that *only* off-Windows — Windows keeps full enforcement, where the variants
+/// are live, so real dead code can't hide behind this.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SmartAppControlState {
