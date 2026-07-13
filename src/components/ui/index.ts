@@ -15,6 +15,7 @@ export { Collapsible, type CollapsibleProps } from "./Collapsible";
 export { ListRow, type ListRowProps } from "./ListRow";
 export { StatusBadge, STATUS_LABEL, type StatusBadgeProps } from "./StatusBadge";
 export { Modal, type ModalProps } from "./Modal";
+export { Tooltip, type TooltipProps } from "./Tooltip";
 export { ConfirmDialog, type ConfirmDialogProps } from "./ConfirmDialog";
 export { NavItem, type NavItemProps } from "./NavItem";
 export { Progress, type ProgressProps } from "./Progress";

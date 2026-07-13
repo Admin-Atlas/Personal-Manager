@@ -198,6 +198,40 @@ export const ACCENTS: Record<System, readonly string[]> = {
   terminal: ["#9ece6a", "#e0af68", "#7dcfff", "#bb9af7", "#f7768e", "#7fe0b0"],
 };
 
+/** Human names for the accent swatches, shown on hover so every colour is legible — not just the
+ *  monochrome sentinel. Keyed by the same hex/sentinel used in {@link ACCENTS}; theme-neutral colour
+ *  words. Data, not code, so a palette tweak is a one-line change. {@link accentName} falls back to
+ *  the raw value for anything unlisted. */
+export const ACCENT_NAMES: Record<string, string> = {
+  [MONO_ACCENT]: "Monochrome (Eigengrau)",
+  // editorial
+  "#d2825b": "Terracotta",
+  "#c96f4c": "Sienna",
+  "#cda44e": "Ochre",
+  "#8f9a5b": "Olive",
+  "#c789a4": "Mauve",
+  "#6f8bbf": "Slate blue",
+  // slate
+  "#5b8cff": "Blue",
+  "#5bb5c0": "Teal",
+  "#9b8cf0": "Lavender",
+  "#5fd6a0": "Mint",
+  "#e0a86a": "Amber",
+  "#ff93b4": "Rose",
+  // terminal
+  "#9ece6a": "Lime",
+  "#e0af68": "Gold",
+  "#7dcfff": "Sky",
+  "#bb9af7": "Violet",
+  "#f7768e": "Coral",
+  "#7fe0b0": "Aquamarine",
+};
+
+/** The display name for an accent value (a hex or the mono sentinel), falling back to the value. */
+export function accentName(accent: string): string {
+  return ACCENT_NAMES[accent] ?? accent;
+}
+
 // The monochrome ramp for the {@link MONO_ACCENT} treatment: per-role Lightness only, rendered at
 // chroma 0 (pure neutral — no accent hue fans through it). tokens.ts pins --bg to the exact
 // Eigengrau hex in dark; every other role is a straight grey. Dark = Eigengrau base + white ink;

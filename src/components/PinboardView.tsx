@@ -9,6 +9,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -26,7 +27,16 @@ import {
   updateMilestone,
 } from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
-import { CELL, COLS, MIN_H, MIN_W, ROWS, boundsForPx, pxRectToCells } from "../lib/pinboard/grid";
+import {
+  CELL,
+  COLS,
+  MIN_H,
+  MIN_W,
+  ROWS,
+  boundsForPx,
+  minSize,
+  pxRectToCells,
+} from "../lib/pinboard/grid";
 import {
   applyLineMarker,
   continueList,
@@ -35,13 +45,24 @@ import {
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
 import { usePinboard } from "../lib/pinboard/usePinboard";
-import type { Rect, Widget } from "../lib/pinboard/types";
+import type { Rect, Widget, WidgetKind } from "../lib/pinboard/types";
 import type { Milestone } from "../lib/types";
 import { useDepth } from "../theme";
-import { Button, Input, Textarea } from "./ui";
+import { Button, Modal, SegmentedControl, Textarea, Tooltip } from "./ui";
 
 /** Note tint options — design tokens, never hex, so they track the active theme. */
 const NOTE_COLORS = ["st-quick", "st-due", "st-look", "st-track", "st-part"];
+
+/** Human names for the tint tokens, shown on hover. These are the semantic status colours reused as
+ *  note tints, so the names track {@link STATUS_LABEL} rather than a raw colour word (the token's hue
+ *  shifts with the theme). */
+const TINT_LABEL: Record<string, string> = {
+  "st-quick": "Quick win",
+  "st-due": "Due soon",
+  "st-look": "Take a look",
+  "st-track": "On track",
+  "st-part": "Part of",
+};
 
 /** The live filing state of a note's ingested document, keyed by `note:<widgetId>`. */
 type DocStatus = { reviewed: boolean; project: string };
@@ -63,6 +84,9 @@ interface PxRect {
 
 interface DragStart {
   id: string;
+  /** The dragged widget's kind, captured at grab so the drop can pick the right min size (folders
+   *  stay 3×3) without the pointer effect needing to look the widget up. */
+  kind: WidgetKind;
   mode: "move" | "resize";
   startX: number;
   startY: number;
@@ -72,6 +96,21 @@ interface DragStart {
 function rectToPx(r: Rect): PxRect {
   return { x: r.x * CELL, y: r.y * CELL, w: r.w * CELL, h: r.h * CELL };
 }
+
+/** The tint applied to a widget tile (and its folder-panel card) — a soft wash of its colour token
+ *  over the panel surface, or a neutral panel when untinted. */
+function tintStyle(color?: string): CSSProperties {
+  return color
+    ? {
+        background: `color-mix(in oklab, var(--${color}) 14%, var(--panel))`,
+        borderColor: `color-mix(in oklab, var(--${color}) 35%, var(--border))`,
+      }
+    : { background: "var(--panel)", borderColor: "var(--border)" };
+}
+
+/** The inline (expand-in-place) folder panel's fixed size, in cells → px. */
+const PANEL_W = 24 * CELL;
+const PANEL_H = 17 * CELL;
 
 /**
  * The Pinboard (spec §4): a bounded planning board of draggable, resizable widgets —
@@ -98,8 +137,10 @@ export function PinboardView() {
     addTimeline,
     updateWidget,
     moveWidget,
+    dropWidget,
     removeWidget,
     raiseWidget,
+    popOutChild,
     addTimelineItem,
     updateTimelineItem,
     removeTimelineItem,
@@ -107,6 +148,8 @@ export function PinboardView() {
 
   const [drag, setDrag] = useState<DragStart | null>(null);
   const [livePx, setLivePx] = useState<PxRect | null>(null);
+  // Which folder is currently expanded (transient — not persisted). At most one at a time.
+  const [expandedFolderId, setExpandedFolderId] = useState<string | null>(null);
 
   // The board fills the window and grows to any larger window ever seen — a high-water mark of the
   // window's OWN content area. So it fits exactly when maximised (no scrollbars), and once the window
@@ -200,10 +243,16 @@ export function PinboardView() {
     };
     const onMove = (e: PointerEvent) => setLivePx(compute(e));
     const onUp = (e: PointerEvent) => {
-      moveWidget(
-        drag.id,
-        pxRectToCells(compute(e), boardBoundsRef.current.cols, boardBoundsRef.current.rows),
+      const rect = pxRectToCells(
+        compute(e),
+        boardBoundsRef.current.cols,
+        boardBoundsRef.current.rows,
+        minSize(drag.kind),
       );
+      // Resize just repositions; a move goes through dropWidget, which may fold two stacked widgets
+      // into a folder or drop one into an existing folder.
+      if (drag.mode === "resize") moveWidget(drag.id, rect);
+      else dropWidget(drag.id, rect);
       setDrag(null);
       setLivePx(null);
     };
@@ -227,14 +276,40 @@ export function PinboardView() {
       window.removeEventListener("pointercancel", onCancel);
       window.removeEventListener("blur", onBlur);
     };
-  }, [drag, moveWidget]);
+  }, [drag, moveWidget, dropWidget]);
 
-  function startDrag(e: ReactPointerEvent, w: Widget, mode: "move" | "resize") {
-    e.preventDefault();
-    raiseWidget(w.id);
-    setDrag({ id: w.id, mode, startX: e.clientX, startY: e.clientY, startRect: w.rect });
-    setLivePx(rectToPx(w.rect));
-  }
+  // Stable across the per-tick drag re-renders (only `raiseWidget` is a dep), so passing it into each
+  // memoised body doesn't defeat the memo that keeps react-markdown from re-running on every move.
+  const startDrag = useCallback(
+    (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => {
+      e.preventDefault();
+      raiseWidget(w.id);
+      setDrag({
+        id: w.id,
+        kind: w.kind,
+        mode,
+        startX: e.clientX,
+        startY: e.clientY,
+        startRect: w.rect,
+      });
+      setLivePx(rectToPx(w.rect));
+    },
+    [raiseWidget],
+  );
+
+  // If the expanded folder dissolves (its last child removed/popped), close the panel.
+  useEffect(() => {
+    if (
+      expandedFolderId &&
+      !board.widgets.some((w) => w.id === expandedFolderId && w.kind === "folder")
+    ) {
+      setExpandedFolderId(null);
+    }
+  }, [expandedFolderId, board.widgets]);
+
+  const expandedFolder = expandedFolderId
+    ? board.widgets.find((w) => w.id === expandedFolderId && w.kind === "folder")
+    : undefined;
 
   return (
     <div className="flex h-full flex-1 flex-col">
@@ -298,58 +373,50 @@ export function PinboardView() {
 
           {board.widgets.map((w) => {
             const px = drag?.id === w.id && livePx ? livePx : rectToPx(w.rect);
-            const tint = w.color
-              ? {
-                  background: `color-mix(in oklab, var(--${w.color}) 14%, var(--panel))`,
-                  borderColor: `color-mix(in oklab, var(--${w.color}) 35%, var(--border))`,
-                }
-              : { background: "var(--panel)", borderColor: "var(--border)" };
             return (
               <div
                 key={w.id}
-                data-help={w.kind === "note" ? "pinboard-note" : "pinboard-timeline"}
+                data-help={
+                  w.kind === "note"
+                    ? "pinboard-note"
+                    : w.kind === "timeline"
+                      ? "pinboard-timeline"
+                      : "pinboard-folder"
+                }
                 className="absolute flex flex-col overflow-hidden rounded-[var(--radius-sm)] border shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none"
-                style={{ left: px.x, top: px.y, width: px.w, height: px.h, ...tint }}
+                style={{ left: px.x, top: px.y, width: px.w, height: px.h, ...tintStyle(w.color) }}
               >
-                {/* Drag handle / header */}
-                <div
-                  onPointerDown={(e) => startDrag(e, w, "move")}
-                  className="flex shrink-0 cursor-grab touch-none items-center justify-between gap-1 border-b border-rule px-2 py-1 active:cursor-grabbing"
-                >
-                  <span className="truncate font-mono text-[10px] uppercase tracking-wide text-ink4">
-                    {w.kind === "note" ? "Note" : "Timeline"}
-                  </span>
-                  <button
-                    onPointerDown={(e) => e.stopPropagation()}
-                    onClick={() => removeWidget(w.id)}
-                    aria-label="Delete widget"
-                    title="Delete"
-                    className="shrink-0 rounded-[var(--radius-sm)] px-1 text-xs text-ink4 hover:bg-surface hover:text-st-due"
-                  >
-                    ✕
-                  </button>
-                </div>
-
-                {/* Body */}
-                <div className="min-h-0 flex-1 overflow-auto">
-                  {w.kind === "note" ? (
-                    <NoteBody
-                      widget={w}
-                      onChange={updateWidget}
-                      status={docStatus.get(`note:${w.id}`)}
-                      onIngested={refreshDocs}
-                    />
-                  ) : (
-                    <TimelineBody
-                      widget={w}
-                      showPower={showPower}
-                      onChange={updateWidget}
-                      onAddItem={addTimelineItem}
-                      onUpdateItem={updateTimelineItem}
-                      onRemoveItem={removeTimelineItem}
-                    />
-                  )}
-                </div>
+                {/* The widget owns its own header + body, so note-specific controls (Ingest) can sit
+                    in the top bar while their state stays inside the memoised body. */}
+                {w.kind === "note" ? (
+                  <NoteBody
+                    widget={w}
+                    onChange={updateWidget}
+                    onDelete={removeWidget}
+                    onStartDrag={startDrag}
+                    status={docStatus.get(`note:${w.id}`)}
+                    onIngested={refreshDocs}
+                  />
+                ) : w.kind === "timeline" ? (
+                  <TimelineBody
+                    widget={w}
+                    showPower={showPower}
+                    onChange={updateWidget}
+                    onDelete={removeWidget}
+                    onStartDrag={startDrag}
+                    onAddItem={addTimelineItem}
+                    onUpdateItem={updateTimelineItem}
+                    onRemoveItem={removeTimelineItem}
+                  />
+                ) : (
+                  <FolderTile
+                    widget={w}
+                    onChange={updateWidget}
+                    onUngroup={removeWidget}
+                    onStartDrag={startDrag}
+                    onOpen={() => setExpandedFolderId(w.id)}
+                  />
+                )}
 
                 {showPower && (
                   <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[9px] text-faint">
@@ -357,20 +424,73 @@ export function PinboardView() {
                   </div>
                 )}
 
-                {/* Resize handle (bottom-right) */}
-                <div
-                  onPointerDown={(e) => startDrag(e, w, "resize")}
-                  title="Resize"
-                  aria-label="Resize widget"
-                  className="absolute bottom-0 right-0 h-3.5 w-3.5 cursor-nwse-resize touch-none"
-                  style={{
-                    background:
-                      "linear-gradient(135deg, transparent 50%, color-mix(in oklab, var(--ink4) 50%, transparent) 50%)",
-                  }}
-                />
+                {/* Resize handle (bottom-right) — folders are a fixed 3×3 tile, so not resizable. */}
+                {w.kind !== "folder" && (
+                  <div
+                    onPointerDown={(e) => startDrag(e, w, "resize")}
+                    title="Resize"
+                    aria-label="Resize widget"
+                    className="absolute bottom-0 right-0 h-3.5 w-3.5 cursor-nwse-resize touch-none"
+                    style={{
+                      background:
+                        "linear-gradient(135deg, transparent 50%, color-mix(in oklab, var(--ink4) 50%, transparent) 50%)",
+                    }}
+                  />
+                )}
               </div>
             );
           })}
+
+          {/* Expanded folder (transient UI, at most one). Rendered as a board sibling so the inline
+              panel escapes the tiles' overflow-hidden and paints above them; the tile's rect never moves. */}
+          {expandedFolder &&
+            ((expandedFolder.expandMode ?? "inline") === "overlay" ? (
+              <Modal open onClose={() => setExpandedFolderId(null)} widthClassName="max-w-3xl">
+                <div className="h-[70vh]">
+                  <FolderPanel
+                    folder={expandedFolder}
+                    onChange={updateWidget}
+                    onDelete={removeWidget}
+                    onPopOut={popOutChild}
+                    onAddItem={addTimelineItem}
+                    onUpdateItem={updateTimelineItem}
+                    onRemoveItem={removeTimelineItem}
+                    docStatus={docStatus}
+                    onIngested={refreshDocs}
+                    onClose={() => setExpandedFolderId(null)}
+                  />
+                </div>
+              </Modal>
+            ) : (
+              <div
+                className="absolute z-30 flex flex-col overflow-hidden rounded-[var(--radius)] border border-border2 bg-panel shadow-2xl"
+                style={{
+                  left: Math.max(
+                    0,
+                    Math.min(expandedFolder.rect.x * CELL, boardBounds.cols * CELL - PANEL_W),
+                  ),
+                  top: Math.max(
+                    0,
+                    Math.min(expandedFolder.rect.y * CELL, boardBounds.rows * CELL - PANEL_H),
+                  ),
+                  width: PANEL_W,
+                  height: PANEL_H,
+                }}
+              >
+                <FolderPanel
+                  folder={expandedFolder}
+                  onChange={updateWidget}
+                  onDelete={removeWidget}
+                  onPopOut={popOutChild}
+                  onAddItem={addTimelineItem}
+                  onUpdateItem={updateTimelineItem}
+                  onRemoveItem={removeTimelineItem}
+                  docStatus={docStatus}
+                  onIngested={refreshDocs}
+                  onClose={() => setExpandedFolderId(null)}
+                />
+              </div>
+            ))}
         </div>
       </div>
     </div>
@@ -453,18 +573,96 @@ function formatForKey(e: ReactKeyboardEvent<HTMLTextAreaElement>): FormatAction 
   return null;
 }
 
+/** The shared top bar for every widget: an editable title, an optional right-side `actions` slot,
+ *  and the delete/✕ control. It is the drag handle when `onStartDrag` is given (board widgets);
+ *  folder-panel children pass none, so their card header is a plain, non-draggable bar. */
+function WidgetHeader({
+  widget,
+  placeholder,
+  onRename,
+  onDelete,
+  onStartDrag,
+  deleteLabel = "Delete",
+  actions,
+}: {
+  widget: Widget;
+  placeholder: string;
+  onRename: (title: string) => void;
+  onDelete: () => void;
+  onStartDrag?: (e: ReactPointerEvent) => void;
+  deleteLabel?: string;
+  actions?: ReactNode;
+}) {
+  return (
+    <div
+      onPointerDown={onStartDrag}
+      className={`flex shrink-0 items-center justify-between gap-1 border-b border-rule px-2 py-1 ${
+        onStartDrag ? "cursor-grab touch-none active:cursor-grabbing" : ""
+      }`}
+    >
+      {/* stopPropagation on pointerdown so a click edits the title instead of starting a drag
+          (mirrors the ✕ button); flex-none + max-w keeps a wide drag region to the input's right. */}
+      <input
+        value={widget.title ?? ""}
+        onChange={(e) => onRename(e.target.value)}
+        onPointerDown={(e) => e.stopPropagation()}
+        placeholder={placeholder}
+        aria-label={`${placeholder} title`}
+        className="min-w-0 max-w-[62%] flex-none truncate border-0 bg-transparent px-0 text-xs font-medium text-ink3 placeholder:text-ink4 focus:text-ink2 focus:outline-none focus:ring-0"
+      />
+      <div className="flex shrink-0 items-center gap-1">
+        {actions}
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={onDelete}
+          aria-label={deleteLabel}
+          title={deleteLabel}
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-xs text-ink4 hover:bg-surface hover:text-st-due"
+        >
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** "Move this card out of the folder, back onto the board" — shown on folder-panel children. */
+function PopOutButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={onClick}
+      title="Move out to the board"
+      aria-label="Move out to the board"
+      className="shrink-0 rounded-[var(--radius-sm)] px-1 text-xs text-ink4 hover:bg-surface hover:text-ink2"
+    >
+      ⤴
+    </button>
+  );
+}
+
 // Memoised: a drag/resize sets state on every pointermove, re-rendering the whole board — without
 // memo each note would re-run the react-markdown pipeline per tick. All props are stable across a
-// drag (widget objects are only replaced when edited; the usePinboard mutators and refreshDocs are
-// stable useCallbacks; `status` comes out of a map rebuilt only on refetch).
+// board drag: widget objects are only replaced when edited; `onChange`/`onDelete`/`onIngested` and
+// the memoised `onStartDrag` are stable useCallbacks; `onPopOut` is absent for board tiles; `status`
+// comes out of a map rebuilt only on refetch.
 const NoteBody = memo(function NoteBody({
   widget,
   onChange,
+  onDelete,
+  onStartDrag,
+  onPopOut,
   status,
   onIngested,
 }: {
   widget: Widget;
   onChange: (id: string, patch: Partial<Widget>) => void;
+  onDelete: (id: string) => void;
+  /** The board drag handle. Absent for folder-panel children (they aren't board-positioned). */
+  onStartDrag?: (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => void;
+  /** When set (folder-panel child), a "move out to the board" control shows in the header. */
+  onPopOut?: () => void;
   status?: DocStatus;
   onIngested: () => void;
 }) {
@@ -547,48 +745,63 @@ const NoteBody = memo(function NoteBody({
     });
   }
 
+  // The Ingest / filing-status control sits in the top bar (right of the title, left of ✕).
+  const ingestControl = !ingested ? (
+    <button
+      type="button"
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={ingest}
+      disabled={ingesting || !text.trim()}
+      className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
+      title="Save this note to your vault as a document (it goes through Review)"
+    >
+      {ingesting ? "Saving…" : "Ingest"}
+    </button>
+  ) : (
+    <>
+      <span
+        className="max-w-[8rem] truncate text-[10px] text-ink4"
+        title={
+          status
+            ? status.reviewed
+              ? `Filed under ${status.project}`
+              : "Waiting in the Review queue"
+            : "Saved to your vault as a document"
+        }
+      >
+        {status ? (status.reviewed ? `Filed · ${status.project}` : "In review") : "Ingested"}
+      </span>
+      {edited && (
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={ingest}
+          disabled={ingesting}
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
+          title="Update the saved document with your latest edits"
+        >
+          {ingesting ? "…" : "Re-ingest"}
+        </button>
+      )}
+    </>
+  );
+
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex shrink-0 items-center gap-1 px-2 pt-1" data-help="pinboard-note-ingest">
-        {!ingested ? (
-          <button
-            type="button"
-            onClick={ingest}
-            disabled={ingesting || !text.trim()}
-            className="rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
-            title="Save this note to your vault as a document (it goes through Review)"
-          >
-            {ingesting ? "Saving…" : "Ingest"}
-          </button>
-        ) : (
+    <div className="flex min-h-0 flex-1 flex-col" data-help="pinboard-note-ingest">
+      <WidgetHeader
+        widget={widget}
+        placeholder="Note"
+        onRename={(t) => onChange(widget.id, { title: t })}
+        onDelete={() => onDelete(widget.id)}
+        onStartDrag={onStartDrag ? (e) => onStartDrag(e, widget, "move") : undefined}
+        actions={
           <>
-            <span
-              className="truncate text-[10px] text-ink4"
-              title={
-                status
-                  ? status.reviewed
-                    ? `Filed under ${status.project}`
-                    : "Waiting in the Review queue"
-                  : "Saved to your vault as a document"
-              }
-            >
-              {status ? (status.reviewed ? `Filed · ${status.project}` : "In review") : "Ingested"}
-            </span>
-            {edited && (
-              <button
-                type="button"
-                onClick={ingest}
-                disabled={ingesting}
-                className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
-                title="Update the saved document with your latest edits"
-              >
-                {ingesting ? "…" : "Re-ingest"}
-              </button>
-            )}
+            {onPopOut && <PopOutButton onClick={onPopOut} />}
+            {ingestControl}
           </>
-        )}
-      </div>
-      {ingestErr && <p className="shrink-0 px-2 text-[10px] text-st-due">{ingestErr}</p>}
+        }
+      />
+      {ingestErr && <p className="shrink-0 px-2 pt-1 text-[10px] text-st-due">{ingestErr}</p>}
       {showEditor ? (
         <Textarea
           ref={taRef}
@@ -613,36 +826,41 @@ const NoteBody = memo(function NoteBody({
         {showEditor && (
           <div className="flex items-center gap-0.5" data-help="pinboard-note-format">
             {FORMAT_ACTIONS.map((a) => (
-              <button
-                key={a.key}
-                type="button"
-                title={`${a.label}  (${a.hint})`}
-                aria-label={`${a.label} (${a.hint})`}
-                // Keep the textarea focused/selected so the edit lands where the caret is.
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => applyEdit(a.apply)}
-                className="flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] text-ink4 hover:bg-surface hover:text-ink2"
-              >
-                {a.icon}
-              </button>
+              <Tooltip key={a.key} label={`${a.label} · ${a.hint}`}>
+                <button
+                  type="button"
+                  aria-label={`${a.label} (${a.hint})`}
+                  // Keep the textarea focused/selected so the edit (and its shortcut) lands where
+                  // the caret is.
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => applyEdit(a.apply)}
+                  className="flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] text-ink4 hover:bg-surface hover:text-ink2"
+                >
+                  {a.icon}
+                </button>
+              </Tooltip>
             ))}
           </div>
         )}
         <div className="flex items-center gap-1" data-help="pinboard-note-tint">
-          {NOTE_COLORS.map((c) => (
-            <button
-              key={c}
-              onClick={() => onChange(widget.id, { color: c })}
-              aria-label={`Tint ${c.replace("st-", "")}`}
-              className={`h-3 w-3 rounded-full border ${
-                widget.color === c ? "ring-1 ring-ink3" : ""
-              }`}
-              style={{
-                background: `var(--${c})`,
-                borderColor: "color-mix(in oklab, var(--ink) 20%, transparent)",
-              }}
-            />
-          ))}
+          {NOTE_COLORS.map((c) => {
+            const name = TINT_LABEL[c] ?? c.replace("st-", "");
+            return (
+              <Tooltip key={c} label={name}>
+                <button
+                  onClick={() => onChange(widget.id, { color: c })}
+                  aria-label={`Tint: ${name}`}
+                  className={`h-3 w-3 rounded-full border ${
+                    widget.color === c ? "ring-1 ring-ink3" : ""
+                  }`}
+                  style={{
+                    background: `var(--${c})`,
+                    borderColor: "color-mix(in oklab, var(--ink) 20%, transparent)",
+                  }}
+                />
+              </Tooltip>
+            );
+          })}
         </div>
       </div>
     </div>
@@ -702,26 +920,202 @@ interface TimelineBodyProps {
   widget: Widget;
   showPower: boolean;
   onChange: (id: string, patch: Partial<Widget>) => void;
+  onDelete: (id: string) => void;
+  /** The board drag handle. Absent for folder-panel children (they aren't board-positioned). */
+  onStartDrag?: (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => void;
+  /** When set (folder-panel child), a "move out to the board" control shows in the header. */
+  onPopOut?: () => void;
   onAddItem: (id: string) => void;
   onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
   onRemoveItem: (id: string, itemId: string) => void;
 }
 
 /** A timeline is either *bound* to a real project — showing and editing that project's live
- *  milestones, which flow to the brief + Focus — or a freeform scratch list (the default).
- *  Memoised for the same board-wide drag re-renders as NoteBody (all props are stable). */
+ *  milestones, which flow to the brief + Focus — or a freeform scratch list (the default). The
+ *  shared header (editable title, drag, delete) wraps either body. Memoised for the same board-wide
+ *  drag re-renders as NoteBody (all board-tile props are stable). */
 const TimelineBody = memo(function TimelineBody(props: TimelineBodyProps) {
-  if (props.widget.project) {
-    return (
-      <BoundTimeline
-        project={props.widget.project}
-        showPower={props.showPower}
-        onUnlink={() => props.onChange(props.widget.id, { project: undefined })}
+  const { widget, onChange, onDelete, onStartDrag, onPopOut, showPower } = props;
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <WidgetHeader
+        widget={widget}
+        placeholder="Timeline"
+        onRename={(t) => onChange(widget.id, { title: t })}
+        onDelete={() => onDelete(widget.id)}
+        onStartDrag={onStartDrag ? (e) => onStartDrag(e, widget, "move") : undefined}
+        actions={onPopOut ? <PopOutButton onClick={onPopOut} /> : undefined}
       />
-    );
-  }
-  return <FreeformTimeline {...props} />;
+      <div className="min-h-0 flex-1 overflow-auto">
+        {widget.project ? (
+          <BoundTimeline
+            project={widget.project}
+            showPower={showPower}
+            onUnlink={() => onChange(widget.id, { project: undefined })}
+          />
+        ) : (
+          <FreeformTimeline {...props} />
+        )}
+      </div>
+    </div>
+  );
 });
+
+/** A collapsed folder tile (3×3): the shared header (editable title + Ungroup) over a big button
+ *  showing the child count, which opens the folder. Not resizable (the outer loop omits the handle). */
+function FolderTile({
+  widget,
+  onChange,
+  onUngroup,
+  onStartDrag,
+  onOpen,
+}: {
+  widget: Widget;
+  onChange: (id: string, patch: Partial<Widget>) => void;
+  onUngroup: (id: string) => void;
+  onStartDrag: (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => void;
+  onOpen: () => void;
+}) {
+  const n = widget.children?.length ?? 0;
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <WidgetHeader
+        widget={widget}
+        placeholder="Folder"
+        deleteLabel="Ungroup (spill notes back onto the board)"
+        onRename={(t) => onChange(widget.id, { title: t })}
+        onDelete={() => onUngroup(widget.id)}
+        onStartDrag={(e) => onStartDrag(e, widget, "move")}
+      />
+      <button
+        type="button"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={onOpen}
+        title="Open folder"
+        className="flex min-h-0 flex-1 flex-col items-center justify-center gap-0.5 text-ink3 hover:bg-surface"
+      >
+        <FolderGlyph />
+        <span className="font-mono text-[10px]">
+          {n} item{n === 1 ? "" : "s"}
+        </span>
+      </button>
+    </div>
+  );
+}
+
+function FolderGlyph() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className="h-6 w-6"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.6}
+    >
+      <path
+        d="M3 7a1 1 0 0 1 1-1h5l2 2h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/** The expanded folder view (inline panel or overlay): editable title, a presentation toggle, and
+ *  a grid of the contained cards — each the SAME NoteBody/TimelineBody, so children edit/ingest just
+ *  like board widgets. Children carry no drag handle (they aren't board-positioned) but get a
+ *  pop-out control; a child's ✕ deletes it (and auto-dissolves the folder at ≤1). */
+function FolderPanel({
+  folder,
+  onChange,
+  onDelete,
+  onPopOut,
+  onAddItem,
+  onUpdateItem,
+  onRemoveItem,
+  docStatus,
+  onIngested,
+  onClose,
+}: {
+  folder: Widget;
+  onChange: (id: string, patch: Partial<Widget>) => void;
+  onDelete: (id: string) => void;
+  onPopOut: (folderId: string, childId: string) => void;
+  onAddItem: (id: string) => void;
+  onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
+  onRemoveItem: (id: string, itemId: string) => void;
+  docStatus: Map<string, DocStatus>;
+  onIngested: () => void;
+  onClose: () => void;
+}) {
+  const children = folder.children ?? [];
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-rule px-3 py-2">
+        <input
+          value={folder.title ?? ""}
+          onChange={(e) => onChange(folder.id, { title: e.target.value })}
+          placeholder="Folder"
+          aria-label="Folder title"
+          className="min-w-0 flex-1 truncate border-0 bg-transparent px-0 text-sm font-medium text-ink2 placeholder:text-ink4 focus:outline-none focus:ring-0"
+        />
+        <SegmentedControl
+          value={folder.expandMode ?? "inline"}
+          onChange={(m) => onChange(folder.id, { expandMode: m })}
+          options={[
+            { value: "inline", label: "In place" },
+            { value: "overlay", label: "Overlay" },
+          ]}
+        />
+        <button
+          type="button"
+          onClick={onClose}
+          title="Close folder"
+          aria-label="Close folder"
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-sm text-ink4 hover:bg-surface hover:text-ink2"
+        >
+          ✕
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto p-3">
+        {children.length === 0 ? (
+          <p className="text-xs text-ink4">This folder is empty.</p>
+        ) : (
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+            {children.map((c) => (
+              <div
+                key={c.id}
+                className="flex h-64 flex-col overflow-hidden rounded-[var(--radius-sm)] border"
+                style={tintStyle(c.color)}
+              >
+                {c.kind === "note" ? (
+                  <NoteBody
+                    widget={c}
+                    onChange={onChange}
+                    onDelete={onDelete}
+                    onPopOut={() => onPopOut(folder.id, c.id)}
+                    status={docStatus.get(`note:${c.id}`)}
+                    onIngested={onIngested}
+                  />
+                ) : (
+                  <TimelineBody
+                    widget={c}
+                    showPower={false}
+                    onChange={onChange}
+                    onDelete={onDelete}
+                    onPopOut={() => onPopOut(folder.id, c.id)}
+                    onAddItem={onAddItem}
+                    onUpdateItem={onUpdateItem}
+                    onRemoveItem={onRemoveItem}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 /** A milestone's effective date as YYYY-MM-DD, or "" when undated. */
 function msDate(m: Milestone): string {
@@ -955,12 +1349,6 @@ function FreeformTimeline({
 
   return (
     <div className="flex h-full flex-col px-2 py-1">
-      <Input
-        value={widget.title ?? ""}
-        onChange={(e) => onChange(widget.id, { title: e.target.value })}
-        placeholder="Timeline title"
-        className="mb-1 border-0 bg-transparent px-0 text-sm font-medium focus:ring-0"
-      />
       <div className="min-h-0 flex-1 space-y-1 overflow-auto">
         {items.length === 0 && <p className="text-[11px] text-ink4">No milestones yet.</p>}
         {items.map((it) => (
