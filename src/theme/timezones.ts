@@ -158,3 +158,43 @@ export function parseCoords(raw: string | null | undefined): Coords | null {
 export function formatCoords(coords: Coords): string {
   return `${coords[0].toFixed(2)}, ${coords[1].toFixed(2)}`;
 }
+
+/** The device's IANA time zone (e.g. "Europe/London"), or "UTC" if the runtime can't report one. */
+export function deviceTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+/** The effective coordinates for the solar features: a valid user "lat, lon" override, else the
+ *  device-timezone's representative coordinates (or null if unknown). This is the ONE derivation the
+ *  theme's auto light/dark mode and the calendar's sunrise/sunset both read, so they can't drift. */
+export function coordsFor(override: string | null | undefined): Coords | null {
+  return parseCoords(override) ?? deviceCoords();
+}
+
+/** Every IANA zone the runtime knows (for a manual picker); just the device zone on a runtime
+ *  without `Intl.supportedValuesOf`. */
+export function allTimeZones(): string[] {
+  const intl = Intl as typeof Intl & { supportedValuesOf?: (key: string) => string[] };
+  try {
+    return typeof intl.supportedValuesOf === "function"
+      ? intl.supportedValuesOf("timeZone")
+      : [deviceTimeZone()];
+  } catch {
+    return [deviceTimeZone()];
+  }
+}
+
+/** Whether `tz` is an IANA zone this runtime accepts — guards persisted/extra zones before use. */
+export function isValidTimeZone(tz: string): boolean {
+  if (!tz) return false;
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}

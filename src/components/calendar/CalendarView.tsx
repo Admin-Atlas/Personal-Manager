@@ -15,16 +15,22 @@ import type { CalendarEvent, CalendarOverview } from "../../lib/types";
 import {
   readHidden,
   readRange,
+  readRangeBounds,
   readView,
+  readZones,
   writeHidden,
   writeRange,
+  writeRangeBounds,
   writeView,
+  writeZones,
   type CalendarRange,
   type CalendarViewMode,
+  type RangeBounds,
 } from "../../lib/calendarPrefs";
+import { resolveRangeBounds } from "../../lib/calendarGeom";
 import { formatDateLocal } from "../../lib/format";
 import { addDays, dayKey, eventDaySpan, startOfDay } from "../../lib/calendar-layout";
-import { sourceColors, useTheme } from "../../theme";
+import { sourceColors, useTheme, useUserTime } from "../../theme";
 import { Skeleton } from "../ui";
 import { useNowTick } from "./parts/useNowTick";
 import { CalendarHeader } from "./CalendarHeader";
@@ -112,11 +118,17 @@ function visibleRange(view: CalendarViewMode, cur: Date): { start: Date; end: Da
 
 export function CalendarView() {
   const { system, accent } = useTheme();
+  const { coords } = useUserTime();
   const [overview, setOverview] = useState<CalendarOverview | null>(() => cachedOverview);
   const [events, setEvents] = useState<CalendarEvent[]>(() => cachedEvents);
   const [hidden, setHidden] = useState<Set<string>>(() => readHidden());
   const [view, setView] = useState<CalendarViewMode>(() => readView(AVAILABLE_VIEWS, DEFAULT_VIEW));
   const [range, setRange] = useState<CalendarRange>(() => readRange());
+  // Extra gutter timezones + any custom Work/Day hour windows (both per-device view prefs).
+  const [zones, setZones] = useState<string[]>(() => readZones());
+  const [customBounds, setCustomBounds] = useState<Partial<Record<CalendarRange, RangeBounds>>>(
+    () => readRangeBounds(),
+  );
   const [cursor, setCursor] = useState<Date>(() => new Date());
   const [loading, setLoading] = useState(cachedOverview === null);
   const [syncing, setSyncing] = useState(false);
@@ -214,6 +226,21 @@ export function CalendarView() {
     writeRange(r);
   }, []);
 
+  const onZonesChange = useCallback((next: string[]) => {
+    setZones(next);
+    writeZones(next);
+  }, []);
+
+  const onBoundsChange = useCallback((r: CalendarRange, bounds: RangeBounds | null) => {
+    setCustomBounds((prev) => {
+      const next = { ...prev };
+      if (bounds) next[r] = bounds;
+      else delete next[r];
+      writeRangeBounds(next);
+      return next;
+    });
+  }, []);
+
   const onPrev = useCallback(() => setCursor((c) => stepCursor(view, c, -1)), [view]);
   const onNext = useCallback(() => setCursor((c) => stepCursor(view, c, 1)), [view]);
   const onToday = useCallback(() => setCursor(new Date()), []);
@@ -279,6 +306,14 @@ export function CalendarView() {
     }
     return [];
   }, [view, cursor]);
+
+  // The visible-hour window the time grid frames: a custom Work/Day override, else the computed
+  // default (Work 08:30–17:30, Day = local sunrise/sunset, 24h = full). Recomputed with the cursor so
+  // the Day default tracks the shown date's daylight (rounded to the hour, it shifts ~seasonally).
+  const activeBounds = useMemo(
+    () => resolveRangeBounds(range, customBounds, coords, cursor),
+    [range, customBounds, coords, cursor],
+  );
 
   const label = viewLabel(view, cursor);
   const isTerminal = system === "terminal";
@@ -369,7 +404,14 @@ export function CalendarView() {
       case "week":
       default:
         return (
-          <TimeGridView days={gridDays} events={visibleEvents} colorOf={colorOf} range={range} />
+          <TimeGridView
+            days={gridDays}
+            events={visibleEvents}
+            colorOf={colorOf}
+            range={range}
+            bounds={activeBounds}
+            zones={zones}
+          />
         );
     }
   };
@@ -382,6 +424,11 @@ export function CalendarView() {
         onViewChange={onViewChange}
         range={range}
         onRangeChange={onRangeChange}
+        customBounds={customBounds}
+        onBoundsChange={onBoundsChange}
+        coords={coords}
+        zones={zones}
+        onZonesChange={onZonesChange}
         label={label}
         cursor={cursor}
         onPickDate={onPickDate}

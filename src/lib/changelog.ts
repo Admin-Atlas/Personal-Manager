@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.9.0-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "See other timezones on the calendar. In Day and Week view, add up to two more timezones from the “Zones” button and they show as extra columns down the left beside your local time — handy for a call with another city. Remove them the same way.",
+      "Set your own Work and Day hours. The ▾ on the Work and Day buttons (Day/Week view) opens a little editor for the start and end of each. Work now frames 08:30–17:30 by default, so a 9-to-5 day's first and last events sit comfortably inside the view; Day frames your local sunrise-to-sunset, rounded to the hour so it only shifts with the seasons. Change either to whatever suits you, or reset to the default.",
+      "Calendar events now show their start and end time (e.g. 09:30–10:45), not just the start.",
+      "Under the hood: your timezone and location now come from one shared place, so the calendar, the sunrise/sunset day framing, and the automatic light/dark switch all stay in step.",
+    ],
+  },
+  {
     version: "3.8.0-alpha",
     date: "2026-07-13",
     highlights: [

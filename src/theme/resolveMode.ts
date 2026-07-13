@@ -12,7 +12,7 @@
 
 import type { Mode, ModePref } from "./profiles";
 import { isDaytime, nextTransition } from "./solar";
-import { deviceCoords, parseCoords, type Coords } from "./timezones";
+import { coordsFor, type Coords } from "./timezones";
 
 /** How a resolved Mode was arrived at — surfaced in Settings so the choice is legible. */
 export type ModeSource = "explicit" | "system" | "auto" | "auto-fallback";
@@ -42,8 +42,8 @@ export function resolveMode(pref: ModePref, now: Date, override?: string | null)
   if (pref === "light" || pref === "dark") return { mode: pref, source: "explicit" };
   if (pref === "system") return { mode: prefersDark() ? "dark" : "light", source: "system" };
 
-  // auto — sunrise/sunset at the user's location.
-  const coords = parseCoords(override) ?? deviceCoords();
+  // auto — sunrise/sunset at the user's location (one shared derivation; see coordsFor).
+  const coords = coordsFor(override);
   if (!coords) return { mode: prefersDark() ? "dark" : "light", source: "auto-fallback" };
   const day = isDaytime(now, coords[0], coords[1]);
   const next = nextTransition(now, coords[0], coords[1]);
