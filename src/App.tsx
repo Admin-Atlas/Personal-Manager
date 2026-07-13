@@ -26,6 +26,7 @@ import { SettingsView } from "./components/SettingsView";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { VaultCurtain } from "./components/VaultCurtain";
 import { VaultOpenError } from "./components/VaultOpenError";
+import { DeletedVaultNotice } from "./components/VaultRecovery";
 import { VaultUnlock } from "./components/VaultUnlock";
 import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
@@ -675,6 +676,14 @@ export default function App() {
         }
       />
     );
+  }
+
+  // The pointed shared vault was DELETED by its owner (a discovery tombstone marks it) — a
+  // positive, honest notice + switch-to-local, ahead of the generic "couldn't open" gate
+  // below (which would otherwise show the unreachable-folder story for a folder that's gone
+  // for good). Only set when the folder is genuinely absent, so a live vault never hits this.
+  if (vault?.deleted_notice) {
+    return <DeletedVaultNotice notice={vault.deleted_notice} onAcknowledged={completeUnlock} />;
   }
 
   // A boot-time open failure (an AV / search-indexer file lock, a denied or gone pointed

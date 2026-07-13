@@ -144,6 +144,15 @@ export interface RepairOutcome {
   warnings: string[];
 }
 
+/** The joiner-facing record that a pointed shared vault was DELETED by its owner (read from
+ *  the discovery tombstone) — drives the one-time "switched you back to your own vault"
+ *  notice instead of the generic "couldn't open your vault" screen. */
+export interface DeletedVaultNotice {
+  folder: string;
+  /** RFC3339; formatted DD-MM-YYYY for display. */
+  deleted_at: string | null;
+}
+
 /** The vault's current state for the UI: its key mode, whether it needs unlocking on
  *  this profile (a passphrase vault whose key isn't cached here yet), whether the
  *  Markdown is encrypted at rest, where it lives on disk, and its stable id. */
@@ -172,6 +181,9 @@ export interface VaultStatus {
    *  access-denied — repairable), so Settings can offer "Rejoin …". Null when never
    *  detached or when the folder no longer holds a vault. */
   retired_root: string | null;
+  /** Set when the shared vault this profile points at was DELETED by its owner (a tombstone
+   *  marks the folder). The app shows a one-time notice and switches back to a local vault. */
+  deleted_notice: DeletedVaultNotice | null;
 }
 
 /** Non-fatal warnings from a vault operation (a folder-ACL or discovery-marker hiccup);

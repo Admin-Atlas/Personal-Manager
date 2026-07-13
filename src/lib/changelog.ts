@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.7.2-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "You can now delete a shared vault properly. From Settings → Vault, “Delete shared vault…” removes it from the shared folder for everyone who uses it — with a clear warning first — and switches your account back to a vault of its own. The accounts you shared with are told, plainly, that the vault was deleted the next time they open PM, and are moved back to their own vault instead of hitting a confusing error.",
+      "“Remove PM data” from an account that joined someone else's shared vault now only clears your own copy of things and leaves the shared vault untouched for everyone else — it can no longer wipe a shared vault out from under the other accounts.",
+    ],
+  },
+  {
     version: "3.7.1-alpha",
     date: "2026-07-13",
     highlights: [

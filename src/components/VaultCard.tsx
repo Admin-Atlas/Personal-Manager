@@ -16,6 +16,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   adoptSharedVault,
   changeVaultPassphrase,
+  deleteSharedVault,
   exportPlaintextMarkdown,
   forgetVaultPassphrase,
   makeVaultPrivate,
@@ -30,7 +31,7 @@ import { joinErrorMessage } from "./VaultJoin";
 import { markJustJoinedVault } from "../lib/joinedVault";
 
 /** Which inline form/confirmation is currently open (only one at a time). */
-type Pending = "change" | "private" | "adopt" | null;
+type Pending = "change" | "private" | "adopt" | "delete" | null;
 
 export function VaultCard() {
   const [status, setStatus] = useState<VaultStatus | null>(null);
@@ -127,6 +128,20 @@ export function VaultCard() {
     } catch (e) {
       // Classified copy: folder-denied ≠ wrong passphrase ≠ no vault ≠ damaged store.
       setError(joinErrorMessage(e));
+      setBusy(false);
+    }
+  }
+
+  /** Delete the shared vault for everyone, then reload the whole webview onto the local
+   *  vault this account switched to (the same store-swap reload as adopt/detach). */
+  async function deleteShared() {
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteSharedVault();
+      window.location.reload();
+    } catch (e) {
+      setError(String(e));
       setBusy(false);
     }
   }
@@ -236,6 +251,13 @@ export function VaultCard() {
             >
               Forget passphrase here
             </Button>
+            {/* Deleting a shared vault only makes sense once it's actually in a shared
+                folder (pointed) — it removes the vault for every account that uses it. */}
+            {status?.pointed_root && (
+              <Button variant="tertiary" onClick={() => setPending("delete")} disabled={busy}>
+                Delete shared vault…
+              </Button>
+            )}
           </div>
 
           {pending === "change" && (
@@ -288,6 +310,39 @@ export function VaultCard() {
                   }
                 >
                   {busy ? "Working…" : "Make private"}
+                </Button>
+                <Button variant="tertiary" onClick={reset} disabled={busy}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {pending === "delete" && (
+            <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-st-due p-3">
+              <p className="text-xs text-ink3">
+                Delete this shared vault for <span className="font-medium text-st-due">every</span>{" "}
+                account that uses it? Its documents, chats, and projects are{" "}
+                <span className="font-medium text-st-due">permanently removed</span> from the shared
+                folder. Connected accounts lose access at their next launch and are moved back to a
+                vault of their own.
+              </p>
+              <p className="text-xs text-ink4">
+                {status?.has_set_aside_vault
+                  ? "This account switches back to the vault that was set aside when you joined."
+                  : "This account switches to a new, empty vault (your data was moved into the shared copy when you shared it)."}
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  variant="primary"
+                  disabled={busy}
+                  onClick={() => void deleteShared()}
+                  style={{
+                    background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+                    color: "var(--st-due)",
+                  }}
+                >
+                  {busy ? "Deleting…" : "Delete for everyone"}
                 </Button>
                 <Button variant="tertiary" onClick={reset} disabled={busy}>
                   Cancel
