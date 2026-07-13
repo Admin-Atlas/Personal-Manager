@@ -277,8 +277,12 @@ fn discard_partial_target(target: &Path) {
         Ok(m) if !m.file_type().is_symlink() => {}
         _ => return,
     }
-    // Proven ours: strip only the vault artifacts we would have written, drop the marker, then
-    // remove the container iff that left it empty (any other files the user kept there survive).
+    // Proven ours: reset any lockdown we applied (the verify-then-commit move locks the
+    // destination down BEFORE copying, so a partial copy discarded at boot may carry a
+    // restrictive DACL — the folder's owner can always reset it), then strip only the vault
+    // artifacts we would have written, drop the marker, and remove the container iff that
+    // left it empty (any other files the user kept there survive).
+    let _ = super::acl::reset_inheritance(target);
     delete_vault_artifacts(target);
     if std::fs::remove_file(&marker).is_err() {
         return;
@@ -448,6 +452,22 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
         }
     }
 
+    // Pre-flight the destination BEFORE any mutation (verify-then-commit): reject a location
+    // a shared vault can't live on (network / non-ACL filesystem, spec §498) and dress-
+    // rehearse the exact owner lockdown in a throwaway subfolder — so a machine whose policy
+    // would strand the owner fails HERE, with nothing touched, instead of after the move has
+    // committed. Gated to the case that actually locks the folder down: a passphrase result
+    // moving OUT of the profile dir, on a platform that enforces ACLs.
+    if let Some(target) = plan.target_location.as_ref() {
+        if target != &resolved.vault_root
+            && plan.target_key_mode == KeyMode::Passphrase
+            && !target.starts_with(&data_dir)
+            && super::acl::lockdown_supported()
+        {
+            super::preflight::preflight_share_target(target)?;
+        }
+    }
+
     let old_key = current_key_hex(&old_meta)?;
     let (new_key, new_meta) = plan_new_key_and_meta(&old_meta, &plan)?;
 
@@ -533,9 +553,23 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
         }
     }
 
-    // ---- Phase B: relocate (no key change; source kept until the pointer flips) ----
+    let mut warnings = Vec::new();
+    let final_root = plan
+        .target_location
+        .clone()
+        .unwrap_or_else(|| resolved.vault_root.clone());
+
+    // ---- Phase B: relocate (source kept until the pointer flips; lockdown BEFORE commit) ----
+    // The owner lockdown used to run here, AFTER the move committed, as a swallowed warning —
+    // the exact bug: a lockdown that stripped the owner's own access left the vault bricked and
+    // no rollback possible. It now happens fatally inside `relocate`, on the near-empty
+    // destination before the pointer flips, with an effective-access probe; a failure aborts
+    // the move with the source vault intact.
     if let Some(target) = plan.target_location.as_ref() {
         if target != &resolved.vault_root {
+            let lockdown = new_meta.key_mode == KeyMode::Passphrase
+                && !target.starts_with(&data_dir)
+                && super::acl::lockdown_supported();
             relocate(
                 state,
                 &data_dir,
@@ -543,37 +577,16 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
                 target,
                 &new_meta,
                 &new_key,
+                lockdown,
             )?;
         }
     }
 
-    let mut warnings = Vec::new();
-    let final_root = plan
-        .target_location
-        .clone()
-        .unwrap_or_else(|| resolved.vault_root.clone());
-
-    // Defence in depth: when a shareable vault is moved into a (potentially shared)
-    // folder, lock that folder down to its owner PLUS every linked account — the
-    // sidecar travelled with the copy, so a link made before the move survives it. A
-    // vault that stays in the per-profile data dir is already OS-isolated and needs no
-    // ACL. Encryption is the real protection, so a failure here is only a warning.
     if new_meta.key_mode == KeyMode::Passphrase {
-        if let Some(target) = plan.target_location.as_ref() {
-            let linked = access::principals(target, &new_meta.vault_id);
-            if let Err(e) = super::acl::restrict_to_owner(target, &linked) {
-                eprintln!(
-                    "vault: could not apply folder ACL ({e}); encryption still protects the vault"
-                );
-                warnings.push(format!(
-                    "PM couldn't set the folder permissions ({e}). Your data is still \
-                     encrypted; linked accounts may need the folder shared by hand."
-                ));
-            }
-        }
         // Advertise a shareable vault that lives OUTSIDE this profile's private folder,
         // so another account's fresh install can discover and offer it. Non-secret and
-        // best-effort; the passphrase stays the real gate.
+        // best-effort; the passphrase stays the real gate. (The owner lockdown is now a
+        // fatal pre-commit step inside `relocate`, not a post-commit warning here.)
         if !final_root.starts_with(&data_dir) {
             if let Some(ads) = advert::ads_dir() {
                 let ad = advert::SharedVaultAd::for_vault(&new_meta.vault_id, &final_root);
@@ -627,9 +640,13 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
     Ok(warnings)
 }
 
-/// The location-move half of a migration: copy the vault to `to_root`, flip the pointer
-/// (the commit point), then drop the old copy and reopen at the new root. No key change
-/// happens here, so the source is a safe fallback until the pointer commits.
+/// The location-move half of a migration, verify-then-commit. Ordered so the destination
+/// is proven usable by THIS process before anything commits: journal, close the source
+/// connection, then (in [`perform_relocation`]) re-check the target, lock it down on the
+/// near-empty dir, probe access, copy, probe again, open the real DB — and only then flip
+/// the pointer (the commit) and drop the source. A pre-commit failure aborts with the
+/// source vault intact and openable, and this reopens it so the session survives.
+#[allow(clippy::too_many_arguments)]
 fn relocate(
     state: &AppState,
     data_dir: &Path,
@@ -637,6 +654,7 @@ fn relocate(
     to_root: &Path,
     new_meta: &VaultMeta,
     new_key: &Secret,
+    lockdown: bool,
 ) -> Result<()> {
     write_journal(
         data_dir,
@@ -655,14 +673,90 @@ fn relocate(
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
     drop(state.take_conn()?);
-    // Re-check the target right before writing into it: the collision guard in `migrate_vault`
-    // ran before Phase A (seconds-to-minutes of rekey/convert ago), so a concurrent wizard on
-    // another account could have dropped its own vault here since. Refuse rather than overwrite —
-    // narrows the check-to-copy TOCTOU to this final instant. (A truly simultaneous same-folder
-    // race is still possible but astronomically unlikely: `suggest_shared_vault_location`
-    // auto-suffixes past an occupied folder, so the default flow never picks the same one.)
+
+    // The lockdown closure applies the owner + linked-account ACL to the destination.
+    // Linked principals are read from the SOURCE sidecar (it hasn't been copied yet); the
+    // inheritable ACEs then propagate to every file the copy lands there. `lockdown == false`
+    // (a device move, an in-profile target, or macOS) makes it a no-op.
+    let linked = if lockdown {
+        access::principals(from_root, &new_meta.vault_id)
+    } else {
+        Vec::new()
+    };
+    let apply_lockdown = |dir: &Path| -> Result<()> {
+        if lockdown {
+            super::acl::restrict_to_owner(dir, &linked)
+        } else {
+            Ok(())
+        }
+    };
+
+    match perform_relocation(
+        data_dir,
+        from_root,
+        to_root,
+        new_meta,
+        new_key,
+        &apply_lockdown,
+    ) {
+        Ok(conn) => {
+            let to_resolved = super::ResolvedVault {
+                vault_root: to_root.to_path_buf(),
+                db_path: to_root.join(DB_FILENAME),
+                markdown_dir: to_root.join(MARKDOWN_SUBDIR),
+            };
+            let new_master = master_from_db_key_hex(new_key.expose())?;
+            state.open_session(
+                conn,
+                VaultRuntime::build(&to_resolved, new_meta, &new_master),
+            )?;
+            Ok(())
+        }
+        Err(e) => {
+            // Nothing committed. Reopen the SOURCE so the session survives the failed move —
+            // Phase A already committed at `from_root`, so it's the live, openable vault
+            // (shareable but still in the profile folder, which the wizard's Move step
+            // finishes later). Best-effort: a failure here just means a restart is needed.
+            if let (Ok(conn), Ok(new_master)) = (
+                db::open(&from_root.join(DB_FILENAME), new_key.expose()),
+                master_from_db_key_hex(new_key.expose()),
+            ) {
+                let from_resolved = super::ResolvedVault {
+                    vault_root: from_root.to_path_buf(),
+                    db_path: from_root.join(DB_FILENAME),
+                    markdown_dir: from_root.join(MARKDOWN_SUBDIR),
+                };
+                let _ = state.open_session(
+                    conn,
+                    VaultRuntime::build(&from_resolved, new_meta, &new_master),
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The testable core of a relocate (between closing the source connection and reopening at
+/// the destination): re-check the target, lock it down, probe, copy, probe, open the real
+/// DB, then commit the pointer and drop the source. Returns the opened destination
+/// connection once committed. On any PRE-commit failure it resets + discards the partial
+/// destination and clears the journal — the source is untouched and the pointer never
+/// moved. Takes paths + a lockdown closure (not `AppState`), so it exercises in a tempdir.
+fn perform_relocation(
+    data_dir: &Path,
+    from_root: &Path,
+    to_root: &Path,
+    new_meta: &VaultMeta,
+    new_key: &Secret,
+    apply_lockdown: &dyn Fn(&Path) -> Result<()>,
+) -> Result<rusqlite::Connection> {
+    // Re-check the target FIRST — the collision guard ran before Phase A (a rekey/convert
+    // ago), so a concurrent wizard could have dropped its own vault here since. A foreign /
+    // unreadable target is returned WITHOUT any cleanup touching it (it isn't ours), so we
+    // can never strip a bystander vault's ACLs or files.
     match relocation_target_state(&load_meta(to_root), &new_meta.vault_id) {
         TargetState::ForeignVault | TargetState::Unreadable => {
+            let _ = clear_journal(data_dir);
             return Err(Error::Other(
                 "another PM vault appeared in that folder while this move was preparing — nothing \
                  was overwritten; pick a different folder and try again"
@@ -671,30 +765,54 @@ fn relocate(
         }
         TargetState::Vacant | TargetState::SameVault => {}
     }
-    copy_vault_artifacts(from_root, to_root)?;
-    // Drop a provenance marker so that, if the move is interrupted before it commits, recover() can
-    // positively identify this destination copy as PM's own rather than inferring it from contents.
-    let _ = std::fs::write(to_root.join(VAULT_MARKER), b"pm-vault\n");
-    // Commit the move: point this profile at the new root, then clear the journal.
-    pointer::store(data_dir, &pointer::VaultPointer::new(to_root.to_path_buf()))?;
-    clear_journal(data_dir)?;
-    delete_vault_artifacts(from_root);
-    // The move has committed — this is now the live vault, no longer a discardable partial copy.
-    let _ = std::fs::remove_file(to_root.join(VAULT_MARKER));
-    // Reopen at the new location with the (possibly new) key, building the session runtime (both
-    // Markdown + rules ciphers) from the master; open_session reconciles the rules file there.
-    let conn = db::open(&to_root.join(DB_FILENAME), new_key.expose())?;
-    let to_resolved = super::ResolvedVault {
-        vault_root: to_root.to_path_buf(),
-        db_path: to_root.join(DB_FILENAME),
-        markdown_dir: to_root.join(MARKDOWN_SUBDIR),
+
+    // Everything from here writes into `to_root`, which the marker now proves is ours — so
+    // the shared error cleanup below may safely reset + discard it.
+    let attempt = || -> Result<rusqlite::Connection> {
+        std::fs::create_dir_all(to_root)
+            .map_err(crate::error::io_at("prepare the vault folder", to_root))?;
+        // Drop the provenance marker BEFORE the copy, so even an interrupted copy is
+        // positively discardable by recover() (or the abort path here).
+        std::fs::write(to_root.join(VAULT_MARKER), b"pm-vault\n")
+            .map_err(crate::error::io_at("prepare the vault folder", to_root))?;
+        // Lock the near-empty destination down to its owner (FATAL now), then prove THIS
+        // process can still open a handle into it — before copying a possibly-large vault.
+        apply_lockdown(to_root)?;
+        super::preflight::probe_dir_access(to_root)?;
+        // Copy, the full effective-access probe, then the real SQLCipher open — the deepest
+        // pre-commit proof that the vault is genuinely usable at the destination.
+        copy_vault_artifacts(from_root, to_root)?;
+        super::preflight::probe_vault_access(to_root)?;
+        let conn = db::open(&to_root.join(DB_FILENAME), new_key.expose())?;
+        // Commit: flip the pointer. After this the move is done.
+        pointer::store(data_dir, &pointer::VaultPointer::new(to_root.to_path_buf()))?;
+        Ok(conn)
     };
-    let new_master = master_from_db_key_hex(new_key.expose())?;
-    state.open_session(
-        conn,
-        VaultRuntime::build(&to_resolved, new_meta, &new_master),
-    )?;
-    Ok(())
+
+    match attempt() {
+        Ok(conn) => {
+            // Committed. EVERYTHING here is best-effort — the pointer already flipped, so a
+            // failure now must not turn a successful move into a reported error (which would
+            // route the caller into the abort path and reopen the already-deleted source).
+            // `clear_journal` therefore swallows its error like its two siblings below (a stale
+            // journal is harmless: recover()'s Relocating→now==target arm finishes the cleanup
+            // on the next launch).
+            delete_vault_artifacts(from_root);
+            let _ = std::fs::remove_file(to_root.join(VAULT_MARKER));
+            let _ = clear_journal(data_dir);
+            Ok(conn)
+        }
+        Err(e) => {
+            // Nothing committed. Undo the destination we started: reset a possibly-botched
+            // lockdown so the partial copy is deletable, discard it (marker-gated), and clear
+            // the journal (the pointer never moved, so a leftover would only cause a spurious
+            // repair prompt on next boot).
+            let _ = super::acl::reset_inheritance(to_root);
+            discard_partial_target(to_root);
+            let _ = clear_journal(data_dir);
+            Err(e)
+        }
+    }
 }
 
 /// Repair an interrupted migration on launch (called before the store is opened). With a
@@ -922,6 +1040,141 @@ mod tests {
             backup_dir(data_dir.path()),
             data_dir.path().join(MIGRATION_BACKUP_DIR)
         );
+    }
+
+    /// Build a minimal, openable device vault at `root` keyed with `key_hex`, for the
+    /// perform_relocation round-trip tests (a real SQLCipher DB + meta + Markdown dir).
+    fn build_test_vault(root: &Path, key_hex: &str) -> VaultMeta {
+        std::fs::create_dir_all(root.join(MARKDOWN_SUBDIR)).unwrap();
+        let conn = db::open(&root.join(DB_FILENAME), key_hex).unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (7);")
+            .unwrap();
+        drop(conn);
+        let meta = VaultMeta::new_device();
+        store_meta(root, &meta).unwrap();
+        meta
+    }
+
+    #[test]
+    fn perform_relocation_commits_then_drops_the_source() {
+        // The verify-then-commit happy path: with a no-op lockdown the destination is
+        // built, probed, opened, and committed — pointer flipped, source removed, marker
+        // and journal gone, and the destination opens with the same key.
+        let dd = tempfile::tempdir().unwrap();
+        let src = dd.path().join("src");
+        let dst = dd.path().join("dst");
+        let key = "ab".repeat(32); // 64 hex chars
+        let meta = build_test_vault(&src, &key);
+        let secret = Secret::from(key.clone());
+        write_journal(
+            dd.path(),
+            &MigrationJournal {
+                stage: MigrationStage::Relocating,
+                started_at: "2026-07-13T00:00:00Z".into(),
+                from_root: src.clone(),
+                backup_dir: None,
+                target_location: Some(dst.clone()),
+            },
+        )
+        .unwrap();
+
+        let noop = |_: &Path| -> Result<()> { Ok(()) };
+        let conn =
+            perform_relocation(dd.path(), &src, &dst, &meta, &secret, &noop).expect("commit");
+        drop(conn);
+
+        assert_eq!(
+            pointer::load(dd.path()).unwrap().unwrap().vault_root,
+            dst,
+            "the pointer commits to the destination"
+        );
+        assert!(!src.join(DB_FILENAME).exists(), "the source is dropped");
+        assert!(!dst.join(VAULT_MARKER).exists(), "the marker is cleared");
+        assert!(
+            read_journal(dd.path()).unwrap().is_none(),
+            "journal cleared"
+        );
+        assert!(
+            db::open(&dst.join(DB_FILENAME), &key).is_ok(),
+            "the destination vault opens"
+        );
+    }
+
+    #[test]
+    fn perform_relocation_aborts_on_lockdown_failure_leaving_source_intact() {
+        // The abort path: a fatal lockdown failure before the commit must leave the SOURCE
+        // untouched and openable, the pointer unmoved, the partial destination discarded,
+        // and the journal cleared — nothing half-committed.
+        let dd = tempfile::tempdir().unwrap();
+        let src = dd.path().join("src");
+        let dst = dd.path().join("dst");
+        let key = "cd".repeat(32);
+        let meta = build_test_vault(&src, &key);
+        let secret = Secret::from(key.clone());
+        write_journal(
+            dd.path(),
+            &MigrationJournal {
+                stage: MigrationStage::Relocating,
+                started_at: "2026-07-13T00:00:00Z".into(),
+                from_root: src.clone(),
+                backup_dir: None,
+                target_location: Some(dst.clone()),
+            },
+        )
+        .unwrap();
+
+        let boom = |_: &Path| -> Result<()> { Err(Error::Other("lockdown refused".into())) };
+        let err = perform_relocation(dd.path(), &src, &dst, &meta, &secret, &boom);
+        assert!(err.is_err(), "a lockdown failure aborts the move");
+
+        assert!(
+            db::open(&src.join(DB_FILENAME), &key).is_ok(),
+            "the source vault is intact and still opens"
+        );
+        assert!(
+            pointer::load(dd.path()).unwrap().is_none(),
+            "the pointer never moved"
+        );
+        assert!(
+            !dst.join(DB_FILENAME).exists(),
+            "the partial destination is discarded"
+        );
+        assert!(
+            read_journal(dd.path()).unwrap().is_none(),
+            "journal cleared"
+        );
+    }
+
+    #[test]
+    fn perform_relocation_refuses_a_foreign_target_without_touching_it() {
+        // A foreign vault that appears at the destination between the collision guard and the
+        // copy must be left completely alone — no reset, no discard, source intact.
+        let dd = tempfile::tempdir().unwrap();
+        let src = dd.path().join("src");
+        let dst = dd.path().join("dst");
+        let key = "ef".repeat(32);
+        let meta = build_test_vault(&src, &key);
+        // A DIFFERENT vault already sits at the destination.
+        let mut foreign = VaultMeta::new_device();
+        foreign.vault_id = "someone-elses-vault".into();
+        std::fs::create_dir_all(&dst).unwrap();
+        store_meta(&dst, &foreign).unwrap();
+        std::fs::write(dst.join(DB_FILENAME), b"foreign-db").unwrap();
+        let secret = Secret::from(key.clone());
+
+        let noop = |_: &Path| -> Result<()> { Ok(()) };
+        let err = perform_relocation(dd.path(), &src, &dst, &meta, &secret, &noop);
+        assert!(err.is_err(), "a foreign target is refused");
+        assert_eq!(
+            std::fs::read(dst.join(DB_FILENAME)).unwrap(),
+            b"foreign-db",
+            "the bystander vault's files are untouched"
+        );
+        assert!(
+            db::open(&src.join(DB_FILENAME), &key).is_ok(),
+            "the source is intact"
+        );
+        assert!(pointer::load(dd.path()).unwrap().is_none());
     }
 
     #[test]

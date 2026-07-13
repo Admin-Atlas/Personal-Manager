@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.7.1-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "Sharing a vault is now safe by construction: PM checks the destination folder can actually hold a shared vault before it moves anything, locks the folder down and confirms it can still open the vault there, and only then commits the move. If any of that fails, the move is cancelled and your vault stays exactly where it was — the earlier failure that could leave a vault stranded in a folder Windows then blocked can no longer happen.",
+      "PM won't let you put a shared vault somewhere it can't work — a network drive, or a USB stick formatted as FAT32/exFAT (which can't store per-account permissions) — and says so up front instead of failing partway through.",
+      "Making a shared vault private again now moves it back to your own private folder first, then decrypts — so your notes are never briefly written in readable form inside a folder other accounts can reach.",
+      "When you add an account to a shared vault, PM now double-checks the permission actually took effect, so a silent “looked fine but didn't work” can't slip through.",
+    ],
+  },
+  {
     version: "3.7.0-alpha",
     date: "2026-07-13",
     highlights: [
