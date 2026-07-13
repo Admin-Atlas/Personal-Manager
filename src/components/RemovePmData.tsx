@@ -18,6 +18,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { exit } from "@tauri-apps/plugin-process";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirmWipeIdentity, launchUninstaller, wipePmData } from "../lib/ipc";
 import { formatBytes } from "../lib/format";
 import type { WipeReport } from "../lib/types";
@@ -34,6 +35,17 @@ const CONFIRM_PHRASE = "Delete PM Data";
 
 /** Where to finish revoking Microsoft access (no programmatic revoke for a public desktop client). */
 const MICROSOFT_APPS_URL = "https://account.live.com/consent/Manage";
+
+/** Quit the app after a wipe / uninstall. Prefer a full process exit; if that's ever denied (e.g. a
+ *  missing `process:allow-exit` capability), fall back to closing the window — which is separately
+ *  permitted and, as the sole window, ends the app. Either way the "Close PM" button must do something. */
+async function quitApp() {
+  try {
+    await exit(0);
+  } catch {
+    await getCurrentWindow().close();
+  }
+}
 
 interface Selection {
   regenerable: boolean;
@@ -205,7 +217,13 @@ export function RemovePmData({ biometricAvailable }: Props) {
       setUninstallHint(String(e));
       return;
     }
-    await exit(0);
+    // The uninstaller is on its way; now quit. Reset the guard if quitting somehow fails so the button
+    // stays live (quitApp already falls back to closing the window, so this is belt-and-braces).
+    try {
+      await quitApp();
+    } catch {
+      finishingRef.current = false;
+    }
   }
 
   // Auto-launch the uninstaller as soon as a full wipe reports success — unless there's a revoke
@@ -346,6 +364,12 @@ export function RemovePmData({ biometricAvailable }: Props) {
             <p className="mt-3 text-xs text-st-due">
               Removing your saved keys removes the vault &amp; database along with them — the
               database&apos;s only key is in the keychain, so it can&apos;t be kept.
+            </p>
+          )}
+          {sel.vaultAndDb && (
+            <p className="mt-3 text-xs font-medium text-st-due">
+              Your vault and database can&apos;t be recovered once removed. If you haven&apos;t
+              already backed them up, do that first.
             </p>
           )}
           {(sel.vaultAndDb || sel.keychain) && (
@@ -491,12 +515,12 @@ export function RemovePmData({ biometricAvailable }: Props) {
                 {report?.fullPurge ? (
                   <Button
                     variant="primary"
-                    onClick={() => void (uninstallHint ? exit(0) : finishUninstall())}
+                    onClick={() => void (uninstallHint ? quitApp() : finishUninstall())}
                   >
                     {uninstallHint ? "Close PM" : "Finish uninstall"}
                   </Button>
                 ) : report?.quitRequired ? (
-                  <Button variant="primary" onClick={() => void exit(0)}>
+                  <Button variant="primary" onClick={() => void quitApp()}>
                     Close PM
                   </Button>
                 ) : sel.localStorage ? (
