@@ -106,20 +106,18 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
 
   const myWhole = scope.my_drive_folders == null;
 
+  // A mode switch resets any excludes (they only mean anything alongside chosen folders).
   const setMyDriveWhole = (whole: boolean) =>
-    commit({ ...scope, my_drive_folders: whole ? null : [] });
+    commit({ ...scope, my_drive_folders: whole ? null : [], my_drive_exclude: [] });
 
-  const toggleMyFolder = (folderId: string, checked: boolean) => {
-    const cur = scope.my_drive_folders ?? [];
-    const next = checked ? [...new Set([...cur, folderId])] : cur.filter((f) => f !== folderId);
-    commit({ ...scope, my_drive_folders: next });
-  };
+  const setMyFolders = (selected: string[], excluded: string[]) =>
+    commit({ ...scope, my_drive_folders: selected, my_drive_exclude: excluded });
 
   const toggleDrive = (drive: SharedDrive, included: boolean) =>
     commit({
       ...scope,
       shared: included
-        ? [...scope.shared, { drive_id: drive.id, name: drive.name, folders: [] }]
+        ? [...scope.shared, { drive_id: drive.id, name: drive.name, folders: [], exclude: [] }]
         : scope.shared.filter((s) => s.drive_id !== drive.id),
     });
 
@@ -127,19 +125,16 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
     commit({
       ...scope,
       shared: scope.shared.map((s) =>
-        s.drive_id === driveId ? { ...s, folders: whole ? null : [] } : s,
+        s.drive_id === driveId ? { ...s, folders: whole ? null : [], exclude: [] } : s,
       ),
     });
 
-  const toggleFolder = (driveId: string, folderId: string, checked: boolean) =>
+  const setDriveFolders = (driveId: string, selected: string[], excluded: string[]) =>
     commit({
       ...scope,
-      shared: scope.shared.map((s) => {
-        if (s.drive_id !== driveId) return s;
-        const cur = s.folders ?? [];
-        const next = checked ? [...new Set([...cur, folderId])] : cur.filter((f) => f !== folderId);
-        return { ...s, folders: next };
-      }),
+      shared: scope.shared.map((s) =>
+        s.drive_id === driveId ? { ...s, folders: selected, exclude: excluded } : s,
+      ),
     });
 
   return (
@@ -176,7 +171,8 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
                 email={email}
                 driveId={MY_DRIVE_ROOT}
                 selected={scope.my_drive_folders ?? []}
-                onToggle={toggleMyFolder}
+                excluded={scope.my_drive_exclude ?? []}
+                onChange={setMyFolders}
               />
             )}
           </div>
@@ -234,7 +230,10 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
                           email={email}
                           driveId={d.id}
                           selected={sel.folders ?? []}
-                          onToggle={(fid, checked) => toggleFolder(d.id, fid, checked)}
+                          excluded={sel.exclude ?? []}
+                          onChange={(selected, excluded) =>
+                            setDriveFolders(d.id, selected, excluded)
+                          }
                         />
                       )}
                     </div>
@@ -263,12 +262,14 @@ function DriveFolderPicker({
   email,
   driveId,
   selected,
-  onToggle,
+  excluded,
+  onChange,
 }: {
   email: string;
   driveId: string;
   selected: string[];
-  onToggle: (folderId: string, checked: boolean) => void;
+  excluded: string[];
+  onChange: (selected: string[], excluded: string[]) => void;
 }) {
   // Stable per (email, driveId) so the picker's lazy-load effects don't refire on every render.
   const loadChildren = useCallback(
@@ -280,7 +281,8 @@ function DriveFolderPicker({
       className="mt-2"
       loadChildren={loadChildren}
       selected={selected}
-      onToggle={onToggle}
+      excluded={excluded}
+      onChange={(next) => onChange(next.selected, next.excluded)}
     />
   );
 }

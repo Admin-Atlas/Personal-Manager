@@ -616,6 +616,8 @@ export interface SharedSelection {
   name: string;
   /** `null` = the entire shared drive; otherwise index only these folders (recursively). */
   folders: string[] | null;
+  /** Subfolder ids to skip within the chosen `folders` (each prunes that folder + its subtree). */
+  exclude?: string[];
 }
 
 /** What one account indexes: the personal My Drive plus any opted-in shared drives. Default scope is
@@ -625,6 +627,8 @@ export interface DriveScope {
   /** `null` = the entire My Drive (delta-cursor sync); otherwise index only these folders
    *  (recursively, re-enumerated each sync). */
   my_drive_folders: string[] | null;
+  /** Subfolder ids to skip within the chosen `my_drive_folders` (each prunes that folder + subtree). */
+  my_drive_exclude?: string[];
   shared: SharedSelection[];
 }
 
@@ -807,6 +811,8 @@ export interface OneDriveScope {
   /** `null` = the entire OneDrive (delta-cursor sync); otherwise index only these folders
    *  (recursively, re-enumerated each sync). */
   folders: string[] | null;
+  /** Subfolder ids to skip within the chosen `folders` (each prunes that folder + its subtree). */
+  exclude?: string[];
 }
 
 /** Snapshot of an in-flight OneDrive sync, so the UI can resume showing progress after navigating
@@ -838,6 +844,15 @@ export interface LocalFolder {
   indexed: number;
   /** Whether the path is a readable directory right now (false = unmounted/removed). */
   present: boolean;
+  /** Root-relative subfolders excluded from indexing (empty = the whole folder is indexed). */
+  exclude: string[];
+}
+
+/** One immediate subfolder for the local folder picker: its root-relative path (what an exclude
+ *  stores) and its own name (what the tree shows). */
+export interface LocalSubfolder {
+  rel: string;
+  name: string;
 }
 
 /** Snapshot of an in-flight local-folder sync, so the UI can restore progress after navigating away.

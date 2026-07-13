@@ -88,13 +88,8 @@ export function OneDriveFolders({ email, onSaved }: { email: string; onSaved: ()
       });
   };
 
-  const setWhole = (w: boolean) => commit({ folders: w ? null : [] });
-
-  const toggleFolder = (folderId: string, checked: boolean) => {
-    const cur = scope.folders ?? [];
-    const next = checked ? [...new Set([...cur, folderId])] : cur.filter((f) => f !== folderId);
-    commit({ folders: next });
-  };
+  // A mode switch resets any excludes (they only mean anything alongside chosen folders).
+  const setWhole = (w: boolean) => commit({ folders: w ? null : [], exclude: [] });
 
   return (
     <div className="mt-2 space-y-3" data-help="settings-onedrive-scope">
@@ -111,7 +106,8 @@ export function OneDriveFolders({ email, onSaved }: { email: string; onSaved: ()
           className="mt-1"
           loadChildren={loadChildren}
           selected={scope.folders ?? []}
-          onToggle={toggleFolder}
+          excluded={scope.exclude ?? []}
+          onChange={({ selected, excluded }) => commit({ folders: selected, exclude: excluded })}
         />
       )}
 

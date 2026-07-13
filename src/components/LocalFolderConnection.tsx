@@ -6,10 +6,12 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   addLocalFolder,
   listLocalFolders,
+  listLocalSubfolders,
   localFolderSyncStatus,
   onLocalChanged,
   onLocalSync,
   removeLocalFolder,
+  setLocalExcludes,
   stopLocalFolderSync,
   syncLocalFolder,
 } from "../lib/ipc";
@@ -17,6 +19,7 @@ import type { LocalFolder } from "../lib/types";
 import { useDetachedSync } from "../lib/useDetachedSync";
 import { formatWhen } from "../lib/format";
 import { Button, ConfirmDialog } from "./ui";
+import { FolderPicker } from "./FolderPicker";
 import { SyncProgress } from "./SyncProgress";
 import { SyncReport } from "./SyncReport";
 import { ConnectorItemRow } from "./ConnectorItemRow";
@@ -39,6 +42,8 @@ import { ConnectorItemRow } from "./ConnectorItemRow";
 export function LocalFolderConnection() {
   const [folders, setFolders] = useState<LocalFolder[]>([]);
   const [confirmRemove, setConfirmRemove] = useState<LocalFolder | null>(null);
+  // Which folder's subfolder picker is expanded (one at a time), keyed by folder key.
+  const [pickerKey, setPickerKey] = useState<string | null>(null);
 
   const refreshRef = useRef<() => void>(() => {});
   const ds = useDetachedSync<Awaited<ReturnType<typeof localFolderSyncStatus>>>({
@@ -129,6 +134,22 @@ export function LocalFolderConnection() {
                 actionDisabled={anyBusy}
                 onAction={() => setConfirmRemove(f)}
               />
+              {/* Subfolder excludes — only when the folder is readable right now (the picker walks it). */}
+              {f.present && f.state === "ok" && (
+                <div className="mt-1 pl-8">
+                  <button
+                    type="button"
+                    className="text-[11px] text-ink4 underline hover:text-ink2"
+                    onClick={() => setPickerKey((k) => (k === f.key ? null : f.key))}
+                  >
+                    {pickerKey === f.key ? "Hide subfolders" : "Choose subfolders"}
+                    {f.exclude.length > 0 ? ` (${f.exclude.length} excluded)` : ""}
+                  </button>
+                  {pickerKey === f.key && (
+                    <LocalFolderExcludes folder={f} onSaved={() => void refresh()} />
+                  )}
+                </div>
+              )}
             </li>
           ))}
         </ul>
@@ -199,6 +220,68 @@ export function LocalFolderConnection() {
         its changes anymore. Its already-indexed items are kept and stay findable, but marked
         “source unreachable” — they are never deleted. Add the folder again to resume.
       </ConfirmDialog>
+    </div>
+  );
+}
+
+/**
+ * The per-folder subfolder picker: the whole folder is indexed, and unchecking a subfolder **excludes**
+ * it (and its subtree). Reuses the shared {@link FolderPicker} with `rootIncluded` — local folders have
+ * no "seed root" concept, so only excludes are ever produced. Saves auto (serialized, latest-wins) and
+ * take effect on the folder's next **Sync** (already-indexed files under a newly-excluded folder go soft
+ * then; the live watcher can't retroactively remove them).
+ */
+function LocalFolderExcludes({ folder, onSaved }: { folder: LocalFolder; onSaved: () => void }) {
+  const [excluded, setExcluded] = useState<string[]>(folder.exclude);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const saveSeq = useRef(0);
+  const saveChain = useRef<Promise<void>>(Promise.resolve());
+
+  // A subfolder's id IS its root-relative path (what an exclude stores); `null` is the folder root.
+  const loadChildren = useCallback(
+    (parentId: string | null) =>
+      listLocalSubfolders(folder.key, parentId).then((subs) =>
+        subs.map((s) => ({ id: s.rel, name: s.name })),
+      ),
+    [folder.key],
+  );
+
+  const commit = (next: string[]) => {
+    setExcluded(next);
+    setError(null);
+    setSaving(true);
+    const seq = ++saveSeq.current;
+    saveChain.current = saveChain.current
+      .catch(() => {})
+      .then(() => setLocalExcludes(folder.key, next))
+      .then(() => {
+        if (seq !== saveSeq.current) return; // a newer save owns the UI
+        setSaving(false);
+        onSaved();
+      })
+      .catch((e) => {
+        if (seq !== saveSeq.current) return;
+        setSaving(false);
+        setError(String(e));
+      });
+  };
+
+  return (
+    <div className="mt-2">
+      <FolderPicker
+        loadChildren={loadChildren}
+        selected={[]}
+        excluded={excluded}
+        rootIncluded
+        onChange={(next) => commit(next.excluded)}
+      />
+      {error && <p className="mt-1 text-xs text-st-due">{error}</p>}
+      <p className="mt-1 text-[11px] text-ink4">
+        {excluded.length === 0 ? "Indexing the whole folder." : `${excluded.length} excluded`}
+        {saving ? " · saving…" : ""} — applied on this folder’s next{" "}
+        <span className="text-ink3">Sync</span>.
+      </p>
     </div>
   );
 }

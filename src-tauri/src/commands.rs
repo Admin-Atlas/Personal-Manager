@@ -3608,11 +3608,39 @@ pub fn remove_local_folder(app: AppHandle, key: String) -> Result<()> {
     localfolder::remove_folder(&conn, &key)
 }
 
-/// Every tracked local folder (path, state, indexed count, present?), for the Settings list.
+/// Every tracked local folder (path, state, indexed count, present?, excludes), for the Settings list.
 #[tauri::command]
 pub fn list_local_folders(state: State<'_, AppState>) -> Result<Vec<localfolder::LocalFolder>> {
     let conn = state.conn()?;
     localfolder::list_folders(&conn)
+}
+
+/// The immediate child subfolders of `rel` (root-relative, `/`-joined; `None`/empty = the folder root)
+/// inside a tracked folder — one lazy level of the local folder picker.
+#[tauri::command]
+pub fn list_local_subfolders(
+    app: AppHandle,
+    key: String,
+    rel: Option<String>,
+) -> Result<Vec<localfolder::LocalSubfolder>> {
+    let root = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        localfolder::folder_root(&conn, &key)?
+    };
+    let Some(root) = root else {
+        return Err(Error::Other("That folder isn't tracked.".into()));
+    };
+    localfolder::list_subfolders(&root, rel.as_deref().unwrap_or(""))
+}
+
+/// Persist a tracked folder's excluded subfolders (root-relative paths). The UI follows this with a
+/// `sync_local` to apply it (soft-remove now-excluded files, re-index any un-excluded ones).
+#[tauri::command]
+pub fn set_local_excludes(app: AppHandle, key: String, exclude: Vec<String>) -> Result<()> {
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    localfolder::set_excludes(&conn, &key, &exclude)
 }
 
 /// The currently-running local-folder sync snapshot, so the UI resumes progress after navigating away.
