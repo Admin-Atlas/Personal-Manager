@@ -36,6 +36,7 @@ import {
   setBackupDestinations,
   setBackupPassphrase,
   setBackupSchedule,
+  setProtonCliPath,
   stopBackup,
   switchToVault,
 } from "../lib/ipc";
@@ -106,6 +107,9 @@ export function BackupSettings() {
   const [protonRestoreName, setProtonRestoreName] = useState<string | null>(null);
   const [protonRestorePass, setProtonRestorePass] = useState("");
   const [protonListError, setProtonListError] = useState<string | null>(null);
+  // "Locate manually…" state: an error if the user picked a non-CLI file; `locating` guards the pick.
+  const [locateError, setLocateError] = useState<string | null>(null);
+  const [locating, setLocating] = useState(false);
 
   // Google Drive destination (Drive v3 REST). `gdrive` = null while checking; once loaded,
   // `has_write_scope` gates the whole panel (a drive.file re-consent is required — connector
@@ -169,6 +173,28 @@ export function BackupSettings() {
     }
   }, []);
 
+  // "Locate manually…": let the user point PM at the proton-drive binary wherever it lives (the CLI
+  // is a portable single file), remember it, and re-probe. The backend rejects a non-file path.
+  const locateCli = useCallback(async () => {
+    if (locating) return;
+    setLocating(true);
+    setLocateError(null);
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        directory: false,
+        title: "Locate the proton-drive program",
+      });
+      if (typeof picked !== "string") return; // cancelled
+      await setProtonCliPath(picked);
+      await refreshProton();
+    } catch (e) {
+      setLocateError(String(e));
+    } finally {
+      setLocating(false);
+    }
+  }, [locating, refreshProton]);
+
   // Google Drive status is independent of Proton/schedule, so load it on its own.
   const refreshGdrive = useCallback(async () => {
     const s = await backupGdriveStatus().catch(() => null);
@@ -190,6 +216,15 @@ export function BackupSettings() {
   useEffect(() => {
     void refreshProton();
   }, [refreshProton]);
+  // Re-probe when the window regains focus while the CLI still isn't detected, so installing it
+  // while PM is open is picked up without a restart. Gated to the not-found case so it never
+  // re-spawns the CLI (a `proton_status` call) on every focus once it's already located.
+  useEffect(() => {
+    if (proton?.installed) return;
+    const onFocus = () => void refreshProton();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [proton?.installed, refreshProton]);
   useEffect(() => {
     void refreshGdrive();
   }, [refreshGdrive]);
@@ -775,17 +810,26 @@ export function BackupSettings() {
         ) : !proton.installed ? (
           <div className="mt-2 flex max-w-sm flex-col gap-2">
             <p className="text-xs text-ink4">
-              The Proton Drive CLI isn&rsquo;t installed. Install the official build to back up here
-              — PM detects it automatically.
+              The Proton Drive CLI isn&rsquo;t installed. Download the official build — it&rsquo;s a
+              single program you can keep anywhere. If it&rsquo;s in your Downloads or on your PATH,
+              just <span className="text-ink3">Check again</span>; otherwise point PM straight at
+              it.
             </p>
-            <div>
+            <div className="flex flex-wrap gap-2">
               <Button
                 variant="secondary"
                 onClick={() => void openUrl(proton.install_url).catch(() => {})}
               >
                 Get the Proton Drive CLI&hellip;
               </Button>
+              <Button variant="secondary" onClick={() => void locateCli()} disabled={locating}>
+                {locating ? "Locating…" : "Locate manually…"}
+              </Button>
+              <Button variant="tertiary" onClick={() => void refreshProton()} disabled={locating}>
+                Check again
+              </Button>
             </div>
+            {locateError && <p className="break-words text-xs text-st-due">{locateError}</p>}
           </div>
         ) : conn === null ? (
           <p className="mt-2 text-xs text-ink4">Checking your Proton Drive connection&hellip;</p>

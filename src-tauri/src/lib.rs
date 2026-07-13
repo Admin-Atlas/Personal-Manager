@@ -1001,6 +1001,7 @@ pub fn run() {
             commands::backup_status,
             commands::stop_backup,
             commands::proton_cli_status,
+            commands::set_proton_cli_path,
             commands::proton_connect,
             commands::proton_disconnect,
             commands::proton_status,

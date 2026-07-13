@@ -221,8 +221,9 @@ async fn maybe_run_scheduled_backup(app: &AppHandle) {
         return; // not opted in — unattended backup can't prompt
     };
 
-    // 3) Read the per-destination enable flags + the chosen Google account under the lock.
-    let (proton_enabled, gdrive_enabled, gdrive_account) = {
+    // 3) Read the per-destination enable flags + the chosen Google account + any manual Proton CLI
+    //    path under the lock.
+    let (proton_enabled, gdrive_enabled, gdrive_account, proton_cli_override) = {
         let state = app.state::<crate::AppState>();
         let Ok(conn) = state.conn() else {
             return;
@@ -234,6 +235,11 @@ async fn maybe_run_scheduled_backup(app: &AppHandle) {
                 .ok()
                 .flatten()
                 .filter(|s| !s.is_empty()),
+            db::get_setting(&conn, crate::backup::proton::CLI_PATH_SETTING)
+                .ok()
+                .flatten()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_file()),
         )
     };
 
@@ -244,7 +250,8 @@ async fn maybe_run_scheduled_backup(app: &AppHandle) {
     //    keeps an offline/unconfigured machine from packing a full archive just to fail.
     let mut targets: Vec<BackupDestination> = Vec::new();
     if proton_enabled {
-        if let Some(cli) = crate::backup::proton::locate_proton_cli() {
+        if let Some(cli) = crate::backup::proton::locate_proton_cli(proton_cli_override.as_deref())
+        {
             let cli_probe = cli.clone();
             let connected = tokio::task::spawn_blocking(move || {
                 crate::backup::proton::connection(&cli_probe).connected

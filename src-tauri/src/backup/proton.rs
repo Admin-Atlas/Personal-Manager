@@ -29,7 +29,12 @@ use crate::error::{Error, Result};
 
 /// Official download page for the Proton Drive CLI (per-OS pre-built binaries). The Backup
 /// UI links here when the CLI is not found; PM does not fetch it automatically.
-pub const INSTALL_URL: &str = "https://proton.me/download/drive/cli";
+pub const INSTALL_URL: &str = "https://proton.me/support/drive-cli";
+
+/// Settings key holding a user-chosen absolute path to the `proton-drive` binary (the Backup UI's
+/// "Locate manually…" escape hatch, for when the portable binary lives somewhere auto-detection
+/// doesn't probe). Empty / absent means "auto-detect only".
+pub(crate) const CLI_PATH_SETTING: &str = "proton_cli_path";
 
 /// The user's real Drive root (the CLI's `/` only lists virtual sections). Everything PM
 /// writes lives under here.
@@ -78,6 +83,10 @@ fn extra_install_dirs(
     if let Some(h) = home {
         dirs.push(h.join(".local").join("bin"));
         dirs.push(h.join("bin"));
+        // The CLI is a portable single binary, so users often just leave it where it downloaded —
+        // most commonly the browser's default folder — rather than "installing" it onto PATH.
+        dirs.push(h.join("Downloads"));
+        dirs.push(h.join("Desktop"));
     }
     dirs
 }
@@ -99,10 +108,19 @@ where
     None
 }
 
-/// Locate an installed `proton-drive` CLI, or `None` if it isn't found. Checks `PATH` first
-/// (the authoritative location for a CLI the user installed), then the per-OS install
-/// directories. Cheap enough to call on demand — it is a handful of `stat`s, no process spawn.
-pub(crate) fn locate_proton_cli() -> Option<PathBuf> {
+/// Locate the `proton-drive` CLI, or `None` if it isn't found. A user-set `override_path` (from the
+/// Backup UI's "Locate manually…" picker) wins outright — the CLI is a portable binary that can live
+/// anywhere, so an explicit pointer is the reliable escape hatch when auto-detection misses. Otherwise
+/// checks `PATH` first (where an installed CLI is meant to land), then the per-OS install + common
+/// download directories. Cheap enough to call on demand — a handful of `stat`s, no process spawn.
+pub(crate) fn locate_proton_cli(override_path: Option<&Path>) -> Option<PathBuf> {
+    // 0) An explicit user-chosen path wins, as long as it still points at a real file.
+    if let Some(p) = override_path {
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+
     let names = cli_binary_names();
 
     // 1) Anything on PATH wins — that's where a CLI install is meant to land.
@@ -842,8 +860,24 @@ mod tests {
             vec![
                 PathBuf::from("/home/u").join(".local").join("bin"),
                 PathBuf::from("/home/u").join("bin"),
+                PathBuf::from("/home/u").join("Downloads"),
+                PathBuf::from("/home/u").join("Desktop"),
             ]
         );
+    }
+
+    #[test]
+    fn a_user_override_wins_over_auto_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let picked = tmp.path().join("wherever-they-put-it.exe");
+        std::fs::write(&picked, b"binary").unwrap();
+        // An override pointing at a real file is returned verbatim, regardless of PATH / install dirs.
+        assert_eq!(locate_proton_cli(Some(&picked)), Some(picked.clone()));
+        // A stale override (file since deleted / never existed) is ignored, falling back to the probe.
+        std::fs::remove_file(&picked).unwrap();
+        // We can't assert the fallback's result (depends on the host), only that a dead override does
+        // not masquerade as a hit.
+        assert_ne!(locate_proton_cli(Some(&picked)), Some(picked));
     }
 
     #[test]
