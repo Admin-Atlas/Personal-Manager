@@ -1,4 +1,4 @@
-PM desktop release — **v3.6.2-alpha**.
+PM desktop release — **v3.9.1-alpha**.
 
 ## Install
 
@@ -44,29 +44,35 @@ than keeping two around.
 installed the **`.rpm`**, update it with your package manager (`dnf upgrade`) when a new
 release lands.
 
-## What's new in 3.6.2-alpha
+## What's new in 3.9.1-alpha
 
-This release rolls up everything since v3.0.2 — here's the tour at a glance:
+This release rolls up everything since v3.6.2 — here's the tour at a glance:
 
-- **Share your vault across Windows accounts.** On a PC with more than one account, a
-  single guided flow moves your vault somewhere every account can reach, lets you pick who
-  may open it, and the other account joins from one screen by typing the passphrase.
-  Anything already on that account is kept safely aside, never deleted.
-- **PM runs on Linux now.** An auto-updating AppImage (the recommended install) and an rpm
-  for Fedora-family systems — both self-contained, built and signed by the same pipeline as
-  Windows and macOS.
-- **Index a folder but skip parts of it.** When you choose what to index from a Google
-  Drive, OneDrive, or a folder on this computer, uncheck any subfolder to leave it — and
-  everything inside it — out. Handy for a big archive or a noisy downloads folder.
-- **Quiet calendars.** Mark a calendar "Quiet" and it still shows on your Calendar tab, but
-  its events stay out of the daily briefing, "due soon" reminders, and chat.
-- **Tidy up after filing.** Change a document's project or importance once it's already
-  filed, and clear a review one document at a time instead of all at once.
-- **Sturdier and safer.** "Remove PM data" can no longer leave you stuck on a vault that
-  won't open, the "couldn't open your vault" screen has a clear way forward, and finding
-  the Proton Drive CLI for encrypted backups is far more reliable.
-- **Under the hood.** Linux keychain support, safer release tooling, and refreshed build
-  dependencies.
+- **See other timezones on the calendar, and set your own hours.** In Day and Week view,
+  add up to two more timezones from the **Zones** button and they show as extra columns
+  down the left beside your local time — handy for a call with another city. The **▾** on
+  the Work and Day buttons lets you frame the view to your own hours (Work sits around a
+  comfortable 9-to-5, Day follows your local sunrise-to-sunset), and events now show their
+  **start and end** time (e.g. 09:30–10:45), not just the start.
+- **A tidier pinboard.** Notes and timelines can now carry a **title**, the **Ingest**
+  button moved up into the top bar so notes get their full height back, and dropping a note
+  exactly on top of another the same size folds the two into a neat **folder** tile you can
+  name, open in place, and drag cards back out of. Every colour also tells you its name on
+  hover now — the note tint dots and every theme swatch in Settings.
+- **Honest vault recovery when Windows blocks the folder.** If Windows ever blocks PM from
+  its own vault folder, PM now says exactly that and offers a one-click **Repair access**,
+  instead of a confusing wall of "the vault is locked" messages. Sharing a vault across
+  Windows accounts is now safe by construction — PM checks the destination can hold it,
+  locks it down and confirms it still opens there *before* committing the move — and you can
+  properly **delete a shared vault**, with everyone who joined told plainly and moved back to
+  a vault of their own. Your data was never at risk; now PM says so, on every screen.
+- **Windows updates no longer fail silently.** If Windows **Smart App Control** is switched
+  on, it blocks PM's update installer with no visible error — clicking "Restart now" used to
+  quietly reopen on the old version. PM now spots that and tells you the one thing that fixes
+  it, instead of retrying the same broken update on every launch.
+- **A cleaner exit.** Finishing "Remove PM data" now actually closes the app, a full
+  uninstall on Windows no longer strands a leftover "PM" folder, and you get a clear reminder
+  before erasing a vault and database that can't be recovered.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
