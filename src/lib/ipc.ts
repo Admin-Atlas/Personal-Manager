@@ -587,6 +587,11 @@ export const calendarOverview = () => invoke<CalendarOverview>("calendar_overvie
 export const setCalendarSelected = (calendarId: string, selected: boolean) =>
   invoke<void>("set_calendar_selected", { calendarId, selected });
 
+/** Mark a calendar "quiet": keep it on the Calendar tab but exclude its events from the assistant
+ *  (briefing, flags/reminders, chat agenda, focus upcoming). No re-sync — events stay mirrored. */
+export const setCalendarQuiet = (calendarId: string, quiet: boolean) =>
+  invoke<void>("set_calendar_quiet", { calendarId, quiet });
+
 /** Connect a Google Calendar account (multi-account) — opens the browser; resolves on sign-in.
  *  Pass an account's own project `clientId`/`clientSecret` to sign in with it (Advanced-Protection
  *  path); omit both to use the shared group client. */

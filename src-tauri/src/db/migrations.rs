@@ -965,6 +965,17 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE flags ADD COLUMN instance_at TEXT;   -- occurrence this flag is about (event start); NULL = milestone flag or pre-v33
     "#,
+    // v34: per-calendar "quiet" flag — show a calendar on the Calendar tab but keep its EVENTS out of
+    // everything the assistant surfaces (daily briefing, "due soon" flags/reminders, the chat agenda
+    // preamble, the focus view's upcoming list, and the project name-match). Distinct from `selected`,
+    // which is a SYNC gate that prunes an unticked calendar's events from the mirror entirely: a quiet
+    // calendar still syncs and still renders, it is merely filtered out of `calendar::agenda_query`
+    // (the single reader behind every assistant path). Explicit calendar-LINKED milestones are left
+    // alone — those are deliberate project deadlines, not the calendar's event stream. Additive +
+    // defaulted (rule #3); existing calendars default to not-quiet, so behaviour is unchanged.
+    r#"
+    ALTER TABLE calendars ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1014,7 +1025,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 33,
+            version, 34,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1025,7 +1036,8 @@ mod tests {
              chat preference source + extraction cursor is v28; \
              Drive parent-folder tag + normalized source_account is v29; \
              spreadsheet ingestion table is v30; project activity log is v31; \
-             structured flag layer is v32; per-flag instance timestamp (F-18) is v33)"
+             structured flag layer is v32; per-flag instance timestamp (F-18) is v33; \
+             per-calendar quiet flag is v34)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

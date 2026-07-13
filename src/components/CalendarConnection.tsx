@@ -9,6 +9,7 @@ import {
   disconnectGoogleCalendarAccount,
   disconnectOutlookCalendar,
   setCalendarSelected,
+  setCalendarQuiet,
   syncCalendar,
 } from "../lib/ipc";
 import type { Calendar, CalendarAccount, CalendarOverview } from "../lib/types";
@@ -157,6 +158,26 @@ export function CalendarConnection({
       await refresh();
     });
 
+  // Mark a calendar quiet (or not). Unlike the sync tick this needs no re-sync — the events stay in
+  // the mirror; only the assistant paths (briefing/flags/chat/focus/milestones) filter them out.
+  const toggleQuiet = (cal: Calendar, on: boolean) =>
+    run("quiet", async () => {
+      setOverview((o) =>
+        o
+          ? {
+              ...o,
+              calendars: o.calendars.map((c) => (c.id === cal.id ? { ...c, quiet: on } : c)),
+            }
+          : o,
+      );
+      try {
+        await setCalendarQuiet(cal.id, on);
+      } catch (e) {
+        await refresh();
+        throw e;
+      }
+    });
+
   const sync = () =>
     run("sync", async () => {
       const n = await syncCalendar();
@@ -201,6 +222,7 @@ export function CalendarConnection({
                     calendars={calendarsFor(a.id)}
                     busy={busy != null}
                     onToggle={toggle}
+                    onToggleQuiet={toggleQuiet}
                     onDisconnect={() => setConfirmEmail(a.email)}
                   />
                 </li>
@@ -361,12 +383,14 @@ function AccountBlock({
   calendars,
   busy,
   onToggle,
+  onToggleQuiet,
   onDisconnect,
 }: {
   account: CalendarAccount;
   calendars: Calendar[];
   busy: boolean;
   onToggle: (cal: Calendar, on: boolean) => void;
+  onToggleQuiet: (cal: Calendar, on: boolean) => void;
   onDisconnect: () => void;
 }) {
   const unreachable = account.state !== "ok";
@@ -393,21 +417,44 @@ function AccountBlock({
         </Button>
       </div>
       {calendars.length > 0 ? (
-        <ul className="mt-1.5 max-h-44 overflow-y-auto">
-          {calendars.map((c) => (
-            <li key={c.id} className="flex items-center gap-2 py-1 text-sm text-ink">
-              <input
-                type="checkbox"
-                checked={c.selected}
-                disabled={busy}
-                onChange={(e) => onToggle(c, e.target.checked)}
-                className="accent-[var(--accent)]"
-              />
-              <span className="truncate">{c.name}</span>
-              {c.is_primary && <span className="font-mono text-[10px] text-ink4">primary</span>}
-            </li>
-          ))}
-        </ul>
+        <>
+          <ul className="mt-1.5 max-h-44 overflow-y-auto">
+            {calendars.map((c) => (
+              <li key={c.id} className="flex items-center gap-2 py-1 text-sm text-ink">
+                <input
+                  type="checkbox"
+                  checked={c.selected}
+                  disabled={busy}
+                  onChange={(e) => onToggle(c, e.target.checked)}
+                  className="accent-[var(--accent)]"
+                />
+                <span className="truncate">{c.name}</span>
+                {c.is_primary && <span className="font-mono text-[10px] text-ink4">primary</span>}
+                {c.selected && (
+                  <label
+                    className="ml-auto flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-ink4"
+                    title="Keep this calendar on the Calendar tab, but leave it out of reminders, the daily briefing, and chat."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={c.quiet}
+                      disabled={busy}
+                      onChange={(e) => onToggleQuiet(c, e.target.checked)}
+                      className="accent-[var(--accent)]"
+                    />
+                    Quiet
+                  </label>
+                )}
+              </li>
+            ))}
+          </ul>
+          {calendars.some((c) => c.selected) && (
+            <p className="mt-1 text-[10px] text-ink4">
+              &ldquo;Quiet&rdquo; keeps a calendar visible on the Calendar tab but out of reminders,
+              the daily briefing, and chat.
+            </p>
+          )}
+        </>
       ) : (
         <p className="mt-1 text-xs text-ink4">No calendars found on this account.</p>
       )}
