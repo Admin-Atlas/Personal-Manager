@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.6.2-alpha"
+version = "3.6.3-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -136,6 +136,7 @@ windows = { version = "0.61", features = [
     "Security_Credentials_UI",
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_Registry",
     "Win32_System_WinRT",
 ] }
 windows-future = "0.2"

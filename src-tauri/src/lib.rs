@@ -62,6 +62,7 @@ mod review;
 mod secret;
 mod secrets;
 mod sidecar;
+mod smart_app_control;
 mod splitter;
 mod spreadsheets;
 mod vault;
@@ -1088,6 +1089,7 @@ pub fn run() {
             commands::list_gdrive_backups,
             commands::backup_to_gdrive,
             commands::restore_from_gdrive,
+            commands::smart_app_control_state,
             // Developer mode (issue #78) — read-only inspection. Always registered (the
             // commands are harmless reads); only the UI is gated by the runtime `devMode`.
             commands_dev::dev_system_info,

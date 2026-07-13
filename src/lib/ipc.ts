@@ -81,6 +81,7 @@ import type {
   VaultLockStatus,
   VaultOpOutcome,
   VaultStatus,
+  SmartAppControlState,
   WipeReport,
   WipeSelection,
 } from "./types";
@@ -95,6 +96,10 @@ export const setOpenRouterBackgroundKey = (key: string) =>
   invoke<void>("set_openrouter_background_key", { key });
 
 export const getSettings = () => invoke<Settings>("get_settings");
+
+/** Current Windows Smart App Control state, so the updater can warn before a restart that SAC
+ *  would silently block. Off-Windows / when SAC is absent this resolves to "unknown". */
+export const smartAppControlState = () => invoke<SmartAppControlState>("smart_app_control_state");
 
 /** Turn query-time reranking on/off (a cross-encoder re-scores search hits). Stateless — never
  *  triggers a Rebuild; the effect lands on the next query. */

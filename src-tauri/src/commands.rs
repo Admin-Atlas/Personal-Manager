@@ -1109,6 +1109,15 @@ fn parse_account_lines(output: &str, current_sid: &str) -> Vec<LocalAccount> {
         .collect()
 }
 
+/// Current Windows Smart App Control state, so the updater UI can warn before offering a
+/// restart that SAC would silently block (an unsigned installer under SAC-enforced closes
+/// PM and reopens on the old version with no error — see `crate::smart_app_control`).
+/// Off-Windows, or when SAC is absent, this reports `Unknown` and the UI proceeds normally.
+#[tauri::command]
+pub fn smart_app_control_state() -> crate::smart_app_control::SmartAppControlState {
+    crate::smart_app_control::state()
+}
+
 /// The enabled local Windows accounts, for the share wizard's "who can open it" picker
 /// (so nobody has to hand-copy a SID). Best-effort: on failure or off-Windows the UI
 /// falls back to the manual name/SID field.

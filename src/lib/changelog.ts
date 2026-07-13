@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.6.3-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "Windows updates no longer fail silently. If Windows Smart App Control is switched on, it blocks PM's update installer with no visible error — clicking “Restart now” would close PM and quietly reopen on the old version. Now PM checks for that first and, when it's the cause, tells you plainly and points to the one thing that fixes it (turning Smart App Control off), instead of trying the same broken update again and again on every launch.",
+    ],
+  },
+  {
     version: "3.6.2-alpha",
     date: "2026-07-13",
     highlights: [
