@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use super::{
-    load_meta, master_from_db_key_hex, meta_path, pointer, prepare_shareable, resolve, store_meta,
-    KeyMode, MarkdownCipher, MarkdownEncryption, MarkdownPolicy, VaultMeta,
+    access, advert, load_meta, master_from_db_key_hex, meta_path, pointer, prepare_shareable,
+    resolve, store_meta, KeyMode, MarkdownCipher, MarkdownEncryption, MarkdownPolicy, VaultMeta,
 };
 use crate::error::{Error, Result};
 use crate::secret::Secret;
@@ -233,6 +233,12 @@ pub(crate) fn copy_vault_artifacts(from_root: &Path, to_root: &Path) -> Result<(
     if meta.exists() {
         copy_file_verified(&meta, &meta_path(to_root))?;
     }
+    // The linked-accounts sidecar travels with the vault so a link made before a move
+    // survives it (the move's ACL lockdown re-applies these principals).
+    let access_file = from_root.join(access::ACCESS_FILENAME);
+    if access_file.exists() {
+        copy_file_verified(&access_file, &to_root.join(access::ACCESS_FILENAME))?;
+    }
     Ok(())
 }
 
@@ -245,6 +251,7 @@ pub(crate) fn delete_vault_artifacts(root: &Path) {
     let _ = std::fs::remove_file(root.join(format!("{DB_FILENAME}-shm")));
     let _ = std::fs::remove_dir_all(root.join(MARKDOWN_SUBDIR));
     let _ = std::fs::remove_file(meta_path(root));
+    let _ = std::fs::remove_file(root.join(access::ACCESS_FILENAME));
 }
 
 /// A tiny provenance marker PM drops into a relocation destination while a move is in flight, so
@@ -252,27 +259,30 @@ pub(crate) fn delete_vault_artifacts(root: &Path) {
 /// held their files. Removed once the move commits.
 const VAULT_MARKER: &str = ".pm-vault";
 
-/// Discard a migration's partial destination copy WITHOUT ever bulk-removing a folder the user may
-/// have chosen. Strips only the vault artifacts we would have written, then removes the container dir
-/// only when our [`VAULT_MARKER`] proves PM created it AND, after the strip, it is empty. Fail closed
-/// on a missing marker, a symlink/reparse point, a non-empty dir, or any I/O error: a stranded partial
-/// copy is inert (the pointer commits elsewhere), whereas deleting a user's folder is not.
+/// Discard a migration's partial destination copy WITHOUT ever removing a folder that isn't provably
+/// ours. The [`VAULT_MARKER`] is checked FIRST: no marker ⇒ we touch nothing at all — critically,
+/// because a crashed Phase-A migration's journal still names the target even though nothing was ever
+/// written there, and a DIFFERENT account may have since put its own live vault in that well-known
+/// folder (e.g. the default shared location). Stripping artifacts before the marker check would
+/// destroy that other account's data. Only once the marker proves PM created this copy do we strip
+/// our artifacts and remove the (now-empty, non-symlink) container. A stranded partial copy is inert
+/// (the pointer commits elsewhere), so leaving one is always the safe failure.
 fn discard_partial_target(target: &Path) {
-    delete_vault_artifacts(target);
     let marker = target.join(VAULT_MARKER);
     if !marker.exists() {
-        return; // no marker ⇒ can't prove this is ours ⇒ leave it entirely
+        return; // no marker ⇒ can't prove this is ours ⇒ leave it entirely (may be another vault)
     }
-    if std::fs::remove_file(&marker).is_err() {
-        return;
-    }
-    // Never follow a symlink/reparse point out of the intended location.
+    // Never follow a symlink/reparse point out of the intended location before deleting.
     match std::fs::symlink_metadata(target) {
         Ok(m) if !m.file_type().is_symlink() => {}
         _ => return,
     }
-    // Remove the container only if stripping our artifacts left it empty, so any other files the
-    // user kept there are always preserved.
+    // Proven ours: strip only the vault artifacts we would have written, drop the marker, then
+    // remove the container iff that left it empty (any other files the user kept there survive).
+    delete_vault_artifacts(target);
+    if std::fs::remove_file(&marker).is_err() {
+        return;
+    }
     if let Ok(mut entries) = std::fs::read_dir(target) {
         if entries.next().is_none() {
             let _ = std::fs::remove_dir(target);
@@ -298,6 +308,36 @@ pub(crate) fn vacuum_into(conn: &rusqlite::Connection, dest: &Path) -> Result<()
     let escaped = dest.to_string_lossy().replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
     Ok(())
+}
+
+/// What already sits at a relocation target, from the caller's `load_meta` look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetState {
+    /// Nothing there (or no metadata) — safe to move in.
+    Vacant,
+    /// The target holds THIS vault (a wizard re-run or a crash-leftover partial copy) —
+    /// safe to overwrite; Phase B and the `VAULT_MARKER` recovery already handle partials.
+    SameVault,
+    /// The target holds a DIFFERENT vault — moving in would silently overwrite it.
+    ForeignVault,
+    /// The target can't be checked (unreadable metadata / access denied) — refuse
+    /// rather than risk clobbering something unseen.
+    Unreadable,
+}
+
+/// Classify a relocation target from the result of `load_meta(target)`. Pure — the
+/// guard that stops two accounts from silently overwriting each other's vault by
+/// moving into the same folder.
+pub fn relocation_target_state(
+    looked: &Result<Option<VaultMeta>>,
+    own_vault_id: &str,
+) -> TargetState {
+    match looked {
+        Err(_) => TargetState::Unreadable,
+        Ok(None) => TargetState::Vacant,
+        Ok(Some(m)) if m.vault_id == own_vault_id => TargetState::SameVault,
+        Ok(Some(_)) => TargetState::ForeignVault,
+    }
 }
 
 /// The current SQLCipher key (64-hex) for a vault. Delegates to the shared resolver
@@ -373,8 +413,9 @@ fn update_keychain(new_meta: &VaultMeta, new_key: &Secret) -> Result<()> {
 /// Validates the invariant, then performs the in-place key/Markdown change (backed up for
 /// rollback) and finally the optional relocation (source kept until the pointer commits),
 /// flipping the metadata/pointer/keychain last. An interruption is repaired on the next
-/// launch by [`recover`].
-pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<()> {
+/// launch by [`recover`]. Returns non-fatal warnings (folder ACL / discovery-marker
+/// failures) for the UI to show — encryption still protects the vault when they fire.
+pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>> {
     plan.validate()?;
     let state = app.state::<AppState>();
     let state = state.inner();
@@ -382,6 +423,30 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<()> {
     let resolved = resolve(app)?;
     let old_meta = load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata to migrate".into()))?;
+
+    // Collision guard, before any destructive step: never move onto a DIFFERENT vault
+    // (the second mover would silently overwrite the first's DB + metadata).
+    if let Some(target) = plan.target_location.as_ref() {
+        if target != &resolved.vault_root {
+            match relocation_target_state(&load_meta(target), &old_meta.vault_id) {
+                TargetState::ForeignVault => {
+                    return Err(Error::Other(
+                        "that folder already holds a different PM vault — join it from this \
+                         account instead of moving this vault onto it"
+                            .into(),
+                    ));
+                }
+                TargetState::Unreadable => {
+                    return Err(Error::Other(
+                        "that folder holds vault files PM can't read, so it can't be safely \
+                         moved into — pick another folder"
+                            .into(),
+                    ));
+                }
+                TargetState::Vacant | TargetState::SameVault => {}
+            }
+        }
+    }
 
     let old_key = current_key_hex(&old_meta)?;
     let (new_key, new_meta) = plan_new_key_and_meta(&old_meta, &plan)?;
@@ -413,6 +478,13 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<()> {
         let meta_src = meta_path(&resolved.vault_root);
         if meta_src.exists() {
             copy_file_verified(&meta_src, &meta_path(&backup))?;
+        }
+        // Back up the linked-accounts sidecar too, so a rollback (which restores from this backup
+        // and first clears the destination via delete_vault_artifacts — now including the sidecar)
+        // doesn't lose the linked principals.
+        let access_src = resolved.vault_root.join(access::ACCESS_FILENAME);
+        if access_src.exists() {
+            copy_file_verified(&access_src, &backup.join(access::ACCESS_FILENAME))?;
         }
         let mut journal = MigrationJournal {
             stage: MigrationStage::Rekeying,
@@ -475,20 +547,84 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<()> {
         }
     }
 
+    let mut warnings = Vec::new();
+    let final_root = plan
+        .target_location
+        .clone()
+        .unwrap_or_else(|| resolved.vault_root.clone());
+
     // Defence in depth: when a shareable vault is moved into a (potentially shared)
-    // folder, lock that folder down to its owner. A vault that stays in the per-profile
-    // data dir is already OS-isolated and needs no ACL. Encryption is the real
-    // protection, so a failure here is only a warning.
+    // folder, lock that folder down to its owner PLUS every linked account — the
+    // sidecar travelled with the copy, so a link made before the move survives it. A
+    // vault that stays in the per-profile data dir is already OS-isolated and needs no
+    // ACL. Encryption is the real protection, so a failure here is only a warning.
     if new_meta.key_mode == KeyMode::Passphrase {
-        if let Some(final_root) = plan.target_location.as_ref() {
-            if let Err(e) = super::acl::restrict_to_owner(final_root, &[]) {
+        if let Some(target) = plan.target_location.as_ref() {
+            let linked = access::principals(target, &new_meta.vault_id);
+            if let Err(e) = super::acl::restrict_to_owner(target, &linked) {
                 eprintln!(
                     "vault: could not apply folder ACL ({e}); encryption still protects the vault"
                 );
+                warnings.push(format!(
+                    "PM couldn't set the folder permissions ({e}). Your data is still \
+                     encrypted; linked accounts may need the folder shared by hand."
+                ));
             }
         }
+        // Advertise a shareable vault that lives OUTSIDE this profile's private folder,
+        // so another account's fresh install can discover and offer it. Non-secret and
+        // best-effort; the passphrase stays the real gate.
+        if !final_root.starts_with(&data_dir) {
+            if let Some(ads) = advert::ads_dir() {
+                let ad = advert::SharedVaultAd::for_vault(&new_meta.vault_id, &final_root);
+                if let Err(e) = advert::publish(&ads, &ad) {
+                    warnings.push(format!(
+                        "PM couldn't announce this vault to other accounts ({e}). They can \
+                         still join it by picking the folder by hand."
+                    ));
+                }
+            }
+        }
+    } else if old_meta.key_mode == KeyMode::Passphrase {
+        // A genuine make-private (was Passphrase, now Device) — NOT a plain move of an
+        // already-device vault, which must not trigger any of this owner-lockdown / advert
+        // cleanup (it had no share to undo, and the "your notes are now unencrypted" warning
+        // below would be nonsense for a vault whose Markdown was always plaintext).
+        // Withdraw the discovery marker and the linked-accounts sidecar — there is nothing
+        // left for another account to join.
+        if let Some(ads) = advert::ads_dir() {
+            let _ = advert::retract(&ads, &new_meta.vault_id);
+        }
+        // A vault made private while it still sits in a SHARED folder is the dangerous case: the
+        // Markdown was just decrypted back to plaintext in place, and previously-linked accounts
+        // still hold their folder ACEs — so their access must be revoked or they could now read the
+        // owner's notes in cleartext. Two steps are needed, because `restrict_to_owner` alone can't
+        // do it: on Windows its `/grant:r me admins` only REPLACES the principals it names, so a
+        // linked account's explicit (inheritable) ACE survives. So (1) strip inheritance + grant
+        // owner-only, then (2) explicitly `revoke_access` each previously-linked principal by name —
+        // read from the sidecar BEFORE it's deleted below. A vault already in the per-profile dir is
+        // OS-isolated and needs nothing. Best-effort — warn, never fail the migration that already
+        // committed (the DB re-key is the real protection either way).
+        if !final_root.starts_with(&data_dir) {
+            let linked = access::principals(&final_root, &new_meta.vault_id);
+            let mut acl_failed = super::acl::restrict_to_owner(&final_root, &[]).err();
+            for principal in &linked {
+                if let Err(e) = super::acl::revoke_access(&final_root, principal) {
+                    acl_failed.get_or_insert(e);
+                }
+            }
+            if let Some(e) = acl_failed {
+                eprintln!("vault: could not re-lock the now-private folder ({e})");
+                warnings.push(format!(
+                    "PM couldn't lock the folder back down to just you ({e}). Your notes are now \
+                     unencrypted in a shared folder — move the vault somewhere private, or fix the \
+                     folder's permissions by hand."
+                ));
+            }
+        }
+        let _ = std::fs::remove_file(final_root.join(access::ACCESS_FILENAME));
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// The location-move half of a migration: copy the vault to `to_root`, flip the pointer
@@ -519,6 +655,22 @@ fn relocate(
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
     drop(state.take_conn()?);
+    // Re-check the target right before writing into it: the collision guard in `migrate_vault`
+    // ran before Phase A (seconds-to-minutes of rekey/convert ago), so a concurrent wizard on
+    // another account could have dropped its own vault here since. Refuse rather than overwrite —
+    // narrows the check-to-copy TOCTOU to this final instant. (A truly simultaneous same-folder
+    // race is still possible but astronomically unlikely: `suggest_shared_vault_location`
+    // auto-suffixes past an occupied folder, so the default flow never picks the same one.)
+    match relocation_target_state(&load_meta(to_root), &new_meta.vault_id) {
+        TargetState::ForeignVault | TargetState::Unreadable => {
+            return Err(Error::Other(
+                "another PM vault appeared in that folder while this move was preparing — nothing \
+                 was overwritten; pick a different folder and try again"
+                    .into(),
+            ));
+        }
+        TargetState::Vacant | TargetState::SameVault => {}
+    }
     copy_vault_artifacts(from_root, to_root)?;
     // Drop a provenance marker so that, if the move is interrupted before it commits, recover() can
     // positively identify this destination copy as PM's own rather than inferring it from contents.
@@ -717,6 +869,49 @@ mod tests {
             read_journal(data_dir.path()).unwrap().is_none(),
             "clearing at the data dir removes the journal"
         );
+    }
+
+    #[test]
+    fn relocation_target_state_classifies_all_four_ways() {
+        // The collision-guard matrix: vacant and same-vault targets are safe; a foreign
+        // vault or an unreadable target must refuse the move.
+        let own = "vault-own";
+        let mut foreign = VaultMeta::new_device();
+        foreign.vault_id = "vault-foreign".into();
+        let mut same = VaultMeta::new_device();
+        same.vault_id = own.into();
+
+        assert_eq!(relocation_target_state(&Ok(None), own), TargetState::Vacant);
+        assert_eq!(
+            relocation_target_state(&Ok(Some(same)), own),
+            TargetState::SameVault
+        );
+        assert_eq!(
+            relocation_target_state(&Ok(Some(foreign)), own),
+            TargetState::ForeignVault
+        );
+        assert_eq!(
+            relocation_target_state(&Err(Error::Other("access denied".into())), own),
+            TargetState::Unreadable
+        );
+    }
+
+    #[test]
+    fn vault_artifacts_carry_the_access_sidecar() {
+        // The linked-accounts sidecar must travel with a move (so the lockdown can
+        // re-apply the principals) and be removed with the rest of the artifacts.
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("old");
+        let to = root.path().join("new");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join(DB_FILENAME), b"db").unwrap();
+        std::fs::write(from.join(access::ACCESS_FILENAME), b"{}").unwrap();
+
+        copy_vault_artifacts(&from, &to).unwrap();
+        assert!(to.join(access::ACCESS_FILENAME).exists());
+
+        delete_vault_artifacts(&to);
+        assert!(!to.join(access::ACCESS_FILENAME).exists());
     }
 
     #[test]

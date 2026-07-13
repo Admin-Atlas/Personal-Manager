@@ -15,7 +15,9 @@
 // Build 2–6 land and exercise them on a non-test path.
 #![allow(dead_code)]
 
+pub mod access;
 pub mod acl;
+pub mod advert;
 pub mod crypto;
 pub mod kdf;
 pub mod lock;
@@ -226,6 +228,43 @@ pub fn ensure_device_meta(vault_root: &Path) -> Result<VaultMeta> {
     let meta = VaultMeta::new_device();
     store_meta(vault_root, &meta)?;
     Ok(meta)
+}
+
+/// What boot should do about vault metadata, decided by [`boot_meta_decision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootMeta {
+    /// Metadata found — open this vault (pointered or default alike). Boxed so the loaded-meta
+    /// variant (much larger than the two string/unit variants) doesn't bloat the whole enum.
+    UseExisting(Box<VaultMeta>),
+    /// Default location, no metadata: a genuinely fresh profile — create the
+    /// zero-friction device vault, exactly as before.
+    CreateDeviceDefault,
+    /// A pointer names a folder that has no readable vault (deleted, made private, or
+    /// this account's access was revoked). Boot LOCKED with the carried detail instead
+    /// of silently creating a fresh empty vault inside someone else's folder — the
+    /// failure that made a joined-then-broken vault look like "all my data vanished".
+    PointedVaultMissing(String),
+}
+
+/// Decide how boot treats the (possibly absent) vault metadata. Pure: takes whether a
+/// pointer redirects this profile and the outcome of loading the pointed root's meta
+/// (`Err` = the load itself failed, e.g. access denied — stringly so the decision
+/// stays testable without constructing real I/O errors). A missing/unreadable meta is
+/// only auto-created at the DEFAULT location; behind a pointer it is a reportable
+/// fault. A meta-load failure at the default location stays fatal (`Err`), as before.
+pub fn boot_meta_decision(
+    pointer_present: bool,
+    meta: std::result::Result<Option<VaultMeta>, String>,
+) -> std::result::Result<BootMeta, String> {
+    match (pointer_present, meta) {
+        (_, Ok(Some(m))) => Ok(BootMeta::UseExisting(Box::new(m))),
+        (false, Ok(None)) => Ok(BootMeta::CreateDeviceDefault),
+        (false, Err(e)) => Err(e),
+        (true, Ok(None)) => Ok(BootMeta::PointedVaultMissing(
+            "the folder doesn't contain a PM vault any more".into(),
+        )),
+        (true, Err(e)) => Ok(BootMeta::PointedVaultMissing(e)),
+    }
 }
 
 /// What [`authenticate_meta`] did on open — surfaced so a caller can show a non-blocking warning (M-3).
@@ -724,6 +763,29 @@ pub fn open_at_boot(
     let conn = match db::open(&resolved.db_path, key.expose()) {
         Ok(conn) => conn,
         Err(e) => {
+            // A Passphrase vault whose CACHED key fails to open the store has two very different
+            // causes, told apart by the meta verifier (which authenticates the master — and the
+            // cached key IS the master hex): if the verifier REJECTS the cached master, the key is
+            // stale — typically the owner changed the passphrase from another profile — so drop the
+            // cache and report "locked" (Ok(None)); the UI then prompts for the new passphrase
+            // instead of the open-error surface (whose "start fresh" would wrongly offer to delete a
+            // vault that just needs re-typing). If the verifier ACCEPTS the cached master, the key is
+            // correct and the store is genuinely corrupt — fall through so the honest error reaches
+            // the recovery surface (Retry / Start fresh for a local vault, Detach for a shared one).
+            if meta.key_mode == KeyMode::Passphrase
+                && e.to_string().contains(db::WRONG_KEY_OR_CORRUPT_MSG)
+                && secrets::get_cached_vault_key(&meta.vault_id)?.is_some()
+            {
+                let cached_master = master_from_db_key_hex(key.expose())?;
+                let key_is_stale = match meta.verifier.as_ref() {
+                    Some(v) => !verifier::check(v, &cached_master)?,
+                    None => true, // no verifier to trust ⇒ treat as stale (prompt) rather than brick
+                };
+                if key_is_stale {
+                    secrets::clear_cached_vault_key(&meta.vault_id)?;
+                    return Ok(None);
+                }
+            }
             // A Device-mode vault whose *cached* key fails to open may be a half-finished
             // make-private (B1-3): the store was re-keyed to the random device key and the meta
             // flipped to Device, but a crash before `update_keychain` left the old
@@ -868,6 +930,40 @@ mod tests {
         let salt: [u8; kdf::SALT_LEN] = super::random_array().unwrap();
         let k = kdf::derive_master("x", &salt, &params).unwrap();
         assert_eq!(k.len(), 32);
+    }
+
+    #[test]
+    fn boot_meta_decision_never_creates_a_vault_behind_a_pointer() {
+        // The regression pin for the joiner-boot fix: metadata present opens it, a fresh
+        // default profile creates the device vault, but a POINTERED root with missing or
+        // unreadable metadata must boot locked-with-detail — never mint a fresh vault
+        // inside the pointed (shared) folder.
+        let meta = VaultMeta::new_device();
+        assert_eq!(
+            boot_meta_decision(false, Ok(Some(meta.clone()))),
+            Ok(BootMeta::UseExisting(Box::new(meta.clone())))
+        );
+        assert_eq!(
+            boot_meta_decision(true, Ok(Some(meta.clone()))),
+            Ok(BootMeta::UseExisting(Box::new(meta)))
+        );
+        assert_eq!(
+            boot_meta_decision(false, Ok(None)),
+            Ok(BootMeta::CreateDeviceDefault)
+        );
+        assert!(matches!(
+            boot_meta_decision(true, Ok(None)),
+            Ok(BootMeta::PointedVaultMissing(_))
+        ));
+        assert_eq!(
+            boot_meta_decision(true, Err("access is denied".into())),
+            Ok(BootMeta::PointedVaultMissing("access is denied".into()))
+        );
+        // At the default location a meta-load failure stays fatal, as before.
+        assert_eq!(
+            boot_meta_decision(false, Err("disk error".into())),
+            Err("disk error".into())
+        );
     }
 
     #[test]

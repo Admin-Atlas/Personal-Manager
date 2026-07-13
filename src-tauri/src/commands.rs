@@ -494,14 +494,39 @@ pub struct VaultStatus {
     /// search-indexer file lock, disk I/O) — distinct from a locked passphrase vault, which
     /// reports `needs_unlock` instead. The UI shows a Retry surface; `None` in the normal case.
     pub open_error: Option<String>,
+    /// The folder this profile's pointer names, when one is set (a moved or joined vault).
+    /// Lets the UI offer "detach back to a local vault" when that folder stops answering.
+    pub pointed_root: Option<String>,
+}
+
+/// Non-fatal warnings from a vault operation (a folder-ACL or discovery-marker hiccup),
+/// for the UI to surface without failing the operation — encryption still protects the
+/// vault when these fire.
+#[derive(Serialize)]
+pub struct VaultOpOutcome {
+    pub warnings: Vec<String>,
+}
+
+/// What `adopt_shared_vault` tells the joining UI: whether this instance came up as the
+/// active writer (false ⇒ the other account holds the baton and the curtain shows), plus
+/// any non-fatal warnings.
+#[derive(Serialize)]
+pub struct AdoptOutcome {
+    pub active_writer: bool,
+    pub warnings: Vec<String>,
 }
 
 /// Report the current vault's mode and whether it needs unlocking (a passphrase vault
 /// whose key isn't cached in this profile yet).
 #[tauri::command]
 pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultStatus> {
-    let resolved = vault::resolve(&app)?;
-    let meta = vault::load_meta(&resolved.vault_root)?;
+    // Resolve tolerantly: a POINTED root that stopped answering (access revoked, folder
+    // deleted) must still yield a status — with `open_error` carrying the boot detail and
+    // `pointed_root` naming the folder — rather than an error that leaves the UI blind.
+    let data_dir = paths::data_dir(&app)?;
+    let pointer = vault::pointer::load(&data_dir).ok().flatten();
+    let resolved = vault::resolve_layout(&data_dir, pointer.as_ref());
+    let meta = vault::load_meta(&resolved.vault_root).ok().flatten();
     let (mode, markdown_encrypted, vault_id) = match &meta {
         Some(m) => (
             m.key_mode,
@@ -539,6 +564,7 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         vault_id,
         retrieval_rebuild_needed,
         open_error,
+        pointed_root: pointer.map(|p| p.vault_root.to_string_lossy().into_owned()),
     })
 }
 
@@ -578,12 +604,19 @@ pub fn retry_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()
     }
 }
 
-/// Convert this profile's device vault into a shareable, passphrase-protected one. Runs
-/// through the one migration routine (derive the key, re-key the store, encrypt the
-/// Markdown), so it is crash-recoverable. The device-only default is untouched for users
-/// who never opt in; changing an existing passphrase is `change_vault_passphrase`.
+/// Convert this profile's device vault into a shareable, passphrase-protected one —
+/// and, when `target_location` is given, move it to that (cross-account-reachable)
+/// folder in the SAME crash-recoverable migration. The guided share flow always passes
+/// a location: a shareable vault left inside the per-user profile folder is unreachable
+/// by every other account, which is exactly the trap this closes. The device-only
+/// default is untouched for users who never opt in; changing an existing passphrase is
+/// `change_vault_passphrase`.
 #[tauri::command]
-pub async fn create_shareable_vault(app: AppHandle, passphrase: String) -> Result<()> {
+pub async fn create_shareable_vault(
+    app: AppHandle,
+    passphrase: String,
+    target_location: Option<String>,
+) -> Result<VaultOpOutcome> {
     // I-03: hold the passphrase in a Zeroizing so its plaintext is wiped from memory on return
     // (every derived key is already Zeroizing; the raw passphrase was the gap).
     let passphrase = zeroize::Zeroizing::new(passphrase);
@@ -604,23 +637,26 @@ pub async fn create_shareable_vault(app: AppHandle, passphrase: String) -> Resul
         target_key_mode: vault::KeyMode::Passphrase,
         new_passphrase: Some(passphrase),
         target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
-        target_location: None,
+        target_location: target_location.map(std::path::PathBuf::from),
     };
     let app2 = app.clone();
-    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+    let warnings = tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
         .await
         .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
     // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
     // release if it went device-only, or re-acquire at the new location after a move.
     lock_session::engage(&app)?;
-    Ok(())
+    Ok(VaultOpOutcome { warnings })
 }
 
 /// Change a shareable vault's passphrase: re-derive the key (new salt + verifier),
 /// re-key the store, and re-encrypt the Markdown under the new subkey — one atomic,
 /// crash-recoverable migration. Only valid for an already-shareable vault.
 #[tauri::command]
-pub async fn change_vault_passphrase(app: AppHandle, new_passphrase: String) -> Result<()> {
+pub async fn change_vault_passphrase(
+    app: AppHandle,
+    new_passphrase: String,
+) -> Result<VaultOpOutcome> {
     // I-03: wipe the passphrase plaintext from memory on return.
     let new_passphrase = zeroize::Zeroizing::new(new_passphrase);
     if new_passphrase.trim().is_empty() {
@@ -644,20 +680,21 @@ pub async fn change_vault_passphrase(app: AppHandle, new_passphrase: String) -> 
         target_location: None,
     };
     let app2 = app.clone();
-    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+    let warnings = tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
         .await
         .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
     // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
     // release if it went device-only, or re-acquire at the new location after a move.
     lock_session::engage(&app)?;
-    Ok(())
+    Ok(VaultOpOutcome { warnings })
 }
 
 /// Make a shareable vault private again: re-key it to a random device key (held only in
-/// this profile's keychain) and decrypt the Markdown back to plaintext. Reverses
+/// this profile's keychain) and decrypt the Markdown back to plaintext. Also withdraws
+/// the discovery marker and linked-accounts sidecar (inside the migration). Reverses
 /// `create_shareable_vault`; a no-op-style error if the vault is already device-only.
 #[tauri::command]
-pub async fn make_vault_private(app: AppHandle) -> Result<()> {
+pub async fn make_vault_private(app: AppHandle) -> Result<VaultOpOutcome> {
     {
         let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
             .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
@@ -674,20 +711,21 @@ pub async fn make_vault_private(app: AppHandle) -> Result<()> {
         target_location: None,
     };
     let app2 = app.clone();
-    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+    let warnings = tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
         .await
         .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
     // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
     // release if it went device-only, or re-acquire at the new location after a move.
     lock_session::engage(&app)?;
-    Ok(())
+    Ok(VaultOpOutcome { warnings })
 }
 
 /// Move the vault to a new folder (e.g. a shared location), keeping its key and Markdown
 /// policy unchanged. Copy-verify-delete with the pointer flipped last, so an interrupted
-/// move leaves the vault safely at its current location.
+/// move leaves the vault safely at its current location. Refuses a folder that already
+/// holds a DIFFERENT vault (the collision guard in the migration) — join that one instead.
 #[tauri::command]
-pub async fn move_vault(app: AppHandle, folder: String) -> Result<()> {
+pub async fn move_vault(app: AppHandle, folder: String) -> Result<VaultOpOutcome> {
     let target = std::path::PathBuf::from(folder);
     let plan = {
         let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
@@ -700,13 +738,13 @@ pub async fn move_vault(app: AppHandle, folder: String) -> Result<()> {
         }
     };
     let app2 = app.clone();
-    tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+    let warnings = tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
         .await
         .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
     // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
     // release if it went device-only, or re-acquire at the new location after a move.
     lock_session::engage(&app)?;
-    Ok(())
+    Ok(VaultOpOutcome { warnings })
 }
 
 /// Surface a non-blocking warning to the UI when the vault meta was repaired on open (M-3): a
@@ -811,11 +849,15 @@ pub fn score_passphrase(passphrase: String) -> PassphraseScore {
 
 /// Grant another account on this machine access to the shared vault folder — the
 /// Settings "link a second account" action. Takes an account name (e.g. `PC\alice`) or
-/// a SID. Only a shareable vault can be linked; ACLs are defence in depth (encryption
-/// is the real protection), so on platforms without support this surfaces as a clear
-/// error the UI can show as a warning.
+/// a SID. Only a shareable vault that has actually MOVED out of this profile's private
+/// folder can be linked — an ACE on a folder under the owner's profile is inert (other
+/// accounts can't traverse the profile directories), which used to make this action
+/// silently useless. The principal is persisted in the vault-access sidecar so a later
+/// move re-applies it, and the discovery marker is refreshed. ACLs are defence in depth
+/// (encryption is the real protection), so on platforms without support this surfaces
+/// as a clear error the UI can show as a warning.
 #[tauri::command]
-pub fn link_vault_account(app: AppHandle, account: String) -> Result<()> {
+pub fn link_vault_account(app: AppHandle, account: String) -> Result<VaultOpOutcome> {
     let resolved = vault::resolve(&app)?;
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
@@ -825,7 +867,281 @@ pub fn link_vault_account(app: AppHandle, account: String) -> Result<()> {
                 .into(),
         ));
     }
-    vault::acl::grant_access(&resolved.vault_root, &account)
+    let data_dir = paths::data_dir(&app)?;
+    if resolved.vault_root.starts_with(&data_dir) {
+        return Err(Error::Other(
+            "this vault still lives in your account's private folder, which other accounts \
+             can never reach — move it to a shared location first (Share with other accounts)"
+                .into(),
+        ));
+    }
+    vault::acl::grant_access(&resolved.vault_root, &account)?;
+    let mut warnings = Vec::new();
+    // Record the principal so a later move's owner-lockdown re-grants it (best-effort:
+    // the ACE above is already applied either way).
+    let mut access = vault::access::load(&resolved.vault_root, &meta.vault_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| vault::access::VaultAccess::new(&meta.vault_id));
+    access.principals = vault::access::merge_principal(&access.principals, &account);
+    if let Err(e) = vault::access::store(&resolved.vault_root, &access) {
+        warnings.push(format!(
+            "PM couldn't record the linked account ({e}) — if you move the vault later, \
+             link this account again afterwards."
+        ));
+    }
+    // Refresh the discovery marker so the linked account's fresh install gets the offer.
+    if let Some(ads) = vault::advert::ads_dir() {
+        let ad = vault::advert::SharedVaultAd::for_vault(&meta.vault_id, &resolved.vault_root);
+        if let Err(e) = vault::advert::publish(&ads, &ad) {
+            warnings.push(format!(
+                "PM couldn't announce this vault to other accounts ({e}) — they can still \
+                 join it by picking the folder by hand."
+            ));
+        }
+    }
+    Ok(VaultOpOutcome { warnings })
+}
+
+/// The shared vaults other accounts have advertised on this machine, filtered to ones
+/// this profile could actually join (not its own vault; folders that still answer). An
+/// unreadable folder is still offered — that's exactly the "owner hasn't linked this
+/// account yet" case, and adopting surfaces the actionable error.
+#[tauri::command]
+pub fn list_shared_vaults(app: AppHandle) -> Result<Vec<vault::advert::SharedVaultAd>> {
+    let Some(ads) = vault::advert::ads_dir() else {
+        return Ok(Vec::new());
+    };
+    let data_dir = paths::data_dir(&app)?;
+    let pointer = vault::pointer::load(&data_dir).ok().flatten();
+    let resolved = vault::resolve_layout(&data_dir, pointer.as_ref());
+    let current = vault::load_meta(&resolved.vault_root)
+        .ok()
+        .flatten()
+        .map(|m| m.vault_id);
+    Ok(vault::advert::filter_adoptable(
+        vault::advert::list(&ads),
+        current.as_deref(),
+        // "Still standing" = anything except a readable folder with no vault in it; an
+        // ACCESS-DENIED folder keeps its offer so the joiner gets the real error.
+        |root| !matches!(vault::load_meta(root), Ok(None)),
+    ))
+}
+
+/// Point this profile at `root` and install the freshly opened session: pointer first
+/// (the commit — the next launch reads it), then the session swap, then the writer
+/// lock. Shared by the backup-restore switch and the shared-vault adopt so the
+/// attach sequence lives exactly once.
+fn attach_profile_here(
+    app: &AppHandle,
+    state: &AppState,
+    root: std::path::PathBuf,
+    conn: rusqlite::Connection,
+    runtime: VaultRuntime,
+) -> Result<()> {
+    let data_dir = paths::data_dir(app)?;
+    vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
+    state.open_session(conn, runtime)?;
+    lock_session::engage(app)?;
+    Ok(())
+}
+
+/// Join an existing shared vault from THIS Windows account: validate the folder, unlock
+/// it with the passphrase (verifier first, so a wrong passphrase errors cleanly), cache
+/// the derived key so the next launch is silent, then point this profile at the folder.
+/// The joiner's previous vault stays intact on disk — set aside, never deleted;
+/// `detach_from_shared_vault` brings it back. No strength floor here: adopt is
+/// unlock-family, and the passphrase already exists.
+#[tauri::command]
+pub fn adopt_shared_vault(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder: String,
+    passphrase: String,
+) -> Result<AdoptOutcome> {
+    // I-03: wipe the passphrase plaintext from memory on return.
+    let passphrase = zeroize::Zeroizing::new(passphrase);
+    let root = std::path::PathBuf::from(&folder);
+    let meta = match vault::load_meta(&root) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Err(Error::Other("no PM vault was found in that folder".into())),
+        Err(e) => {
+            return Err(Error::Other(format!(
+                "PM can't reach that folder ({e}) — the vault's owner needs to add this \
+                 Windows account first, under Manage sharing on their side"
+            )))
+        }
+    };
+    if meta.key_mode != vault::KeyMode::Passphrase {
+        return Err(Error::Other(
+            "that vault is private to its owner's account, so it can't be joined — they \
+             can make it shareable first"
+                .into(),
+        ));
+    }
+    let resolved = vault::ResolvedVault {
+        vault_root: root.clone(),
+        db_path: root.join("pm.sqlite"),
+        markdown_dir: root.join("vault"),
+    };
+    let (conn, key, meta_report) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
+    let mut warnings = Vec::new();
+    // Cache-first is deliberate: a cache failure costs one passphrase prompt next
+    // launch, never a failed adopt.
+    if let Err(e) = secrets::set_cached_vault_key(&meta.vault_id, key.expose()) {
+        warnings.push(format!(
+            "PM couldn't keep the key on this account ({e}) — you'll be asked for the \
+             passphrase again next launch."
+        ));
+    }
+    let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
+    attach_profile_here(&app, &state, root, conn, runtime)?;
+    // A successful adopt supersedes any boot-time "vault unreachable" state.
+    *state
+        .boot_open_error
+        .lock()
+        .map_err(|_| Error::Other("boot-error lock poisoned".into()))? = None;
+    // M-3: if the meta was repaired on open, tell the user (non-blocking).
+    emit_vault_meta_warning(&app, &meta_report);
+    Ok(AdoptOutcome {
+        active_writer: lock_session::status(&app).active,
+        warnings,
+    })
+}
+
+/// Leave the shared vault: clear this profile's pointer and reopen the local
+/// (default-location) vault — whatever was set aside at adopt time, or a fresh one on a
+/// profile that never had data. The shared folder itself is untouched. This is the
+/// escape hatch when the shared vault stops answering (owner revoked access, folder
+/// gone, vault made private).
+#[tauri::command]
+pub fn detach_from_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    let data_dir = paths::data_dir(&app)?;
+    vault::pointer::clear(&data_dir)?;
+    // Close whatever is open (possibly the shared store) before reopening locally.
+    let _ = state.take_conn();
+    let _ = state.clear_vault_runtime();
+    *state
+        .boot_open_error
+        .lock()
+        .map_err(|_| Error::Other("boot-error lock poisoned".into()))? = None;
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::ensure_device_meta(&resolved.vault_root)?;
+    if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
+        state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+    }
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// The suggested cross-account location for a shared vault, plus whether it looks
+/// writable from here. Windows only (the suggestion lives under `%ProgramData%`, whose
+/// default ACLs let any user create their own subfolder); elsewhere `path` is null and
+/// the UI asks for a folder pick.
+#[derive(Serialize)]
+pub struct SuggestedLocation {
+    pub path: Option<String>,
+    pub writable: bool,
+}
+
+/// Suggest where a shared vault should live (see [`SuggestedLocation`]): the first
+/// `Shared Vault` / `Shared Vault 2` / … folder under the shared base not already
+/// occupied by a different vault. Re-suggesting this vault's own folder is fine (a
+/// wizard re-run).
+#[tauri::command]
+pub fn suggest_shared_vault_location(app: AppHandle) -> Result<SuggestedLocation> {
+    let Some(base) = vault::advert::shared_base_dir() else {
+        return Ok(SuggestedLocation {
+            path: None,
+            writable: false,
+        });
+    };
+    let own_id = vault::load_meta(&vault::resolve(&app)?.vault_root)?
+        .map(|m| m.vault_id)
+        .unwrap_or_default();
+    // Occupied = a different vault sits there, or the folder can't be checked. This
+    // vault's own folder (or an empty one) is free.
+    let occupied = |p: &std::path::Path| {
+        !matches!(
+            vault::migrate::relocation_target_state(&vault::load_meta(p), &own_id),
+            vault::migrate::TargetState::Vacant | vault::migrate::TargetState::SameVault
+        )
+    };
+    let path = vault::advert::next_free_location(&base, "Shared Vault", occupied);
+    // Probe writability of the BASE (creating the vault folder itself is the move's
+    // job): stock ProgramData lets Users create subfolders, but GPO/AV can tighten it.
+    let writable = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&base)?;
+        let probe = base.join(".pm-write-probe");
+        std::fs::write(&probe, b"probe")?;
+        std::fs::remove_file(&probe)?;
+        Ok(())
+    })()
+    .is_ok();
+    Ok(SuggestedLocation {
+        path: Some(path.to_string_lossy().into_owned()),
+        writable,
+    })
+}
+
+/// One local Windows account for the share wizard's picker.
+#[derive(Serialize)]
+pub struct LocalAccount {
+    pub name: String,
+    pub sid: String,
+    pub is_current: bool,
+}
+
+/// Parse `Get-LocalUser` picker lines (`name|SID`, one per line), marking the caller's
+/// own account. Pure; tolerant of blank/garbage lines.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_account_lines(output: &str, current_sid: &str) -> Vec<LocalAccount> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (name, sid) = line.trim().rsplit_once('|')?;
+            (!name.is_empty() && sid.starts_with("S-1-")).then(|| LocalAccount {
+                name: name.to_string(),
+                sid: sid.to_string(),
+                is_current: sid == current_sid,
+            })
+        })
+        .collect()
+}
+
+/// The enabled local Windows accounts, for the share wizard's "who can open it" picker
+/// (so nobody has to hand-copy a SID). Best-effort: on failure or off-Windows the UI
+/// falls back to the manual name/SID field.
+#[tauri::command]
+pub fn list_local_accounts() -> Result<Vec<LocalAccount>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Suppress the console window that would flash when a GUI app spawns a child.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-LocalUser | Where-Object { $_.Enabled } | ForEach-Object { $_.Name + '|' + $_.SID.Value }",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| Error::Other(format!("could not list local accounts: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::Other("could not list local accounts".into()));
+        }
+        let current = vault::acl::current_user_sid().unwrap_or_default();
+        Ok(parse_account_lines(
+            &String::from_utf8_lossy(&out.stdout),
+            &current,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Vec::new())
+    }
 }
 
 /// The cooperative writer-lock status for a shared vault: whether this instance is the
@@ -5673,13 +5989,11 @@ pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: Strin
         )
     })?;
     let runtime = VaultRuntime::build(&resolved, &meta, &master);
-    // Point this profile here, then install the new session — `open_session` swaps `db`
-    // + `vault` together and drops the old connection, so there's no locked-in-between
-    // window. The next launch reads the pointer directly.
-    let data_dir = paths::data_dir(&app)?;
-    vault::pointer::store(&data_dir, &vault::pointer::VaultPointer::new(root))?;
-    state.open_session(conn, runtime)?;
-    lock_session::engage(&app)?;
+    // Point this profile here, then install the new session — `attach_profile_here`
+    // stores the pointer first (the next launch reads it), and `open_session` swaps
+    // `db` + `vault` together and drops the old connection, so there's no
+    // locked-in-between window.
+    attach_profile_here(&app, &state, root, conn, runtime)?;
     // Committed: drop the staged-restore banner so a reopened Backup panel doesn't offer to
     // "switch" to the vault that's now already active.
     if let Ok(mut snap) = state.backup_state.lock() {

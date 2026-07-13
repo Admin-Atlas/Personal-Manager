@@ -50,6 +50,7 @@ import {
   getSettings,
   hasOpenRouterKey,
   listConversations,
+  listSharedVaults,
   markActivity,
   onVaultAcquired,
   onVaultCurtain,
@@ -67,7 +68,15 @@ import {
   vaultLockStatus,
   vaultStatus,
 } from "./lib/ipc";
-import type { Conversation, Settings, VaultLockStatus, VaultStatus } from "./lib/types";
+import type {
+  Conversation,
+  Settings,
+  SharedVaultAd,
+  VaultLockStatus,
+  VaultStatus,
+} from "./lib/types";
+import { VaultJoin } from "./components/VaultJoin";
+import { markJustJoinedVault } from "./lib/joinedVault";
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -84,6 +93,12 @@ export default function App() {
   // Cooperative single-writer state for a shared vault: when another profile is the
   // active writer, `vaultLock.active` is false and the curtain shows over everything.
   const [vaultLock, setVaultLock] = useState<VaultLockStatus | null>(null);
+  // Shared vaults other accounts advertised on this PC (issue #337). A fresh profile
+  // (no key yet, still on its own device vault) gets the join offer ahead of
+  // onboarding; skipping falls through for this launch only, so a one-tap join is
+  // never permanently buried.
+  const [sharedOffers, setSharedOffers] = useState<SharedVaultAd[]>([]);
+  const [joinSkipped, setJoinSkipped] = useState(false);
   const [curtainReason, setCurtainReason] = useState<"other-active" | "handed-off">("other-active");
   // A non-blocking notice when a vault's metadata was repaired on open (M-3): a downgraded
   // encryption policy PM forced back on, or a failed integrity check. Dismissible.
@@ -231,7 +246,13 @@ export default function App() {
       try {
         const version = await getVersion();
         setAppVersion(version);
-        if (localStorage.getItem(LAST_SEEN_VERSION_KEY) !== version) {
+        const lastSeen = localStorage.getItem(LAST_SEEN_VERSION_KEY);
+        if (lastSeen === null) {
+          // A brand-new profile has no "what's new" — everything is new. Record the
+          // version silently so only genuine upgrades open the modal (it used to fire
+          // on every fresh profile, papering over an empty first launch — issue #337).
+          localStorage.setItem(LAST_SEEN_VERSION_KEY, version);
+        } else if (lastSeen !== version) {
           setShowWhatsNew(true);
         }
       } catch {
@@ -252,12 +273,14 @@ export default function App() {
         // serial round-trips behind each other (F-09). `has_openrouter_key` reads the OS keychain,
         // not the encrypted store, so it's safe to fetch eagerly even when a gate below early-returns
         // before it's consumed. The gate ORDER is preserved exactly.
-        const [appLocked, vs, writerLock, has] = await Promise.all([
+        const [appLocked, vs, writerLock, has, offers] = await Promise.all([
           appLockStatus().catch(() => null),
           vaultStatus().catch(() => null),
           vaultLockStatus().catch(() => null),
           hasOpenRouterKey().catch(() => false),
+          listSharedVaults().catch(() => []),
         ]);
+        setSharedOffers(offers);
         // Resolve the launch lock before the first paint so locked content never flashes.
         if (appLocked?.locked) setLocked(true);
         // A passphrase vault with no cached key on this profile boots locked (the store can't open
@@ -656,6 +679,25 @@ export default function App() {
   // main.tsx) so the window stays draggable/closable while locked.
   if (locked) {
     return <LockScreen onUnlocked={() => setLocked(false)} />;
+  }
+
+  // The join offer (issue #337): a fresh profile (no key yet, still on its own device
+  // vault) is offered any shared vault another account advertised on this PC, before
+  // onboarding. Joining swaps the whole store, so it reloads the webview — the same
+  // pattern as the backup-restore switch; the just-joined flag lets onboarding and the
+  // Connectors tab explain what's theirs alone. Skipping falls through to onboarding
+  // for this launch; the offer returns next launch.
+  if (!keySet && !joinSkipped && vault?.mode === "device" && sharedOffers.length > 0) {
+    return (
+      <VaultJoin
+        vaults={sharedOffers}
+        onJoined={() => {
+          markJustJoinedVault();
+          window.location.reload();
+        }}
+        onSkip={() => setJoinSkipped(true)}
+      />
+    );
   }
 
   if (!keySet) {

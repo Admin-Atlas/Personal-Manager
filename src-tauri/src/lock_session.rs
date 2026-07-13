@@ -107,8 +107,24 @@ pub fn engage(app: &AppHandle) -> Result<()> {
     let state = state.inner();
     let id = state.instance_id.clone();
 
-    let resolved = vault::resolve(app)?;
-    let meta = vault::load_meta(&resolved.vault_root)?;
+    // A pointed root that stopped answering (access revoked, folder gone) can't be coordinated —
+    // so tolerate a resolve/load failure instead of erroring, or a joiner's broken shared vault
+    // would abort the boot/adopt/detach flows that call this. Close the store as well as releasing
+    // the lock: if this instance were somehow still the active writer with the store open, dropping
+    // the lock alone would let another profile acquire it while we kept writing (split-brain). A
+    // closed store fails a DB command cleanly instead.
+    let close_and_disengage = || {
+        close_store(state);
+        disengage(app);
+    };
+    let Ok(resolved) = vault::resolve(app) else {
+        close_and_disengage();
+        return Ok(());
+    };
+    let Ok(meta) = vault::load_meta(&resolved.vault_root) else {
+        close_and_disengage();
+        return Ok(());
+    };
     let is_shareable = matches!(
         meta.as_ref().map(|m| m.key_mode),
         Some(vault::KeyMode::Passphrase)

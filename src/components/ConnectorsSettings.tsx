@@ -4,7 +4,8 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useDepth } from "../theme";
 import { driveStatus, oneDriveStatus } from "../lib/ipc";
-import { Collapsible, SegmentedControl } from "./ui";
+import { Button, Collapsible, SegmentedControl } from "./ui";
+import { clearJustJoinedVault, justJoinedVault } from "../lib/joinedVault";
 import { CalendarConnection } from "./CalendarConnection";
 import { CloudDriveConnection } from "./CloudDriveConnection";
 import { LocalFolderConnection } from "./LocalFolderConnection";
@@ -45,6 +46,8 @@ export function ConnectorsSettings({
         in your keychain.
       </p>
 
+      <JoinedVaultBanner />
+
       <IndexingSpeedControl value={indexingSpeed} onChange={onChangeIndexingSpeed} />
 
       <GoogleProvider />
@@ -52,6 +55,39 @@ export function ConnectorsSettings({
       <AppleProvider />
       <ThisDevice />
       <CalendarSubscriptions />
+    </div>
+  );
+}
+
+/** A dismissible one-time note after joining a shared vault (issue #337): the connectors
+ *  listed were connected by the vault's owner, so they show "unreachable" on this account
+ *  until reconnected with this account's own sign-ins (tokens are per-Windows-user by
+ *  design). Keyed on the per-user `pm:justJoinedVault` flag the join flow sets, so it can
+ *  never appear on the owner's side; Dismiss clears the flag for good. */
+function JoinedVaultBanner() {
+  const [visible, setVisible] = useState(justJoinedVault);
+  if (!visible) return null;
+  return (
+    <div
+      className="mt-3 flex items-start justify-between gap-3 rounded-[var(--radius)] px-3 py-2"
+      style={{ background: "color-mix(in oklab, var(--st-look) 12%, transparent)" }}
+    >
+      <p className="text-xs text-ink3">
+        <span className="font-medium text-ink2">Joined a shared vault?</span> The accounts below
+        were connected by the vault's owner, so they show as unreachable for you until you reconnect
+        them as yourself — just hit Connect with the same account. Everything already indexed stays
+        findable meanwhile. Folders that live on the owner's account stay theirs.
+      </p>
+      <Button
+        variant="tertiary"
+        className="shrink-0"
+        onClick={() => {
+          clearJustJoinedVault();
+          setVisible(false);
+        }}
+      >
+        Dismiss
+      </Button>
     </div>
   );
 }
