@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.6.4-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "Finishing “Remove PM data” now actually closes the app. The “Close PM” and “Finish uninstall” buttons at the end of the removal flow used to do nothing when clicked, leaving PM open — they now quit it properly. And a full uninstall on Windows no longer strands a leftover “PM” folder: the bundled document-engine files it used to leave behind are now cleaned up with everything else.",
+      "One more safeguard before you erase your data — when your vault and database are part of what you're removing, the confirmation screen now reminds you, in plain sight, that they can't be recovered, so you can back them up first if you haven't already.",
+    ],
+  },
+  {
     version: "3.6.3-alpha",
     date: "2026-07-13",
     highlights: [

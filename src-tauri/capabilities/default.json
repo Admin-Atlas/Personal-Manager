@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window — least-privilege: the dialog/process actions the app calls (open a file picker; save-file dialog for the data export; restart to apply an update) plus the window controls the custom titlebar drives (drag, minimize, maximize/restore, fullscreen, close) since native decorations are off.",
+  "description": "Capability for the main window — least-privilege: the dialog/process actions the app calls (open a file picker; save-file dialog for the data export; restart to apply an update; exit to close the app after a data wipe / uninstall) plus the window controls the custom titlebar drives (drag, minimize, maximize/restore, fullscreen, close) since native decorations are off.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -16,6 +16,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "process:allow-exit"
   ]
 }

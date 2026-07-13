@@ -7,11 +7,17 @@
 ; wipes it (see src-tauri/src/paths.rs). That same isolation means a normal uninstall
 ; would otherwise leave behind the multi-hundred-MB regenerable runtime.
 ;
-; So, after the app's own files are removed, we delete ONLY that runtime folder: the
-; managed Python venv (including the optional t-SNE and photo-OCR stacks), the Whisper
-; speech model, and the bundled standalone interpreter — exactly what the in-app
-; Settings -> Storage tab frees, and nothing the user would miss (it re-downloads on
-; next use). This is the counterpart to the app's "Remove PM data" flow.
+; So, after the app's own files are removed, we delete that regenerable runtime folder under the
+; data dir: the managed Python venv (including the optional t-SNE and photo-OCR stacks) and the
+; Whisper speech model — exactly what the in-app Settings -> Storage tab frees, and nothing the
+; user would miss (it re-downloads on next use). This is the counterpart to the app's "Remove PM
+; data" flow.
+;
+; Separately, and on EVERY uninstall, we force-remove the bundled standalone interpreter at
+; $INSTDIR\python. It ships as an installer resource, but we run it IN PLACE to build the venv, so
+; CPython scatters __pycache__\*.pyc through its Lib at runtime — untracked files the stock
+; uninstaller never recorded and its RMDir can't clear, which would otherwise strand
+; $INSTDIR\python\Lib (and, with it, the whole install dir) behind.
 ;
 ; Deliberately LEFT untouched on a NORMAL uninstall, so uninstall -> reinstall keeps everything:
 ;   * the Markdown vault and the encrypted database (the real user data),
@@ -32,6 +38,11 @@
 ; "org.itsatlas.pm" is fixed (renaming it orphans the keychain; see src-tauri/src/paths.rs).
 
 !macro NSIS_HOOK_POSTUNINSTALL
+  ; Always clear the bundled interpreter (see header): RMDir /r deletes the runtime-written .pyc the
+  ; stock uninstaller can't, then drop the now-empty install dir (no-op if it isn't empty / is gone).
+  RMDir /r "$INSTDIR\python"
+  RMDir "$INSTDIR"
+
   IfFileExists "$LOCALAPPDATA\org.itsatlas.pm\.pm-uninstall-purge" pm_purge_all pm_keep_data
   pm_purge_all:
     RMDir /r "$LOCALAPPDATA\Personal Manager"
