@@ -4,6 +4,7 @@
 import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
   useEffect,
   useMemo,
   useRef,
@@ -16,14 +17,10 @@ import {
   openSource,
   readDocumentBody,
   readDocumentImage,
+  reindexIndexOnly,
 } from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
-import {
-  offsetsAlignToBody,
-  parentGroupStarts,
-  segmentByLeaves,
-  shadeLeaves,
-} from "../lib/chunkOverlay";
+import { parentGroupStarts, segmentByLeaves, shadeLeaves } from "../lib/chunkOverlay";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
@@ -84,6 +81,18 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [showChunks, setShowChunks] = useState(false);
   const [spans, setSpans] = useState<ChunkSpan[] | null>(null);
+  // Whether the stored chunk offsets still index the body we're showing. Vault docs are always
+  // aligned (their body IS the indexed string); an index-only doc reports it from the live fetch (an
+  // exact content-hash identity check). When false, the saved chunk map is stale and the overlay
+  // would land in the wrong places — the reader offers Re-index instead of drawing it.
+  const [aligned, setAligned] = useState(true);
+  // The chunk-spans fetch lifecycle, so "Show chunks" never silently shows nothing: a load in
+  // flight, or a failure the user can retry.
+  const [spansLoading, setSpansLoading] = useState(false);
+  const [spansError, setSpansError] = useState(false);
+  // The on-demand Re-index (index-only only): rebuild the stored chunk map against the current body.
+  const [reindexing, setReindexing] = useState(false);
+  const [reindexError, setReindexError] = useState<string | null>(null);
   // Latest doc id, so a slow chunk-spans fetch that resolves after the reader moved to another
   // document is dropped rather than painted over the new one.
   const docIdRef = useRef(doc.id);
@@ -106,6 +115,11 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
     setError(null);
     setShowChunks(false);
     setSpans(null);
+    setAligned(true);
+    setSpansLoading(false);
+    setSpansError(false);
+    setReindexing(false);
+    setReindexError(null);
     setLoading(true);
     void (async () => {
       try {
@@ -124,10 +138,11 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
           // other document (and so its chunk offsets line up). If the source can't be reached (offline,
           // removed, or access expired), fall back to the ~500-char summary PM keeps offline.
           try {
-            const full = await fetchIndexOnlyBody(doc.id);
+            const res = await fetchIndexOnlyBody(doc.id);
             if (!cancelled) {
-              setBody(full);
+              setBody(res.body);
               setBodyFull(true);
+              setAligned(res.aligned);
             }
           } catch (e) {
             const summary = await readDocumentBody(doc.id).catch(() => "");
@@ -194,20 +209,68 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
   const renderedAsMarkdown = body != null && image == null && (!isIndexOnly || bodyFull);
   const canOverlay = renderedAsMarkdown && showPower;
 
-  async function toggleChunks() {
-    const next = !showChunks;
-    setShowChunks(next);
-    if (next && spans == null) {
-      const forDoc = doc.id;
-      try {
-        const s = await documentChunkSpans(forDoc);
-        if (docIdRef.current === forDoc) setSpans(s);
-      } catch {
-        // Read-only diagnostic — drop back to the plain reader on failure.
-        if (docIdRef.current === forDoc) setShowChunks(false);
-      }
+  // Load the chunk spans for the current doc, tracking a loading/error state so the overlay panel can
+  // say what's happening instead of silently rendering plain text (the old catch just turned the
+  // toggle back off). Late resolves for a doc the reader has since left are dropped.
+  async function loadSpans() {
+    const forDoc = doc.id;
+    setSpansLoading(true);
+    setSpansError(false);
+    try {
+      const s = await documentChunkSpans(forDoc);
+      if (docIdRef.current === forDoc) setSpans(s);
+    } catch {
+      if (docIdRef.current === forDoc) setSpansError(true);
+    } finally {
+      if (docIdRef.current === forDoc) setSpansLoading(false);
     }
   }
+
+  function toggleChunks() {
+    const next = !showChunks;
+    setShowChunks(next);
+    if (next && spans == null && !spansLoading) void loadSpans();
+  }
+
+  // Re-index this index-only item against its current live body, then refresh the body + spans so the
+  // overlay redraws aligned. Fixes a stale chunk map (offsets left indexing the offline summary).
+  async function reindex() {
+    const forDoc = doc.id;
+    setReindexing(true);
+    setReindexError(null);
+    try {
+      // The command re-embeds and hands back the exact body it indexed (+ aligned), so we redraw
+      // against that — no second live fetch, and no window for the source to drift between them.
+      const res = await reindexIndexOnly(forDoc);
+      if (docIdRef.current !== forDoc) return;
+      setBody(res.body);
+      setBodyFull(true);
+      setAligned(res.aligned);
+      setSpans(null);
+      await loadSpans();
+    } catch (e) {
+      if (docIdRef.current === forDoc) setReindexError(String(e));
+    } finally {
+      if (docIdRef.current === forDoc) setReindexing(false);
+    }
+  }
+
+  // Everything the body renderers need to draw the chunk overlay — or the right honest note in its
+  // place (loading / failed / stale / none), with the fix affordance where one exists.
+  const chunk: ChunkPanel = {
+    showChunks,
+    spans,
+    aligned,
+    isIndexOnly,
+    spansLoading,
+    spansError,
+    reindexing,
+    reindexError,
+    onReindex: () => void reindex(),
+    onRetrySpans: () => void loadSpans(),
+    stale,
+    raw: devMode,
+  };
 
   return (
     // Docked to the right, starting *below* the custom title bar (`top-9` = its `h-9`) so its drag
@@ -274,42 +337,161 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
             body={body ?? ""}
             full={bodyFull}
             fallbackReason={indexOnlyFallback}
-            showChunks={showChunks}
-            spans={spans}
-            stale={stale}
-            raw={devMode}
+            chunk={chunk}
           />
         ) : body != null ? (
-          <BodyView body={body} showChunks={showChunks} spans={spans} stale={stale} raw={devMode} />
+          <BodyView body={body} chunk={chunk} />
         ) : null}
       </div>
     </aside>
   );
 }
 
-/** A rendered document body, optionally overlaid with the splitter's chunk boundaries. */
-function BodyView({
-  body,
-  showChunks,
-  spans,
-  stale,
-  raw,
-}: {
-  body: string;
+/** Everything the body renderers need to draw the chunk overlay — or the right honest note in its
+ *  place. `aligned`/`isIndexOnly` decide draw-vs-explain; the loading/error/reindex fields carry the
+ *  spans-fetch lifecycle and the index-only Re-index affordance. */
+interface ChunkPanel {
   showChunks: boolean;
   spans: ChunkSpan[] | null;
+  /** The stored offsets index the shown body exactly (index-only reports this; vault is always true). */
+  aligned: boolean;
+  isIndexOnly: boolean;
+  spansLoading: boolean;
+  spansError: boolean;
+  reindexing: boolean;
+  reindexError: string | null;
+  onReindex: () => void;
+  onRetrySpans: () => void;
+  /** Vault-level retrieval-config staleness (the separate global StaleNote), shown above a live overlay. */
   stale: boolean;
   raw: boolean;
-}) {
-  if (showChunks && spans) {
+}
+
+/** A rendered document body, overlaid with the splitter's chunk boundaries when the user asks for
+ *  them (and they can be drawn honestly). */
+function BodyView({ body, chunk }: { body: string; chunk: ChunkPanel }) {
+  if (!chunk.showChunks) return <Markdown>{body}</Markdown>;
+  return <ChunkArea body={body} chunk={chunk} />;
+}
+
+/** The "Show chunks" surface: draws the overlay when the offsets line up, otherwise the honest note
+ *  for whichever state we're in (loading / failed to load / stale map / none recorded), each with the
+ *  fix where the user can make one. */
+function ChunkArea({ body, chunk }: { body: string; chunk: ChunkPanel }) {
+  const { spans, spansLoading, spansError, aligned, isIndexOnly, reindexing, reindexError } = chunk;
+  const reindexAction = <ReindexAction reindexing={reindexing} onReindex={chunk.onReindex} />;
+
+  // The spans fetch failed — say so and let them retry, rather than silently reverting to plain text.
+  if (spansError) {
     return (
       <>
-        {stale && <StaleNote />}
-        <ChunkOverlayView body={body} spans={spans} raw={raw} />
+        <ChunkStatusNote
+          title="Couldn't load the chunk boundaries"
+          action={<InlineAction label="Try again" onClick={chunk.onRetrySpans} />}
+        >
+          Something went wrong reading this document&apos;s saved chunk map. This is only a view —
+          your document itself is unaffected.
+        </ChunkStatusNote>
+        <Markdown>{body}</Markdown>
       </>
     );
   }
-  return <Markdown>{body}</Markdown>;
+  // Still loading (or not requested yet).
+  if (spans == null || spansLoading) {
+    return (
+      <>
+        <ChunkStatusNote title="Loading chunk boundaries…" />
+        <Markdown>{body}</Markdown>
+      </>
+    );
+  }
+  // Index-only item whose saved offsets index a different version than the body shown — Re-index fixes it.
+  if (isIndexOnly && !aligned) {
+    return (
+      <>
+        <ChunkStatusNote title="Chunk boundaries are out of date" action={reindexAction}>
+          PM&apos;s saved chunk map for this item was built from a different version of the source
+          than the copy shown here — most often because the index was rebuilt from the short summary
+          PM keeps offline. Re-index it to rebuild the map from its current text; the boundaries
+          will then line up.
+        </ChunkStatusNote>
+        {reindexError && <p className="mb-3 text-xs text-st-due">{reindexError}</p>}
+        <Markdown>{body}</Markdown>
+      </>
+    );
+  }
+  // Aligned, but nothing to draw — no leaf offsets were recorded for this document.
+  const hasLeaves = spans.some(
+    (s) => s.kind === "leaf" && s.start_offset != null && s.end_offset != null,
+  );
+  if (!hasLeaves) {
+    return (
+      <>
+        <ChunkStatusNote
+          title="No chunk boundaries recorded"
+          action={isIndexOnly ? reindexAction : undefined}
+        >
+          {isIndexOnly
+            ? "This item has no saved chunk boundaries. Re-index it to compute them from its current text."
+            : "This document was indexed by an older version of PM, before it recorded chunk boundaries. Rebuild the index from the Documents tab (the “Rebuild” button) to add them."}
+        </ChunkStatusNote>
+        {isIndexOnly && reindexError && <p className="mb-3 text-xs text-st-due">{reindexError}</p>}
+        <Markdown>{body}</Markdown>
+      </>
+    );
+  }
+  // Aligned + has leaves → the real overlay (the global retrieval-staleness note rides above it).
+  return (
+    <>
+      {chunk.stale && <StaleNote />}
+      <ChunkOverlayView body={body} spans={spans} raw={chunk.raw} />
+    </>
+  );
+}
+
+/** A small framed note in place of the chunk overlay: a title, an optional explanation, and an
+ *  optional action (Re-index / Try again). */
+function ChunkStatusNote({
+  title,
+  children,
+  action,
+}: {
+  title: string;
+  children?: ReactNode;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="mb-3 rounded-[var(--radius-sm)] border border-border2 bg-surface px-3 py-2 text-xs text-ink3">
+      <p className="font-medium text-ink2">{title}</p>
+      {children && <p className="mt-1">{children}</p>}
+      {action && <div className="mt-2">{action}</div>}
+    </div>
+  );
+}
+
+function ReindexAction({ reindexing, onReindex }: { reindexing: boolean; onReindex: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onReindex}
+      disabled={reindexing}
+      className="rounded-[var(--radius-sm)] bg-accent px-2.5 py-1 text-xs text-accent-ink hover:brightness-110 disabled:opacity-50"
+    >
+      {reindexing ? "Re-indexing…" : "Re-index this item"}
+    </button>
+  );
+}
+
+function InlineAction({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="rounded-[var(--radius-sm)] border border-border px-2.5 py-1 text-xs text-ink2 hover:bg-surface"
+    >
+      {label}
+    </button>
+  );
 }
 
 /** Index-only reader: the live-fetched full body when the source is reachable (so it reads like any
@@ -319,19 +501,13 @@ function IndexOnlyBody({
   body,
   full,
   fallbackReason,
-  showChunks,
-  spans,
-  stale,
-  raw,
+  chunk,
 }: {
   doc: Document;
   body: string;
   full: boolean;
   fallbackReason: string | null;
-  showChunks: boolean;
-  spans: ChunkSpan[] | null;
-  stale: boolean;
-  raw: boolean;
+  chunk: ChunkPanel;
 }) {
   const isLocal = doc.source_id?.startsWith("local:") ?? false;
   return (
@@ -347,7 +523,7 @@ function IndexOnlyBody({
       )}
       {full ? (
         <div className="mt-3">
-          <BodyView body={body} showChunks={showChunks} spans={spans} stale={stale} raw={raw} />
+          <BodyView body={body} chunk={chunk} />
         </div>
       ) : (
         <>
@@ -378,34 +554,11 @@ function ChunkOverlayView({
   spans: ChunkSpan[];
   raw: boolean;
 }) {
-  const aligned = useMemo(() => offsetsAlignToBody(body, spans), [body, spans]);
-  const segments = useMemo(
-    () => (aligned ? segmentByLeaves(body, spans) : []),
-    [body, spans, aligned],
-  );
+  // Alignment + no-leaf handling now live upstream in `ChunkArea`, which only renders this once the
+  // stored offsets are known to index `body` exactly and there is at least one leaf to draw.
+  const segments = useMemo(() => segmentByLeaves(body, spans), [body, spans]);
   const shades = useMemo(() => shadeLeaves(segments), [segments]);
   const groupStarts = useMemo(() => parentGroupStarts(segments), [segments]);
-
-  // The stored offsets don't index this exact body (an index-only item re-embedded from its summary):
-  // render it plainly rather than paint boundaries in the wrong places.
-  if (!aligned) {
-    return (
-      <>
-        <div className="mb-3 rounded-[var(--radius-sm)] border border-border2 bg-surface px-3 py-2 text-xs text-ink3">
-          <p className="font-medium text-ink2">Chunk boundaries are not available for this copy.</p>
-          <p className="mt-1">
-            This document is indexed by pointer, so PM just fetched its current text live from the
-            source. The saved chunk map was built from the version PM indexed earlier, and the two
-            have drifted apart — the source changed since, or its index was last rebuilt from the
-            short summary PM keeps offline — so the highlights would land in the wrong places. PM
-            hides them here rather than mislead you; they return once the source is re-indexed from
-            the text shown above.
-          </p>
-        </div>
-        <Markdown>{body}</Markdown>
-      </>
-    );
-  }
 
   if (segments.length === 0) {
     return <p className="text-sm text-ink4">No chunk spans to display for this document.</p>;

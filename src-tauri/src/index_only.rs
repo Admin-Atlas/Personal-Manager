@@ -1133,6 +1133,23 @@ fn reembed_item(
     Ok(())
 }
 
+/// Force a fresh full-body re-embed of one index-only item — the reader's on-demand "Re-index".
+/// Unlike the change-driven [`react`]/[`apply_actions`] path this ignores the content-hash guard: the
+/// caller already holds the current live body and wants the stored chunk offsets rebuilt against it
+/// (e.g. after a rebuild-from-manifest left them indexing the ~500-char summary). The source's tracked
+/// content hash is preserved — the source itself did not change, only PM's stored map of it.
+pub fn reindex_pointer(
+    state: &AppState,
+    gateway: &ModelGateway<'_>,
+    input: &PointerInput,
+) -> Result<()> {
+    let source_hash = input
+        .source_content_hash
+        .clone()
+        .unwrap_or_else(|| ingest::hex_digest(input.body.trim().as_bytes()));
+    reembed_item(state, gateway, &input.source_id, &source_hash, input)
+}
+
 /// Set one index-only item's reachability state (`documents.source_state`).
 fn set_item_state(conn: &Connection, source_id: &str, state: SourceState) -> Result<()> {
     conn.execute(

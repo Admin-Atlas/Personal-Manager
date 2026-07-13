@@ -25,6 +25,7 @@ export const CHANGELOG: ChangelogEntry[] = [
       "You can now change a document’s project and importance after it’s been filed, straight from the Documents tab. Filed something in the wrong place, or want to raise its importance? Click “Edit” on its row and adjust — nothing is re-processed.",
       "In Review, you can now approve documents one at a time: each row has its own “Approve” button, so you can clear the ones you’re sure about without committing the whole list.",
       "Fixed a small annoyance in Review — choosing an importance no longer re-shuffles the list and scrolls you away from the item you were working on. It stays put.",
+      "When you preview how an indexed-only file (from a connected Drive/OneDrive/folder) was split into chunks, PM now shows the highlights correctly, or — if its saved breakdown is out of date — tells you plainly and offers a one-click “Re-index this item” to rebuild it, instead of a dead-end message.",
     ],
   },
   {

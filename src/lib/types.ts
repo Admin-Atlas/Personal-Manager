@@ -318,6 +318,15 @@ export interface ChunkSpan {
   end_offset: number | null;
 }
 
+/** The reader's live fetch of an index-only body plus whether the stored chunk offsets still index it
+ *  exactly (a content-hash identity match). When `aligned` is false the saved chunk map is stale
+ *  (e.g. rebuilt from the offline summary) and the overlay would land in the wrong places — the reader
+ *  offers a Re-index instead of drawing it. */
+export interface IndexOnlyFetch {
+  body: string;
+  aligned: boolean;
+}
+
 /** A decrypted image served to the reader as base64 + mime, for a `data:` URL (the asset protocol is off
  *  and a vault-saved original may be ciphertext). */
 export interface ImageData {
