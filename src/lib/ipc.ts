@@ -948,8 +948,14 @@ export const onBackupProgress = (handler: (e: BackupEvent) => void): Promise<Unl
   listen<BackupEvent>("backup://progress", (e) => handler(e.payload));
 
 /** Whether the official `proton-drive` CLI is installed (for backing up to Proton Drive). When it
- *  isn't, the Backup UI links `install_url` — PM does not download the CLI itself. */
+ *  isn't, the Backup UI links `install_url` — PM does not download the CLI itself. Probes a manual
+ *  override first, then PATH + well-known install/download dirs, so it can be re-called after the
+ *  user installs the CLI (no restart). */
 export const protonCliStatus = () => invoke<ProtonCliStatus>("proton_cli_status");
+
+/** Remember (or clear, with "") a manual path to the `proton-drive` binary, for when it lives
+ *  somewhere auto-detection doesn't look. Rejects a non-empty path that isn't an existing file. */
+export const setProtonCliPath = (path: string) => invoke<void>("set_proton_cli_path", { path });
 
 /** Whether the CLI has an active Proton session (+ the account email if available). */
 export const protonStatus = () => invoke<ProtonConnStatus>("proton_status");

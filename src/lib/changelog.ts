@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.3.1-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "Fixed the “Get the Proton Drive CLI” button, which had started leading to a missing page — it now opens Proton’s current guide.",
+      "PM finds the Proton Drive CLI more reliably now. It also looks where the download usually lands (like your Downloads folder); if you keep it somewhere else you can point PM straight at it with “Locate manually…”; and a “Check again” button — plus an automatic re-check when you return to the window — picks it up right after you install it, with no restart.",
+    ],
+  },
+  {
     version: "3.3.0-alpha",
     date: "2026-07-13",
     highlights: [

@@ -5556,11 +5556,23 @@ pub struct ProtonCliStatus {
     pub install_url: String,
 }
 
-/// Probe for an installed Proton Drive CLI (PATH + well-known per-OS install dirs). Cheap
-/// (a few `stat`s, no process spawn), so the Backup UI can call it on mount.
+/// The manual "Locate the CLI" override the user set in the Backup UI, if any and still valid — read
+/// from the store's settings. `None` when unset, when the store isn't open, or when the saved path no
+/// longer points at a file (a moved/deleted binary falls back to auto-detection rather than erroring).
+fn proton_cli_override(state: &AppState) -> Option<std::path::PathBuf> {
+    let conn = state.conn().ok()?;
+    let raw = crate::db::get_setting(&conn, crate::backup::proton::CLI_PATH_SETTING).ok()??;
+    let path = std::path::PathBuf::from(raw);
+    path.is_file().then_some(path)
+}
+
+/// Probe for the Proton Drive CLI — a manual override first, then PATH + well-known install and
+/// download dirs. Cheap (a few `stat`s, no process spawn), so the Backup UI can call it on mount and
+/// re-call it (a "Check again" button / on window focus) after the user installs it, no restart.
 #[tauri::command]
-pub fn proton_cli_status() -> ProtonCliStatus {
-    let located = crate::backup::proton::locate_proton_cli();
+pub fn proton_cli_status(state: State<'_, AppState>) -> ProtonCliStatus {
+    let override_path = proton_cli_override(&state);
+    let located = crate::backup::proton::locate_proton_cli(override_path.as_deref());
     ProtonCliStatus {
         installed: located.is_some(),
         path: located.map(|p| p.to_string_lossy().into_owned()),
@@ -5568,10 +5580,25 @@ pub fn proton_cli_status() -> ProtonCliStatus {
     }
 }
 
-/// Resolve the installed CLI or return a friendly "not installed" error (shared by every
-/// Proton command below).
-fn require_proton_cli() -> Result<std::path::PathBuf> {
-    crate::backup::proton::locate_proton_cli()
+/// Remember (or clear) a manual path to the `proton-drive` binary — the escape hatch for when the
+/// portable CLI lives somewhere auto-detection doesn't look. An empty string clears it; a non-empty
+/// path must point at an existing file, so the UI can flag a wrong pick immediately.
+#[tauri::command]
+pub fn set_proton_cli_path(state: State<'_, AppState>, path: String) -> Result<()> {
+    let conn = state.conn()?;
+    let trimmed = path.trim();
+    if !trimmed.is_empty() && !std::path::Path::new(trimmed).is_file() {
+        return Err(Error::Other(
+            "That path isn't a file — pick the proton-drive program itself.".into(),
+        ));
+    }
+    crate::db::set_setting(&conn, crate::backup::proton::CLI_PATH_SETTING, trimmed)
+}
+
+/// Resolve the CLI (honouring a manual override) or return a friendly "not installed" error (shared
+/// by every Proton command below).
+fn require_proton_cli(state: &AppState) -> Result<std::path::PathBuf> {
+    crate::backup::proton::locate_proton_cli(proton_cli_override(state).as_deref())
         .ok_or_else(|| Error::Other("the Proton Drive CLI is not installed".into()))
 }
 
@@ -5684,16 +5711,18 @@ pub fn forget_backup_passphrase(state: State<'_, AppState>) -> Result<()> {
 /// Sign in to Proton Drive — opens the browser and blocks until the flow completes. The
 /// session is stored and owned by the CLI (OS secret store); PM never sees Proton credentials.
 #[tauri::command]
-pub async fn proton_connect() -> Result<()> {
-    tokio::task::spawn_blocking(|| crate::backup::proton::connect(&require_proton_cli()?))
+pub async fn proton_connect(state: State<'_, AppState>) -> Result<()> {
+    let cli = require_proton_cli(&state)?;
+    tokio::task::spawn_blocking(move || crate::backup::proton::connect(&cli))
         .await
         .map_err(|e| Error::Other(format!("connect task panicked: {e}")))?
 }
 
 /// Sign out of Proton Drive (`auth logout`).
 #[tauri::command]
-pub async fn proton_disconnect() -> Result<()> {
-    tokio::task::spawn_blocking(|| crate::backup::proton::disconnect(&require_proton_cli()?))
+pub async fn proton_disconnect(state: State<'_, AppState>) -> Result<()> {
+    let cli = require_proton_cli(&state)?;
+    tokio::task::spawn_blocking(move || crate::backup::proton::disconnect(&cli))
         .await
         .map_err(|e| Error::Other(format!("disconnect task panicked: {e}")))?
 }
@@ -5701,16 +5730,22 @@ pub async fn proton_disconnect() -> Result<()> {
 /// Whether the CLI has an active Proton session (+ the account email if available). A clean
 /// "not signed in" is reported as `connected: false`, not an error.
 #[tauri::command]
-pub async fn proton_status() -> Result<crate::backup::proton::ProtonConnStatus> {
-    tokio::task::spawn_blocking(|| Ok(crate::backup::proton::connection(&require_proton_cli()?)))
+pub async fn proton_status(
+    state: State<'_, AppState>,
+) -> Result<crate::backup::proton::ProtonConnStatus> {
+    let cli = require_proton_cli(&state)?;
+    tokio::task::spawn_blocking(move || Ok(crate::backup::proton::connection(&cli)))
         .await
         .map_err(|e| Error::Other(format!("status task panicked: {e}")))?
 }
 
 /// List PM's encrypted archives already on Proton Drive (newest first), for the restore picker.
 #[tauri::command]
-pub async fn list_proton_backups() -> Result<Vec<crate::backup::naming::BackupEntry>> {
-    tokio::task::spawn_blocking(|| crate::backup::proton::list_archives(&require_proton_cli()?))
+pub async fn list_proton_backups(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::backup::naming::BackupEntry>> {
+    let cli = require_proton_cli(&state)?;
+    tokio::task::spawn_blocking(move || crate::backup::proton::list_archives(&cli))
         .await
         .map_err(|e| Error::Other(format!("list task panicked: {e}")))?
 }
@@ -5941,13 +5976,17 @@ pub(crate) async fn run_backup(
 /// Create an encrypted archive and push it to Proton Drive. Same portable format as a local
 /// backup; the temp file never leaves the machine unencrypted and is discarded after upload.
 #[tauri::command]
-pub async fn backup_to_proton(app: AppHandle, passphrase: String) -> Result<()> {
+pub async fn backup_to_proton(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    passphrase: String,
+) -> Result<()> {
     if passphrase.is_empty() {
         return Err(Error::Other("a backup passphrase is required".into()));
     }
     // M-4: strength floor before the archive (which embeds the raw DB key) leaves the machine.
     vault::kdf::validate_passphrase_strength(&passphrase)?;
-    let cli = require_proton_cli()?;
+    let cli = require_proton_cli(&state)?;
     run_backup(
         &app,
         passphrase,
@@ -5973,7 +6012,7 @@ pub async fn restore_from_proton(
     if passphrase.is_empty() {
         return Err(Error::Other("the backup passphrase is required".into()));
     }
-    let cli = require_proton_cli()?;
+    let cli = require_proton_cli(&state)?;
     let _busy = BusyGuard::acquire(&state.backup_busy)
         .ok_or_else(|| Error::Other("a backup or restore is already running".into()))?;
     state.backup_cancel.store(false, Ordering::SeqCst);
