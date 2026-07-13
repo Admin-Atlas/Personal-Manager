@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.5.0-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "You can now change a document’s project and importance after it’s been filed, straight from the Documents tab. Filed something in the wrong place, or want to raise its importance? Click “Edit” on its row and adjust — nothing is re-processed.",
+      "In Review, you can now approve documents one at a time: each row has its own “Approve” button, so you can clear the ones you’re sure about without committing the whole list.",
+      "Fixed a small annoyance in Review — choosing an importance no longer re-shuffles the list and scrolls you away from the item you were working on. It stays put.",
+    ],
+  },
+  {
     version: "3.4.0-alpha",
     date: "2026-07-13",
     highlights: [

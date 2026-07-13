@@ -392,8 +392,15 @@ function ChunkOverlayView({
     return (
       <>
         <div className="mb-3 rounded-[var(--radius-sm)] border border-border2 bg-surface px-3 py-2 text-xs text-ink3">
-          Chunk boundaries aren&apos;t available for this fetched copy — re-index this source to see
-          them.
+          <p className="font-medium text-ink2">Chunk boundaries are not available for this copy.</p>
+          <p className="mt-1">
+            This document is indexed by pointer, so PM just fetched its current text live from the
+            source. The saved chunk map was built from the version PM indexed earlier, and the two
+            have drifted apart — the source changed since, or its index was last rebuilt from the
+            short summary PM keeps offline — so the highlights would land in the wrong places. PM
+            hides them here rather than mislead you; they return once the source is re-indexed from
+            the text shown above.
+          </p>
         </div>
         <Markdown>{body}</Markdown>
       </>

@@ -11,10 +11,12 @@ import {
   ingestPaths,
   installOptionalOcr,
   listDocuments,
+  listProjects,
   onOcrInstall,
   optionalOcrStatus,
   promoteIndexOnly,
   rebuildIndex,
+  setDocumentMetadata,
   sidecarStatus,
   vaultStatus,
 } from "../lib/ipc";
@@ -22,12 +24,16 @@ import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/
 import { formatDate } from "../lib/format";
 import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
-import { useDepth } from "../theme";
-import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
+import { useDepth, useTheme } from "../theme";
+import { Button, Card, Collapsible, ConfirmDialog, Input } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
+import { ImportancePicker } from "./ImportancePicker";
 import { IngestProgress } from "./IngestProgress";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
 import { useReader } from "../lib/reader";
+
+// Datalist backing the inline-reclassify project field (existing project names for autocomplete).
+const RECLASSIFY_PROJECTS_LIST_ID = "documents-reclassify-projects";
 
 type ItemStatus = "working" | "done" | "skipped" | "failed";
 interface ProgressItem {
@@ -96,7 +102,22 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [devTitle, setDevTitle] = useState("");
   const [devBody, setDevBody] = useState("");
   const { showPower } = useDepth();
+  // Inline reclassify (issue #333) rides the same "show manual triage" switch as the Review/Teach
+  // tabs: when the user trusts the AI's filing and hides those, the per-row Edit affordance hides
+  // too (the table stays read-only).
+  const { teachVisible } = useTheme();
   const [sort, setSort] = useState<DocSort | null>(null);
+  // The row whose inline project/importance editor is open (one at a time). Both fields live in a
+  // single working draft so one Save writes the whole tuple at once — two independent optimistic
+  // saves (project onBlur + importance onChange) would race and silently drop one field, since a
+  // blur-then-click sends each with the other's stale value.
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState<{
+    project: string;
+    importance: Document["importance"];
+  }>({ project: "", importance: null });
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [projectNames, setProjectNames] = useState<string[]>([]);
   // Developer mode (issue #78): an in-place chunk inspector. Clicking a document's chunk count
   // (when devMode is on) expands its leaf/parent chunk breakdown, fetched read-only on demand.
   const { devMode } = useDevMode();
@@ -129,6 +150,26 @@ export function DocumentsView({ onReviewClick }: Props) {
       setError(String(e));
     } finally {
       setPromoting(null);
+    }
+  }
+
+  // Persist the open editor's project/importance for one already-filed document (issue #333) in a
+  // single write, then reflect it locally and close the editor. Tags pass through unchanged — this
+  // surface only re-files + re-rates; fuller tag editing stays in Review / a project's file list.
+  // A metadata edit rewrites front-matter only (no re-embed), reusing the `set_document_metadata`
+  // seam. An empty project field falls back to the document's current project (never blanks it).
+  async function saveMeta(doc: Document) {
+    const project = editDraft.project.trim() || doc.project;
+    setSavingEdit(true);
+    setError(null);
+    try {
+      const updated = await setDocumentMetadata(doc.id, project, doc.tags, editDraft.importance);
+      setDocuments((docs) => docs.map((d) => (d.id === updated.id ? updated : d)));
+      setEditingId(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingEdit(false);
     }
   }
 
@@ -176,6 +217,15 @@ export function DocumentsView({ onReviewClick }: Props) {
       .then(setStatus)
       .catch(() => {});
   }, []);
+
+  // Project names for the reclassify datalist — only fetched while the manual-triage controls
+  // can show, and re-fetched if the user turns them back on mid-session.
+  useEffect(() => {
+    if (!teachVisible) return;
+    listProjects()
+      .then(setProjectNames)
+      .catch(() => {});
+  }, [teachVisible]);
 
   useEffect(() => {
     if (status?.state === "error") {
@@ -489,6 +539,15 @@ export function DocumentsView({ onReviewClick }: Props) {
 
   return (
     <div className="flex h-full flex-col">
+      {/* Project-name autocomplete for the inline reclassify editor (issue #333); rendered once,
+          referenced by each row's editor via `list=`. Position is irrelevant for a datalist. */}
+      {teachVisible && (
+        <datalist id={RECLASSIFY_PROJECTS_LIST_ID}>
+          {projectNames.map((name) => (
+            <option key={name} value={name} />
+          ))}
+        </datalist>
+      )}
       <header className="flex items-center justify-between border-b border-border px-6 py-3">
         <div>
           <h1 className="font-head text-sm font-semibold text-ink">Documents</h1>
@@ -800,6 +859,28 @@ export function DocumentsView({ onReviewClick }: Props) {
                               {doc.title}
                             </div>
                             {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
+                            {teachVisible && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (editingId === doc.id) {
+                                    setEditingId(null);
+                                  } else {
+                                    setEditDraft({
+                                      project: doc.project,
+                                      importance: doc.importance,
+                                    });
+                                    setEditingId(doc.id);
+                                  }
+                                }}
+                                className="shrink-0 text-xs text-ink4 hover:text-accent-text"
+                                title="Change project or importance"
+                                aria-expanded={editingId === doc.id}
+                              >
+                                {editingId === doc.id ? "Close" : "Edit"}
+                              </button>
+                            )}
                           </div>
                           {doc.source_type === "index_only" ? (
                             // Row-level buttons stop propagation so they don't also open the reader.
@@ -882,6 +963,59 @@ export function DocumentsView({ onReviewClick }: Props) {
                               ) : (
                                 <p className="text-xs text-ink4">Loading…</p>
                               )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      {/* Inline reclassify (issue #333): project + importance for an already-filed
+                          document, expanded under its row. One Save writes both at once (no racy
+                          per-field optimistic saves). Tags stay out of this surface. */}
+                      {teachVisible && editingId === doc.id && (
+                        <tr>
+                          <td colSpan={showPower ? 5 : 4} className="pb-3">
+                            <div className="flex flex-col gap-2 rounded-[var(--radius-sm)] border border-border bg-surface p-3">
+                              <label className="flex items-center gap-2 text-xs text-ink3">
+                                <span className="w-20 shrink-0">Project</span>
+                                <Input
+                                  autoFocus
+                                  list={RECLASSIFY_PROJECTS_LIST_ID}
+                                  value={editDraft.project}
+                                  onChange={(e) =>
+                                    setEditDraft((d) => ({ ...d, project: e.target.value }))
+                                  }
+                                  className="h-7 max-w-xs flex-1 text-xs"
+                                />
+                              </label>
+                              <div className="flex items-center gap-2 text-xs text-ink3">
+                                <span className="w-20 shrink-0">Importance</span>
+                                <ImportancePicker
+                                  value={editDraft.importance}
+                                  onChange={(importance) =>
+                                    setEditDraft((d) => ({ ...d, importance }))
+                                  }
+                                />
+                              </div>
+                              <div className="flex justify-end gap-2 pt-1">
+                                <Button
+                                  variant="tertiary"
+                                  onClick={() => setEditingId(null)}
+                                  className="px-2 py-1 text-xs"
+                                >
+                                  Cancel
+                                </Button>
+                                <Button
+                                  variant="primary"
+                                  onClick={() => void saveMeta(doc)}
+                                  disabled={
+                                    savingEdit ||
+                                    (editDraft.project.trim() === doc.project &&
+                                      editDraft.importance === doc.importance)
+                                  }
+                                  className="px-2 py-1 text-xs"
+                                >
+                                  {savingEdit ? "Saving…" : "Save"}
+                                </Button>
+                              </div>
                             </div>
                           </td>
                         </tr>
