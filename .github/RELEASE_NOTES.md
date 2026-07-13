@@ -1,4 +1,4 @@
-PM desktop release — **v3.0.0-alpha**.
+PM desktop release — **v3.6.2-alpha**.
 
 ## Install
 
@@ -6,6 +6,9 @@ PM desktop release — **v3.0.0-alpha**.
 
 🪟 **Windows** — download the file ending in **`-setup.exe`** and run it.
 🍎 **macOS** — download the **`.dmg`** file, then drag **PM** to **Applications**.
+🐧 **Linux (x86_64)** — download the **`.AppImage`**, make it executable (`chmod +x`) and
+run it; it auto-updates like the others. On Fedora-family systems you can instead install
+the **`.rpm`** with `dnf` and update it later with `dnf upgrade`.
 
 That's it. PM is **self-contained** — everything it needs (including a private Python
 runtime for the document features) is inside that one file. Nothing else to install.
@@ -37,41 +40,33 @@ unsigned): download the `.dmg` above and drag **PM** to **Applications** again, 
 **Replace** when asked. Everything you have is kept — just replace the old copy rather
 than keeping two around.
 
-## What's new in 3.0.0-alpha
+**🐧 Linux.** The **AppImage** updates itself exactly like the Windows app. If you
+installed the **`.rpm`**, update it with your package manager (`dnf upgrade`) when a new
+release lands.
 
-This release rolls up everything since v2.1.2 — here's the tour at a glance:
+## What's new in 3.6.2-alpha
 
-- **Connect your clouds.** Google Drive and OneDrive are indexed in place: what's in
-  them turns up in your search, and nothing is copied out of your drive.
-- **Watch folders on this computer.** Point PM at a folder and it keeps itself current
-  as you work — an edit is searchable within seconds.
-- **A real calendar.** Google (several accounts), Outlook and iCal subscriptions
-  together, in Month, Week, Day, Year and Agenda views.
-- **Chats are part of your memory.** Past conversations become searchable, answers cite
-  the exact turn they drew from, chats name themselves, and each project keeps its own.
-- **A briefing that tracks instead of narrates.** Deadlines, today's events and
-  prep-ahead nudges are real items you can mark done — or just tell it "the deck is
-  done" in plain words.
-- **Projects with real milestones.** Several dated deadlines per project, priorities you
-  set (or PM infers for projects other work waits on), and a sortable Focus view.
-- **Encrypted backups.** Your whole vault in one passphrase-protected file, on demand or
-  on a schedule, to your own Proton Drive or Google Drive.
-- **A map of your knowledge.** Your documents arranged by meaning on a fast, navigable
-  canvas.
-- **A built-in reader.** Click any document — or any source a chat answer cites — and
-  read it right there; cloud items fetch their full text on demand.
-- **Photos and spreadsheets, done properly.** Screenshots read with on-device text
-  recognition; spreadsheets indexed row by row, with one-click full import for Google
-  Sheets.
-- **A Pinboard that keeps up.** Notes with real formatting, timelines linked to real
-  projects, and one-click ingest of a note into your vault.
-- **Teach PM your world.** Merge and rename project names for good, and keep structured
-  preferences that PM applies exactly where they fit.
-- **Sharper search.** Structure-aware chunking, a re-ranking second pass, multilingual
-  vaults, and proper Chinese/Japanese/Korean keyword search.
-- **Quality of life.** A calm new monochrome look with a sun-following Auto mode, a
-  Storage tab to reclaim space, one-click Mac setup, a tidy uninstall, and a read-only
-  Developer mode for the curious.
+This release rolls up everything since v3.0.2 — here's the tour at a glance:
+
+- **Share your vault across Windows accounts.** On a PC with more than one account, a
+  single guided flow moves your vault somewhere every account can reach, lets you pick who
+  may open it, and the other account joins from one screen by typing the passphrase.
+  Anything already on that account is kept safely aside, never deleted.
+- **PM runs on Linux now.** An auto-updating AppImage (the recommended install) and an rpm
+  for Fedora-family systems — both self-contained, built and signed by the same pipeline as
+  Windows and macOS.
+- **Index a folder but skip parts of it.** When you choose what to index from a Google
+  Drive, OneDrive, or a folder on this computer, uncheck any subfolder to leave it — and
+  everything inside it — out. Handy for a big archive or a noisy downloads folder.
+- **Quiet calendars.** Mark a calendar "Quiet" and it still shows on your Calendar tab, but
+  its events stay out of the daily briefing, "due soon" reminders, and chat.
+- **Tidy up after filing.** Change a document's project or importance once it's already
+  filed, and clear a review one document at a time instead of all at once.
+- **Sturdier and safer.** "Remove PM data" can no longer leave you stuck on a vault that
+  won't open, the "couldn't open your vault" screen has a clear way forward, and finding
+  the Proton Drive CLI for encrypted backups is far more reliable.
+- **Under the hood.** Linux keychain support, safer release tooling, and refreshed build
+  dependencies.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
@@ -80,7 +75,7 @@ sidebar for the release-by-release detail.
 
 ## Third-party
 
-Windows builds bundle a relocatable **CPython** runtime from
+Windows and Linux builds bundle a relocatable **CPython** runtime from
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) for the
 document features. Python is distributed under the PSF License Agreement; the licence text
 ships with the runtime inside the app (`python/LICENSE.txt`). PM's own third-party Rust

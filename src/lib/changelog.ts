@@ -19,6 +19,19 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.6.2-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "PM 3.6.2 rolls up everything since the last release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
+      "Share your vault across Windows accounts on this PC — one guided flow moves the vault somewhere every account can reach, you pick who may open it from a list, and the other account joins from a single screen by typing the passphrase. Whatever was already on that account is kept safely aside, never deleted.",
+      "PM now runs on Linux (x86_64) — an auto-updating AppImage (the recommended install) and an rpm for Fedora-family systems, both self-contained and built by the same signed pipeline as Windows and macOS.",
+      "Index a folder but skip parts of it — when you choose what to index from a Google Drive, OneDrive, or a folder on this computer, uncheck any subfolder to leave it (and everything inside) out. Handy for a big archive or a noisy downloads folder.",
+      "Mark a calendar as “Quiet” — it still shows on your Calendar tab, but its events stay out of everything PM brings to your attention: the daily briefing, “due soon” reminders, and chat.",
+      "Tidy up after filing — change a document's project or importance once it's already filed, straight from the Documents tab, and clear a review one document at a time instead of committing the whole list.",
+      "Sturdier and safer — “Remove PM data” can no longer leave you stuck on a vault that won't open, the “couldn't open your vault” screen now has a way forward, and finding the Proton Drive CLI for encrypted backups is far more reliable. Plus under-the-hood work: Linux keychain support, safer release tooling, and refreshed build dependencies.",
+    ],
+  },
+  {
     version: "3.6.1-alpha",
     date: "2026-07-13",
     highlights: [
