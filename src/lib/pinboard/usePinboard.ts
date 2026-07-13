@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getPref, setPref } from "../ipc";
-import { clampRect, COLS, findFreeRect, ROWS } from "./grid";
+import { clampRect, COLS, dissolveFolders, findFreeRect, minSize, resolveDrop, ROWS } from "./grid";
 import {
   BOARD_VERSION,
   EMPTY_BOARD,
@@ -39,15 +39,39 @@ function makeId(): string {
 function isValidWidget(w: unknown): w is Widget {
   if (!w || typeof w !== "object") return false;
   const x = w as Record<string, unknown>;
-  if (typeof x.id !== "string" || (x.kind !== "note" && x.kind !== "timeline")) return false;
+  if (typeof x.id !== "string") return false;
+  if (x.kind !== "note" && x.kind !== "timeline" && x.kind !== "folder") return false;
   const r = x.rect as Record<string, unknown> | undefined;
-  return (
+  const rectOk =
     !!r &&
     typeof r.x === "number" &&
     typeof r.y === "number" &&
     typeof r.w === "number" &&
-    typeof r.h === "number"
-  );
+    typeof r.h === "number";
+  if (!rectOk) return false;
+  if (x.kind === "folder") {
+    // Children must be an array of valid, NON-folder widgets (folders never nest). A single
+    // malformed child fails the whole folder rather than white-screening the app on render —
+    // there's no error boundary, and the view dereferences child fields unconditionally.
+    return (
+      Array.isArray(x.children) &&
+      x.children.every((c) => isValidWidget(c) && (c as Widget).kind !== "folder")
+    );
+  }
+  return true;
+}
+
+/** Apply `fn` to the widget with `id` wherever it lives — top-level or a folder child. Folders
+ *  never nest, so a depth-1 walk reaches everything, and note/timeline mutators keep working
+ *  unchanged whether the target is on the board or inside an open folder. */
+function mapWidget(widgets: Widget[], id: string, fn: (w: Widget) => Widget): Widget[] {
+  return widgets.map((w) => {
+    if (w.id === id) return fn(w);
+    if (w.kind === "folder" && w.children?.some((c) => c.id === id)) {
+      return { ...w, children: w.children.map((c) => (c.id === id ? fn(c) : c)) };
+    }
+    return w;
+  });
 }
 
 /** A generous absolute cap (cells) so a corrupt/hand-edited pref can't blow the board up to a
@@ -73,8 +97,20 @@ function parseBoard(raw: string | null, cols: number, rows: number): Board {
       boundCols = Math.max(boundCols, Math.min(w.rect.x + w.rect.w, MAX_BOARD_CELLS));
       boundRows = Math.max(boundRows, Math.min(w.rect.y + w.rect.h, MAX_BOARD_CELLS));
     }
-    const widgets = valid.map((w) => ({ ...w, rect: clampRect(w.rect, boundCols, boundRows) }));
-    return { version: BOARD_VERSION, widgets };
+    const widgets = valid.map((w) => {
+      const rect = clampRect(w.rect, boundCols, boundRows, minSize(w.kind));
+      if (w.kind === "folder") {
+        // Clamp children too (kind-aware), so a folder authored elsewhere renders cleanly.
+        const children = (w.children ?? []).map((c) => ({
+          ...c,
+          rect: clampRect(c.rect, boundCols, boundRows, minSize(c.kind)),
+        }));
+        return { ...w, rect, children };
+      }
+      return { ...w, rect };
+    });
+    // Heal any folder a corrupt/hand-edited pref left with ≤1 child.
+    return { version: BOARD_VERSION, widgets: dissolveFolders(widgets, boundCols, boundRows) };
   } catch {
     return EMPTY_BOARD;
   }
@@ -148,18 +184,17 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
   const addTimeline = useCallback(() => {
     setBoard((b) => {
       const rect = findFreeRect(b.widgets, 9, 8, boundsRef.current.cols, boundsRef.current.rows);
-      const widget: Widget = { id: makeId(), kind: "timeline", rect, title: "Timeline", items: [] };
+      // Seed an empty title so the header shows its "Timeline" placeholder (matching notes/folders).
+      const widget: Widget = { id: makeId(), kind: "timeline", rect, title: "", items: [] };
       return { ...b, widgets: [...b.widgets, widget] };
     });
   }, []);
 
   const updateWidget = useCallback((id: string, patch: Partial<Widget>) => {
-    setBoard((b) => ({
-      ...b,
-      widgets: b.widgets.map((w) => (w.id === id ? { ...w, ...patch } : w)),
-    }));
+    setBoard((b) => ({ ...b, widgets: mapWidget(b.widgets, id, (w) => ({ ...w, ...patch })) }));
   }, []);
 
+  /** Reposition a widget (used by resize; move gestures go through {@link dropWidget}). */
   const moveWidget = useCallback((id: string, rect: Rect) => {
     setBoard((b) => ({
       ...b,
@@ -167,8 +202,70 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     }));
   }, []);
 
+  /** Commit a MOVE drop: may merge two identically-placed widgets into a folder, drop a widget into
+   *  an overlapped folder, or just reposition (see {@link resolveDrop}). */
+  const dropWidget = useCallback((id: string, rect: Rect) => {
+    setBoard((b) => ({
+      ...b,
+      widgets: resolveDrop(
+        b.widgets,
+        id,
+        rect,
+        boundsRef.current.cols,
+        boundsRef.current.rows,
+        makeId,
+      ),
+    }));
+  }, []);
+
   const removeWidget = useCallback((id: string) => {
-    setBoard((b) => ({ ...b, widgets: b.widgets.filter((w) => w.id !== id) }));
+    setBoard((b) => {
+      const top = b.widgets.find((w) => w.id === id);
+      if (top) {
+        // A top-level FOLDER ungroups (spill its children back onto the board — non-destructive, so
+        // deleting a tile never nukes the user's notes); a note/timeline is deleted outright.
+        if (top.kind === "folder") {
+          const { cols, rows } = boundsRef.current;
+          let others = b.widgets.filter((w) => w.id !== id);
+          for (const child of top.children ?? []) {
+            const rect = findFreeRect(others, child.rect.w, child.rect.h, cols, rows);
+            others = [...others, { ...child, rect }];
+          }
+          return { ...b, widgets: others };
+        }
+        return { ...b, widgets: b.widgets.filter((w) => w.id !== id) };
+      }
+      // A folder CHILD: remove it from its parent, then auto-dissolve if the folder is now ≤1.
+      const widgets = b.widgets.map((w) =>
+        w.kind === "folder" && w.children?.some((c) => c.id === id)
+          ? { ...w, children: (w.children ?? []).filter((c) => c.id !== id) }
+          : w,
+      );
+      return {
+        ...b,
+        widgets: dissolveFolders(widgets, boundsRef.current.cols, boundsRef.current.rows),
+      };
+    });
+  }, []);
+
+  /** Pull a child out of a folder back onto the board — at `rect` when dragged there, else a free
+   *  slot. Releasing it back over a folder re-files it; the source folder auto-dissolves if drained. */
+  const popOutChild = useCallback((folderId: string, childId: string, rect?: Rect) => {
+    setBoard((b) => {
+      const { cols, rows } = boundsRef.current;
+      const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
+      const child = folder?.children?.find((c) => c.id === childId);
+      if (!folder || !child) return b;
+      const remaining = (folder.children ?? []).filter((c) => c.id !== childId);
+      const landing = rect
+        ? clampRect(rect, cols, rows, minSize(child.kind))
+        : findFreeRect(b.widgets, child.rect.w, child.rect.h, cols, rows);
+      let ws = b.widgets.map((w) => (w.id === folderId ? { ...w, children: remaining } : w));
+      ws = [...ws, { ...child, rect: landing }];
+      ws = resolveDrop(ws, child.id, landing, cols, rows, makeId); // dropped onto a folder → re-file
+      ws = dissolveFolders(ws, cols, rows); // source folder may now be ≤1 child
+      return { ...b, widgets: ws };
+    });
   }, []);
 
   /** Move a widget to the end of the list (= painted on top) when it's interacted with. */
@@ -185,9 +282,7 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     const item: TimelineItem = { id: makeId(), date: "", label: "" };
     setBoard((b) => ({
       ...b,
-      widgets: b.widgets.map((w) =>
-        w.id === id ? { ...w, items: [...(w.items ?? []), item] } : w,
-      ),
+      widgets: mapWidget(b.widgets, id, (w) => ({ ...w, items: [...(w.items ?? []), item] })),
     }));
   }, []);
 
@@ -195,14 +290,10 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     (id: string, itemId: string, patch: Partial<TimelineItem>) => {
       setBoard((b) => ({
         ...b,
-        widgets: b.widgets.map((w) =>
-          w.id === id
-            ? {
-                ...w,
-                items: (w.items ?? []).map((it) => (it.id === itemId ? { ...it, ...patch } : it)),
-              }
-            : w,
-        ),
+        widgets: mapWidget(b.widgets, id, (w) => ({
+          ...w,
+          items: (w.items ?? []).map((it) => (it.id === itemId ? { ...it, ...patch } : it)),
+        })),
       }));
     },
     [],
@@ -211,9 +302,10 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
   const removeTimelineItem = useCallback((id: string, itemId: string) => {
     setBoard((b) => ({
       ...b,
-      widgets: b.widgets.map((w) =>
-        w.id === id ? { ...w, items: (w.items ?? []).filter((it) => it.id !== itemId) } : w,
-      ),
+      widgets: mapWidget(b.widgets, id, (w) => ({
+        ...w,
+        items: (w.items ?? []).filter((it) => it.id !== itemId),
+      })),
     }));
   }, []);
 
@@ -223,8 +315,10 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     addTimeline,
     updateWidget,
     moveWidget,
+    dropWidget,
     removeWidget,
     raiseWidget,
+    popOutChild,
     addTimelineItem,
     updateTimelineItem,
     removeTimelineItem,

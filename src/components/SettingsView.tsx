@@ -57,6 +57,7 @@ import {
   useTheme,
   useDepth,
   ACCENTS,
+  accentName,
   MONO_ACCENT,
   EIGENGRAU,
   deviceCoords,
@@ -712,9 +713,21 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       value={system}
                       onChange={setSystem}
                       options={[
-                        { value: "editorial", label: "Editorial" },
-                        { value: "slate", label: "Slate" },
-                        { value: "terminal", label: "Terminal" },
+                        {
+                          value: "editorial",
+                          label: "Editorial",
+                          title: "Editorial — serif headings, warm paper tones",
+                        },
+                        {
+                          value: "slate",
+                          label: "Slate",
+                          title: "Slate — clean sans, cool neutrals (default)",
+                        },
+                        {
+                          value: "terminal",
+                          label: "Terminal",
+                          title: "Terminal — monospace, high contrast",
+                        },
                       ]}
                     />
                   </div>
@@ -825,15 +838,14 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     <div className="flex items-center gap-1.5">
                       {ACCENTS[system].map((hex) => {
                         const isMono = hex === MONO_ACCENT;
+                        const name = accentName(hex);
                         return (
                           <button
                             key={hex}
                             type="button"
-                            aria-label={isMono ? "Monochrome (Eigengrau)" : `Accent ${hex}`}
+                            aria-label={isMono ? "Monochrome (Eigengrau)" : `Accent: ${name}`}
                             title={
-                              isMono
-                                ? "Monochrome — Eigengrau base, white text & accents"
-                                : undefined
+                              isMono ? "Monochrome — Eigengrau base, white text & accents" : name
                             }
                             onClick={() => setAccent(hex)}
                             style={{

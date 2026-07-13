@@ -6,7 +6,7 @@
  *  truth and needs no encryption). All geometry is in **grid cells**, not pixels, so the
  *  board renders crisply at any cell size. */
 
-export type WidgetKind = "note" | "timeline";
+export type WidgetKind = "note" | "timeline" | "folder";
 
 /** A widget's position and size, in grid cells (top-left origin). */
 export interface Rect {
@@ -37,14 +37,26 @@ export interface Widget {
   /** A cheap client-side hash of the note text at last ingest, so the UI can offer "re-ingest
    *  edits" when the text has since changed. Not the backend content hash. */
   ingestedHash?: string;
-  // timeline
+  /** A short user label shown (and edited) in the widget's top bar. Originally timeline-only;
+   *  now the shared title for every kind (note / timeline / folder). Empty → the header shows a
+   *  kind placeholder. Optional and additive, so old boards parse unchanged. */
   title?: string;
+  // timeline
   items?: TimelineItem[];
   /** When set, a timeline widget is *bound* to this project: it shows and edits that project's
    *  real milestones (backend `project_milestones`) instead of the freeform `items` above, so
    *  changes flow to the daily brief and the project's Focus/sidebar. Unset → freeform (default).
    *  Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1. */
   project?: string;
+  // folder (kind === "folder")
+  /** The widgets contained by a folder. Notes and timelines only — folders never nest (enforced
+   *  on drop and on load). A collapsed folder shows the child count; expanding reveals the cards.
+   *  Additive, so old boards (which have none) parse unchanged and `BOARD_VERSION` stays 1. */
+  children?: Widget[];
+  /** How an opened folder is presented, persisted per-folder. Default `"inline"` (an in-place
+   *  panel); `"overlay"` opens a centred modal. Whether the folder is *currently* expanded is
+   *  transient UI state and is deliberately NOT stored here. */
+  expandMode?: "inline" | "overlay";
 }
 
 export interface Board {
