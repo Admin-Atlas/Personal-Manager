@@ -260,6 +260,8 @@ fn remove_vault_artifacts(resolved: &vault::ResolvedVault, data_dir: &Path) -> u
         remove_empty_dir_retrying(&resolved.vault_root);
     }
     let _ = vault::pointer::clear(data_dir);
+    // The rejoin breadcrumb goes too — "remove the vault" means every trace of it.
+    let _ = vault::pointer::clear_retired(data_dir);
     // Restore staging: full, DECRYPTABLE vault copies left by every inspected restore. PM owns this
     // whole tree (each `restore-*` is a PM-chosen path under the data dir), so it's safe to remove
     // wholesale — leaving decryptable copies behind after "remove the vault" would be a footgun.
@@ -449,8 +451,23 @@ pub async fn wipe_pm_data(
     //        can never orphan an unreadable store. Delete the DB FILE first and reliably; abort if
     //        it can't be removed, before any irreversible key deletion. ---
     if selection.vault_and_db || selection.keychain {
-        let resolved = vault::resolve(&app)?;
         let data_dir = paths::data_dir(&app)?;
+        // Never delete a vault this profile only POINTS at (a joined/shared vault): the folder
+        // belongs to every account that uses it, and `vault::resolve` follows the pointer — so
+        // an unguarded wipe here would destroy the shared store for ALL of them from any one
+        // account's "Remove PM data". Wipe THIS account's local state instead: the store and
+        // artifacts at the DEFAULT location (a joiner's set-aside vault, or nothing), both
+        // pointers, staging, journal + backup. The shared folder is left untouched; deleting
+        // it for everyone is a deliberate, separately-confirmed action, never a side effect.
+        // (Mirrors the reset_after_open_error guard below, which predates this one.)
+        let pointed = vault::pointer::load(&data_dir).ok().flatten().is_some();
+        let resolved = if pointed {
+            let _ = state.take_conn();
+            let _ = state.clear_vault_runtime();
+            vault::resolve_layout(&data_dir, None)
+        } else {
+            vault::resolve(&app)?
+        };
 
         // Size the user data before removing it (DB file + Markdown tree).
         report.freed_bytes += std::fs::metadata(&resolved.db_path)
@@ -476,7 +493,11 @@ pub async fn wipe_pm_data(
         // The DB file is confirmed gone; now the rest of the vault artifacts.
         report.freed_bytes += remove_vault_artifacts(&resolved, &data_dir);
 
-        report.removed.push("Vault & encrypted database".into());
+        report.removed.push(if pointed {
+            "This account's PM data (the shared vault folder was left untouched)".into()
+        } else {
+            "Vault & encrypted database".into()
+        });
         report.quit_required = true;
     }
 
@@ -522,6 +543,28 @@ fn is_genuine_brick(boot_error: &str) -> bool {
     boot_error.contains(crate::db::WRONG_KEY_OR_CORRUPT_MSG)
 }
 
+/// Why a "start fresh" reset must be refused for this fault, or `None` when the reset may
+/// proceed. Pure, so both safety gates are unit-tested together: an access-DENIED vault is
+/// NEVER a brick — the data is intact behind a permissions problem, whatever the message
+/// text says — and a transient lock/disk blip may clear on its own. Only the deterministic
+/// wrong-key / corrupt-file failure passes.
+fn reset_refusal(fault: &crate::error::VaultFault) -> Option<&'static str> {
+    if fault.code == crate::error::VaultFaultCode::Denied {
+        return Some(
+            "Windows is refusing access to the vault — the vault itself isn't broken, and \
+             nothing needs deleting. Use Repair access (Settings → Vault) instead.",
+        );
+    }
+    if !is_genuine_brick(&fault.message) {
+        return Some(
+            "The vault file looks momentarily unavailable — often antivirus or Windows Search \
+             holding it — rather than broken. Close this and choose \"Try again\"; it should \
+             open once the file is free.",
+        );
+    }
+    None
+}
+
 /// Recover from a boot-time vault-open failure by deleting the unreadable store and starting fresh.
 /// This is the escape hatch behind the VaultOpenError screen's "Start fresh": a Device vault whose
 /// key was lost (e.g. an interrupted "Remove PM data", or the historical delete-key-before-file bug)
@@ -538,25 +581,15 @@ fn is_genuine_brick(boot_error: &str) -> bool {
 /// left untouched — the regenerated DB key simply becomes the key for the new empty store.
 #[tauri::command]
 pub fn reset_after_open_error(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
-    let boot_error = state
-        .boot_open_error
-        .lock()
-        .map_err(|_| Error::Other("boot-error lock poisoned".into()))?
-        .clone();
-    let Some(msg) = boot_error else {
+    let Some(fault) = state.vault_fault() else {
         return Err(Error::Other(
             "The vault opened normally — there's nothing to reset.".into(),
         ));
     };
-    if !is_genuine_brick(&msg) {
-        // A transient lock / disk-I/O error, not a broken store — never delete a vault that may
-        // still open once the file is free.
-        return Err(Error::Other(
-            "The vault file looks momentarily unavailable — often antivirus or Windows Search \
-             holding it — rather than broken. Close this and choose \"Try again\"; it should open \
-             once the file is free."
-                .into(),
-        ));
+    // The pure gate: denied is never a brick, transient hiccups get "Try again" — only the
+    // deterministic wrong-key / corrupt-file failure may delete anything.
+    if let Some(refusal) = reset_refusal(&fault) {
+        return Err(Error::Other(refusal.into()));
     }
 
     let data_dir = paths::data_dir(&app)?;
@@ -584,9 +617,7 @@ pub fn reset_after_open_error(app: AppHandle, state: State<'_, AppState>) -> Res
         ));
     }
     remove_vault_artifacts(&resolved, &data_dir);
-    if let Ok(mut guard) = state.boot_open_error.lock() {
-        *guard = None;
-    }
+    state.set_vault_fault(None);
     Ok(())
 }
 
@@ -740,6 +771,39 @@ mod tests {
     }
 
     // --- "Start fresh" may delete ONLY a genuine brick, never a transiently-locked healthy vault ---
+
+    fn fault_with(code: crate::error::VaultFaultCode, message: &str) -> crate::error::VaultFault {
+        crate::error::VaultFault {
+            code,
+            op: "open the vault".into(),
+            path: None,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn a_denied_vault_never_arms_the_reset() {
+        // The ACL-lockout pin: an access-DENIED vault is intact data behind a permissions
+        // problem — "Start fresh" must refuse EVEN IF the message happens to contain the
+        // genuine-brick literal (belt-and-braces against message drift).
+        let denied = fault_with(
+            crate::error::VaultFaultCode::Denied,
+            crate::db::WRONG_KEY_OR_CORRUPT_MSG,
+        );
+        assert!(reset_refusal(&denied).unwrap().contains("Repair access"));
+        // A transient hiccup keeps its "Try again" refusal…
+        let transient = fault_with(
+            crate::error::VaultFaultCode::Other,
+            "the database is in use by another program",
+        );
+        assert!(reset_refusal(&transient).unwrap().contains("Try again"));
+        // …and only the deterministic brick passes.
+        let brick = fault_with(
+            crate::error::VaultFaultCode::Other,
+            crate::db::WRONG_KEY_OR_CORRUPT_MSG,
+        );
+        assert_eq!(reset_refusal(&brick), None);
+    }
 
     #[test]
     fn only_a_genuine_brick_arms_the_reset() {

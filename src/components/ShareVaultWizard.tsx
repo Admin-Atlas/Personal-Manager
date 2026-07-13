@@ -20,10 +20,12 @@ import {
   listLocalAccounts,
   moveVault,
   suggestSharedVaultLocation,
+  vaultFaultOf,
 } from "../lib/ipc";
 import type { LocalAccount, PassphraseScore, VaultStatus } from "../lib/types";
 import { Button, Card, Collapsible, Input, Modal } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
+import { RepairAccessButton } from "./VaultRecovery";
 
 type Step = "passphrase" | "location" | "accounts" | "done";
 
@@ -36,8 +38,11 @@ interface Props {
   onChanged: () => void | Promise<void>;
 }
 
-/** Per-account link state on the accounts step. */
-type LinkState = { kind: "linked" } | { kind: "error"; message: string };
+/** Per-account link state on the accounts step. `denied` is the folder itself refusing
+ *  THIS account (the owner-lockout moment, not a per-account grant problem) — it gets
+ *  the repair treatment instead of an inert error line. */
+type LinkState =
+  { kind: "linked" } | { kind: "error"; message: string } | { kind: "denied"; message: string };
 
 export function ShareVaultWizard({ open, onClose, status, onChanged }: Props) {
   const stepTitles: Record<Step, string> = {
@@ -152,7 +157,22 @@ export function ShareVaultWizard({ open, onClose, status, onChanged }: Props) {
       setLinkStates((s) => ({ ...s, [key]: { kind: "linked" } }));
       setLinkedAny(true);
     } catch (e) {
-      setLinkStates((s) => ({ ...s, [key]: { kind: "error", message: String(e) } }));
+      // The folder itself refusing THIS account is not a per-account grant failure — it
+      // means the move-time lockdown went wrong and the owner is on the way to being
+      // locked out (issue #343). Say so and offer the repair right here.
+      const fault = vaultFaultOf(e);
+      setLinkStates((s) => ({
+        ...s,
+        [key]:
+          fault?.code === "denied"
+            ? {
+                kind: "denied",
+                message:
+                  "PM just lost access to the shared folder itself — its permissions went " +
+                  "wrong during the move. Repair access, then add accounts again.",
+              }
+            : { kind: "error", message: String(e) },
+      }));
     } finally {
       setBusy(false);
     }
@@ -268,8 +288,17 @@ export function ShareVaultWizard({ open, onClose, status, onChanged }: Props) {
                     >
                       <div className="min-w-0">
                         <p className="truncate text-sm text-ink2">{a.name}</p>
-                        {state?.kind === "error" && (
+                        {(state?.kind === "error" || state?.kind === "denied") && (
                           <p className="break-all text-xs text-st-due">{state.message}</p>
+                        )}
+                        {state?.kind === "denied" && (
+                          <div className="mt-2">
+                            <RepairAccessButton
+                              path={location}
+                              onRepaired={() => setLinkStates({})}
+                              variant="secondary"
+                            />
+                          </div>
                         )}
                       </div>
                       <Button
@@ -321,10 +350,21 @@ export function ShareVaultWizard({ open, onClose, status, onChanged }: Props) {
                   Object.entries(linkStates)
                     .filter(([key]) => !accounts.some((a) => a.sid === key))
                     .map(([key, state]) =>
-                      state.kind === "error" ? (
-                        <p key={key} className="break-all text-xs text-st-due">
-                          {key}: {state.message}
-                        </p>
+                      state.kind === "error" || state.kind === "denied" ? (
+                        <div key={key}>
+                          <p className="break-all text-xs text-st-due">
+                            {key}: {state.message}
+                          </p>
+                          {state.kind === "denied" && (
+                            <div className="mt-2">
+                              <RepairAccessButton
+                                path={location}
+                                onRepaired={() => setLinkStates({})}
+                                variant="secondary"
+                              />
+                            </div>
+                          )}
+                        </div>
                       ) : null,
                     )}
               </div>

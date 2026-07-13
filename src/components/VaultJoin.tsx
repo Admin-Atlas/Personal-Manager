@@ -9,9 +9,35 @@
 // validates the real vault metadata — the advertisement is only a signpost.
 
 import { useState } from "react";
-import { adoptSharedVault } from "../lib/ipc";
+import { adoptSharedVault, vaultFaultOf } from "../lib/ipc";
 import type { SharedVaultAd } from "../lib/types";
 import { Button, Input } from "./ui";
+
+/** The join-failure story by classified fault code — a joiner-persona message for each
+ *  distinct cause, so "the owner hasn't added you" is never read as "wrong passphrase"
+ *  (the lockout incident's most damaging conflation). Falls back to the raw message. */
+export function joinErrorMessage(e: unknown): string {
+  const fault = vaultFaultOf(e);
+  switch (fault?.code) {
+    case "denied":
+      return (
+        "The vault's owner needs to add this Windows account before you can join — on " +
+        "their side: Settings → Vault → Manage sharing. (If this vault is yours, open PM " +
+        "on the account that set it up and use Repair access.)"
+      );
+    case "wrong-passphrase":
+      return "That passphrase doesn't match this vault. The folder itself is fine.";
+    case "no-vault":
+      return "No PM vault in that folder — pick the folder that holds vault-meta.json and pm.sqlite.";
+    case "corrupt":
+      return (
+        "The passphrase is right, but the vault's database won't open — it may be damaged. " +
+        "Its owner can restore it from a backup."
+      );
+    default:
+      return String(e);
+  }
+}
 
 export function VaultJoin({
   vaults,
@@ -40,7 +66,7 @@ export function VaultJoin({
       await adoptSharedVault(vault.vault_root, pass);
       onJoined();
     } catch (e) {
-      setError(String(e));
+      setError(joinErrorMessage(e));
       setBusy(false);
     }
   }

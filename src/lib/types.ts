@@ -119,6 +119,31 @@ export type VaultMode = "device" | "passphrase";
  *  warns instead of offering a restart that would no-op. Mirrors Rust `SmartAppControlState`. */
 export type SmartAppControlState = "off" | "enforced" | "evaluation" | "unknown";
 
+/** Machine-branchable classification of a vault-path failure — mirrors Rust
+ *  `VaultFaultCode` (kebab-case on the wire). The recovery surfaces branch on this
+ *  instead of string-matching: `denied` gets Repair access, `no-vault`/`not-found` the
+ *  honest gone-folder story, `wrong-passphrase` its own message, `corrupt` the damaged-
+ *  store guidance, `other` the generic Retry surface. */
+export type VaultFaultCode =
+  "denied" | "not-found" | "no-vault" | "wrong-passphrase" | "corrupt" | "other";
+
+/** A vault failure the UI can branch on AND display verbatim — mirrors Rust `VaultFault`.
+ *  `message` is a ready-to-show sentence; `op`/`path` say what was being done where. */
+export interface VaultFault {
+  code: VaultFaultCode;
+  op: string;
+  path: string | null;
+  message: string;
+}
+
+/** What `repair_vault_access` achieved: the folder answers again, and whether the store
+ *  reopened right away (`repaired` without `reopened` ⇒ the passphrase prompt is next). */
+export interface RepairOutcome {
+  repaired: boolean;
+  reopened: boolean;
+  warnings: string[];
+}
+
 /** The vault's current state for the UI: its key mode, whether it needs unlocking on
  *  this profile (a passphrase vault whose key isn't cached here yet), whether the
  *  Markdown is encrypted at rest, where it lives on disk, and its stable id. */
@@ -132,13 +157,21 @@ export interface VaultStatus {
    *  build (a model, chunking, or splitter change) — i.e. a one-time Rebuild is recommended.
    *  The Documents view shows this as a dismissible banner. False when locked or empty. */
   retrieval_rebuild_needed: boolean;
-  /** A friendly, retryable message when the store *failed to open* at boot (a transient AV /
-   *  search-indexer file lock, disk I/O) — distinct from a locked passphrase vault, which sets
-   *  `needs_unlock` instead. The app shows a Retry surface; null in the normal case. */
-  open_error: string | null;
+  /** Why the store is unavailable beyond needing an unlock — a classified fault (boot open
+   *  failure, denied/gone pointed root, mid-session access loss), or null in the normal
+   *  case. Replaces the old string-only `open_error`; branch on `fault.code`. */
+  fault: VaultFault | null;
   /** The folder this profile's pointer names, when one is set (a moved or joined vault) —
    *  lets the UI offer "go back to a local vault" when that folder stops answering. */
   pointed_root: string | null;
+  /** Whether a vault already sits at this profile's DEFAULT location while a pointer
+   *  redirects elsewhere (a joiner's set-aside vault) — drives the detach confirm's copy:
+   *  "switch back to the set-aside vault" vs "start a new, empty vault". */
+  has_set_aside_vault: boolean;
+  /** A shared folder this profile detached from whose vault still answers (or is merely
+   *  access-denied — repairable), so Settings can offer "Rejoin …". Null when never
+   *  detached or when the folder no longer holds a vault. */
+  retired_root: string | null;
 }
 
 /** Non-fatal warnings from a vault operation (a folder-ACL or discovery-marker hiccup);

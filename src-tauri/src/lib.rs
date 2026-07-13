@@ -310,12 +310,31 @@ pub struct AppState {
     /// switch keeps a restore-you-never-switch-to from clobbering the LIVE vault's cached key. Dropped
     /// (and zeroized) on exit; a restore not switched-to in this session is simply re-done.
     pub pending_restore_keys: Mutex<std::collections::HashMap<String, secret::Secret>>,
-    /// A friendly, retryable message when the store *failed to open* at boot (a transient
-    /// Windows file lock from antivirus/the search indexer, or disk I/O) — as opposed to a
-    /// locked passphrase vault, which is `None` here and `needs_unlock` instead. Set once in
-    /// `setup` so the app degrades to a locked state with a Retry rather than panicking out of
-    /// setup (B1-6); cleared by `retry_open_vault` on a successful reopen.
-    pub boot_open_error: Mutex<Option<String>>,
+    /// Why the store is unavailable beyond "locked, needs the passphrase" — a classified
+    /// [`error::VaultFault`]: a boot-time open failure (transient AV/search-indexer file
+    /// lock, disk I/O), an unreachable pointed root (access denied / folder gone), or a
+    /// mid-session loss detected by the lock watcher. `None` for the normal cases (open,
+    /// or merely `needs_unlock`). Set in `setup`/`engage`/the watcher; cleared by
+    /// [`AppState::open_session`] on every successful open path, and re-armed by
+    /// `retry_open_vault` on a failed retry. Drives `vault_status.fault` and the honest
+    /// [`session_unavailable_message`] — "access denied" must never masquerade as
+    /// "the vault is locked" (the ACL-lockout incident).
+    pub vault_fault: Mutex<Option<error::VaultFault>>,
+}
+
+/// The sentence a command gets when it needs the store but the session is closed. Pure
+/// so it unit-tests: `None` keeps today's "the vault is locked" (a passphrase vault
+/// awaiting unlock); a Denied fault names the real problem and the way out; anything
+/// else surfaces its own message with a pointer to the Vault settings.
+pub(crate) fn session_unavailable_message(fault: Option<&error::VaultFault>) -> String {
+    match fault {
+        None => "the vault is locked".to_string(),
+        Some(f) if f.code == error::VaultFaultCode::Denied => format!(
+            "PM lost access to the vault folder — {} — use Repair access in Settings → Vault",
+            f.message
+        ),
+        Some(f) => format!("{} — check Settings → Vault", f.message),
+    }
 }
 
 /// Single-flight guard with RAII release. [`BusyGuard::acquire`] returns `Some` if it flipped the flag
@@ -404,9 +423,24 @@ impl AppState {
             .lock()
             .map_err(|_| error::Error::Other("database lock poisoned".into()))?;
         if guard.is_none() {
-            return Err(error::Error::Other("the vault is locked".into()));
+            return Err(error::Error::Other(session_unavailable_message(
+                self.vault_fault().as_ref(),
+            )));
         }
         Ok(DbGuard(guard))
+    }
+
+    /// The current vault fault, if any (poison-tolerant — a poisoned slot reads as none).
+    pub fn vault_fault(&self) -> Option<error::VaultFault> {
+        self.vault_fault.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Record (or clear) why the store is unavailable. Poison-tolerant: fault state is
+    /// advisory for the UI, never worth failing a command over.
+    pub fn set_vault_fault(&self, fault: Option<error::VaultFault>) {
+        if let Ok(mut guard) = self.vault_fault.lock() {
+            *guard = fault;
+        }
     }
 
     /// Open the session after an unlock / open-existing succeeds: install the
@@ -424,6 +458,10 @@ impl AppState {
             *db = Some(conn);
             *vault = Some(runtime);
         }
+        // The one choke point that heals fault state: every successful open path (retry,
+        // unlock, adopt, repair, curtain take-over) lands here, so none can leave a stale
+        // "vault unreachable" story behind.
+        self.set_vault_fault(None);
         // Drop the guards before reconciling — it re-locks both to (re)build the rules file or
         // restore the mirror from it. Best-effort: a hiccup here never blocks the open. The
         // index-only manifest reconcile runs AFTER the rules one (it resolves item projects through
@@ -484,7 +522,9 @@ impl AppState {
             .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
         match guard.as_ref() {
             Some(rt) => Ok((rt.markdown_dir.clone(), rt.cipher.clone())),
-            None => Err(error::Error::Other("the vault is locked".into())),
+            None => Err(error::Error::Other(session_unavailable_message(
+                self.vault_fault().as_ref(),
+            ))),
         }
     }
 
@@ -498,7 +538,9 @@ impl AppState {
             .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
         match guard.as_ref() {
             Some(rt) => Ok((rt.vault_root.clone(), rt.rules_cipher.clone())),
-            None => Err(error::Error::Other("the vault is locked".into())),
+            None => Err(error::Error::Other(session_unavailable_message(
+                self.vault_fault().as_ref(),
+            ))),
         }
     }
 
@@ -512,7 +554,9 @@ impl AppState {
             .map_err(|_| error::Error::Other("vault lock poisoned".into()))?;
         match guard.as_ref() {
             Some(rt) => Ok((rt.vault_root.clone(), rt.manifest_cipher.clone())),
-            None => Err(error::Error::Other("the vault is locked".into())),
+            None => Err(error::Error::Other(session_unavailable_message(
+                self.vault_fault().as_ref(),
+            ))),
         }
     }
 
@@ -665,15 +709,39 @@ pub fn run() {
             // Resolved by hand (not `vault::resolve`) because a POINTED root that stopped
             // answering must degrade to a locked boot below, not abort setup here.
             let data_dir = paths::data_dir(handle)?;
-            let boot_pointer = vault::pointer::load(&data_dir)?;
+            // A pointer FILE that exists but won't load (denied/corrupt) also degrades to a
+            // locked boot carrying the fault — never an aborted setup, and never a fresh
+            // default-location vault silently minted while the real one sits behind the
+            // unreadable pointer. `Ok(None)` (no file at all) stays the plain default case.
+            let (boot_pointer, pointer_fault) = match vault::pointer::load(&data_dir) {
+                Ok(p) => (p, None),
+                Err(e) => {
+                    let fault = error::VaultFault::from_error("read PM's vault pointer", &e);
+                    eprintln!(
+                        "vault: pointer unreadable, booting locked: {}",
+                        fault.message
+                    );
+                    (None, Some(fault))
+                }
+            };
+            let pointer_present = boot_pointer.is_some() || pointer_fault.is_some();
             let resolved = vault::resolve_layout(&data_dir, boot_pointer.as_ref());
             let root_dirs_ready = std::fs::create_dir_all(&resolved.vault_root)
-                .and_then(|()| std::fs::create_dir_all(&resolved.markdown_dir))
-                .map_err(|e| e.to_string());
-            if boot_pointer.is_none() {
+                .map_err(error::io_at(
+                    "prepare the vault folder",
+                    &resolved.vault_root,
+                ))
+                .and_then(|()| {
+                    std::fs::create_dir_all(&resolved.markdown_dir).map_err(error::io_at(
+                        "prepare the vault folder",
+                        &resolved.markdown_dir,
+                    ))
+                })
+                .map_err(|e| error::VaultFault::from_error("prepare the vault folder", &e));
+            if !pointer_present {
                 // The default location must be creatable — that failure is fatal, as before.
-                if let Err(e) = &root_dirs_ready {
-                    return Err(error::Error::Other(e.clone()).into());
+                if let Err(f) = &root_dirs_ready {
+                    return Err(error::Error::Vault(f.clone()).into());
                 }
             }
 
@@ -693,33 +761,63 @@ pub fn run() {
 
             // Decide what to do about metadata (spec §6). At the DEFAULT location a
             // fresh profile still gets its zero-friction device vault; behind a POINTER,
-            // missing or unreachable metadata boots LOCKED with the detail carried —
+            // missing or unreachable metadata boots LOCKED with the fault carried —
             // never a fresh empty vault silently minted where the shared one should be
             // (the failure that made a broken join look like "all my data vanished").
-            let meta_load = match &root_dirs_ready {
-                Ok(()) => vault::load_meta(&resolved.vault_root).map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
+            let meta_load = match (&pointer_fault, &root_dirs_ready) {
+                (Some(f), _) => Err(f.clone()),
+                (None, Ok(())) => vault::load_meta(&resolved.vault_root)
+                    .map_err(|e| error::VaultFault::from_error("read the vault's settings", &e)),
+                (None, Err(f)) => Err(f.clone()),
             };
-            let boot_meta = vault::boot_meta_decision(boot_pointer.is_some(), meta_load)
-                .map_err(error::Error::Other)?;
+            let boot_meta = vault::boot_meta_decision(pointer_present, meta_load)
+                .map_err(error::Error::Vault)?;
             let open_attempt = match boot_meta {
                 vault::BootMeta::UseExisting(meta) => Ok(*meta),
                 vault::BootMeta::CreateDeviceDefault => {
                     Ok(vault::ensure_device_meta(&resolved.vault_root)?)
                 }
-                vault::BootMeta::PointedVaultMissing(detail) => Err(format!(
-                    "your shared vault at {} isn't reachable: {detail} — its owner may need \
-                     to re-add this account, or you can go back to a vault on this account \
-                     from Settings",
-                    resolved.vault_root.display()
-                )),
+                // Compose the user-facing story around the fault's classification, keeping
+                // code/path intact so the recovery screen can pick its actions (Repair for
+                // denied, Try again / detach for a gone folder). An unreadable pointer FILE
+                // keeps its own message — the pointed folder isn't even known in that case.
+                vault::BootMeta::PointedVaultMissing(fault) => {
+                    let root = resolved.vault_root.display();
+                    let message = if pointer_fault.is_some() {
+                        fault.message.clone()
+                    } else {
+                        match fault.code {
+                            error::VaultFaultCode::Denied => format!(
+                                "Windows is refusing this account access to your vault at \
+                                 {root} — your documents are still there, nothing has been \
+                                 deleted. Repair access below, or the vault's owner may need \
+                                 to re-add this account"
+                            ),
+                            error::VaultFaultCode::NoVault | error::VaultFaultCode::NotFound => {
+                                format!(
+                                    "your shared vault at {root} isn't there any more: {} — \
+                                     it may have been moved or deleted, or live on a drive \
+                                     that isn't connected",
+                                    fault.message
+                                )
+                            }
+                            _ => format!(
+                                "your shared vault at {root} isn't reachable: {} — its owner \
+                                 may need to re-add this account, or you can go back to a \
+                                 vault on this account from Settings",
+                                fault.message
+                            ),
+                        }
+                    };
+                    Err(error::VaultFault { message, ..fault })
+                }
             };
             // On a successful open we also get the Markdown cipher; pair it with the
             // resolved Markdown dir as the session's vault runtime. A locked
             // (passphrase, uncached) vault leaves both `None` until an unlock command.
             // A device vault opens now with the keychain key; a passphrase/shareable
             // vault opens only if this profile cached its key.
-            let (conn, vault_runtime, boot_open_error) = match &open_attempt {
+            let (conn, vault_runtime, boot_fault) = match &open_attempt {
                 Ok(meta) => match vault::open_at_boot(&resolved, meta) {
                     Ok(Some((conn, master))) => {
                         // Self-heal the discovery marker for an open shared vault living
@@ -749,20 +847,23 @@ pub fn run() {
                     Ok(None) => (None, None, None),
                     // A boot-time open failure (a transient AV/search-indexer file lock, disk I/O)
                     // must NOT abort the whole app — `db::open` already maps these to friendly,
-                    // retryable messages. Degrade to a not-opened store and carry the message so the
+                    // retryable messages. Degrade to a not-opened store and carry the fault so the
                     // UI can offer Retry, exactly like a locked vault (B1-6). Only a genuinely
                     // corrupt store then needs a manual fix, instead of every transient hiccup.
                     Err(e) => {
-                        let msg = e.to_string();
-                        eprintln!("vault: boot open failed, starting locked with Retry: {msg}");
-                        (None, None, Some(msg))
+                        let fault = error::VaultFault::from_error("open the vault", &e);
+                        eprintln!(
+                            "vault: boot open failed, starting locked with Retry: {}",
+                            fault.message
+                        );
+                        (None, None, Some(fault))
                     }
                 },
                 // The pointed vault is missing/unreachable: boot locked, carrying the
-                // specific story so the UI can offer Retry or "go back to a local vault".
-                Err(msg) => {
-                    eprintln!("vault: {msg}");
-                    (None, None, Some(msg.clone()))
+                // classified story so the UI can offer Repair, Retry, or a detach.
+                Err(fault) => {
+                    eprintln!("vault: {}", fault.message);
+                    (None, None, Some(fault.clone()))
                 }
             };
 
@@ -808,7 +909,7 @@ pub fn run() {
                 backup_cancel: AtomicBool::new(false),
                 backup_busy: AtomicBool::new(false),
                 pending_restore_keys: Mutex::new(std::collections::HashMap::new()),
-                boot_open_error: Mutex::new(boot_open_error),
+                vault_fault: Mutex::new(boot_fault),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -926,6 +1027,7 @@ pub fn run() {
             commands::list_shared_vaults,
             commands::adopt_shared_vault,
             commands::detach_from_shared_vault,
+            commands::repair_vault_access,
             commands::suggest_shared_vault_location,
             commands::list_local_accounts,
             commands::vault_lock_status,
@@ -1101,4 +1203,38 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_unavailable_message_tells_denied_apart_from_locked() {
+        // No fault = the plain locked-vault story, byte-for-byte as before.
+        assert_eq!(session_unavailable_message(None), "the vault is locked");
+        // A Denied fault names the real problem and the way out — never "locked".
+        let denied = error::VaultFault {
+            code: error::VaultFaultCode::Denied,
+            op: "read the vault's settings".into(),
+            path: Some("C:/shared".into()),
+            message: "PM couldn't read the vault's settings at C:/shared: the system refused \
+                      this account access"
+                .into(),
+        };
+        let msg = session_unavailable_message(Some(&denied));
+        assert!(msg.contains("Repair access"));
+        assert!(msg.contains("C:/shared"));
+        assert!(!msg.contains("the vault is locked"));
+        // Any other fault surfaces its own message with a Settings pointer.
+        let other = error::VaultFault {
+            code: error::VaultFaultCode::Other,
+            op: "open the vault".into(),
+            path: None,
+            message: "disk I/O error".into(),
+        };
+        let msg = session_unavailable_message(Some(&other));
+        assert!(msg.contains("disk I/O error"));
+        assert!(msg.contains("Settings"));
+    }
 }

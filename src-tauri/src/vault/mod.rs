@@ -34,7 +34,7 @@ use tauri::AppHandle;
 use zeroize::Zeroizing;
 
 use crate::db;
-use crate::error::{Error, Result};
+use crate::error::{io_at, Error, Result, VaultFault, VaultFaultCode};
 use crate::paths;
 use crate::secret::Secret;
 use crate::secrets;
@@ -201,20 +201,22 @@ pub fn load_meta(vault_root: &Path) -> Result<Option<VaultMeta>> {
             Ok(Some(meta))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        // Classified (Denied vs transient), path-bearing — an access-denied vault folder
+        // must never surface as a bare "io error: os error 5" (the ACL-lockout incident).
+        Err(e) => Err(io_at("read the vault's settings", &path)(e)),
     }
 }
 
 /// Write `vault-meta.json` atomically (temp file in the same dir, then rename), so a
 /// crash mid-write can never leave a half-written metadata file.
 pub fn store_meta(vault_root: &Path, meta: &VaultMeta) -> Result<()> {
-    std::fs::create_dir_all(vault_root)?;
+    std::fs::create_dir_all(vault_root).map_err(io_at("write the vault's settings", vault_root))?;
     let path = meta_path(vault_root);
     let json = serde_json::to_vec_pretty(meta)
         .map_err(|e| Error::Other(format!("could not encode {META_FILENAME}: {e}")))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, &path)?;
+    std::fs::write(&tmp, &json).map_err(io_at("write the vault's settings", &path))?;
+    std::fs::rename(&tmp, &path).map_err(io_at("write the vault's settings", &path))?;
     Ok(())
 }
 
@@ -240,29 +242,33 @@ pub enum BootMeta {
     /// zero-friction device vault, exactly as before.
     CreateDeviceDefault,
     /// A pointer names a folder that has no readable vault (deleted, made private, or
-    /// this account's access was revoked). Boot LOCKED with the carried detail instead
+    /// this account's access was revoked). Boot LOCKED with the carried fault instead
     /// of silently creating a fresh empty vault inside someone else's folder — the
     /// failure that made a joined-then-broken vault look like "all my data vanished".
-    PointedVaultMissing(String),
+    PointedVaultMissing(VaultFault),
 }
 
 /// Decide how boot treats the (possibly absent) vault metadata. Pure: takes whether a
 /// pointer redirects this profile and the outcome of loading the pointed root's meta
-/// (`Err` = the load itself failed, e.g. access denied — stringly so the decision
-/// stays testable without constructing real I/O errors). A missing/unreadable meta is
-/// only auto-created at the DEFAULT location; behind a pointer it is a reportable
-/// fault. A meta-load failure at the default location stays fatal (`Err`), as before.
+/// (`Err` = the load itself failed, carried as a classified [`VaultFault`] so the
+/// decision stays testable without constructing real I/O errors — and so the UI can
+/// pick Repair vs rejoin by `code`). A missing/unreadable meta is only auto-created at
+/// the DEFAULT location; behind a pointer it is a reportable fault. A meta-load
+/// failure at the default location stays fatal (`Err`), as before.
 pub fn boot_meta_decision(
     pointer_present: bool,
-    meta: std::result::Result<Option<VaultMeta>, String>,
-) -> std::result::Result<BootMeta, String> {
+    meta: std::result::Result<Option<VaultMeta>, VaultFault>,
+) -> std::result::Result<BootMeta, VaultFault> {
     match (pointer_present, meta) {
         (_, Ok(Some(m))) => Ok(BootMeta::UseExisting(Box::new(m))),
         (false, Ok(None)) => Ok(BootMeta::CreateDeviceDefault),
         (false, Err(e)) => Err(e),
-        (true, Ok(None)) => Ok(BootMeta::PointedVaultMissing(
-            "the folder doesn't contain a PM vault any more".into(),
-        )),
+        (true, Ok(None)) => Ok(BootMeta::PointedVaultMissing(VaultFault {
+            code: VaultFaultCode::NoVault,
+            op: "open the vault".into(),
+            path: None,
+            message: "the folder doesn't contain a PM vault any more".into(),
+        })),
         (true, Err(e)) => Ok(BootMeta::PointedVaultMissing(e)),
     }
 }
@@ -394,8 +400,12 @@ pub fn resolve(app: &AppHandle) -> Result<ResolvedVault> {
     let data_dir = paths::data_dir(app)?;
     let pointer = pointer::load(&data_dir)?;
     let resolved = resolve_layout(&data_dir, pointer.as_ref());
-    std::fs::create_dir_all(&resolved.vault_root)?;
-    std::fs::create_dir_all(&resolved.markdown_dir)?;
+    // Classified + path-bearing: on a pointed root whose ACLs broke, these are the first
+    // fresh handles a command opens, so their failure is what the user actually sees.
+    std::fs::create_dir_all(&resolved.vault_root)
+        .map_err(io_at("prepare the vault folder", &resolved.vault_root))?;
+    std::fs::create_dir_all(&resolved.markdown_dir)
+        .map_err(io_at("prepare the vault folder", &resolved.markdown_dir))?;
     Ok(resolved)
 }
 
@@ -716,13 +726,36 @@ pub fn open_with_passphrase(
         .as_ref()
         .ok_or_else(|| Error::Other("vault metadata is missing its verifier".into()))?;
     if !verifier::check(verifier, &master)? {
-        return Err(Error::Other("wrong passphrase".into()));
+        return Err(Error::Vault(VaultFault {
+            code: VaultFaultCode::WrongPassphrase,
+            op: "unlock the vault".into(),
+            path: None,
+            message: "That passphrase doesn't match this vault.".into(),
+        }));
     }
     // The passphrase is now proven, so the master is trusted — the first point at which we can
     // authenticate + repair the non-secret meta (M-3). The report drives a non-blocking UI warning.
     let report = authenticate_meta(&resolved.vault_root, meta, &master)?;
     let key = db_key_hex(&master);
-    let conn = db::open(&resolved.db_path, key.expose())?;
+    // The verifier PASSED, so a wrong-key-shaped open failure here means the store itself is
+    // damaged (e.g. a truncated copy) — tell that apart from "wrong passphrase" so recovery
+    // guidance doesn't send the user back to retype a passphrase that is already right. Other
+    // open failures (transient AV/indexer locks, disk I/O) pass through with their retryable
+    // messages untouched.
+    let conn = db::open(&resolved.db_path, key.expose()).map_err(|e| {
+        if e.to_string().contains(db::WRONG_KEY_OR_CORRUPT_MSG) {
+            Error::Vault(VaultFault {
+                code: VaultFaultCode::Corrupt,
+                op: "open the vault's database".into(),
+                path: Some(resolved.db_path.display().to_string()),
+                message: "The passphrase is right, but the vault's database won't open — the \
+                          file may be damaged."
+                    .into(),
+            })
+        } else {
+            e
+        }
+    })?;
     Ok((conn, key, report))
 }
 
@@ -951,19 +984,29 @@ mod tests {
             boot_meta_decision(false, Ok(None)),
             Ok(BootMeta::CreateDeviceDefault)
         );
+        // A pointer to a vault-less folder is a NoVault fault (PR3's tombstone check
+        // hangs off this code), not a generic message.
         assert!(matches!(
             boot_meta_decision(true, Ok(None)),
-            Ok(BootMeta::PointedVaultMissing(_))
+            Ok(BootMeta::PointedVaultMissing(VaultFault {
+                code: VaultFaultCode::NoVault,
+                ..
+            }))
         ));
+        // The classification travels through untouched: a Denied load fault comes out as
+        // a Denied PointedVaultMissing, so the boot screen can offer Repair access.
+        let denied = VaultFault {
+            code: VaultFaultCode::Denied,
+            op: "read the vault's settings".into(),
+            path: Some("C:/shared".into()),
+            message: "access is denied".into(),
+        };
         assert_eq!(
-            boot_meta_decision(true, Err("access is denied".into())),
-            Ok(BootMeta::PointedVaultMissing("access is denied".into()))
+            boot_meta_decision(true, Err(denied.clone())),
+            Ok(BootMeta::PointedVaultMissing(denied.clone()))
         );
         // At the default location a meta-load failure stays fatal, as before.
-        assert_eq!(
-            boot_meta_decision(false, Err("disk error".into())),
-            Err("disk error".into())
-        );
+        assert_eq!(boot_meta_decision(false, Err(denied.clone())), Err(denied));
     }
 
     #[test]
