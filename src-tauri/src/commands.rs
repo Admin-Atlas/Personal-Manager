@@ -654,13 +654,25 @@ pub async fn create_shareable_vault(
         target_location: target_location.map(std::path::PathBuf::from),
     };
     let app2 = app.clone();
-    let warnings = tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
-        .await
-        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
-    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
-    // release if it went device-only, or re-acquire at the new location after a move.
-    lock_session::engage(&app)?;
+    let mut warnings =
+        tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+            .await
+            .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    engage_or_warn(&app, &mut warnings);
     Ok(VaultOpOutcome { warnings })
+}
+
+/// Re-engage the writer lock after a migration, demoting a failure to a WARNING: by this
+/// point the migration has already committed, so erroring here would misreport a successful
+/// transition as failed (and the verify-then-commit relocate already probes the folder's
+/// writability before committing, so `engage`'s real failure mode can't reach here anyway).
+fn engage_or_warn(app: &AppHandle, warnings: &mut Vec<String>) {
+    if let Err(e) = lock_session::engage(app) {
+        warnings.push(format!(
+            "PM couldn't re-engage its shared-vault coordination ({e}) — restart PM before \
+             using the vault from another account."
+        ));
+    }
 }
 
 /// Change a shareable vault's passphrase: re-derive the key (new salt + verifier),
@@ -694,30 +706,77 @@ pub async fn change_vault_passphrase(
         target_location: None,
     };
     let app2 = app.clone();
-    let warnings = tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
-        .await
-        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
-    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
-    // release if it went device-only, or re-acquire at the new location after a move.
-    lock_session::engage(&app)?;
+    let mut warnings =
+        tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+            .await
+            .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    engage_or_warn(&app, &mut warnings);
     Ok(VaultOpOutcome { warnings })
 }
 
+/// Whether making a vault private must first move it back into this profile's own folder
+/// before decrypting — true when the vault currently lives OUTSIDE the data dir (a shared
+/// location). Decrypting in place there would briefly write plaintext notes into a folder
+/// other accounts can reach; moving home first keeps plaintext to the OS-isolated profile
+/// dir. Pure, so the decision unit-tests.
+fn needs_move_home(vault_root: &std::path::Path, data_dir: &std::path::Path) -> bool {
+    !vault_root.starts_with(data_dir)
+}
+
 /// Make a shareable vault private again: re-key it to a random device key (held only in
-/// this profile's keychain) and decrypt the Markdown back to plaintext. Also withdraws
-/// the discovery marker and linked-accounts sidecar (inside the migration). Reverses
-/// `create_shareable_vault`; a no-op-style error if the vault is already device-only.
+/// this profile's keychain) and decrypt the Markdown back to plaintext. A vault that lives
+/// in a shared folder is FIRST moved back into this profile's own (OS-isolated) folder —
+/// still encrypted — so the decrypt never writes plaintext where another account could read
+/// it. Also withdraws the discovery marker and linked-accounts sidecar (inside the
+/// migration). Reverses `create_shareable_vault`; a no-op-style error if already device-only.
 #[tauri::command]
 pub async fn make_vault_private(app: AppHandle) -> Result<VaultOpOutcome> {
-    {
-        let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
-            .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
-        if meta.key_mode == vault::KeyMode::Device {
-            return Err(Error::Other(
-                "this vault is already private to this device".into(),
-            ));
-        }
+    let data_dir = paths::data_dir(&app)?;
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    if meta.key_mode == vault::KeyMode::Device {
+        return Err(Error::Other(
+            "this vault is already private to this device".into(),
+        ));
     }
+    let mut warnings = Vec::new();
+
+    // Move home first if the vault is in a shared folder — two individually crash-safe
+    // journaled migrations; a crash between them leaves a valid shareable-in-profile vault
+    // that a re-run finishes. The home slot must be free: a joiner whose own vault is parked
+    // there detaches instead of making someone else's shared vault private.
+    if needs_move_home(&resolved.vault_root, &data_dir) {
+        match vault::migrate::relocation_target_state(&vault::load_meta(&data_dir), &meta.vault_id)
+        {
+            vault::migrate::TargetState::ForeignVault | vault::migrate::TargetState::Unreadable => {
+                return Err(Error::Other(
+                    "this account already has its own vault here — leave the shared vault with \
+                     \"Use a vault on this account instead\" rather than making it private"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        // A pure relocate to the profile root, keeping the passphrase key + encryption. The
+        // move-home target IS inside the data dir, so the migration's lockdown/pre-flight
+        // are correctly skipped (they gate on `!starts_with(data_dir)`) — no icacls touches
+        // the profile folder.
+        let move_plan = vault::migrate::MigrationPlan {
+            target_key_mode: vault::KeyMode::Passphrase,
+            new_passphrase: None,
+            target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
+            target_location: Some(data_dir.clone()),
+        };
+        let app2 = app.clone();
+        let move_warnings =
+            tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, move_plan))
+                .await
+                .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+        warnings.extend(move_warnings);
+    }
+
+    // Decrypt in place at the (now-local) root.
     let plan = vault::migrate::MigrationPlan {
         target_key_mode: vault::KeyMode::Device,
         new_passphrase: None,
@@ -725,12 +784,17 @@ pub async fn make_vault_private(app: AppHandle) -> Result<VaultOpOutcome> {
         target_location: None,
     };
     let app2 = app.clone();
-    let warnings = tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
-        .await
-        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
-    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
-    // release if it went device-only, or re-acquire at the new location after a move.
-    lock_session::engage(&app)?;
+    let decrypt_warnings =
+        tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+            .await
+            .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    warnings.extend(decrypt_warnings);
+
+    // The vault is now a device vault at the default location; clear the pointer so it's the
+    // plain no-pointer default (the invariant `boot_meta_decision` branches on). Idempotent —
+    // a no-op when the vault was already local.
+    vault::pointer::clear(&data_dir)?;
+    engage_or_warn(&app, &mut warnings);
     Ok(VaultOpOutcome { warnings })
 }
 
@@ -752,12 +816,11 @@ pub async fn move_vault(app: AppHandle, folder: String) -> Result<VaultOpOutcome
         }
     };
     let app2 = app.clone();
-    let warnings = tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
-        .await
-        .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
-    // Re-engage the writer lock for the vault's new state: acquire if it became shareable,
-    // release if it went device-only, or re-acquire at the new location after a move.
-    lock_session::engage(&app)?;
+    let mut warnings =
+        tokio::task::spawn_blocking(move || vault::migrate::migrate_vault(&app2, plan))
+            .await
+            .map_err(|e| Error::Other(format!("migration task panicked: {e}")))??;
+    engage_or_warn(&app, &mut warnings);
     Ok(VaultOpOutcome { warnings })
 }
 
@@ -891,6 +954,25 @@ pub fn link_vault_account(app: AppHandle, account: String) -> Result<VaultOpOutc
     }
     vault::acl::grant_access(&resolved.vault_root, &account)?;
     let mut warnings = Vec::new();
+    // Read the grant back: a fail-loud `grant_access` already errored on a non-zero icacls,
+    // but a readback catches the case where icacls reports success yet the ACE didn't land
+    // (a resolvable-but-wrong principal). NotFound is a hard error (the link didn't take);
+    // an inconclusive readback is only a warning — it must never fail a link that worked.
+    match vault::acl::verify_grant(&resolved.vault_root, &account) {
+        vault::acl::GrantCheck::Granted => {}
+        vault::acl::GrantCheck::NotFound => {
+            return Err(Error::Other(format!(
+                "PM granted access to {account} but Windows didn't record it — check the \
+                 account name or SID is exactly right and try again"
+            )));
+        }
+        vault::acl::GrantCheck::Inconclusive(detail) => {
+            warnings.push(format!(
+                "PM granted access to {account} but couldn't confirm it landed ({detail}). \
+                 If they can't open the vault, remove and re-add the account."
+            ));
+        }
+    }
     // Record the principal so a later move's owner-lockdown re-grants it (best-effort:
     // the ACE above is already applied either way).
     let mut access = vault::access::load(&resolved.vault_root, &meta.vault_id)
@@ -1117,10 +1199,21 @@ pub fn repair_vault_access(app: AppHandle, state: State<'_, AppState>) -> Result
         }
     }
     let mut warnings = Vec::new();
-    // (1) Additive self-grant, by SID. On the POSIX side a chmod-700 lockdown can't strip
-    // the owner in the first place, so the grant step is Windows-only.
+    // (1) Reset the folder's DACL to inherit again, THEN re-grant this account. The reset
+    // clears a botched lockdown wholesale (a `/grant` alone can't repair an `/inheritance:r`
+    // that dropped the owner's usable access on child items); both work against a hostile
+    // DACL because the folder's OS owner keeps implicit WRITE_DAC. POSIX chmod-700 can't
+    // strip the Unix owner, so this whole step is Windows-only.
     #[cfg(windows)]
     {
+        // A reset failure isn't fatal on its own — the grant below may still fix access —
+        // so it's a warning; the grant's failure is the real gate.
+        if let Err(e) = vault::acl::reset_inheritance(&root) {
+            warnings.push(format!(
+                "PM couldn't reset the folder's inherited permissions ({e}); trying a direct \
+                 grant instead."
+            ));
+        }
         let me = vault::acl::current_user_sid()?;
         vault::acl::grant_access(&root, &me).map_err(|e| {
             Error::Vault(VaultFault {
@@ -4712,6 +4805,25 @@ pub fn open_source(state: State<'_, AppState>, doc_id: i64) -> Result<()> {
     match classify_source_ref(&refr) {
         SourceRefKind::Web => open_external_url(&refr),
         SourceRefKind::LocalPath => reveal_in_file_manager(&refr),
+    }
+}
+
+#[cfg(test)]
+mod vault_command_tests {
+    use super::needs_move_home;
+    use std::path::Path;
+
+    #[test]
+    fn needs_move_home_only_when_the_vault_is_outside_the_profile() {
+        let data_dir = Path::new("/profile/data");
+        // A shared-folder vault (outside the profile) must move home before decrypting.
+        assert!(needs_move_home(
+            Path::new("/ProgramData/Personal Manager/Shared Vault"),
+            data_dir
+        ));
+        // A vault already at (or under) the profile data dir stays put.
+        assert!(!needs_move_home(data_dir, data_dir));
+        assert!(!needs_move_home(&data_dir.join("vault"), data_dir));
     }
 }
 

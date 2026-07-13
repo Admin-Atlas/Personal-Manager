@@ -90,8 +90,10 @@ jobs:
   # compile error or clippy lint is invisible on a PR and first surfaces in the
   # release build matrix — the green-PR≠green-release class this repo has been burned
   # by. This runs clippy + `cargo check --tests` on windows-latest so that class fails
-  # a PR instead of a release. No tests run (the compile/lint class is what Linux can't
-  # see; keeping it check-only keeps the added minutes small).
+  # a PR instead of a release. It also runs the `vault::` test subset (only), so the
+  # shared-folder ACL logic — icacls lockdown, effective-access probes, the verify-then-
+  # commit relocate — is exercised on a real NTFS + icacls host, the one place those tests
+  # mean anything (the Linux job's tempfs can't reproduce a Windows DACL lockout).
   #
   # NB: we invoke cargo DIRECTLY, not through `just`. The justfile forces `bash -c`,
   # and Git-Bash's MSYS perl shadows Strawberry Perl, breaking the vendored-OpenSSL
@@ -123,6 +125,8 @@ jobs:
         run: cargo clippy --all-targets --all-features --manifest-path src-tauri/Cargo.toml -- -D warnings
       - name: cargo check (--tests)
         run: cargo check --all-targets --tests --manifest-path src-tauri/Cargo.toml
+      - name: cargo test (vault:: — ACL/probe/migration on real NTFS)
+        run: cargo test --lib --manifest-path src-tauri/Cargo.toml vault::
 
   # --- sidecar: lint + format (Python) ------------------------------------
   python:

@@ -23,6 +23,7 @@ pub mod kdf;
 pub mod lock;
 pub mod migrate;
 pub mod pointer;
+pub mod preflight;
 pub mod verifier;
 
 use std::path::{Path, PathBuf};
