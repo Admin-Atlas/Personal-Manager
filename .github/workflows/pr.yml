@@ -125,8 +125,8 @@ jobs:
         run: cargo clippy --all-targets --all-features --manifest-path src-tauri/Cargo.toml -- -D warnings
       - name: cargo check (--tests)
         run: cargo check --all-targets --tests --manifest-path src-tauri/Cargo.toml
-      - name: cargo test (vault:: — ACL/probe/migration on real NTFS)
-        run: cargo test --lib --manifest-path src-tauri/Cargo.toml vault::
+      - name: "cargo test (vault:: — ACL/probe/migration on real NTFS)"
+        run: "cargo test --lib --manifest-path src-tauri/Cargo.toml vault::"
 
   # --- sidecar: lint + format (Python) ------------------------------------
   python:
