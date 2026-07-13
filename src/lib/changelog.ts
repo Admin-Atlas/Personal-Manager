@@ -19,6 +19,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.9.1-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "PM 3.9.1 rolls up everything since the last release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
+      "See other timezones on the calendar, and set your own hours. In Day and Week view you can add up to two more timezones down the left beside your local time, frame the view to your own Work or Day hours from the ▾ on those buttons, and events now show their start and end time (e.g. 09:30–10:45) instead of just the start.",
+      "A tidier pinboard. Notes and timelines can have a title, the Ingest button moved up into the top bar to give notes their full height back, and dropping a note exactly on top of another the same size folds them into a neat folder tile you can name, open, and drag cards back out of. Every colour also names itself on hover now.",
+      "Your vault recovers honestly if Windows ever blocks its folder. Instead of a confusing wall of “the vault is locked” messages, PM now says exactly what's wrong and offers a one-click “Repair access”. Sharing a vault across Windows accounts is safe by construction — PM checks the destination, locks it down and confirms it still works before committing — and you can properly delete a shared vault, with everyone who joined told plainly and moved back to their own. Your data was never at risk; now PM says so.",
+      "Windows updates no longer fail silently. If Smart App Control is blocking PM's update installer, PM now spots it and tells you the one thing that fixes it, instead of quietly reopening on the old version every launch.",
+      "A cleaner exit. Finishing “Remove PM data” now actually closes the app and a full uninstall leaves no leftover “PM” folder behind, plus a clear reminder before you erase a vault and database that can't be recovered.",
+    ],
+  },
+  {
     version: "3.9.0-alpha",
     date: "2026-07-13",
     highlights: [
