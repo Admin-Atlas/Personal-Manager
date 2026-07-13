@@ -502,6 +502,9 @@ export interface Calendar {
   color: string | null;
   selected: boolean;
   is_primary: boolean;
+  /** Shown on the Calendar tab but its events are kept out of the assistant (briefing, flags, chat,
+   *  focus). Independent of `selected` — a quiet calendar still syncs and renders. */
+  quiet: boolean;
 }
 
 /** The whole calendar surface in one read (every provider). */

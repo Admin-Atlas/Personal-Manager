@@ -2917,6 +2917,19 @@ pub fn set_calendar_selected(
     calendar::set_calendar_selected(&conn, &calendar_id, selected)
 }
 
+/// Mark one calendar (by its `calendars.id`) quiet, or not: keep it on the Calendar tab but exclude
+/// its events from the assistant (briefing, flags/reminders, chat agenda, focus upcoming).
+/// No re-sync needed — the events stay mirrored; only the assistant query path filters them.
+#[tauri::command]
+pub fn set_calendar_quiet(
+    state: State<'_, AppState>,
+    calendar_id: String,
+    quiet: bool,
+) -> Result<()> {
+    let conn = state.conn()?;
+    calendar::set_calendar_quiet(&conn, &calendar_id, quiet)
+}
+
 // --- Google Calendar (OAuth, per-account) ---
 
 /// The core connect flow, shared by the new per-account command and the back-compat `connect_google`:

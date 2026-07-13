@@ -133,6 +133,12 @@ pub fn calendar_dates_by_uid(conn: &Connection, today: &str) -> Result<HashMap<S
     // date — otherwise a timed event near midnight resolves a calendar-linked milestone to the wrong
     // day west/east of UTC. `today` is already the zone-local date, so the two agree.
     let zone = crate::commands::resolve_zone(conn);
+    // NB: this deliberately does NOT filter out quiet calendars. A milestone links to an event by its
+    // iCal UID only when the user EXPLICITLY attached it — a deliberate project deadline, distinct
+    // from the calendar's "quiet" (don't-surface-its-events) preference. Silencing that link off the
+    // back of quieting the calendar would leave the milestone tracking a stale cached date while its
+    // flags still fired (inconsistent), so quiet governs the event stream (via `agenda_query`) and
+    // leaves explicit milestone links alone. (Extending quiet to linked milestones is a separate opt.)
     let mut stmt = conn.prepare(
         "SELECT uid, start FROM calendar_events WHERE uid IS NOT NULL AND start IS NOT NULL",
     )?;

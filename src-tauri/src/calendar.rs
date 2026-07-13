@@ -691,6 +691,10 @@ pub struct Calendar {
     pub color: Option<String>,
     pub selected: bool,
     pub is_primary: bool,
+    /// Visible on the Calendar tab but its events are excluded from everything the assistant surfaces
+    /// (briefing, flags/reminders, chat agenda, focus upcoming). Independent of `selected` — a quiet
+    /// calendar still syncs and renders; only the assistant query path (`agenda_query`) filters it.
+    pub quiet: bool,
 }
 
 /// A provider-neutral calendar descriptor for registration (a Google `calendarList` item or a Graph
@@ -830,12 +834,12 @@ pub fn remove_source(conn: &Connection, id: &str) -> Result<()> {
 }
 
 /// Insert or refresh a calendar row. On conflict it updates the upstream-owned fields
-/// (name/colour/remote id/primary) but PRESERVES the user's `selected` choice — a re-sync must not
-/// silently re-tick a calendar the user unticked.
+/// (name/colour/remote id/primary) but PRESERVES the user's `selected` AND `quiet` choices — a
+/// re-sync must not silently re-tick a calendar the user unticked, nor un-quiet one they quieted.
 pub fn upsert_calendar(conn: &Connection, cal: &Calendar) -> Result<()> {
     conn.execute(
-        "INSERT INTO calendars(id, source_id, provider, remote_id, name, color, selected, is_primary) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+        "INSERT INTO calendars(id, source_id, provider, remote_id, name, color, selected, is_primary, quiet) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color, \
              remote_id = excluded.remote_id, is_primary = excluded.is_primary",
         params![
@@ -846,7 +850,8 @@ pub fn upsert_calendar(conn: &Connection, cal: &Calendar) -> Result<()> {
             cal.name,
             cal.color,
             cal.selected as i64,
-            cal.is_primary as i64
+            cal.is_primary as i64,
+            cal.quiet as i64
         ],
     )?;
     Ok(())
@@ -861,6 +866,7 @@ type CalendarRow = (
     Option<String>,
     i64,
     i64,
+    i64,
 );
 
 fn row_to_calendar(r: &rusqlite::Row) -> rusqlite::Result<CalendarRow> {
@@ -873,11 +879,12 @@ fn row_to_calendar(r: &rusqlite::Row) -> rusqlite::Result<CalendarRow> {
         r.get(5)?,
         r.get(6)?,
         r.get(7)?,
+        r.get(8)?,
     ))
 }
 
 fn calendar_from_row(row: CalendarRow) -> Calendar {
-    let (id, source_id, provider, remote_id, name, color, selected, is_primary) = row;
+    let (id, source_id, provider, remote_id, name, color, selected, is_primary, quiet) = row;
     Calendar {
         id,
         source_id,
@@ -887,11 +894,12 @@ fn calendar_from_row(row: CalendarRow) -> Calendar {
         color,
         selected: selected != 0,
         is_primary: is_primary != 0,
+        quiet: quiet != 0,
     }
 }
 
 const CALENDAR_COLS: &str =
-    "id, source_id, provider, remote_id, name, color, selected, is_primary FROM calendars";
+    "id, source_id, provider, remote_id, name, color, selected, is_primary, quiet FROM calendars";
 
 /// Every registered calendar, across all accounts/subscriptions (for the unified picker + 6B view).
 pub fn list_calendars(conn: &Connection) -> Result<Vec<Calendar>> {
@@ -940,6 +948,17 @@ pub fn set_calendar_selected(conn: &Connection, calendar_id: &str, on: bool) -> 
     Ok(())
 }
 
+/// Mark one calendar quiet (or not): keep it on the Calendar tab but exclude its events from
+/// everything the assistant surfaces (via `agenda_query`). Unlike [`set_calendar_selected`] this
+/// needs no re-sync — the events stay in the mirror; only the assistant query path filters them out.
+pub fn set_calendar_quiet(conn: &Connection, calendar_id: &str, on: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE calendars SET quiet = ?2 WHERE id = ?1",
+        params![calendar_id, on as i64],
+    )?;
+    Ok(())
+}
+
 /// All currently-selected calendars (the set a sync refreshes; everything else is pruned).
 pub fn selected_calendars(conn: &Connection) -> Result<Vec<Calendar>> {
     Ok(list_calendars(conn)?
@@ -974,6 +993,7 @@ pub fn register_calendars(
                 color: it.color.clone(),
                 selected: select(it),
                 is_primary: it.is_primary,
+                quiet: false, // new calendars are surfaced to the assistant until the user quiets them
             },
         )?;
     }
@@ -995,6 +1015,7 @@ pub fn register_feed_source(conn: &Connection, feed: &IcsFeed) -> Result<()> {
             color: None,
             selected: true,
             is_primary: false,
+            quiet: false,
         },
     )
 }
@@ -1156,6 +1177,7 @@ fn agenda_query(
                      THEN date(COALESCE(end, date(start, '+1 day'))) > ?1 \
                      ELSE julianday(COALESCE(end, start)) >= julianday(?2) END) \
            AND julianday(start) <= julianday(?1, ?3) \
+           AND calendar_id NOT IN (SELECT id FROM calendars WHERE quiet = 1) \
          ORDER BY start \
          LIMIT ?4",
     )?;
@@ -1234,6 +1256,8 @@ pub fn focus_agenda(conn: &Connection, days: i64, zone: chrono_tz::Tz) -> Result
 /// previous month included — so the Month/Week/Year grids render and page without a per-view
 /// fetch. Ordered by start. Contrast [`list_upcoming`], the narrow forward agenda for the focus
 /// view. Read-only; the client filters to the visible range and by locally-hidden calendars.
+/// Deliberately NOT filtered by `quiet`: a quiet calendar is kept out of the assistant paths
+/// ([`agenda_query`]) but still shown here on the Calendar tab — that's the whole point of quiet.
 pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
     let mut stmt = conn.prepare(
         "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid \

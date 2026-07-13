@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.4.0-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "New: mark a calendar as “Quiet”. A quiet calendar still shows on your Calendar tab, but its events are kept out of everything PM brings to your attention — the daily briefing, “due soon” reminders, and chat. Ideal for a calendar you want to see but not be nudged about, like a recurring payments tracker. Toggle “Quiet” next to each calendar under Settings → Connectors.",
+    ],
+  },
+  {
     version: "3.3.1-alpha",
     date: "2026-07-13",
     highlights: [
