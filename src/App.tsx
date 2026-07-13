@@ -54,6 +54,7 @@ import {
   markActivity,
   onVaultAcquired,
   onVaultCurtain,
+  onVaultFault,
   onVaultMetaWarning,
   openUrl,
   resumeDriveSync,
@@ -103,6 +104,11 @@ export default function App() {
   // A non-blocking notice when a vault's metadata was repaired on open (M-3): a downgraded
   // encryption policy PM forced back on, or a failed integrity check. Dismissible.
   const [metaWarning, setMetaWarning] = useState<string | null>(null);
+  // PM lost access to the shared vault folder MID-SESSION (`vault://fault` — the store
+  // closed, or the writer-lock heartbeat started failing while open handles still work).
+  // A dismissible banner naming the real problem, so it never masquerades as "locked"
+  // until the next relaunch surprises the user (issue #343). Fixed from Settings → Vault.
+  const [vaultFaultNotice, setVaultFaultNotice] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [view, setView] = useState<View>("focus");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
@@ -291,10 +297,11 @@ export default function App() {
         // cached; the vault just isn't ours to write right now).
         setVaultLock(writerLock);
         if (writerLock && !writerLock.active) return;
-        // The store failed to open at boot (a transient file lock, disk I/O) — the open-error gate
-        // renders from `vault.open_error` and offers Retry. Checked before `needs_unlock` because a
-        // device vault has no passphrase to prompt for. The store is closed, so skip the load below.
-        if (vs?.open_error) return;
+        // The store failed to open at boot (a transient file lock, a denied/gone pointed root,
+        // disk I/O) — the open-error gate renders from `vault.fault` and offers the matching way
+        // out (Retry / Repair access / detach). Checked before `needs_unlock` because a device
+        // vault has no passphrase to prompt for. The store is closed, so skip the load below.
+        if (vs?.fault) return;
         if (vs?.needs_unlock) {
           setVaultNeedsUnlock(true);
           return;
@@ -373,6 +380,14 @@ export default function App() {
   useEffect(() => {
     let off: (() => void) | undefined;
     void onVaultMetaWarning((message) => setMetaWarning(message)).then((o) => (off = o));
+    return () => off?.();
+  }, []);
+
+  // Issue #343: surface a mid-session loss of access to the vault folder the moment the
+  // backend notices it, instead of a wall of "the vault is locked" errors.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    void onVaultFault((fault) => setVaultFaultNotice(fault.message)).then((o) => (off = o));
     return () => off?.();
   }, []);
 
@@ -662,10 +677,11 @@ export default function App() {
     );
   }
 
-  // A transient boot-time open failure (an AV / search-indexer file lock, disk I/O) degrades
-  // to this Retry gate instead of aborting the app (B1-6). It sits before the unlock prompt:
-  // a device vault that failed to open has no passphrase to enter, just a file to retry.
-  if (vault?.open_error) {
+  // A boot-time open failure (an AV / search-indexer file lock, a denied or gone pointed
+  // root, disk I/O) degrades to this recovery gate instead of aborting the app (B1-6). It
+  // sits before the unlock prompt: a vault that failed to OPEN has no passphrase to enter —
+  // it needs Retry, Repair access, or a step back to a vault on this account.
+  if (vault?.fault) {
     return <VaultOpenError status={vault} onResolved={completeUnlock} />;
   }
 
@@ -728,6 +744,21 @@ export default function App() {
               <button
                 className="shrink-0 font-medium text-ink3 underline underline-offset-2 hover:text-ink"
                 onClick={() => setMetaWarning(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+          {vaultFaultNotice && (
+            <div
+              role="alert"
+              className="flex items-start justify-between gap-3 border-b border-border px-4 py-2 text-sm text-st-due"
+              style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+            >
+              <span>{vaultFaultNotice} You can fix this from Settings → Vault.</span>
+              <button
+                className="shrink-0 font-medium underline underline-offset-2"
+                onClick={() => setVaultFaultNotice(null)}
               >
                 Dismiss
               </button>

@@ -15,7 +15,7 @@ use crate::backup::{
     self, destination::BackupDestination, BackupEvent, BackupKind, BackupPhase, BackupReport,
 };
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, VaultFault, VaultFaultCode};
 use crate::google;
 use crate::ingest::{self, Document, IngestEvent};
 use crate::milestones::{self, Milestone};
@@ -490,13 +490,23 @@ pub struct VaultStatus {
     /// Documents view surfaces this as a dismissible banner. False when the vault is locked or
     /// has no documents yet.
     pub retrieval_rebuild_needed: bool,
-    /// A friendly, retryable message when the store *failed to open* at boot (a transient AV /
-    /// search-indexer file lock, disk I/O) — distinct from a locked passphrase vault, which
-    /// reports `needs_unlock` instead. The UI shows a Retry surface; `None` in the normal case.
-    pub open_error: Option<String>,
+    /// Why the store is unavailable beyond needing an unlock — a classified fault (boot open
+    /// failure, denied/gone pointed root, mid-session access loss), or `None` in the normal
+    /// case. The UI branches on `fault.code`: Denied gets Repair access, NoVault/NotFound get
+    /// the honest gone-folder story, everything else the Retry surface. Replaces the old
+    /// string-only `open_error`.
+    pub fault: Option<VaultFault>,
     /// The folder this profile's pointer names, when one is set (a moved or joined vault).
     /// Lets the UI offer "detach back to a local vault" when that folder stops answering.
     pub pointed_root: Option<String>,
+    /// Whether a vault already sits at this profile's DEFAULT location while a pointer
+    /// redirects elsewhere — i.e. a joiner's set-aside vault. Drives the detach confirm's
+    /// copy: "switch back to the set-aside vault" vs "start a new, empty vault".
+    pub has_set_aside_vault: bool,
+    /// A shared folder this profile detached from whose vault still answers (or is merely
+    /// access-denied — repairable), so Settings can offer "Rejoin …". `None` when never
+    /// detached, or when the folder no longer holds a vault (the offer self-heals away).
+    pub retired_root: Option<String>,
 }
 
 /// Non-fatal warnings from a vault operation (a folder-ACL or discovery-marker hiccup),
@@ -551,11 +561,18 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
     } else {
         false
     };
-    let open_error = state
-        .boot_open_error
-        .lock()
-        .map_err(|_| Error::Other("boot-error lock poisoned".into()))?
-        .clone();
+    // A set-aside vault = metadata already at the DEFAULT location while a pointer redirects
+    // elsewhere (a joiner's own vault, parked by the adopt). Only meaningful when pointed.
+    let has_set_aside_vault =
+        pointer.is_some() && matches!(vault::load_meta(&data_dir), Ok(Some(_)));
+    // The rejoin offer, probed so it self-heals: a retired folder that still answers with a
+    // vault (or is merely denied — repairable) keeps the offer; one that no longer holds a
+    // vault drops out. The record itself is kept — a drive that comes back re-offers.
+    let retired_root = vault::pointer::load_retired(&data_dir)
+        .ok()
+        .flatten()
+        .filter(|r| !matches!(vault::load_meta(&r.vault_root), Ok(None)))
+        .map(|r| r.vault_root.to_string_lossy().into_owned());
     Ok(VaultStatus {
         mode,
         needs_unlock: !state.is_unlocked(),
@@ -563,8 +580,10 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         location: resolved.vault_root.to_string_lossy().into_owned(),
         vault_id,
         retrieval_rebuild_needed,
-        open_error,
+        fault: state.vault_fault(),
         pointed_root: pointer.map(|p| p.vault_root.to_string_lossy().into_owned()),
+        has_set_aside_vault,
+        retired_root,
     })
 }
 
@@ -578,27 +597,22 @@ pub fn retry_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()
     let resolved = vault::resolve(&app)?;
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
-    let set_error = |value: Option<String>| -> Result<()> {
-        *state
-            .boot_open_error
-            .lock()
-            .map_err(|_| Error::Other("boot-error lock poisoned".into()))? = value;
-        Ok(())
-    };
     match vault::open_at_boot(&resolved, &meta) {
         Ok(Some((conn, master))) => {
+            // open_session clears the carried fault (the one healing choke point).
             state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
-            set_error(None)?;
             // Re-engage the cooperative writer lock now the store is open again.
             lock_session::engage(&app)?;
             Ok(())
         }
         Ok(None) => {
-            set_error(None)?;
+            // Now merely locked (key not cached) — the unlock prompt takes it from here.
+            state.set_vault_fault(None);
             Ok(())
         }
         Err(e) => {
-            set_error(Some(e.to_string()))?;
+            // Re-arm with the fresh story so the surface shows the current failure.
+            state.set_vault_fault(Some(VaultFault::from_error("open the vault", &e)));
             Err(e)
         }
     }
@@ -964,12 +978,33 @@ pub fn adopt_shared_vault(
     let root = std::path::PathBuf::from(&folder);
     let meta = match vault::load_meta(&root) {
         Ok(Some(m)) => m,
-        Ok(None) => return Err(Error::Other("no PM vault was found in that folder".into())),
+        Ok(None) => {
+            return Err(Error::Vault(VaultFault {
+                code: VaultFaultCode::NoVault,
+                op: "join the shared vault".into(),
+                path: Some(root.display().to_string()),
+                message: "No PM vault was found in that folder — pick the folder that holds \
+                          vault-meta.json and pm.sqlite."
+                    .into(),
+            }))
+        }
+        // A denied folder gets the joiner-persona story (the owner must add this account;
+        // an owner locked out of their own folder repairs it instead) — and stays a
+        // distinct code from wrong-passphrase, so "can't open the folder" is never read
+        // as "passphrase not working" (the lockout incident's most damaging conflation).
         Err(e) => {
-            return Err(Error::Other(format!(
-                "PM can't reach that folder ({e}) — the vault's owner needs to add this \
-                 Windows account first, under Manage sharing on their side"
-            )))
+            let fault = VaultFault::from_error("join the shared vault", &e);
+            let message = if fault.code == VaultFaultCode::Denied {
+                format!(
+                    "PM can't open that folder from this Windows account ({}). If someone \
+                     shared it with you, they need to add this account first (their PM: \
+                     Settings → Vault → Manage sharing). If it's yours, use Repair access.",
+                    fault.message
+                )
+            } else {
+                fault.message.clone()
+            };
+            return Err(Error::Vault(VaultFault { message, ..fault }));
         }
     };
     if meta.key_mode != vault::KeyMode::Passphrase {
@@ -995,12 +1030,16 @@ pub fn adopt_shared_vault(
         ));
     }
     let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
-    attach_profile_here(&app, &state, root, conn, runtime)?;
-    // A successful adopt supersedes any boot-time "vault unreachable" state.
-    *state
-        .boot_open_error
-        .lock()
-        .map_err(|_| Error::Other("boot-error lock poisoned".into()))? = None;
+    // attach_profile_here → open_session clears any carried "vault unreachable" fault.
+    attach_profile_here(&app, &state, root.clone(), conn, runtime)?;
+    // A completed rejoin retires the breadcrumb: if this folder is the one the profile
+    // once detached from, the "Rejoin …" offer has served its purpose. Best-effort.
+    let data_dir = paths::data_dir(&app)?;
+    if let Ok(Some(retired)) = vault::pointer::load_retired(&data_dir) {
+        if retired.vault_root == root {
+            let _ = vault::pointer::clear_retired(&data_dir);
+        }
+    }
     // M-3: if the meta was repaired on open, tell the user (non-blocking).
     emit_vault_meta_warning(&app, &meta_report);
     Ok(AdoptOutcome {
@@ -1009,22 +1048,23 @@ pub fn adopt_shared_vault(
     })
 }
 
-/// Leave the shared vault: clear this profile's pointer and reopen the local
-/// (default-location) vault — whatever was set aside at adopt time, or a fresh one on a
-/// profile that never had data. The shared folder itself is untouched. This is the
-/// escape hatch when the shared vault stops answering (owner revoked access, folder
-/// gone, vault made private).
+/// Leave the shared vault: RETIRE this profile's pointer (keeping the folder on record
+/// so Settings can offer a rejoin) and reopen the vault already at the default location
+/// if one was set aside (a joiner's own vault) — otherwise a fresh, EMPTY one. That
+/// empty case is real for an owner whose vault physically moved into the shared folder:
+/// the shared copy is then the only copy, kept on disk untouched and rejoinable with the
+/// passphrase. The UI confirms exactly which of the two the user is about to get before
+/// calling this. This is the escape hatch when the shared vault stops answering (owner
+/// revoked access, folder gone, vault made private).
 #[tauri::command]
 pub fn detach_from_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
     let data_dir = paths::data_dir(&app)?;
-    vault::pointer::clear(&data_dir)?;
+    vault::pointer::retire(&data_dir)?;
     // Close whatever is open (possibly the shared store) before reopening locally.
     let _ = state.take_conn();
     let _ = state.clear_vault_runtime();
-    *state
-        .boot_open_error
-        .lock()
-        .map_err(|_| Error::Other("boot-error lock poisoned".into()))? = None;
+    // The unreachable-shared-vault story no longer applies — this profile walked away.
+    state.set_vault_fault(None);
     let resolved = vault::resolve(&app)?;
     let meta = vault::ensure_device_meta(&resolved.vault_root)?;
     if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
@@ -1032,6 +1072,120 @@ pub fn detach_from_shared_vault(app: AppHandle, state: State<'_, AppState>) -> R
     }
     lock_session::engage(&app)?;
     Ok(())
+}
+
+/// What `repair_vault_access` achieved: whether the folder answers again, whether the
+/// store could be reopened right away (false + repaired ⇒ the passphrase prompt is
+/// next), and any non-fatal warnings.
+#[derive(Serialize)]
+pub struct RepairOutcome {
+    pub repaired: bool,
+    pub reopened: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Owner-side repair for a vault folder the OS is refusing: re-grant this account,
+/// verify the vault answers, best-effort restore the intended lockdown (owner + linked
+/// accounts), and reopen the session. Works even against a hostile DACL because the
+/// folder's OS owner retains implicit READ_CONTROL + WRITE_DAC on objects it created —
+/// exactly the account that shared the vault. Never elevates: when even this fails, the
+/// UI shows a copyable admin recipe instead. A joiner running it gets an honest denial
+/// (they don't own the folder) plus guidance to ask the owner.
+#[tauri::command]
+pub fn repair_vault_access(app: AppHandle, state: State<'_, AppState>) -> Result<RepairOutcome> {
+    let data_dir = paths::data_dir(&app)?;
+    // resolve_layout, not resolve(): resolve's create_dir_all may itself be the thing
+    // that's denied, and repair must reach the grant step regardless.
+    let Some(pointer) = vault::pointer::load(&data_dir)? else {
+        return Err(Error::Other(
+            "this account isn't pointed at a shared vault — there's nothing to repair".into(),
+        ));
+    };
+    let root = pointer.vault_root;
+    if let Err(e) = std::fs::metadata(&root) {
+        // Denied metadata still means the folder EXISTS (that's the repairable case);
+        // only a genuinely absent folder ends the repair here.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Err(Error::Vault(VaultFault {
+                code: VaultFaultCode::NotFound,
+                op: "repair the vault folder".into(),
+                path: Some(root.display().to_string()),
+                message: "That folder is gone — if it lives on a removable drive, plug it \
+                          in and try again."
+                    .into(),
+            }));
+        }
+    }
+    let mut warnings = Vec::new();
+    // (1) Additive self-grant, by SID. On the POSIX side a chmod-700 lockdown can't strip
+    // the owner in the first place, so the grant step is Windows-only.
+    #[cfg(windows)]
+    {
+        let me = vault::acl::current_user_sid()?;
+        vault::acl::grant_access(&root, &me).map_err(|e| {
+            Error::Vault(VaultFault {
+                code: VaultFaultCode::Denied,
+                op: "repair the vault folder".into(),
+                path: Some(root.display().to_string()),
+                message: format!(
+                    "Windows wouldn't let PM change the folder's permissions from this \
+                     account ({e})."
+                ),
+            })
+        })?;
+    }
+    // (2) The probe: the vault must actually answer now (ACLs are checked at handle-open,
+    // so this read is the honest test of whether the grant took effect).
+    let meta = vault::load_meta(&root)?.ok_or_else(|| {
+        Error::Vault(VaultFault {
+            code: VaultFaultCode::NoVault,
+            op: "repair the vault folder".into(),
+            path: Some(root.display().to_string()),
+            message: "The folder answers again, but it doesn't hold a PM vault any more.".into(),
+        })
+    })?;
+    // (3) Best-effort: restore the intended lockdown (owner + every linked account from
+    // the sidecar). Failure leaves the vault reachable-but-unlocked-down; encryption
+    // still protects the contents, so this is a warning, not a failed repair.
+    let linked = vault::access::principals(&root, &meta.vault_id);
+    if let Err(e) = vault::acl::restrict_to_owner(&root, &linked) {
+        warnings.push(format!(
+            "Access is restored, but PM couldn't re-apply the folder's protections ({e}) — \
+             other accounts on this PC may see the encrypted files (they still can't read \
+             their contents)."
+        ));
+    }
+    // (4) Reopen if the store is closed; a repaired-but-uncached passphrase vault falls
+    // through to the unlock prompt (repaired: true, reopened: false).
+    let mut reopened = false;
+    if state.is_unlocked() {
+        // A watcher-raised fault on a still-open session: the folder answers again.
+        state.set_vault_fault(None);
+    } else {
+        let resolved = vault::ResolvedVault {
+            vault_root: root.clone(),
+            db_path: root.join("pm.sqlite"),
+            markdown_dir: root.join("vault"),
+        };
+        if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
+            // open_session clears the carried fault (the one healing choke point).
+            state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+            reopened = true;
+        } else {
+            state.set_vault_fault(None);
+        }
+    }
+    if let Err(e) = lock_session::engage(&app) {
+        warnings.push(format!(
+            "PM couldn't re-engage its writer coordination ({e}) — restart PM before using \
+             the vault from another account."
+        ));
+    }
+    Ok(RepairOutcome {
+        repaired: true,
+        reopened,
+        warnings,
+    })
 }
 
 /// The suggested cross-account location for a shared vault, plus whether it looks

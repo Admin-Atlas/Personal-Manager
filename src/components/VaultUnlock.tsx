@@ -8,9 +8,10 @@
 // without it), which is exactly why there is no "open anyway" escape: there's no backdoor.
 
 import { useState } from "react";
-import { detachFromSharedVault, unlockVault } from "../lib/ipc";
+import { detachFromSharedVault, unlockVault, vaultFaultOf } from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
 import { Button, Input } from "./ui";
+import { DetachConfirm, RepairAccessButton } from "./VaultRecovery";
 
 export function VaultUnlock({
   status,
@@ -22,23 +23,42 @@ export function VaultUnlock({
   const [pass, setPass] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // An unlock that failed because the FOLDER is refusing access, not because the
+  // passphrase is wrong — the retype-forever trap from the lockout incident. Branch on
+  // the classified code, never on message text, and lead with Repair instead.
+  const [deniedPath, setDeniedPath] = useState<string | null>(null);
+  const [confirmDetach, setConfirmDetach] = useState(false);
 
   async function unlock() {
     if (busy || pass.trim().length === 0) return;
     setBusy(true);
     setError(null);
+    setDeniedPath(null);
     try {
       await unlockVault(pass);
       onUnlocked(); // this gate unmounts on success
     } catch (e) {
-      setError(String(e));
+      const fault = vaultFaultOf(e);
+      if (fault?.code === "denied") {
+        setDeniedPath(fault.path ?? status?.location ?? null);
+        setError(
+          "It's not the passphrase — Windows is refusing this account access to the vault folder.",
+        );
+      } else if (fault?.code === "wrong-passphrase") {
+        setError(
+          "That passphrase doesn't match this vault. If it was changed, check with whoever set it.",
+        );
+      } else {
+        setError(String(e));
+      }
       setBusy(false);
     }
   }
 
   // A joined (pointed) vault the user can't unlock — the owner changed the passphrase and didn't
   // share it, or revoked access — needs a way out that isn't "guess forever". Step back to a vault
-  // of your own; the shared folder is untouched and can be rejoined later.
+  // of your own (confirmed via DetachConfirm — it says exactly which vault is on the other side);
+  // the shared folder is untouched and can be rejoined later.
   async function detach() {
     if (busy) return;
     setBusy(true);
@@ -112,15 +132,27 @@ export function VaultUnlock({
         </Button>
       </form>
 
+      {/* The folder itself is refusing access — retyping the passphrase can't fix that. */}
+      {deniedPath !== null && (
+        <RepairAccessButton path={deniedPath} onRepaired={onUnlocked} variant="secondary" />
+      )}
+
       {status?.pointed_root && (
         <button
           className="text-xs text-ink4 underline underline-offset-2 hover:text-ink3"
           disabled={busy}
-          onClick={() => void detach()}
+          onClick={() => setConfirmDetach(true)}
         >
           Can't unlock? Use a vault on this account instead
         </button>
       )}
+
+      <DetachConfirm
+        open={confirmDetach}
+        onClose={() => setConfirmDetach(false)}
+        status={status}
+        onConfirm={() => void detach()}
+      />
 
       {status?.location && (
         <p className="max-w-xs break-all text-xs text-faint">{status.location}</p>

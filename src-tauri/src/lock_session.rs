@@ -112,18 +112,34 @@ pub fn engage(app: &AppHandle) -> Result<()> {
     // would abort the boot/adopt/detach flows that call this. Close the store as well as releasing
     // the lock: if this instance were somehow still the active writer with the store open, dropping
     // the lock alone would let another profile acquire it while we kept writing (split-brain). A
-    // closed store fails a DB command cleanly instead.
-    let close_and_disengage = || {
+    // closed store fails a DB command cleanly instead — but NEVER silently: record why, so the
+    // "vault is locked" story every later command tells is replaced by the real one (denied /
+    // gone), and emit `vault://fault` so the UI can raise its banner. The lockout incident was
+    // exactly this branch swallowing an access-denied folder as a wordless lock.
+    let close_and_disengage = |e: &crate::error::Error| {
         close_store(state);
         disengage(app);
+        let fault = crate::error::VaultFault::from_error("reach the shared vault", e);
+        eprintln!(
+            "vault: shared vault unreachable, store closed: {}",
+            fault.message
+        );
+        state.set_vault_fault(Some(fault.clone()));
+        let _ = app.emit("vault://fault", fault);
     };
-    let Ok(resolved) = vault::resolve(app) else {
-        close_and_disengage();
-        return Ok(());
+    let resolved = match vault::resolve(app) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            close_and_disengage(&e);
+            return Ok(());
+        }
     };
-    let Ok(meta) = vault::load_meta(&resolved.vault_root) else {
-        close_and_disengage();
-        return Ok(());
+    let meta = match vault::load_meta(&resolved.vault_root) {
+        Ok(meta) => meta,
+        Err(e) => {
+            close_and_disengage(&e);
+            return Ok(());
+        }
     };
     let is_shareable = matches!(
         meta.as_ref().map(|m| m.key_mode),
@@ -310,14 +326,49 @@ fn take_over(app: &AppHandle, root: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// How many CONSECUTIVE access-denied ticks the watcher tolerates before raising a
+/// vault fault (~4.5s at the 1.5s tick) — enough to ride out AV scan flapping, short
+/// enough that a mid-session ACL break is announced while the open handles still work.
+const WATCHER_DENIED_FAULT_TICKS: u32 = 3;
+
+/// Pure threshold rule for the watcher's denied-tick counter, split out so the
+/// "mid-session revoke gets announced, transient noise doesn't" policy unit-tests.
+fn watcher_fault_due(consecutive_denied: u32) -> bool {
+    consecutive_denied >= WATCHER_DENIED_FAULT_TICKS
+}
+
 /// Spawn the heartbeat + hand-off watcher. Runs for the life of the app; it is a no-op
 /// each tick unless a shared vault is engaged.
+///
+/// The watcher is also the earliest detector of a MID-SESSION access loss: its lock-file
+/// reads/writes open fresh handles every tick, so a broken folder ACL fails here minutes
+/// or hours before the user's next boot. Persistent denials raise the vault fault (and
+/// `vault://fault`) instead of only spamming stderr — the session keeps running on its
+/// open handles; the user just finally learns saving/coordination is degraded.
 pub fn spawn_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let mut denied_ticks: u32 = 0;
         loop {
             tokio::time::sleep(Duration::from_millis(TICK_INTERVAL_MS)).await;
-            if let Err(e) = tick(&app) {
-                eprintln!("vault: lock watcher tick failed: {e}");
+            match tick(&app) {
+                Ok(()) => denied_ticks = 0,
+                Err(e) => {
+                    eprintln!("vault: lock watcher tick failed: {e}");
+                    denied_ticks = if e.is_denied() { denied_ticks + 1 } else { 0 };
+                    if watcher_fault_due(denied_ticks) {
+                        let state = app.state::<AppState>();
+                        let state = state.inner();
+                        // First writer wins: engage/boot may already carry a richer story.
+                        if state.vault_fault().is_none() {
+                            let fault = crate::error::VaultFault::from_error(
+                                "keep the shared vault's writer lock fresh",
+                                &e,
+                            );
+                            state.set_vault_fault(Some(fault.clone()));
+                            let _ = app.emit("vault://fault", fault);
+                        }
+                    }
+                }
             }
         }
     });
@@ -517,5 +568,17 @@ mod tests {
             next_action(LockMode::Waiting, true, true, true),
             TickAction::Idle
         );
+    }
+
+    #[test]
+    fn watcher_fault_waits_out_transient_denials() {
+        // One or two denied ticks are AV/indexer flapping; the third in a row is a broken
+        // folder ACL worth announcing. (The caller resets the counter on any success or
+        // non-denied error, so only a consecutive run reaches 3.)
+        assert!(!watcher_fault_due(0));
+        assert!(!watcher_fault_due(1));
+        assert!(!watcher_fault_due(2));
+        assert!(watcher_fault_due(3));
+        assert!(watcher_fault_due(4));
     }
 }

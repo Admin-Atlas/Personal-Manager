@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.7.0-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "If Windows ever blocks PM from its own vault folder, PM now says exactly that — and offers a one-click “Repair access” that fixes the folder's permissions and opens your vault again. Before, a blocked folder showed up as a confusing wall of “the vault is locked” messages, a restart landed on a dead-end error screen, and rejoining looked like your passphrase had stopped working. Your data was never gone — now PM says so, in plain words, on every screen it could happen.",
+      "Every vault problem now tells you what's actually wrong and what to do about it: a folder PM can't reach points to Repair access, a folder that's gone says so, a wrong passphrase says it's the passphrase (and only when it really is), and a damaged vault file is called damaged — four different problems that used to look identical.",
+      "“Use a vault on this account instead” now explains what will happen before it does anything — whether you'll get back the vault that was set aside when you joined, or start with an empty one — and PM remembers the shared vault you left, so Settings can offer “Rejoin” with one click later. Nothing in the shared folder is ever deleted.",
+      "Two protections against losing a shared vault by accident: “Remove PM data” on an account that's joined a shared vault now cleans up only that account's own data and leaves the shared vault untouched for everyone else, and the “start fresh” recovery can no longer delete a vault that's merely blocked by permissions.",
+    ],
+  },
+  {
     version: "3.6.4-alpha",
     date: "2026-07-13",
     highlights: [

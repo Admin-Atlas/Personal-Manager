@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { invoke, Channel } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { RepairOutcome, VaultFault } from "./types";
 import type {
   AppLockStatus,
   BackupEntry,
@@ -85,6 +86,44 @@ import type {
   WipeReport,
   WipeSelection,
 } from "./types";
+
+/** A rejected vault command, carrying the backend's classified `VaultFault` so the five
+ *  vault recovery surfaces can branch on `fault.code` instead of string-matching. Its
+ *  `message`/`toString()` stay the ready-to-show sentence, so the ~200 existing
+ *  `String(e)` call sites keep rendering cleanly. */
+export class VaultError extends Error {
+  constructor(public readonly fault: VaultFault) {
+    super(fault.message);
+    this.name = "VaultError";
+  }
+  toString() {
+    return this.message;
+  }
+}
+
+/** The classified fault behind a caught error, or null for any other rejection. */
+export const vaultFaultOf = (e: unknown): VaultFault | null =>
+  e instanceof VaultError ? e.fault : null;
+
+/** Whether a rejection is the backend's one structured error shape (Rust `Error::Vault`
+ *  serializes `{code, op, path, message}`; every other variant stays a bare string). */
+function isVaultFaultShaped(e: unknown): e is VaultFault {
+  if (typeof e !== "object" || e === null) return false;
+  const f = e as Record<string, unknown>;
+  return typeof f.code === "string" && typeof f.op === "string" && typeof f.message === "string";
+}
+
+/** The one invoke used by every wrapper below: passes results and string rejections
+ *  through untouched, and normalizes the single structured rejection shape into a
+ *  `VaultError` — so no caller can ever see `[object Object]`, and no vault-path command
+ *  can be missed by a per-wrapper list. */
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await tauriInvoke<T>(cmd, args);
+  } catch (e) {
+    throw isVaultFaultShaped(e) ? new VaultError(e) : e;
+  }
+}
 
 export const hasOpenRouterKey = () => invoke<boolean>("has_openrouter_key");
 
@@ -249,9 +288,23 @@ export const listSharedVaults = () => invoke<SharedVaultAd[]>("list_shared_vault
 export const adoptSharedVault = (folder: string, passphrase: string) =>
   invoke<AdoptOutcome>("adopt_shared_vault", { folder, passphrase });
 
-/** Leave the shared vault: clear this profile's pointer and reopen the local vault that
- *  was set aside at join time. The shared folder itself is untouched. */
+/** Leave the shared vault: retire this profile's pointer (kept on record so Settings can
+ *  offer a rejoin) and reopen the vault set aside at join time — or a fresh, EMPTY one for
+ *  an owner whose vault physically moved into the shared folder. The shared folder itself
+ *  is untouched. Callers confirm via DetachConfirm first — this is not a silent switch. */
 export const detachFromSharedVault = () => invoke<void>("detach_from_shared_vault");
+
+/** Owner-side repair for a vault folder the OS is refusing (`fault.code === "denied"`):
+ *  re-grant this account, restore the intended lockdown, and reopen the session. Works
+ *  even against a hostile DACL (the folder's OS owner keeps implicit permission-editing
+ *  rights); never elevates — on failure the UI shows a copyable admin recipe instead. */
+export const repairVaultAccess = () => invoke<RepairOutcome>("repair_vault_access");
+
+/** Subscribe to `vault://fault` — emitted when PM loses access to the shared vault folder
+ *  mid-session (the store closed, or the writer-lock heartbeat started failing), so the
+ *  app can raise a banner naming the real problem instead of a generic "vault is locked". */
+export const onVaultFault = (handler: (fault: VaultFault) => void): Promise<UnlistenFn> =>
+  listen<VaultFault>("vault://fault", (e) => handler(e.payload));
 
 /** Where a shared vault should live so every account can reach it (null path ⇒ ask the
  *  user to pick a folder), plus whether that base looks writable from here. */

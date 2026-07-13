@@ -25,6 +25,8 @@ import type { PassphraseScore, VaultStatus } from "../lib/types";
 import { Button, Input } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { ShareVaultWizard } from "./ShareVaultWizard";
+import { RepairAccessButton } from "./VaultRecovery";
+import { joinErrorMessage } from "./VaultJoin";
 import { markJustJoinedVault } from "../lib/joinedVault";
 
 /** Which inline form/confirmation is currently open (only one at a time). */
@@ -123,7 +125,8 @@ export function VaultCard() {
       markJustJoinedVault();
       window.location.reload();
     } catch (e) {
-      setError(String(e));
+      // Classified copy: folder-denied ≠ wrong passphrase ≠ no vault ≠ damaged store.
+      setError(joinErrorMessage(e));
       setBusy(false);
     }
   }
@@ -144,6 +147,44 @@ export function VaultCard() {
           {shareable && status.markdown_encrypted ? ", with Markdown encrypted at rest" : ""}.{" "}
           <span className="break-all">{status.location}</span>
         </p>
+      )}
+
+      {/* The mid-session heal: PM lost access to the vault folder (the watcher or a command
+          noticed) — name it and offer the one-click repair right here, while other views can
+          only report their operations failing. */}
+      {status?.fault && (
+        <div className="mt-3 space-y-2 rounded-[var(--radius-sm)] border border-border2 p-3">
+          <p
+            className="break-words rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
+            style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+          >
+            {status.fault.message}
+          </p>
+          {status.fault.code === "denied" && (
+            <RepairAccessButton
+              path={status.fault.path ?? status.pointed_root ?? null}
+              onRepaired={() => void refresh()}
+              variant="secondary"
+            />
+          )}
+        </div>
+      )}
+
+      {/* The way back to a shared vault this account once left: one click re-opens the
+          adopt form on the recorded folder (passphrase still required — nothing silent). */}
+      {status?.retired_root && !status.pointed_root && pending !== "adopt" && (
+        <div className="mt-3">
+          <Button
+            variant="tertiary"
+            disabled={busy}
+            onClick={() => {
+              setAdoptFolder(status.retired_root);
+              setPending("adopt");
+            }}
+          >
+            Rejoin the shared vault at {status.retired_root}…
+          </Button>
+        </div>
       )}
 
       {/* Device-only → the guided share flow (passphrase → shared folder → accounts). */}
