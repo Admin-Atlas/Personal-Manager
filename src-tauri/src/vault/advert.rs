@@ -32,6 +32,13 @@ pub struct SharedVaultAd {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub owner: Option<String>,
     pub updated_at: String,
+    /// A TOMBSTONE marker: when set (RFC3339), the owner deliberately DELETED this shared
+    /// vault. It stays in place as positive evidence so a joiner — whose pointed folder is
+    /// now gone — can tell "the owner deleted it" (switch back to a local vault, with a
+    /// notice) apart from "the drive is unplugged" (offer Retry). Never shown as a join
+    /// offer. Additive + backward-compatible: an old ad without the field reads as `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub deleted_at: Option<String>,
 }
 
 impl SharedVaultAd {
@@ -52,17 +59,30 @@ impl SharedVaultAd {
             label,
             owner,
             updated_at: chrono::Utc::now().to_rfc3339(),
+            deleted_at: None,
+        }
+    }
+
+    /// Build a TOMBSTONE ad for a vault the owner just deleted: same identity, with
+    /// `deleted_at` stamped now. Overwrites the live ad (see [`publish`], which now treats
+    /// a tombstone as changed content), so a joiner's next launch finds the deletion.
+    pub fn tombstone(vault_id: &str, vault_root: &Path) -> Self {
+        Self {
+            deleted_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Self::for_vault(vault_id, vault_root)
         }
     }
 
     /// Whether two ads say the same thing (ignoring the timestamp), so a republish of
     /// unchanged facts can skip the write — a joiner's best-effort self-heal would
-    /// otherwise fail on the owner-owned file every boot.
+    /// otherwise fail on the owner-owned file every boot. `deleted_at` IS compared, so a
+    /// tombstone always counts as changed content and overwrites a live ad.
     fn same_content(&self, other: &Self) -> bool {
         self.vault_id == other.vault_id
             && self.vault_root == other.vault_root
             && self.label == other.label
             && self.owner == other.owner
+            && self.deleted_at == other.deleted_at
     }
 }
 
@@ -155,9 +175,29 @@ pub fn filter_adoptable(
     root_has_meta: impl Fn(&Path) -> bool,
 ) -> Vec<SharedVaultAd> {
     ads.into_iter()
+        .filter(|ad| ad.deleted_at.is_none()) // a tombstoned vault is never a join offer
         .filter(|ad| Some(ad.vault_id.as_str()) != current_vault_id)
         .filter(|ad| root_has_meta(&ad.vault_root))
         .collect()
+}
+
+/// Whether a folder this profile points at was DELETED by its owner — a tombstone ad names
+/// it AND no live ad has since re-shared the same path (a re-share supersedes the tombstone,
+/// so a fresh live vault there is a normal join, not a deletion). Pure, so the joiner-boot
+/// decision unit-tests without the ProgramData folder. The joiner matches by PATH because,
+/// once the folder is gone, it can't read the vault id out of it any more.
+pub fn deletion_tombstone_for<'a>(
+    ads: &'a [SharedVaultAd],
+    pointed_root: &Path,
+) -> Option<&'a SharedVaultAd> {
+    let at_root = |ad: &&SharedVaultAd| ad.vault_root == pointed_root;
+    let superseded = ads.iter().filter(at_root).any(|ad| ad.deleted_at.is_none());
+    if superseded {
+        return None;
+    }
+    ads.iter()
+        .filter(at_root)
+        .find(|ad| ad.deleted_at.is_some())
 }
 
 /// The first free location for a new shared vault: `base\name`, then `base\name 2`,
@@ -189,6 +229,14 @@ mod tests {
             label: format!("label-{id}"),
             owner: Some("owner-a".into()),
             updated_at: "2026-07-13T00:00:00Z".into(),
+            deleted_at: None,
+        }
+    }
+
+    fn tombstone_ad(id: &str, root: &str) -> SharedVaultAd {
+        SharedVaultAd {
+            deleted_at: Some("2026-07-13T01:00:00Z".into()),
+            ..ad(id, root)
         }
     }
 
@@ -249,6 +297,38 @@ mod tests {
         let out = filter_adoptable(ads, None, |root| root != Path::new("/c"));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].vault_id, "mine");
+    }
+
+    #[test]
+    fn a_tombstone_overwrites_the_live_ad_and_is_never_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        publish(dir.path(), &ad("v1", "/shared/one")).unwrap();
+        // The owner deletes: a tombstone (same vault_id) overwrites the live ad, even
+        // though everything but deleted_at matches (same_content now compares deleted_at).
+        publish(
+            dir.path(),
+            &SharedVaultAd::tombstone("v1", Path::new("/shared/one")),
+        )
+        .unwrap();
+        let listed = list(dir.path());
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].deleted_at.is_some(), "the ad is now a tombstone");
+        // A tombstoned vault is filtered out of join offers even though its root "has meta".
+        assert!(filter_adoptable(listed, None, |_| true).is_empty());
+    }
+
+    #[test]
+    fn deletion_tombstone_matches_by_root_and_a_reshare_supersedes_it() {
+        let root = "/shared/one";
+        // A tombstone for the pointed root is a positive "owner deleted it" signal.
+        let ads = vec![tombstone_ad("old", root)];
+        assert!(deletion_tombstone_for(&ads, Path::new(root)).is_some());
+        // No tombstone at a different root.
+        assert!(deletion_tombstone_for(&ads, Path::new("/shared/other")).is_none());
+        // A later LIVE ad re-sharing the same path supersedes the tombstone (a fresh vault
+        // there is a normal join, not a deletion notice).
+        let ads = vec![tombstone_ad("old", root), ad("new", root)];
+        assert!(deletion_tombstone_for(&ads, Path::new(root)).is_none());
     }
 
     #[test]

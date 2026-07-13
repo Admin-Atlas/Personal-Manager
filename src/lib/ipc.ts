@@ -300,6 +300,17 @@ export const detachFromSharedVault = () => invoke<void>("detach_from_shared_vaul
  *  rights); never elevates — on failure the UI shows a copyable admin recipe instead. */
 export const repairVaultAccess = () => invoke<RepairOutcome>("repair_vault_access");
 
+/** Owner-side deletion of the shared vault: remove it from the shared folder, leave a
+ *  tombstone so every joined account is told it's gone at next launch, and switch this
+ *  account back to a vault of its own. Distinct from make-private (keeps the data) and
+ *  detach (leaves the shared copy). Returns non-fatal warnings. */
+export const deleteSharedVault = () => invoke<VaultOpOutcome>("delete_shared_vault");
+
+/** Joiner-side acknowledgement that the shared vault was deleted by its owner: switch back
+ *  to a vault on this account (no rejoin breadcrumb — it's gone for good) and drop the
+ *  cached key. Called from the one-time deletion notice. */
+export const acknowledgeDeletedSharedVault = () => invoke<void>("acknowledge_deleted_shared_vault");
+
 /** Subscribe to `vault://fault` — emitted when PM loses access to the shared vault folder
  *  mid-session (the store closed, or the writer-lock heartbeat started failing), so the
  *  app can raise a banner naming the real problem instead of a generic "vault is locked". */

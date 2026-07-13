@@ -1028,6 +1028,8 @@ pub fn run() {
             commands::adopt_shared_vault,
             commands::detach_from_shared_vault,
             commands::repair_vault_access,
+            commands::delete_shared_vault,
+            commands::acknowledge_deleted_shared_vault,
             commands::suggest_shared_vault_location,
             commands::list_local_accounts,
             commands::vault_lock_status,

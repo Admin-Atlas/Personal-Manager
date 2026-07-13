@@ -14,8 +14,9 @@
 //    shared folder is deleted.
 
 import { useState } from "react";
-import { repairVaultAccess } from "../lib/ipc";
-import type { VaultStatus } from "../lib/types";
+import { acknowledgeDeletedSharedVault, repairVaultAccess } from "../lib/ipc";
+import type { DeletedVaultNotice as DeletedNotice, VaultStatus } from "../lib/types";
+import { formatDateOnly } from "../lib/format";
 import { Button, Modal } from "./ui";
 
 /** The admin fallback recipe for `path`, shown when in-app repair fails. `%USERNAME%`
@@ -116,6 +117,67 @@ export function RepairAccessButton({
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+export function DeletedVaultNotice({
+  notice,
+  onAcknowledged,
+}: {
+  /** The tombstone record: which shared folder was deleted, and when. */
+  notice: DeletedNotice;
+  /** Called after the switch-to-local completes — reload boot state; this screen unmounts. */
+  onAcknowledged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const when = notice.deleted_at ? formatDateOnly(notice.deleted_at) : null;
+
+  async function acknowledge() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await acknowledgeDeletedSharedVault();
+      onAcknowledged();
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-4 bg-bg px-6 text-center">
+      <div className="flex h-12 w-12 items-center justify-center rounded-full border border-border text-ink2">
+        {/* Info glyph — no icon dependency (matches the other vault gates). */}
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.6" />
+          <path d="M12 11v5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+          <circle cx="12" cy="7.6" r="0.9" fill="currentColor" />
+        </svg>
+      </div>
+      <div>
+        <h1 className="font-ui text-lg font-semibold text-ink">The shared vault was deleted</h1>
+        <p className="mt-1 max-w-sm text-sm text-ink4">
+          The shared vault
+          {when ? ` was deleted by its owner on ${when}` : " was deleted by its owner"}. PM will
+          switch you back to the vault on this account — anything that was only in the shared vault
+          is no longer available here.
+        </p>
+      </div>
+      {error && (
+        <p
+          className="max-w-xs break-words rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
+          style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+        >
+          {error}
+        </p>
+      )}
+      <Button variant="primary" disabled={busy} onClick={() => void acknowledge()}>
+        {busy ? "Switching…" : "Continue"}
+      </Button>
+      <p className="max-w-sm break-all text-xs text-faint">{notice.folder}</p>
     </div>
   );
 }

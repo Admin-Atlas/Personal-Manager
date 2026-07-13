@@ -507,6 +507,19 @@ pub struct VaultStatus {
     /// access-denied — repairable), so Settings can offer "Rejoin …". `None` when never
     /// detached, or when the folder no longer holds a vault (the offer self-heals away).
     pub retired_root: Option<String>,
+    /// Set when the shared vault this profile points at was DELETED by its owner (a tombstone
+    /// marks the folder) — the folder, and when it was deleted. The UI shows a one-time notice
+    /// and switches back to a local vault, instead of the generic "couldn't open" screen.
+    pub deleted_notice: Option<DeletedVaultNotice>,
+}
+
+/// The joiner-facing record that a pointed shared vault was deleted by its owner (from the
+/// discovery tombstone). Drives the one-time "switched you back to your own vault" notice.
+#[derive(Serialize)]
+pub struct DeletedVaultNotice {
+    pub folder: String,
+    /// RFC3339; the UI formats it (DD-MM-YYYY).
+    pub deleted_at: Option<String>,
 }
 
 /// Non-fatal warnings from a vault operation (a folder-ACL or discovery-marker hiccup),
@@ -573,6 +586,17 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         .flatten()
         .filter(|r| !matches!(vault::load_meta(&r.vault_root), Ok(None)))
         .map(|r| r.vault_root.to_string_lossy().into_owned());
+    // A pointed folder that no longer holds a vault AND is tombstoned = the owner deleted it.
+    // Only checked when we're pointed at a folder that isn't currently answering (no meta),
+    // so a live shared vault never triggers the notice. Matched by PATH (the id is unreadable
+    // once the folder is gone). Discovery is Windows-only, so this is `None` elsewhere.
+    let deleted_notice = pointer.as_ref().filter(|_| meta.is_none()).and_then(|p| {
+        let ads = vault::advert::ads_dir().map(|d| vault::advert::list(&d))?;
+        vault::advert::deletion_tombstone_for(&ads, &p.vault_root).map(|ad| DeletedVaultNotice {
+            folder: p.vault_root.to_string_lossy().into_owned(),
+            deleted_at: ad.deleted_at.clone(),
+        })
+    });
     Ok(VaultStatus {
         mode,
         needs_unlock: !state.is_unlocked(),
@@ -584,6 +608,7 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         pointed_root: pointer.map(|p| p.vault_root.to_string_lossy().into_owned()),
         has_set_aside_vault,
         retired_root,
+        deleted_notice,
     })
 }
 
@@ -1154,6 +1179,104 @@ pub fn detach_from_shared_vault(app: AppHandle, state: State<'_, AppState>) -> R
     }
     lock_session::engage(&app)?;
     Ok(())
+}
+
+/// Switch this profile back to a vault on its own account after the shared vault it
+/// pointed at was DELETED by its owner (the joiner-side acknowledgement of a tombstone).
+/// Unlike detach, this does NOT retire the pointer for a later rejoin — the shared vault is
+/// gone for good — and it drops this profile's cached key for it. Idempotent-ish: safe to
+/// call even if the folder briefly reappears (the tombstone is the authority the UI acted
+/// on). The set-aside local vault (a joiner's own) reopens, or a fresh empty one is minted.
+#[tauri::command]
+pub fn acknowledge_deleted_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    let data_dir = paths::data_dir(&app)?;
+    // Drop this profile's cached key for the deleted vault before we forget which vault it
+    // was (the pointer names the folder; the meta named the id — read it while we still can).
+    if let Some(pointer) = vault::pointer::load(&data_dir)? {
+        if let Ok(Some(meta)) = vault::load_meta(&pointer.vault_root) {
+            let _ = secrets::clear_cached_vault_key(&meta.vault_id);
+        }
+    }
+    vault::pointer::clear(&data_dir)?;
+    vault::pointer::clear_retired(&data_dir)?;
+    let _ = state.take_conn();
+    let _ = state.clear_vault_runtime();
+    state.set_vault_fault(None);
+    let resolved = vault::resolve(&app)?;
+    let meta = vault::ensure_device_meta(&resolved.vault_root)?;
+    if let Some((conn, master)) = vault::open_at_boot(&resolved, &meta)? {
+        state.open_session(conn, VaultRuntime::build(&resolved, &meta, &master))?;
+    }
+    lock_session::engage(&app)?;
+    Ok(())
+}
+
+/// Owner-side deletion of a shared vault: remove the DB + artifacts from the shared folder,
+/// leave a tombstone so every joined account learns it's gone at their next launch, and
+/// switch THIS account back to a vault of its own. Distinct from make-private (which keeps
+/// the data, just re-privatises it) and from detach (which leaves the shared copy intact) —
+/// this is the deliberate "take the shared vault away from everyone" action. Any account
+/// with write access to the folder can run it (it can't be hard-gated to the OS owner), so
+/// the UI warns when the caller isn't the advertised owner.
+#[tauri::command]
+pub fn delete_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result<VaultOpOutcome> {
+    let data_dir = paths::data_dir(&app)?;
+    let Some(pointer) = vault::pointer::load(&data_dir)? else {
+        return Err(Error::Other(
+            "this account isn't using a shared vault, so there's nothing to delete here".into(),
+        ));
+    };
+    let root = pointer.vault_root;
+    if root.starts_with(&data_dir) {
+        return Err(Error::Other(
+            "this vault lives in your own account's folder — use \"Make private\" or \"Remove \
+             PM data\" instead of deleting a shared vault"
+                .into(),
+        ));
+    }
+    let meta = vault::load_meta(&root)?
+        .ok_or_else(|| Error::Other("this folder no longer holds a PM vault".into()))?;
+    let mut warnings = Vec::new();
+
+    // Close our handle, then remove the vault from the shared folder. Reset any lockdown
+    // first so the artifacts are deletable, then strip PM's files and drop the folder if it
+    // was ours alone (leaving any unrelated files the user kept there).
+    let _ = state.take_conn();
+    let _ = state.clear_vault_runtime();
+    let _ = vault::acl::reset_inheritance(&root);
+    vault::migrate::delete_vault_artifacts(&root);
+    if let Ok(mut entries) = std::fs::read_dir(&root) {
+        if entries.next().is_none() {
+            let _ = std::fs::remove_dir(&root);
+        }
+    }
+
+    // Leave the tombstone so joiners learn it was deleted (not merely unreachable), and drop
+    // our own cached key for it. Both best-effort — the vault is already gone from disk.
+    if let Some(ads) = vault::advert::ads_dir() {
+        if let Err(e) = vault::advert::publish(
+            &ads,
+            &vault::advert::SharedVaultAd::tombstone(&meta.vault_id, &root),
+        ) {
+            warnings.push(format!(
+                "PM removed the shared vault but couldn't leave a deletion marker ({e}); other \
+                 accounts will see it as unreachable rather than deleted."
+            ));
+        }
+    }
+    let _ = secrets::clear_cached_vault_key(&meta.vault_id);
+
+    // Switch this account back to a vault of its own (the detach tail).
+    vault::pointer::clear(&data_dir)?;
+    vault::pointer::clear_retired(&data_dir)?;
+    state.set_vault_fault(None);
+    let resolved = vault::resolve(&app)?;
+    let local_meta = vault::ensure_device_meta(&resolved.vault_root)?;
+    if let Some((conn, master)) = vault::open_at_boot(&resolved, &local_meta)? {
+        state.open_session(conn, VaultRuntime::build(&resolved, &local_meta, &master))?;
+    }
+    engage_or_warn(&app, &mut warnings);
+    Ok(VaultOpOutcome { warnings })
 }
 
 /// What `repair_vault_access` achieved: whether the folder answers again, whether the
