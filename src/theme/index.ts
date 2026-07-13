@@ -14,6 +14,8 @@ export {
   RADII,
   PROFILES,
   ACCENTS,
+  ACCENT_NAMES,
+  accentName,
   STATUS,
   MONO_ACCENT,
   MONO_RAMP,

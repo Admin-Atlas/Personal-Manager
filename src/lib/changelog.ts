@@ -29,6 +29,16 @@ export const CHANGELOG: ChangelogEntry[] = [
     ],
   },
   {
+    version: "3.8.0-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "Pinboard notes and timelines can now have a title — click the label at the top of a card (it starts as “Note” or “Timeline”) and type your own. The Ingest button moved up into that top bar too, so notes get their full height back for what you're actually writing.",
+      "Stack it to file it: drop a note exactly on top of another the same size and the two fold into a tidy folder tile that shows how many cards are inside. Open it to read and edit them in place (or as a pop-out overlay), give the folder its own name, drag a card back out, and the folder quietly dissolves once it's down to one. Timelines can go in folders too, and a folder's ✕ just spills its cards back onto the board — it never deletes them.",
+      "Every colour now tells you its name on hover — the note tint dots on the pinboard and every theme swatch in Settings, not just the monochrome one.",
+      "While you're editing a note, hovering the formatting buttons (bold, lists, checklist…) reliably shows what each one does and its keyboard shortcut again.",
+    ],
+  },
+  {
     version: "3.7.2-alpha",
     date: "2026-07-13",
     highlights: [
