@@ -33,11 +33,23 @@ export type { ModeResolution, ModeSource } from "./resolveMode";
 export { sunTimes, isDaytime, nextTransition } from "./solar";
 export type { SunTimes } from "./solar";
 
-export { coordsForTimezone, deviceCoords, parseCoords, formatCoords } from "./timezones";
+export {
+  coordsForTimezone,
+  deviceCoords,
+  parseCoords,
+  formatCoords,
+  deviceTimeZone,
+  coordsFor,
+  allTimeZones,
+  isValidTimeZone,
+} from "./timezones";
 export type { Coords } from "./timezones";
 
 export { ThemeProvider, useTheme } from "./ThemeContext";
 export type { ThemeState } from "./ThemeContext";
+
+export { UserTimeProvider, useUserTime } from "./UserTimeContext";
+export type { UserTime } from "./UserTimeContext";
 
 export { useDepth } from "./depth";
 export type { DepthState } from "./depth";

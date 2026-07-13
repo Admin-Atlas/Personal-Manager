@@ -10,7 +10,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
-import type { CalendarRange } from "../../../lib/calendarPrefs";
+import type { CalendarRange, RangeBounds } from "../../../lib/calendarPrefs";
 import {
   assignColumns,
   dayKey,
@@ -23,7 +23,7 @@ import {
   type TimedInput,
 } from "../../../lib/calendar-layout";
 import { formatClock } from "../../../lib/format";
-import { useDepth } from "../../../theme";
+import { deviceTimeZone, useDepth } from "../../../theme";
 import { cn } from "../../ui";
 import { EventCard } from "../parts/EventCard";
 import { NowLine } from "../parts/NowLine";
@@ -36,20 +36,41 @@ interface Props {
   events: CalendarEvent[];
   colorOf: (calendarId: string) => string;
   range: CalendarRange;
+  /** The visible-hour window this range frames (start/end in decimal hours). The grid still spans a
+   *  scrollable full 24h — these only set the initial framing/scroll and the row scale. */
+  bounds: RangeBounds;
+  /** Up to 2 extra IANA zones to show as gutter columns beside the local time. */
+  zones: string[];
 }
 
-const GUTTER_PX = 54;
+const LOCAL_COL = 54; // width of the local hour column (px)
+const ZONE_COL = 46; // width of each extra-zone column (px)
 const HOURS = 24;
+const MIN_ROW_H = 20; // never scrunch a row below this
+const MIN_WINDOW = 1; // guard divide-by-tiny in the row-height fill
 
-// Vertical scale per range, plus the hour window each is framed on. The grid always spans the full
-// 24h (nothing is ever un-scrollable-to) — `scrollHour` positions the body on mount, and
-// `windowHours` is how many of those hours should fill the body exactly (stretching rowH beyond the
-// preset when the body's taller than a fixed-size grid would need, so there's no dead space below).
-const GEOM: Record<CalendarRange, { rowH: number; scrollHour: number; windowHours: number }> = {
-  work: { rowH: 52, scrollHour: 8, windowHours: 24 },
-  day: { rowH: 36, scrollHour: 8, windowHours: 12 },
-  full: { rowH: 20, scrollHour: 0, windowHours: 24 },
-};
+/** Short, friendly display for a zone: last path segment with underscores as spaces. */
+function zoneShort(tz: string): string {
+  return (tz.split("/").pop() ?? tz).replace(/_/g, " ");
+}
+
+/** The 24 hour labels for `zone`, formatting the same absolute instants the local column marks on
+ *  `refDay` — DST-safe, and shows fractional offsets (Kolkata :30, Kathmandu :45) natively. */
+function zoneHourLabels(refDay: Date, zone: string): string[] {
+  try {
+    const f = new Intl.DateTimeFormat("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      timeZone: zone,
+    });
+    return Array.from({ length: HOURS }, (_, h) =>
+      f.format(new Date(refDay.getFullYear(), refDay.getMonth(), refDay.getDate(), h)),
+    );
+  } catch {
+    return Array(HOURS).fill("");
+  }
+}
 
 // Position/size are kept as minute values so lane packing is independent of rowH — the pixel
 // multiply happens at render, so a resize (which only changes rowH) never re-runs the packing memo.
@@ -69,9 +90,13 @@ interface DayColumn {
   cards: CardGeom[];
 }
 
-export function TimeGridView({ days, events, colorOf, range }: Props) {
+export function TimeGridView({ days, events, colorOf, range, bounds, zones }: Props) {
   const { minimal, showPower } = useDepth();
-  const { rowH: presetRowH, scrollHour, windowHours } = GEOM[range];
+  // Derived from the framed window: scroll to its start on mount, stretch rows so the window fills
+  // the body exactly. The grid itself always spans the full 24h; scrolling reaches the rest.
+  const windowHours = Math.max(bounds.endHour - bounds.startHour, MIN_WINDOW);
+  const scrollHour = bounds.startHour;
+  const gutterPx = LOCAL_COL + zones.length * ZONE_COL;
   const scrollRef = useRef<HTMLDivElement>(null);
   const [bodyHeight, setBodyHeight] = useState(0);
 
@@ -87,13 +112,21 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  // Stretch rows so the range's window (not necessarily the full 24h) fills the body exactly —
-  // never shrink below the preset, so `work`'s tall business-hours grid still needs a scroll as
-  // designed. The grid itself always spans the full 24h; scrolling reaches whatever's outside the
-  // window (e.g. `day`'s 08–20 default framing).
-  const rowH = bodyHeight > 0 ? Math.max(presetRowH, bodyHeight / windowHours) : presetRowH;
+  // Stretch rows so the framed window fills the body exactly. A narrow window (e.g. Work's ~9h) makes
+  // tall rows and the full-24h grid scrolls; a wide one is floored at MIN_ROW_H so a short pane can't
+  // crush rows below legibility (it scrolls instead). The grid always spans the full 24h — scrolling
+  // reaches whatever sits outside the framed window.
+  const rowH = bodyHeight > 0 ? Math.max(MIN_ROW_H, bodyHeight / windowHours) : MIN_ROW_H * 2;
 
   const bandEvents = useMemo(() => events.filter((e) => e.all_day || isMultiDay(e)), [events]);
+
+  // The extra-zone gutter labels, computed against the first visible day (one shared axis across a
+  // week — see the DST caveat below). Recomputed only when the zones or the anchor day change.
+  const refDay = days[0];
+  const zoneLabels = useMemo(
+    () => zones.map((zone) => ({ zone, labels: refDay ? zoneHourLabels(refDay, zone) : [] })),
+    [zones, refDay],
+  );
 
   const columns = useMemo<DayColumn[]>(() => {
     const todayKey = dayKey(startOfDay(new Date()));
@@ -125,13 +158,16 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
       const cards: CardGeom[] = dayEvents.map((ev, i) => {
         const input = inputs[i];
         const info = laneOf.get(ev.id) ?? { lane: 0, lanes: 1 };
+        const startD = parseLocal(ev.start, false)!;
+        const endD = ev.end ? parseLocal(ev.end, false) : null;
         return {
           ev,
           startMin: input.startMin,
           durMin: Math.max(input.endMin - input.startMin, 1),
           leftPct: (info.lane / info.lanes) * 100,
           widthPct: 100 / info.lanes,
-          timeLabel: formatClock(parseLocal(ev.start, false)!),
+          // Show start–end (en-dash); fall back to start-only when there's no/invalid end.
+          timeLabel: endD ? `${formatClock(startD)}–${formatClock(endD)}` : formatClock(startD),
         };
       });
       // Total events touching the day (timed + bands overlapping), for the Power count line.
@@ -156,7 +192,8 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
   // every resize — a resize only changes rowH, and re-running this would yank a scrolled-away user
   // back to the window start.
   const firstDayMs = days[0]?.getTime() ?? 0;
-  const scrollKey = `${range}:${firstDayMs}`;
+  // Include the start bound so editing a range's hours re-frames the scroll to the new start.
+  const scrollKey = `${range}:${bounds.startHour}:${firstDayMs}`;
   const scrolledKeyRef = useRef<string | null>(null);
   useEffect(() => {
     const el = scrollRef.current;
@@ -173,7 +210,27 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
     <div className="flex h-full min-h-0 flex-1 flex-col">
       {/* Day-header row */}
       <div className="flex border-b border-rule">
-        <div className="shrink-0" style={{ width: `${GUTTER_PX}px` }} />
+        <div className="flex shrink-0" style={{ width: `${gutterPx}px` }}>
+          {zones.map((z) => (
+            <div
+              key={z}
+              className="flex items-end justify-end border-l border-rule px-1 pb-0.5 font-mono text-[9px] uppercase tracking-tight text-ink4"
+              style={{ width: `${ZONE_COL}px` }}
+              title={z}
+            >
+              <span className="truncate">{zoneShort(z)}</span>
+            </div>
+          ))}
+          <div
+            className="flex items-end justify-end px-2 pb-0.5 font-mono text-[9px] uppercase tracking-tight text-ink4"
+            style={{ width: `${LOCAL_COL}px` }}
+            title={deviceTimeZone()}
+          >
+            {zones.length > 0 ? (
+              <span className="truncate">{zoneShort(deviceTimeZone())}</span>
+            ) : null}
+          </div>
+        </div>
         {columns.map((c) => (
           <div key={dayKey(c.day)} className="flex-1 border-l border-rule px-2 py-1 text-center">
             <div
@@ -196,24 +253,45 @@ export function TimeGridView({ days, events, colorOf, range }: Props) {
         events={bandEvents}
         days={days}
         colorOf={colorOf}
-        gutterPx={GUTTER_PX}
+        gutterPx={gutterPx}
         showLabel={!minimal}
       />
 
       {/* Scrollable time body */}
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="flex" style={{ height: `${HOURS * rowH}px` }}>
-          {/* Hour gutter */}
-          <div className="relative shrink-0" style={{ width: `${GUTTER_PX}px` }}>
-            {Array.from({ length: HOURS }, (_, h) => h).map((h) => (
+          {/* Hour gutter — extra zones then the local column (nearest the grid). */}
+          <div className="flex shrink-0" style={{ width: `${gutterPx}px` }}>
+            {zoneLabels.map(({ zone, labels }) => (
               <div
-                key={h}
-                className="absolute right-2 -translate-y-1/2 font-mono text-[10px] text-ink4"
-                style={{ top: `${h * rowH}px` }}
+                key={zone}
+                className="relative border-l border-rule"
+                style={{ width: `${ZONE_COL}px` }}
               >
-                {h === 0 ? "" : `${String(h).padStart(2, "0")}:00`}
+                {labels.map((lab, h) =>
+                  h === 0 ? null : (
+                    <div
+                      key={h}
+                      className="absolute right-1 -translate-y-1/2 font-mono text-[9px] text-ink4"
+                      style={{ top: `${h * rowH}px` }}
+                    >
+                      {lab}
+                    </div>
+                  ),
+                )}
               </div>
             ))}
+            <div className="relative" style={{ width: `${LOCAL_COL}px` }}>
+              {Array.from({ length: HOURS }, (_, h) => h).map((h) => (
+                <div
+                  key={h}
+                  className="absolute right-2 -translate-y-1/2 font-mono text-[10px] text-ink4"
+                  style={{ top: `${h * rowH}px` }}
+                >
+                  {h === 0 ? "" : `${String(h).padStart(2, "0")}:00`}
+                </div>
+              ))}
+            </div>
           </div>
           {/* Day columns */}
           {columns.map((c) => (

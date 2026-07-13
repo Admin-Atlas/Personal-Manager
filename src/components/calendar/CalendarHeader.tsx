@@ -6,12 +6,14 @@
 // indicator. Meta (sync time) is gated by depth; the layout never forks.
 
 import type { Calendar, CalendarAccount } from "../../lib/types";
-import type { CalendarRange, CalendarViewMode } from "../../lib/calendarPrefs";
+import type { CalendarRange, CalendarViewMode, RangeBounds } from "../../lib/calendarPrefs";
 import { formatClockIso } from "../../lib/format";
-import { useDepth, useTheme } from "../../theme";
+import { useDepth, useTheme, type Coords } from "../../theme";
 import { Button, SegmentedControl, type SegOption } from "../ui";
 import { CalendarsDropdown } from "./CalendarsDropdown";
 import { MiniCalendarPopover } from "./MiniCalendarPopover";
+import { RangeControl } from "./RangeControl";
+import { ZonePicker } from "./ZonePicker";
 
 interface Props {
   view: CalendarViewMode;
@@ -20,6 +22,14 @@ interface Props {
   /** Time-grid vertical scale (Week/Day only). */
   range: CalendarRange;
   onRangeChange: (r: CalendarRange) => void;
+  /** Custom Work/Day hour windows + the setter (null clears back to the computed default). */
+  customBounds: Partial<Record<CalendarRange, RangeBounds>>;
+  onBoundsChange: (range: CalendarRange, bounds: RangeBounds | null) => void;
+  /** The user's coordinates, for the Day range's sunrise/sunset default. */
+  coords: Coords | null;
+  /** Extra gutter timezones + the setter. */
+  zones: string[];
+  onZonesChange: (zones: string[]) => void;
   /** The current period label (e.g. "July 2026") shown between the nav arrows. */
   label: string;
   /** The anchor day, for the mini-calendar picker. */
@@ -46,18 +56,17 @@ const VIEW_LABEL: Record<CalendarViewMode, string> = {
   agenda: "Agenda",
 };
 
-const RANGE_OPTIONS: SegOption<CalendarRange>[] = [
-  { value: "work", label: "Work" },
-  { value: "day", label: "Day" },
-  { value: "full", label: "24h" },
-];
-
 export function CalendarHeader({
   view,
   availableViews,
   onViewChange,
   range,
   onRangeChange,
+  customBounds,
+  onBoundsChange,
+  coords,
+  zones,
+  onZonesChange,
   label,
   cursor,
   onPickDate,
@@ -107,7 +116,17 @@ export function CalendarHeader({
 
       <div className="ml-auto flex flex-wrap items-center gap-3">
         {showRange && (
-          <SegmentedControl options={RANGE_OPTIONS} value={range} onChange={onRangeChange} />
+          <>
+            <RangeControl
+              range={range}
+              onRangeChange={onRangeChange}
+              customBounds={customBounds}
+              onBoundsChange={onBoundsChange}
+              coords={coords}
+              cursor={cursor}
+            />
+            <ZonePicker zones={zones} onChange={onZonesChange} />
+          </>
         )}
         {viewOptions.length > 1 && (
           <SegmentedControl options={viewOptions} value={view} onChange={onViewChange} />

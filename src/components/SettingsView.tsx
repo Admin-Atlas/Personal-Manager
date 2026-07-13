@@ -62,6 +62,8 @@ import {
   deviceCoords,
   coordsForTimezone,
   formatCoords,
+  deviceTimeZone,
+  allTimeZones,
 } from "../theme";
 import { Button, Collapsible, ConfirmDialog, Input, NavItem, SegmentedControl, Select } from "./ui";
 
@@ -188,11 +190,11 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
 
         if (settings.time_zone) {
           setTimeZoneState(settings.time_zone);
-          setTzAuto(settings.time_zone === detectTimeZone());
+          setTzAuto(settings.time_zone === deviceTimeZone());
         } else {
           // First launch: detect the device zone and persist it so the backend's
           // "today"/agenda reasoning has a zone from the start.
-          const detected = detectTimeZone();
+          const detected = deviceTimeZone();
           setTimeZoneState(detected);
           setTzAuto(true);
           // Best-effort: an exotic zone chrono-tz doesn't recognise stays unsaved and
@@ -475,7 +477,9 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       }
       await setChatAutoSwitch(chatAuto);
       await setBackgroundAutoSwitch(backgroundAuto);
-      await setTimeZone(tzAuto ? detectTimeZone() : timeZone);
+      await setTimeZone(tzAuto ? deviceTimeZone() : timeZone);
+      // Let the shared time/location context re-read the zone at once (it also re-reads on refocus).
+      window.dispatchEvent(new Event("pm:settings-changed"));
       // First-run: record the chosen search language on the still-empty vault (only if the user
       // changed it from the default). Must happen before any documents exist. A JOINED vault
       // already has both a language and a passphrase — its choosers aren't shown, and neither
@@ -1000,7 +1004,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                   )}
                   <p className="mt-2 text-xs text-faint">
                     {tzAuto
-                      ? `Following this device: ${detectTimeZone()}`
+                      ? `Following this device: ${deviceTimeZone()}`
                       : `Selected: ${timeZone || "—"}`}
                   </p>
                 </div>
@@ -1553,18 +1557,4 @@ function fmtUsd(v: number | null): string {
   if (v == null) return "—";
   if (v === 0) return "$0.00";
   return v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
-}
-
-/** The device's IANA time zone (e.g. "Europe/London"), via the Intl API. */
-function detectTimeZone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-}
-
-/** Every IANA zone the runtime knows, for the manual picker. Falls back to just the
- *  detected zone on a runtime without `Intl.supportedValuesOf`. */
-function allTimeZones(): string[] {
-  const intl = Intl as typeof Intl & { supportedValuesOf?: (key: string) => string[] };
-  return typeof intl.supportedValuesOf === "function"
-    ? intl.supportedValuesOf("timeZone")
-    : [detectTimeZone()];
 }
