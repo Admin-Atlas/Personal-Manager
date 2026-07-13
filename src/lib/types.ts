@@ -114,6 +114,11 @@ export interface WipeReport {
  *  profile/machine that knows it). */
 export type VaultMode = "device" | "passphrase";
 
+/** Windows Smart App Control enforcement state (Windows-only; everything else is "unknown").
+ *  "enforced" means SAC will silently block our unsigned update installer — the updater UI
+ *  warns instead of offering a restart that would no-op. Mirrors Rust `SmartAppControlState`. */
+export type SmartAppControlState = "off" | "enforced" | "evaluation" | "unknown";
+
 /** The vault's current state for the UI: its key mode, whether it needs unlocking on
  *  this profile (a passphrase vault whose key isn't cached here yet), whether the
  *  Markdown is encrypted at rest, where it lives on disk, and its stable id. */

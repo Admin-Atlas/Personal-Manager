@@ -4,6 +4,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
+import { smartAppControlState } from "./ipc";
+import type { SmartAppControlState } from "./types";
+import { evaluateAttemptMarker } from "./updateGate";
 
 /**
  * Background auto-update. On launch we silently ask the release feed whether a
@@ -15,12 +19,24 @@ import { relaunch } from "@tauri-apps/plugin-process";
  * Every step is best-effort: offline, dev builds (no signature), or a malformed
  * feed all just leave the app in the "idle" state with no visible error — the
  * check simply runs again next launch.
+ *
+ * Windows caveat this hook defends against: our installer is an unsigned NSIS setup, and
+ * the updater plugin applies an update by launching it and exiting the process WITHOUT
+ * observing whether it launched. So an OS block — Smart App Control (SAC) enforced, or a
+ * SmartScreen "Don't run" — silently closes the app and it reopens on the old version, and
+ * `install()` never throws (the `catch` below is unreachable on that path). Two guards:
+ * (1) we read SAC state up front and, when it's enforcing, warn instead of firing a restart
+ * that would no-op; (2) we record the version we're about to install and, if the app reopens
+ * still on the old one, flag it next launch instead of silently re-offering the same update.
  */
 export type UpdateStatus =
   | "idle" // no update, still checking, or check failed (silent)
   | "downloading" // a newer version is being fetched in the background
   | "ready" // downloaded and staged; waiting for the user to restart
   | "installing"; // applying the update and relaunching
+
+/** localStorage key: the version we last began an install for (see the loop-marker logic). */
+const ATTEMPT_KEY = "pm.update.attemptedVersion";
 
 export interface AppUpdate {
   status: UpdateStatus;
@@ -29,9 +45,17 @@ export interface AppUpdate {
   progress: number | null;
   /** True once the user clicked "Later" — the banner collapses to a slim chip. */
   dismissed: boolean;
-  /** True after an in-place install failed — the banner offers a manual download instead.
-   *  Most likely on an unsigned macOS build, where Gatekeeper can refuse the swapped app. */
+  /** True after an in-place install threw — the banner offers a manual download instead.
+   *  Reachable on macOS (Gatekeeper can refuse the swapped app); on Windows the plugin exits
+   *  the process before it can throw, so the loop marker below covers that case instead. */
   installFailed: boolean;
+  /** Windows Smart App Control state. When "enforced", a restart would be silently blocked,
+   *  so the banner warns and explains how to proceed rather than offering it. */
+  sac: SmartAppControlState;
+  /** True when a prior install attempt silently didn't apply (the app reopened on the old
+   *  version and the feed is re-offering the same update) — the banner warns instead of
+   *  looping a download-and-fail. */
+  blockedByPriorAttempt: boolean;
   /** The releases page for the manual-download fallback. */
   releasesUrl: string;
   restart: () => void;
@@ -48,11 +72,28 @@ export function useUpdater(): AppUpdate {
   const [update, setUpdate] = useState<Update | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const [installFailed, setInstallFailed] = useState(false);
+  const [sac, setSac] = useState<SmartAppControlState>("unknown");
+  const [blockedByPriorAttempt, setBlockedByPriorAttempt] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
 
     void (async () => {
+      // Smart App Control state is best-effort and independent of whether an update exists.
+      try {
+        const s = await smartAppControlState();
+        if (!cancelled) setSac(s);
+      } catch {
+        // Leave "unknown" — the UI treats that as "proceed normally".
+      }
+
+      let running = "";
+      try {
+        running = await getVersion();
+      } catch {
+        // Non-Tauri context or API error — the marker logic tolerates an empty running version.
+      }
+
       let found: Update | null;
       try {
         found = await check();
@@ -60,6 +101,21 @@ export function useUpdater(): AppUpdate {
         // Dev build, offline, or unreachable feed — stay quiet, retry next launch.
         return;
       }
+
+      // Reconcile the "previous attempt" marker: did the last restart actually apply?
+      try {
+        const attempted = localStorage.getItem(ATTEMPT_KEY);
+        const decision = evaluateAttemptMarker({
+          attempted,
+          running,
+          offered: found?.version ?? null,
+        });
+        if (decision.clearMarker) localStorage.removeItem(ATTEMPT_KEY);
+        if (decision.blocked && !cancelled) setBlockedByPriorAttempt(true);
+      } catch {
+        // localStorage unavailable — skip the loop guard, everything else still works.
+      }
+
       if (!found || cancelled) return;
 
       setUpdate(found);
@@ -98,20 +154,49 @@ export function useUpdater(): AppUpdate {
   const restart = useCallback(() => {
     if (!update) return;
     void (async () => {
+      // The user may have toggled Smart App Control since launch — re-check at click time.
+      let current = sac;
+      try {
+        current = await smartAppControlState();
+        setSac(current);
+      } catch {
+        // Keep the last-known state.
+      }
+      if (current === "enforced") {
+        // Do NOT call install(): under SAC-enforced the plugin would launch the unsigned
+        // installer, get silently blocked, and exit(0) — closing PM with no signal and no
+        // update. Leave the app running; the banner explains that SAC must be turned off.
+        return;
+      }
+
       setStatus("installing");
       setInstallFailed(false);
       try {
+        // Record the version we're about to install so that, if the app reopens still on the
+        // old version (a silent OS block we can't catch inside install()), the next launch
+        // warns instead of silently re-offering the same update.
+        if (update.version) {
+          try {
+            localStorage.setItem(ATTEMPT_KEY, update.version);
+          } catch {
+            // Non-fatal — the SAC pre-check is the primary guard.
+          }
+        }
         await update.install();
         await relaunch();
       } catch {
-        // The in-place update couldn't apply — most likely on an unsigned macOS build,
-        // where Gatekeeper can refuse the swapped bundle. Drop back to "ready" and flag the
-        // failure so the banner can offer a manual download instead of silently looping.
+        // The in-place update threw (reachable on macOS — Gatekeeper can refuse the swapped
+        // bundle). We got a real signal, so clear the marker and offer a manual download.
+        try {
+          localStorage.removeItem(ATTEMPT_KEY);
+        } catch {
+          // ignore
+        }
         setStatus("ready");
         setInstallFailed(true);
       }
     })();
-  }, [update]);
+  }, [update, sac]);
 
   const dismiss = useCallback(() => {
     // Keep the staged update fully reachable; collapse the banner to a slim "restart"
@@ -125,6 +210,8 @@ export function useUpdater(): AppUpdate {
     progress,
     dismissed,
     installFailed,
+    sac,
+    blockedByPriorAttempt,
     releasesUrl: RELEASES_URL,
     restart,
     dismiss,
