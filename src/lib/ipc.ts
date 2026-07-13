@@ -39,6 +39,7 @@ import type {
   IcsFeedInfo,
   ImageData,
   Importance,
+  IndexOnlyFetch,
   IngestEvent,
   InstallProgressEvent,
   LanguageOptions,
@@ -779,9 +780,17 @@ export const onLocalSync = (handler: (e: SyncEvent) => void): Promise<UnlistenFn
 export const onLocalChanged = (handler: () => void): Promise<UnlistenFn> =>
   listen("local://changed", () => handler());
 
-/** Fetch an index-only document's full body live from its source (the body is never stored). */
+/** Fetch an index-only document's full body live from its source (the body is never stored), plus
+ *  whether the stored chunk offsets still index it exactly (so the reader can draw the overlay or
+ *  offer a Re-index). */
 export const fetchIndexOnlyBody = (docId: number) =>
-  invoke<string>("fetch_index_only_body", { docId });
+  invoke<IndexOnlyFetch>("fetch_index_only_body", { docId });
+
+/** Rebuild one index-only item's stored chunk map + summary against its current live body (the
+ *  reader's "Re-index this item" — fixes a stale overlay, e.g. one left indexing the offline summary).
+ *  Returns the exact body it embedded (+ aligned=true), so the reader redraws with no second fetch. */
+export const reindexIndexOnly = (docId: number) =>
+  invoke<IndexOnlyFetch>("reindex_index_only", { docId });
 
 /** Promote an index-only Google Sheet to a full local spreadsheet import ("import fully"): pull the
  *  whole grid, index it locally, and flip the document off index-only. Returns the updated document. */

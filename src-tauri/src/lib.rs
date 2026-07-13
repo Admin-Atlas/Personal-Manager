@@ -960,6 +960,7 @@ pub fn run() {
             commands::stop_local_folder_sync,
             commands::resume_local_folder_sync,
             commands::fetch_index_only_body,
+            commands::reindex_index_only,
             commands::promote_index_only,
             layout::semantic_layout,
             layout::start_semantic_layout,

@@ -3651,10 +3651,11 @@ pub fn resume_local_folder_sync(app: AppHandle) -> Result<bool> {
     )
 }
 
-/// Fetch an index-only document's full body live from its source (Drive), for the "show full text"
-/// affordance. The body is never stored — only the short summary lives offline.
-#[tauri::command]
-pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String> {
+/// Fetch one index-only item's current body live from its source, converted to the same indexable
+/// text the ingest path produces and **trimmed identically** (`input.body.trim()`, index_only.rs), so
+/// its bytes match the string the stored chunk offsets were computed against. Shared by the reader
+/// (`fetch_index_only_body`) and the on-demand re-index (`reindex_index_only`). Never persists the body.
+async fn fetch_index_only_text(app: &AppHandle, doc_id: i64) -> Result<String> {
     let (source_type, source_id, source_state, external_ref): (
         String,
         Option<String>,
@@ -3681,9 +3682,6 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
             "This file was removed at the source; only its saved summary is available.".into(),
         ));
     }
-    // Dispatch on the source-id provider prefix (Drive vs OneDrive). Both fetch the body live from
-    // the source and never store it; the trailing segment after the last `:` is the provider's file id
-    // (Drive fileIds and Graph itemIds both carry no `:`).
     let state = app.state::<AppState>();
     // `ensure_installed` is blocking (first run installs the venv + deps) — run it on the blocking
     // pool so it never pins a tokio worker (F-41). The cloned handle reaches AppState in the closure.
@@ -3694,9 +3692,11 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
             .map_err(|e| Error::Other(format!("sidecar install task panicked: {e}")))??;
     }
     let no_text = || Error::Other("This file has no extractable text to show.".into());
-    // Local folder: the body is on disk at the stored path (its `external_ref`). Read + convert it live,
-    // exactly like a fresh index — nothing is stored.
-    if source_id.starts_with("local:") {
+    // Fetch the body live and convert it exactly like a fresh index. Dispatch on the source-id
+    // provider prefix; the trailing segment after the last `:` is the provider's file id (Drive
+    // fileIds and Graph itemIds carry no `:`). Every branch yields a String, trimmed uniformly below.
+    let raw = if source_id.starts_with("local:") {
+        // Local folder: the body is on disk at the stored path (its `external_ref`).
         let path = external_ref
             .ok_or_else(|| Error::Other("This indexed file has no stored path.".into()))?;
         let path = std::path::PathBuf::from(&path);
@@ -3710,38 +3710,158 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<String
             tokio::task::spawn_blocking(move || app2.state::<AppState>().sidecar.convert(&path))
                 .await
                 .map_err(|e| Error::Other(format!("local convert task panicked: {e}")))??;
-        let markdown = markdown.trim().to_string();
-        return if markdown.is_empty() {
-            Err(no_text())
-        } else {
-            Ok(markdown)
-        };
-    }
-    let item_id = source_id
-        .rsplit_once(':')
-        .map(|(_, id)| id.to_string())
-        .ok_or_else(|| Error::Other("Malformed source id.".into()))?;
-    // Drive: a My Drive id names its account directly; a shared-drive id is account-independent, so
-    // resolve an account that can reach it (owner first) from the access table. Read off the lock
-    // before the fetch (rule #4).
-    let drive_token_key = {
-        let conn = state.conn()?;
-        drive::token_key_for_source(&conn, &source_id)?
-    };
-    if let Some(token_key) = drive_token_key {
-        let file = drive::fetch_file(&token_key, &item_id).await?;
-        drive::fetch_body(state.inner(), &token_key, &file)
-            .await?
-            .ok_or_else(no_text)
-    } else if let Some(email) = onedrive::account_of(&source_id) {
-        let token_key = onedrive::account_token_key(&email);
-        let item = onedrive::fetch_item(&token_key, &item_id).await?;
-        onedrive::fetch_body(state.inner(), &token_key, &item)
-            .await?
-            .ok_or_else(no_text)
+        markdown
     } else {
-        Err(Error::Other("Unrecognised index-only source.".into()))
+        let item_id = source_id
+            .rsplit_once(':')
+            .map(|(_, id)| id.to_string())
+            .ok_or_else(|| Error::Other("Malformed source id.".into()))?;
+        // Drive: a My Drive id names its account directly; a shared-drive id is account-independent,
+        // so resolve an account that can reach it (owner first). Read off the lock before the fetch.
+        let drive_token_key = {
+            let conn = state.conn()?;
+            drive::token_key_for_source(&conn, &source_id)?
+        };
+        if let Some(token_key) = drive_token_key {
+            let file = drive::fetch_file(&token_key, &item_id).await?;
+            drive::fetch_body(state.inner(), &token_key, &file)
+                .await?
+                .ok_or_else(no_text)?
+        } else if let Some(email) = onedrive::account_of(&source_id) {
+            let token_key = onedrive::account_token_key(&email);
+            let item = onedrive::fetch_item(&token_key, &item_id).await?;
+            onedrive::fetch_body(state.inner(), &token_key, &item)
+                .await?
+                .ok_or_else(no_text)?
+        } else {
+            return Err(Error::Other("Unrecognised index-only source.".into()));
+        }
+    };
+    // Trim on EVERY branch, not just local: the chunk offsets index `input.body.trim()`, so the
+    // cloud branches used to return an un-trimmed body that shifted the whole overlay.
+    let body = raw.trim().to_string();
+    if body.is_empty() {
+        return Err(no_text());
     }
+    Ok(body)
+}
+
+/// The reader's live fetch of an index-only body plus whether the stored chunk offsets still index it
+/// EXACTLY (a `content_hash` identity match, not a length heuristic) — so the overlay is drawn only
+/// when its byte offsets would land in the right places, and offers Re-index otherwise.
+#[derive(Serialize)]
+pub struct IndexOnlyFetch {
+    pub body: String,
+    pub aligned: bool,
+}
+
+/// Fetch an index-only document's full body live from its source, for the reader. The body is never
+/// stored — only the short summary lives offline. Also reports whether the stored chunk offsets still
+/// index this exact body, so the chunk overlay can decide between drawing and offering a Re-index.
+#[tauri::command]
+pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<IndexOnlyFetch> {
+    let body = fetch_index_only_text(&app, doc_id).await?;
+    let state = app.state::<AppState>();
+    let (source_id, stored_hash): (Option<String>, Option<String>) = {
+        let conn = state.conn()?;
+        conn.query_row(
+            "SELECT source_id, content_hash FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+    };
+    // `documents.content_hash` for an index-only item IS pointer_content_hash(source_id, indexed
+    // trimmed body). Recompute it over the freshly fetched (trimmed) body: equal ⇒ the offsets index
+    // this exact string, so the overlay is safe to draw; unequal ⇒ the map is stale (offer Re-index).
+    let aligned = match (source_id, stored_hash) {
+        (Some(sid), Some(stored)) => index_only::pointer_content_hash(&sid, &body) == stored,
+        _ => false,
+    };
+    Ok(IndexOnlyFetch { body, aligned })
+}
+
+/// Re-index one index-only item on demand (the reader's "Re-index this item"): re-fetch its current
+/// live body and rebuild the stored chunk map + summary against it, so a stale overlay (e.g. offsets
+/// left indexing the ~500-char summary after a rebuild-from-manifest) lines up again. Reuses the
+/// connector re-embed path; the body bytes are never persisted. Returns the exact body it embedded
+/// (so the reader redraws the overlay against it with no second live fetch and no drift window).
+#[tauri::command]
+pub async fn reindex_index_only(app: AppHandle, doc_id: i64) -> Result<IndexOnlyFetch> {
+    let body = fetch_index_only_text(&app, doc_id).await?;
+    tokio::task::spawn_blocking(move || -> Result<IndexOnlyFetch> {
+        let state = app.state::<AppState>();
+        state.sidecar.ensure_installed()?;
+        let (source_id, external_ref, title, source_modified_at, source_content_hash): (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = {
+            let conn = state.conn()?;
+            conn.query_row(
+                "SELECT source_id, external_ref, title, source_modified_at, source_content_hash \
+                 FROM documents WHERE id = ?1 AND source_type = 'index_only'",
+                params![doc_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                    ))
+                },
+            )?
+        };
+        if source_id.is_empty() {
+            return Err(Error::Other(
+                "This item has no source pointer to re-index.".into(),
+            ));
+        }
+        let input = index_only::PointerInput {
+            source_id,
+            title,
+            external_ref,
+            source_modified_at,
+            source_content_hash,
+            body,
+            // Not used by the re-embed (it rewrites only the chunk map + summary + title); the DB's
+            // existing folder columns are left untouched.
+            source_parent_folder_id: None,
+            source_parent_folder_name: None,
+        };
+        let gateway = {
+            let conn = state.conn()?;
+            state.gateway_for_write(&conn)?
+        };
+        index_only::reindex_pointer(&state, &gateway, &input)?;
+        // The re-embed rewrote the DB row (chunk map + source_state='ok' + summary); push those to the
+        // encrypted manifest (the source of truth) so a reconcile-on-open can't revert them — every
+        // other index-only write path syncs the manifest, and this must too.
+        {
+            let (vault_root, manifest_cipher) = state.manifest_io()?;
+            let conn = state.conn()?;
+            index_only::write_synced(&conn, &vault_root, &manifest_cipher)?;
+        }
+        // The overlay now indexes the exact body we just embedded — confirm against the freshly
+        // written content_hash and hand the body back so the reader needn't fetch a second time.
+        let aligned = {
+            let conn = state.conn()?;
+            let stored: String = conn.query_row(
+                "SELECT content_hash FROM documents WHERE id = ?1",
+                params![doc_id],
+                |r| r.get(0),
+            )?;
+            index_only::pointer_content_hash(&input.source_id, &input.body) == stored
+        };
+        Ok(IndexOnlyFetch {
+            body: input.body,
+            aligned,
+        })
+    })
+    .await
+    .map_err(|e| Error::Other(format!("reindex task panicked: {e}")))?
 }
 
 /// Promote an index-only Google Sheet to a **full local spreadsheet import** — the "import fully"

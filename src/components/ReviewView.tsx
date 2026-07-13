@@ -40,6 +40,10 @@ export function ReviewView({ onChanged }: Props) {
   const [projects, setProjects] = useState<string[]>([]);
   const [proposing, setProposing] = useState(false);
   const [committing, setCommitting] = useState(false);
+  // Documents being filed one at a time via a row's own Approve button (distinct from the bulk
+  // "Approve all") — tracked per id so each such row shows its own progress without disabling
+  // the whole queue.
+  const [committingIds, setCommittingIds] = useState<Set<number>>(new Set());
   const [showAutofiled, setShowAutofiled] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Rows the user has hand-edited; a late streaming proposal must not overwrite
@@ -158,7 +162,7 @@ export function ReviewView({ onChanged }: Props) {
   }
 
   async function approveAll() {
-    if (queue.length === 0 || proposing) return;
+    if (queue.length === 0 || proposing || committingIds.size > 0) return;
     setCommitting(true);
     setError(null);
     try {
@@ -177,22 +181,59 @@ export function ReviewView({ onChanged }: Props) {
     }
   }
 
+  // File a single document (a row's own Approve button) with the values currently shown, leaving
+  // the rest of the queue in place — so a confident item can be cleared without committing all.
+  async function commitOne(doc: Document) {
+    if (proposing || committing || committingIds.has(doc.id)) return;
+    setCommittingIds((s) => new Set(s).add(doc.id));
+    setError(null);
+    try {
+      await commitReview([decisionFor(doc)]);
+      proposalCache.delete(doc.id);
+      editCache.delete(doc.id);
+      setQueue((q) => q.filter((d) => d.id !== doc.id));
+      setProposals((prev) => {
+        const next = { ...prev };
+        delete next[doc.id];
+        return next;
+      });
+      setEdits((prev) => {
+        const next = { ...prev };
+        delete next[doc.id];
+        return next;
+      });
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCommittingIds((s) => {
+        const next = new Set(s);
+        next.delete(doc.id);
+        return next;
+      });
+    }
+  }
+
   // Low-importance items auto-file into a collapsed section so nothing backs up
   // into a chore (spec §3). They're still committed by "Approve all".
   const { needsReview, autofiled } = useMemo(() => {
     const needsReview: Document[] = [];
     const autofiled: Document[] = [];
+    // Bucket + order by the AI's PROPOSED importance, not the user's live edit. The proposal is
+    // stable once it has streamed in, so hand-picking an importance on a row never re-sorts the
+    // list or yanks the row into the collapsed section under the user — it stays where they left
+    // it (their pick is still what gets committed, via `decisionFor`). Ordering still animates as
+    // proposals arrive, since this memo keys on `proposals`.
     for (const d of queue) {
-      const imp = edits[d.id]?.importance ?? d.importance;
+      const imp = proposals[d.id]?.importance ?? d.importance;
       (imp === "low" ? autofiled : needsReview).push(d);
     }
-    // Sort the active queue by importance, high → low, so the AI's most-important picks rise to the
-    // top — and re-order live as proposals stream in (this memo keys on `edits`, which proposals
-    // update). Untriaged sits above archive; title breaks ties for a stable order.
-    const eff = (d: Document) => rankImportance(edits[d.id]?.importance ?? d.importance);
+    // High → low, so the AI's most-important picks rise to the top. Untriaged sits above archive;
+    // title breaks ties for a stable order.
+    const eff = (d: Document) => rankImportance(proposals[d.id]?.importance ?? d.importance);
     needsReview.sort((a, b) => eff(b) - eff(a) || a.title.localeCompare(b.title));
     return { needsReview, autofiled };
-  }, [queue, edits]);
+  }, [queue, proposals]);
 
   return (
     <div className="flex h-full flex-col">
@@ -209,7 +250,7 @@ export function ReviewView({ onChanged }: Props) {
           <Button
             variant="tertiary"
             onClick={repropose}
-            disabled={proposing || committing || queue.length === 0}
+            disabled={proposing || committing || committingIds.size > 0 || queue.length === 0}
             data-help="review-repropose"
             title="Re-run the AI proposals"
           >
@@ -218,7 +259,7 @@ export function ReviewView({ onChanged }: Props) {
           <Button
             variant="primary"
             onClick={approveAll}
-            disabled={proposing || committing || queue.length === 0}
+            disabled={proposing || committing || committingIds.size > 0 || queue.length === 0}
             data-help="review-approve-all"
           >
             {committing ? "Saving…" : "Approve all"}
@@ -259,7 +300,10 @@ export function ReviewView({ onChanged }: Props) {
                     doc={doc}
                     proposal={proposals[doc.id]}
                     edit={edits[doc.id]}
+                    committing={committingIds.has(doc.id)}
+                    disabled={proposing || committing || committingIds.has(doc.id)}
                     onChange={(patch) => updateEdit(doc.id, patch)}
+                    onApprove={() => void commitOne(doc)}
                   />
                 ))}
               </ul>
@@ -281,7 +325,10 @@ export function ReviewView({ onChanged }: Props) {
                           doc={doc}
                           proposal={proposals[doc.id]}
                           edit={edits[doc.id]}
+                          committing={committingIds.has(doc.id)}
+                          disabled={proposing || committing || committingIds.has(doc.id)}
                           onChange={(patch) => updateEdit(doc.id, patch)}
+                          onApprove={() => void commitOne(doc)}
                         />
                       ))}
                     </ul>
@@ -300,12 +347,21 @@ function ReviewRow({
   doc,
   proposal,
   edit,
+  committing,
+  disabled,
   onChange,
+  onApprove,
 }: {
   doc: Document;
   proposal?: MetadataProposal;
   edit?: Edit;
+  /** This row is being filed by its own Approve button (drives its "Saving…" label). */
+  committing: boolean;
+  /** Approve is unavailable (proposals still streaming, or a commit is in flight). */
+  disabled: boolean;
   onChange: (patch: Partial<Edit>) => void;
+  /** File just this document with the values shown, leaving the rest of the queue. */
+  onApprove: () => void;
 }) {
   const { showPower } = useDepth();
   // Open the same shared, app-level document reader the Documents tab and project file list use
@@ -328,6 +384,16 @@ function ReviewRow({
             {doc.title}
           </button>
           {doc.source_type === "chat" && <ChatBadge />}
+          <Button
+            variant="secondary"
+            onClick={onApprove}
+            disabled={disabled}
+            className="shrink-0 px-2 py-1 text-xs"
+            data-help="review-approve-one"
+            title="File just this document with the values shown"
+          >
+            {committing ? "Saving…" : "Approve"}
+          </Button>
         </div>
         {proposal?.reasoning ? (
           <p className="mt-1 text-xs text-ink3">{proposal.reasoning}</p>
