@@ -728,7 +728,7 @@ async fn gather_shared(
     match sel.folders.as_deref() {
         Some(folders) => {
             let (items, truncated) =
-                gather_shared_folders(app, token_key, &sel.drive_id, folders).await?;
+                gather_shared_folders(app, token_key, &sel.drive_id, folders, &sel.exclude).await?;
             Ok((items, None, truncated))
         }
         None => gather_shared_whole(app, token_key, email, &sel.drive_id).await,
@@ -745,8 +745,10 @@ async fn gather_shared_folders(
     token_key: &str,
     drive_id: &str,
     folders: &[String],
+    exclude: &[String],
 ) -> Result<(Vec<DriveItem>, bool)> {
-    let (files, truncated) = drive::enumerate_shared(token_key, drive_id, Some(folders)).await?;
+    let (files, truncated) =
+        drive::enumerate_shared(token_key, drive_id, Some(folders), exclude).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -774,8 +776,9 @@ async fn gather_my_drive_folders(
     token_key: &str,
     email: &str,
     folders: &[String],
+    exclude: &[String],
 ) -> Result<(Vec<DriveItem>, bool)> {
-    let (files, truncated) = drive::enumerate_my_folders(token_key, folders).await?;
+    let (files, truncated) = drive::enumerate_my_folders(token_key, folders, exclude).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -813,7 +816,7 @@ async fn gather_shared_whole(
     // First sync / 410 reset: the whole drive enumerated as Adds + a fresh baseline cursor. Also
     // reports whether the enumeration was truncated (⇒ don't baseline the cursor yet — retry next pass).
     async fn baseline(token_key: &str, drive_id: &str) -> Result<(Vec<DriveItem>, String, bool)> {
-        let (files, truncated) = drive::enumerate_shared(token_key, drive_id, None).await?;
+        let (files, truncated) = drive::enumerate_shared(token_key, drive_id, None, &[]).await?;
         let new_cursor = drive::start_page_token(token_key, Some(drive_id)).await?;
         let items = files
             .into_iter()
@@ -958,7 +961,15 @@ impl CloudDriver for DriveDriver {
         if scope.my_drive {
             match scope.my_drive_folders.as_deref() {
                 Some(folders) => {
-                    match gather_my_drive_folders(app, &token_key, &email, folders).await {
+                    match gather_my_drive_folders(
+                        app,
+                        &token_key,
+                        &email,
+                        folders,
+                        &scope.my_drive_exclude,
+                    )
+                    .await
+                    {
                         Ok((mut recon, truncated)) => {
                             items.append(&mut recon);
                             coverage_incomplete |= truncated;
@@ -1195,8 +1206,9 @@ async fn gather_onedrive_folders(
     token_key: &str,
     email: &str,
     folders: &[String],
+    exclude: &[String],
 ) -> Result<(Vec<OneDriveItem>, bool)> {
-    let (items, truncated) = onedrive::enumerate_folders(token_key, folders).await?;
+    let (items, truncated) = onedrive::enumerate_folders(token_key, folders, exclude).await?;
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -1293,7 +1305,9 @@ impl CloudDriver for OneDriveDriver {
         match scope.folders.as_deref() {
             // Folder-scoped: re-enumerate selected folders + reconcile (no cursor).
             Some(folders) => {
-                match gather_onedrive_folders(app, &token_key, &email, folders).await {
+                match gather_onedrive_folders(app, &token_key, &email, folders, &scope.exclude)
+                    .await
+                {
                     Ok((mut recon, truncated)) => {
                         items.append(&mut recon);
                         coverage_incomplete |= truncated;

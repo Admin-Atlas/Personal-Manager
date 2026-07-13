@@ -46,6 +46,7 @@ import type {
   LayoutProgressEvent,
   LocalFolder,
   LocalFolderSyncState,
+  LocalSubfolder,
   Message,
   ModelInfo,
   ModelRecommendations,
@@ -756,6 +757,16 @@ export const addLocalFolder = (path: string) => invoke<string>("add_local_folder
 /** Stop tracking a folder: drop its registration and flag its items `unreachable` — they stay findable
  *  (summaries searchable offline), never hard-deleted, just like a cloud disconnect. Pass the key. */
 export const removeLocalFolder = (key: string) => invoke<void>("remove_local_folder", { key });
+
+/** The immediate child subfolders of `rel` (root-relative, `/`-joined; null/empty = the folder root)
+ *  inside a tracked folder — one lazy level of the local folder picker. */
+export const listLocalSubfolders = (key: string, rel: string | null) =>
+  invoke<LocalSubfolder[]>("list_local_subfolders", { key, rel });
+
+/** Persist a tracked folder's excluded subfolders (root-relative paths). Apply it with a
+ *  {@link syncLocalFolder} — newly-excluded files soft-remove, un-excluded ones re-index. */
+export const setLocalExcludes = (key: string, exclude: string[]) =>
+  invoke<void>("set_local_excludes", { key, exclude });
 
 /** Start syncing one folder (or all when `folder` is null). Detached in the backend — progress arrives
  *  via the global `local://sync` event (subscribe with {@link onLocalSync}). */

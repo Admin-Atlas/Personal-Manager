@@ -508,6 +508,11 @@ pub struct SharedSelection {
     /// default in the UI is folder-scoped (shared drives are often huge and org-wide).
     #[serde(default)]
     pub folders: Option<Vec<String>>,
+    /// Subfolders to skip while walking the selected `folders` (a folder id excludes that folder and
+    /// its whole subtree). Only meaningful in folder-scoped mode; the whole-drive path can't be
+    /// folder-scoped. Empty/absent in older stored scopes, so nothing is excluded by default.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// What an account indexes: My Drive (the whole personal drive, the existing default) plus any
@@ -525,6 +530,12 @@ pub struct DriveScope {
     /// so it defaults to whole-drive and every pre-existing account behaves exactly as before.
     #[serde(default)]
     pub my_drive_folders: Option<Vec<String>>,
+    /// Subfolders to skip while walking the selected `my_drive_folders` (a folder id excludes that
+    /// folder and its whole subtree). Only meaningful in folder-scoped My Drive; the whole-drive delta
+    /// path can't be folder-scoped. Empty/absent in older stored scopes, so nothing is excluded by
+    /// default.
+    #[serde(default)]
+    pub my_drive_exclude: Vec<String>,
     /// Opted-in shared drives (each re-enumerated + reconciled per sync).
     #[serde(default)]
     pub shared: Vec<SharedSelection>,
@@ -539,6 +550,7 @@ impl Default for DriveScope {
         DriveScope {
             my_drive: true,
             my_drive_folders: None,
+            my_drive_exclude: Vec::new(),
             shared: Vec::new(),
         }
     }
@@ -1113,12 +1125,15 @@ pub async fn list_folders(
 }
 
 /// Enumerate the files of a shared drive to index: the **whole** drive (`folders == None`), or only
-/// the selected folders walked recursively (`Some`). Folders themselves are never indexed — only the
-/// files beneath them. Deduplicates files reachable from more than one selected folder.
+/// the selected folders walked recursively (`Some`, minus any `exclude`d subtrees). Folders
+/// themselves are never indexed — only the files beneath them. Deduplicates files reachable from more
+/// than one selected folder. `exclude` is ignored in whole-drive mode (the changes feed can't be
+/// folder-scoped).
 pub async fn enumerate_shared(
     token_key: &str,
     drive_id: &str,
     folders: Option<&[String]>,
+    exclude: &[String],
 ) -> Result<(Vec<DriveFile>, bool)> {
     match folders {
         None => {
@@ -1136,7 +1151,7 @@ pub async fn enumerate_shared(
             .await
         }
         Some(roots) => {
-            walk_folders(token_key, roots, |q, page| {
+            walk_folders(token_key, roots, exclude, |q, page| {
                 shared_files_url(drive_id, q, FILE_FIELDS, "", page)
             })
             .await
@@ -1148,18 +1163,26 @@ pub async fn enumerate_shared(
 /// beneath them — deduped, and each folder walked once even if reachable from two selections. The
 /// `url_for(q, page)` closure builds each `files.list` page URL, so My Drive (`my_files_url`) and
 /// shared drives (`shared_files_url`) share one walk. Folders themselves are never returned.
+/// Any folder id in `exclude` is never enqueued — pruning that folder and its whole subtree (its
+/// files are only ever discovered by walking into it), both as a seed root and as a descended child.
 /// Returns the deduped files plus whether the walk was cut short by the folder-count guard (`true` ⇒
 /// INCOMPLETE — the caller must not treat an unseen file as deleted; see [`connector_sync::paginate`]).
 async fn walk_folders(
     token_key: &str,
     roots: &[String],
+    exclude: &[String],
     url_for: impl Fn(&str, Option<&str>) -> Result<String>,
 ) -> Result<(Vec<DriveFile>, bool)> {
     use std::collections::HashSet;
+    let excluded: HashSet<&str> = exclude.iter().map(String::as_str).collect();
     let mut out: Vec<DriveFile> = Vec::new();
     let mut seen_folders: HashSet<String> = HashSet::new();
     let mut seen_files: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = roots.to_vec();
+    let mut queue: Vec<String> = roots
+        .iter()
+        .filter(|r| !excluded.contains(r.as_str()))
+        .cloned()
+        .collect();
     let mut nodes = 0usize;
     while let Some(folder) = queue.pop() {
         if !seen_folders.insert(folder.clone()) {
@@ -1178,7 +1201,9 @@ async fn walk_folders(
             let (children, next) = parse_files(&v);
             for child in children {
                 if child.mime_type == FOLDER_MIME {
-                    queue.push(child.id);
+                    if !excluded.contains(child.id.as_str()) {
+                        queue.push(child.id);
+                    }
                 } else if seen_files.insert(child.id.clone()) {
                     out.push(child);
                 }
@@ -1192,14 +1217,15 @@ async fn walk_folders(
     Ok((out, false))
 }
 
-/// Enumerate the files under the selected **My Drive** folders (recursively, deduped) — the personal
-/// counterpart to `enumerate_shared`'s folder branch, for folder-scoped My Drive. Carries the same
-/// truncated flag as [`walk_folders`].
+/// Enumerate the files under the selected **My Drive** folders (recursively, deduped, minus any
+/// `exclude`d subtrees) — the personal counterpart to `enumerate_shared`'s folder branch, for
+/// folder-scoped My Drive. Carries the same truncated flag as [`walk_folders`].
 pub async fn enumerate_my_folders(
     token_key: &str,
     folders: &[String],
+    exclude: &[String],
 ) -> Result<(Vec<DriveFile>, bool)> {
-    walk_folders(token_key, folders, my_files_url).await
+    walk_folders(token_key, folders, exclude, my_files_url).await
 }
 
 /// The delta baseline cursor (`changes.getStartPageToken`). `drive_id: Some` scopes it to one shared

@@ -261,6 +261,11 @@ pub struct OneDriveScope {
     /// cursor). Absent in older stored scopes, so it defaults to whole-drive.
     #[serde(default)]
     pub folders: Option<Vec<String>>,
+    /// Subfolders to skip while walking the selected `folders` (an item id excludes that folder and
+    /// its whole subtree). Only meaningful in folder-scoped mode; the whole-drive delta path can't be
+    /// folder-scoped. Empty/absent in older stored scopes, so nothing is excluded by default.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// Read an account's indexing scope (the default scope when none is stored yet).
@@ -636,18 +641,26 @@ pub async fn list_delta(
 
 /// Enumerate the files under the selected folders (recursively, breadth via a queue), deduped, each
 /// folder walked once even if reachable from two selections. Folders themselves are never returned —
-/// only the files beneath them. The folder-scoped counterpart to [`list_delta`].
+/// only the files beneath them. Any item id in `exclude` is never enqueued — pruning that folder and
+/// its whole subtree, both as a seed root and as a descended child. The folder-scoped counterpart to
+/// [`list_delta`].
 /// Returns the deduped files plus whether the walk was cut short by the folder-count guard (`true` ⇒
 /// INCOMPLETE — the caller must not treat an unseen file as deleted; see [`connector_sync::paginate`]).
 pub async fn enumerate_folders(
     token_key: &str,
     roots: &[String],
+    exclude: &[String],
 ) -> Result<(Vec<DriveItem>, bool)> {
     use std::collections::HashSet;
+    let excluded: HashSet<&str> = exclude.iter().map(String::as_str).collect();
     let mut out: Vec<DriveItem> = Vec::new();
     let mut seen_folders: HashSet<String> = HashSet::new();
     let mut seen_files: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = roots.to_vec();
+    let mut queue: Vec<String> = roots
+        .iter()
+        .filter(|r| !excluded.contains(r.as_str()))
+        .cloned()
+        .collect();
     let mut nodes = 0usize;
     while let Some(folder) = queue.pop() {
         if !seen_folders.insert(folder.clone()) {
@@ -664,7 +677,9 @@ pub async fn enumerate_folders(
             let (children, next) = parse_children(&v);
             for child in children {
                 if child.is_folder {
-                    queue.push(child.id);
+                    if !excluded.contains(child.id.as_str()) {
+                        queue.push(child.id);
+                    }
                 } else if child.is_file && seen_files.insert(child.id.clone()) {
                     out.push(child);
                 }

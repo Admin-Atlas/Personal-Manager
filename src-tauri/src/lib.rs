@@ -955,6 +955,8 @@ pub fn run() {
             commands::add_local_folder,
             commands::remove_local_folder,
             commands::list_local_folders,
+            commands::list_local_subfolders,
+            commands::set_local_excludes,
             commands::sync_local_folder,
             commands::local_folder_sync_status,
             commands::stop_local_folder_sync,

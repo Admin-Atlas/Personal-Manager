@@ -38,7 +38,7 @@ use std::time::Duration;
 use notify::event::{EventKind, ModifyKind, RenameMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{Error, Result};
@@ -155,6 +155,57 @@ fn is_ignored_dir(name: &str) -> bool {
     name.starts_with('.') || IGNORE_DIRS.contains(&name)
 }
 
+/// A path's `Normal` components, lower-cased on the case-insensitive desktops (Windows/macOS). Used to
+/// compare a walked path against a stored exclude entry independently of separator style (`/` vs `\`)
+/// and on-disk letter case — the walk yields real OS-case, OS-separator paths while excludes are stored
+/// root-relative with `/` from the picker.
+fn normalized_components(p: &Path) -> Vec<String> {
+    p.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => {
+                let s = os.to_string_lossy();
+                Some(if cfg!(any(windows, target_os = "macos")) {
+                    s.to_lowercase()
+                } else {
+                    s.into_owned()
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether every component of a root-relative path is an ordinary name — no `..`, no absolute/root or
+/// drive prefix. Guards the picker/exclude boundary so a crafted or malformed path can't escape the
+/// tracked root (`..`) or be silently collapsed by [`normalized_components`] (which drops `..`) into a
+/// prefix that prunes the wrong folder.
+fn is_safe_rel(rel: &Path) -> bool {
+    rel.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Whether a root-relative path is at or below any excluded subfolder — i.e. one of `exclude` is a
+/// leading component-prefix of `rel`. Excludes hold root-relative paths (as the picker emits them);
+/// matching is component-wise via [`normalized_components`] so separators and case never trip it.
+/// Malformed exclude entries (containing `..`, absolute) are ignored rather than collapsed. An empty
+/// exclude list (the common case) short-circuits.
+fn is_excluded(rel: &Path, exclude: &[String]) -> bool {
+    if exclude.is_empty() {
+        return false;
+    }
+    let rel_comps = normalized_components(rel);
+    exclude.iter().any(|ex| {
+        let ex_path = Path::new(ex);
+        if !is_safe_rel(ex_path) {
+            return false;
+        }
+        let ex_comps = normalized_components(ex_path);
+        !ex_comps.is_empty()
+            && rel_comps.len() >= ex_comps.len()
+            && rel_comps[..ex_comps.len()] == ex_comps[..]
+    })
+}
+
 /// Whether a walked path is a file worth indexing: a supported extension, under the size cap, not
 /// hidden. Pure over `(path, size, is_hidden)` so it's unit-testable without a filesystem.
 pub fn should_index(path: &Path, size: u64, hidden: bool) -> bool {
@@ -162,15 +213,16 @@ pub fn should_index(path: &Path, size: u64, hidden: bool) -> bool {
 }
 
 /// Recursively collect the indexable files under `root`, keyed by OS file id. Skips ignored/hidden
-/// directories, unsupported extensions, over-cap files, and (below the top level) directory symlinks —
-/// the same cycle/scope guards the drag-drop walk uses. `root` itself must be a directory.
+/// directories, any `exclude`d subfolder (and its whole subtree), unsupported extensions, over-cap
+/// files, and (below the top level) directory symlinks — the same cycle/scope guards the drag-drop
+/// walk uses. `root` itself must be a directory. `exclude` holds root-relative subfolder paths.
 /// Returns the collected files and whether the walk was TRUNCATED at `MAX_COLLECTED_FILES` — an
 /// incomplete enumeration, on which the caller must NOT infer deletions from a file's absence.
-pub fn walk(root: &Path) -> (Vec<LocalFile>, bool) {
+pub fn walk(root: &Path, exclude: &[String]) -> (Vec<LocalFile>, bool) {
     let key = folder_key(root);
     let mut out = Vec::new();
     let mut truncated = false;
-    walk_into(root, root, &key, &mut out, 0, &mut truncated);
+    walk_into(root, root, &key, exclude, &mut out, 0, &mut truncated);
     (out, truncated)
 }
 
@@ -178,6 +230,7 @@ fn walk_into(
     root: &Path,
     path: &Path,
     key: &str,
+    exclude: &[String],
     out: &mut Vec<LocalFile>,
     depth: usize,
     truncated: &mut bool,
@@ -203,12 +256,22 @@ fn walk_into(
         if depth > 0 && is_ignored_dir(&name) {
             return;
         }
+        // Prune an excluded subfolder (and its whole subtree) — the user chose to skip it. Checked at the
+        // directory so nothing beneath is ever read; the watcher applies the same gate (see
+        // `upsert_local_path`) so a create inside it can't sneak back in.
+        if depth > 0 {
+            if let Ok(rel) = path.strip_prefix(root) {
+                if is_excluded(rel, exclude) {
+                    return;
+                }
+            }
+        }
         if depth >= MAX_WALK_DEPTH {
             return;
         }
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
-                walk_into(root, &entry.path(), key, out, depth + 1, truncated);
+                walk_into(root, &entry.path(), key, exclude, out, depth + 1, truncated);
                 if out.len() >= MAX_COLLECTED_FILES {
                     *truncated = true;
                     break;
@@ -353,14 +416,25 @@ pub fn classify_event(kind: &EventKind, paths: &[PathBuf]) -> Vec<FsChange> {
     }
 }
 
+/// One tracked folder as the live watcher resolves an event path against it: its key, canonical root,
+/// and the subfolders excluded from indexing. Carries `exclude` so the watcher can apply the SAME
+/// directory pruning the periodic walk does — otherwise a create inside an excluded folder would index
+/// and the next walk (which skips it) would soft-delete it, the `ok`↔`source_missing` thrash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRoot {
+    pub key: String,
+    pub root: PathBuf,
+    pub exclude: Vec<String>,
+}
+
 /// Which tracked folder a filesystem path belongs to: the watched root that is a prefix of `path`,
 /// longest match winning so a nested tracked folder claims its own files. Pure; returns the matching
-/// `(key, root)`. A path under no watched root (a stray event) yields `None`.
-pub fn folder_of(path: &Path, roots: &[(String, PathBuf)]) -> Option<(String, PathBuf)> {
+/// [`LocalRoot`]. A path under no watched root (a stray event) yields `None`.
+pub fn folder_of(path: &Path, roots: &[LocalRoot]) -> Option<LocalRoot> {
     roots
         .iter()
-        .filter(|(_, root)| path.starts_with(root))
-        .max_by_key(|(_, root)| root.components().count())
+        .filter(|r| path.starts_with(&r.root))
+        .max_by_key(|r| r.root.components().count())
         .cloned()
 }
 
@@ -431,12 +505,43 @@ pub struct LocalFolder {
     pub indexed: i64,
     /// Whether the path is currently a readable directory (a removed/unmounted root reads `false`).
     pub present: bool,
+    /// Root-relative subfolders excluded from indexing (empty = index the whole folder).
+    pub exclude: Vec<String>,
+}
+
+/// What a tracked local folder indexes, persisted as JSON in `connector_sources.folder_ids`: the
+/// canonical root plus the subfolders to skip. Older rows stored the bare root path there (no exclude
+/// concept); [`parse_scope`] reads both shapes, so this is additive with no migration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalScope {
+    /// The canonical absolute root path.
+    pub root: String,
+    /// Root-relative subfolders excluded from indexing (each skips that folder and its subtree).
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// Read a folder's stored scope from the `folder_ids` cell, tolerating the two shapes: the current
+/// JSON object, or a legacy bare root path (which reads as that root with no excludes). An absolute
+/// path never starts with `{`, so the leading brace cleanly distinguishes them.
+fn parse_scope(raw: &str) -> LocalScope {
+    let t = raw.trim();
+    if t.starts_with('{') {
+        if let Ok(s) = serde_json::from_str::<LocalScope>(t) {
+            return s;
+        }
+    }
+    LocalScope {
+        root: raw.to_string(),
+        exclude: Vec::new(),
+    }
 }
 
 /// Register a folder to track (or reactivate one already tracked), returning its stable key. The
-/// absolute path is stored in `folder_ids` (local rows have no folder-scope concept, so the column
-/// carries the root path); re-adding the same folder reuses the row and clears any prior failure
-/// state. No documents are touched here — indexing happens on the following sync.
+/// scope (root path + any excludes) is stored as JSON in `folder_ids`. Re-adding the same folder
+/// reuses the row and clears any prior failure state, **preserving its existing scope** (the canonical
+/// root can't change for a given key, and its excludes should survive a reconnect). No documents are
+/// touched here — indexing happens on the following sync.
 pub fn add_folder(conn: &Connection, root: &Path) -> Result<String> {
     let key = folder_key(root);
     let id = folder_source_id(&key);
@@ -446,14 +551,48 @@ pub fn add_folder(conn: &Connection, root: &Path) -> Result<String> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
+    let scope_json = serde_json::to_string(&LocalScope {
+        root: path,
+        exclude: Vec::new(),
+    })
+    .map_err(|e| Error::Other(format!("encode local scope: {e}")))?;
     conn.execute(
         "INSERT INTO connector_sources (id, provider, service, label, mode, folder_ids, state) \
          VALUES (?1, ?2, ?3, ?4, 'index_only', ?5, 'ok') \
-         ON CONFLICT(id) DO UPDATE SET label = excluded.label, folder_ids = excluded.folder_ids, \
-                                        state = 'ok'",
-        params![id, PROVIDER, SERVICE, label, path],
+         ON CONFLICT(id) DO UPDATE SET label = excluded.label, state = 'ok'",
+        params![id, PROVIDER, SERVICE, label, scope_json],
     )?;
     Ok(key)
+}
+
+/// A folder's stored scope (root + excludes), or `None` if the key isn't registered.
+pub fn get_scope(conn: &Connection, key: &str) -> Result<Option<LocalScope>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT folder_ids FROM connector_sources WHERE id = ?1",
+            params![folder_source_id(key)],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)?;
+    Ok(raw.map(|s| parse_scope(&s)))
+}
+
+/// Persist a folder's excluded subfolders, keeping its stored root. The UI follows this with a sync to
+/// apply the change (soft-remove now-excluded files, re-index any un-excluded ones). A no-op if the key
+/// isn't registered.
+pub fn set_excludes(conn: &Connection, key: &str, exclude: &[String]) -> Result<()> {
+    let Some(mut scope) = get_scope(conn, key)? else {
+        return Ok(());
+    };
+    scope.exclude = exclude.to_vec();
+    let json = serde_json::to_string(&scope)
+        .map_err(|e| Error::Other(format!("encode local scope: {e}")))?;
+    conn.execute(
+        "UPDATE connector_sources SET folder_ids = ?2 WHERE id = ?1",
+        params![folder_source_id(key), json],
+    )?;
+    Ok(())
 }
 
 /// Every tracked local folder, with its live document count and whether its path is currently present.
@@ -478,18 +617,19 @@ pub fn list_folders(conn: &Connection) -> Result<Vec<LocalFolder>> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut out = Vec::with_capacity(rows.len());
-    for (id, label, path, state, last_synced_at, indexed) in rows {
-        let path = path.unwrap_or_default();
-        let present = Path::new(&path).is_dir();
+    for (id, label, raw, state, last_synced_at, indexed) in rows {
+        let scope = parse_scope(raw.as_deref().unwrap_or_default());
+        let present = Path::new(&scope.root).is_dir();
         let key = id.strip_prefix("local:").unwrap_or(&id).to_string();
         out.push(LocalFolder {
             key,
-            path,
+            path: scope.root,
             label,
             state,
             last_synced_at,
             indexed,
             present,
+            exclude: scope.exclude,
         });
     }
     Ok(out)
@@ -497,15 +637,7 @@ pub fn list_folders(conn: &Connection) -> Result<Vec<LocalFolder>> {
 
 /// The absolute root path of a tracked folder, or `None` if the key isn't registered.
 pub fn folder_root(conn: &Connection, key: &str) -> Result<Option<PathBuf>> {
-    let path: Option<String> = conn
-        .query_row(
-            "SELECT folder_ids FROM connector_sources WHERE id = ?1",
-            params![folder_source_id(key)],
-            |r| r.get(0),
-        )
-        .optional()
-        .map(Option::flatten)?;
-    Ok(path.map(PathBuf::from))
+    Ok(get_scope(conn, key)?.map(|s| PathBuf::from(s.root)))
 }
 
 /// The folder keys of every tracked local folder (for an all-folders sync).
@@ -653,13 +785,97 @@ pub fn watch_targets(conn: &Connection) -> Result<Vec<WatchTarget>> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
-        .map(|(id, path)| {
+        .map(|(id, raw)| {
             let key = id.strip_prefix("local:").unwrap_or(&id).to_string();
-            let root = PathBuf::from(path.unwrap_or_default());
+            let root = PathBuf::from(parse_scope(raw.as_deref().unwrap_or_default()).root);
             let present = root.is_dir();
             WatchTarget { key, root, present }
         })
         .collect())
+}
+
+/// Every tracked folder as a [`LocalRoot`] (key, canonical root, exclude list) — the live watcher's
+/// per-event resolution set. Mirrors [`watch_targets`] but carries excludes, so a create/modify event
+/// can be pruned exactly as the periodic walk prunes it.
+pub fn tracked_roots(conn: &Connection) -> Result<Vec<LocalRoot>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, folder_ids FROM connector_sources \
+         WHERE provider = ?1 AND service = ?2 ORDER BY created_at",
+    )?;
+    let rows = stmt
+        .query_map(params![PROVIDER, SERVICE], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, raw)| {
+            let key = id.strip_prefix("local:").unwrap_or(&id).to_string();
+            let scope = parse_scope(raw.as_deref().unwrap_or_default());
+            LocalRoot {
+                key,
+                root: PathBuf::from(scope.root),
+                exclude: scope.exclude,
+            }
+        })
+        .collect())
+}
+
+/// One immediate subfolder for the local folder picker: its root-relative path (what an exclude
+/// stores) and its own name (what the tree shows).
+#[derive(Clone, Debug, Serialize)]
+pub struct LocalSubfolder {
+    pub rel: String,
+    pub name: String,
+}
+
+/// The immediate child subfolders of `rel` (root-relative, `/`-joined, empty = the root) inside the
+/// tracked folder `root` — one lazy level of the local folder picker. Skips the same ignored dirs the
+/// walk does (VCS/build/cache, dotfiles) and directory symlinks, so the tree shows only what could
+/// actually be indexed. Each entry's `rel` is what an exclude stores.
+pub fn list_subfolders(root: &Path, rel: &str) -> Result<Vec<LocalSubfolder>> {
+    // Never let a `..`/absolute `rel` escape the tracked root — `PathBuf::join` doesn't normalise it,
+    // so the OS would resolve it at read time and enumerate directories outside the folder.
+    if !rel.is_empty() && !is_safe_rel(Path::new(rel)) {
+        return Err(Error::Other("invalid subfolder path".into()));
+    }
+    let base = if rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    let mut out: Vec<LocalSubfolder> = Vec::new();
+    let entries = std::fs::read_dir(&base)
+        .map_err(|e| Error::Other(format!("read {}: {e}", base.display())))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // A directory, but not a symlinked one (the walk won't descend those below the root).
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if is_ignored_dir(&name) {
+            continue;
+        }
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        out.push(LocalSubfolder {
+            rel: child_rel,
+            name,
+        });
+    }
+    out.sort_by_key(|s| s.name.to_lowercase());
+    Ok(out)
 }
 
 /// Record a file's new mtime without re-embedding — used when the mtime moved but the content hash
@@ -843,14 +1059,15 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
     // walk stats + opens files for their OS id, so it must not hold the DB).
     let mut work: Vec<FolderWork> = Vec::new();
     for key in keys {
-        let root = {
+        let scope = {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            folder_root(&conn, &key)?
+            get_scope(&conn, &key)?
         };
-        let Some(root) = root else {
+        let Some(scope) = scope else {
             continue; // the registry row was removed mid-run
         };
+        let root = PathBuf::from(&scope.root);
         let known = {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
@@ -868,7 +1085,8 @@ async fn run_local_sync(app: &AppHandle, folder: Option<String>) -> Result<usize
             continue;
         }
         let root2 = root.clone();
-        let (files, truncated) = tokio::task::spawn_blocking(move || walk(&root2))
+        let exclude = scope.exclude.clone();
+        let (files, truncated) = tokio::task::spawn_blocking(move || walk(&root2, &exclude))
             .await
             .map_err(|e| Error::Other(format!("local walk task panicked: {e}")))?;
         work.push(FolderWork {
@@ -1428,16 +1646,13 @@ async fn process_local_watch_batch(app: &AppHandle, res: DebounceEventResult) {
             return;
         }
     };
-    // Snapshot the tracked roots once for this batch, to place each event's path to its folder.
-    let roots: Vec<(String, std::path::PathBuf)> = {
+    // Snapshot the tracked roots once for this batch, to place each event's path to its folder (and
+    // carry each folder's excludes so an event inside an excluded subtree is pruned like the walk does).
+    let roots: Vec<LocalRoot> = {
         let state = app.state::<AppState>();
         let conn = state.conn();
         let Ok(conn) = conn else { return };
-        watch_targets(&conn)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| (t.key, t.root))
-            .collect()
+        tracked_roots(&conn).unwrap_or_default()
     };
     if roots.is_empty() {
         return;
@@ -1462,11 +1677,7 @@ async fn process_local_watch_batch(app: &AppHandle, res: DebounceEventResult) {
 /// changed. A rename repoints by the stable OS id: upsert `to` (keeps the item when the id survived,
 /// or ingests a fresh one when the file was only path-keyed), then a remove of `from` that no-ops on
 /// the survived-id case and soft-deletes the orphan otherwise.
-async fn handle_fs_change(
-    app: &AppHandle,
-    change: FsChange,
-    roots: &[(String, std::path::PathBuf)],
-) -> Result<bool> {
+async fn handle_fs_change(app: &AppHandle, change: FsChange, roots: &[LocalRoot]) -> Result<bool> {
     match change {
         FsChange::Upsert(path) => upsert_local_path(app, &path, roots).await,
         FsChange::Removed(path) => remove_local_path(app, &path, roots).await,
@@ -1484,9 +1695,9 @@ async fn handle_fs_change(
 async fn upsert_local_path(
     app: &AppHandle,
     path: &std::path::Path,
-    roots: &[(String, std::path::PathBuf)],
+    roots: &[LocalRoot],
 ) -> Result<bool> {
-    let Some((key, root)) = folder_of(path, roots) else {
+    let Some(LocalRoot { key, root, exclude }) = folder_of(path, roots) else {
         return Ok(false);
     };
     let meta = match std::fs::symlink_metadata(path) {
@@ -1504,8 +1715,9 @@ async fn upsert_local_path(
         return Ok(false);
     }
     // Match the periodic walk's DIRECTORY guards too (not just should_index's file guards): never index
-    // a file the walk would skip — one inside an ignored dir (node_modules/.git/…) or below the depth
-    // cap — or the next walk (which does skip it) soft-deletes it → ok↔source_missing thrash.
+    // a file the walk would skip — one inside an ignored dir (node_modules/.git/…), an excluded subtree,
+    // or below the depth cap — or the next walk (which does skip it) soft-deletes it → ok↔source_missing
+    // thrash.
     if let Ok(rel) = path.strip_prefix(&root) {
         let comps: Vec<_> = rel.components().collect();
         let dir_count = comps.len().saturating_sub(1); // components minus the file name
@@ -1513,6 +1725,7 @@ async fn upsert_local_path(
             || comps.iter().take(dir_count).any(|c| {
                 matches!(c, std::path::Component::Normal(os) if is_ignored_dir(&os.to_string_lossy()))
             })
+            || is_excluded(rel, &exclude)
         {
             return Ok(false);
         }
@@ -1554,9 +1767,9 @@ async fn upsert_local_path(
 async fn remove_local_path(
     app: &AppHandle,
     path: &std::path::Path,
-    roots: &[(String, std::path::PathBuf)],
+    roots: &[LocalRoot],
 ) -> Result<bool> {
-    let Some((key, _root)) = folder_of(path, roots) else {
+    let Some(LocalRoot { key, .. }) = folder_of(path, roots) else {
         return Ok(false);
     };
     let abs = path.to_string_lossy().to_string();
@@ -1689,7 +1902,7 @@ mod tests {
         std::fs::create_dir(&git).unwrap();
         std::fs::write(git.join("config.txt"), b"vcs").unwrap(); // ignored dir
 
-        let mut rels: Vec<String> = walk(root)
+        let mut rels: Vec<String> = walk(root, &[])
             .0
             .into_iter()
             .map(|f| f.rel_path.replace('\\', "/"))
@@ -1701,10 +1914,94 @@ mod tests {
         );
         // Every item is namespaced under this folder's key.
         let key = folder_key(root);
-        assert!(walk(root)
+        assert!(walk(root, &[])
             .0
             .iter()
             .all(|f| f.source_id.starts_with(&format!("local:{key}:"))));
+    }
+
+    #[test]
+    fn walk_prunes_excluded_subfolders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("keep.md"), b"x").unwrap();
+        let archive = root.join("Archive");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::write(archive.join("old.md"), b"x").unwrap();
+        let deep = archive.join("2020");
+        std::fs::create_dir(&deep).unwrap();
+        std::fs::write(deep.join("older.md"), b"x").unwrap();
+        let work = root.join("Work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("plan.md"), b"x").unwrap();
+
+        // Excluding "Archive" drops it and its whole subtree, and nothing else.
+        let mut rels: Vec<String> = walk(root, &["Archive".to_string()])
+            .0
+            .into_iter()
+            .map(|f| f.rel_path.replace('\\', "/"))
+            .collect();
+        rels.sort();
+        assert_eq!(rels, vec!["Work/plan.md".to_string(), "keep.md".into()]);
+
+        // A nested exclude prunes just that branch; the case/separator style don't matter.
+        let mut rels: Vec<String> = walk(root, &["archive/2020".to_string()])
+            .0
+            .into_iter()
+            .map(|f| f.rel_path.replace('\\', "/"))
+            .collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec![
+                "Archive/old.md".to_string(),
+                "Work/plan.md".into(),
+                "keep.md".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn list_subfolders_rejects_parent_dir_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        // A legit relative level works.
+        assert!(list_subfolders(root, "").is_ok());
+        assert!(list_subfolders(root, "sub").is_ok());
+        // A `..` escape is refused rather than enumerating outside the root.
+        assert!(list_subfolders(root, "..").is_err());
+        assert!(list_subfolders(root, "../..").is_err());
+        assert!(list_subfolders(root, "sub/../..").is_err());
+    }
+
+    #[test]
+    fn is_excluded_ignores_malformed_parent_dir_entries() {
+        // A `..`-bearing exclude must NOT collapse to "Work" and prune a top-level Work folder.
+        assert!(!is_excluded(Path::new("Work"), &["../Work".to_string()]));
+        // A well-formed exclude still matches (itself and descendants), case/separator-insensitively.
+        assert!(is_excluded(Path::new("Archive"), &["archive".to_string()]));
+        assert!(is_excluded(
+            Path::new("Archive/2020/x"),
+            &["Archive/2020".to_string()]
+        ));
+        assert!(!is_excluded(Path::new("Work"), &["Archive".to_string()]));
+    }
+
+    #[test]
+    fn parse_scope_reads_json_and_legacy_bare_path() {
+        // Legacy rows stored a bare path with no exclude concept.
+        let legacy = parse_scope("/home/docs");
+        assert_eq!(legacy.root, "/home/docs");
+        assert!(legacy.exclude.is_empty());
+        // The current JSON shape round-trips root + excludes.
+        let json = parse_scope(r#"{"root":"/home/docs","exclude":["Archive","Work/tmp"]}"#);
+        assert_eq!(json.root, "/home/docs");
+        assert_eq!(json.exclude, vec!["Archive".to_string(), "Work/tmp".into()]);
+        // A JSON object without the key defaults excludes to empty.
+        let no_excl = parse_scope(r#"{"root":"/x"}"#);
+        assert_eq!(no_excl.root, "/x");
+        assert!(no_excl.exclude.is_empty());
     }
 
     // --- live-watcher event translation (pure) ---
@@ -1788,16 +2085,26 @@ mod tests {
 
     #[test]
     fn folder_of_picks_the_innermost_tracked_root() {
-        let roots = vec![
-            ("outer".to_string(), PathBuf::from("/home/docs")),
-            ("inner".to_string(), PathBuf::from("/home/docs/work")),
-        ];
+        let mk = |key: &str, root: &str| LocalRoot {
+            key: key.to_string(),
+            root: PathBuf::from(root),
+            exclude: Vec::new(),
+        };
+        let roots = vec![mk("outer", "/home/docs"), mk("inner", "/home/docs/work")];
         // A file under the nested root belongs to the nested folder (longest prefix wins).
-        let (k, _) = folder_of(Path::new("/home/docs/work/plan.md"), &roots).unwrap();
-        assert_eq!(k, "inner");
+        assert_eq!(
+            folder_of(Path::new("/home/docs/work/plan.md"), &roots)
+                .unwrap()
+                .key,
+            "inner"
+        );
         // A file only under the outer root belongs to it.
-        let (k, _) = folder_of(Path::new("/home/docs/notes.md"), &roots).unwrap();
-        assert_eq!(k, "outer");
+        assert_eq!(
+            folder_of(Path::new("/home/docs/notes.md"), &roots)
+                .unwrap()
+                .key,
+            "outer"
+        );
         // A path under no tracked root → no folder.
         assert!(folder_of(Path::new("/tmp/x.md"), &roots).is_none());
     }

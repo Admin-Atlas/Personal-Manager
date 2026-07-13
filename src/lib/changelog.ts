@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.6.0-alpha",
+    date: "2026-07-13",
+    highlights: [
+      "You can now index a folder but skip parts of it. When you choose which folders to index from a Google Drive, OneDrive, or a folder on this computer, the folder tree lets you uncheck any subfolder to leave it (and everything inside it) out — handy for skipping a big archive or a noisy downloads folder while indexing the rest.",
+      "Your choices take effect on that connection’s next sync. Anything already indexed inside a subfolder you’ve just excluded is removed from search then — but the files themselves are never touched on disk or in the cloud.",
+    ],
+  },
+  {
     version: "3.5.0-alpha",
     date: "2026-07-13",
     highlights: [
