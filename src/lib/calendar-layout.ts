@@ -9,6 +9,18 @@
 import { pad2 } from "./format";
 import type { CalendarEvent } from "./types";
 
+// --- milestone overlay -----------------------------------------------------------------------------
+
+/** The synthetic `calendar_id` carried by project-milestone events (card 7 overlay). These are
+ *  injected by CalendarView, not synced — they render as all-day events but are the one clickable,
+ *  navigational element on the otherwise read-only calendar. Their `id` is `milestone:<milestone id>`. */
+export const MILESTONE_CALENDAR_ID = "pm:milestones";
+
+/** True for a synthetic project-milestone event (vs a real synced event). */
+export function isMilestoneEvent(ev: CalendarEvent): boolean {
+  return ev.calendar_id === MILESTONE_CALENDAR_ID;
+}
+
 // --- local-day helpers ---------------------------------------------------------------------------
 
 /** Parse a mirror date string to a LOCAL `Date`. An all-day value is a civil date ("YYYY-MM-DD")

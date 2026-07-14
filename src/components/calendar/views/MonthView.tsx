@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
-import { addDays, dayKey, startOfDay } from "../../../lib/calendar-layout";
+import { addDays, dayKey, isMilestoneEvent, startOfDay } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -31,6 +31,8 @@ interface Props {
   colorOf: (calendarId: string) => string;
   /** Reports the month filling the view as the user scrolls, so the header label can track it. */
   onFocusDate: (d: Date) => void;
+  /** Open a milestone overlay event's project (fires for milestone chips only). */
+  onEventClick?: (ev: CalendarEvent) => void;
 }
 
 const BAND_H = 16;
@@ -49,7 +51,7 @@ const firstOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth(), 1);
 /** A week's representative month = its Thursday (ISO), so a boundary week picks the majority side. */
 const weekMonthKey = (w: MonthWeekRow) => monthKey(w.cells[3].date);
 
-export function MonthView({ cursor, events, colorOf, onFocusDate }: Props) {
+export function MonthView({ cursor, events, colorOf, onFocusDate, onEventClick }: Props) {
   const { minimal, showMeta, showPower } = useDepth();
   const maxChips = showPower ? 4 : 3;
 
@@ -262,6 +264,7 @@ export function MonthView({ cursor, events, colorOf, onFocusDate }: Props) {
                             color={colorOf(ev.calendar_id)}
                             timeLabel={ev.all_day ? "" : formatClockIso(ev.start)}
                             showTime={showMeta}
+                            onClick={isMilestoneEvent(ev) ? () => onEventClick?.(ev) : undefined}
                           />
                         ))}
                         {hidden > 0 && (

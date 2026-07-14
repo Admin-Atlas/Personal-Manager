@@ -8,6 +8,7 @@
 
 import { useMemo } from "react";
 import type { Calendar, CalendarAccount } from "../../lib/types";
+import { MILESTONE_CALENDAR_ID } from "../../lib/calendar-layout";
 import { Button, cn } from "../ui";
 import { Popover } from "./Popover";
 import { SourceDot } from "./parts/SourceDot";
@@ -64,6 +65,32 @@ export function CalendarsDropdown({ accounts, calendars, hidden, onToggle, color
         </Button>
       )}
     >
+      {/* Project milestones — a first-party pseudo-calendar you can show/hide like any synced one.
+          Shown even with no calendars connected, since milestones exist independently of them. */}
+      <div className="mb-1">
+        <p className="truncate px-2 pb-0.5 pt-1 font-mono text-[10px] uppercase tracking-wide text-faint">
+          Personal Manager
+        </p>
+        <ul>
+          <li>
+            <label className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1 text-sm text-ink hover:bg-surface">
+              <input
+                type="checkbox"
+                checked={!hidden.has(MILESTONE_CALENDAR_ID)}
+                onChange={() => onToggle(MILESTONE_CALENDAR_ID)}
+                className="accent-[var(--accent)]"
+              />
+              <SourceDot
+                color={colorOf(MILESTONE_CALENDAR_ID)}
+                className={cn(hidden.has(MILESTONE_CALENDAR_ID) && "opacity-40")}
+              />
+              <span className={cn("truncate", hidden.has(MILESTONE_CALENDAR_ID) && "text-ink4")}>
+                Milestones
+              </span>
+            </label>
+          </li>
+        </ul>
+      </div>
       {calendars.length === 0 ? (
         <p className="px-2 py-2 text-xs text-ink4">No calendars connected.</p>
       ) : (

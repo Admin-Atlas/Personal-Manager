@@ -13,18 +13,36 @@ interface Props {
   timeLabel: string;
   /** Depth gate: show the time prefix (Power). */
   showTime: boolean;
+  /** When set, the chip is interactive (the milestone overlay only) — click / Enter / Space fires it.
+   *  Synced events leave this undefined and stay non-interactive. */
+  onClick?: () => void;
 }
 
-export function EventChip({ summary, color, timeLabel, showTime }: Props) {
+export function EventChip({ summary, color, timeLabel, showTime, onClick }: Props) {
   return (
     <div
-      className="flex items-center gap-1 overflow-hidden rounded-[var(--radius-sm)] border-l-[2px] px-1 py-px text-[11px] leading-tight"
+      className={`flex items-center gap-1 overflow-hidden rounded-[var(--radius-sm)] border-l-[2px] px-1 py-px text-[11px] leading-tight ${
+        onClick ? "cursor-pointer hover:brightness-110" : ""
+      }`}
       style={{
         background: `color-mix(in oklab, ${color} 16%, transparent)`,
         borderLeftColor: color,
       }}
       title={summary}
       aria-label={[timeLabel, summary].filter(Boolean).join(", ")}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onClick={onClick}
+      onKeyDown={
+        onClick
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onClick();
+              }
+            }
+          : undefined
+      }
     >
       {showTime && timeLabel && (
         <span className="shrink-0 font-mono text-[9px] text-ink4">{timeLabel}</span>

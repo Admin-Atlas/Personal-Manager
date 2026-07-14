@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { CalendarEvent, Milestone } from "../lib/types";
 import {
   addMilestone,
@@ -17,14 +17,19 @@ import { Button, Input, Select } from "./ui";
 
 interface Props {
   project: string;
-  /** The project's milestones, resolved + date-ordered (controlled by the parent). */
+  /** The project's milestones, in the order the parent wants them shown (controlled). */
   milestones: Milestone[];
-  /** Upcoming events (those with a uid) for the link picker; empty hides linking. */
+  /** Calendar events (those with a uid) for the link picker; empty hides linking. Deduped by
+   *  uid and date-ordered here, so the parent can pass the whole mirror. */
   calendarEvents?: CalendarEvent[];
   /** Called after any mutation so the parent refetches and reflects the new state. */
   onChanged: () => void;
   /** Read-only summary (no edit controls) — for lower depth / display surfaces. */
   readOnly?: boolean;
+  /** Manual reorder mode: show the per-row ↑/↓ arrows. False under an active sort, where reordering
+   *  would persist a wrong `sort_order` (onMove swaps by array index). Defaults to true so callers
+   *  that don't sort (e.g. FocusView's project-edit form) keep the arrows. */
+  manualOrder?: boolean;
 }
 
 /** A project's milestones (multi-deadline, card 7): add / edit / remove / reorder, mark
@@ -37,6 +42,7 @@ export function MilestoneList({
   calendarEvents = [],
   onChanged,
   readOnly = false,
+  manualOrder = true,
 }: Props) {
   // A single error line for the whole list: any row's failed mutation surfaces here instead
   // of silently no-opping (F3-8). Declared before the read-only early return to keep the hook
@@ -62,16 +68,20 @@ export function MilestoneList({
           events={calendarEvents}
           onChanged={onChanged}
           onError={setError}
-          onMove={(dir) => {
-            const j = i + dir;
-            if (j < 0 || j >= milestones.length) return;
-            const ids = milestones.map((x) => x.id);
-            [ids[i], ids[j]] = [ids[j], ids[i]];
-            void runMutation(async () => {
-              await reorderMilestones(project, ids);
-              onChanged();
-            }, setError);
-          }}
+          onMove={
+            manualOrder
+              ? (dir) => {
+                  const j = i + dir;
+                  if (j < 0 || j >= milestones.length) return;
+                  const ids = milestones.map((x) => x.id);
+                  [ids[i], ids[j]] = [ids[j], ids[i]];
+                  void runMutation(async () => {
+                    await reorderMilestones(project, ids);
+                    onChanged();
+                  }, setError);
+                }
+              : undefined
+          }
         />
       ))}
       <AddMilestone project={project} onChanged={onChanged} onError={setError} />
@@ -127,12 +137,25 @@ function MilestoneRow({
   events: CalendarEvent[];
   onChanged: () => void;
   onError: (message: string | null) => void;
-  onMove: (dir: -1 | 1) => void;
+  /** Reorder within the list. Omitted (undefined) hides the ↑/↓ arrows — see `manualOrder`. */
+  onMove?: (dir: -1 | 1) => void;
 }) {
   const [label, setLabel] = useState(m.label);
   const [date, setDate] = useState(m.due_date?.slice(0, 10) ?? "");
   const met = m.state === "met";
-  const linkable = events.filter((e) => e.uid);
+  // Linkable targets: events with a uid (the link re-resolves its date by uid each sync, so a
+  // uid is required — milestones.rs). The parent can hand us the whole calendar mirror, which
+  // repeats a recurring series and mirrors an event across calendars, so dedup by uid (keep the
+  // soonest) and show them earliest→latest for a clean, chronological picker.
+  const linkable = useMemo(() => {
+    const byUid = new Map<string, CalendarEvent>();
+    for (const e of events) {
+      if (!e.uid) continue;
+      const prev = byUid.get(e.uid);
+      if (!prev || e.start.localeCompare(prev.start) < 0) byUid.set(e.uid, e);
+    }
+    return [...byUid.values()].sort((a, b) => a.start.localeCompare(b.start));
+  }, [events]);
 
   // Persist label (+ PM-native date) on blur, skipping a no-op so we don't refetch needlessly.
   async function persist() {
@@ -186,24 +209,28 @@ function MilestoneRow({
         />
         {met && <DonePill />}
         <div className="flex shrink-0 items-center">
-          <Button
-            variant="tertiary"
-            onClick={() => onMove(-1)}
-            disabled={isFirst}
-            title="Move up"
-            className="px-1.5 py-0.5 disabled:opacity-30"
-          >
-            ↑
-          </Button>
-          <Button
-            variant="tertiary"
-            onClick={() => onMove(1)}
-            disabled={isLast}
-            title="Move down"
-            className="px-1.5 py-0.5 disabled:opacity-30"
-          >
-            ↓
-          </Button>
+          {onMove && (
+            <>
+              <Button
+                variant="tertiary"
+                onClick={() => onMove(-1)}
+                disabled={isFirst}
+                title="Move up"
+                className="px-1.5 py-0.5 disabled:opacity-30"
+              >
+                ↑
+              </Button>
+              <Button
+                variant="tertiary"
+                onClick={() => onMove(1)}
+                disabled={isLast}
+                title="Move down"
+                className="px-1.5 py-0.5 disabled:opacity-30"
+              >
+                ↓
+              </Button>
+            </>
+          )}
           <Button
             variant="tertiary"
             onClick={() =>

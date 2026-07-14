@@ -741,7 +741,7 @@ const NoteBody = memo(function NoteBody({
       // everywhere outside the board (reader, retrieval, chat citations), where the raw dialect
       // markers render degraded and get indexed as noise. The widget keeps the raw `text`, and the
       // edit-detection hash still tracks it, so "edited since last ingest" is unaffected.
-      await ingestNote(widget.id, toRenderMarkdown(text));
+      await ingestNote(widget.id, widget.title ?? "", toRenderMarkdown(text));
       onChange(widget.id, { ingestedAt: new Date().toISOString(), ingestedHash: cheapHash(text) });
       onIngested();
     } catch (e) {
@@ -1597,6 +1597,7 @@ function FreeformTimeline({
 }: TimelineBodyProps & { view: TimelineView }) {
   const [projects, setProjects] = useState<string[]>([]);
   const [projDraft, setProjDraft] = useState("");
+  const [linkErr, setLinkErr] = useState<string | null>(null);
   useEffect(() => {
     listProjects()
       .then(setProjects)
@@ -1610,6 +1611,28 @@ function FreeformTimeline({
     if (!b.date) return -1;
     return a.date.localeCompare(b.date);
   });
+
+  // Bind to a project — but first MERGE the freeform entries into that project's real milestones, so
+  // what you typed becomes the project's milestones instead of vanishing behind the bound view. Dedup
+  // against what's already there (by label + date) so re-linking after an Unlink can't duplicate. A
+  // new project name is fine — addMilestone creates the project on first insert.
+  async function linkProject(project: string) {
+    await runMutation(async () => {
+      const existing = await listMilestones(project);
+      const seen = new Set(
+        existing.map((m) => `${m.label.trim()} ${m.due_date?.slice(0, 10) ?? ""}`),
+      );
+      for (const it of widget.items ?? []) {
+        const label = it.label.trim() || "deadline";
+        const date = it.date || null;
+        const key = `${label} ${date ?? ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        await addMilestone(project, label, date, null);
+      }
+      onChange(widget.id, { project });
+    }, setLinkErr);
+  }
 
   return (
     <div className="flex h-full flex-col px-2 py-1">
@@ -1663,8 +1686,9 @@ function FreeformTimeline({
       >
         + Milestone
       </button>
-      {/* Bind to a real project to sync milestones with the brief + Focus. Typing a new name is
-          allowed (it's created when the first milestone is added). */}
+      {/* Bind to a real project. Linking first merges the freeform entries above into that project's
+          milestones (so they don't vanish behind the bound view), then switches to it. Typing a new
+          name is allowed — the project is created when the first milestone is added. */}
       <div className="mt-1 flex shrink-0 items-center gap-1" data-help="pinboard-timeline-project">
         <input
           list={listId}
@@ -1679,13 +1703,14 @@ function FreeformTimeline({
           ))}
         </datalist>
         <button
-          onClick={() => projDraft.trim() && onChange(widget.id, { project: projDraft.trim() })}
+          onClick={() => projDraft.trim() && void linkProject(projDraft.trim())}
           disabled={!projDraft.trim()}
           className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface disabled:opacity-40"
         >
           Link
         </button>
       </div>
+      {linkErr && <p className="mt-1 shrink-0 text-[10px] text-st-due">{linkErr}</p>}
     </div>
   );
 }

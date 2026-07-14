@@ -13,6 +13,7 @@ import {
   clampSpanToRange,
   dayDiff,
   eventDaySpan,
+  isMilestoneEvent,
   packBands,
   type BandInput,
 } from "../../../lib/calendar-layout";
@@ -27,6 +28,8 @@ interface Props {
   gutterPx: number;
   /** Depth gate for the "all-day" gutter label. */
   showLabel: boolean;
+  /** Open a milestone overlay event's project (fires for milestone bands only). */
+  onEventClick?: (ev: CalendarEvent) => void;
 }
 
 const LANE_H = 20;
@@ -37,7 +40,7 @@ interface Placed extends BandInput {
   continuesRight: boolean;
 }
 
-export function AllDayBand({ events, days, colorOf, gutterPx, showLabel }: Props) {
+export function AllDayBand({ events, days, colorOf, gutterPx, showLabel, onEventClick }: Props) {
   const ndays = days.length;
 
   const { placed, laneCount } = useMemo(() => {
@@ -87,10 +90,13 @@ export function AllDayBand({ events, days, colorOf, gutterPx, showLabel }: Props
           const color = colorOf(b.ev.calendar_id);
           const leftPct = (b.startDay / ndays) * 100;
           const widthPct = ((b.endDay - b.startDay + 1) / ndays) * 100;
+          const clickable = isMilestoneEvent(b.ev);
           return (
             <div
               key={b.ev.id}
-              className="absolute overflow-hidden px-1.5 text-[11px] leading-[18px]"
+              className={`absolute overflow-hidden px-1.5 text-[11px] leading-[18px] ${
+                clickable ? "cursor-pointer hover:brightness-110" : ""
+              }`}
               style={{
                 top: `${b.lane * LANE_H}px`,
                 left: `${leftPct}%`,
@@ -105,6 +111,19 @@ export function AllDayBand({ events, days, colorOf, gutterPx, showLabel }: Props
               }}
               title={b.ev.summary}
               aria-label={b.ev.summary}
+              role={clickable ? "button" : undefined}
+              tabIndex={clickable ? 0 : undefined}
+              onClick={clickable ? () => onEventClick?.(b.ev) : undefined}
+              onKeyDown={
+                clickable
+                  ? (e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        onEventClick?.(b.ev);
+                      }
+                    }
+                  : undefined
+              }
             >
               <span className="truncate font-head text-ink">
                 {b.continuesLeft ? "‹ " : ""}

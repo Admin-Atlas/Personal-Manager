@@ -40,3 +40,18 @@ export function sourceColors(
   ordered.forEach((id, i) => map.set(id, palette[i % palette.length]));
   return map;
 }
+
+/** The distinct hue for project-milestone events on the calendar (card 7 overlay) — one per System,
+ *  chosen from OUTSIDE that System's accent picker (`ACCENTS`) so it can never land on a source slot
+ *  and never reads as the reserved "today/now" accent. A single mid-tone hue (like the source hues),
+ *  which carries in both light and dark via the same `color-mix` tints the event parts already apply.
+ *  DOCUMENTED hex exception, like the source palette above. */
+const MILESTONE_HUES: Record<System, string> = {
+  editorial: "#3f8f86", // deep teal — cool against the warm earth-tone sources
+  slate: "#b8559e", // magenta — distinct from the blue/teal/lavender/rose picker
+  terminal: "#ff9e64", // orange — distinct from the green/violet/pink picker
+};
+
+export function milestoneColor(system: System): string {
+  return MILESTONE_HUES[system];
+}

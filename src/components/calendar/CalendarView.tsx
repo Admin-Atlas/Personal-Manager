@@ -7,11 +7,18 @@
 // render the pixel grids (Day/Week time-grid, Month, Year) + Agenda; Terminal forks to a mono, flat set
 // (a CLI status strip + agenda/tables, never a pixel grid) enumerated explicitly per view so nothing
 // falls through to the wrong body. A neutral hint flags paging past the synced band; each view fades up
-// on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. Nothing here writes back.
+// on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. Synced events are read-only;
+// the only interactive element is the project-milestone overlay (all-day events in a distinct hue that
+// open their project on click) — injected here, never written back to any calendar.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { calendarOverview, listAllCalendarEvents, syncCalendar } from "../../lib/ipc";
-import type { CalendarEvent, CalendarOverview } from "../../lib/types";
+import {
+  calendarOverview,
+  listAllCalendarEvents,
+  listAllMilestones,
+  syncCalendar,
+} from "../../lib/ipc";
+import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
 import {
   readHidden,
   readRange,
@@ -29,8 +36,15 @@ import {
 } from "../../lib/calendarPrefs";
 import { resolveRangeBounds } from "../../lib/calendarGeom";
 import { formatDateLocal } from "../../lib/format";
-import { addDays, dayKey, eventDaySpan, startOfDay } from "../../lib/calendar-layout";
-import { sourceColors, useTheme, useUserTime } from "../../theme";
+import {
+  addDays,
+  dayKey,
+  eventDaySpan,
+  isMilestoneEvent,
+  MILESTONE_CALENDAR_ID,
+  startOfDay,
+} from "../../lib/calendar-layout";
+import { milestoneColor, sourceColors, useTheme, useUserTime } from "../../theme";
 import { Skeleton } from "../ui";
 import { useNowTick } from "./parts/useNowTick";
 import { CalendarHeader } from "./CalendarHeader";
@@ -52,6 +66,7 @@ const DEFAULT_VIEW: CalendarViewMode = "month";
 // mirror re-reads (mirrors FocusView's cache).
 let cachedEvents: CalendarEvent[] = [];
 let cachedOverview: CalendarOverview | null = null;
+let cachedMilestones: Milestone[] = [];
 
 /** Monday-first start of the week containing `d`. */
 function startOfWeek(d: Date): Date {
@@ -116,11 +131,18 @@ function visibleRange(view: CalendarViewMode, cur: Date): { start: Date; end: Da
   }
 }
 
-export function CalendarView() {
+interface CalendarViewProps {
+  /** Open a project's page — wired only to the clickable milestone overlay events; the rest of the
+   *  calendar stays read-only. */
+  onOpenProject?: (project: string) => void;
+}
+
+export function CalendarView({ onOpenProject }: CalendarViewProps) {
   const { system, accent } = useTheme();
   const { coords } = useUserTime();
   const [overview, setOverview] = useState<CalendarOverview | null>(() => cachedOverview);
   const [events, setEvents] = useState<CalendarEvent[]>(() => cachedEvents);
+  const [milestones, setMilestones] = useState<Milestone[]>(() => cachedMilestones);
   const [hidden, setHidden] = useState<Set<string>>(() => readHidden());
   const [view, setView] = useState<CalendarViewMode>(() => readView(AVAILABLE_VIEWS, DEFAULT_VIEW));
   const [range, setRange] = useState<CalendarRange>(() => readRange());
@@ -164,6 +186,17 @@ export function CalendarView() {
     }
   }, []);
 
+  const loadMilestones = useCallback(async () => {
+    try {
+      const ms = await listAllMilestones();
+      if (!aliveRef.current) return;
+      setMilestones(ms);
+      cachedMilestones = ms;
+    } catch {
+      // Keep the last-good milestones; a read failure is transient and the overlay is non-critical.
+    }
+  }, []);
+
   const loadOverview = useCallback(async () => {
     try {
       const ov = await calendarOverview();
@@ -182,29 +215,32 @@ export function CalendarView() {
   useEffect(() => {
     void loadOverview();
     void loadEvents();
-    // Re-read the WHOLE mirror on focus — both events and the overview. The background poll can have
-    // shifted the synced band, added a calendar, or changed the last-sync time while we were away, so
-    // refreshing events alone would leave the range hint, source colours, and "synced" label stale.
+    void loadMilestones();
+    // Re-read the WHOLE mirror on focus — events, overview, AND milestones. The background poll can
+    // have shifted the synced band, added a calendar, or changed the last-sync time while we were
+    // away, and milestone edits happen in ProjectView (which unmounts this tab), so refreshing events
+    // alone would leave the range hint, source colours, "synced" label, and overlay stale.
     const onFocus = () => {
       void loadEvents();
       void loadOverview();
+      void loadMilestones();
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [loadOverview, loadEvents]);
+  }, [loadOverview, loadEvents, loadMilestones]);
 
   const onRefresh = useCallback(async () => {
     setSyncing(true);
     setError(null);
     try {
       await syncCalendar();
-      await Promise.all([loadEvents(), loadOverview()]);
+      await Promise.all([loadEvents(), loadOverview(), loadMilestones()]);
     } catch (e) {
       if (aliveRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (aliveRef.current) setSyncing(false);
     }
-  }, [loadEvents, loadOverview]);
+  }, [loadEvents, loadOverview, loadMilestones]);
 
   const onToggleCalendar = useCallback((calendarId: string) => {
     setHidden((prev) => {
@@ -281,8 +317,38 @@ export function CalendarView() {
   const colorOf = useMemo(() => {
     const ids = overview?.calendars.map((c) => c.id) ?? [];
     const map = sourceColors(ids, system, accent);
-    return (calendarId: string) => map.get(calendarId) ?? "var(--ink4)";
+    return (calendarId: string) =>
+      calendarId === MILESTONE_CALENDAR_ID
+        ? milestoneColor(system)
+        : (map.get(calendarId) ?? "var(--ink4)");
   }, [overview, system, accent]);
+
+  // Project milestones as synthetic all-day events — a first-party overlay, not synced. Only draw a
+  // milestone that ISN'T already on the calendar as a real event: PM-native (unlinked) ones, plus
+  // linked ones whose event is `event_missing` (out of the mirror band / deselected / deleted), which
+  // nothing else shows. A linked, in-mirror milestone is already drawn as its real event, so skip it
+  // to avoid a double. (Accepted edge: a linked, in-mirror milestone whose calendar the user hid then
+  // shows nowhere.) Dateless milestones have no day to sit on, so they're excluded.
+  const milestoneEvents = useMemo<CalendarEvent[]>(() => {
+    const out: CalendarEvent[] = [];
+    for (const m of milestones) {
+      if (!m.due_date) continue;
+      if (!(m.event_uid === null || m.event_missing)) continue;
+      out.push({
+        id: `milestone:${m.id}`,
+        calendar_id: MILESTONE_CALENDAR_ID,
+        summary: m.state === "met" ? `✓ ${m.label}` : m.label,
+        description: null,
+        location: null,
+        start: m.due_date.slice(0, 10),
+        end: null,
+        all_day: true,
+        html_link: null,
+        uid: null,
+      });
+    }
+    return out;
+  }, [milestones]);
 
   const visibleEvents = useMemo(() => {
     // Filter to visible calendars, THEN dedup the same physical event mirrored on two of them (same
@@ -298,8 +364,23 @@ export function CalendarView() {
       }
       out.push(e);
     }
+    // The milestone overlay rides on top, toggleable like a calendar via the same `hidden` set. Its
+    // events carry a null uid + a unique calendar_id, so they skip the dedup and hide filter cleanly.
+    if (!hidden.has(MILESTONE_CALENDAR_ID)) out.push(...milestoneEvents);
     return out;
-  }, [events, hidden]);
+  }, [events, hidden, milestoneEvents]);
+
+  // The one interactive element on the otherwise read-only calendar: clicking a milestone overlay
+  // event opens its project. Real synced events are never wired to a click (isMilestoneEvent === false).
+  const onEventClick = useCallback(
+    (ev: CalendarEvent) => {
+      if (!isMilestoneEvent(ev)) return;
+      const id = Number(ev.id.slice("milestone:".length));
+      const m = milestones.find((x) => x.id === id);
+      if (m) onOpenProject?.(m.project_name);
+    },
+    [milestones, onOpenProject],
+  );
 
   const gridDays = useMemo<Date[]>(() => {
     if (view === "day") return [startOfDay(cursor)];
@@ -349,6 +430,7 @@ export function CalendarView() {
     if (view === "agenda") {
       const fromMs = startOfDay(cursor).getTime();
       return visibleEvents.filter((e) => {
+        if (isMilestoneEvent(e)) return false; // count synced events only, honest to "N events"
         const span = eventDaySpan(e);
         return span && span.endDay.getTime() >= fromMs;
       }).length;
@@ -357,6 +439,7 @@ export function CalendarView() {
     const startMs = start.getTime();
     const endMs = end.getTime(); // exclusive
     return visibleEvents.filter((e) => {
+      if (isMilestoneEvent(e)) return false; // count synced events only, honest to "N events"
       const span = eventDaySpan(e);
       return span && span.startDay.getTime() < endMs && span.endDay.getTime() >= startMs;
     }).length;
@@ -379,7 +462,14 @@ export function CalendarView() {
     if (isTerminal) {
       switch (view) {
         case "month":
-          return <TerminalMonthTable cursor={cursor} events={visibleEvents} colorOf={colorOf} />;
+          return (
+            <TerminalMonthTable
+              cursor={cursor}
+              events={visibleEvents}
+              colorOf={colorOf}
+              onEventClick={onEventClick}
+            />
+          );
         case "year":
           return (
             <TerminalYearTable
@@ -390,15 +480,36 @@ export function CalendarView() {
           );
         case "day":
         case "week":
-          return <TerminalAgenda events={visibleEvents} colorOf={colorOf} days={gridDays} />;
+          return (
+            <TerminalAgenda
+              events={visibleEvents}
+              colorOf={colorOf}
+              days={gridDays}
+              onEventClick={onEventClick}
+            />
+          );
         case "agenda":
         default:
-          return <TerminalAgenda events={visibleEvents} colorOf={colorOf} fromDay={cursor} />;
+          return (
+            <TerminalAgenda
+              events={visibleEvents}
+              colorOf={colorOf}
+              fromDay={cursor}
+              onEventClick={onEventClick}
+            />
+          );
       }
     }
     switch (view) {
       case "agenda":
-        return <AgendaView events={visibleEvents} fromDay={cursor} colorOf={colorOf} />;
+        return (
+          <AgendaView
+            events={visibleEvents}
+            fromDay={cursor}
+            colorOf={colorOf}
+            onEventClick={onEventClick}
+          />
+        );
       case "month":
         return (
           <MonthView
@@ -406,6 +517,7 @@ export function CalendarView() {
             events={visibleEvents}
             colorOf={colorOf}
             onFocusDate={onFocusDate}
+            onEventClick={onEventClick}
           />
         );
       case "year":
@@ -429,6 +541,7 @@ export function CalendarView() {
             bounds={activeBounds}
             zones={zones}
             onZonesChange={onZonesChange}
+            onEventClick={onEventClick}
           />
         );
     }

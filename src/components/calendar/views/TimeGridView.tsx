@@ -44,6 +44,8 @@ interface Props {
   zones: string[];
   /** Add/remove an extra gutter zone — the corner control lives in the header row's gutter cell. */
   onZonesChange: (zones: string[]) => void;
+  /** Open a milestone overlay event's project (fires for milestone all-day bands only). */
+  onEventClick?: (ev: CalendarEvent) => void;
 }
 
 const LOCAL_COL = 54; // width of the local hour column (px)
@@ -96,6 +98,7 @@ export function TimeGridView({
   bounds,
   zones,
   onZonesChange,
+  onEventClick,
 }: Props) {
   const { minimal, showPower } = useDepth();
   // Derived from the framed window: scroll to its start on mount, stretch rows so the window fills
@@ -246,6 +249,7 @@ export function TimeGridView({
         colorOf={colorOf}
         gutterPx={gutterPx}
         showLabel={!minimal}
+        onEventClick={onEventClick}
       />
 
       {/* Scrollable time body */}

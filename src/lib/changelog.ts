@@ -19,6 +19,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.13.0-alpha",
+    date: "2026-07-14",
+    highlights: [
+      "You can now sort a project's milestones. The Milestones panel has a small Manual / Deadline / Name control in its header: sort by deadline (click again for latest-first) or by name, or keep arranging them by hand with the up/down arrows as before. Undated milestones settle at the bottom.",
+      "Your milestones now show on the calendar. Every dated milestone appears as an all-day marker in its own colour across Month, Week, Day and Agenda (and the Terminal look) — one central place to see everything. Click a milestone to jump straight to its project. Completed ones show a ✓, and you can hide them all from the Calendars menu.",
+      "Linking a milestone to a calendar event now offers every event, not just the next few weeks — past and future, across all your calendars, tidied so a repeating event only appears once.",
+      "Linking a pinboard timeline to a project now keeps the entries you typed: they're added to that project's milestones instead of disappearing behind the linked view. Unlinking still leaves them safely in the project.",
+      "Ingesting a note now keeps the title you gave it — that title becomes the document's name in Review, with the note's text as its contents. Untitled notes still take their first line, as before.",
+    ],
+  },
+  {
     version: "3.12.1-alpha",
     date: "2026-07-14",
     highlights: [
