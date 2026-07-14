@@ -1089,8 +1089,18 @@ fn copy_original_to_vault(
 }
 
 /// Drop the derived index and rebuild it from the Markdown vault. Proves the
-/// store is reconstructable from disk (spec §3 acceptance).
-pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
+/// store is reconstructable from disk (spec §3 acceptance). Index-only items (no vault file) are
+/// restored from the encrypted manifest, re-embedded from their offline summaries.
+///
+/// `extra_total` is folded into the progress `Counted` so the bar can span a SECOND phase the caller
+/// runs afterwards — the async full-body re-index of index-only items (network I/O this blocking fn
+/// can't do). Returns `(ingested, failed)` so the caller emits the terminal `Finished` once that phase
+/// is done, rather than this fn ending the run prematurely.
+pub fn rebuild(
+    app: &AppHandle,
+    on_event: Channel<IngestEvent>,
+    extra_total: usize,
+) -> Result<(usize, usize)> {
     let state = app.state::<AppState>();
 
     // Indexing is active use — hold the idle chat-indexer (card 7B) off so it doesn't contend with it.
@@ -1159,7 +1169,9 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| is_vault_markdown(path))
         .collect();
-    let _ = on_event.send(IngestEvent::Counted { total: files.len() });
+    let _ = on_event.send(IngestEvent::Counted {
+        total: files.len() + extra_total,
+    });
     let (mut ingested, mut failed) = (0usize, 0usize);
     for path in files {
         let name = file_name(&path);
@@ -1244,12 +1256,9 @@ pub fn rebuild(app: &AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
         }
     }
 
-    let _ = on_event.send(IngestEvent::Finished {
-        ingested,
-        skipped: 0,
-        failed,
-    });
-    Ok(())
+    // The terminal `Finished` is sent by the caller (`commands::rebuild_index`) AFTER it has run the
+    // async full-body re-index of index-only items; hand back the counts so it can fold them in.
+    Ok((ingested, failed))
 }
 
 fn rebuild_one(

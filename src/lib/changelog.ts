@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.12.1-alpha",
+    date: "2026-07-14",
+    highlights: [
+      "Files you connect from Google Drive, OneDrive, or a watched folder are now searched on their full contents. Until now, after PM rebuilt its search index these files were only findable by a short (~500-character) summary — so search and chat could miss things deeper in a document, and the filing suggestions in Review only saw the title. They're now indexed in full.",
+      "Because of that fix: after updating, open the Documents tab and click Rebuild once. It now also re-reads your connected files from their source, one at a time, so a single Rebuild brings everything fully up to date — you'll see each file processed. Anything temporarily offline stays findable by its summary and is caught up automatically the next time it syncs.",
+      "HTML files from Google Drive are now read as clean text — the page's code (scripts, styles, and head) is stripped before indexing, exactly like files in a watched folder — so only the real content is indexed and summarised.",
+    ],
+  },
+  {
     version: "3.12.0-alpha",
     date: "2026-07-14",
     highlights: [

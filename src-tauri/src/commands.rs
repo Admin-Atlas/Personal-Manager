@@ -2426,12 +2426,93 @@ pub async fn ingest_paths(
         .map_err(|e| Error::Other(format!("ingest task panicked: {e}")))?
 }
 
-/// Drop the index and rebuild it from the Markdown vault (spec §3 acceptance).
+/// Drop the index and rebuild it from the Markdown vault (spec §3 acceptance), then upgrade every
+/// reachable index-only item (Drive / OneDrive / local folder) from the ~500-char summary the rebuild
+/// restored to a FULL-body index — so connected files end up chunked from their whole contents, not a
+/// preview. The upgrade is best-effort and one item at a time: an unreachable source is left on its
+/// summary and healed by the next connector Sync (its `summary_indexed` flag forces a re-embed).
 #[tauri::command]
 pub async fn rebuild_index(app: AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
-    tokio::task::spawn_blocking(move || ingest::rebuild(&app, on_event))
-        .await
-        .map_err(|e| Error::Other(format!("rebuild task panicked: {e}")))?
+    // Count reachable index-only items up front so the progress bar's total spans BOTH phases (the
+    // vault rebuild AND the full-body re-index). Row ids change across the rebuild — it drops and
+    // recreates them — so the second phase re-queries the set; the count is stable because a local
+    // rebuild never changes a source's reachability.
+    let extra_total = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        conn.query_row(
+            "SELECT count(*) FROM documents WHERE source_type = 'index_only' AND source_state = 'ok'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as usize
+    };
+    let ev = on_event.clone();
+    let app2 = app.clone();
+    let (ingested, failed) =
+        tokio::task::spawn_blocking(move || ingest::rebuild(&app2, ev, extra_total))
+            .await
+            .map_err(|e| Error::Other(format!("rebuild task panicked: {e}")))??;
+    let (upgraded, up_failed) = upgrade_index_only_to_full_body(&app, &on_event).await?;
+    let _ = on_event.send(IngestEvent::Finished {
+        ingested: ingested + upgraded,
+        skipped: 0,
+        failed: failed + up_failed,
+    });
+    Ok(())
+}
+
+/// After a Rebuild has restored index-only items from their ~500-char summaries, upgrade each
+/// reachable one to a full-body index: re-fetch its live body and re-embed (via
+/// [`reindex_index_only_core`], which preserves the item's classification), one at a time with per-item
+/// progress. An unreachable item (offline source / expired auth / removed file) is left on its summary
+/// and healed by the next connector Sync. Best-effort: a per-item failure is reported and counted,
+/// never fatal. Returns `(upgraded, failed)`.
+async fn upgrade_index_only_to_full_body(
+    app: &AppHandle,
+    on_event: &Channel<IngestEvent>,
+) -> Result<(usize, usize)> {
+    let items: Vec<(i64, String)> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title FROM documents \
+             WHERE source_type = 'index_only' AND source_state = 'ok' ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let (mut upgraded, mut failed) = (0usize, 0usize);
+    for (doc_id, title) in items {
+        let _ = on_event.send(IngestEvent::Started {
+            path: format!("idx://{doc_id}"),
+            name: title,
+        });
+        let outcome = match reindex_index_only_core(app, doc_id).await {
+            Ok(_) => {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                ingest::load_document(&conn, doc_id)
+            }
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(document) => {
+                upgraded += 1;
+                let _ = on_event.send(IngestEvent::Done { document });
+            }
+            Err(e) => {
+                // Leave it on its summary (the next Sync heals it) and report — never fatal.
+                failed += 1;
+                let _ = on_event.send(IngestEvent::Failed {
+                    path: format!("idx://{doc_id}"),
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok((upgraded, failed))
 }
 
 /// Dev-only: drive the index-only substrate (board card 3) through its reducer, without a real
@@ -2556,6 +2637,9 @@ pub async fn dev_apply_change_event(
             source_modified_at: smod,
             source_content_hash: shash,
             source_state: index_only::SourceState::from_db(&sstate),
+            // The dev harness always pastes a full body (never a summary restore), so this item is
+            // never summary-derived.
+            summary_indexed: false,
         });
         let actions = index_only::react(event, item_state.as_ref());
         // A single dev event: apply, then flush its manifest change immediately (no batch loop here).
@@ -2811,8 +2895,17 @@ pub async fn propose_metadata(
         // `DISTINCT project`, which would offer variants like "PM"/"Atlas - PM" as co-equal.
         let projects = entities::canonical_project_names(&conn)?;
         let pending = {
+            // Body sent to the filing model. For an index-only doc the chunks' `content` column is a
+            // fixed placeholder (`INDEX_ONLY_BODY_PLACEHOLDER` — the body bytes are never stored), so
+            // read its `stored_summary` instead; otherwise the model would classify off the title +
+            // folder alone. Vault docs (`source_type` != 'index_only') have NULL `stored_summary`, so
+            // they fall through to their first chunk's real content exactly as before.
             let base_sql = "SELECT d.id, d.title, \
-                    COALESCE((SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), ''), \
+                    COALESCE( \
+                        CASE WHEN d.source_type = 'index_only' THEN NULLIF(d.stored_summary, '') END, \
+                        (SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), \
+                        '' \
+                    ), \
                     d.source_parent_folder_name \
              FROM documents d WHERE d.reviewed = 0";
 
@@ -4503,16 +4596,17 @@ pub async fn fetch_index_only_body(app: AppHandle, doc_id: i64) -> Result<IndexO
     Ok(IndexOnlyFetch { body, aligned })
 }
 
-/// Re-index one index-only item on demand (the reader's "Re-index this item"): re-fetch its current
-/// live body and rebuild the stored chunk map + summary against it, so a stale overlay (e.g. offsets
-/// left indexing the ~500-char summary after a rebuild-from-manifest) lines up again. Reuses the
-/// connector re-embed path; the body bytes are never persisted. Returns the exact body it embedded
-/// (so the reader redraws the overlay against it with no second live fetch and no drift window).
-#[tauri::command]
-pub async fn reindex_index_only(app: AppHandle, doc_id: i64) -> Result<IndexOnlyFetch> {
-    let body = fetch_index_only_text(&app, doc_id).await?;
-    tokio::task::spawn_blocking(move || -> Result<IndexOnlyFetch> {
-        let state = app.state::<AppState>();
+/// Re-fetch one index-only item's live body and rebuild its stored chunk map + summary against it,
+/// reusing [`index_only::reindex_pointer`] (which preserves the item's classification —
+/// project/tags/importance/reviewed/entity — replacing only chunks/summary/title), then push the change
+/// to the encrypted manifest so a reconcile-on-open can't revert it. Returns the exact body it embedded.
+/// The shared core of the reader's on-demand "Re-index this item" and the Rebuild-time bulk upgrade.
+async fn reindex_index_only_core(app: &AppHandle, doc_id: i64) -> Result<String> {
+    let body = fetch_index_only_text(app, doc_id).await?;
+    let app2 = app.clone();
+    let embedded = body.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let state = app2.state::<AppState>();
         state.sidecar.ensure_installed()?;
         let (source_id, external_ref, title, source_modified_at, source_content_hash): (
             String,
@@ -4548,7 +4642,7 @@ pub async fn reindex_index_only(app: AppHandle, doc_id: i64) -> Result<IndexOnly
             external_ref,
             source_modified_at,
             source_content_hash,
-            body,
+            body: embedded,
             // Not used by the re-embed (it rewrites only the chunk map + summary + title); the DB's
             // existing folder columns are left untouched.
             source_parent_folder_id: None,
@@ -4562,29 +4656,36 @@ pub async fn reindex_index_only(app: AppHandle, doc_id: i64) -> Result<IndexOnly
         // The re-embed rewrote the DB row (chunk map + source_state='ok' + summary); push those to the
         // encrypted manifest (the source of truth) so a reconcile-on-open can't revert them — every
         // other index-only write path syncs the manifest, and this must too.
-        {
-            let (vault_root, manifest_cipher) = state.manifest_io()?;
-            let conn = state.conn()?;
-            index_only::write_synced(&conn, &vault_root, &manifest_cipher)?;
-        }
-        // The overlay now indexes the exact body we just embedded — confirm against the freshly
-        // written content_hash and hand the body back so the reader needn't fetch a second time.
-        let aligned = {
-            let conn = state.conn()?;
-            let stored: String = conn.query_row(
-                "SELECT content_hash FROM documents WHERE id = ?1",
-                params![doc_id],
-                |r| r.get(0),
-            )?;
-            index_only::pointer_content_hash(&input.source_id, &input.body) == stored
-        };
-        Ok(IndexOnlyFetch {
-            body: input.body,
-            aligned,
-        })
+        let (vault_root, manifest_cipher) = state.manifest_io()?;
+        let conn = state.conn()?;
+        index_only::write_synced(&conn, &vault_root, &manifest_cipher)?;
+        Ok(())
     })
     .await
-    .map_err(|e| Error::Other(format!("reindex task panicked: {e}")))?
+    .map_err(|e| Error::Other(format!("reindex task panicked: {e}")))??;
+    Ok(body)
+}
+
+/// Re-index one index-only item on demand (the reader's "Re-index this item"): re-fetch its current
+/// live body and rebuild the stored chunk map + summary against it, so a stale overlay (e.g. offsets
+/// left indexing the ~500-char summary after a rebuild-from-manifest) lines up again. Returns the exact
+/// body it embedded (so the reader redraws the overlay against it with no second live fetch).
+#[tauri::command]
+pub async fn reindex_index_only(app: AppHandle, doc_id: i64) -> Result<IndexOnlyFetch> {
+    let body = reindex_index_only_core(&app, doc_id).await?;
+    // The overlay now indexes the exact body we just embedded — confirm against the freshly written
+    // content_hash and hand the body back so the reader needn't fetch a second time.
+    let aligned = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let (source_id, stored): (Option<String>, String) = conn.query_row(
+            "SELECT source_id, content_hash FROM documents WHERE id = ?1",
+            params![doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        source_id.is_some_and(|sid| index_only::pointer_content_hash(&sid, &body) == stored)
+    };
+    Ok(IndexOnlyFetch { body, aligned })
 }
 
 /// Promote an index-only Google Sheet to a **full local spreadsheet import** — the "import fully"
