@@ -858,7 +858,10 @@ export default function App() {
                 <GraphView onOpenProject={openProject} />
               </main>
             ) : view === "pinboard" ? (
-              <main className="flex h-full flex-1 flex-col">
+              // min-w-0 lets the oversized pinboard board stay contained in its own
+              // overflow-auto scroller instead of inflating <main> and shoving the board
+              // header's right-aligned buttons off-screen.
+              <main className="flex h-full min-w-0 flex-1 flex-col">
                 <PinboardView />
               </main>
             ) : view === "dev" ? (

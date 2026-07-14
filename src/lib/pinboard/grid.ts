@@ -107,6 +107,26 @@ export function findFreeRect(
   return { x: 0, y: 0, w: cw, h: ch };
 }
 
+/**
+ * Keep the board a FIXED width of `cols` (the window): widgets already within the width stay exactly
+ * where they are, and any that overhang the right edge re-flow into a free slot — scanned row-major,
+ * so they wrap onto a new row rather than sitting off-screen. Only top-level x/w matter (folder
+ * children aren't board-positioned). Used on load so a board authored on a wider window, or before
+ * the fixed-width model, tidies itself into the current window.
+ */
+export function reflowToWidth(widgets: Widget[], cols: number, rows: number): Widget[] {
+  const placed: Widget[] = [];
+  for (const w of widgets) {
+    if (w.rect.x + w.rect.w <= cols) {
+      placed.push(w);
+    } else {
+      const rect = findFreeRect(placed, Math.min(w.rect.w, cols), w.rect.h, cols, rows);
+      placed.push({ ...w, rect });
+    }
+  }
+  return placed;
+}
+
 // --- folders (pure) ------------------------------------------------------------------------------
 
 /** The widgets a container contributes to a merge: a folder yields its children (never itself, so

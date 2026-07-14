@@ -10,7 +10,17 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getPref, setPref } from "../ipc";
-import { clampRect, COLS, dissolveFolders, findFreeRect, minSize, resolveDrop, ROWS } from "./grid";
+import {
+  clampRect,
+  COLS,
+  dissolveFolders,
+  findFreeRect,
+  minSize,
+  reflowToWidth,
+  resolveDrop,
+  ROWS,
+} from "./grid";
+import { DEFAULT_TINT } from "./palette";
 import {
   BOARD_VERSION,
   EMPTY_BOARD,
@@ -88,29 +98,28 @@ function parseBoard(raw: string | null, cols: number, rows: number): Board {
       return EMPTY_BOARD;
     }
     const valid = parsed.widgets.filter(isValidWidget);
-    // Expand the clamp bounds to contain every already-valid widget (capped), so a board authored on
-    // a larger screen isn't snapped inward when reopened on a smaller one — the board just scrolls to
-    // reach it. A single widget beyond the sane cap is still clamped, guarding a corrupt pref.
-    let boundCols = cols;
-    let boundRows = rows;
-    for (const w of valid) {
-      boundCols = Math.max(boundCols, Math.min(w.rect.x + w.rect.w, MAX_BOARD_CELLS));
-      boundRows = Math.max(boundRows, Math.min(w.rect.y + w.rect.h, MAX_BOARD_CELLS));
-    }
-    const widgets = valid.map((w) => {
-      const rect = clampRect(w.rect, boundCols, boundRows, minSize(w.kind));
+    // The board is a FIXED-WIDTH canvas = `cols` (the window) and grows only downward; give it a
+    // generous vertical cap so widgets that overhang the width wrap onto new rows (the board scrolls)
+    // rather than piling up. `rows` is the caller's generous vertical extent (≈ the screen height).
+    const rowCap = Math.min(Math.max(rows, ROWS), MAX_BOARD_CELLS);
+    // Sanity-clamp every rect to a generous box first (preserving the stored x/y up to the cap, so a
+    // fitter keeps its exact spot) — this only guards a corrupt/hand-edited pref. Children are
+    // clamped kind-aware; they aren't board-positioned so they don't take part in the re-flow.
+    const sane = valid.map((w) => {
+      const rect = clampRect(w.rect, MAX_BOARD_CELLS, MAX_BOARD_CELLS, minSize(w.kind));
       if (w.kind === "folder") {
-        // Clamp children too (kind-aware), so a folder authored elsewhere renders cleanly.
         const children = (w.children ?? []).map((c) => ({
           ...c,
-          rect: clampRect(c.rect, boundCols, boundRows, minSize(c.kind)),
+          rect: clampRect(c.rect, MAX_BOARD_CELLS, MAX_BOARD_CELLS, minSize(c.kind)),
         }));
         return { ...w, rect, children };
       }
       return { ...w, rect };
     });
-    // Heal any folder a corrupt/hand-edited pref left with ≤1 child.
-    return { version: BOARD_VERSION, widgets: dissolveFolders(widgets, boundCols, boundRows) };
+    // Re-flow any widget that overhangs the fixed width back on-screen (wrapping to a new row), then
+    // heal any folder a corrupt/hand-edited pref left with ≤1 child.
+    const reflowed = reflowToWidth(sane, cols, rowCap);
+    return { version: BOARD_VERSION, widgets: dissolveFolders(reflowed, cols, rowCap) };
   } catch {
     return EMPTY_BOARD;
   }
@@ -173,21 +182,28 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     [],
   );
 
+  // add* return the new widget's id so the view can scroll it into sight — a note placed on a
+  // lower row would otherwise be created off-screen. The id is minted up front (outside the
+  // functional update) so it can be returned synchronously.
   const addNote = useCallback(() => {
+    const id = makeId();
     setBoard((b) => {
       const rect = findFreeRect(b.widgets, 7, 5, boundsRef.current.cols, boundsRef.current.rows);
-      const widget: Widget = { id: makeId(), kind: "note", rect, text: "", color: "st-quick" };
+      const widget: Widget = { id, kind: "note", rect, text: "", color: DEFAULT_TINT };
       return { ...b, widgets: [...b.widgets, widget] };
     });
+    return id;
   }, []);
 
   const addTimeline = useCallback(() => {
+    const id = makeId();
     setBoard((b) => {
       const rect = findFreeRect(b.widgets, 9, 8, boundsRef.current.cols, boundsRef.current.rows);
       // Seed an empty title so the header shows its "Timeline" placeholder (matching notes/folders).
-      const widget: Widget = { id: makeId(), kind: "timeline", rect, title: "", items: [] };
+      const widget: Widget = { id, kind: "timeline", rect, title: "", items: [] };
       return { ...b, widgets: [...b.widgets, widget] };
     });
+    return id;
   }, []);
 
   const updateWidget = useCallback((id: string, patch: Partial<Widget>) => {

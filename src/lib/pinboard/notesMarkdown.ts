@@ -212,6 +212,22 @@ function splitMarker(line: string): { indent: string; content: string } {
   return { indent, content: rest };
 }
 
+/** The block of whole lines a selection touches, plus whether the selection was collapsed. A
+ *  selection ending exactly at a line boundary doesn't pull the next line in (standard editor
+ *  convention). Shared by the line-marker toggle and the indent/outdent helpers. */
+function selectedLines(
+  value: string,
+  selStart: number,
+  selEnd: number,
+): { blockStart: number; blockEnd: number; lines: string[]; collapsed: boolean } {
+  const collapsed = selStart === selEnd;
+  const blockStart = value.lastIndexOf("\n", selStart - 1) + 1;
+  const scanFrom = !collapsed && value[selEnd - 1] === "\n" ? selEnd - 1 : selEnd;
+  const nextNl = value.indexOf("\n", scanFrom);
+  const blockEnd = nextNl === -1 ? value.length : nextNl;
+  return { blockStart, blockEnd, lines: value.slice(blockStart, blockEnd).split("\n"), collapsed };
+}
+
 /**
  * Toggle a line-level marker across every line the selection touches. If all non-blank lines already
  * carry the marker it's removed; otherwise any existing marker is swapped for this one (indent kept).
@@ -222,14 +238,7 @@ export function applyLineMarker(
   selEnd: number,
   kind: LineMarkerKind,
 ): TextEdit {
-  const collapsed = selStart === selEnd;
-  const blockStart = value.lastIndexOf("\n", selStart - 1) + 1;
-  // A selection ending exactly at the start of the next line shouldn't pull that line in (standard
-  // editor convention) — scan for the block's end from just before that boundary newline instead.
-  const scanFrom = !collapsed && value[selEnd - 1] === "\n" ? selEnd - 1 : selEnd;
-  const nextNl = value.indexOf("\n", scanFrom);
-  const blockEnd = nextNl === -1 ? value.length : nextNl;
-  const lines = value.slice(blockStart, blockEnd).split("\n");
+  const { blockStart, blockEnd, lines, collapsed } = selectedLines(value, selStart, selEnd);
 
   const nonBlank = lines.filter((l) => l.trim() !== "");
   const allMarked = nonBlank.length > 0 && nonBlank.every((l) => markerLen(l, kind) > 0);
@@ -258,6 +267,68 @@ export function applyLineMarker(
     selStart: collapsed ? blockStart + block.length : blockStart,
     selEnd: blockStart + block.length,
   };
+}
+
+// --- indent / outdent (pure) ----------------------------------------------------------------
+// Back the note editor's Tab / Shift+Tab / Backspace behaviour. One indent level = two spaces —
+// enough to nest a task/list item under the one above once rendered. `continueList` already
+// carries a line's indent to the next item, so once a checkbox is indented the ones typed after
+// it inherit that indent automatically.
+
+/** One indentation level. Two spaces nests a list item under its parent in GFM. */
+const INDENT = "  ";
+
+/** Strip one indent level (a leading tab, or up to two leading spaces) from a line. */
+function stripOneIndent(line: string): { line: string; removed: number } {
+  if (line.startsWith("\t")) return { line: line.slice(1), removed: 1 };
+  let n = 0;
+  while (n < INDENT.length && line[n] === " ") n++;
+  return { line: line.slice(n), removed: n };
+}
+
+/** Indent every line the selection touches by one level (blank lines left alone). */
+export function indentLines(value: string, selStart: number, selEnd: number): TextEdit {
+  const { blockStart, blockEnd, lines, collapsed } = selectedLines(value, selStart, selEnd);
+  const out = lines.map((l) => (l.trim() === "" ? l : INDENT + l));
+  const block = out.join("\n");
+  const firstAdded = lines[0].trim() === "" ? 0 : INDENT.length;
+  return {
+    text: value.slice(0, blockStart) + block + value.slice(blockEnd),
+    // A collapsed caret sits on the first line → nudge it past the spaces just inserted; a real
+    // selection re-covers the whole (now-indented) block.
+    selStart: collapsed ? selStart + firstAdded : blockStart,
+    selEnd: collapsed ? selStart + firstAdded : blockStart + block.length,
+  };
+}
+
+/** Outdent every line the selection touches by one level (a no-op on already-flush lines). */
+export function outdentLines(value: string, selStart: number, selEnd: number): TextEdit {
+  const { blockStart, blockEnd, lines, collapsed } = selectedLines(value, selStart, selEnd);
+  let firstRemoved = 0;
+  const out = lines.map((l, i) => {
+    const { line, removed } = stripOneIndent(l);
+    if (i === 0) firstRemoved = removed;
+    return line;
+  });
+  const block = out.join("\n");
+  const caret = Math.max(blockStart, selStart - firstRemoved);
+  return {
+    text: value.slice(0, blockStart) + block + value.slice(blockEnd),
+    selStart: collapsed ? caret : blockStart,
+    selEnd: collapsed ? caret : blockStart + block.length,
+  };
+}
+
+/** If a collapsed caret sits inside the leading indent of an indented list item, that indent's
+ *  length; else null — so the editor can turn Backspace-in-indent into an outdent. */
+export function listIndentBeforeCaret(value: string, caret: number): number | null {
+  const lineStart = value.lastIndexOf("\n", caret - 1) + 1;
+  const before = value.slice(lineStart, caret);
+  if (before.length === 0 || before.trim() !== "") return null; // caret isn't within pure indent
+  const nextNl = value.indexOf("\n", caret);
+  const line = value.slice(lineStart, nextNl === -1 ? value.length : nextNl);
+  const m = matchMarker(line);
+  return m && m.indent.length > 0 ? m.indent.length : null;
 }
 
 /**
