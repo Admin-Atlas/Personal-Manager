@@ -955,6 +955,11 @@ pub fn fetch_plan(mime: &str) -> FetchPlan {
         // no useful plain-text export.
         m if m.starts_with("application/vnd.google-apps.") => FetchPlan::Skip,
         "application/json" | "application/xml" => FetchPlan::DownloadText,
+        // HTML is markup, not readable text — route it through the sidecar (MarkItDown/BeautifulSoup)
+        // like a binary, so `<head>`/`<script>`/`<style>` are stripped and only the visible content is
+        // indexed. This matches the local-folder path (every file goes through the sidecar) and must
+        // precede the generic `text/*` arm below, which would otherwise download the raw markup.
+        "text/html" | "application/xhtml+xml" => FetchPlan::DownloadBinary,
         m if m.starts_with("text/") => FetchPlan::DownloadText,
         _ => FetchPlan::DownloadBinary,
     }
@@ -1991,6 +1996,13 @@ mod tests {
         assert_eq!(fetch_plan("text/plain"), FetchPlan::DownloadText);
         assert_eq!(fetch_plan("text/markdown"), FetchPlan::DownloadText);
         assert_eq!(fetch_plan("application/json"), FetchPlan::DownloadText);
+        // HTML is markup: it goes through the sidecar (like a binary), NOT downloaded raw — so its
+        // `<head>`/`<script>`/`<style>` is stripped. Other `text/*` types stay raw text.
+        assert_eq!(fetch_plan("text/html"), FetchPlan::DownloadBinary);
+        assert_eq!(
+            fetch_plan("application/xhtml+xml"),
+            FetchPlan::DownloadBinary
+        );
         assert_eq!(fetch_plan("application/pdf"), FetchPlan::DownloadBinary);
         assert_eq!(
             fetch_plan("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),

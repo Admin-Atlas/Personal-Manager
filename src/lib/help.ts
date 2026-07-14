@@ -108,7 +108,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "documents-rebuild": {
     title: "Rebuild",
-    body: "Deletes the search index and rebuilds it from the Markdown vault. Proves your data is reconstructable from disk; safe to run anytime.",
+    body: "Rebuilds PM's search index from scratch. It re-reads every document, note and chat from your vault and re-splits them with the current settings, then re-reads your connected files (Google Drive, OneDrive, watched folders) from their source so each is indexed on its full contents — not just its saved summary. Your documents, projects, tags and importance are never changed. Safe to run anytime; large connected sources make it take longer, and anything offline is skipped and caught up on the next sync.",
   },
   "documents-review-banner": {
     title: "Documents to review",

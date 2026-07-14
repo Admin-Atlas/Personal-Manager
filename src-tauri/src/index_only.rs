@@ -744,6 +744,10 @@ pub struct ItemState {
     pub source_modified_at: Option<String>,
     pub source_content_hash: Option<String>,
     pub source_state: SourceState,
+    /// True when this item's stored chunk map was built from its ~500-char offline SUMMARY rather than
+    /// the full body (a rebuild-from-manifest restore). The reducer uses it to force a full-body
+    /// re-embed on the next sync even when the source content is unchanged — see [`summary_indexed_flag`].
+    pub summary_indexed: bool,
 }
 
 /// One item's persisted sync-pointer columns exactly as stored (raw `source_state` string,
@@ -755,6 +759,29 @@ pub(crate) struct RawItemState {
     pub source_modified_at: Option<String>,
     pub source_content_hash: Option<String>,
     pub source_state: String,
+    /// See [`ItemState::summary_indexed`] — precomputed here so every reader (the cloud connectors'
+    /// `ItemState` view and the local folder's `KnownItem`) shares one definition.
+    pub summary_indexed: bool,
+}
+
+/// Whether an index-only item's stored chunk map was built from its ~500-char offline SUMMARY rather
+/// than the full body — the signature of a [`rebuild_from_manifest`] restore ([`restore_item`]), which
+/// re-embeds from the summary because the body is remote. True iff the stored `content_hash` is the
+/// pointer hash of the summary AND the summary ends in the truncation ellipsis [`summarize`] appends:
+/// the ellipsis proves the summary is a *truncation* of a longer body, so there is genuinely more to
+/// fetch. A body that fits within the summary is stored in full (summary == body), so it is never
+/// flagged — a re-embed would only reproduce identical chunks. The next connector sync uses this to
+/// force a full-body re-embed even when the source itself is unchanged; once re-embedded from the full
+/// body the `content_hash` no longer matches the summary, so the flag self-clears.
+pub(crate) fn summary_indexed_flag(
+    source_id: &str,
+    content_hash: &str,
+    stored_summary: Option<&str>,
+) -> bool {
+    match stored_summary.map(str::trim) {
+        Some(s) if s.ends_with('…') => pointer_content_hash(source_id, s) == content_hash,
+        _ => false,
+    }
 }
 
 /// The ONE per-item state lookup behind `drive`/`onedrive`/`localfolder` (their three copies were
@@ -774,18 +801,27 @@ pub(crate) fn read_raw_item_state(
     include_promoted: bool,
 ) -> Result<Option<RawItemState>> {
     let sql = if include_promoted {
-        "SELECT external_ref, source_modified_at, source_content_hash, source_state \
+        "SELECT external_ref, source_modified_at, source_content_hash, source_state, \
+                content_hash, stored_summary \
          FROM documents WHERE source_id = ?1"
     } else {
-        "SELECT external_ref, source_modified_at, source_content_hash, source_state \
+        "SELECT external_ref, source_modified_at, source_content_hash, source_state, \
+                content_hash, stored_summary \
          FROM documents WHERE source_id = ?1 AND source_type = 'index_only'"
     };
     conn.query_row(sql, params![source_id], |r| {
+        let content_hash: String = r.get(4)?;
+        let stored_summary: Option<String> = r.get(5)?;
         Ok(RawItemState {
             external_ref: r.get(0)?,
             source_modified_at: r.get(1)?,
             source_content_hash: r.get(2)?,
             source_state: r.get(3)?,
+            summary_indexed: summary_indexed_flag(
+                source_id,
+                &content_hash,
+                stored_summary.as_deref(),
+            ),
         })
     })
     .optional()
@@ -805,6 +841,7 @@ pub(crate) fn read_item_state(
             source_modified_at: raw.source_modified_at,
             source_content_hash: raw.source_content_hash,
             source_state: SourceState::from_db(&raw.source_state),
+            summary_indexed: raw.summary_indexed,
         }),
     )
 }
@@ -919,8 +956,21 @@ pub fn react(event: ChangeEvent, current: Option<&ItemState>) -> Vec<Action> {
                 });
                 acts
             }
-            // Same hash → a touch, not an edit.
-            (Some(_), Some(_)) => vec![Action::Noop],
+            // Same source hash → normally a touch, not an edit. BUT if our stored chunk map was built
+            // from the ~500-char offline summary (a rebuild-from-manifest restore), an unchanged source
+            // is exactly when we must still upgrade it to the full body — so force a re-embed against
+            // the freshly-fetched body. Self-clearing: the re-embed rewrites `content_hash` from the
+            // full body, so `summary_indexed` goes false and this no-ops on every later unchanged pass.
+            (Some(s), Some(h)) => {
+                if s.summary_indexed {
+                    vec![Action::ReEmbed {
+                        source_id,
+                        new_content_hash: h,
+                    }]
+                } else {
+                    vec![Action::Noop]
+                }
+            }
         },
         // Soft delete: keep metadata + embedding (still findable), flag the body unretrievable. Never
         // a hard drop. Unknown id → nothing to mark.
@@ -1258,6 +1308,7 @@ mod tests {
             source_modified_at: None,
             source_content_hash: hash.map(String::from),
             source_state: state,
+            summary_indexed: false,
         }
     }
 
@@ -1357,6 +1408,53 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn same_hash_upgrades_a_summary_indexed_item_to_full_body() {
+        // A rebuild-from-manifest leaves an item's chunks indexing only its ~500-char summary
+        // (summary_indexed = true). The next sync sees the SAME source hash — normally a no-op — but we
+        // must still re-fetch the full body and re-embed, so it returns ReEmbed rather than Noop.
+        let mut summary_only = st(SourceState::Ok, Some("h1"));
+        summary_only.summary_indexed = true;
+        assert_eq!(
+            react(update(Some("h1")), Some(&summary_only)),
+            vec![Action::ReEmbed {
+                source_id: "s1".into(),
+                new_content_hash: "h1".into()
+            }]
+        );
+        // Once it is full-body indexed (summary_indexed = false), the same unchanged hash no-ops again.
+        assert_eq!(
+            react(update(Some("h1")), Some(&st(SourceState::Ok, Some("h1")))),
+            vec![Action::Noop]
+        );
+    }
+
+    #[test]
+    fn summary_indexed_flag_only_fires_on_a_truncated_summary_index() {
+        let body = "a very long body that certainly exceeds the summary length ".repeat(20);
+        let summary = summarize(&body); // ends with the truncation ellipsis
+        assert!(summary.ends_with('…'));
+        // content_hash built from the SUMMARY (a rebuild-from-manifest restore) → flagged.
+        let summary_hash = pointer_content_hash("s1", summary.trim());
+        assert!(summary_indexed_flag("s1", &summary_hash, Some(&summary)));
+        // content_hash built from the FULL body (a fresh/upgraded index) → not flagged.
+        let body_hash = pointer_content_hash("s1", body.trim());
+        assert!(!summary_indexed_flag("s1", &body_hash, Some(&summary)));
+        // A body that fits the summary (no ellipsis) is stored in full → never flagged, even though its
+        // summary equals its body and hashes identically.
+        let short = "short body";
+        let short_summary = summarize(short);
+        assert!(!short_summary.ends_with('…'));
+        let short_hash = pointer_content_hash("s1", short_summary.trim());
+        assert!(!summary_indexed_flag(
+            "s1",
+            &short_hash,
+            Some(&short_summary)
+        ));
+        // No summary at all → never flagged.
+        assert!(!summary_indexed_flag("s1", &summary_hash, None));
     }
 
     #[test]

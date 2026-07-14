@@ -315,6 +315,10 @@ pub struct KnownItem {
     pub content_hash: Option<String>,
     /// The item's `source_state` string (`ok` / `source_missing` / `unreachable`).
     pub source_state: String,
+    /// Whether this item's chunks were built from its ~500-char summary (see
+    /// [`index_only::ItemState::summary_indexed`]) — carried into the reducer so an unchanged local
+    /// file still upgrades to the full body after a rebuild-from-manifest restore.
+    pub summary_indexed: bool,
 }
 
 impl KnownItem {
@@ -325,6 +329,7 @@ impl KnownItem {
             source_modified_at: self.modified_at.clone(),
             source_content_hash: self.content_hash.clone(),
             source_state: index_only::SourceState::from_db(&self.source_state),
+            summary_indexed: self.summary_indexed,
         }
     }
 }
@@ -699,18 +704,25 @@ pub fn remove_folder(conn: &Connection, key: &str) -> Result<()> {
 pub fn known_items(conn: &Connection, key: &str) -> Result<HashMap<String, KnownItem>> {
     let id = folder_source_id(key);
     let mut stmt = conn.prepare(
-        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state \
+        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state, \
+                content_hash, stored_summary \
          FROM documents WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%'",
     )?;
     let rows = stmt
         .query_map(params![id], |r| {
+            let sid: String = r.get(0)?;
+            let content_hash: String = r.get(5)?;
+            let stored_summary: Option<String> = r.get(6)?;
+            let summary_indexed =
+                index_only::summary_indexed_flag(&sid, &content_hash, stored_summary.as_deref());
             Ok((
-                r.get::<_, String>(0)?,
+                sid,
                 KnownItem {
                     external_ref: r.get::<_, Option<String>>(1)?,
                     modified_at: r.get::<_, Option<String>>(2)?,
                     content_hash: r.get::<_, Option<String>>(3)?,
                     source_state: r.get::<_, String>(4)?,
+                    summary_indexed,
                 },
             ))
         })?
@@ -730,6 +742,7 @@ pub fn known_item(conn: &Connection, source_id: &str) -> Result<Option<KnownItem
                 modified_at: raw.source_modified_at,
                 content_hash: raw.source_content_hash,
                 source_state: raw.source_state,
+                summary_indexed: raw.summary_indexed,
             },
         ),
     )
@@ -746,18 +759,25 @@ pub fn source_id_for_ref(
 ) -> Result<Option<(String, KnownItem)>> {
     let id = folder_source_id(key);
     conn.query_row(
-        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state \
+        "SELECT source_id, external_ref, source_modified_at, source_content_hash, source_state, \
+                content_hash, stored_summary \
          FROM documents \
          WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%' AND external_ref = ?2",
         params![id, abs_path],
         |r| {
+            let sid: String = r.get(0)?;
+            let content_hash: String = r.get(5)?;
+            let stored_summary: Option<String> = r.get(6)?;
+            let summary_indexed =
+                index_only::summary_indexed_flag(&sid, &content_hash, stored_summary.as_deref());
             Ok((
-                r.get::<_, String>(0)?,
+                sid,
                 KnownItem {
                     external_ref: r.get(1)?,
                     modified_at: r.get(2)?,
                     content_hash: r.get(3)?,
                     source_state: r.get(4)?,
+                    summary_indexed,
                 },
             ))
         },
@@ -1341,8 +1361,13 @@ async fn reconcile_present_file(
         );
         flusher.note(apply_local_actions_off_lock(app, actions, None).await?)?;
     }
-    // Content unchanged (same mtime) and not new → the state work above (if any) is all there was.
-    if !plan.content_maybe_changed {
+    // Content unchanged (same mtime) and not new → normally the state work above (if any) is all
+    // there was. EXCEPT an item whose stored chunks were built from its ~500-char summary (a
+    // rebuild-from-manifest restore) must still be upgraded to the full body — so fall through to
+    // hash + re-embed even on a stable mtime; the reducer turns the unchanged-hash Update into a
+    // ReEmbed, and once it is full-body indexed the flag self-clears so later walks no-op again.
+    let summary_only = known.is_some_and(|k| k.summary_indexed);
+    if !plan.content_maybe_changed && !summary_only {
         return Ok(PresentOutcome::NoChange);
     }
 
@@ -1854,6 +1879,7 @@ mod tests {
             modified_at: Some("2026-01-01T00:00:00.000Z".into()),
             content_hash: Some("deadbeef".into()),
             source_state: ingest::SOURCE_STATE_OK.into(),
+            summary_indexed: false,
         };
         let plan = plan_file(Some(&known), "a/b.md", Some("2026-01-01T00:00:00.000Z"));
         assert_eq!(
@@ -1870,6 +1896,7 @@ mod tests {
             modified_at: Some("2026-01-01T00:00:00.000Z".into()),
             content_hash: Some("deadbeef".into()),
             source_state: ingest::SOURCE_STATE_MISSING.into(),
+            summary_indexed: false,
         };
         // Moved (new path), touched (new mtime), and previously missing → all three flags set.
         let plan = plan_file(
