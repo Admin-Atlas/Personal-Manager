@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.12.0-alpha",
+    date: "2026-07-14",
+    highlights: [
+      "The calendar's Month and Year views now scroll. Drag up and down to move smoothly through past and future — no more jumping a whole month or year at a time.",
+      "Month view flows as one continuous run of weeks: let go and it settles neatly on a week, never mid-week. Each new month names itself inline and alternates a faint shade so you can see where one ends and the next begins; the header keeps up with whatever's on screen.",
+      "Year view scrolls the same way through its little months, settling on a row of months rather than snapping a whole year. Today, the arrows, and the mini-calendar all glide you to the right spot.",
+    ],
+  },
+  {
     version: "3.11.0-alpha",
     date: "2026-07-14",
     highlights: [
