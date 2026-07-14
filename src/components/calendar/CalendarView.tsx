@@ -411,6 +411,7 @@ export function CalendarView() {
             range={range}
             bounds={activeBounds}
             zones={zones}
+            onZonesChange={onZonesChange}
           />
         );
     }
@@ -427,8 +428,6 @@ export function CalendarView() {
         customBounds={customBounds}
         onBoundsChange={onBoundsChange}
         coords={coords}
-        zones={zones}
-        onZonesChange={onZonesChange}
         label={label}
         cursor={cursor}
         onPickDate={onPickDate}

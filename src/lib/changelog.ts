@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.11.0-alpha",
+    date: "2026-07-14",
+    highlights: [
+      "Adding an extra timezone to the calendar is easier to find. The separate “Zones” button is gone — instead, look to the top-left corner of the Day or Week grid, where the hour column meets the dates: a small “＋ Add” lives there. Add a zone and it shrinks to a “＋” to save space, and you can remove any extra timezone by hovering its column heading and clicking the ✕ that appears.",
+      "The timezone list is far easier to search. Every zone now reads as Continent / Country / City with its code or UTC offset alongside — so you can find one by continent, country, city, or code. Can't find your exact city? Search your country and pick the nearest one listed.",
+    ],
+  },
+  {
     version: "3.10.0-alpha",
     date: "2026-07-14",
     highlights: [
