@@ -253,6 +253,9 @@ export function CalendarView() {
     },
     [onViewChange],
   );
+  // The scrolling Month/Year views report the period filling the pane so the header label tracks the
+  // scroll. The views guard against re-scrolling on the cursor change they just caused (no loop).
+  const onFocusDate = useCallback((d: Date) => setCursor(d), []);
 
   // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today. Ignored while a
   // field is focused or a modifier is held (so app shortcuts and text entry are untouched).
@@ -397,9 +400,23 @@ export function CalendarView() {
       case "agenda":
         return <AgendaView events={visibleEvents} fromDay={cursor} colorOf={colorOf} />;
       case "month":
-        return <MonthView cursor={cursor} events={visibleEvents} colorOf={colorOf} />;
+        return (
+          <MonthView
+            cursor={cursor}
+            events={visibleEvents}
+            colorOf={colorOf}
+            onFocusDate={onFocusDate}
+          />
+        );
       case "year":
-        return <YearView cursor={cursor} events={visibleEvents} onSelectDay={onSelectYearDay} />;
+        return (
+          <YearView
+            cursor={cursor}
+            events={visibleEvents}
+            onSelectDay={onSelectYearDay}
+            onFocusDate={onFocusDate}
+          />
+        );
       case "day":
       case "week":
       default:

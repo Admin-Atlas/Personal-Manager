@@ -59,14 +59,24 @@ export interface MonthGrid {
   weekdayLabels: string[];
 }
 
-function buildMonthGrid(cursor: Date, events: CalendarEvent[]): MonthGrid {
-  const year = cursor.getFullYear();
-  const month = cursor.getMonth();
-  const first = new Date(year, month, 1);
-  const lead = (first.getDay() + 6) % 7; // Monday-first offset
-  const gridStart = addDays(startOfDay(first), -lead);
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const rows = Math.ceil((lead + daysInMonth) / 7);
+/** Monday of the week `cursor` falls in (the grid/stream anchor). */
+export function weekStartMonday(cursor: Date): Date {
+  const d = startOfDay(cursor);
+  const lead = (d.getDay() + 6) % 7; // Monday-first offset
+  return addDays(d, -lead);
+}
+
+/** Build `rows` consecutive Monday-first week rows from `gridStart`, bucketing single-day events as
+ *  chips and packing multi-day events into stable lanes across the whole range. `focus` (a year+month)
+ *  marks cells inside that month as `inMonth` for the single-month grid; the continuous stream omits it
+ *  (every day is in-month). Shared by the single-month grid and the scrolling week stream so the
+ *  chip/band logic can't drift. */
+export function buildWeekRows(
+  gridStart: Date,
+  rows: number,
+  events: CalendarEvent[],
+  focus?: { year: number; month: number },
+): MonthWeekRow[] {
   const lastIdx = rows * 7 - 1;
   const todayKey = dayKey(startOfDay(new Date()));
 
@@ -139,7 +149,9 @@ function buildMonthGrid(cursor: Date, events: CalendarEvent[]): MonthGrid {
       const date = addDays(weekStart, i);
       return {
         date,
-        inMonth: date.getMonth() === month,
+        inMonth: focus
+          ? date.getMonth() === focus.month && date.getFullYear() === focus.year
+          : true,
         isToday: dayKey(date) === todayKey,
         chips: chipsByDay.get(dayKey(date)) ?? [],
         hiddenBands: hiddenByCol[i],
@@ -148,10 +160,27 @@ function buildMonthGrid(cursor: Date, events: CalendarEvent[]): MonthGrid {
     weeks.push({ cells, bands: bars, laneCount });
   }
 
-  const weekdayLabels = Array.from({ length: 7 }, (_, i) =>
-    addDays(gridStart, i).toLocaleDateString(undefined, { weekday: "short" }),
+  return weeks;
+}
+
+/** Monday-first weekday labels ("Mon"…"Sun"), for the grid/stream header. */
+export function weekdayLabels(): string[] {
+  const monday = weekStartMonday(new Date());
+  return Array.from({ length: 7 }, (_, i) =>
+    addDays(monday, i).toLocaleDateString(undefined, { weekday: "short" }),
   );
-  return { weeks, weekdayLabels };
+}
+
+function buildMonthGrid(cursor: Date, events: CalendarEvent[]): MonthGrid {
+  const year = cursor.getFullYear();
+  const month = cursor.getMonth();
+  const first = new Date(year, month, 1);
+  const lead = (first.getDay() + 6) % 7; // Monday-first offset
+  const gridStart = addDays(startOfDay(first), -lead);
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const rows = Math.ceil((lead + daysInMonth) / 7);
+  const weeks = buildWeekRows(gridStart, rows, events, { year, month });
+  return { weeks, weekdayLabels: weekdayLabels() };
 }
 
 /** Memoised {@link buildMonthGrid} for a component. */
