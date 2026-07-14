@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { clampRect, dissolveFolders, FOLDER_MIN, minSize, resolveDrop } from "./grid";
+import {
+  clampRect,
+  dissolveFolders,
+  FOLDER_MIN,
+  minSize,
+  reflowToWidth,
+  resolveDrop,
+} from "./grid";
 import type { Rect, Widget } from "./types";
 
 // Deterministic id stub so resolveDrop's new-folder id is assertable.
@@ -34,6 +41,36 @@ describe("clampRect — per-kind minimum size", () => {
   it("minSize picks the folder floor by kind", () => {
     expect(minSize("folder")).toEqual({ w: 3, h: 3 });
     expect(minSize("note")).toEqual({ w: 4, h: 3 });
+  });
+});
+
+describe("reflowToWidth — fixed-width board wraps overflow to new rows", () => {
+  it("leaves widgets that already fit the width exactly where they are", () => {
+    const ws = [note("a", { x: 0, y: 0, w: 4, h: 3 }), note("b", { x: 4, y: 0, w: 4, h: 3 })];
+    expect(reflowToWidth(ws, 10, 20)).toEqual(ws);
+  });
+
+  it("re-flows a widget that overhangs the right edge into a free slot on the same row", () => {
+    const out = reflowToWidth(
+      [note("a", { x: 0, y: 0, w: 4, h: 3 }), note("b", { x: 8, y: 0, w: 4, h: 3 })],
+      10,
+      20,
+    );
+    expect(out[0].rect).toEqual({ x: 0, y: 0, w: 4, h: 3 }); // fitter untouched
+    expect(out[1].rect).toEqual({ x: 4, y: 0, w: 4, h: 3 }); // pulled in beside it
+  });
+
+  it("wraps an overflowing widget onto a new row when the first row is full", () => {
+    const out = reflowToWidth(
+      [
+        note("a", { x: 0, y: 0, w: 4, h: 3 }),
+        note("b", { x: 4, y: 0, w: 4, h: 3 }),
+        note("c", { x: 10, y: 0, w: 4, h: 3 }), // overhangs width 8 → must wrap down
+      ],
+      8,
+      20,
+    );
+    expect(out[2].rect).toEqual({ x: 0, y: 3, w: 4, h: 3 });
   });
 });
 

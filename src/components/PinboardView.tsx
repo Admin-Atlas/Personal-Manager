@@ -107,12 +107,37 @@ const PANEL_H = 17 * CELL;
  */
 export function PinboardView() {
   const { showMeta, showPower } = useDepth();
-  // The board's persistence/placement extent = the device screen (floored at the legacy board), so
-  // a widget dragged anywhere on the enlarged board is kept on reload rather than snapped back.
-  // Screen size is fixed per machine → compute once.
-  const maxBounds = useMemo(
-    () => boundsForPx({ w: window.screen.availWidth, h: window.screen.availHeight }),
+  // The board is a FIXED-WIDTH canvas = the window's own content area: adding notes wraps to a new
+  // row and the board only ever grows DOWNWARD (and scrolls), never sideways.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [viewBounds, setViewBounds] = useState({ cols: COLS, rows: ROWS });
+  // Measure the scroller's content area and track it LIVE (grow AND shrink) so the board width
+  // always equals the window — not a stale high-water mark that would overflow horizontally. Layout
+  // effect so the real width is known before the async board load re-flows overflow into it.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const PAD = 24; // matches the scroller's p-6, so the board never forces a horizontal scrollbar
+    const measure = () =>
+      setViewBounds({
+        cols: Math.max(COLS, Math.floor((el.clientWidth - PAD * 2) / CELL)),
+        rows: Math.max(ROWS, Math.floor((el.clientHeight - PAD * 2) / CELL)),
+      });
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // A generous vertical extent (the device screen height, fixed per machine) so notes wrap to new
+  // rows with room to spare before the board scrolls; the WIDTH is always the live window, so the
+  // board never widens. These are the bounds the hook places, drops, and re-flows within.
+  const screenRows = useMemo(
+    () => boundsForPx({ w: window.screen.availWidth, h: window.screen.availHeight }).rows,
     [],
+  );
+  const boardConstraints = useMemo(
+    () => ({ cols: viewBounds.cols, rows: Math.max(viewBounds.rows, screenRows) }),
+    [viewBounds.cols, viewBounds.rows, screenRows],
   );
   const {
     board,
@@ -127,7 +152,7 @@ export function PinboardView() {
     addTimelineItem,
     updateTimelineItem,
     removeTimelineItem,
-  } = usePinboard(maxBounds);
+  } = usePinboard(boardConstraints);
 
   const [drag, setDrag] = useState<DragStart | null>(null);
   const [livePx, setLivePx] = useState<PxRect | null>(null);
@@ -136,33 +161,10 @@ export function PinboardView() {
   // A just-added widget id to scroll into view (set by the add buttons; cleared once scrolled).
   const [pendingScrollId, setPendingScrollId] = useState<string | null>(null);
 
-  // The board fills the window and grows to any larger window ever seen — a high-water mark of the
-  // window's OWN content area. So it fits exactly when maximised (no scrollbars), and once the window
-  // is made smaller than that mark it overflows and scrolls to its edges (see the `pm-scrollbars`
-  // ribbons + the global wheel normaliser). Cell size and fonts are untouched — the board only gains
-  // cells. Floored at the legacy 44×28. (A far-dragged widget stays reachable via boardBounds below.)
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const [viewBounds, setViewBounds] = useState({ cols: COLS, rows: ROWS });
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const PAD = 24; // matches the scroll container's p-6, so board + padding never forces a scrollbar at full size
-    const measure = () => {
-      const availW = el.clientWidth - PAD * 2;
-      const availH = el.clientHeight - PAD * 2;
-      setViewBounds((prev) => ({
-        cols: Math.max(prev.cols, COLS, Math.floor(availW / CELL)),
-        rows: Math.max(prev.rows, ROWS, Math.floor(availH / CELL)),
-      }));
-    };
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  // The board must also contain every widget, so one placed on a bigger screen stays reachable when
-  // the board is reopened in a smaller window — take the max of the fill size and the widgets' extent.
+  // Width is the fixed window (viewBounds.cols); the board grows only DOWNWARD to contain content
+  // (vertical scroll). We still take the max with widget extents defensively — so that if the window
+  // is dragged narrower than existing content the widgets stay reachable until the next load re-flows
+  // them in — but new notes are always placed within the window, so adding them never widens it.
   const boardBounds = useMemo(() => {
     let cols = viewBounds.cols;
     let rows = viewBounds.rows;
