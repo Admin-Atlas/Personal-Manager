@@ -23,8 +23,9 @@ import {
   type TimedInput,
 } from "../../../lib/calendar-layout";
 import { formatClock } from "../../../lib/format";
-import { deviceTimeZone, useDepth } from "../../../theme";
+import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
+import { ZoneGutter } from "../ZoneGutter";
 import { EventCard } from "../parts/EventCard";
 import { NowLine } from "../parts/NowLine";
 import { AllDayBand } from "../parts/AllDayBand";
@@ -41,6 +42,8 @@ interface Props {
   bounds: RangeBounds;
   /** Up to 2 extra IANA zones to show as gutter columns beside the local time. */
   zones: string[];
+  /** Add/remove an extra gutter zone — the corner control lives in the header row's gutter cell. */
+  onZonesChange: (zones: string[]) => void;
 }
 
 const LOCAL_COL = 54; // width of the local hour column (px)
@@ -48,11 +51,6 @@ const ZONE_COL = 46; // width of each extra-zone column (px)
 const HOURS = 24;
 const MIN_ROW_H = 20; // never scrunch a row below this
 const MIN_WINDOW = 1; // guard divide-by-tiny in the row-height fill
-
-/** Short, friendly display for a zone: last path segment with underscores as spaces. */
-function zoneShort(tz: string): string {
-  return (tz.split("/").pop() ?? tz).replace(/_/g, " ");
-}
 
 /** The 24 hour labels for `zone`, formatting the same absolute instants the local column marks on
  *  `refDay` — DST-safe, and shows fractional offsets (Kolkata :30, Kathmandu :45) natively. */
@@ -90,7 +88,15 @@ interface DayColumn {
   cards: CardGeom[];
 }
 
-export function TimeGridView({ days, events, colorOf, range, bounds, zones }: Props) {
+export function TimeGridView({
+  days,
+  events,
+  colorOf,
+  range,
+  bounds,
+  zones,
+  onZonesChange,
+}: Props) {
   const { minimal, showPower } = useDepth();
   // Derived from the framed window: scroll to its start on mount, stretch rows so the window fills
   // the body exactly. The grid itself always spans the full 24h; scrolling reaches the rest.
@@ -210,27 +216,12 @@ export function TimeGridView({ days, events, colorOf, range, bounds, zones }: Pr
     <div className="flex h-full min-h-0 flex-1 flex-col">
       {/* Day-header row */}
       <div className="flex border-b border-rule">
-        <div className="flex shrink-0" style={{ width: `${gutterPx}px` }}>
-          {zones.map((z) => (
-            <div
-              key={z}
-              className="flex items-end justify-end border-l border-rule px-1 pb-0.5 font-mono text-[9px] uppercase tracking-tight text-ink4"
-              style={{ width: `${ZONE_COL}px` }}
-              title={z}
-            >
-              <span className="truncate">{zoneShort(z)}</span>
-            </div>
-          ))}
-          <div
-            className="flex items-end justify-end px-2 pb-0.5 font-mono text-[9px] uppercase tracking-tight text-ink4"
-            style={{ width: `${LOCAL_COL}px` }}
-            title={deviceTimeZone()}
-          >
-            {zones.length > 0 ? (
-              <span className="truncate">{zoneShort(deviceTimeZone())}</span>
-            ) : null}
-          </div>
-        </div>
+        <ZoneGutter
+          zones={zones}
+          onChange={onZonesChange}
+          zoneCol={ZONE_COL}
+          localCol={LOCAL_COL}
+        />
         {columns.map((c) => (
           <div key={dayKey(c.day)} className="flex-1 border-l border-rule px-2 py-1 text-center">
             <div
