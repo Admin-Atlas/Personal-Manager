@@ -1077,6 +1077,7 @@ pub fn run() {
             commands::set_project_metadata,
             commands::propose_project_metadata,
             commands::list_milestones,
+            commands::list_all_milestones,
             commands::add_milestone,
             commands::update_milestone,
             commands::set_milestone_event,

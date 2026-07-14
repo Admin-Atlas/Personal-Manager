@@ -8,7 +8,7 @@
 // today's number chip only — every source colour comes from the categorical palette, never the accent.
 
 import type { CalendarEvent } from "../../../lib/types";
-import { dayKey } from "../../../lib/calendar-layout";
+import { dayKey, isOverlayEvent } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -20,6 +20,8 @@ interface Props {
   /** Already filtered to visible (non-hidden) calendars. */
   events: CalendarEvent[];
   colorOf: (calendarId: string) => string;
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay chips only). */
+  onEventClick?: (ev: CalendarEvent) => void;
 }
 
 const BAND_H = 16;
@@ -27,7 +29,7 @@ const NUM_H = 22;
 const CELL_PAD = 4; // matches the cells' py-1, so the row-relative band overlay clears the number row
 const MAX_DOTS = 5;
 
-export function TerminalMonthTable({ cursor, events, colorOf }: Props) {
+export function TerminalMonthTable({ cursor, events, colorOf, onEventClick }: Props) {
   const { minimal, showMeta, showPower } = useDepth();
   const maxChips = showPower ? 4 : 3;
 
@@ -103,21 +105,40 @@ export function TerminalMonthTable({ cursor, events, colorOf }: Props) {
                     </div>
                   ) : (
                     <div className="flex min-h-0 flex-col gap-0.5 overflow-hidden">
-                      {cell.chips.slice(0, maxChips).map((ev) => (
-                        <div
-                          key={ev.id}
-                          className="flex items-center gap-1 overflow-hidden border-l-2 pl-1 text-[11px] leading-tight"
-                          style={{ borderLeftColor: colorOf(ev.calendar_id) }}
-                          title={ev.summary}
-                        >
-                          {showMeta && !ev.all_day && formatClockIso(ev.start) && (
-                            <span className="shrink-0 text-[9px] text-ink4">
-                              {formatClockIso(ev.start)}
-                            </span>
-                          )}
-                          <span className="truncate text-ink">{ev.summary}</span>
-                        </div>
-                      ))}
+                      {cell.chips.slice(0, maxChips).map((ev) => {
+                        const clickable = isOverlayEvent(ev);
+                        return (
+                          <div
+                            key={ev.id}
+                            className={cn(
+                              "flex items-center gap-1 overflow-hidden border-l-2 pl-1 text-[11px] leading-tight",
+                              clickable && "cursor-pointer hover:brightness-110",
+                            )}
+                            style={{ borderLeftColor: colorOf(ev.calendar_id) }}
+                            title={ev.summary}
+                            role={clickable ? "button" : undefined}
+                            tabIndex={clickable ? 0 : undefined}
+                            onClick={clickable ? () => onEventClick?.(ev) : undefined}
+                            onKeyDown={
+                              clickable
+                                ? (e) => {
+                                    if (e.key === "Enter" || e.key === " ") {
+                                      e.preventDefault();
+                                      onEventClick?.(ev);
+                                    }
+                                  }
+                                : undefined
+                            }
+                          >
+                            {showMeta && !ev.all_day && formatClockIso(ev.start) && (
+                              <span className="shrink-0 text-[9px] text-ink4">
+                                {formatClockIso(ev.start)}
+                              </span>
+                            )}
+                            <span className="truncate text-ink">{ev.summary}</span>
+                          </div>
+                        );
+                      })}
                       {hiddenCount > 0 && (
                         <span className="pl-1 text-[10px] text-ink4">+{hiddenCount} more</span>
                       )}

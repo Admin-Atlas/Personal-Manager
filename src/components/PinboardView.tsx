@@ -741,7 +741,7 @@ const NoteBody = memo(function NoteBody({
       // everywhere outside the board (reader, retrieval, chat citations), where the raw dialect
       // markers render degraded and get indexed as noise. The widget keeps the raw `text`, and the
       // edit-detection hash still tracks it, so "edited since last ingest" is unaffected.
-      await ingestNote(widget.id, toRenderMarkdown(text));
+      await ingestNote(widget.id, widget.title ?? "", toRenderMarkdown(text));
       onChange(widget.id, { ingestedAt: new Date().toISOString(), ingestedHash: cheapHash(text) });
       onIngested();
     } catch (e) {
@@ -1049,7 +1049,12 @@ const TimelineBody = memo(function TimelineBody(props: TimelineBodyProps) {
             project={widget.project}
             view={view}
             showPower={showPower}
-            onUnlink={() => onChange(widget.id, { project: undefined })}
+            // Unbind, and drop any freeform entries the widget still carries. Linking consumes them
+            // now, so post-fix this is a no-op — but a board linked by an older build kept its copy,
+            // and without this those stale entries would spring back onto the calendar's pinboard
+            // overlay beside the milestones they already became. The milestones stay in the project
+            // either way, which is exactly what the button promises.
+            onUnlink={() => onChange(widget.id, { project: undefined, items: [] })}
           />
         ) : (
           <FreeformTimeline {...props} view={view} />
@@ -1597,6 +1602,7 @@ function FreeformTimeline({
 }: TimelineBodyProps & { view: TimelineView }) {
   const [projects, setProjects] = useState<string[]>([]);
   const [projDraft, setProjDraft] = useState("");
+  const [linkErr, setLinkErr] = useState<string | null>(null);
   useEffect(() => {
     listProjects()
       .then(setProjects)
@@ -1610,6 +1616,34 @@ function FreeformTimeline({
     if (!b.date) return -1;
     return a.date.localeCompare(b.date);
   });
+
+  // Bind to a project — but first MERGE the freeform entries into that project's real milestones, so
+  // what you typed becomes the project's milestones instead of vanishing behind the bound view. Dedup
+  // against what's already there (by label + date) so re-linking after an Unlink can't duplicate. A
+  // new project name is fine — addMilestone creates the project on first insert.
+  //
+  // The merge CONSUMES the entries, so they're cleared in the same commit: each one is now a real
+  // milestone (or already matched one), so nothing is lost — and a widget that kept a private copy
+  // would re-emit it onto the calendar's pinboard overlay the moment it was unlinked, drawing that
+  // deadline twice (once as the entry, once as the milestone it became). Both writes land together,
+  // after the milestones are safely persisted, so a failed merge leaves the entries untouched.
+  async function linkProject(project: string) {
+    await runMutation(async () => {
+      const existing = await listMilestones(project);
+      const seen = new Set(
+        existing.map((m) => `${m.label.trim()} ${m.due_date?.slice(0, 10) ?? ""}`),
+      );
+      for (const it of widget.items ?? []) {
+        const label = it.label.trim() || "deadline";
+        const date = it.date || null;
+        const key = `${label} ${date ?? ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        await addMilestone(project, label, date, null);
+      }
+      onChange(widget.id, { project, items: [] });
+    }, setLinkErr);
+  }
 
   return (
     <div className="flex h-full flex-col px-2 py-1">
@@ -1657,15 +1691,17 @@ function FreeformTimeline({
           ))}
         </TimelineList>
       )}
-      <button
-        onClick={() => onAddItem(widget.id)}
-        className="mt-1 shrink-0 self-start rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface"
-      >
-        + Milestone
-      </button>
-      {/* Bind to a real project to sync milestones with the brief + Focus. Typing a new name is
-          allowed (it's created when the first milestone is added). */}
+      {/* Add-a-milestone and bind-to-a-project share one row: + Milestone on the left, the project
+          picker filling the middle, Link on the right. Linking first merges the freeform entries above
+          into that project's milestones (so they don't vanish behind the bound view), then switches to
+          it. Typing a new name is allowed — the project is created when the first milestone is added. */}
       <div className="mt-1 flex shrink-0 items-center gap-1" data-help="pinboard-timeline-project">
+        <button
+          onClick={() => onAddItem(widget.id)}
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface"
+        >
+          + Milestone
+        </button>
         <input
           list={listId}
           value={projDraft}
@@ -1679,13 +1715,27 @@ function FreeformTimeline({
           ))}
         </datalist>
         <button
-          onClick={() => projDraft.trim() && onChange(widget.id, { project: projDraft.trim() })}
+          onClick={() => projDraft.trim() && void linkProject(projDraft.trim())}
           disabled={!projDraft.trim()}
           className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface disabled:opacity-40"
         >
           Link
         </button>
       </div>
+      {/* Dated entries ride the calendar's pinboard overlay by default; this opts THIS timeline out.
+          Deliberately freeform-only: once a timeline is linked to a project its entries are real
+          milestones, and the calendar's own Milestones toggle governs them — so a second, conflicting
+          switch here would just be a lie. */}
+      <label className="mt-1 flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-ink4">
+        <input
+          type="checkbox"
+          checked={widget.showOnCalendar !== false}
+          onChange={(e) => onChange(widget.id, { showOnCalendar: e.target.checked })}
+          className="accent-[var(--accent)]"
+        />
+        Show on calendar
+      </label>
+      {linkErr && <p className="mt-1 shrink-0 text-[10px] text-st-due">{linkErr}</p>}
     </div>
   );
 }

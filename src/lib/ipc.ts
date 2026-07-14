@@ -470,8 +470,8 @@ export interface NoteIngest {
  *  project-importance like any doc. Idempotent on the widget id: an unchanged re-ingest is a no-op,
  *  an edited note re-embeds in place keeping its filing. The document persists if the note is
  *  deleted. */
-export const ingestNote = (widgetId: string, text: string) =>
-  invoke<NoteIngest>("ingest_note", { widgetId, text });
+export const ingestNote = (widgetId: string, title: string, text: string) =>
+  invoke<NoteIngest>("ingest_note", { widgetId, title, text });
 
 /**
  * Dev-only (debug builds): drive the index-only substrate (board card 3) through its reducer without
@@ -656,6 +656,10 @@ export function proposeProjectMetadata(
 /** A project's milestones, resolved (calendar-linked dates synced) and date-ordered. */
 export const listMilestones = (project: string) =>
   invoke<Milestone[]>("list_milestones", { project });
+
+/** Every project's milestones, resolved — read-only, for the calendar overlay (each carries its
+ *  `project_name` for click-to-open). */
+export const listAllMilestones = () => invoke<Milestone[]>("list_all_milestones");
 
 /** Add a milestone to a project. A non-null `eventUid` makes it calendar-linked. */
 export const addMilestone = (

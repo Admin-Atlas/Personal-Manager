@@ -2694,7 +2694,12 @@ fn derive_title(body: &str) -> String {
 /// summary). See [`ingest::ingest_note_document`], which also promotes any note ingested under the
 /// earlier index-only path (v2.89.0-alpha #214) in place.
 #[tauri::command]
-pub async fn ingest_note(app: AppHandle, widget_id: String, text: String) -> Result<NoteIngest> {
+pub async fn ingest_note(
+    app: AppHandle,
+    widget_id: String,
+    title: String,
+    text: String,
+) -> Result<NoteIngest> {
     tokio::task::spawn_blocking(move || -> Result<NoteIngest> {
         let body = text.trim();
         if body.is_empty() {
@@ -2702,7 +2707,16 @@ pub async fn ingest_note(app: AppHandle, widget_id: String, text: String) -> Res
                 "this note is empty — nothing to ingest".into(),
             ));
         }
-        let title = derive_title(body);
+        // Prefer the note's own (editable) title; fall back to the first non-blank line of the body
+        // for untitled notes, preserving the previous behaviour.
+        let title = {
+            let t = title.trim();
+            if t.is_empty() {
+                derive_title(body)
+            } else {
+                t.to_string()
+            }
+        };
 
         let state = app.state::<AppState>();
         state.sidecar.ensure_installed()?;
@@ -3541,6 +3555,15 @@ pub fn list_milestones(state: State<'_, AppState>, project: String) -> Result<Ve
     let conn = state.conn()?;
     let today = clock::today_sql_in(resolve_zone(&conn));
     milestones::list_for_project(&conn, project.trim(), &today)
+}
+
+/// Every project's milestones, resolved — read-only, for the calendar overlay (each carries its
+/// `project_name` for click-to-open).
+#[tauri::command]
+pub fn list_all_milestones(state: State<'_, AppState>) -> Result<Vec<Milestone>> {
+    let conn = state.conn()?;
+    let today = clock::today_sql_in(resolve_zone(&conn));
+    milestones::list_all(&conn, &today)
 }
 
 /// Add a milestone to a project (creating the project's metadata row if needed). A non-empty

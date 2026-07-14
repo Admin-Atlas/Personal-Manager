@@ -15,6 +15,7 @@ import {
   dayKey,
   eventDaySpan,
   groupEventsFromDay,
+  isOverlayEvent,
   startOfDay,
   weekdayShort,
 } from "../../../lib/calendar-layout";
@@ -29,6 +30,8 @@ interface Props {
   days?: Date[];
   /** Open-ended Agenda anchor: group events on/after this day, omitting empty days. Ignored if `days`. */
   fromDay?: Date;
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay rows only). */
+  onEventClick?: (ev: CalendarEvent) => void;
 }
 
 interface DayRow {
@@ -46,7 +49,7 @@ function rowTime(ev: CalendarEvent, day: Date): string {
   return formatClock(start);
 }
 
-export function TerminalAgenda({ events, colorOf, days, fromDay }: Props) {
+export function TerminalAgenda({ events, colorOf, days, fromDay, onEventClick }: Props) {
   const { showPower } = useDepth();
   const bounded = !!(days && days.length > 0);
 
@@ -96,18 +99,40 @@ export function TerminalAgenda({ events, colorOf, days, fromDay }: Props) {
               <div className="pl-2 text-sm text-faint">·</div>
             ) : (
               <ul className="flex flex-col gap-0.5">
-                {row.items.map((ev) => (
-                  <li key={ev.id} className="flex items-baseline gap-2 text-sm">
-                    <span className="w-16 shrink-0 text-ink4">{rowTime(ev, row.day)}</span>
-                    <span aria-hidden style={{ color: colorOf(ev.calendar_id) }}>
-                      ●
-                    </span>
-                    <span className="truncate text-ink">{ev.summary}</span>
-                    {showPower && ev.location && (
-                      <span className="truncate text-ink4">· {ev.location}</span>
-                    )}
-                  </li>
-                ))}
+                {row.items.map((ev) => {
+                  const clickable = isOverlayEvent(ev);
+                  return (
+                    <li
+                      key={ev.id}
+                      className={cn(
+                        "flex items-baseline gap-2 text-sm",
+                        clickable && "cursor-pointer rounded-[var(--radius-sm)] hover:bg-surface",
+                      )}
+                      role={clickable ? "button" : undefined}
+                      tabIndex={clickable ? 0 : undefined}
+                      onClick={clickable ? () => onEventClick?.(ev) : undefined}
+                      onKeyDown={
+                        clickable
+                          ? (e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                onEventClick?.(ev);
+                              }
+                            }
+                          : undefined
+                      }
+                    >
+                      <span className="w-16 shrink-0 text-ink4">{rowTime(ev, row.day)}</span>
+                      <span aria-hidden style={{ color: colorOf(ev.calendar_id) }}>
+                        ●
+                      </span>
+                      <span className="truncate text-ink">{ev.summary}</span>
+                      {showPower && ev.location && (
+                        <span className="truncate text-ink4">· {ev.location}</span>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </section>

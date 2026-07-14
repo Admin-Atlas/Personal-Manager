@@ -8,7 +8,13 @@
 import { useMemo } from "react";
 import type { CalendarEvent } from "../../../lib/types";
 import { formatClockIso, formatDateLocal } from "../../../lib/format";
-import { dayKey, groupEventsFromDay, startOfDay, weekdayShort } from "../../../lib/calendar-layout";
+import {
+  dayKey,
+  groupEventsFromDay,
+  isOverlayEvent,
+  startOfDay,
+  weekdayShort,
+} from "../../../lib/calendar-layout";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
 
@@ -18,6 +24,8 @@ interface Props {
   /** Show events on/after this day — including a multi-day event still running through it. */
   fromDay: Date;
   colorOf: (calendarId: string) => string;
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay rows only). */
+  onEventClick?: (ev: CalendarEvent) => void;
 }
 
 /** An event's clock time for the agenda row: the local start time, or "all-day". */
@@ -25,7 +33,7 @@ function eventTime(ev: CalendarEvent): string {
   return ev.all_day ? "all-day" : formatClockIso(ev.start);
 }
 
-export function AgendaView({ events, fromDay, colorOf }: Props) {
+export function AgendaView({ events, fromDay, colorOf, onEventClick }: Props) {
   const { showMeta, showPower } = useDepth();
 
   const groups = useMemo(() => groupEventsFromDay(events, fromDay), [events, fromDay]);
@@ -66,19 +74,40 @@ export function AgendaView({ events, fromDay, colorOf }: Props) {
               )}
             </div>
             <ul className="flex flex-1 flex-col gap-1">
-              {g.items.map((ev) => (
-                <li
-                  key={ev.id}
-                  className="flex items-baseline gap-3 border-l-[3px] py-0.5 pl-2.5"
-                  style={{ borderLeftColor: colorOf(ev.calendar_id) }}
-                >
-                  <span className="w-14 shrink-0 font-mono text-xs text-ink4">{eventTime(ev)}</span>
-                  <span className="truncate font-head text-sm text-ink">{ev.summary}</span>
-                  {showPower && ev.location && (
-                    <span className="truncate font-mono text-xs text-ink4">· {ev.location}</span>
-                  )}
-                </li>
-              ))}
+              {g.items.map((ev) => {
+                const clickable = isOverlayEvent(ev);
+                return (
+                  <li
+                    key={ev.id}
+                    className={cn(
+                      "flex items-baseline gap-3 border-l-[3px] py-0.5 pl-2.5",
+                      clickable && "cursor-pointer rounded-[var(--radius-sm)] hover:bg-surface",
+                    )}
+                    style={{ borderLeftColor: colorOf(ev.calendar_id) }}
+                    role={clickable ? "button" : undefined}
+                    tabIndex={clickable ? 0 : undefined}
+                    onClick={clickable ? () => onEventClick?.(ev) : undefined}
+                    onKeyDown={
+                      clickable
+                        ? (e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              onEventClick?.(ev);
+                            }
+                          }
+                        : undefined
+                    }
+                  >
+                    <span className="w-14 shrink-0 font-mono text-xs text-ink4">
+                      {eventTime(ev)}
+                    </span>
+                    <span className="truncate font-head text-sm text-ink">{ev.summary}</span>
+                    {showPower && ev.location && (
+                      <span className="truncate font-mono text-xs text-ink4">· {ev.location}</span>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           </section>
         );

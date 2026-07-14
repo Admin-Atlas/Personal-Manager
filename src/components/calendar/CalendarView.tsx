@@ -7,11 +7,20 @@
 // render the pixel grids (Day/Week time-grid, Month, Year) + Agenda; Terminal forks to a mono, flat set
 // (a CLI status strip + agenda/tables, never a pixel grid) enumerated explicitly per view so nothing
 // falls through to the wrong body. A neutral hint flags paging past the synced band; each view fades up
-// on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. Nothing here writes back.
+// on switch (respecting prefers-reduced-motion); ←/→/t drive navigation. Synced events are read-only;
+// the only interactive elements are the two first-party overlays — project milestones (click opens
+// their project) and freeform pinboard timeline entries (click opens the Pinboard) — each an all-day
+// event in its own hue, injected here and never written back to any calendar.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { calendarOverview, listAllCalendarEvents, syncCalendar } from "../../lib/ipc";
-import type { CalendarEvent, CalendarOverview } from "../../lib/types";
+import {
+  calendarOverview,
+  getPref,
+  listAllCalendarEvents,
+  listAllMilestones,
+  syncCalendar,
+} from "../../lib/ipc";
+import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
 import {
   readHidden,
   readRange,
@@ -29,8 +38,20 @@ import {
 } from "../../lib/calendarPrefs";
 import { resolveRangeBounds } from "../../lib/calendarGeom";
 import { formatDateLocal } from "../../lib/format";
-import { addDays, dayKey, eventDaySpan, startOfDay } from "../../lib/calendar-layout";
-import { sourceColors, useTheme, useUserTime } from "../../theme";
+import {
+  addDays,
+  dayKey,
+  eventDaySpan,
+  isMilestoneEvent,
+  isOverlayEvent,
+  isPinboardEvent,
+  MILESTONE_CALENDAR_ID,
+  PINBOARD_CALENDAR_ID,
+  startOfDay,
+} from "../../lib/calendar-layout";
+import { pinboardEntries, type PinboardEntry } from "../../lib/pinboard/calendarEntries";
+import { PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
+import { milestoneColor, pinboardColor, sourceColors, useTheme, useUserTime } from "../../theme";
 import { Skeleton } from "../ui";
 import { useNowTick } from "./parts/useNowTick";
 import { CalendarHeader } from "./CalendarHeader";
@@ -52,6 +73,8 @@ const DEFAULT_VIEW: CalendarViewMode = "month";
 // mirror re-reads (mirrors FocusView's cache).
 let cachedEvents: CalendarEvent[] = [];
 let cachedOverview: CalendarOverview | null = null;
+let cachedMilestones: Milestone[] = [];
+let cachedPinboard: PinboardEntry[] = [];
 
 /** Monday-first start of the week containing `d`. */
 function startOfWeek(d: Date): Date {
@@ -116,11 +139,21 @@ function visibleRange(view: CalendarViewMode, cur: Date): { start: Date; end: Da
   }
 }
 
-export function CalendarView() {
+interface CalendarViewProps {
+  /** Open a project's page — wired only to the clickable milestone overlay events; the rest of the
+   *  calendar stays read-only. */
+  onOpenProject?: (project: string) => void;
+  /** Open the Pinboard tab — wired to the pinboard overlay events, which have no project to open. */
+  onOpenPinboard?: () => void;
+}
+
+export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProps) {
   const { system, accent } = useTheme();
   const { coords } = useUserTime();
   const [overview, setOverview] = useState<CalendarOverview | null>(() => cachedOverview);
   const [events, setEvents] = useState<CalendarEvent[]>(() => cachedEvents);
+  const [milestones, setMilestones] = useState<Milestone[]>(() => cachedMilestones);
+  const [pinboardItems, setPinboardItems] = useState<PinboardEntry[]>(() => cachedPinboard);
   const [hidden, setHidden] = useState<Set<string>>(() => readHidden());
   const [view, setView] = useState<CalendarViewMode>(() => readView(AVAILABLE_VIEWS, DEFAULT_VIEW));
   const [range, setRange] = useState<CalendarRange>(() => readRange());
@@ -164,6 +197,32 @@ export function CalendarView() {
     }
   }, []);
 
+  const loadMilestones = useCallback(async () => {
+    try {
+      const ms = await listAllMilestones();
+      if (!aliveRef.current) return;
+      setMilestones(ms);
+      cachedMilestones = ms;
+    } catch {
+      // Keep the last-good milestones; a read failure is transient and the overlay is non-critical.
+    }
+  }, []);
+
+  // The board lives in the encrypted settings table (not localStorage), so its overlay is a plain read
+  // like everything else here. Switching tabs unmounts this view, so the mount load below picks up any
+  // board edit; the focus listener covers one made while the window was away.
+  const loadPinboard = useCallback(async () => {
+    try {
+      const raw = await getPref(PINBOARD_PREF_KEY);
+      if (!aliveRef.current) return;
+      const entries = pinboardEntries(raw);
+      setPinboardItems(entries);
+      cachedPinboard = entries;
+    } catch {
+      // Keep the last-good entries; a read failure is transient and the overlay is non-critical.
+    }
+  }, []);
+
   const loadOverview = useCallback(async () => {
     try {
       const ov = await calendarOverview();
@@ -182,29 +241,34 @@ export function CalendarView() {
   useEffect(() => {
     void loadOverview();
     void loadEvents();
-    // Re-read the WHOLE mirror on focus — both events and the overview. The background poll can have
-    // shifted the synced band, added a calendar, or changed the last-sync time while we were away, so
-    // refreshing events alone would leave the range hint, source colours, and "synced" label stale.
+    void loadMilestones();
+    void loadPinboard();
+    // Re-read EVERYTHING on focus — events, overview, milestones AND the board. The background poll can
+    // have shifted the synced band, added a calendar, or changed the last-sync time while we were
+    // away, and milestone/board edits happen in other tabs (which unmount this one), so refreshing
+    // events alone would leave the range hint, source colours, "synced" label, and overlays stale.
     const onFocus = () => {
       void loadEvents();
       void loadOverview();
+      void loadMilestones();
+      void loadPinboard();
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [loadOverview, loadEvents]);
+  }, [loadOverview, loadEvents, loadMilestones, loadPinboard]);
 
   const onRefresh = useCallback(async () => {
     setSyncing(true);
     setError(null);
     try {
       await syncCalendar();
-      await Promise.all([loadEvents(), loadOverview()]);
+      await Promise.all([loadEvents(), loadOverview(), loadMilestones(), loadPinboard()]);
     } catch (e) {
       if (aliveRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (aliveRef.current) setSyncing(false);
     }
-  }, [loadEvents, loadOverview]);
+  }, [loadEvents, loadOverview, loadMilestones, loadPinboard]);
 
   const onToggleCalendar = useCallback((calendarId: string) => {
     setHidden((prev) => {
@@ -281,8 +345,59 @@ export function CalendarView() {
   const colorOf = useMemo(() => {
     const ids = overview?.calendars.map((c) => c.id) ?? [];
     const map = sourceColors(ids, system, accent);
-    return (calendarId: string) => map.get(calendarId) ?? "var(--ink4)";
+    return (calendarId: string) => {
+      if (calendarId === MILESTONE_CALENDAR_ID) return milestoneColor(system);
+      if (calendarId === PINBOARD_CALENDAR_ID) return pinboardColor(system);
+      return map.get(calendarId) ?? "var(--ink4)";
+    };
   }, [overview, system, accent]);
+
+  // Project milestones as synthetic all-day events — a first-party overlay, not synced. Only draw a
+  // milestone that ISN'T already on the calendar as a real event: PM-native (unlinked) ones, plus
+  // linked ones whose event is `event_missing` (out of the mirror band / deselected / deleted), which
+  // nothing else shows. A linked, in-mirror milestone is already drawn as its real event, so skip it
+  // to avoid a double. (Accepted edge: a linked, in-mirror milestone whose calendar the user hid then
+  // shows nowhere.) Dateless milestones have no day to sit on, so they're excluded.
+  const milestoneEvents = useMemo<CalendarEvent[]>(() => {
+    const out: CalendarEvent[] = [];
+    for (const m of milestones) {
+      if (!m.due_date) continue;
+      if (!(m.event_uid === null || m.event_missing)) continue;
+      out.push({
+        id: `milestone:${m.id}`,
+        calendar_id: MILESTONE_CALENDAR_ID,
+        summary: m.state === "met" ? `✓ ${m.label}` : m.label,
+        description: null,
+        location: null,
+        start: m.due_date.slice(0, 10),
+        end: null,
+        all_day: true,
+        html_link: null,
+        uid: null,
+      });
+    }
+    return out;
+  }, [milestones]);
+
+  // Freeform pinboard timeline entries as synthetic all-day events — the second first-party overlay.
+  // `pinboardEntries` has already dropped project-bound timelines (their entries are real milestones,
+  // drawn above), opted-out widgets, and dateless entries, so this is a straight projection.
+  const pinboardEvents = useMemo<CalendarEvent[]>(
+    () =>
+      pinboardItems.map((e) => ({
+        id: `pinboard:${e.widgetId}:${e.itemId}`,
+        calendar_id: PINBOARD_CALENDAR_ID,
+        summary: e.label,
+        description: null,
+        location: null,
+        start: e.date,
+        end: null,
+        all_day: true,
+        html_link: null,
+        uid: null,
+      })),
+    [pinboardItems],
+  );
 
   const visibleEvents = useMemo(() => {
     // Filter to visible calendars, THEN dedup the same physical event mirrored on two of them (same
@@ -298,8 +413,30 @@ export function CalendarView() {
       }
       out.push(e);
     }
+    // Both first-party overlays ride on top, each toggleable like a calendar via the same `hidden` set.
+    // Their events carry a null uid + a unique calendar_id, so they skip the dedup and hide filter
+    // cleanly.
+    if (!hidden.has(MILESTONE_CALENDAR_ID)) out.push(...milestoneEvents);
+    if (!hidden.has(PINBOARD_CALENDAR_ID)) out.push(...pinboardEvents);
     return out;
-  }, [events, hidden]);
+  }, [events, hidden, milestoneEvents, pinboardEvents]);
+
+  // The only interactive elements on the otherwise read-only calendar: a milestone opens its project,
+  // a freeform pinboard entry opens the Pinboard (it has no project to open). Real synced events are
+  // never wired to a click (isOverlayEvent === false).
+  const onEventClick = useCallback(
+    (ev: CalendarEvent) => {
+      if (isPinboardEvent(ev)) {
+        onOpenPinboard?.();
+        return;
+      }
+      if (!isMilestoneEvent(ev)) return;
+      const id = Number(ev.id.slice("milestone:".length));
+      const m = milestones.find((x) => x.id === id);
+      if (m) onOpenProject?.(m.project_name);
+    },
+    [milestones, onOpenProject, onOpenPinboard],
+  );
 
   const gridDays = useMemo<Date[]>(() => {
     if (view === "day") return [startOfDay(cursor)];
@@ -349,6 +486,7 @@ export function CalendarView() {
     if (view === "agenda") {
       const fromMs = startOfDay(cursor).getTime();
       return visibleEvents.filter((e) => {
+        if (isOverlayEvent(e)) return false; // count synced events only, honest to "N events"
         const span = eventDaySpan(e);
         return span && span.endDay.getTime() >= fromMs;
       }).length;
@@ -357,6 +495,7 @@ export function CalendarView() {
     const startMs = start.getTime();
     const endMs = end.getTime(); // exclusive
     return visibleEvents.filter((e) => {
+      if (isOverlayEvent(e)) return false; // count synced events only, honest to "N events"
       const span = eventDaySpan(e);
       return span && span.startDay.getTime() < endMs && span.endDay.getTime() >= startMs;
     }).length;
@@ -372,6 +511,12 @@ export function CalendarView() {
   }
 
   const hasCalendars = (overview?.calendars.length ?? 0) > 0;
+  // Both first-party overlays exist WITHOUT any connected calendar, so the grid has to render for them
+  // alone — otherwise a user with milestones or pinboard entries and no account is told "No calendars
+  // connected yet." over data the Calendars menu is simultaneously offering to show/hide. Read the raw
+  // overlay memos, not `visibleEvents`: hiding an overlay should empty the grid, never swap the whole
+  // body for an onboarding message. The empty state is then honest — it means nothing to draw at all.
+  const hasOverlay = milestoneEvents.length > 0 || pinboardEvents.length > 0;
 
   // The active body for the current System + view. Terminal forks to the mono set and never mounts the
   // pixel TimeGridView; both branches enumerate all five views so none falls through to the wrong body.
@@ -379,7 +524,14 @@ export function CalendarView() {
     if (isTerminal) {
       switch (view) {
         case "month":
-          return <TerminalMonthTable cursor={cursor} events={visibleEvents} colorOf={colorOf} />;
+          return (
+            <TerminalMonthTable
+              cursor={cursor}
+              events={visibleEvents}
+              colorOf={colorOf}
+              onEventClick={onEventClick}
+            />
+          );
         case "year":
           return (
             <TerminalYearTable
@@ -390,15 +542,36 @@ export function CalendarView() {
           );
         case "day":
         case "week":
-          return <TerminalAgenda events={visibleEvents} colorOf={colorOf} days={gridDays} />;
+          return (
+            <TerminalAgenda
+              events={visibleEvents}
+              colorOf={colorOf}
+              days={gridDays}
+              onEventClick={onEventClick}
+            />
+          );
         case "agenda":
         default:
-          return <TerminalAgenda events={visibleEvents} colorOf={colorOf} fromDay={cursor} />;
+          return (
+            <TerminalAgenda
+              events={visibleEvents}
+              colorOf={colorOf}
+              fromDay={cursor}
+              onEventClick={onEventClick}
+            />
+          );
       }
     }
     switch (view) {
       case "agenda":
-        return <AgendaView events={visibleEvents} fromDay={cursor} colorOf={colorOf} />;
+        return (
+          <AgendaView
+            events={visibleEvents}
+            fromDay={cursor}
+            colorOf={colorOf}
+            onEventClick={onEventClick}
+          />
+        );
       case "month":
         return (
           <MonthView
@@ -406,6 +579,7 @@ export function CalendarView() {
             events={visibleEvents}
             colorOf={colorOf}
             onFocusDate={onFocusDate}
+            onEventClick={onEventClick}
           />
         );
       case "year":
@@ -429,6 +603,7 @@ export function CalendarView() {
             bounds={activeBounds}
             zones={zones}
             onZonesChange={onZonesChange}
+            onEventClick={onEventClick}
           />
         );
     }
@@ -484,7 +659,15 @@ export function CalendarView() {
         </div>
       )}
 
-      {!hasCalendars ? (
+      {/* Overlays but no connected calendar: the grid below is real (milestones / pinboard entries), so
+          the connect-a-calendar nudge demotes to a hint strip rather than replacing the body. */}
+      {!hasCalendars && hasOverlay && (
+        <div className="border-b border-rule bg-panel px-4 py-1.5 text-center font-mono text-xs text-ink4">
+          No calendars connected — showing your milestones and pinboard entries only.
+        </div>
+      )}
+
+      {!hasCalendars && !hasOverlay ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
           <p className="text-sm text-ink2">No calendars connected yet.</p>
           <p className="max-w-sm text-xs text-ink4">

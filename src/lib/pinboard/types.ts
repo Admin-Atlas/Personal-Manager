@@ -48,6 +48,12 @@ export interface Widget {
    *  changes flow to the daily brief and the project's Focus/sidebar. Unset → freeform (default).
    *  Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1. */
   project?: string;
+  /** Freeform timelines only: whether this widget's dated entries also appear on the Calendar tab
+   *  (the pinboard overlay). Unset → shown, so entries land on the calendar by default. A
+   *  project-bound timeline ignores it — those entries are real milestones, already drawn by the
+   *  milestone overlay. Optional and additive, so old boards parse unchanged and `BOARD_VERSION`
+   *  stays 1. */
+  showOnCalendar?: boolean;
   /** How a timeline widget lays its entries out: `"list"` (stacked rows) or `"row"` (a
    *  horizontal date-ordered track). Unset falls back to each kind's historical default —
    *  freeform → list, project-bound → row — so old boards look identical. Optional and
@@ -71,5 +77,9 @@ export interface Board {
 }
 
 export const BOARD_VERSION = 1;
+
+/** The settings-table key the board persists under (must match the backend `set_pref` allowlist).
+ *  Shared so read-only consumers (the calendar's pinboard overlay) can't drift from the writer. */
+export const PINBOARD_PREF_KEY = "pinboard";
 
 export const EMPTY_BOARD: Board = { version: BOARD_VERSION, widgets: [] };

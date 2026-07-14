@@ -8,7 +8,7 @@
 // timed events crossing midnight are already multi-day, so they lift too. Today's column gets an
 // accent-soft tint and the now-line. Every colour is a token or the passed source colour — no hex.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
 import type { CalendarRange, RangeBounds } from "../../../lib/calendarPrefs";
 import {
@@ -44,6 +44,8 @@ interface Props {
   zones: string[];
   /** Add/remove an extra gutter zone — the corner control lives in the header row's gutter cell. */
   onZonesChange: (zones: string[]) => void;
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay bands only). */
+  onEventClick?: (ev: CalendarEvent) => void;
 }
 
 const LOCAL_COL = 54; // width of the local hour column (px)
@@ -96,6 +98,7 @@ export function TimeGridView({
   bounds,
   zones,
   onZonesChange,
+  onEventClick,
 }: Props) {
   const { minimal, showPower } = useDepth();
   // Derived from the framed window: scroll to its start on mount, stretch rows so the window fills
@@ -105,6 +108,11 @@ export function TimeGridView({
   const gutterPx = LOCAL_COL + zones.length * ZONE_COL;
   const scrollRef = useRef<HTMLDivElement>(null);
   const [bodyHeight, setBodyHeight] = useState(0);
+  // Width the body's vertical scrollbar steals from its day columns. The header row and all-day band
+  // don't scroll, so they must reserve the same width or their columns drift right of the body's
+  // (visible only with classic, space-consuming scrollbars — WebView2's overlay bar measures 0). Fed
+  // into the header row's paddingRight and the AllDayBand end gutter below.
+  const [scrollbarW, setScrollbarW] = useState(0);
 
   // The body's visible height, independent of content — the flex layout sizes it, not the grid.
   useEffect(() => {
@@ -123,6 +131,21 @@ export function TimeGridView({
   // crush rows below legibility (it scrolls instead). The grid always spans the full 24h — scrolling
   // reaches whatever sits outside the framed window.
   const rowH = bodyHeight > 0 ? Math.max(MIN_ROW_H, bodyHeight / windowHours) : MIN_ROW_H * 2;
+
+  // Measure the body scrollbar so the non-scrolling header/all-day reserve a matching gutter.
+  // useLayoutEffect, not useEffect: a passive effect would paint one frame at 0 then correct it — a
+  // visible sideways jump of the header columns in exactly the case this targets (a classic,
+  // space-consuming scrollbar). The scrollbar exists iff the grid (HOURS * rowH) overflows the body,
+  // so rowH + bodyHeight are the only inputs that can toggle it — which is also why the
+  // ResizeObserver above can't do this job: the body's own box doesn't change when its scrollbar
+  // appears. Writing the gutter onto the HEADER can't feed back into the BODY's scrollbar (different
+  // elements), and the identity guard stops a same-width write, so this can't loop.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const w = el.offsetWidth - el.clientWidth;
+    setScrollbarW((prev) => (prev === w ? prev : w));
+  }, [rowH, bodyHeight]);
 
   const bandEvents = useMemo(() => events.filter((e) => e.all_day || isMultiDay(e)), [events]);
 
@@ -214,8 +237,8 @@ export function TimeGridView({
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
-      {/* Day-header row */}
-      <div className="flex border-b border-rule">
+      {/* Day-header row — reserve the body's scrollbar gutter so its columns stay aligned. */}
+      <div className="flex border-b border-rule" style={{ paddingRight: scrollbarW }}>
         <ZoneGutter
           zones={zones}
           onChange={onZonesChange}
@@ -245,7 +268,9 @@ export function TimeGridView({
         days={days}
         colorOf={colorOf}
         gutterPx={gutterPx}
+        endGutterPx={scrollbarW}
         showLabel={!minimal}
+        onEventClick={onEventClick}
       />
 
       {/* Scrollable time body */}

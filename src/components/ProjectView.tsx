@@ -6,18 +6,12 @@ import { ChatView } from "./ChatView";
 import { Composer } from "./Composer";
 import { ContextMeter } from "./ContextMeter";
 import { RetrievalExplainPanel } from "./RetrievalExplainPanel";
-import {
-  listCalendarEvents,
-  listDocuments,
-  listMilestones,
-  listProjects,
-  setDocumentMetadata,
-} from "../lib/ipc";
+import { listDocuments, listMilestones, listProjects, setDocumentMetadata } from "../lib/ipc";
 import { useResizable } from "../lib/useResizable";
 import { useSidebarSplit } from "../lib/useSidebarSplit";
 import { idleSince } from "../lib/chatSession";
 import type { ProjectChat } from "../lib/useProjectChat";
-import type { CalendarEvent, Document, Milestone } from "../lib/types";
+import type { Document, Milestone } from "../lib/types";
 import { Button, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { MilestoneList } from "./MilestoneList";
@@ -33,6 +27,12 @@ const PROJECT_LIST_ID = "focus-projects";
 type FileSortKey = "name" | "importance";
 interface FileSort {
   key: FileSortKey;
+  dir: "asc" | "desc";
+}
+
+type MsSortKey = "manual" | "deadline" | "label";
+interface MsSort {
+  key: MsSortKey;
   dir: "asc" | "desc";
 }
 
@@ -65,7 +65,6 @@ export function ProjectView({
 }: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
-  const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   /** The file the palette jumped to — flashed briefly, then cleared. */
   const [flashId, setFlashId] = useState<number | null>(null);
   const filesRef = useRef<HTMLUListElement>(null);
@@ -81,6 +80,9 @@ export function ProjectView({
   const { openReader, current: readerDoc } = useReader();
   // How the Files panel is ordered. Name A→Z by default; clicking a key again reverses it.
   const [sort, setSort] = useState<FileSort>({ key: "name", dir: "asc" });
+  // How the Milestones panel is ordered. Manual (backend sort_order) by default, so the ↑/↓ arrows
+  // work and today's behaviour is unchanged. Per-session (no localStorage), like the Files sort.
+  const [msSort, setMsSort] = useState<MsSort>({ key: "manual", dir: "asc" });
   // The right panel's width is a fraction of the window (drag the left edge to resize, stays
   // proportional on window resize), clamped so it can't get so narrow the content scrolls.
   const {
@@ -114,6 +116,12 @@ export function ProjectView({
     );
   }
 
+  function toggleMsSort(key: MsSortKey) {
+    setMsSort((cur) =>
+      cur.key === key ? { key, dir: cur.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" },
+    );
+  }
+
   const sortedDocs = useMemo(() => {
     const factor = sort.dir === "asc" ? 1 : -1;
     return [...documents].sort((a, b) => {
@@ -126,6 +134,32 @@ export function ProjectView({
     });
   }, [documents, sort]);
 
+  // Milestones sorted for display only — the backend order (sort_order, id) is left untouched, so
+  // governing()/status derivation is unaffected. Manual returns the array unchanged (already backend
+  // order, so the ↑/↓ index math stays correct). Undated milestones sink to the bottom either way.
+  const sortedMilestones = useMemo(() => {
+    if (msSort.key === "manual") return milestones;
+    const factor = msSort.dir === "asc" ? 1 : -1;
+    return [...milestones].sort((a, b) => {
+      if (msSort.key === "deadline") {
+        const da = a.due_date?.slice(0, 10) ?? "";
+        const db = b.due_date?.slice(0, 10) ?? "";
+        if (da && db) {
+          const c = da.localeCompare(db);
+          if (c) return c * factor;
+        } else if (!da && db) {
+          return 1; // undated sinks, regardless of direction
+        } else if (da && !db) {
+          return -1;
+        }
+      } else {
+        const c = a.label.localeCompare(b.label);
+        if (c) return c * factor;
+      }
+      return a.sort_order - b.sort_order || a.id - b.id;
+    });
+  }, [milestones, msSort]);
+
   const refreshMilestones = () => {
     listMilestones(project)
       .then(setMilestones)
@@ -133,17 +167,12 @@ export function ProjectView({
   };
 
   useEffect(() => {
-    // Load this project's documents/milestones/calendar. The chat session (App-owned) re-inits
-    // itself on the same project change.
+    // Load this project's documents and milestones. The chat session (App-owned) re-inits itself on
+    // the same project change.
     listDocuments()
       .then((all) => setDocuments(all.filter((d) => d.project === project)))
       .catch((e) => chat.setError(String(e)));
     refreshMilestones();
-    // Upcoming events feed the milestone link picker (empty when no calendar connected). Drop events
-    // that already ended today — the agenda greys those, but linking targets stay strictly upcoming.
-    listCalendarEvents()
-      .then((evts) => setCalendarEvents(evts.filter((e) => !e.ended)))
-      .catch(() => setCalendarEvents([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
 
@@ -211,13 +240,8 @@ export function ProjectView({
         <span className="font-mono text-xs uppercase tracking-wide text-ink4">Files</span>
         {documents.length > 1 && (
           <div className="flex items-center gap-2 text-[10px] text-ink4">
-            <FileSortButton label="Name" sortKey="name" sort={sort} onSort={toggleSort} />
-            <FileSortButton
-              label="Importance"
-              sortKey="importance"
-              sort={sort}
-              onSort={toggleSort}
-            />
+            <SortToggle label="Name" sortKey="name" sort={sort} onSort={toggleSort} />
+            <SortToggle label="Importance" sortKey="importance" sort={sort} onSort={toggleSort} />
           </div>
         )}
       </div>
@@ -301,14 +325,29 @@ export function ProjectView({
 
   const milestonesPanel = (
     <div className="px-4 pb-3 pt-3" data-help="project-milestones">
-      <span className="font-mono text-xs uppercase tracking-wide text-ink4">Milestones</span>
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-mono text-xs uppercase tracking-wide text-ink4">Milestones</span>
+        {showMeta && milestones.length > 1 && (
+          <div className="flex items-center gap-2 text-[10px] text-ink4">
+            <SortToggle
+              label="Manual"
+              sortKey="manual"
+              sort={msSort}
+              directional={false}
+              onSort={toggleMsSort}
+            />
+            <SortToggle label="Deadline" sortKey="deadline" sort={msSort} onSort={toggleMsSort} />
+            <SortToggle label="Name" sortKey="label" sort={msSort} onSort={toggleMsSort} />
+          </div>
+        )}
+      </div>
       <div className="mt-2">
         <MilestoneList
           project={project}
-          milestones={milestones}
-          calendarEvents={calendarEvents}
+          milestones={sortedMilestones}
           onChanged={refreshMilestones}
           readOnly={!showMeta}
+          manualOrder={msSort.key === "manual"}
         />
       </div>
     </div>
@@ -447,31 +486,41 @@ export function ProjectView({
   );
 }
 
-/** A compact sort toggle for the Files panel header: click to sort by this key, click again to
- *  reverse. Shows the active direction (▲/▼) or an idle hint (↕). */
-function FileSortButton({
+/** A compact sort toggle for a panel header: click to sort by this key, click again to reverse.
+ *  Shows the active direction (▲/▼) or an idle hint (↕). A non-directional key (e.g. "Manual")
+ *  shows no glyph — it just selects that order. Shared by the Files and Milestones panels. */
+function SortToggle<K extends string>({
   label,
   sortKey,
   sort,
+  directional = true,
   onSort,
 }: {
   label: string;
-  sortKey: FileSortKey;
-  sort: FileSort;
-  onSort: (key: FileSortKey) => void;
+  sortKey: K;
+  sort: { key: K; dir: "asc" | "desc" };
+  directional?: boolean;
+  onSort: (key: K) => void;
 }) {
   const active = sort.key === sortKey;
   return (
     <button
       type="button"
       onClick={() => onSort(sortKey)}
-      title={`Sort by ${label.toLowerCase()}`}
+      aria-pressed={active}
+      title={
+        directional
+          ? `Sort by ${label.toLowerCase()} (${active && sort.dir === "desc" ? "descending" : "ascending"})`
+          : `Sort ${label.toLowerCase()}`
+      }
       className={`inline-flex items-center gap-0.5 hover:text-ink2 ${active ? "text-ink2" : ""}`}
     >
       {label}
-      <span aria-hidden className="text-[8px] leading-none">
-        {active ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}
-      </span>
+      {directional && (
+        <span aria-hidden className="text-[8px] leading-none">
+          {active ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}
+        </span>
+      )}
     </button>
   );
 }

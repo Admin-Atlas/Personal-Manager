@@ -24,6 +24,7 @@ import { DEFAULT_TINT } from "./palette";
 import {
   BOARD_VERSION,
   EMPTY_BOARD,
+  PINBOARD_PREF_KEY,
   type Board,
   type Rect,
   type TimelineItem,
@@ -31,7 +32,7 @@ import {
 } from "./types";
 
 // The settings-table key (must match the backend `set_pref` allowlist).
-const PREF_KEY = "pinboard";
+const PREF_KEY = PINBOARD_PREF_KEY;
 
 /** A stable unique id; `crypto.randomUUID` in the webview, with a cheap fallback. */
 function makeId(): string {

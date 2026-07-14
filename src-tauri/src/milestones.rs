@@ -247,6 +247,17 @@ pub fn list_for_project(conn: &Connection, project: &str, today: &str) -> Result
         .collect())
 }
 
+/// Every resolved milestone across all projects, for the calendar overlay (each carries its
+/// `project_name`, so the frontend can navigate on click). `today` is the user's zone-local civil
+/// date, so calendar-linked dates resolve the same way the project surface sees them.
+pub fn list_all(conn: &Connection, today: &str) -> Result<Vec<Milestone>> {
+    let uid_dates = calendar_dates_by_uid(conn, today)?;
+    Ok(load_rows(conn, None)?
+        .into_iter()
+        .map(|r| resolve(r, &uid_dates))
+        .collect())
+}
+
 /// Every milestone, resolved and grouped by project name — one pass for `list_overviews`.
 pub fn all_by_project(conn: &Connection, today: &str) -> Result<HashMap<String, Vec<Milestone>>> {
     let uid_dates = calendar_dates_by_uid(conn, today)?;

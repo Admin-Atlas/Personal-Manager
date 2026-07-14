@@ -19,7 +19,6 @@ import {
 import { MilestoneList } from "./MilestoneList";
 import type {
   AgendaEvent,
-  CalendarEvent,
   DailyBriefing,
   FocusRoute,
   Importance,
@@ -145,7 +144,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   const [proposals, setProposals] = useState<Record<string, ProjectProposal>>({});
   const [proposing, setProposing] = useState(false);
   /** Focus-agenda events (empty when not connected). Includes events that ended earlier today, tagged
-   *  `ended` — the Agenda greys those; every other consumer takes the strict `upcoming` subset below. */
+   *  `ended` — the Agenda greys those rather than hiding them. */
   const [events, setEvents] = useState<AgendaEvent[]>(() => cachedEvents);
   /** The daily briefing (Step 7); null until loaded, then refreshed when stale. */
   const [briefing, setBriefing] = useState<DailyBriefing | null>(() => cachedBriefing);
@@ -245,9 +244,6 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   }, []);
 
   const names = useMemo(() => projects.map((p) => p.name), [projects]);
-  // The strict "not yet ended" subset for name-matching and milestone linking — those surfaces must
-  // never see an event that already ended today (only the Agenda greys and shows those).
-  const upcoming = useMemo(() => events.filter((e) => !e.ended), [events]);
   // How the project list is ordered. Defaults to "Smart" (status precedence); remembered per-device.
   const [sort, setSort] = useState<Sort>(() => readSort());
   useEffect(() => {
@@ -370,7 +366,6 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
                     key={p.name}
                     project={p}
                     otherProjects={names.filter((n) => n !== p.name)}
-                    events={upcoming}
                     proposal={proposals[p.name]}
                     editing={editing === p.name}
                     onEdit={() => setEditing(editing === p.name ? null : p.name)}
@@ -394,7 +389,6 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
 function ProjectCard({
   project,
   otherProjects,
-  events,
   proposal,
   editing,
   onEdit,
@@ -404,7 +398,6 @@ function ProjectCard({
 }: {
   project: ProjectOverview;
   otherProjects: string[];
-  events: CalendarEvent[];
   proposal?: ProjectProposal;
   editing: boolean;
   onEdit: () => void;
@@ -479,7 +472,6 @@ function ProjectCard({
           <MetaEditor
             project={project}
             otherProjects={otherProjects}
-            events={events}
             proposal={proposal}
             onChanged={onChanged}
             onSaved={onSaved}
@@ -495,14 +487,12 @@ function ProjectCard({
 function MetaEditor({
   project,
   otherProjects,
-  events,
   proposal,
   onChanged,
   onSaved,
 }: {
   project: ProjectOverview;
   otherProjects: string[];
-  events: CalendarEvent[];
   proposal?: ProjectProposal;
   onChanged: () => void;
   onSaved: () => void;
@@ -632,7 +622,6 @@ function MetaEditor({
           <MilestoneList
             project={project.name}
             milestones={project.milestones}
-            calendarEvents={events}
             onChanged={onChanged}
           />
         </div>
