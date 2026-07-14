@@ -19,6 +19,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.10.0-alpha",
+    date: "2026-07-14",
+    highlights: [
+      "More pinboard polish, all from living with it. Folders are now resizable like notes and timelines — drag a folder's corner to make it as big or small as you like.",
+      "Adding lots of notes no longer stretches the board off the edge of the window and takes its buttons with it, and a note you add now scrolls into view instead of appearing somewhere out of sight.",
+      "Note titles can be much longer now, stretching nearly to the Ingest button. The colour dots stay out of the way until you're actually editing a note — and they name themselves by colour on hover: Sage, Coral, Amber, Stone, Teal.",
+      "Notes keep their place when you switch to another app and back — a note you're writing stays open for editing until you click somewhere else on the board, rather than snapping shut the moment PM loses focus.",
+      "Timelines can switch between a stacked list and a horizontal track from a little toggle in their top bar, and the date column is a touch tidier.",
+      "Checklists start flush against the left edge instead of looking pre-indented. Press Tab to nest an item under the one above (new checkboxes keep that level automatically), and Shift+Tab or Backspace to pull it back out.",
+    ],
+  },
+  {
     version: "3.9.1-alpha",
     date: "2026-07-13",
     highlights: [

@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getPref, setPref } from "../ipc";
 import { clampRect, COLS, dissolveFolders, findFreeRect, minSize, resolveDrop, ROWS } from "./grid";
+import { DEFAULT_TINT } from "./palette";
 import {
   BOARD_VERSION,
   EMPTY_BOARD,
@@ -173,21 +174,28 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     [],
   );
 
+  // add* return the new widget's id so the view can scroll it into sight — a note placed on a
+  // lower row would otherwise be created off-screen. The id is minted up front (outside the
+  // functional update) so it can be returned synchronously.
   const addNote = useCallback(() => {
+    const id = makeId();
     setBoard((b) => {
       const rect = findFreeRect(b.widgets, 7, 5, boundsRef.current.cols, boundsRef.current.rows);
-      const widget: Widget = { id: makeId(), kind: "note", rect, text: "", color: "st-quick" };
+      const widget: Widget = { id, kind: "note", rect, text: "", color: DEFAULT_TINT };
       return { ...b, widgets: [...b.widgets, widget] };
     });
+    return id;
   }, []);
 
   const addTimeline = useCallback(() => {
+    const id = makeId();
     setBoard((b) => {
       const rect = findFreeRect(b.widgets, 9, 8, boundsRef.current.cols, boundsRef.current.rows);
       // Seed an empty title so the header shows its "Timeline" placeholder (matching notes/folders).
-      const widget: Widget = { id: makeId(), kind: "timeline", rect, title: "", items: [] };
+      const widget: Widget = { id, kind: "timeline", rect, title: "", items: [] };
       return { ...b, widgets: [...b.widgets, widget] };
     });
+    return id;
   }, []);
 
   const updateWidget = useCallback((id: string, patch: Partial<Widget>) => {

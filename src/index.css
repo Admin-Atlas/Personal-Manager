@@ -167,6 +167,17 @@ body {
   margin-right: 0.4rem;
   transform: translateY(1px);
 }
+/* Pinboard notes only (scoped via `.pm-note-md`, so chat / the document reader keep their
+   indented lists): a top-level checklist sits FLUSH with the note's left edge — a lone
+   checkbox shouldn't look pre-indented. A Tab-nested checklist (rendered as a task list
+   inside a parent list item) keeps its indentation; the nested selector's higher specificity
+   wins over the flush rule above it. `:has` is already relied on for task lists here. */
+.pm-note-md .pm-markdown ul:has(> li > input[type="checkbox"]) {
+  padding-left: 0;
+}
+.pm-note-md .pm-markdown li ul:has(> li > input[type="checkbox"]) {
+  padding-left: 1.25rem;
+}
 .pm-markdown strong {
   color: var(--ink);
   font-weight: 600;

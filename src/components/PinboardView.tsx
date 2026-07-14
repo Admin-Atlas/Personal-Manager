@@ -27,42 +27,25 @@ import {
   updateMilestone,
 } from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
-import {
-  CELL,
-  COLS,
-  MIN_H,
-  MIN_W,
-  ROWS,
-  boundsForPx,
-  minSize,
-  pxRectToCells,
-} from "../lib/pinboard/grid";
+import { CELL, COLS, ROWS, boundsForPx, minSize, pxRectToCells } from "../lib/pinboard/grid";
 import {
   applyLineMarker,
   continueList,
+  indentLines,
+  listIndentBeforeCaret,
+  outdentLines,
   toRenderMarkdown,
   toggleWrap,
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
 import { usePinboard } from "../lib/pinboard/usePinboard";
-import type { Rect, Widget, WidgetKind } from "../lib/pinboard/types";
+// The tint set + names live in one place (src/lib/pinboard/palette.ts) so the board's colours
+// stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
+import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
+import type { Rect, TimelineItem, Widget, WidgetKind } from "../lib/pinboard/types";
 import type { Milestone } from "../lib/types";
 import { useDepth } from "../theme";
 import { Button, Modal, SegmentedControl, Textarea, Tooltip } from "./ui";
-
-/** Note tint options — design tokens, never hex, so they track the active theme. */
-const NOTE_COLORS = ["st-quick", "st-due", "st-look", "st-track", "st-part"];
-
-/** Human names for the tint tokens, shown on hover. These are the semantic status colours reused as
- *  note tints, so the names track {@link STATUS_LABEL} rather than a raw colour word (the token's hue
- *  shifts with the theme). */
-const TINT_LABEL: Record<string, string> = {
-  "st-quick": "Quick win",
-  "st-due": "Due soon",
-  "st-look": "Take a look",
-  "st-track": "On track",
-  "st-part": "Part of",
-};
 
 /** The live filing state of a note's ingested document, keyed by `note:<widgetId>`. */
 type DocStatus = { reviewed: boolean; project: string };
@@ -150,6 +133,8 @@ export function PinboardView() {
   const [livePx, setLivePx] = useState<PxRect | null>(null);
   // Which folder is currently expanded (transient — not persisted). At most one at a time.
   const [expandedFolderId, setExpandedFolderId] = useState<string | null>(null);
+  // A just-added widget id to scroll into view (set by the add buttons; cleared once scrolled).
+  const [pendingScrollId, setPendingScrollId] = useState<string | null>(null);
 
   // The board fills the window and grows to any larger window ever seen — a high-water mark of the
   // window's OWN content area. So it fits exactly when maximised (no scrollbars), and once the window
@@ -234,11 +219,14 @@ export function PinboardView() {
           h: startPx.h,
         };
       }
+      // Clamp to the kind's own minimum so a folder can shrink back to its 3×3 floor (not the
+      // note/timeline 4×3) while still growing freely.
+      const min = minSize(drag.kind);
       return {
         x: startPx.x,
         y: startPx.y,
-        w: Math.max(MIN_W * CELL, Math.min(startPx.w + dx, maxX - startPx.x)),
-        h: Math.max(MIN_H * CELL, Math.min(startPx.h + dy, maxY - startPx.y)),
+        w: Math.max(min.w * CELL, Math.min(startPx.w + dx, maxX - startPx.x)),
+        h: Math.max(min.h * CELL, Math.min(startPx.h + dy, maxY - startPx.y)),
       };
     };
     const onMove = (e: PointerEvent) => setLivePx(compute(e));
@@ -297,6 +285,35 @@ export function PinboardView() {
     [raiseWidget],
   );
 
+  // Add buttons remember the new widget so it can be scrolled into view (a note placed on a lower
+  // row would otherwise be created off-screen).
+  const handleAddNote = useCallback(() => setPendingScrollId(addNote()), [addNote]);
+  const handleAddTimeline = useCallback(() => setPendingScrollId(addTimeline()), [addTimeline]);
+  useLayoutEffect(() => {
+    if (!pendingScrollId) return;
+    const el = scrollRef.current;
+    const w = board.widgets.find((x) => x.id === pendingScrollId);
+    if (el && w) {
+      const PAD = 24; // matches the scroller's p-6
+      const px = rectToPx(w.rect);
+      const top = el.scrollTop;
+      const left = el.scrollLeft;
+      // Only scroll when the new widget isn't already fully in view, to avoid a jarring jump.
+      const nextTop =
+        px.y - PAD < top || px.y + px.h + PAD > top + el.clientHeight
+          ? Math.max(0, px.y - PAD)
+          : top;
+      const nextLeft =
+        px.x - PAD < left || px.x + px.w + PAD > left + el.clientWidth
+          ? Math.max(0, px.x - PAD)
+          : left;
+      if (nextTop !== top || nextLeft !== left) {
+        el.scrollTo({ top: nextTop, left: nextLeft, behavior: "smooth" });
+      }
+    }
+    setPendingScrollId(null);
+  }, [pendingScrollId, board.widgets]);
+
   // If the expanded folder dissolves (its last child removed/popped), close the panel.
   useEffect(() => {
     if (
@@ -312,7 +329,9 @@ export function PinboardView() {
     : undefined;
 
   return (
-    <div className="flex h-full flex-1 flex-col">
+    // min-w-0 / min-h-0 keep the oversized board penned inside its own overflow-auto scroller
+    // (below) instead of inflating this column and pushing the header's buttons off-screen.
+    <div className="flex h-full min-w-0 min-h-0 flex-1 flex-col">
       <header className="flex items-center justify-between gap-3 border-b border-rule px-6 py-3">
         <div>
           <h1 className="font-head text-lg font-semibold text-ink">Pinboard</h1>
@@ -330,7 +349,7 @@ export function PinboardView() {
           )}
           <Button
             variant="secondary"
-            onClick={addNote}
+            onClick={handleAddNote}
             className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-note"
           >
@@ -339,7 +358,7 @@ export function PinboardView() {
           {/* Notes and timelines are both available at every density. */}
           <Button
             variant="secondary"
-            onClick={addTimeline}
+            onClick={handleAddTimeline}
             className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-timeline"
           >
@@ -348,7 +367,7 @@ export function PinboardView() {
         </div>
       </header>
 
-      <div ref={scrollRef} className="pm-scrollbars flex-1 overflow-auto p-6">
+      <div ref={scrollRef} className="pm-scrollbars min-h-0 min-w-0 flex-1 overflow-auto p-6">
         <div
           data-help="pinboard-board"
           className={`relative rounded-[var(--radius)] border border-border ${
@@ -391,6 +410,7 @@ export function PinboardView() {
                 {w.kind === "note" ? (
                   <NoteBody
                     widget={w}
+                    showPower={showPower}
                     onChange={updateWidget}
                     onDelete={removeWidget}
                     onStartDrag={startDrag}
@@ -418,25 +438,25 @@ export function PinboardView() {
                   />
                 )}
 
-                {showPower && (
+                {/* A note shows its size inline in its own footer (see NoteBody); timeline/folder
+                    keep the compact coords strip. */}
+                {showPower && w.kind !== "note" && (
                   <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[9px] text-faint">
                     {w.rect.x},{w.rect.y} · {w.rect.w}×{w.rect.h}
                   </div>
                 )}
 
-                {/* Resize handle (bottom-right) — folders are a fixed 3×3 tile, so not resizable. */}
-                {w.kind !== "folder" && (
-                  <div
-                    onPointerDown={(e) => startDrag(e, w, "resize")}
-                    title="Resize"
-                    aria-label="Resize widget"
-                    className="absolute bottom-0 right-0 h-3.5 w-3.5 cursor-nwse-resize touch-none"
-                    style={{
-                      background:
-                        "linear-gradient(135deg, transparent 50%, color-mix(in oklab, var(--ink4) 50%, transparent) 50%)",
-                    }}
-                  />
-                )}
+                {/* Resize handle (bottom-right) — every widget kind is resizable (folders floor at 3×3). */}
+                <div
+                  onPointerDown={(e) => startDrag(e, w, "resize")}
+                  title="Resize"
+                  aria-label="Resize widget"
+                  className="absolute bottom-0 right-0 h-3.5 w-3.5 cursor-nwse-resize touch-none"
+                  style={{
+                    background:
+                      "linear-gradient(135deg, transparent 50%, color-mix(in oklab, var(--ink4) 50%, transparent) 50%)",
+                  }}
+                />
               </div>
             );
           })}
@@ -601,15 +621,18 @@ function WidgetHeader({
       }`}
     >
       {/* stopPropagation on pointerdown so a click edits the title instead of starting a drag
-          (mirrors the ✕ button); flex-none + max-w keeps a wide drag region to the input's right. */}
+          (mirrors the ✕ button). The title now grows to fill the bar (nearly up to the actions),
+          and a fixed drag spacer to its right keeps a reliable grab zone even for a long title. */}
       <input
         value={widget.title ?? ""}
         onChange={(e) => onRename(e.target.value)}
         onPointerDown={(e) => e.stopPropagation()}
         placeholder={placeholder}
         aria-label={`${placeholder} title`}
-        className="min-w-0 max-w-[62%] flex-none truncate border-0 bg-transparent px-0 text-xs font-medium text-ink3 placeholder:text-ink4 focus:text-ink2 focus:outline-none focus:ring-0"
+        className="min-w-0 flex-1 truncate border-0 bg-transparent px-0 text-xs font-medium text-ink3 placeholder:text-ink4 focus:text-ink2 focus:outline-none focus:ring-0"
       />
+      {/* An always-present drag grip so a long title still leaves somewhere to grab the header. */}
+      <div className="w-6 shrink-0 self-stretch" aria-hidden="true" />
       <div className="flex shrink-0 items-center gap-1">
         {actions}
         <button
@@ -649,6 +672,7 @@ function PopOutButton({ onClick }: { onClick: () => void }) {
 // comes out of a map rebuilt only on refetch.
 const NoteBody = memo(function NoteBody({
   widget,
+  showPower,
   onChange,
   onDelete,
   onStartDrag,
@@ -657,6 +681,8 @@ const NoteBody = memo(function NoteBody({
   onIngested,
 }: {
   widget: Widget;
+  /** At `power` depth, show the note's size (w×h) at the right of its footer. */
+  showPower?: boolean;
   onChange: (id: string, patch: Partial<Widget>) => void;
   onDelete: (id: string) => void;
   /** The board drag handle. Absent for folder-panel children (they aren't board-positioned). */
@@ -668,6 +694,7 @@ const NoteBody = memo(function NoteBody({
 }) {
   const text = widget.text ?? "";
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   // Render-on-idle: a filled note shows rendered Markdown (so lists read as lists); click it — or an
   // empty note — to drop into the textarea, and it re-renders on blur. No manual preview/edit toggle.
   const [editing, setEditing] = useState(false);
@@ -677,6 +704,24 @@ const NoteBody = memo(function NoteBody({
   // so existing empty notes don't fight over focus.
   useLayoutEffect(() => {
     if (editing) taRef.current?.focus();
+  }, [editing]);
+
+  // Stay in edit mode until the user clicks elsewhere on the board — NOT when the window merely
+  // loses OS focus (tabbing out of the app used to collapse the note, because the textarea blurred).
+  // Exit only on a pointer-down outside this note; re-focus the textarea when the window returns
+  // while we're still editing, so the caret picks back up.
+  useEffect(() => {
+    if (!editing) return;
+    const onDown = (e: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setEditing(false);
+    };
+    const onWinFocus = () => taRef.current?.focus();
+    document.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("focus", onWinFocus);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("focus", onWinFocus);
+    };
   }, [editing]);
 
   const [ingesting, setIngesting] = useState(false);
@@ -733,6 +778,28 @@ const NoteBody = memo(function NoteBody({
       applyEdit(fmt.apply);
       return;
     }
+    // Tab / Shift+Tab indent / outdent the current line(s). Indenting a checkbox nests it under the
+    // item above; continueList carries that indent to the items typed after it.
+    if (e.key === "Tab") {
+      e.preventDefault();
+      applyEdit(e.shiftKey ? outdentLines : indentLines);
+      return;
+    }
+    // Backspace while the caret sits inside a list item's leading indent → outdent, rather than
+    // nibbling one space at a time.
+    if (
+      e.key === "Backspace" &&
+      !e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      e.currentTarget.selectionStart === e.currentTarget.selectionEnd &&
+      listIndentBeforeCaret(e.currentTarget.value, e.currentTarget.selectionStart) != null
+    ) {
+      e.preventDefault();
+      applyEdit(outdentLines);
+      return;
+    }
     if (e.key !== "Enter" || e.shiftKey) return;
     const ta = e.currentTarget;
     if (ta.selectionStart !== ta.selectionEnd) return;
@@ -787,7 +854,7 @@ const NoteBody = memo(function NoteBody({
   );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col" data-help="pinboard-note-ingest">
+    <div ref={rootRef} className="flex min-h-0 flex-1 flex-col" data-help="pinboard-note-ingest">
       <WidgetHeader
         widget={widget}
         placeholder="Note"
@@ -809,60 +876,80 @@ const NoteBody = memo(function NoteBody({
           onChange={(e) => onChange(widget.id, { text: e.target.value })}
           onKeyDown={onKeyDown}
           onFocus={() => setEditing(true)}
-          onBlur={() => setEditing(false)}
+          // No onBlur exit — edit mode ends only on a click outside the note (see the effect above),
+          // so tabbing out of the app or clicking the note's own controls keeps it editable.
           placeholder="Jot something down…"
           className="min-h-0 flex-1 resize-none border-0 bg-transparent text-sm leading-snug focus:ring-0"
         />
       ) : (
         <div
-          className="min-h-0 flex-1 cursor-text overflow-auto px-2 text-sm"
+          // pm-note-md scopes the flush-checkbox rule to notes (index.css) without touching chat/reader.
+          className="pm-note-md min-h-0 flex-1 cursor-text overflow-auto px-2 text-sm"
           onClick={() => setEditing(true)}
           title="Click to edit"
         >
           <Markdown>{toRenderMarkdown(text)}</Markdown>
         </div>
       )}
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 px-2 pb-1">
-        {showEditor && (
-          <div className="flex items-center gap-0.5" data-help="pinboard-note-format">
-            {FORMAT_ACTIONS.map((a) => (
-              <Tooltip key={a.key} label={`${a.label} · ${a.hint}`}>
-                <button
-                  type="button"
-                  aria-label={`${a.label} (${a.hint})`}
-                  // Keep the textarea focused/selected so the edit (and its shortcut) lands where
-                  // the caret is.
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => applyEdit(a.apply)}
-                  className="flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] text-ink4 hover:bg-surface hover:text-ink2"
-                >
-                  {a.icon}
-                </button>
-              </Tooltip>
-            ))}
+      {/* Footer: only render when it has something to show — the format toolbar + colour swatches
+          appear while editing, and the size (w×h) at power depth. An idle filled note has neither,
+          so the footer vanishes and the note gains that space. */}
+      {(showEditor || showPower) && (
+        <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 px-2 pb-1">
+          {showEditor && (
+            <div className="flex items-center gap-0.5" data-help="pinboard-note-format">
+              {FORMAT_ACTIONS.map((a) => (
+                <Tooltip key={a.key} label={`${a.label} · ${a.hint}`}>
+                  <button
+                    type="button"
+                    aria-label={`${a.label} (${a.hint})`}
+                    // Keep the textarea focused/selected so the edit (and its shortcut) lands where
+                    // the caret is.
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => applyEdit(a.apply)}
+                    className="flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] text-ink4 hover:bg-surface hover:text-ink2"
+                  >
+                    {a.icon}
+                  </button>
+                </Tooltip>
+              ))}
+            </div>
+          )}
+          {/* Right-aligned: colour swatches (edit only) then the size (power). */}
+          <div className="ml-auto flex items-center gap-2">
+            {showEditor && (
+              <div className="flex items-center gap-1" data-help="pinboard-note-tint">
+                {NOTE_COLORS.map((c) => {
+                  const name = TINT_NAME[c] ?? c.replace("st-", "");
+                  return (
+                    <Tooltip key={c} label={name}>
+                      <button
+                        // Don't blur the textarea's caret when picking a colour (mirrors the format
+                        // buttons) so edit mode and the selection survive.
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => onChange(widget.id, { color: c })}
+                        aria-label={`Colour: ${name}`}
+                        className={`h-3 w-3 rounded-full border ${
+                          widget.color === c ? "ring-1 ring-ink3" : ""
+                        }`}
+                        style={{
+                          background: `var(--${c})`,
+                          borderColor: "color-mix(in oklab, var(--ink) 20%, transparent)",
+                        }}
+                      />
+                    </Tooltip>
+                  );
+                })}
+              </div>
+            )}
+            {showPower && (
+              <span className="font-mono text-[9px] text-faint">
+                {widget.rect.w}×{widget.rect.h}
+              </span>
+            )}
           </div>
-        )}
-        <div className="flex items-center gap-1" data-help="pinboard-note-tint">
-          {NOTE_COLORS.map((c) => {
-            const name = TINT_LABEL[c] ?? c.replace("st-", "");
-            return (
-              <Tooltip key={c} label={name}>
-                <button
-                  onClick={() => onChange(widget.id, { color: c })}
-                  aria-label={`Tint: ${name}`}
-                  className={`h-3 w-3 rounded-full border ${
-                    widget.color === c ? "ring-1 ring-ink3" : ""
-                  }`}
-                  style={{
-                    background: `var(--${c})`,
-                    borderColor: "color-mix(in oklab, var(--ink) 20%, transparent)",
-                  }}
-                />
-              </Tooltip>
-            );
-          })}
         </div>
-      </div>
+      )}
     </div>
   );
 });
@@ -936,6 +1023,9 @@ interface TimelineBodyProps {
  *  drag re-renders as NoteBody (all board-tile props are stable). */
 const TimelineBody = memo(function TimelineBody(props: TimelineBodyProps) {
   const { widget, onChange, onDelete, onStartDrag, onPopOut, showPower } = props;
+  // Effective layout: an explicit `widget.view`, else each kind's historical default (freeform →
+  // list, bound → row) so pre-existing boards look identical until the user toggles.
+  const view: TimelineView = widget.view ?? (widget.project ? "row" : "list");
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <WidgetHeader
@@ -944,22 +1034,113 @@ const TimelineBody = memo(function TimelineBody(props: TimelineBodyProps) {
         onRename={(t) => onChange(widget.id, { title: t })}
         onDelete={() => onDelete(widget.id)}
         onStartDrag={onStartDrag ? (e) => onStartDrag(e, widget, "move") : undefined}
-        actions={onPopOut ? <PopOutButton onClick={onPopOut} /> : undefined}
+        actions={
+          <>
+            <TimelineViewToggle value={view} onChange={(v) => onChange(widget.id, { view: v })} />
+            {onPopOut && <PopOutButton onClick={onPopOut} />}
+          </>
+        }
       />
       <div className="min-h-0 flex-1 overflow-auto">
         {widget.project ? (
           <BoundTimeline
             project={widget.project}
+            view={view}
             showPower={showPower}
             onUnlink={() => onChange(widget.id, { project: undefined })}
           />
         ) : (
-          <FreeformTimeline {...props} />
+          <FreeformTimeline {...props} view={view} />
         )}
       </div>
     </div>
   );
 });
+
+type TimelineView = "list" | "row";
+
+/** A compact list ⇄ row toggle for a timeline widget, sitting in its header. stopPropagation so a
+ *  click switches views instead of starting a board drag (the header is the drag handle). */
+function TimelineViewToggle({
+  value,
+  onChange,
+}: {
+  value: TimelineView;
+  onChange: (v: TimelineView) => void;
+}) {
+  const opt = (v: TimelineView, label: string, icon: ReactNode) => (
+    <button
+      type="button"
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={() => onChange(v)}
+      aria-pressed={value === v}
+      aria-label={label}
+      title={label}
+      className={`flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] ${
+        value === v ? "bg-accent text-accent-ink" : "text-ink4 hover:bg-surface hover:text-ink2"
+      }`}
+    >
+      {icon}
+    </button>
+  );
+  return (
+    <div className="flex items-center gap-0.5" data-help="pinboard-timeline-view">
+      {opt("list", "List view", <ListViewIcon />)}
+      {opt("row", "Timeline view", <RowViewIcon />)}
+    </div>
+  );
+}
+
+function ListViewIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className="h-3.5 w-3.5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+    >
+      <line x1="5" y1="7" x2="19" y2="7" />
+      <line x1="5" y1="12" x2="19" y2="12" />
+      <line x1="5" y1="17" x2="19" y2="17" />
+    </svg>
+  );
+}
+
+function RowViewIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className="h-3.5 w-3.5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+    >
+      <line x1="3" y1="12" x2="21" y2="12" strokeLinecap="round" />
+      <circle cx="7" cy="12" r="1.8" fill="currentColor" stroke="none" />
+      <circle cx="13" cy="12" r="1.8" fill="currentColor" stroke="none" />
+      <circle cx="19" cy="12" r="1.8" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/** The horizontal-track chrome shared by both row-view timelines: a baseline line under
+ *  date-ordered columns that scroll horizontally. */
+function TimelineTrack({ children }: { children: ReactNode }) {
+  return (
+    <div className="relative min-h-0 flex-1 overflow-x-auto" data-help="pinboard-timeline-line">
+      {/* the line the dots sit on */}
+      <div className="pointer-events-none absolute inset-x-2 top-8 h-px bg-border2" />
+      <div className="flex items-start gap-1 pb-1">{children}</div>
+    </div>
+  );
+}
+
+/** The stacked-rows chrome shared by both list-view timelines. */
+function TimelineList({ children }: { children: ReactNode }) {
+  return <div className="min-h-0 flex-1 space-y-1 overflow-auto">{children}</div>;
+}
 
 /** A collapsed folder tile (3×3): the shared header (editable title + Ungroup) over a big button
  *  showing the child count, which opens the folder. Not resizable (the outer loop omits the handle). */
@@ -1128,10 +1309,12 @@ function msDate(m: Milestone): string {
  *  milestone added elsewhere shows up here). */
 function BoundTimeline({
   project,
+  view,
   showPower,
   onUnlink,
 }: {
   project: string;
+  view: TimelineView;
   showPower: boolean;
   onUnlink: () => void;
 }) {
@@ -1194,22 +1377,30 @@ function BoundTimeline({
         <p className="text-[11px] text-ink4">Loading…</p>
       ) : ordered.length === 0 ? (
         <p className="text-[11px] text-ink4">No milestones yet — add one below.</p>
+      ) : view === "row" ? (
+        <TimelineTrack>
+          {ordered.map((m) => (
+            <MilestoneColumn
+              key={m.id}
+              m={m}
+              onChanged={refresh}
+              onError={setError}
+              showPower={showPower}
+            />
+          ))}
+        </TimelineTrack>
       ) : (
-        <div className="relative min-h-0 flex-1 overflow-x-auto" data-help="pinboard-timeline-line">
-          {/* the line the dots sit on */}
-          <div className="pointer-events-none absolute inset-x-2 top-8 h-px bg-border2" />
-          <div className="flex items-start gap-1 pb-1">
-            {ordered.map((m) => (
-              <MilestoneColumn
-                key={m.id}
-                m={m}
-                onChanged={refresh}
-                onError={setError}
-                showPower={showPower}
-              />
-            ))}
-          </div>
-        </div>
+        <TimelineList>
+          {ordered.map((m) => (
+            <MilestoneRow
+              key={m.id}
+              m={m}
+              onChanged={refresh}
+              onError={setError}
+              showPower={showPower}
+            />
+          ))}
+        </TimelineList>
       )}
 
       <button
@@ -1227,20 +1418,14 @@ function BoundTimeline({
   );
 }
 
-/** One milestone as a column on the bound timeline: date on top, a dot on the line, its label
- *  below, and a remove ✕ — every edit persists through the milestone commands. Calendar-linked
- *  milestones show their synced date read-only. */
-function MilestoneColumn({
-  m,
-  onChanged,
-  onError,
-  showPower,
-}: {
-  m: Milestone;
-  onChanged: () => void;
-  onError: (message: string | null) => void;
-  showPower: boolean;
-}) {
+/** Shared editing state + mutations for one milestone, so the column (row-view) and row (list-view)
+ *  presentations stay in lock-step. Every edit persists through the milestone commands; a
+ *  calendar-linked milestone keeps its synced date read-only. */
+function useMilestoneEditor(
+  m: Milestone,
+  onChanged: () => void,
+  onError: (message: string | null) => void,
+) {
   const [label, setLabel] = useState(m.label);
   const [date, setDate] = useState(msDate(m));
   const met = m.state === "met";
@@ -1249,7 +1434,7 @@ function MilestoneColumn({
   useEffect(() => setLabel(m.label), [m.label]);
   useEffect(() => setDate(m.due_date?.slice(0, 10) ?? ""), [m.due_date]);
 
-  async function persist() {
+  const persist = async () => {
     const nextLabel = label.trim() || "deadline";
     const nextDate = m.calendar_linked ? null : date || null;
     const curDate = m.calendar_linked ? null : msDate(m) || null;
@@ -1258,8 +1443,49 @@ function MilestoneColumn({
       await updateMilestone(m.id, nextLabel, nextDate);
       onChanged();
     }, onError);
-  }
+  };
+  const toggleDone = () =>
+    void runMutation(async () => {
+      await setMilestoneState(m.id, !met);
+      onChanged();
+    }, onError);
+  const remove = () =>
+    void runMutation(async () => {
+      await deleteMilestone(m.id);
+      onChanged();
+    }, onError);
 
+  return { label, setLabel, date, setDate, met, persist, toggleDone, remove };
+}
+
+interface MilestoneItemProps {
+  m: Milestone;
+  onChanged: () => void;
+  onError: (message: string | null) => void;
+  showPower: boolean;
+}
+
+/** A milestone's done toggle — a dot that reads "done" (st-track) or "open" (accent). */
+function MilestoneDot({ met, onToggle }: { met: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      title={met ? "Mark not done" : "Mark done"}
+      aria-label={met ? "Mark not done" : "Mark done"}
+      className="h-2.5 w-2.5 shrink-0 rounded-full border"
+      style={{ background: met ? "var(--st-track)" : "var(--accent)", borderColor: "var(--panel)" }}
+    />
+  );
+}
+
+/** One milestone as a column on the row/track view: date on top, a dot on the line, its label
+ *  below, and a remove ✕. Calendar-linked milestones show their synced date read-only. */
+function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProps) {
+  const { label, setLabel, date, setDate, met, persist, toggleDone, remove } = useMilestoneEditor(
+    m,
+    onChanged,
+    onError,
+  );
   return (
     <div className="flex w-[5.5rem] shrink-0 flex-col items-center gap-1 text-center">
       {m.calendar_linked ? (
@@ -1280,21 +1506,7 @@ function MilestoneColumn({
           className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[9px] text-ink3 focus:border-accent focus:outline-none"
         />
       )}
-      <button
-        onClick={() =>
-          void runMutation(async () => {
-            await setMilestoneState(m.id, !met);
-            onChanged();
-          }, onError)
-        }
-        title={met ? "Mark not done" : "Mark done"}
-        aria-label={met ? "Mark not done" : "Mark done"}
-        className="h-2.5 w-2.5 shrink-0 rounded-full border"
-        style={{
-          background: met ? "var(--st-track)" : "var(--accent)",
-          borderColor: "var(--panel)",
-        }}
-      />
+      <MilestoneDot met={met} onToggle={toggleDone} />
       <input
         value={label}
         onChange={(e) => setLabel(e.target.value)}
@@ -1305,12 +1517,7 @@ function MilestoneColumn({
         }`}
       />
       <button
-        onClick={() =>
-          void runMutation(async () => {
-            await deleteMilestone(m.id);
-            onChanged();
-          }, onError)
-        }
+        onClick={remove}
         aria-label="Remove milestone"
         className="text-[10px] text-ink4 hover:text-st-due"
       >
@@ -1321,16 +1528,71 @@ function MilestoneColumn({
   );
 }
 
-/** The default freeform timeline: type-in dated rows that live in the widget, plus a picker to
- *  bind the card to a real project (which switches it to {@link BoundTimeline}). */
+/** One milestone as a list row: done dot · date · label · remove — the same edits as the column
+ *  view, laid out horizontally. */
+function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) {
+  const { label, setLabel, date, setDate, met, persist, toggleDone, remove } = useMilestoneEditor(
+    m,
+    onChanged,
+    onError,
+  );
+  return (
+    <div className="flex items-center gap-1">
+      <MilestoneDot met={met} onToggle={toggleDone} />
+      {m.calendar_linked ? (
+        <span
+          className="flex h-6 w-[6.25rem] shrink-0 items-center gap-0.5 font-mono text-[9px] text-accent-text"
+          title={
+            m.event_missing ? "Linked event not found in your calendars" : "Synced from calendar"
+          }
+        >
+          📅 {m.due_date ? formatDateOnly(msDate(m)) : "—"}
+        </span>
+      ) : (
+        <input
+          type="date"
+          value={date}
+          onChange={(e) => setDate(e.target.value)}
+          onBlur={persist}
+          className="w-[6.25rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[10px] text-ink3 focus:border-accent focus:outline-none"
+        />
+      )}
+      <input
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onBlur={persist}
+        placeholder="label"
+        className={`min-w-0 flex-1 rounded-[var(--radius-sm)] border border-transparent bg-transparent px-1 py-0.5 text-xs text-ink2 focus:border-accent focus:outline-none ${
+          met ? "text-ink4 line-through" : ""
+        }`}
+      />
+      {showPower && m.event_missing && (
+        <span className="shrink-0 text-[9px] text-st-due" title="Linked event not found">
+          ⚠
+        </span>
+      )}
+      <button
+        onClick={remove}
+        aria-label="Remove milestone"
+        className="shrink-0 px-0.5 text-[11px] text-ink4 hover:text-st-due"
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
+/** The default freeform timeline: type-in dated entries that live in the widget, shown as a list or
+ *  a horizontal track, plus a picker to bind the card to a real project (which switches it to
+ *  {@link BoundTimeline}). */
 function FreeformTimeline({
   widget,
-  showPower,
+  view,
   onChange,
   onAddItem,
   onUpdateItem,
   onRemoveItem,
-}: TimelineBodyProps) {
+}: TimelineBodyProps & { view: TimelineView }) {
   const [projects, setProjects] = useState<string[]>([]);
   const [projDraft, setProjDraft] = useState("");
   useEffect(() => {
@@ -1349,38 +1611,50 @@ function FreeformTimeline({
 
   return (
     <div className="flex h-full flex-col px-2 py-1">
-      <div className="min-h-0 flex-1 space-y-1 overflow-auto">
-        {items.length === 0 && <p className="text-[11px] text-ink4">No milestones yet.</p>}
-        {items.map((it) => (
-          <div key={it.id} className="flex items-center gap-1">
-            <input
-              type="date"
-              value={it.date ?? ""}
-              onChange={(e) => onUpdateItem(widget.id, it.id, { date: e.target.value })}
-              title={it.date ? formatDateOnly(it.date) : "Set a date"}
-              className="w-[7.5rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[10px] text-ink3 focus:border-accent focus:outline-none"
+      {items.length === 0 ? (
+        <div className="min-h-0 flex-1">
+          <p className="text-[11px] text-ink4">No milestones yet.</p>
+        </div>
+      ) : view === "row" ? (
+        <TimelineTrack>
+          {items.map((it) => (
+            <FreeformColumn
+              key={it.id}
+              widgetId={widget.id}
+              item={it}
+              onUpdateItem={onUpdateItem}
+              onRemoveItem={onRemoveItem}
             />
-            <input
-              value={it.label ?? ""}
-              onChange={(e) => onUpdateItem(widget.id, it.id, { label: e.target.value })}
-              placeholder="what happens"
-              className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-transparent bg-transparent px-1 py-0.5 text-xs text-ink2 focus:border-accent focus:outline-none"
-            />
-            {showPower && it.date && (
-              <span className="shrink-0 font-mono text-[9px] text-faint">
-                {formatDateOnly(it.date)}
-              </span>
-            )}
-            <button
-              onClick={() => onRemoveItem(widget.id, it.id)}
-              aria-label="Remove milestone"
-              className="shrink-0 px-0.5 text-[11px] text-ink4 hover:text-st-due"
-            >
-              ✕
-            </button>
-          </div>
-        ))}
-      </div>
+          ))}
+        </TimelineTrack>
+      ) : (
+        <TimelineList>
+          {items.map((it) => (
+            <div key={it.id} className="flex items-center gap-1">
+              <input
+                type="date"
+                value={it.date ?? ""}
+                onChange={(e) => onUpdateItem(widget.id, it.id, { date: e.target.value })}
+                title={it.date ? formatDateOnly(it.date) : "Set a date"}
+                className="w-[6.25rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[10px] text-ink3 focus:border-accent focus:outline-none"
+              />
+              <input
+                value={it.label ?? ""}
+                onChange={(e) => onUpdateItem(widget.id, it.id, { label: e.target.value })}
+                placeholder="what happens"
+                className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-transparent bg-transparent px-1 py-0.5 text-xs text-ink2 focus:border-accent focus:outline-none"
+              />
+              <button
+                onClick={() => onRemoveItem(widget.id, it.id)}
+                aria-label="Remove milestone"
+                className="shrink-0 px-0.5 text-[11px] text-ink4 hover:text-st-due"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </TimelineList>
+      )}
       <button
         onClick={() => onAddItem(widget.id)}
         className="mt-1 shrink-0 self-start rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface"
@@ -1410,6 +1684,49 @@ function FreeformTimeline({
           Link
         </button>
       </div>
+    </div>
+  );
+}
+
+/** One freeform entry as a track column: date on top, a dot on the line, its label below, remove ✕
+ *  — the row-view counterpart of the list row above. */
+function FreeformColumn({
+  widgetId,
+  item,
+  onUpdateItem,
+  onRemoveItem,
+}: {
+  widgetId: string;
+  item: TimelineItem;
+  onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
+  onRemoveItem: (id: string, itemId: string) => void;
+}) {
+  return (
+    <div className="flex w-[5.5rem] shrink-0 flex-col items-center gap-1 text-center">
+      <input
+        type="date"
+        value={item.date ?? ""}
+        onChange={(e) => onUpdateItem(widgetId, item.id, { date: e.target.value })}
+        title={item.date ? formatDateOnly(item.date) : "Set a date"}
+        className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[9px] text-ink3 focus:border-accent focus:outline-none"
+      />
+      <span
+        className="h-2.5 w-2.5 shrink-0 rounded-full border"
+        style={{ background: "var(--accent)", borderColor: "var(--panel)" }}
+      />
+      <input
+        value={item.label ?? ""}
+        onChange={(e) => onUpdateItem(widgetId, item.id, { label: e.target.value })}
+        placeholder="what happens"
+        className="w-full rounded-[var(--radius-sm)] bg-transparent px-0.5 text-center text-[10px] text-ink2 focus:outline-none"
+      />
+      <button
+        onClick={() => onRemoveItem(widgetId, item.id)}
+        aria-label="Remove milestone"
+        className="text-[10px] text-ink4 hover:text-st-due"
+      >
+        ✕
+      </button>
     </div>
   );
 }

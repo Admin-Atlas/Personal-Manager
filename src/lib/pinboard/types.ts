@@ -48,6 +48,11 @@ export interface Widget {
    *  changes flow to the daily brief and the project's Focus/sidebar. Unset → freeform (default).
    *  Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1. */
   project?: string;
+  /** How a timeline widget lays its entries out: `"list"` (stacked rows) or `"row"` (a
+   *  horizontal date-ordered track). Unset falls back to each kind's historical default —
+   *  freeform → list, project-bound → row — so old boards look identical. Optional and
+   *  additive, so `BOARD_VERSION` stays 1. */
+  view?: "list" | "row";
   // folder (kind === "folder")
   /** The widgets contained by a folder. Notes and timelines only — folders never nest (enforced
    *  on drop and on load). A collapsed folder shows the child count; expanding reveals the cards.
