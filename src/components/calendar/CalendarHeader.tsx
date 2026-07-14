@@ -13,7 +13,6 @@ import { Button, SegmentedControl, type SegOption } from "../ui";
 import { CalendarsDropdown } from "./CalendarsDropdown";
 import { MiniCalendarPopover } from "./MiniCalendarPopover";
 import { RangeControl } from "./RangeControl";
-import { ZonePicker } from "./ZonePicker";
 
 interface Props {
   view: CalendarViewMode;
@@ -27,9 +26,6 @@ interface Props {
   onBoundsChange: (range: CalendarRange, bounds: RangeBounds | null) => void;
   /** The user's coordinates, for the Day range's sunrise/sunset default. */
   coords: Coords | null;
-  /** Extra gutter timezones + the setter. */
-  zones: string[];
-  onZonesChange: (zones: string[]) => void;
   /** The current period label (e.g. "July 2026") shown between the nav arrows. */
   label: string;
   /** The anchor day, for the mini-calendar picker. */
@@ -65,8 +61,6 @@ export function CalendarHeader({
   customBounds,
   onBoundsChange,
   coords,
-  zones,
-  onZonesChange,
   label,
   cursor,
   onPickDate,
@@ -125,7 +119,6 @@ export function CalendarHeader({
               coords={coords}
               cursor={cursor}
             />
-            <ZonePicker zones={zones} onChange={onZonesChange} />
           </>
         )}
         {viewOptions.length > 1 && (
