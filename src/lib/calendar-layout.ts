@@ -21,6 +21,21 @@ export function isMilestoneEvent(ev: CalendarEvent): boolean {
   return ev.calendar_id === MILESTONE_CALENDAR_ID;
 }
 
+/** The pseudo-calendar carrying the pinboard overlay: dated entries from freeform (not-yet-linked)
+ *  timeline widgets. Toggled like a calendar via the same `hidden` set. */
+export const PINBOARD_CALENDAR_ID = "pm:pinboard";
+
+/** True for a synthetic pinboard-timeline event (vs a real synced event). */
+export function isPinboardEvent(ev: CalendarEvent): boolean {
+  return ev.calendar_id === PINBOARD_CALENDAR_ID;
+}
+
+/** True for any first-party PM overlay event (a milestone or a pinboard entry). These are the only
+ *  clickable things on the otherwise read-only calendar — a synced event is never wired to a click. */
+export function isOverlayEvent(ev: CalendarEvent): boolean {
+  return isMilestoneEvent(ev) || isPinboardEvent(ev);
+}
+
 // --- local-day helpers ---------------------------------------------------------------------------
 
 /** Parse a mirror date string to a LOCAL `Date`. An all-day value is a civil date ("YYYY-MM-DD")

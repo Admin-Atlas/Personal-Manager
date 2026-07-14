@@ -20,13 +20,16 @@ export interface ChangelogEntry {
 export const CHANGELOG: ChangelogEntry[] = [
   {
     version: "3.13.0-alpha",
-    date: "2026-07-14",
+    date: "2026-07-15",
     highlights: [
       "You can now sort a project's milestones. The Milestones panel has a small Manual / Deadline / Name control in its header: sort by deadline (click again for latest-first) or by name, or keep arranging them by hand with the up/down arrows as before. Undated milestones settle at the bottom.",
-      "Your milestones now show on the calendar. Every dated milestone appears as an all-day marker in its own colour across Month, Week, Day and Agenda (and the Terminal look) — one central place to see everything. Click a milestone to jump straight to its project. Completed ones show a ✓, and you can hide them all from the Calendars menu.",
-      "Linking a milestone to a calendar event now offers every event, not just the next few weeks — past and future, across all your calendars, tidied so a repeating event only appears once.",
-      "Linking a pinboard timeline to a project now keeps the entries you typed: they're added to that project's milestones instead of disappearing behind the linked view. Unlinking still leaves them safely in the project.",
+      "Your milestones now show on the calendar. Any dated milestone that isn't already on one of your calendars appears as an all-day marker in its own colour across Month, Week, Day and Agenda (and the Terminal look) — one central place to see everything. Click one to jump straight to its project. Completed ones show a ✓, and you can hide them from the Calendars menu. (A milestone you'd tied to a real calendar event keeps showing as that event, in its calendar's colour.)",
+      "Your pinboard timelines show on the calendar too. Every dated entry on a freeform timeline appears as an all-day marker in its own colour — click one to jump back to the Pinboard. Each freeform timeline has a “Show on calendar” tick if you'd rather keep one off, and you can hide the lot from the Calendars menu. Link a timeline to a project and its entries become that project's milestones, shown in the milestone colour instead.",
+      "The little picker for tying a milestone to a calendar event has gone. Now that milestones show on the calendar by themselves, it was more fiddle than help — and each milestone row has more room for its name, with the up/down arrows moved down beside the date. Milestones you had already linked keep their synced date and can still be unlinked.",
+      "Linking a pinboard timeline to a project now keeps the entries you typed: they're added to that project's milestones instead of disappearing behind the linked view. Unlinking still leaves them safely in the project. The timeline's + Milestone button now shares a row with the project box, so the card wastes less space.",
       "Ingesting a note now keeps the title you gave it — that title becomes the document's name in Review, with the note's text as its contents. Untitled notes still take their first line, as before.",
+      "Fixed: in Week and Day view, the dates along the top could sit slightly out of step with the columns beneath them whenever the grid showed a scrollbar. The header now reserves exactly the same space, so they line up.",
+      "Fixed: if your OpenRouter key was ever saved blank, PM would try to use it anyway and the AI would fail with a confusing 401 “Missing Authentication header”. A blank key now counts as no key at all — you'll get the plain “No OpenRouter API key set” prompt instead, and a blank background key quietly falls back to your main one.",
     ],
   },
   {

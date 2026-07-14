@@ -13,7 +13,7 @@ import {
   clampSpanToRange,
   dayDiff,
   eventDaySpan,
-  isMilestoneEvent,
+  isOverlayEvent,
   packBands,
   type BandInput,
 } from "../../../lib/calendar-layout";
@@ -26,9 +26,12 @@ interface Props {
   colorOf: (calendarId: string) => string;
   /** Left gutter width, matched to the time-grid's hour gutter so bands align with columns. */
   gutterPx: number;
+  /** Right gutter matching the scrolling body's vertical-scrollbar width, so the band's columns line
+   *  up with the time-grid below it (0 under overlay scrollbars). */
+  endGutterPx?: number;
   /** Depth gate for the "all-day" gutter label. */
   showLabel: boolean;
-  /** Open a milestone overlay event's project (fires for milestone bands only). */
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay bands only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
 
@@ -40,7 +43,15 @@ interface Placed extends BandInput {
   continuesRight: boolean;
 }
 
-export function AllDayBand({ events, days, colorOf, gutterPx, showLabel, onEventClick }: Props) {
+export function AllDayBand({
+  events,
+  days,
+  colorOf,
+  gutterPx,
+  endGutterPx = 0,
+  showLabel,
+  onEventClick,
+}: Props) {
   const ndays = days.length;
 
   const { placed, laneCount } = useMemo(() => {
@@ -78,7 +89,7 @@ export function AllDayBand({ events, days, colorOf, gutterPx, showLabel, onEvent
   if (laneCount === 0) return null;
 
   return (
-    <div className="flex border-b border-rule">
+    <div className="flex border-b border-rule" style={{ paddingRight: endGutterPx }}>
       <div
         className="flex shrink-0 items-start justify-end pr-2 pt-1"
         style={{ width: `${gutterPx}px` }}
@@ -90,7 +101,7 @@ export function AllDayBand({ events, days, colorOf, gutterPx, showLabel, onEvent
           const color = colorOf(b.ev.calendar_id);
           const leftPct = (b.startDay / ndays) * 100;
           const widthPct = ((b.endDay - b.startDay + 1) / ndays) * 100;
-          const clickable = isMilestoneEvent(b.ev);
+          const clickable = isOverlayEvent(b.ev);
           return (
             <div
               key={b.ev.id}

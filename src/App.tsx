@@ -838,7 +838,10 @@ export default function App() {
               </main>
             ) : view === "calendar" ? (
               <main className="flex h-full flex-1 flex-col">
-                <CalendarView onOpenProject={openProject} />
+                <CalendarView
+                  onOpenProject={openProject}
+                  onOpenPinboard={() => setView("pinboard")}
+                />
               </main>
             ) : view === "documents" ? (
               <main className="flex h-full flex-1 flex-col">

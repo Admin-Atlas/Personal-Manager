@@ -15,7 +15,7 @@ import {
   dayKey,
   eventDaySpan,
   groupEventsFromDay,
-  isMilestoneEvent,
+  isOverlayEvent,
   startOfDay,
   weekdayShort,
 } from "../../../lib/calendar-layout";
@@ -30,7 +30,7 @@ interface Props {
   days?: Date[];
   /** Open-ended Agenda anchor: group events on/after this day, omitting empty days. Ignored if `days`. */
   fromDay?: Date;
-  /** Open a milestone overlay event's project (fires for milestone rows only). */
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay rows only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
 
@@ -100,7 +100,7 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, onEventClick }:
             ) : (
               <ul className="flex flex-col gap-0.5">
                 {row.items.map((ev) => {
-                  const clickable = isMilestoneEvent(ev);
+                  const clickable = isOverlayEvent(ev);
                   return (
                     <li
                       key={ev.id}

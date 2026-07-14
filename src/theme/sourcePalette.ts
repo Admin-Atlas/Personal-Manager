@@ -55,3 +55,17 @@ const MILESTONE_HUES: Record<System, string> = {
 export function milestoneColor(system: System): string {
   return MILESTONE_HUES[system];
 }
+
+/** The distinct hue for the pinboard overlay (freeform timeline entries) — same rules as
+ *  {@link MILESTONE_HUES}: outside the System's accent picker so it can never take a source slot or
+ *  read as "today/now", and distinct from the milestone hue so the two overlays never blur together.
+ *  DOCUMENTED hex exception, like the source palette above. */
+const PINBOARD_HUES: Record<System, string> = {
+  editorial: "#7a5aa8", // violet — off the warm earth-tone sources and the teal milestones
+  slate: "#d1603d", // rust — the one warm hue among slate's cool picker + magenta milestones
+  terminal: "#7aa2f7", // blue — deeper than the picker's cyan, clear of the orange milestones
+};
+
+export function pinboardColor(system: System): string {
+  return PINBOARD_HUES[system];
+}

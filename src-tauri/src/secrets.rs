@@ -93,7 +93,12 @@ pub fn delete_backup_passphrase() -> Result<()> {
 }
 
 pub fn get_openrouter_key() -> Result<Option<Secret>> {
-    Ok(get(OPENROUTER_KEY)?.map(Secret::from))
+    // Treat a blank/whitespace stored key as absent: otherwise every guard that only checks for a
+    // `Some` entry passes, `bearer_auth("")` sends an empty Authorization header, and OpenRouter
+    // answers 401 "Missing Authentication header" instead of the friendly "no key set" message.
+    Ok(get(OPENROUTER_KEY)?
+        .filter(|v| !v.trim().is_empty())
+        .map(Secret::from))
 }
 
 pub fn set_openrouter_key(value: &str) -> Result<()> {
@@ -101,7 +106,11 @@ pub fn set_openrouter_key(value: &str) -> Result<()> {
 }
 
 pub fn get_openrouter_background_key() -> Result<Option<Secret>> {
-    Ok(get(OPENROUTER_BACKGROUND_KEY)?.map(Secret::from))
+    // A blank background key reads as absent (see get_openrouter_key), so get_background_or_primary_key
+    // falls back to the primary key rather than short-circuiting on an empty string.
+    Ok(get(OPENROUTER_BACKGROUND_KEY)?
+        .filter(|v| !v.trim().is_empty())
+        .map(Secret::from))
 }
 
 pub fn set_openrouter_background_key(value: &str) -> Result<()> {

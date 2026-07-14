@@ -8,7 +8,7 @@
 
 import { useMemo } from "react";
 import type { Calendar, CalendarAccount } from "../../lib/types";
-import { MILESTONE_CALENDAR_ID } from "../../lib/calendar-layout";
+import { MILESTONE_CALENDAR_ID, PINBOARD_CALENDAR_ID } from "../../lib/calendar-layout";
 import { Button, cn } from "../ui";
 import { Popover } from "./Popover";
 import { SourceDot } from "./parts/SourceDot";
@@ -26,6 +26,39 @@ interface Group {
   key: string;
   label: string;
   calendars: Calendar[];
+}
+
+/** One first-party overlay row (milestones / pinboard): the same dot + checkbox + name as a synced
+ *  calendar, but keyed on a pseudo-calendar id. The `hidden` set is generic over arbitrary ids, so
+ *  these toggle through exactly the same path. */
+function OverlayRow({
+  id,
+  label,
+  hidden,
+  onToggle,
+  colorOf,
+}: {
+  id: string;
+  label: string;
+  hidden: Set<string>;
+  onToggle: (calendarId: string) => void;
+  colorOf: (calendarId: string) => string;
+}) {
+  const shown = !hidden.has(id);
+  return (
+    <li>
+      <label className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1 text-sm text-ink hover:bg-surface">
+        <input
+          type="checkbox"
+          checked={shown}
+          onChange={() => onToggle(id)}
+          className="accent-[var(--accent)]"
+        />
+        <SourceDot color={colorOf(id)} className={cn(!shown && "opacity-40")} />
+        <span className={cn("truncate", !shown && "text-ink4")}>{label}</span>
+      </label>
+    </li>
+  );
 }
 
 export function CalendarsDropdown({ accounts, calendars, hidden, onToggle, colorOf }: Props) {
@@ -65,30 +98,27 @@ export function CalendarsDropdown({ accounts, calendars, hidden, onToggle, color
         </Button>
       )}
     >
-      {/* Project milestones — a first-party pseudo-calendar you can show/hide like any synced one.
-          Shown even with no calendars connected, since milestones exist independently of them. */}
+      {/* The first-party overlays — pseudo-calendars you can show/hide like any synced one. Shown even
+          with no calendars connected, since milestones and pinboard entries exist independently. */}
       <div className="mb-1">
         <p className="truncate px-2 pb-0.5 pt-1 font-mono text-[10px] uppercase tracking-wide text-faint">
           Personal Manager
         </p>
         <ul>
-          <li>
-            <label className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1 text-sm text-ink hover:bg-surface">
-              <input
-                type="checkbox"
-                checked={!hidden.has(MILESTONE_CALENDAR_ID)}
-                onChange={() => onToggle(MILESTONE_CALENDAR_ID)}
-                className="accent-[var(--accent)]"
-              />
-              <SourceDot
-                color={colorOf(MILESTONE_CALENDAR_ID)}
-                className={cn(hidden.has(MILESTONE_CALENDAR_ID) && "opacity-40")}
-              />
-              <span className={cn("truncate", hidden.has(MILESTONE_CALENDAR_ID) && "text-ink4")}>
-                Milestones
-              </span>
-            </label>
-          </li>
+          <OverlayRow
+            id={MILESTONE_CALENDAR_ID}
+            label="Milestones"
+            hidden={hidden}
+            onToggle={onToggle}
+            colorOf={colorOf}
+          />
+          <OverlayRow
+            id={PINBOARD_CALENDAR_ID}
+            label="Pinboard"
+            hidden={hidden}
+            onToggle={onToggle}
+            colorOf={colorOf}
+          />
         </ul>
       </div>
       {calendars.length === 0 ? (

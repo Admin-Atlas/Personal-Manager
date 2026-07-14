@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
-import { addDays, dayKey, isMilestoneEvent, startOfDay } from "../../../lib/calendar-layout";
+import { addDays, dayKey, isOverlayEvent, startOfDay } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -31,7 +31,7 @@ interface Props {
   colorOf: (calendarId: string) => string;
   /** Reports the month filling the view as the user scrolls, so the header label can track it. */
   onFocusDate: (d: Date) => void;
-  /** Open a milestone overlay event's project (fires for milestone chips only). */
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay chips only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
 
@@ -264,7 +264,7 @@ export function MonthView({ cursor, events, colorOf, onFocusDate, onEventClick }
                             color={colorOf(ev.calendar_id)}
                             timeLabel={ev.all_day ? "" : formatClockIso(ev.start)}
                             showTime={showMeta}
-                            onClick={isMilestoneEvent(ev) ? () => onEventClick?.(ev) : undefined}
+                            onClick={isOverlayEvent(ev) ? () => onEventClick?.(ev) : undefined}
                           />
                         ))}
                         {hidden > 0 && (

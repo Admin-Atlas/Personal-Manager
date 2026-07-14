@@ -8,7 +8,7 @@
 // today's number chip only — every source colour comes from the categorical palette, never the accent.
 
 import type { CalendarEvent } from "../../../lib/types";
-import { dayKey, isMilestoneEvent } from "../../../lib/calendar-layout";
+import { dayKey, isOverlayEvent } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -20,7 +20,7 @@ interface Props {
   /** Already filtered to visible (non-hidden) calendars. */
   events: CalendarEvent[];
   colorOf: (calendarId: string) => string;
-  /** Open a milestone overlay event's project (fires for milestone chips only). */
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay chips only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
 
@@ -106,7 +106,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, onEventClick }: Pr
                   ) : (
                     <div className="flex min-h-0 flex-col gap-0.5 overflow-hidden">
                       {cell.chips.slice(0, maxChips).map((ev) => {
-                        const clickable = isMilestoneEvent(ev);
+                        const clickable = isOverlayEvent(ev);
                         return (
                           <div
                             key={ev.id}

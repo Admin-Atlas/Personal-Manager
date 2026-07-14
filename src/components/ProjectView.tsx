@@ -6,18 +6,12 @@ import { ChatView } from "./ChatView";
 import { Composer } from "./Composer";
 import { ContextMeter } from "./ContextMeter";
 import { RetrievalExplainPanel } from "./RetrievalExplainPanel";
-import {
-  listAllCalendarEvents,
-  listDocuments,
-  listMilestones,
-  listProjects,
-  setDocumentMetadata,
-} from "../lib/ipc";
+import { listDocuments, listMilestones, listProjects, setDocumentMetadata } from "../lib/ipc";
 import { useResizable } from "../lib/useResizable";
 import { useSidebarSplit } from "../lib/useSidebarSplit";
 import { idleSince } from "../lib/chatSession";
 import type { ProjectChat } from "../lib/useProjectChat";
-import type { CalendarEvent, Document, Milestone } from "../lib/types";
+import type { Document, Milestone } from "../lib/types";
 import { Button, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { MilestoneList } from "./MilestoneList";
@@ -71,7 +65,6 @@ export function ProjectView({
 }: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
-  const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   /** The file the palette jumped to — flashed briefly, then cleared. */
   const [flashId, setFlashId] = useState<number | null>(null);
   const filesRef = useRef<HTMLUListElement>(null);
@@ -174,18 +167,12 @@ export function ProjectView({
   };
 
   useEffect(() => {
-    // Load this project's documents/milestones/calendar. The chat session (App-owned) re-inits
-    // itself on the same project change.
+    // Load this project's documents and milestones. The chat session (App-owned) re-inits itself on
+    // the same project change.
     listDocuments()
       .then((all) => setDocuments(all.filter((d) => d.project === project)))
       .catch((e) => chat.setError(String(e)));
     refreshMilestones();
-    // The whole calendar mirror (past + future, every calendar) feeds the milestone link picker, so a
-    // deadline can link to any event — not just the next few weeks. MilestoneList dedups by uid and
-    // orders them. Empty when no calendar is connected.
-    listAllCalendarEvents()
-      .then(setCalendarEvents)
-      .catch(() => setCalendarEvents([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
 
@@ -358,7 +345,6 @@ export function ProjectView({
         <MilestoneList
           project={project}
           milestones={sortedMilestones}
-          calendarEvents={calendarEvents}
           onChanged={refreshMilestones}
           readOnly={!showMeta}
           manualOrder={msSort.key === "manual"}

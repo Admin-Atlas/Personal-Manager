@@ -13,7 +13,7 @@ interface Props {
   timeLabel: string;
   /** Depth gate: show the time prefix (Power). */
   showTime: boolean;
-  /** When set, the chip is interactive (the milestone overlay only) — click / Enter / Space fires it.
+  /** When set, the chip is interactive (the PM overlays only) — click / Enter / Space fires it.
    *  Synced events leave this undefined and stay non-interactive. */
   onClick?: () => void;
 }

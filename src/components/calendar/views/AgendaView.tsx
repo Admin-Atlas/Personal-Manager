@@ -11,7 +11,7 @@ import { formatClockIso, formatDateLocal } from "../../../lib/format";
 import {
   dayKey,
   groupEventsFromDay,
-  isMilestoneEvent,
+  isOverlayEvent,
   startOfDay,
   weekdayShort,
 } from "../../../lib/calendar-layout";
@@ -24,7 +24,7 @@ interface Props {
   /** Show events on/after this day — including a multi-day event still running through it. */
   fromDay: Date;
   colorOf: (calendarId: string) => string;
-  /** Open a milestone overlay event's project (fires for milestone rows only). */
+  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay rows only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
 
@@ -75,7 +75,7 @@ export function AgendaView({ events, fromDay, colorOf, onEventClick }: Props) {
             </div>
             <ul className="flex flex-1 flex-col gap-1">
               {g.items.map((ev) => {
-                const clickable = isMilestoneEvent(ev);
+                const clickable = isOverlayEvent(ev);
                 return (
                   <li
                     key={ev.id}
