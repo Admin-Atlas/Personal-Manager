@@ -36,7 +36,6 @@ import { useHelp } from "../lib/help";
 import { BackupSettings } from "./BackupSettings";
 import { ConnectorsSettings } from "./ConnectorsSettings";
 import { ModelListEditor } from "./ModelListEditor";
-import { ModelRecommendationCards } from "./ModelRecommendationCards";
 import { IngestProgress } from "./IngestProgress";
 import { RebuildProgress } from "./RebuildProgress";
 import { RemovePmData } from "./RemovePmData";
@@ -56,7 +55,6 @@ import {
 import { readConfirmDelete, writeConfirmDelete } from "../lib/pinboard/prefs";
 import {
   useTheme,
-  useDepth,
   ACCENTS,
   accentName,
   MONO_ACCENT,
@@ -123,7 +121,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     setTeachVisible,
   } = useTheme();
   const { devMode, setDevMode } = useDevMode();
-  const { showMeta, showPower } = useDepth();
   // Seeded from localStorage rather than watched: the toggle is the only writer here, and the
   // Pinboard reads the pref fresh at the moment you click delete (see pinboard/prefs.ts).
   const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
@@ -1154,18 +1151,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     onChange={setBackgroundModelsState}
                     autoSwitch={backgroundAuto}
                     onAutoSwitchChange={setBackgroundAuto}
-                  />
-                  <ModelRecommendationCards
-                    showMeta={showMeta}
-                    showPower={showPower}
-                    onUseForChat={(m) =>
-                      setChatModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
-                    }
-                    onUseForBackground={(m) =>
-                      setBackgroundModelsState((prev) =>
-                        [m, ...prev.filter((x) => x !== m)].slice(0, 50),
-                      )
-                    }
                   />
                 </div>
 

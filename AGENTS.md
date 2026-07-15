@@ -92,7 +92,7 @@ release remain the open post-v1 work.
     `index_only.rs` (the pointer+embed observe-and-react reducer), `photos.rs` /
     `spreadsheets.rs` (dedicated processors), `review.rs` (sorting-review proposal +
     corrections), `projects.rs` (triage + the pure `derive_status`, spec §4.1), `entities.rs`,
-    `preferences.rs`, `milestones.rs`, `flags.rs`, `project_activity.rs`, `recommend.rs`,
+    `preferences.rs`, `milestones.rs`, `flags.rs`, `project_activity.rs`,
     `briefing.rs`, `layout.rs` (semantic-map dimensionality reduction).
   - **Chat pipeline** — `chat.rs` (turn model, vault-as-truth), `chat_index.rs` (append-only
     indexing), `chat_summary.rs` (rolling summary), `chat_title.rs`, `chat_prefs.rs`,

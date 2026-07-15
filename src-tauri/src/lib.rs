@@ -53,7 +53,6 @@ mod preferences;
 mod project_activity;
 mod projects;
 mod python_fetch;
-mod recommend;
 mod registry;
 mod retrieval;
 mod retrieval_config;
@@ -1155,8 +1154,6 @@ pub fn run() {
             commands::route_focus_input,
             commands::cost_summary,
             commands::refresh_pricing,
-            commands::model_recommendations,
-            commands::set_recommend_denylist,
             commands::open_data_folder,
             commands::export_all_data,
             commands::export_plaintext_markdown,
