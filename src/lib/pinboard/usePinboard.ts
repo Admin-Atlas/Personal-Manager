@@ -325,6 +325,26 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     });
   }, []);
 
+  /** The same, one level down: raise a child within its folder's own board, where cards overlap just
+   *  like they do outside. Separate from {@link raiseWidget}, which only walks the top level. */
+  const raiseChild = useCallback((folderId: string, childId: string) => {
+    setBoard((b) => {
+      const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
+      const kids = folder?.children;
+      if (!kids || kids[kids.length - 1]?.id === childId) return b;
+      const child = kids.find((c) => c.id === childId);
+      if (!child) return b;
+      return {
+        ...b,
+        widgets: b.widgets.map((w) =>
+          w.id === folderId
+            ? { ...w, children: [...kids.filter((c) => c.id !== childId), child] }
+            : w,
+        ),
+      };
+    });
+  }, []);
+
   const addTimelineItem = useCallback((id: string) => {
     const item: TimelineItem = { id: makeId(), date: "", label: "" };
     setBoard((b) => ({
@@ -366,6 +386,7 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     dropWidget,
     removeWidget,
     raiseWidget,
+    raiseChild,
     popOutChild,
     addTimelineItem,
     updateTimelineItem,

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
+  forwardRef,
   memo,
   useCallback,
   useEffect,
@@ -27,15 +28,7 @@ import {
   updateMilestone,
 } from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
-import {
-  CELL,
-  COLS,
-  ROWS,
-  boundsForPx,
-  folderAtPointer,
-  minSize,
-  pxRectToCells,
-} from "../lib/pinboard/grid";
+import { CELL, boundsForPx, folderAtPointer } from "../lib/pinboard/grid";
 import {
   applyLineMarker,
   continueList,
@@ -46,11 +39,12 @@ import {
   toggleWrap,
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
+import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinboard/useBoardDrag";
 import { usePinboard } from "../lib/pinboard/usePinboard";
 // The tint set + names live in one place (src/lib/pinboard/palette.ts) so the board's colours
 // stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
 import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
-import type { CellPoint, Rect, TimelineItem, Widget, WidgetKind } from "../lib/pinboard/types";
+import type { CellPoint, Rect, TimelineItem, Widget } from "../lib/pinboard/types";
 import type { Milestone } from "../lib/types";
 import { useDepth } from "../theme";
 import { Button, Modal, SegmentedControl, Textarea, Tooltip } from "./ui";
@@ -64,28 +58,6 @@ function cheapHash(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = (((h << 5) + h) ^ s.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);
-}
-
-interface PxRect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-interface DragStart {
-  id: string;
-  /** The dragged widget's kind, captured at grab so the drop can pick the right min size (folders
-   *  stay 3×3) without the pointer effect needing to look the widget up. */
-  kind: WidgetKind;
-  mode: "move" | "resize";
-  startX: number;
-  startY: number;
-  startRect: Rect;
-}
-
-function rectToPx(r: Rect): PxRect {
-  return { x: r.x * CELL, y: r.y * CELL, w: r.w * CELL, h: r.h * CELL };
 }
 
 /** A cell rect as absolute-positioning styles — for overlays drawn over a widget's own tile. */
@@ -109,49 +81,123 @@ function tintStyle(color?: string): CSSProperties {
 const PANEL_W = 24 * CELL;
 const PANEL_H = 17 * CELL;
 
+/** The share of the main board an opened folder's overlay takes up. */
+const OVERLAY_SHARE = 0.8;
+
+/**
+ * A board canvas: the ruled grid every widget is positioned against, sized in cells. Shared by the
+ * main board and a folder's overlay board so the two can't drift apart — `ref` is what turns a
+ * viewport pointer into a board cell, so it must be THIS element (its padding box is the origin
+ * absolutely-positioned tiles resolve against).
+ */
+const BoardSurface = forwardRef<
+  HTMLDivElement,
+  {
+    bounds: { cols: number; rows: number };
+    /** Suppress text selection while a gesture is in flight. */
+    dragging?: boolean;
+    className?: string;
+    dataHelp?: string;
+    children: ReactNode;
+  }
+>(function BoardSurface({ bounds, dragging, className, dataHelp, children }, ref) {
+  return (
+    <div
+      ref={ref}
+      data-help={dataHelp}
+      className={`relative rounded-[var(--radius)] border border-border ${
+        dragging ? "select-none" : ""
+      } ${className ?? ""}`}
+      style={{
+        width: bounds.cols * CELL,
+        height: bounds.rows * CELL,
+        backgroundColor: "var(--surface)",
+        backgroundImage:
+          "linear-gradient(var(--rule) 1px, transparent 1px), linear-gradient(90deg, var(--rule) 1px, transparent 1px)",
+        backgroundSize: `${CELL}px ${CELL}px`,
+      }}
+    >
+      {children}
+    </div>
+  );
+});
+
+/** One widget's tile on a board: positioned at its cell rect, tinted, with the size strip (at power)
+ *  and the resize grip. Shared by the main board and a folder's overlay board — a card should look
+ *  and behave the same wherever it is, which is the whole point of giving a folder a real board. */
+function WidgetTile({
+  widget,
+  px,
+  showPower,
+  onStartDrag,
+  children,
+}: {
+  widget: Widget;
+  px: PxRect;
+  showPower?: boolean;
+  onStartDrag: (e: ReactPointerEvent, w: Widget, mode: DragMode) => void;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      data-help={
+        widget.kind === "note"
+          ? "pinboard-note"
+          : widget.kind === "timeline"
+            ? "pinboard-timeline"
+            : "pinboard-folder"
+      }
+      className="absolute flex flex-col overflow-hidden rounded-[var(--radius-sm)] border shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none"
+      style={{ left: px.x, top: px.y, width: px.w, height: px.h, ...tintStyle(widget.color) }}
+    >
+      {children}
+
+      {/* A note shows its size inline in its own footer (see NoteBody); timeline/folder keep the
+          compact coords strip. */}
+      {showPower && widget.kind !== "note" && (
+        <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[9px] text-faint">
+          {widget.rect.x},{widget.rect.y} · {widget.rect.w}×{widget.rect.h}
+        </div>
+      )}
+
+      {/* Resize handle (bottom-right) — every widget kind is resizable (folders floor at 3×3). */}
+      <div
+        onPointerDown={(e) => onStartDrag(e, widget, "resize")}
+        title="Resize"
+        aria-label="Resize widget"
+        className="absolute bottom-0 right-0 h-3.5 w-3.5 cursor-nwse-resize touch-none"
+        style={{
+          background:
+            "linear-gradient(135deg, transparent 50%, color-mix(in oklab, var(--ink4) 50%, transparent) 50%)",
+        }}
+      />
+    </div>
+  );
+}
+
 /**
  * The Pinboard (spec §4): a bounded planning board of draggable, resizable widgets —
  * post-it notes and simple dated timelines — persisted locally. Hand-rolled on pointer
  * events + CSS transforms with grid-snap (no layout library); the snap/clamp maths live in
- * `lib/pinboard/grid.ts`. The board grows to fill the window (cell size and fonts fixed) and
- * scrolls both axes once the window is made smaller. Notes and timelines are available at every
+ * `lib/pinboard/grid.ts`. The board is a fixed canvas the size of the device screen (cell size and
+ * fonts fixed too) and scrolls both axes once the window is smaller than it. Notes, timelines and
+ * folders are available at every
  * depth; per-widget metadata shows at `power`. Notes are Markdown: they render in place and turn
  * back into an editor on click, with a formatting toolbar, keyboard shortcuts, and smart list
  * continuation (`lib/pinboard/notesMarkdown.ts`).
  */
 export function PinboardView() {
   const { showMeta, showPower } = useDepth();
-  // The board is a FIXED-WIDTH canvas = the window's own content area: adding notes wraps to a new
-  // row and the board only ever grows DOWNWARD (and scrolls), never sideways.
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [viewBounds, setViewBounds] = useState({ cols: COLS, rows: ROWS });
-  // Measure the scroller's content area and track it LIVE (grow AND shrink) so the board width
-  // always equals the window — not a stale high-water mark that would overflow horizontally. Layout
-  // effect so the real width is known before the async board load re-flows overflow into it.
-  useLayoutEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const PAD = 24; // matches the scroller's p-6, so the board never forces a horizontal scrollbar
-    const measure = () =>
-      setViewBounds({
-        cols: Math.max(COLS, Math.floor((el.clientWidth - PAD * 2) / CELL)),
-        rows: Math.max(ROWS, Math.floor((el.clientHeight - PAD * 2) / CELL)),
-      });
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-  // A generous vertical extent (the device screen height, fixed per machine) so notes wrap to new
-  // rows with room to spare before the board scrolls; the WIDTH is always the live window, so the
-  // board never widens. These are the bounds the hook places, drops, and re-flows within.
-  const screenRows = useMemo(
-    () => boundsForPx({ w: window.screen.availWidth, h: window.screen.availHeight }).rows,
+  // The board is a FIXED canvas the size of the DEVICE SCREEN. It does not track the window and does
+  // not grow to contain its content in either axis: a board whose extent moved with the window (or
+  // with wherever the lowest note happened to sit) has no stable size to reason about — and the
+  // folder overlay is sized as a share of it. Make the window smaller and the board simply scrolls;
+  // `reflowToWidth` tidies a board authored on a wider screen back in on load. `boundsForPx` keeps
+  // the legacy COLS×ROWS floor. Computed once — `screen` is fixed for the life of the process.
+  const boardBounds = useMemo(
+    () => boundsForPx({ w: window.screen.availWidth, h: window.screen.availHeight }),
     [],
-  );
-  const boardConstraints = useMemo(
-    () => ({ cols: viewBounds.cols, rows: Math.max(viewBounds.rows, screenRows) }),
-    [viewBounds.cols, viewBounds.rows, screenRows],
   );
   const {
     board,
@@ -163,14 +209,13 @@ export function PinboardView() {
     dropWidget,
     removeWidget,
     raiseWidget,
+    raiseChild,
     popOutChild,
     addTimelineItem,
     updateTimelineItem,
     removeTimelineItem,
-  } = usePinboard(boardConstraints);
+  } = usePinboard(boardBounds);
 
-  const [drag, setDrag] = useState<DragStart | null>(null);
-  const [livePx, setLivePx] = useState<PxRect | null>(null);
   // The board element itself (scrollRef is its scroller) — needed to turn a viewport pointer
   // position into a board cell, which is what decides whether a drop files into a folder.
   const boardRef = useRef<HTMLDivElement>(null);
@@ -182,21 +227,8 @@ export function PinboardView() {
   // A just-added widget id to scroll into view (set by the add buttons; cleared once scrolled).
   const [pendingScrollId, setPendingScrollId] = useState<string | null>(null);
 
-  // Width is the fixed window (viewBounds.cols); the board grows only DOWNWARD to contain content
-  // (vertical scroll). We still take the max with widget extents defensively — so that if the window
-  // is dragged narrower than existing content the widgets stay reachable until the next load re-flows
-  // them in — but new notes are always placed within the window, so adding them never widens it.
-  const boardBounds = useMemo(() => {
-    let cols = viewBounds.cols;
-    let rows = viewBounds.rows;
-    for (const w of board.widgets) {
-      cols = Math.max(cols, w.rect.x + w.rect.w);
-      rows = Math.max(rows, w.rect.y + w.rect.h);
-    }
-    return { cols, rows };
-  }, [viewBounds, board.widgets]);
-  // Read board bounds through a ref inside the drag effect so an in-flight drag always clamps to the
-  // current board without the effect re-subscribing to pointer events on every resize.
+  // The drag effect reads the bounds through a ref, so it never re-subscribes its pointer listeners
+  // to pick up a new value.
   const boardBoundsRef = useRef(boardBounds);
   boardBoundsRef.current = boardBounds;
   // Likewise the widget list, which the drag reads to find the folder under the pointer: as a dep it
@@ -227,106 +259,22 @@ export function PinboardView() {
     return () => window.removeEventListener("focus", onFocus);
   }, [refreshDocs]);
 
-  // While a drag is active, track the pointer on the window so it keeps following even when
-  // the cursor leaves the widget; commit the snapped cell rect on release. Effect re-runs only
-  // when a drag starts/ends (livePx lives in its own state, off the dependency list).
-  useEffect(() => {
-    if (!drag) return;
-    const startPx = rectToPx(drag.startRect);
-    const compute = (e: PointerEvent): PxRect => {
-      const dx = e.clientX - drag.startX;
-      const dy = e.clientY - drag.startY;
-      const maxX = boardBoundsRef.current.cols * CELL;
-      const maxY = boardBoundsRef.current.rows * CELL;
-      if (drag.mode === "move") {
-        return {
-          x: Math.max(0, Math.min(startPx.x + dx, maxX - startPx.w)),
-          y: Math.max(0, Math.min(startPx.y + dy, maxY - startPx.h)),
-          w: startPx.w,
-          h: startPx.h,
-        };
-      }
-      // Clamp to the kind's own minimum so a folder can shrink back to its 3×3 floor (not the
-      // note/timeline 4×3) while still growing freely.
-      const min = minSize(drag.kind);
-      return {
-        x: startPx.x,
-        y: startPx.y,
-        w: Math.max(min.w * CELL, Math.min(startPx.w + dx, maxX - startPx.x)),
-        h: Math.max(min.h * CELL, Math.min(startPx.h + dy, maxY - startPx.y)),
-      };
-    };
-    // The board cell under the pointer. The origin is read LIVE rather than cached at grab, because
-    // the board sits in a scroller the user can wheel mid-drag — a stale origin would make the
-    // highlight promise one thing and the drop do another. (Same approach as GraphView.)
-    const pointerCell = (e: PointerEvent): CellPoint | null => {
-      const el = boardRef.current;
-      if (!el || drag.mode !== "move") return null;
-      const r = el.getBoundingClientRect();
-      return {
-        x: Math.floor((e.clientX - r.left) / CELL),
-        y: Math.floor((e.clientY - r.top) / CELL),
-      };
-    };
-    const onMove = (e: PointerEvent) => {
-      setLivePx(compute(e));
-      setDropFolderId(folderAtPointer(widgetsRef.current, drag.id, pointerCell(e))?.id ?? null);
-    };
-    const onUp = (e: PointerEvent) => {
-      const rect = pxRectToCells(
-        compute(e),
-        boardBoundsRef.current.cols,
-        boardBoundsRef.current.rows,
-        minSize(drag.kind),
-      );
-      // Resize just repositions; a move goes through dropWidget, which may file the widget into the
-      // folder under the pointer or fold two stacked widgets into a new one.
-      if (drag.mode === "resize") moveWidget(drag.id, rect);
-      else dropWidget(drag.id, rect, pointerCell(e));
-      setDrag(null);
-      setLivePx(null);
-      setDropFolderId(null);
-    };
-    // If the gesture is interrupted (touch handed to the scroller, an OS context menu,
-    // the window losing focus), the browser fires pointercancel/blur instead of pointerup.
-    // Without this the drag would dangle: `drag` stuck non-null, `select-none` stuck on, and
-    // the move silently lost. pointercancel still carries coordinates so we commit; a blur
-    // has none, so we just end the drag cleanly.
-    const onCancel = (e: PointerEvent) => onUp(e);
-    const onBlur = () => {
-      setDrag(null);
-      setLivePx(null);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onCancel);
-    window.addEventListener("blur", onBlur);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onCancel);
-      window.removeEventListener("blur", onBlur);
-    };
-  }, [drag, moveWidget, dropWidget]);
-
-  // Stable across the per-tick drag re-renders (only `raiseWidget` is a dep), so passing it into each
-  // memoised body doesn't defeat the memo that keeps react-markdown from re-running on every move.
-  const startDrag = useCallback(
-    (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => {
-      e.preventDefault();
-      raiseWidget(w.id);
-      setDrag({
-        id: w.id,
-        kind: w.kind,
-        mode,
-        startX: e.clientX,
-        startY: e.clientY,
-        startRect: w.rect,
-      });
-      setLivePx(rectToPx(w.rect));
-    },
-    [raiseWidget],
+  // Track the folder under the pointer so it can be ringed — on THIS board a drop may file into one.
+  // (The folder overlay's board passes no equivalent: folders don't nest, so nothing files in there.)
+  const trackDropFolder = useCallback(
+    (id: string, pointer: CellPoint | null) =>
+      setDropFolderId(folderAtPointer(widgetsRef.current, id, pointer)?.id ?? null),
+    [],
   );
+  // The board's drag/resize gesture — the same hook the folder overlay's board uses.
+  const { draggingId, livePx, startDrag } = useBoardDrag({
+    boundsRef: boardBoundsRef,
+    surfaceRef: boardRef,
+    onGrab: raiseWidget,
+    onMoveEnd: dropWidget,
+    onResizeEnd: moveWidget,
+    onPointerCell: trackDropFolder,
+  });
 
   // Add buttons remember the new widget so it can be scrolled into view (a note placed on a lower
   // row would otherwise be created off-screen).
@@ -378,6 +326,22 @@ export function PinboardView() {
     ? board.widgets.find((w) => w.id === dropFolderId && w.kind === "folder")
     : undefined;
 
+  // An opened folder's overlay is 80% of the board — which is a fixed device-screen canvas, so this
+  // is one stable size rather than something that drifts with the window or with wherever the lowest
+  // note happens to sit. Clamped to the scrim's own box (which starts below the h-9 title bar and is
+  // inset by its p-6), because on a window smaller than the screen 80% of the board wouldn't fit.
+  const overlaySize = useMemo(() => {
+    const SCRIM_PAD = 24; // the scrim's p-6
+    const TITLE_BAR = 36; // the scrim's top-9
+    return {
+      width: Math.min(boardBounds.cols * CELL * OVERLAY_SHARE, window.innerWidth - SCRIM_PAD * 2),
+      height: Math.min(
+        boardBounds.rows * CELL * OVERLAY_SHARE,
+        window.innerHeight - TITLE_BAR - SCRIM_PAD * 2,
+      ),
+    };
+  }, [boardBounds]);
+
   return (
     // min-w-0 / min-h-0 keep the oversized board penned inside its own overflow-auto scroller
     // (below) instead of inflating this column and pushing the header's buttons off-screen.
@@ -427,20 +391,11 @@ export function PinboardView() {
       </header>
 
       <div ref={scrollRef} className="pm-scrollbars min-h-0 min-w-0 flex-1 overflow-auto p-6">
-        <div
+        <BoardSurface
           ref={boardRef}
-          data-help="pinboard-board"
-          className={`relative rounded-[var(--radius)] border border-border ${
-            drag ? "select-none" : ""
-          }`}
-          style={{
-            width: boardBounds.cols * CELL,
-            height: boardBounds.rows * CELL,
-            backgroundColor: "var(--surface)",
-            backgroundImage:
-              "linear-gradient(var(--rule) 1px, transparent 1px), linear-gradient(90deg, var(--rule) 1px, transparent 1px)",
-            backgroundSize: `${CELL}px ${CELL}px`,
-          }}
+          bounds={boardBounds}
+          dragging={!!draggingId}
+          dataHelp="pinboard-board"
         >
           {board.widgets.length === 0 && (
             <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
@@ -450,76 +405,48 @@ export function PinboardView() {
             </div>
           )}
 
-          {board.widgets.map((w) => {
-            const px = drag?.id === w.id && livePx ? livePx : rectToPx(w.rect);
-            return (
-              <div
-                key={w.id}
-                data-help={
-                  w.kind === "note"
-                    ? "pinboard-note"
-                    : w.kind === "timeline"
-                      ? "pinboard-timeline"
-                      : "pinboard-folder"
-                }
-                className="absolute flex flex-col overflow-hidden rounded-[var(--radius-sm)] border shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none"
-                style={{ left: px.x, top: px.y, width: px.w, height: px.h, ...tintStyle(w.color) }}
-              >
-                {/* The widget owns its own header + body, so note-specific controls (Ingest) can sit
-                    in the top bar while their state stays inside the memoised body. */}
-                {w.kind === "note" ? (
-                  <NoteBody
-                    widget={w}
-                    showPower={showPower}
-                    onChange={updateWidget}
-                    onDelete={removeWidget}
-                    onStartDrag={startDrag}
-                    status={docStatus.get(`note:${w.id}`)}
-                    onIngested={refreshDocs}
-                  />
-                ) : w.kind === "timeline" ? (
-                  <TimelineBody
-                    widget={w}
-                    showPower={showPower}
-                    onChange={updateWidget}
-                    onDelete={removeWidget}
-                    onStartDrag={startDrag}
-                    onAddItem={addTimelineItem}
-                    onUpdateItem={updateTimelineItem}
-                    onRemoveItem={removeTimelineItem}
-                  />
-                ) : (
-                  <FolderTile
-                    widget={w}
-                    onChange={updateWidget}
-                    onUngroup={removeWidget}
-                    onStartDrag={startDrag}
-                    onOpen={() => setExpandedFolderId(w.id)}
-                  />
-                )}
-
-                {/* A note shows its size inline in its own footer (see NoteBody); timeline/folder
-                    keep the compact coords strip. */}
-                {showPower && w.kind !== "note" && (
-                  <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[9px] text-faint">
-                    {w.rect.x},{w.rect.y} · {w.rect.w}×{w.rect.h}
-                  </div>
-                )}
-
-                {/* Resize handle (bottom-right) — every widget kind is resizable (folders floor at 3×3). */}
-                <div
-                  onPointerDown={(e) => startDrag(e, w, "resize")}
-                  title="Resize"
-                  aria-label="Resize widget"
-                  className="absolute bottom-0 right-0 h-3.5 w-3.5 cursor-nwse-resize touch-none"
-                  style={{
-                    background:
-                      "linear-gradient(135deg, transparent 50%, color-mix(in oklab, var(--ink4) 50%, transparent) 50%)",
-                  }}
+          {board.widgets.map((w) => (
+            <WidgetTile
+              key={w.id}
+              widget={w}
+              px={draggingId === w.id && livePx ? livePx : rectToPx(w.rect)}
+              showPower={showPower}
+              onStartDrag={startDrag}
+            >
+              {/* The widget owns its own header + body, so note-specific controls (Ingest) can sit
+                  in the top bar while their state stays inside the memoised body. */}
+              {w.kind === "note" ? (
+                <NoteBody
+                  widget={w}
+                  showPower={showPower}
+                  onChange={updateWidget}
+                  onDelete={removeWidget}
+                  onStartDrag={startDrag}
+                  status={docStatus.get(`note:${w.id}`)}
+                  onIngested={refreshDocs}
                 />
-              </div>
-            );
-          })}
+              ) : w.kind === "timeline" ? (
+                <TimelineBody
+                  widget={w}
+                  showPower={showPower}
+                  onChange={updateWidget}
+                  onDelete={removeWidget}
+                  onStartDrag={startDrag}
+                  onAddItem={addTimelineItem}
+                  onUpdateItem={updateTimelineItem}
+                  onRemoveItem={removeTimelineItem}
+                />
+              ) : (
+                <FolderTile
+                  widget={w}
+                  onChange={updateWidget}
+                  onUngroup={removeWidget}
+                  onStartDrag={startDrag}
+                  onOpen={() => setExpandedFolderId(w.id)}
+                />
+              )}
+            </WidgetTile>
+          ))}
 
           {/* The folder the pointer is over mid-drag: releasing here files the card INTO it, instead
               of leaving it lying on top. Drawn as an overlay rather than a ring on the folder's own
@@ -536,21 +463,33 @@ export function PinboardView() {
               panel escapes the tiles' overflow-hidden and paints above them; the tile's rect never moves. */}
           {expandedFolder &&
             ((expandedFolder.expandMode ?? "inline") === "overlay" ? (
-              <Modal open onClose={() => setExpandedFolderId(null)} widthClassName="max-w-3xl">
-                <div className="h-[70vh]">
-                  <FolderPanel
-                    folder={expandedFolder}
-                    onChange={updateWidget}
-                    onDelete={removeWidget}
-                    onPopOut={popOutChild}
-                    onAddItem={addTimelineItem}
-                    onUpdateItem={updateTimelineItem}
-                    onRemoveItem={removeTimelineItem}
-                    docStatus={docStatus}
-                    onIngested={refreshDocs}
-                    onClose={() => setExpandedFolderId(null)}
-                  />
-                </div>
+              <Modal
+                open
+                onClose={() => setExpandedFolderId(null)}
+                // A share of the board, replacing Modal's own width/height/overflow defaults rather
+                // than competing with them. The board is a fixed device-screen canvas, so this is a
+                // stable size; the clamp is for a window smaller than the screen, where 80% of the
+                // board would not fit inside the scrim.
+                widthClassName=""
+                heightClassName=""
+                overflowClassName="overflow-hidden"
+                className="flex flex-col"
+                style={overlaySize}
+              >
+                <FolderBoard
+                  folder={expandedFolder}
+                  showPower={showPower}
+                  onChange={updateWidget}
+                  onDelete={removeWidget}
+                  onPopOut={popOutChild}
+                  onRaiseChild={raiseChild}
+                  onAddItem={addTimelineItem}
+                  onUpdateItem={updateTimelineItem}
+                  onRemoveItem={removeTimelineItem}
+                  docStatus={docStatus}
+                  onIngested={refreshDocs}
+                  onClose={() => setExpandedFolderId(null)}
+                />
               </Modal>
             ) : (
               <div
@@ -582,7 +521,7 @@ export function PinboardView() {
                 />
               </div>
             ))}
-        </div>
+        </BoardSurface>
       </div>
     </div>
   );
@@ -763,8 +702,10 @@ const NoteBody = memo(function NoteBody({
   onDelete: (id: string) => void;
   /** The board drag handle. Absent for folder-panel children (they aren't board-positioned). */
   onStartDrag?: (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => void;
-  /** When set (folder-panel child), a "move out to the board" control shows in the header. */
-  onPopOut?: () => void;
+  /** When set (a folder's child), a "move out to the board" control shows in the header. Takes the
+   *  child's id so the parent can pass ONE stable callback rather than a fresh arrow per render,
+   *  which would defeat this component's memo and re-run react-markdown on every drag tick. */
+  onPopOut?: (id: string) => void;
   status?: DocStatus;
   onIngested: () => void;
 }) {
@@ -942,7 +883,7 @@ const NoteBody = memo(function NoteBody({
         onStartDrag={onStartDrag ? (e) => onStartDrag(e, widget, "move") : undefined}
         actions={
           <>
-            {onPopOut && <PopOutButton onClick={onPopOut} />}
+            {onPopOut && <PopOutButton onClick={() => onPopOut(widget.id)} />}
             {ingestControl}
           </>
         }
@@ -1087,10 +1028,11 @@ interface TimelineBodyProps {
   showPower: boolean;
   onChange: (id: string, patch: Partial<Widget>) => void;
   onDelete: (id: string) => void;
-  /** The board drag handle. Absent for folder-panel children (they aren't board-positioned). */
+  /** The board drag handle. Absent in the in-place folder panel, which lays cards out itself. */
   onStartDrag?: (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => void;
-  /** When set (folder-panel child), a "move out to the board" control shows in the header. */
-  onPopOut?: () => void;
+  /** When set (a folder's child), a "move out to the board" control shows in the header. Takes the
+   *  child's id so the parent can pass one stable callback (see NoteBody). */
+  onPopOut?: (id: string) => void;
   onAddItem: (id: string) => void;
   onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
   onRemoveItem: (id: string, itemId: string) => void;
@@ -1116,7 +1058,7 @@ const TimelineBody = memo(function TimelineBody(props: TimelineBodyProps) {
         actions={
           <>
             <TimelineViewToggle value={view} onChange={(v) => onChange(widget.id, { view: v })} />
-            {onPopOut && <PopOutButton onClick={onPopOut} />}
+            {onPopOut && <PopOutButton onClick={() => onPopOut(widget.id)} />}
           </>
         }
       />
@@ -1285,11 +1227,196 @@ function FolderGlyph() {
   );
 }
 
-/** The expanded folder view (inline panel or overlay): editable title, a presentation toggle, and
- *  a grid of the contained cards — each the SAME NoteBody/TimelineBody, so children edit/ingest just
- *  like board widgets. Children carry no drag handle (they aren't board-positioned) but get a
- *  pop-out control; a child's ✕ deletes it. The folder itself stays however few cards are left —
- *  emptying it is not the same as wanting it gone. */
+/** The bar both expanded-folder presentations share: editable title, the In place / Overlay choice,
+ *  and close. */
+function FolderPanelHeader({
+  folder,
+  onChange,
+  onClose,
+}: {
+  folder: Widget;
+  onChange: (id: string, patch: Partial<Widget>) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center justify-between gap-2 border-b border-rule px-3 py-2">
+      <input
+        value={folder.title ?? ""}
+        onChange={(e) => onChange(folder.id, { title: e.target.value })}
+        placeholder="Folder"
+        aria-label="Folder title"
+        className="min-w-0 flex-1 truncate border-0 bg-transparent px-0 text-sm font-medium text-ink2 placeholder:text-ink4 focus:outline-none focus:ring-0"
+      />
+      <SegmentedControl
+        value={folder.expandMode ?? "inline"}
+        onChange={(m) => onChange(folder.id, { expandMode: m })}
+        options={[
+          { value: "inline", label: "In place" },
+          { value: "overlay", label: "Overlay" },
+        ]}
+      />
+      <button
+        type="button"
+        onClick={onClose}
+        title="Close folder"
+        aria-label="Close folder"
+        className="shrink-0 rounded-[var(--radius-sm)] px-1 text-sm text-ink4 hover:bg-surface hover:text-ink2"
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The OVERLAY presentation: the folder's own pinboard.
+ *
+ * Cards keep the shape and size they had outside, and are dragged and resized in here with the same
+ * gesture, the same grid and the same tile as the main board — a folder is a place to put things,
+ * not a different kind of thing. Folders never nest, so a drop in here can't fold or file anything:
+ * it is always a plain move, and cards simply overlap. That's why there's no resolveDrop, no pointer
+ * cell and no drop highlight — none of them would have anything to decide.
+ */
+function FolderBoard({
+  folder,
+  showPower,
+  onChange,
+  onDelete,
+  onPopOut,
+  onRaiseChild,
+  onAddItem,
+  onUpdateItem,
+  onRemoveItem,
+  docStatus,
+  onIngested,
+  onClose,
+}: {
+  folder: Widget;
+  showPower: boolean;
+  onChange: (id: string, patch: Partial<Widget>) => void;
+  onDelete: (id: string) => void;
+  onPopOut: (folderId: string, childId: string) => void;
+  onRaiseChild: (folderId: string, childId: string) => void;
+  onAddItem: (id: string) => void;
+  onUpdateItem: (id: string, itemId: string, patch: { date?: string; label?: string }) => void;
+  onRemoveItem: (id: string, itemId: string) => void;
+  docStatus: Map<string, DocStatus>;
+  onIngested: () => void;
+  onClose: () => void;
+}) {
+  const children = useMemo(() => folder.children ?? [], [folder.children]);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const surfaceRef = useRef<HTMLDivElement>(null);
+
+  // Measure the body so the canvas fills it. p-3 on the scroller, hence the 12px inset.
+  const [measured, setMeasured] = useState({ cols: 1, rows: 1 });
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const PAD = 12;
+    const measure = () =>
+      setMeasured({
+        cols: Math.max(1, Math.floor((el.clientWidth - PAD * 2) / CELL)),
+        rows: Math.max(1, Math.floor((el.clientHeight - PAD * 2) / CELL)),
+      });
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // The canvas fills the body, then grows to contain any card sitting past it — cards are never
+  // re-flowed to fit (that would resize them, which is exactly what this view exists to preserve),
+  // so the board scrolls to reach them instead.
+  const bounds = useMemo(() => {
+    let cols = measured.cols;
+    let rows = measured.rows;
+    for (const c of children) {
+      cols = Math.max(cols, c.rect.x + c.rect.w);
+      rows = Math.max(rows, c.rect.y + c.rect.h);
+    }
+    return { cols, rows };
+  }, [measured, children]);
+  const boundsRef = useRef(bounds);
+  boundsRef.current = bounds;
+
+  // Stable, so the memoised card bodies survive the per-tick re-renders of a drag.
+  const popOut = useCallback(
+    (childId: string) => onPopOut(folder.id, childId),
+    [onPopOut, folder.id],
+  );
+  const commitRect = useCallback((id: string, rect: Rect) => onChange(id, { rect }), [onChange]);
+  const { draggingId, livePx, startDrag } = useBoardDrag({
+    boundsRef,
+    surfaceRef,
+    onGrab: useCallback((id: string) => onRaiseChild(folder.id, id), [onRaiseChild, folder.id]),
+    onMoveEnd: commitRect,
+    onResizeEnd: commitRect,
+  });
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <FolderPanelHeader folder={folder} onChange={onChange} onClose={onClose} />
+      <div ref={scrollRef} className="pm-scrollbars min-h-0 min-w-0 flex-1 overflow-auto p-3">
+        <BoardSurface
+          ref={surfaceRef}
+          bounds={bounds}
+          dragging={!!draggingId}
+          dataHelp="pinboard-folder-board"
+        >
+          {children.length === 0 && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+              <p className="text-sm text-ink4">
+                This folder is empty — drag a note or timeline onto it to file it here.
+              </p>
+            </div>
+          )}
+          {children.map((c) => (
+            <WidgetTile
+              key={c.id}
+              widget={c}
+              px={draggingId === c.id && livePx ? livePx : rectToPx(c.rect)}
+              showPower={showPower}
+              onStartDrag={startDrag}
+            >
+              {c.kind === "note" ? (
+                <NoteBody
+                  widget={c}
+                  showPower={showPower}
+                  onChange={onChange}
+                  onDelete={onDelete}
+                  onStartDrag={startDrag}
+                  onPopOut={popOut}
+                  status={docStatus.get(`note:${c.id}`)}
+                  onIngested={onIngested}
+                />
+              ) : (
+                <TimelineBody
+                  widget={c}
+                  showPower={showPower}
+                  onChange={onChange}
+                  onDelete={onDelete}
+                  onStartDrag={startDrag}
+                  onPopOut={popOut}
+                  onAddItem={onAddItem}
+                  onUpdateItem={onUpdateItem}
+                  onRemoveItem={onRemoveItem}
+                />
+              )}
+            </WidgetTile>
+          ))}
+        </BoardSurface>
+      </div>
+    </div>
+  );
+}
+
+/** The expanded folder view IN PLACE: editable title, a presentation toggle, and a grid of the
+ *  contained cards — each the SAME NoteBody/TimelineBody, so children edit/ingest just like board
+ *  widgets. Children carry no drag handle here (this view lays them out itself; the Overlay
+ *  presentation is the one that keeps their board shape) but get a pop-out control; a child's ✕
+ *  deletes it. The folder itself stays however few cards are left — emptying it is not the same as
+ *  wanting it gone. */
 function FolderPanel({
   folder,
   onChange,
@@ -1314,34 +1441,14 @@ function FolderPanel({
   onClose: () => void;
 }) {
   const children = folder.children ?? [];
+  // Stable, so a card body's memo isn't defeated by a fresh arrow on every render.
+  const popOut = useCallback(
+    (childId: string) => onPopOut(folder.id, childId),
+    [onPopOut, folder.id],
+  );
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-rule px-3 py-2">
-        <input
-          value={folder.title ?? ""}
-          onChange={(e) => onChange(folder.id, { title: e.target.value })}
-          placeholder="Folder"
-          aria-label="Folder title"
-          className="min-w-0 flex-1 truncate border-0 bg-transparent px-0 text-sm font-medium text-ink2 placeholder:text-ink4 focus:outline-none focus:ring-0"
-        />
-        <SegmentedControl
-          value={folder.expandMode ?? "inline"}
-          onChange={(m) => onChange(folder.id, { expandMode: m })}
-          options={[
-            { value: "inline", label: "In place" },
-            { value: "overlay", label: "Overlay" },
-          ]}
-        />
-        <button
-          type="button"
-          onClick={onClose}
-          title="Close folder"
-          aria-label="Close folder"
-          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-sm text-ink4 hover:bg-surface hover:text-ink2"
-        >
-          ✕
-        </button>
-      </div>
+      <FolderPanelHeader folder={folder} onChange={onChange} onClose={onClose} />
       <div className="min-h-0 flex-1 overflow-auto p-3">
         {children.length === 0 ? (
           <p className="text-xs text-ink4">This folder is empty.</p>
@@ -1362,7 +1469,7 @@ function FolderPanel({
                     widget={c}
                     onChange={onChange}
                     onDelete={onDelete}
-                    onPopOut={() => onPopOut(folder.id, c.id)}
+                    onPopOut={popOut}
                     status={docStatus.get(`note:${c.id}`)}
                     onIngested={onIngested}
                   />
@@ -1372,7 +1479,7 @@ function FolderPanel({
                     showPower={false}
                     onChange={onChange}
                     onDelete={onDelete}
-                    onPopOut={() => onPopOut(folder.id, c.id)}
+                    onPopOut={popOut}
                     onAddItem={onAddItem}
                     onUpdateItem={onUpdateItem}
                     onRemoveItem={onRemoveItem}

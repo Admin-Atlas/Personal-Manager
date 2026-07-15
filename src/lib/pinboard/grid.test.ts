@@ -8,6 +8,7 @@ import {
   folderAtPointer,
   minSize,
   rectContains,
+  rectsOverlap,
   reflowToWidth,
   resolveDrop,
 } from "./grid";
@@ -171,6 +172,34 @@ describe("resolveDrop — file / fold / move", () => {
     });
     expect(out).toHaveLength(1);
     expect(out[0].children?.map((c) => c.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("lays a filed card out clear of its new siblings, at its exact size", () => {
+    // A child's rect is its spot on the folder's own board, so filing has to choose one: the card's
+    // board rect means nothing in there. Size must survive untouched — that's the folder board's job.
+    const f = folder("f", { x: 4, y: 4, w: 3, h: 3 }, [note("a", { x: 0, y: 0, w: 7, h: 5 })]);
+    const widgets = [f, note("c", { x: 30, y: 20, w: 9, h: 8 })];
+    const out = resolveDrop(widgets, "c", { x: 4, y: 4, w: 9, h: 8 }, 44, 28, stubId, {
+      x: 5,
+      y: 5,
+    });
+    const kids = out[0].children!;
+    expect(kids.map((c) => c.id)).toEqual(["a", "c"]);
+    expect(kids[0].rect).toEqual({ x: 0, y: 0, w: 7, h: 5 }); // sibling untouched
+    expect(kids[1].rect).toMatchObject({ w: 9, h: 8 }); // size preserved exactly
+    expect(rectsOverlap(kids[0].rect, kids[1].rect)).toBe(false); // and it doesn't sit on top of it
+  });
+
+  it("lays BOTH twins out when folding, so one isn't hidden under the other", () => {
+    // The fold gesture is "drop one card exactly on another", so the two share a rect by definition.
+    // Keeping it would put them at the same spot on the folder's board — one invisible.
+    const widgets = [note("a", size), note("b", { x: 0, y: 0, w: 7, h: 5 })];
+    const out = resolveDrop(widgets, "b", size, 44, 28, stubId, null);
+    const kids = out[0].children!;
+    expect(kids).toHaveLength(2);
+    expect(kids[0].rect).toMatchObject({ w: 7, h: 5 });
+    expect(kids[1].rect).toMatchObject({ w: 7, h: 5 });
+    expect(rectsOverlap(kids[0].rect, kids[1].rect)).toBe(false);
   });
 
   it("does NOT file when the rect merely OVERLAPS the folder and the pointer is elsewhere", () => {

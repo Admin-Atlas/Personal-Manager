@@ -21,7 +21,11 @@ export function WhatsNew({
       open
       onClose={onClose}
       labelledBy="whats-new-title"
-      className="flex max-h-[80vh] flex-col"
+      // Through the height seam, not `className`: passing a rival max-h-* alongside Modal's own left
+      // both classes in the list and let stylesheet order pick — so this asked for 80vh and silently
+      // got 85vh. The seam replaces the default outright.
+      heightClassName="max-h-[80vh]"
+      className="flex flex-col"
     >
       <div className="flex items-center justify-between border-b border-border px-6 py-4">
         <h1 id="whats-new-title" className="font-head text-lg font-semibold text-ink">

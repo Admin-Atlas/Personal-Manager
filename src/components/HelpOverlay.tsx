@@ -35,12 +35,14 @@ export function HelpOverlay() {
 
   return (
     <>
-      <div className="pointer-events-none fixed left-1/2 top-3 z-40 -translate-x-1/2 rounded-full border border-border2 bg-surface px-3 py-1 text-xs text-ink2 shadow-lg">
+      {/* Above Modal's z-50 scrim: help mode is usable *inside* a dialog too, and at z-40 its
+          banner and card were painted behind one — invisible against an opaque dialog. */}
+      <div className="pointer-events-none fixed left-1/2 top-3 z-[60] -translate-x-1/2 rounded-full border border-border2 bg-surface px-3 py-1 text-xs text-ink2 shadow-lg">
         Help mode on — hover a highlighted section. Turn off in Settings.
       </div>
 
       {entry && (
-        <div className="pointer-events-none fixed bottom-4 left-1/2 z-40 w-[28rem] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-[var(--radius)] border border-border2 bg-surface p-4 shadow-2xl backdrop-blur">
+        <div className="pointer-events-none fixed bottom-4 left-1/2 z-[60] w-[28rem] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-[var(--radius)] border border-border2 bg-surface p-4 shadow-2xl backdrop-blur">
           <p className="text-sm font-semibold text-accent-text">{entry.title}</p>
           <p className="mt-1 text-sm leading-relaxed text-ink2">{entry.body}</p>
         </div>
@@ -51,7 +53,7 @@ export function HelpOverlay() {
       <Button
         variant="secondary"
         onClick={() => setEnabled(false)}
-        className="fixed bottom-4 right-4 z-40 text-xs shadow-lg"
+        className="fixed bottom-4 right-4 z-[60] text-xs shadow-lg"
       >
         Exit help mode
       </Button>

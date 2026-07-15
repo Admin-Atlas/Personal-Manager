@@ -484,7 +484,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "pinboard-folder": {
     title: "A folder",
-    body: "A group of notes and timelines, kept in one tile so the board stays tidy. It shows how many cards are inside; click it to open them, and give it a title like any other card. Drag a card onto it — pointer over the folder — to file that card away. Folders don't go inside folders: drag one onto another and they simply stack, each keeping its own cards. The ✕ ungroups the folder, spilling its cards back onto the board rather than deleting them.",
+    body: "A group of notes and timelines, kept in one tile so the board stays tidy. It shows how many cards are inside; click it to open them, and give it a title like any other card. Drag a card onto it — pointer over the folder — to file that card away. Folders don't go inside folders: drag one onto another and they simply stack, each keeping its own cards. The ✕ ungroups the folder, spilling its cards back onto the board rather than deleting them. Once open, 'In place' shows the cards as a compact grid beside the folder, and 'Overlay' opens the folder's own pinboard over the middle of the screen, where the cards keep their real shape and size.",
+  },
+  "pinboard-folder-board": {
+    title: "The folder's pinboard",
+    body: "Inside a folder you get a board of its own, at 80% of your main one. The cards keep the shape and size you gave them, and you drag, resize and overlap them in here exactly as you do outside — a folder is a place to put things, not a different kind of thing. Nothing files into anything in here: folders don't nest, so a card dropped on another simply overlaps it. Use ⤴ on a card to move it back out to the main board.",
   },
   "pinboard-timeline-view": {
     title: "List or line",
