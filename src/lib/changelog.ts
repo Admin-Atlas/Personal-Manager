@@ -19,6 +19,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.14.0-alpha",
+    date: "2026-07-15",
+    highlights: [
+      "Pinboard folders are now something you make on purpose. There's a + Folder button beside + Note and + Timeline that drops an empty folder on the board, ready to tidy things into. Stacking one card exactly on top of another still folds the two together, as before.",
+      "Filing a card into a folder now follows your mouse, not the card. Until now, dragging a note so that any part of it merely touched a folder was enough for the folder to swallow it — which made big notes almost impossible to park near a folder. Now a card only goes in if your pointer is over the folder when you let go, and the folder lights up to show it's about to catch it. Anywhere else, the card just lands where you put it and overlaps, the way notes and timelines already do.",
+      "Folders no longer swallow each other. Dragging a folder onto another one used to tip its notes into it and destroy the folder you were holding. Now they simply stack, each keeping its own cards — and a folder dropped squarely on another shuffles over a cell so you can still get at the one underneath.",
+      "A folder now stays until you ungroup it. It used to vanish the moment it was down to one card, popping that card back onto the board. That made a folder feel like a temporary side-effect rather than a thing you own — and an empty one you'd just made couldn't survive at all. Its ✕ still ungroups it and spills the cards back out, which remains the way to get rid of one.",
+      "Fixed: opening a folder in place could squeeze a note's card so narrowly that its delete button was pushed out of sight and its title had no room left. The panel now lays its cards out in two columns whatever the size of your window (it was quietly using three on a wide screen), and each card's title is guaranteed a bit of space of its own.",
+    ],
+  },
+  {
     version: "3.13.0-alpha",
     date: "2026-07-15",
     highlights: [

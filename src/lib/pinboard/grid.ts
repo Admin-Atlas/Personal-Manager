@@ -9,7 +9,7 @@
  *  takes the current `cols`/`rows` bounds, defaulting to the legacy floor for callers that don't
  *  care. The cell size (`CELL`) and every font stay fixed — only the number of cells changes. */
 
-import type { Rect, Widget, WidgetKind } from "./types";
+import type { CellPoint, Rect, Widget, WidgetKind } from "./types";
 
 /** Pixels per grid cell — fixed. The board's pixel size is cols×CELL by rows×CELL. */
 export const CELL = 24;
@@ -20,7 +20,8 @@ export const ROWS = 28;
 /** Smallest a note/timeline may be shrunk to (cells), so a resize can't make it unusable. */
 export const MIN_W = 4;
 export const MIN_H = 3;
-/** A collapsed folder is a fixed, compact tile — smaller than a note (it isn't resizable). */
+/** A collapsed folder starts as a compact tile — smaller than a note. It IS resizable (every kind
+ *  is); this is its default and its floor, not a fixed size. */
 export const FOLDER_W = 3;
 export const FOLDER_H = 3;
 
@@ -82,6 +83,12 @@ export function rectsOverlap(a: Rect, b: Rect): boolean {
   return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 }
 
+/** Is a cell point inside a rect? Half-open on the far edges, matching {@link rectsOverlap}, so a
+ *  point on a rect's right/bottom boundary belongs to the neighbour, never to both. */
+export function rectContains(r: Rect, p: CellPoint): boolean {
+  return p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h;
+}
+
 /**
  * Find a free top-left slot for a new `w×h` widget by scanning the grid row-major, skipping
  * cells that would overlap an existing widget. Falls back to the origin (allowing overlap)
@@ -129,45 +136,42 @@ export function reflowToWidth(widgets: Widget[], cols: number, rows: number): Wi
 
 // --- folders (pure) ------------------------------------------------------------------------------
 
-/** The widgets a container contributes to a merge: a folder yields its children (never itself, so
- *  folders can't nest), anything else yields itself. */
-function flatten(w: Widget): Widget[] {
-  return w.kind === "folder" ? (w.children ?? []) : [w];
-}
-
 /**
- * Normalise a widget list so no folder is left with ≤1 child (auto-dissolve). A folder reduced to a
- * single child is replaced by that child at the folder's own position; an empty folder disappears.
- * Run after any child removal / pop-out and on load, so a hand-edited or drained folder self-heals.
+ * The folder a move-drop would file into: the TOP-MOST folder whose rect contains the **pointer**.
+ *
+ * This is the single source of truth for "would this drop file into a folder?" — {@link resolveDrop}
+ * and the view's during-drag highlight both call it, so what the user is shown and what actually
+ * happens cannot drift apart.
+ *
+ * The pointer decides, not the dragged rect: a big note only *overlapping* a folder is placed
+ * normally (widgets are free to overlap), so filing stays a deliberate aim rather than a graze.
+ *
+ * Returns undefined when there's no pointer (a drop with no known pointer must never file — see
+ * usePinboard), nothing is under it, or the moving widget is itself a folder: **folders never nest,
+ * so a dragged folder just stacks.**
  */
-export function dissolveFolders(
+export function folderAtPointer(
   widgets: Widget[],
-  cols: number = COLS,
-  rows: number = ROWS,
-): Widget[] {
-  return widgets.flatMap((w) => {
-    if (w.kind !== "folder") return [w];
-    const kids = w.children ?? [];
-    if (kids.length >= 2) return [w];
-    if (kids.length === 1) {
-      const c = kids[0];
-      return [
-        {
-          ...c,
-          rect: clampRect({ ...c.rect, x: w.rect.x, y: w.rect.y }, cols, rows, minSize(c.kind)),
-        },
-      ];
-    }
-    return []; // 0 children → the folder is gone
-  });
+  movingId: string,
+  pointer: CellPoint | null,
+): Widget | undefined {
+  if (!pointer) return undefined;
+  const moving = widgets.find((w) => w.id === movingId);
+  if (!moving || moving.kind === "folder") return undefined;
+  // Array order IS paint order (raiseWidget appends), so search from the top down: with folders
+  // free to stack, the one the user can actually see must win.
+  return [...widgets]
+    .reverse()
+    .find((w) => w.id !== movingId && w.kind === "folder" && rectContains(w.rect, pointer));
 }
 
 /**
  * Resolve where a just-moved widget `id` lands at cell-`rect`, returning the next widget list:
- *   1. If the drop overlaps an existing folder → add the widget into that folder (folder-onto-folder
- *      flattens the moved folder's children in; no nesting).
- *   2. Else if another loose widget sits at the exact same rect → combine both into a NEW folder at
- *      that spot (the deliberate "stack them to fold" gesture).
+ *   1. Pointer over a folder → file the widget into it (see {@link folderAtPointer}).
+ *   2. Else another loose widget at the exact same rect → combine the two into a NEW folder at that
+ *      spot (the deliberate "stack them to fold" gesture). Folders are excluded on BOTH sides: two
+ *      folders share the default 3×3 tile, so they are exact-rect twins the moment they're stacked,
+ *      and folding them would destroy both shells and merge their notes.
  *   3. Else a plain move.
  * Pure: `makeId` is supplied so the function stays deterministic and unit-testable.
  */
@@ -178,26 +182,33 @@ export function resolveDrop(
   cols: number,
   rows: number,
   makeId: () => string,
+  pointer: CellPoint | null,
 ): Widget[] {
   const moving = widgets.find((w) => w.id === id);
   if (!moving) return widgets;
   const rest = widgets.filter((w) => w.id !== id);
 
-  // 1) Drop onto a folder → add (also handles folder-onto-folder by flattening; the moved shell goes).
-  const folder = rest.find((w) => w.kind === "folder" && rectsOverlap(rect, w.rect));
+  // 1) Pointer over a folder → file it in. (Never fires for a moving folder — no nesting.)
+  const folder = folderAtPointer(widgets, id, pointer);
   if (folder) {
     return rest.map((w) =>
-      w.id === folder.id ? { ...w, children: [...(w.children ?? []), ...flatten(moving)] } : w,
+      w.id === folder.id ? { ...w, children: [...(w.children ?? []), moving] } : w,
     );
   }
 
-  // 2) Exact-rect twin → make a folder from the two identically-placed widgets. (A folder twin is
-  //    always caught by (1) first, since an exact match is an overlap, so `twin` is never a folder.)
-  const twin = rest.find(
-    (w) => w.rect.x === rect.x && w.rect.y === rect.y && w.rect.w === rect.w && w.rect.h === rect.h,
-  );
+  // 2) Exact-rect twin → fold the two identically-placed widgets into a new folder.
+  const twin =
+    moving.kind === "folder"
+      ? undefined
+      : rest.find(
+          (w) =>
+            w.kind !== "folder" &&
+            w.rect.x === rect.x &&
+            w.rect.y === rect.y &&
+            w.rect.w === rect.w &&
+            w.rect.h === rect.h,
+        );
   if (twin) {
-    const children = [...flatten(twin), ...flatten(moving)];
     const folderRect = clampRect(
       { x: rect.x, y: rect.y, w: FOLDER_W, h: FOLDER_H },
       cols,
@@ -209,12 +220,28 @@ export function resolveDrop(
       kind: "folder",
       rect: folderRect,
       title: "",
-      children,
+      children: [twin, moving],
       expandMode: "inline",
     };
     return [...rest.filter((w) => w.id !== twin.id), newFolder];
   }
 
-  // 3) Plain move (keep array position; raiseWidget already ran on grab).
-  return widgets.map((w) => (w.id === id ? { ...w, rect } : w));
+  // 3) Plain move (keep array position; raiseWidget already ran on grab). Two folders now stack
+  //    rather than merge — but a folder landing EXACTLY on another is pixel-identical and would hide
+  //    it completely, with no way to grab the one underneath, so nudge it clear by a cell.
+  const landing =
+    moving.kind === "folder" &&
+    rest.some((w) => w.kind === "folder" && w.rect.x === rect.x && w.rect.y === rect.y)
+      ? clampRect({ ...rect, x: rect.x + 1, y: rect.y + 1 }, cols, rows, minSize(moving.kind))
+      : rect;
+  // Unchanged landing → hand back the same array, so a click-without-moving stays a no-op.
+  if (
+    landing.x === moving.rect.x &&
+    landing.y === moving.rect.y &&
+    landing.w === moving.rect.w &&
+    landing.h === moving.rect.h
+  ) {
+    return widgets;
+  }
+  return widgets.map((w) => (w.id === id ? { ...w, rect: landing } : w));
 }

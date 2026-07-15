@@ -468,7 +468,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Pinboard (spec §4) — a free-form planning board
   "pinboard-board": {
     title: "Your planning board",
-    body: "A free space to think. Add notes and timelines, then drag them anywhere and resize from the bottom-right corner — they snap to a grid and stay where you put them between visits. The board is saved on this device, encrypted with the rest of your data, and is separate from your indexed documents.",
+    body: "A free space to think. Add notes, timelines and folders, then drag them anywhere and resize from the bottom-right corner — they snap to a grid and stay where you put them between visits. Cards are free to overlap; to file one into a folder, drop it with your mouse pointer over the folder. The board is saved on this device, encrypted with the rest of your data, and is separate from your indexed documents.",
   },
   "pinboard-add-note": {
     title: "Add a note",
@@ -477,6 +477,18 @@ export const HELP: Record<string, HelpEntry> = {
   "pinboard-add-timeline": {
     title: "Add a timeline",
     body: "Drops a timeline card for laying out dated milestones in order — handy for sketching a plan at a glance.",
+  },
+  "pinboard-add-folder": {
+    title: "Add a folder",
+    body: "Drops an empty folder on the board to tidy things into. Drag a note or timeline so your mouse pointer is over the folder and let go to file it inside — the folder lights up when it's going to catch what you're holding. (Dropping a card so it merely overlaps a folder just leaves it lying on top, the same as notes overlap each other.) You can also make a folder without this button, by dropping one card exactly on top of another the same size. A folder stays until you ungroup it with its ✕, however few cards are left in it — so an empty one will happily sit and wait.",
+  },
+  "pinboard-folder": {
+    title: "A folder",
+    body: "A group of notes and timelines, kept in one tile so the board stays tidy. It shows how many cards are inside; click it to open them, and give it a title like any other card. Drag a card onto it — pointer over the folder — to file that card away. Folders don't go inside folders: drag one onto another and they simply stack, each keeping its own cards. The ✕ ungroups the folder, spilling its cards back onto the board rather than deleting them.",
+  },
+  "pinboard-timeline-view": {
+    title: "List or line",
+    body: "Two ways to show this timeline's entries: as a stacked list of rows, or laid out left to right along a line in date order. Purely how it looks — the entries and their dates are the same either way — so pick whichever reads better at the size you've made the card.",
   },
   "pinboard-note": {
     title: "A note",

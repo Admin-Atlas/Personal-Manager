@@ -27,7 +27,15 @@ import {
   updateMilestone,
 } from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
-import { CELL, COLS, ROWS, boundsForPx, minSize, pxRectToCells } from "../lib/pinboard/grid";
+import {
+  CELL,
+  COLS,
+  ROWS,
+  boundsForPx,
+  folderAtPointer,
+  minSize,
+  pxRectToCells,
+} from "../lib/pinboard/grid";
 import {
   applyLineMarker,
   continueList,
@@ -42,7 +50,7 @@ import { usePinboard } from "../lib/pinboard/usePinboard";
 // The tint set + names live in one place (src/lib/pinboard/palette.ts) so the board's colours
 // stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
 import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
-import type { Rect, TimelineItem, Widget, WidgetKind } from "../lib/pinboard/types";
+import type { CellPoint, Rect, TimelineItem, Widget, WidgetKind } from "../lib/pinboard/types";
 import type { Milestone } from "../lib/types";
 import { useDepth } from "../theme";
 import { Button, Modal, SegmentedControl, Textarea, Tooltip } from "./ui";
@@ -78,6 +86,12 @@ interface DragStart {
 
 function rectToPx(r: Rect): PxRect {
   return { x: r.x * CELL, y: r.y * CELL, w: r.w * CELL, h: r.h * CELL };
+}
+
+/** A cell rect as absolute-positioning styles — for overlays drawn over a widget's own tile. */
+function rectToPxStyle(r: Rect): CSSProperties {
+  const px = rectToPx(r);
+  return { left: px.x, top: px.y, width: px.w, height: px.h };
 }
 
 /** The tint applied to a widget tile (and its folder-panel card) — a soft wash of its colour token
@@ -143,6 +157,7 @@ export function PinboardView() {
     board,
     addNote,
     addTimeline,
+    addFolder,
     updateWidget,
     moveWidget,
     dropWidget,
@@ -156,6 +171,12 @@ export function PinboardView() {
 
   const [drag, setDrag] = useState<DragStart | null>(null);
   const [livePx, setLivePx] = useState<PxRect | null>(null);
+  // The board element itself (scrollRef is its scroller) — needed to turn a viewport pointer
+  // position into a board cell, which is what decides whether a drop files into a folder.
+  const boardRef = useRef<HTMLDivElement>(null);
+  // The folder the pointer is currently over mid-drag (highlighted, and the one a release would file
+  // into). Pointer targeting is otherwise invisible — nothing about the dragged rect shows intent.
+  const [dropFolderId, setDropFolderId] = useState<string | null>(null);
   // Which folder is currently expanded (transient — not persisted). At most one at a time.
   const [expandedFolderId, setExpandedFolderId] = useState<string | null>(null);
   // A just-added widget id to scroll into view (set by the add buttons; cleared once scrolled).
@@ -178,6 +199,10 @@ export function PinboardView() {
   // current board without the effect re-subscribing to pointer events on every resize.
   const boardBoundsRef = useRef(boardBounds);
   boardBoundsRef.current = boardBounds;
+  // Likewise the widget list, which the drag reads to find the folder under the pointer: as a dep it
+  // would re-subscribe the pointer listeners on every keystroke (a note's text lives in the board).
+  const widgetsRef = useRef(board.widgets);
+  widgetsRef.current = board.widgets;
 
   // Live filing state of any ingested notes, so a note can show "in review" / "filed to X" and
   // reflect a later review made in the Review tab. One list_documents read on mount + on focus.
@@ -231,7 +256,22 @@ export function PinboardView() {
         h: Math.max(min.h * CELL, Math.min(startPx.h + dy, maxY - startPx.y)),
       };
     };
-    const onMove = (e: PointerEvent) => setLivePx(compute(e));
+    // The board cell under the pointer. The origin is read LIVE rather than cached at grab, because
+    // the board sits in a scroller the user can wheel mid-drag — a stale origin would make the
+    // highlight promise one thing and the drop do another. (Same approach as GraphView.)
+    const pointerCell = (e: PointerEvent): CellPoint | null => {
+      const el = boardRef.current;
+      if (!el || drag.mode !== "move") return null;
+      const r = el.getBoundingClientRect();
+      return {
+        x: Math.floor((e.clientX - r.left) / CELL),
+        y: Math.floor((e.clientY - r.top) / CELL),
+      };
+    };
+    const onMove = (e: PointerEvent) => {
+      setLivePx(compute(e));
+      setDropFolderId(folderAtPointer(widgetsRef.current, drag.id, pointerCell(e))?.id ?? null);
+    };
     const onUp = (e: PointerEvent) => {
       const rect = pxRectToCells(
         compute(e),
@@ -239,12 +279,13 @@ export function PinboardView() {
         boardBoundsRef.current.rows,
         minSize(drag.kind),
       );
-      // Resize just repositions; a move goes through dropWidget, which may fold two stacked widgets
-      // into a folder or drop one into an existing folder.
+      // Resize just repositions; a move goes through dropWidget, which may file the widget into the
+      // folder under the pointer or fold two stacked widgets into a new one.
       if (drag.mode === "resize") moveWidget(drag.id, rect);
-      else dropWidget(drag.id, rect);
+      else dropWidget(drag.id, rect, pointerCell(e));
       setDrag(null);
       setLivePx(null);
+      setDropFolderId(null);
     };
     // If the gesture is interrupted (touch handed to the scroller, an OS context menu,
     // the window losing focus), the browser fires pointercancel/blur instead of pointerup.
@@ -291,6 +332,7 @@ export function PinboardView() {
   // row would otherwise be created off-screen).
   const handleAddNote = useCallback(() => setPendingScrollId(addNote()), [addNote]);
   const handleAddTimeline = useCallback(() => setPendingScrollId(addTimeline()), [addTimeline]);
+  const handleAddFolder = useCallback(() => setPendingScrollId(addFolder()), [addFolder]);
   useLayoutEffect(() => {
     if (!pendingScrollId) return;
     const el = scrollRef.current;
@@ -316,7 +358,9 @@ export function PinboardView() {
     setPendingScrollId(null);
   }, [pendingScrollId, board.widgets]);
 
-  // If the expanded folder dissolves (its last child removed/popped), close the panel.
+  // If the expanded folder goes away (ungrouped while open), close the panel. Emptying a folder no
+  // longer removes it, so this no longer fires on the last child leaving — the panel stays open on
+  // "This folder is empty.", ready to take something back.
   useEffect(() => {
     if (
       expandedFolderId &&
@@ -328,6 +372,10 @@ export function PinboardView() {
 
   const expandedFolder = expandedFolderId
     ? board.widgets.find((w) => w.id === expandedFolderId && w.kind === "folder")
+    : undefined;
+
+  const dropFolder = dropFolderId
+    ? board.widgets.find((w) => w.id === dropFolderId && w.kind === "folder")
     : undefined;
 
   return (
@@ -366,11 +414,21 @@ export function PinboardView() {
           >
             + Timeline
           </Button>
+          {/* An empty folder, made deliberately — the counterpart to stacking two cards to fold them. */}
+          <Button
+            variant="secondary"
+            onClick={handleAddFolder}
+            className="px-2.5 py-1 text-xs"
+            data-help="pinboard-add-folder"
+          >
+            + Folder
+          </Button>
         </div>
       </header>
 
       <div ref={scrollRef} className="pm-scrollbars min-h-0 min-w-0 flex-1 overflow-auto p-6">
         <div
+          ref={boardRef}
           data-help="pinboard-board"
           className={`relative rounded-[var(--radius)] border border-border ${
             drag ? "select-none" : ""
@@ -462,6 +520,17 @@ export function PinboardView() {
               </div>
             );
           })}
+
+          {/* The folder the pointer is over mid-drag: releasing here files the card INTO it, instead
+              of leaving it lying on top. Drawn as an overlay rather than a ring on the folder's own
+              tile because the dragged widget is raised above it and would hide the cue. */}
+          {dropFolder && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute z-20 rounded-[var(--radius-sm)] ring-2 ring-accent"
+              style={rectToPxStyle(dropFolder.rect)}
+            />
+          )}
 
           {/* Expanded folder (transient UI, at most one). Rendered as a board sibling so the inline
               panel escapes the tiles' overflow-hidden and paints above them; the tile's rect never moves. */}
@@ -623,19 +692,24 @@ function WidgetHeader({
       }`}
     >
       {/* stopPropagation on pointerdown so a click edits the title instead of starting a drag
-          (mirrors the ✕ button). The title now grows to fill the bar (nearly up to the actions),
-          and a fixed drag spacer to its right keeps a reliable grab zone even for a long title. */}
+          (mirrors the ✕ button). `basis-12 grow shrink` — NOT `flex-1`, whose `flex-basis: 0` means
+          the title only ever gets *leftover* space, and so collapses to nothing on a narrow card
+          (a folder-panel one) where there is none. A real basis reserves it a floor first. */}
       <input
         value={widget.title ?? ""}
         onChange={(e) => onRename(e.target.value)}
         onPointerDown={(e) => e.stopPropagation()}
         placeholder={placeholder}
         aria-label={`${placeholder} title`}
-        className="min-w-0 flex-1 truncate border-0 bg-transparent px-0 text-xs font-medium text-ink3 placeholder:text-ink4 focus:text-ink2 focus:outline-none focus:ring-0"
+        className="min-w-0 shrink grow basis-12 truncate border-0 bg-transparent px-0 text-xs font-medium text-ink3 placeholder:text-ink4 focus:text-ink2 focus:outline-none focus:ring-0"
       />
-      {/* An always-present drag grip so a long title still leaves somewhere to grab the header. */}
-      <div className="w-6 shrink-0 self-stretch" aria-hidden="true" />
-      <div className="flex shrink-0 items-center gap-1">
+      {/* A drag grip so a long title still leaves somewhere to grab the header — only where the
+          header IS a handle. Folder-panel cards aren't draggable, so the spacer was 24px of a narrow
+          card's budget spent on nothing. */}
+      {onStartDrag && <div className="w-6 shrink-0 self-stretch" aria-hidden="true" />}
+      {/* min-w-0 shrink, not shrink-0: the actions must be able to give, or they overflow the card
+          (which is overflow-hidden) and the ✕ on the end is what gets clipped away. */}
+      <div className="flex min-w-0 shrink items-center gap-1">
         {actions}
         <button
           onPointerDown={(e) => e.stopPropagation()}
@@ -829,7 +903,10 @@ const NoteBody = memo(function NoteBody({
   ) : (
     <>
       <span
-        className="max-w-[8rem] truncate text-[10px] text-ink4"
+        // Shrinkable and capped short: this span is the widest thing in the bar on an ingested note
+        // ("Filed · <project>"), and on a folder-panel card it would otherwise push the ✕ out. The
+        // full text is on the tooltip, so truncating hard costs nothing.
+        className="min-w-0 shrink truncate text-[10px] text-ink4"
         title={
           status
             ? status.reviewed
@@ -1149,8 +1226,8 @@ function TimelineList({ children }: { children: ReactNode }) {
   return <div className="min-h-0 flex-1 space-y-1 overflow-auto">{children}</div>;
 }
 
-/** A collapsed folder tile (3×3): the shared header (editable title + Ungroup) over a big button
- *  showing the child count, which opens the folder. Not resizable (the outer loop omits the handle). */
+/** A collapsed folder tile (3×3 by default, resizable like every kind): the shared header (editable
+ *  title + Ungroup) over a big button showing the child count, which opens the folder. */
 function FolderTile({
   widget,
   onChange,
@@ -1211,7 +1288,8 @@ function FolderGlyph() {
 /** The expanded folder view (inline panel or overlay): editable title, a presentation toggle, and
  *  a grid of the contained cards — each the SAME NoteBody/TimelineBody, so children edit/ingest just
  *  like board widgets. Children carry no drag handle (they aren't board-positioned) but get a
- *  pop-out control; a child's ✕ deletes it (and auto-dissolves the folder at ≤1). */
+ *  pop-out control; a child's ✕ deletes it. The folder itself stays however few cards are left —
+ *  emptying it is not the same as wanting it gone. */
 function FolderPanel({
   folder,
   onChange,
@@ -1268,7 +1346,11 @@ function FolderPanel({
         {children.length === 0 ? (
           <p className="text-xs text-ink4">This folder is empty.</p>
         ) : (
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+          /* Always two columns. `lg:grid-cols-3` was a VIEWPORT query on a panel that is a fixed
+             576px wide: on any window past 1024px it squeezed three ~175px cards in, which is what
+             pushed each card's ✕ out of sight. The panel's width doesn't depend on the window, so
+             neither should its column count. */
+          <div className="grid grid-cols-2 gap-3">
             {children.map((c) => (
               <div
                 key={c.id}
