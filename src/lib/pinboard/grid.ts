@@ -166,8 +166,24 @@ export function folderAtPointer(
 }
 
 /**
+ * A card's landing spot INSIDE a folder: a free slot among its siblings, at the card's exact size.
+ *
+ * A child's rect is its position on the folder's own board (what the overlay lays out), so filing has
+ * to choose one — the card's board rect is meaningless in there, and in the twin-fold case both cards
+ * are at the *same* rect by definition, so keeping it would stack one exactly on top of the other.
+ *
+ * `cols`/`rows` are the outer board's extent, which is always ≥ any card that was sitting on it, so
+ * findFreeRect's `Math.min` clamp can't fire and the size is preserved exactly — which is the whole
+ * point of the folder board.
+ */
+function placeInFolder(siblings: Widget[], size: Rect, cols: number, rows: number): Rect {
+  return findFreeRect(siblings, size.w, size.h, cols, rows);
+}
+
+/**
  * Resolve where a just-moved widget `id` lands at cell-`rect`, returning the next widget list:
- *   1. Pointer over a folder → file the widget into it (see {@link folderAtPointer}).
+ *   1. Pointer over a folder → file the widget into it (see {@link folderAtPointer}), laid out clear
+ *      of its new siblings.
  *   2. Else another loose widget at the exact same rect → combine the two into a NEW folder at that
  *      spot (the deliberate "stack them to fold" gesture). Folders are excluded on BOTH sides: two
  *      folders share the default 3×3 tile, so they are exact-rect twins the moment they're stacked,
@@ -191,9 +207,9 @@ export function resolveDrop(
   // 1) Pointer over a folder → file it in. (Never fires for a moving folder — no nesting.)
   const folder = folderAtPointer(widgets, id, pointer);
   if (folder) {
-    return rest.map((w) =>
-      w.id === folder.id ? { ...w, children: [...(w.children ?? []), moving] } : w,
-    );
+    const kids = folder.children ?? [];
+    const filed: Widget = { ...moving, rect: placeInFolder(kids, moving.rect, cols, rows) };
+    return rest.map((w) => (w.id === folder.id ? { ...w, children: [...kids, filed] } : w));
   }
 
   // 2) Exact-rect twin → fold the two identically-placed widgets into a new folder.
@@ -215,12 +231,16 @@ export function resolveDrop(
       rows,
       FOLDER_MIN,
     );
+    // The two are at the SAME rect — that's the gesture — so they must be laid out afresh inside the
+    // folder, or the overlay would render one exactly on top of the other.
+    const first: Widget = { ...twin, rect: placeInFolder([], twin.rect, cols, rows) };
+    const second: Widget = { ...moving, rect: placeInFolder([first], moving.rect, cols, rows) };
     const newFolder: Widget = {
       id: makeId(),
       kind: "folder",
       rect: folderRect,
       title: "",
-      children: [twin, moving],
+      children: [first, second],
       expandMode: "inline",
     };
     return [...rest.filter((w) => w.id !== twin.id), newFolder];

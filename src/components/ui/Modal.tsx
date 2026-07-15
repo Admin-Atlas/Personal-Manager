@@ -6,7 +6,7 @@
 // the same under any accent). Consolidates the app's ad-hoc bg-neutral-950/80 overlays and backs
 // the design's Approval / Permission patterns.
 
-import { useEffect, type ReactNode } from "react";
+import { useEffect, type CSSProperties, type ReactNode } from "react";
 import { cn } from "./cn";
 
 export interface ModalProps {
@@ -15,6 +15,17 @@ export interface ModalProps {
   children: ReactNode;
   /** Width class for the dialog (default max-w-lg). */
   widthClassName?: string;
+  /** Height class for the dialog (default max-h-[85vh]). REPLACES the default rather than competing
+   *  with it: `cn` is a plain joiner, not tailwind-merge, so passing a rival max-h-* through
+   *  `className` leaves both in the class list and lets stylesheet order decide the winner. */
+  heightClassName?: string;
+  /** Overflow class for the dialog (default overflow-y-auto) — same replace-not-compete reason. A
+   *  dialog that manages its own scrolling inside (e.g. a board) passes `overflow-hidden`. */
+  overflowClassName?: string;
+  /** Inline styles for the dialog — for a size only known at runtime (e.g. a share of a measured
+   *  surface), which no class can express. Beats the class defaults, so pair it with the
+   *  `*ClassName` seams above rather than leaving a rival class in play. */
+  style?: CSSProperties;
   className?: string;
   labelledBy?: string;
 }
@@ -24,6 +35,9 @@ export function Modal({
   onClose,
   children,
   widthClassName,
+  heightClassName,
+  overflowClassName,
+  style,
   className,
   labelledBy,
 }: ModalProps) {
@@ -53,8 +67,11 @@ export function Modal({
         role="dialog"
         aria-modal="true"
         aria-labelledby={labelledBy}
+        style={style}
         className={cn(
-          "max-h-[85vh] w-full overflow-y-auto rounded-[var(--radius)] border border-border2 bg-surface shadow-2xl",
+          "w-full rounded-[var(--radius)] border border-border2 bg-surface shadow-2xl",
+          heightClassName ?? "max-h-[85vh]",
+          overflowClassName ?? "overflow-y-auto",
           widthClassName ?? "max-w-lg",
           className,
         )}

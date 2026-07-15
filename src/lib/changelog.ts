@@ -19,6 +19,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.15.0-alpha",
+    date: "2026-07-15",
+    highlights: [
+      "Opening a folder as an overlay now gives you a pinboard, not a list. It fills 80% of the board, and the notes and timelines inside keep the shape and size you gave them — you can drag them around, resize them and overlap them in there exactly as you do outside. Cards are laid out clear of each other when they go in, so nothing hides behind anything else. Opening a folder “in place” is unchanged, if you prefer the compact card view.",
+      "The board is now a fixed size — your screen — instead of quietly resizing with the window. It used to be as wide as the window and grew downward to wherever your lowest note sat, so the same board changed shape depending on how you'd sized PM. Now it's one canvas that simply scrolls if the window is smaller than it, and a board you made on a bigger monitor still tidies itself in to fit.",
+      "Fixed: help mode couldn't be read inside any pop-up window — its labels were painted behind them. They now sit on top.",
+      "Fixed: What's New asked to be 80% of the window's height and was silently getting 85%.",
+      "Under-the-hood tidying: the board's drag-and-drop, its grid, and its cards are now one shared implementation used by both the main board and the one inside a folder, so the two can't drift apart. Dragging with a folder open is also markedly less work for your machine.",
+    ],
+  },
+  {
     version: "3.14.0-alpha",
     date: "2026-07-15",
     highlights: [
