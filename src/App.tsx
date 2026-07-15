@@ -59,6 +59,7 @@ import {
   onVaultMetaWarning,
   openUrl,
   resumeDriveSync,
+  resumeRebuild,
   resumeLocalFolderSync,
   resumeOneDriveSync,
   reviewQueueCount,
@@ -442,6 +443,15 @@ export default function App() {
   // Same for an interrupted OneDrive sync (independent connector, its own resume marker).
   useEffect(() => {
     if (keySet) void resumeOneDriveSync().catch(() => {});
+  }, [keySet]);
+
+  // Resume a rebuild interrupted by a previous close/crash. Unlike the connector resumes above this
+  // one RESTARTS the rebuild rather than continuing it — a rebuild drops the index before it
+  // re-ingests and keeps no per-document checkpoint. That is the honest trade: the marker only
+  // survives when the index was left half-built, and a half-built index means search is quietly
+  // degraded until it's rebuilt. A no-op when there's nothing pending.
+  useEffect(() => {
+    if (keySet) void resumeRebuild().catch(() => {});
   }, [keySet]);
 
   // And an interrupted local-folder sync (board card 6, its own resume marker). The live filesystem

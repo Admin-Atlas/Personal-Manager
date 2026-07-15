@@ -63,6 +63,17 @@ const TIME_ZONE_KEY: &str = "time_zone";
 /// (security preference → backend), not localStorage.
 const APP_LOCK_ENABLED_KEY: &str = "app_lock_enabled";
 
+/// Marker for a rebuild started but not cleanly finished (crash-resume) — the ingest sibling of
+/// `DRIVE_SYNC_PENDING_KEY`. Written before the rebuild's first destructive statement and cleared
+/// only on success, so a value surviving a restart means the app closed mid-rebuild and the index
+/// is partial. `resume_rebuild` picks it up on launch.
+///
+/// Unlike a connector resume, this one restarts from zero rather than continuing: rebuild drops the
+/// index and re-ingests with no per-document checkpoint. That is still strictly better than leaving
+/// a half-built index (it is already dropped; it MUST be rebuilt) — but it is a weaker guarantee
+/// than the connectors', whose resume only does the work that was left.
+const REBUILD_PENDING_KEY: &str = "rebuild_pending";
+
 /// Caps for chat: the most we'll store for a single message, and how many prior
 /// turns we replay into a request. A long conversation or one giant pasted message
 /// would otherwise inflate every call (the spend lands on the user's own key).
@@ -2436,14 +2447,39 @@ pub async fn ingest_paths(
 /// restored to a FULL-body index — so connected files end up chunked from their whole contents, not a
 /// preview. The upgrade is best-effort and one item at a time: an unreachable source is left on its
 /// summary and healed by the next connector Sync (its `summary_indexed` flag forces a re-embed).
+///
+/// Progress is broadcast on the global `ingest://progress` event rather than a per-call `Channel`,
+/// so it reaches whatever view is mounted — including one that mounts long after the rebuild began.
+/// Read `rebuild_status` on mount for what was missed.
 #[tauri::command]
-pub async fn rebuild_index(app: AppHandle, on_event: Channel<IngestEvent>) -> Result<()> {
+pub async fn rebuild_index(app: AppHandle) -> Result<()> {
+    let sink = ingest::ProgressSink::new(app.clone());
+    rebuild_core(app, sink).await
+}
+
+/// The rebuild itself, over whatever progress sink the caller supplies — a user-started rebuild
+/// (channel + global) or one resumed on launch (global only). Owns the single-flight guard, the
+/// shared snapshot's lifecycle, and the crash-resume marker, so every entry point gets them.
+async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink) -> Result<()> {
+    // Single-flight. Rebuild is destructive-first, so a second concurrent run's `DELETE FROM
+    // documents` would destroy the first run's in-progress work — reachable before this guard by
+    // switching tabs (which resets the UI's own component-local guard) and clicking Rebuild again.
+    // Refuse loudly rather than silently no-op: the user pressed a button and deserves an answer.
+    // `state` is bound first so it outlives the guard borrowed out of it (locals drop in reverse).
+    let state = app.state::<AppState>();
+    let Some(_busy) = BusyGuard::acquire(&state.ingest_busy) else {
+        return Err(Error::Other(
+            "A rebuild is already running. It keeps going in the background — open the Documents \
+             tab to watch it."
+                .into(),
+        ));
+    };
+
     // Count reachable index-only items up front so the progress bar's total spans BOTH phases (the
     // vault rebuild AND the full-body re-index). Row ids change across the rebuild — it drops and
     // recreates them — so the second phase re-queries the set; the count is stable because a local
     // rebuild never changes a source's reachability.
     let extra_total = {
-        let state = app.state::<AppState>();
         let conn = state.conn()?;
         conn.query_row(
             "SELECT count(*) FROM documents WHERE source_type = 'index_only' AND source_state = 'ok'",
@@ -2451,19 +2487,66 @@ pub async fn rebuild_index(app: AppHandle, on_event: Channel<IngestEvent>) -> Re
             |r| r.get::<_, i64>(0),
         )? as usize
     };
-    let ev = on_event.clone();
-    let app2 = app.clone();
-    let (ingested, failed) =
-        tokio::task::spawn_blocking(move || ingest::rebuild(&app2, ev, extra_total))
-            .await
-            .map_err(|e| Error::Other(format!("rebuild task panicked: {e}")))??;
-    let (upgraded, up_failed) = upgrade_index_only_to_full_body(&app, &on_event).await?;
-    let _ = on_event.send(IngestEvent::Finished {
-        ingested: ingested + upgraded,
+
+    // Claim the snapshot for this run and persist the resume marker. The marker is written BEFORE
+    // any destructive work: from the first `DELETE FROM documents` until the clean exit below, the
+    // index is partial, and a close in that window must be recoverable on the next launch.
+    {
+        if let Ok(mut snap) = state.ingest_job.lock() {
+            *snap = crate::IngestJobState {
+                running: true,
+                ..Default::default()
+            };
+        }
+        if let Ok(conn) = state.conn() {
+            let _ = db::set_setting(&conn, REBUILD_PENDING_KEY, "1");
+        }
+    }
+
+    let result = rebuild_passes(&app, &sink, extra_total).await;
+
+    // Clear `running` on every path, success or failure, so a failed rebuild can't wedge the UI
+    // showing a phantom in-flight job for the rest of the session. The marker only clears on
+    // success: a failure leaves the index partial, which is exactly what resume is for.
+    {
+        if let Ok(mut snap) = state.ingest_job.lock() {
+            snap.running = false;
+        }
+        if result.is_ok() {
+            if let Ok(conn) = state.conn() {
+                let _ = db::set_setting(&conn, REBUILD_PENDING_KEY, "");
+            }
+        }
+    }
+
+    let (ingested, failed) = result?;
+    sink.send(IngestEvent::Finished {
+        ingested,
         skipped: 0,
-        failed: failed + up_failed,
+        failed,
     });
     Ok(())
+}
+
+/// Both rebuild phases: drop-and-rebuild from the vault, then upgrade index-only items to a full
+/// body. Split out so `rebuild_core` can bracket it with the guard/snapshot/marker teardown on
+/// every exit path, including the error ones.
+async fn rebuild_passes(
+    app: &AppHandle,
+    sink: &ingest::ProgressSink,
+    extra_total: usize,
+) -> Result<(usize, usize)> {
+    // `spawn_blocking` needs 'static, so the blocking phase gets its own clone of the sink — as the
+    // pre-sink code did with the bare Channel. Both clones address the same snapshot and emit the
+    // same global event, so progress is continuous across the phase boundary.
+    let app2 = app.clone();
+    let sink2 = sink.clone();
+    let (ingested, failed) =
+        tokio::task::spawn_blocking(move || ingest::rebuild(&app2, &sink2, extra_total))
+            .await
+            .map_err(|e| Error::Other(format!("rebuild task panicked: {e}")))??;
+    let (upgraded, up_failed) = upgrade_index_only_to_full_body(app, sink).await?;
+    Ok((ingested + upgraded, failed + up_failed))
 }
 
 /// After a Rebuild has restored index-only items from their ~500-char summaries, upgrade each
@@ -2474,7 +2557,7 @@ pub async fn rebuild_index(app: AppHandle, on_event: Channel<IngestEvent>) -> Re
 /// never fatal. Returns `(upgraded, failed)`.
 async fn upgrade_index_only_to_full_body(
     app: &AppHandle,
-    on_event: &Channel<IngestEvent>,
+    on_event: &ingest::ProgressSink,
 ) -> Result<(usize, usize)> {
     let items: Vec<(i64, String)> = {
         let state = app.state::<AppState>();
@@ -2490,7 +2573,7 @@ async fn upgrade_index_only_to_full_body(
     };
     let (mut upgraded, mut failed) = (0usize, 0usize);
     for (doc_id, title) in items {
-        let _ = on_event.send(IngestEvent::Started {
+        on_event.send(IngestEvent::Started {
             path: format!("idx://{doc_id}"),
             name: title,
         });
@@ -2505,12 +2588,12 @@ async fn upgrade_index_only_to_full_body(
         match outcome {
             Ok(document) => {
                 upgraded += 1;
-                let _ = on_event.send(IngestEvent::Done { document });
+                on_event.send(IngestEvent::Done { document });
             }
             Err(e) => {
                 // Leave it on its summary (the next Sync heals it) and report — never fatal.
                 failed += 1;
-                let _ = on_event.send(IngestEvent::Failed {
+                on_event.send(IngestEvent::Failed {
                     path: format!("idx://{doc_id}"),
                     error: e.to_string(),
                 });
@@ -4360,6 +4443,53 @@ fn resume_pending_sync(
     }
     let target: Option<String> = serde_json::from_str(&marker).unwrap_or(None);
     spawn(app, target);
+    Ok(true)
+}
+
+/// The currently-running rebuild snapshot (empty / `running:false` when idle), so the Documents tab
+/// and the Settings rebuild modal can resume showing progress after the user leaves and returns —
+/// the ingest sibling of [`drive_sync_status`]. Also carries the last finished run's counts, so a
+/// user who returns after it completed still sees the result.
+#[tauri::command]
+pub fn rebuild_status(state: State<'_, AppState>) -> Result<crate::IngestJobState> {
+    state
+        .ingest_job
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|_| Error::Other("rebuild state poisoned".into()))
+}
+
+/// Resume a rebuild a previous app session started but didn't finish (the app was closed/crashed
+/// mid-rebuild). Called once on launch. Returns whether a resume was kicked off.
+///
+/// A rebuild can't run while the app is closed, and it keeps no per-document checkpoint, so this
+/// **restarts** it rather than continuing it. That is the honest behaviour and still the right one:
+/// the marker only survives if the index was left partial, and a partial index is already dropped —
+/// search stays quietly degraded until it's rebuilt. No marker → nothing to resume.
+#[tauri::command]
+pub fn resume_rebuild(app: AppHandle) -> Result<bool> {
+    let marker: Option<String> = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, REBUILD_PENDING_KEY)?
+    };
+    // Cleared markers are stored as "" rather than deleted, so treat empty as nothing-to-do.
+    if marker.is_none_or(|m| m.is_empty()) {
+        return Ok(false);
+    }
+    // Don't stack on a rebuild already running this session.
+    if app
+        .state::<AppState>()
+        .ingest_busy
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok(false);
+    }
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let sink = ingest::ProgressSink::new(app2.clone());
+        let _ = rebuild_core(app2, sink).await;
+    });
     Ok(true)
 }
 

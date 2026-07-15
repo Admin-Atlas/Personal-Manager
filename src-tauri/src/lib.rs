@@ -162,6 +162,34 @@ pub struct LocalFolderSyncState {
     pub last_report: Option<localfolder::LocalSyncReport>,
 }
 
+/// A snapshot of the index rebuild that's currently running (if any) — the ingest sibling of
+/// [`CloudSyncState`], and for the same reason: the rebuild runs detached from the component that
+/// started it, so leaving the Documents tab (or starting it, then navigating away) doesn't stop it.
+/// Before this existed the backend kept working while the UI, having lost its per-call `Channel` on
+/// unmount, showed the interface of an idle machine — the user reasonably concluded it had died.
+/// The UI re-reads this on mount and follows the `ingest://progress` event live.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct IngestJobState {
+    pub running: bool,
+    pub processed: usize,
+    pub total: Option<usize>,
+    /// The latest `Preparing` message (engine install / model download), so a UI mounting mid-setup
+    /// shows the same indeterminate label as one that watched it start. Cleared once counting begins.
+    pub prep: Option<String>,
+    /// The most recent finished rebuild's counts, so a user returning after it completed still sees
+    /// the result — the live event only reaches a listener that was mounted. Cleared on a new run.
+    pub last_report: Option<IngestReport>,
+}
+
+/// The counts a finished rebuild reports, mirrored into [`IngestJobState`] so they survive the
+/// unmount of whichever view started the run.
+#[derive(Clone, serde::Serialize)]
+pub struct IngestReport {
+    pub ingested: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
 // The three detached-sync snapshots share their single-flight lifecycle through
 // [`connector_sync::SyncRunGuard`]; each exposes its `running`/`rerun` fields (and how to reset its
 // own counters + target) via [`connector_sync::SyncSlot`] so the guard can own that lifecycle
@@ -278,6 +306,15 @@ pub struct AppState {
     pub local_sync: Mutex<LocalFolderSyncState>,
     /// Cooperative stop flag for the running local-folder sync (the sibling of `drive_sync_cancel`).
     pub local_sync_cancel: AtomicBool,
+    /// Snapshot of the currently-running index rebuild, so the Documents tab (and the Settings
+    /// rebuild modal) can resume showing progress after the user navigates away and back — the
+    /// ingest sibling of `drive_sync`.
+    pub ingest_job: Mutex<IngestJobState>,
+    /// Single-flight guard for the rebuild. Rebuild is destructive-first (it drops the index, then
+    /// re-ingests), so two overlapping runs are not merely wasteful: the second's `DELETE FROM
+    /// documents` destroys the first's in-progress work. The UI's own guard is component-local and
+    /// resets on remount, which made that reachable by simply switching tabs and clicking again.
+    pub ingest_busy: AtomicBool,
     /// Snapshot of the semantic-map layout precompute (single-flight; running/method/last-error), so
     /// the Map can show progress and a second request folds into the running one. See `layout`.
     pub layout_job: Mutex<layout::LayoutJobState>,
@@ -898,6 +935,8 @@ pub fn run() {
                 onedrive_sync_cancel: AtomicBool::new(false),
                 local_sync: Mutex::new(LocalFolderSyncState::default()),
                 local_sync_cancel: AtomicBool::new(false),
+                ingest_job: Mutex::new(IngestJobState::default()),
+                ingest_busy: AtomicBool::new(false),
                 layout_job: Mutex::new(layout::LayoutJobState::default()),
                 last_user_activity: Mutex::new(Instant::now()),
                 chat_index_busy: AtomicBool::new(false),
@@ -1105,6 +1144,8 @@ pub fn run() {
             commands::drive_sync_status,
             commands::stop_drive_sync,
             commands::resume_drive_sync,
+            commands::rebuild_status,
+            commands::resume_rebuild,
             commands::list_drive_shared_drives,
             commands::drive_shared_owners,
             commands::list_drive_folders,

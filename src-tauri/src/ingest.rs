@@ -17,7 +17,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{Error, Result};
 use crate::model_gateway::ModelGateway;
@@ -85,6 +85,86 @@ pub struct Document {
     /// The stable source id for an index-only item (`None` for a vault document) — its manifest key
     /// and the handle the observe-and-react layer targets.
     pub source_id: Option<String>,
+}
+
+/// The global event a rebuild's progress is broadcast on, alongside the caller's `Channel`.
+/// A `Channel` is minted by whoever invokes the command, so only that caller can hear it — and
+/// the caller is a component that unmounts. This event reaches whatever view is mounted now.
+pub const REBUILD_EVENT: &str = "ingest://progress";
+
+/// Where a rebuild's progress goes: the global [`REBUILD_EVENT`] plus the `AppState::ingest_job`
+/// snapshot, together.
+///
+/// The pair is what makes a rebuild watchable after a tab switch. The event carries live progress to
+/// whichever view is mounted *now*; the snapshot answers "what's happening?" for a view that mounts
+/// later and missed the events entirely. This mirrors `cloud_sync::emit_progress`, which solved
+/// exactly this for the connectors.
+///
+/// Deliberately **not** a per-call `Channel`: a channel is minted by whoever invokes the command, so
+/// only that caller hears it — and that caller is a component that unmounts. Emitting globally also
+/// means the starting view must NOT keep a channel as well, or it would count every file twice.
+/// A plain drag-and-drop ingest still uses a channel (`ingest::run`); only rebuild moved.
+///
+/// `Clone` because the rebuild's blocking phase runs under `spawn_blocking` ('static), so it takes
+/// its own clone; every clone addresses the same snapshot and event, so progress stays continuous
+/// across the phase boundary.
+#[derive(Clone)]
+pub struct ProgressSink {
+    app: AppHandle,
+}
+
+impl ProgressSink {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+
+    /// Send one event. Best-effort by design: a failed emit must never abort the run — the whole
+    /// point is that the work outlives its audience.
+    pub fn send(&self, ev: IngestEvent) {
+        self.mirror(&ev);
+        let _ = self.app.emit(REBUILD_EVENT, ev);
+    }
+
+    /// Fold an event into the shared snapshot. Best-effort: a poisoned lock is skipped rather than
+    /// failing the run. Binding the guard to a named local first sidesteps the `if let`
+    /// temporary-lifetime pitfall (as `cloud_sync::with_cloud_snap` does).
+    fn mirror(&self, ev: &IngestEvent) {
+        let state = self.app.state::<AppState>();
+        let guard = state.ingest_job.lock();
+        let Ok(mut snap) = guard else { return };
+        apply_event(&mut snap, ev);
+    }
+}
+
+/// Fold one progress event into the rebuild snapshot. Pure so the counting rules — the thing that
+/// decides what a returning tab actually shows — are unit-testable without an app handle.
+pub(crate) fn apply_event(snap: &mut crate::IngestJobState, ev: &IngestEvent) {
+    match ev {
+        IngestEvent::Preparing { message } => snap.prep = Some(message.clone()),
+        IngestEvent::Counted { total } => {
+            // Setup is over once we have a count; drop the indeterminate label.
+            snap.prep = None;
+            snap.total = Some(*total);
+            snap.processed = 0;
+        }
+        // `processed` counts *completed* files, so it advances on the terminal events, not on
+        // `Started` — matching how the views count. Counting `Started` too would double-count.
+        IngestEvent::Done { .. } | IngestEvent::Failed { .. } | IngestEvent::Skipped { .. } => {
+            snap.processed += 1;
+        }
+        IngestEvent::Finished {
+            ingested,
+            skipped,
+            failed,
+        } => {
+            snap.last_report = Some(crate::IngestReport {
+                ingested: *ingested,
+                skipped: *skipped,
+                failed: *failed,
+            });
+        }
+        IngestEvent::Started { .. } => {}
+    }
 }
 
 /// Streamed to the UI over a Tauri channel as ingestion proceeds (mirrors the
@@ -1098,7 +1178,7 @@ fn copy_original_to_vault(
 /// is done, rather than this fn ending the run prematurely.
 pub fn rebuild(
     app: &AppHandle,
-    on_event: Channel<IngestEvent>,
+    on_event: &ProgressSink,
     extra_total: usize,
 ) -> Result<(usize, usize)> {
     let state = app.state::<AppState>();
@@ -1106,7 +1186,7 @@ pub fn rebuild(
     // Indexing is active use — hold the idle chat-indexer (card 7B) off so it doesn't contend with it.
     state.mark_user_activity();
 
-    let _ = on_event.send(IngestEvent::Preparing {
+    on_event.send(IngestEvent::Preparing {
         message: "Preparing the document engine…".into(),
     });
     state.sidecar.ensure_installed()?;
@@ -1134,7 +1214,7 @@ pub fn rebuild(
     // index fully intact, never after the store is wiped. A non-bundled model can be ~1 GB, so flag
     // the one-time download; the bundled English path (model_file: None) stays silent.
     if embedder.model_file.is_some() {
-        let _ = on_event.send(IngestEvent::Preparing {
+        on_event.send(IngestEvent::Preparing {
             message: "Downloading the multilingual model (~1 GB, one time)…".into(),
         });
     }
@@ -1169,13 +1249,13 @@ pub fn rebuild(
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| is_vault_markdown(path))
         .collect();
-    let _ = on_event.send(IngestEvent::Counted {
+    on_event.send(IngestEvent::Counted {
         total: files.len() + extra_total,
     });
     let (mut ingested, mut failed) = (0usize, 0usize);
     for path in files {
         let name = file_name(&path);
-        let _ = on_event.send(IngestEvent::Started {
+        on_event.send(IngestEvent::Started {
             path: path.to_string_lossy().into(),
             name,
         });
@@ -1191,7 +1271,7 @@ pub fn rebuild(
         match outcome {
             Ok(Some(document)) => {
                 ingested += 1;
-                let _ = on_event.send(IngestEvent::Done { document });
+                on_event.send(IngestEvent::Done { document });
             }
             // A chat that only ever exchanged small talk indexes no substantive turns, so it (correctly)
             // births no document — count it done, but there is nothing to surface.
@@ -1200,7 +1280,7 @@ pub fn rebuild(
             }
             Err(e) => {
                 failed += 1;
-                let _ = on_event.send(IngestEvent::Failed {
+                on_event.send(IngestEvent::Failed {
                     path: path.to_string_lossy().into(),
                     error: e.to_string(),
                 });
@@ -1245,11 +1325,11 @@ pub fn rebuild(
         }
         Err(e) => {
             failed += 1;
-            let _ = on_event.send(IngestEvent::Started {
+            on_event.send(IngestEvent::Started {
                 path: "connector-index".into(),
                 name: "Connector index".into(),
             });
-            let _ = on_event.send(IngestEvent::Failed {
+            on_event.send(IngestEvent::Failed {
                 path: "connector-index".into(),
                 error: format!("couldn't restore connector-indexed items: {e}"),
             });
@@ -2835,6 +2915,79 @@ impl OptionalExists for std::result::Result<(), rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc_event(path: &str) -> IngestEvent {
+        IngestEvent::Failed {
+            path: path.into(),
+            error: "x".into(),
+        }
+    }
+
+    #[test]
+    fn snapshot_counts_completed_files_not_started_ones() {
+        // This is what a tab returning mid-rebuild renders, so the count has to match the views':
+        // `Started` announces a file, the terminal event completes it. Counting both would double.
+        let mut snap = crate::IngestJobState::default();
+        apply_event(&mut snap, &IngestEvent::Counted { total: 3 });
+        assert_eq!((snap.processed, snap.total), (0, Some(3)));
+
+        apply_event(
+            &mut snap,
+            &IngestEvent::Started {
+                path: "a".into(),
+                name: "a".into(),
+            },
+        );
+        assert_eq!(
+            snap.processed, 0,
+            "Started announces work, it doesn't finish it"
+        );
+
+        apply_event(&mut snap, &doc_event("a"));
+        apply_event(
+            &mut snap,
+            &IngestEvent::Skipped {
+                path: "b".into(),
+                reason: "dupe".into(),
+            },
+        );
+        assert_eq!(snap.processed, 2, "failed and skipped both complete a file");
+    }
+
+    #[test]
+    fn snapshot_drops_the_setup_label_once_counting_starts() {
+        // Preparing (engine install / model download) has no total, so the bar sweeps; once the
+        // count lands the bar goes determinate and the label must not linger beside it.
+        let mut snap = crate::IngestJobState::default();
+        apply_event(
+            &mut snap,
+            &IngestEvent::Preparing {
+                message: "Preparing the document engine…".into(),
+            },
+        );
+        assert!(snap.prep.is_some() && snap.total.is_none());
+
+        apply_event(&mut snap, &IngestEvent::Counted { total: 7 });
+        assert!(snap.prep.is_none());
+        assert_eq!(snap.total, Some(7));
+    }
+
+    #[test]
+    fn snapshot_keeps_the_final_report_for_a_tab_that_returns_after_it_finished() {
+        // The live event only reaches a mounted listener; someone who came back afterwards still
+        // needs to see how it went, so the counts live in the snapshot too.
+        let mut snap = crate::IngestJobState::default();
+        apply_event(
+            &mut snap,
+            &IngestEvent::Finished {
+                ingested: 5,
+                skipped: 1,
+                failed: 2,
+            },
+        );
+        let report = snap.last_report.expect("a finished run reports its counts");
+        assert_eq!((report.ingested, report.skipped, report.failed), (5, 1, 2));
+    }
 
     #[test]
     fn a_regular_file_is_never_a_symlink_escape() {

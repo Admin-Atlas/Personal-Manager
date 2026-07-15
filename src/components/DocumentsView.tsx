@@ -15,7 +15,9 @@ import {
   onOcrInstall,
   optionalOcrStatus,
   promoteIndexOnly,
+  onIngestProgress,
   rebuildIndex,
+  rebuildStatus,
   setDocumentMetadata,
   sidecarStatus,
   vaultStatus,
@@ -216,6 +218,50 @@ export function DocumentsView({ onReviewClick }: Props) {
     sidecarStatus()
       .then(setStatus)
       .catch(() => {});
+  }, []);
+
+  // A rebuild runs detached from this view, so switching tabs unmounts us while the work carries on.
+  // Restore whatever is in flight from the backend's snapshot, then follow the global event for the
+  // rest. Without this the tab came back showing an idle machine and looked like it had died —
+  // and, worse, `busy` reset to false, so a second Rebuild could wipe the first one's work.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    rebuildStatus()
+      .then((job) => {
+        if (cancelled || !job.running) return;
+        setBusy(true);
+        setTotal(job.total);
+        setProcessed(job.processed);
+        setPrep(job.prep);
+        // Per-file rows aren't kept in the snapshot (they're transient and unbounded), so a
+        // restored run shows the bar and counts, then fills the list as new files land.
+        setItems([]);
+        setSummary(null);
+        setError(null);
+      })
+      .catch(() => {});
+
+    void onIngestProgress((event) => {
+      handleEvent(event);
+      // The run we restored (or one started elsewhere) has to release the button here — the
+      // starter's `finally` only runs in whichever view invoked it, and that view may be gone.
+      if (event.type === "finished") {
+        setBusy(false);
+        void refresh();
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+    // handleEvent/refresh are stable for this component's lifetime; re-subscribing on every
+    // render would drop events mid-rebuild.
   }, []);
 
   // Project names for the reclassify datalist — only fetched while the manual-triage controls
@@ -424,13 +470,18 @@ export function DocumentsView({ onReviewClick }: Props) {
     setError(null);
     setPrep(null);
     try {
-      await rebuildIndex(handleEvent);
+      // Progress arrives on the global subscription set up at mount, not through this call — so
+      // the rebuild keeps reporting even after this view unmounts. The backend refuses a second
+      // concurrent run outright; rebuild is destructive-first, so overlapping runs would eat
+      // each other's work.
+      await rebuildIndex();
     } catch (e) {
       setError(String(e));
-    } finally {
       setBusy(false);
       await refresh();
     }
+    // No `finally`: on success the "finished" event clears `busy` and refreshes, which also covers
+    // the run we merely restored rather than started.
   }
 
   // Dev-only: register a pasted body as an index-only document (board card 3). The source id is

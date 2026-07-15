@@ -1101,6 +1101,26 @@ export type SidecarStatus =
   | { state: "ready" }
   | { state: "error"; message: string; kind: SidecarErrorKind };
 
+/** A snapshot of the rebuild currently running (if any) — mirrors `IngestJobState`. The rebuild
+ *  runs detached from whichever view started it, so a view mounting later reads this to restore
+ *  progress it never saw, then follows `ingest://progress` live. */
+export interface IngestJobState {
+  running: boolean;
+  processed: number;
+  total: number | null;
+  /** The current setup message (engine install / model download); null once counting starts. */
+  prep: string | null;
+  /** The last finished rebuild's counts, so returning after it completed still shows the result. */
+  last_report: IngestReport | null;
+}
+
+/** The counts a finished rebuild reports; mirrors `IngestReport`. */
+export interface IngestReport {
+  ingested: number;
+  skipped: number;
+  failed: number;
+}
+
 export type IngestEvent =
   | { type: "preparing"; message: string }
   | { type: "counted"; total: number }

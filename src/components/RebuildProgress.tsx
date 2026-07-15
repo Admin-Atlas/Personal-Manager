@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The guided Re-index modal. Given `open`, it runs `rebuildIndex` once — dropping the search index
-// and rebuilding it from the Markdown vault — and streams progress over the same IngestEvent
-// channel the Documents view uses. Self-contained so the Settings language switcher can launch it
-// without re-implementing the rebuild plumbing; the Documents "Rebuild" banner remains its own
-// (older, inline) entry point.
+// and rebuilding it from the Markdown vault — and follows progress on the global `ingest://progress`
+// event the Documents view also listens to. Self-contained so the Settings language switcher can
+// launch it without re-implementing the rebuild plumbing; the Documents "Rebuild" banner remains its
+// own (older, inline) entry point.
+//
+// The rebuild is detached from this modal: closing it (or the tab) doesn't stop the work, and the
+// backend's snapshot lets whatever mounts next pick the progress back up.
 //
 // Safety: a non-bundled multilingual model downloads (~1 GB) at the *start* of the rebuild
 // (warmup-before-destroy in Rust), so an offline failure leaves the existing index intact — we then
@@ -13,7 +16,7 @@
 // while running, so no search is attempted during the brief width-mismatch window.
 
 import { useEffect, useRef, useState } from "react";
-import { rebuildIndex } from "../lib/ipc";
+import { onIngestProgress, rebuildIndex } from "../lib/ipc";
 import type { IngestEvent } from "../lib/types";
 import { Button, Collapsible, Modal } from "./ui";
 import { IngestProgress } from "./IngestProgress";
@@ -72,31 +75,7 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
     started.current = true;
     void (async () => {
       try {
-        await rebuildIndex((event: IngestEvent) => {
-          switch (event.type) {
-            case "preparing":
-              setPrep(event.message);
-              break;
-            case "counted":
-              setTotal(event.total);
-              break;
-            case "started":
-              setPrep(null);
-              setFiles((prev) => [...prev, event.name]);
-              break;
-            case "done":
-              // Each file's terminal event advances the determinate bar; the names roll into
-              // the running list, and the final summary line is enough for the rest.
-              setProcessed((n) => n + 1);
-              break;
-            case "failed":
-              setProcessed((n) => n + 1);
-              setFailedCount((n) => n + 1);
-              break;
-            default:
-              break;
-          }
-        });
+        await rebuildIndex();
         setPhase("done");
         cb.current.onDone?.();
       } catch (e) {
@@ -105,6 +84,49 @@ export function RebuildProgress({ open, title, subtitle, onDone, onError, onClos
         cb.current.onError?.();
       }
     })();
+  }, [open]);
+
+  // Progress arrives on the global event, not a per-call channel, so it keeps reaching this modal
+  // regardless of which surface started the rebuild. Subscribing separately from the run effect also
+  // means a rebuild already in flight when the modal opens still renders live.
+  useEffect(() => {
+    if (!open) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void onIngestProgress((event: IngestEvent) => {
+      switch (event.type) {
+        case "preparing":
+          setPrep(event.message);
+          break;
+        case "counted":
+          setTotal(event.total);
+          break;
+        case "started":
+          setPrep(null);
+          setFiles((prev) => [...prev, event.name]);
+          break;
+        case "done":
+          // Each file's terminal event advances the determinate bar; the names roll into
+          // the running list, and the final summary line is enough for the rest.
+          setProcessed((n) => n + 1);
+          break;
+        case "failed":
+          setProcessed((n) => n + 1);
+          setFailedCount((n) => n + 1);
+          break;
+        default:
+          break;
+      }
+    }).then((fn) => {
+      // The subscription resolves asynchronously; if we already unmounted, drop it immediately
+      // rather than leaking a listener.
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, [open]);
 
   if (!open) return null;
