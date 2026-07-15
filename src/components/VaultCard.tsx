@@ -23,7 +23,7 @@ import {
   vaultStatus,
 } from "../lib/ipc";
 import type { PassphraseScore, VaultStatus } from "../lib/types";
-import { Button, Input } from "./ui";
+import { Button, Input, SectionInfo } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { ShareVaultWizard } from "./ShareVaultWizard";
 import { RepairAccessButton } from "./VaultRecovery";
@@ -216,14 +216,9 @@ export function VaultCard() {
         </div>
       )}
 
-      {/* Shareable → encryption note + manage actions. */}
+      {/* Shareable → manage actions (why encryption is forced folds into the card's info block). */}
       {shareable && (
         <>
-          <p className="mt-2 text-xs text-ink4">
-            Markdown encryption is on because this vault is shared. Without it, other accounts on
-            this device could read your notes directly.
-          </p>
-
           <div className="mt-3 flex flex-wrap gap-2">
             <Button
               variant="secondary"
@@ -397,11 +392,7 @@ export function VaultCard() {
       </div>
 
       {/* Always available: the portability escape hatch. */}
-      <p className="mt-3 text-xs text-ink4">
-        Your files stay yours. Export to plaintext Markdown anytime with your passphrase —
-        encryption protects them at rest, it doesn't lock you in.
-      </p>
-      <div className="mt-2">
+      <div className="mt-3">
         <Button variant="tertiary" onClick={exportPlaintext} disabled={busy}>
           Export to plaintext Markdown…
         </Button>
@@ -409,6 +400,19 @@ export function VaultCard() {
 
       {error && <p className="mt-2 break-all text-xs text-st-due">{error}</p>}
       {msg && <p className="mt-2 break-all text-xs text-faint">{msg}</p>}
+
+      <SectionInfo title="How the vault works">
+        {shareable && (
+          <p>
+            Markdown encryption is on because this vault is shared. Without it, other accounts on
+            this device could read your notes directly.
+          </p>
+        )}
+        <p>
+          Your files stay yours. Export to plaintext Markdown anytime with your passphrase —
+          encryption protects them at rest, it doesn't lock you in.
+        </p>
+      </SectionInfo>
 
       <ShareVaultWizard
         open={wizardOpen}

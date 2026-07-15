@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useDepth } from "../theme";
 import { driveStatus, oneDriveStatus } from "../lib/ipc";
-import { Button, Collapsible, SegmentedControl } from "./ui";
+import { Button, Collapsible, SectionInfo, SegmentedControl } from "./ui";
 import { clearJustJoinedVault, justJoinedVault } from "../lib/joinedVault";
 import { CalendarConnection } from "./CalendarConnection";
 import { CloudDriveConnection } from "./CloudDriveConnection";
@@ -39,12 +39,14 @@ export function ConnectorsSettings({
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-connectors">
       <label className="block text-sm font-medium text-ink2">Connectors</label>
-      <p className="mt-1 text-xs text-ink4">
-        Connect external accounts so PM can find and use what’s in them, grouped by provider. Set up
-        a provider’s sign-in once and it’s shared across that provider’s services. Every connection
-        is independently opt-in and removable — nothing cascades. Credentials and tokens live only
-        in your keychain.
-      </p>
+      <SectionInfo title="What are connectors?">
+        <p>
+          Connect external accounts so PM can find and use what’s in them, grouped by provider. Set
+          up a provider’s sign-in once and it’s shared across that provider’s services. Every
+          connection is independently opt-in and removable — nothing cascades. Credentials and
+          tokens live only in your keychain.
+        </p>
+      </SectionInfo>
 
       <JoinedVaultBanner />
 
@@ -239,60 +241,53 @@ function CalendarSubscriptions() {
 function GoogleMultiAccountHelp() {
   const link = "text-accent-text underline hover:brightness-110";
   return (
-    <Collapsible
-      className="mt-2"
-      defaultOpen={false}
-      title={<span className="text-xs text-ink3">Using more than one Google account?</span>}
+    <SectionInfo
+      title="Using more than one Google account?"
+      helpId="connectors-google-multiaccount"
     >
-      <div
-        className="mt-1.5 space-y-1.5 rounded-[var(--radius)] bg-surface px-3 py-2 text-xs text-ink3"
-        data-help="connectors-google-multiaccount"
-      >
-        <p>
-          You don’t need a new project or new credentials — every account reuses the one Client ID +
-          secret you saved above.
-        </p>
-        <p>
-          <span className="text-ink2">1. Authorise the account in Google Cloud.</span> If your OAuth
-          app is still in <span className="text-ink2">Testing</span> mode, add each account’s email
-          under{" "}
-          <a
-            href="https://console.cloud.google.com/auth/audience"
-            target="_blank"
-            rel="noreferrer"
-            className={link}
-          >
-            Audience → Test users
-          </a>{" "}
-          (<span className="text-ink2">+ Add users</span>) in the Google Cloud Console.
-        </p>
-        <p className="text-ink4">
-          Testing mode signs accounts out after <span className="text-ink2">7 days</span>. For a
-          connection that lasts, <span className="text-ink2">publish to Production</span> on that
-          same{" "}
-          <a
-            href="https://console.cloud.google.com/auth/audience"
-            target="_blank"
-            rel="noreferrer"
-            className={link}
-          >
-            Audience
-          </a>{" "}
-          page (<span className="text-ink2">Publish app</span>) instead — no test-user list to keep
-          and no 7-day expiry. The “unverified app” screen is expected for your own client; continue
-          past it.
-        </p>
-        <p>
-          <span className="text-ink2">2. Add it in PM.</span> Use{" "}
-          <span className="text-ink2">Add another account</span> on Calendar or Drive below — Google
-          shows its account chooser, so pick the <em>different</em> account. Each is independent.
-        </p>
-        <p className="text-ink4">
-          Prefer to keep accounts fully separate? You can instead make a second Google Cloud project
-          with its own credentials — but for most people reusing the one project is simpler.
-        </p>
-      </div>
-    </Collapsible>
+      <p>
+        You don’t need a new project or new credentials — every account reuses the one Client ID +
+        secret you saved above.
+      </p>
+      <p>
+        <span className="text-ink2">1. Authorise the account in Google Cloud.</span> If your OAuth
+        app is still in <span className="text-ink2">Testing</span> mode, add each account’s email
+        under{" "}
+        <a
+          href="https://console.cloud.google.com/auth/audience"
+          target="_blank"
+          rel="noreferrer"
+          className={link}
+        >
+          Audience → Test users
+        </a>{" "}
+        (<span className="text-ink2">+ Add users</span>) in the Google Cloud Console.
+      </p>
+      <p className="text-ink4">
+        Testing mode signs accounts out after <span className="text-ink2">7 days</span>. For a
+        connection that lasts, <span className="text-ink2">publish to Production</span> on that same{" "}
+        <a
+          href="https://console.cloud.google.com/auth/audience"
+          target="_blank"
+          rel="noreferrer"
+          className={link}
+        >
+          Audience
+        </a>{" "}
+        page (<span className="text-ink2">Publish app</span>) instead — no test-user list to keep
+        and no 7-day expiry. The “unverified app” screen is expected for your own client; continue
+        past it.
+      </p>
+      <p>
+        <span className="text-ink2">2. Add it in PM.</span> Use{" "}
+        <span className="text-ink2">Add another account</span> on Calendar or Drive below — Google
+        shows its account chooser, so pick the <em>different</em> account. Each is independent.
+      </p>
+      <p className="text-ink4">
+        Prefer to keep accounts fully separate? You can instead make a second Google Cloud project
+        with its own credentials — but for most people reusing the one project is simpler.
+      </p>
+    </SectionInfo>
   );
 }
 
@@ -301,6 +296,10 @@ function GoogleMultiAccountHelp() {
  * sign-in and its services. These get large (multi-account Drive, calendar feeds), so each is
  * **collapsible**: open by default for Standard/Power density, **collapsed at Minimal** (so the tab
  * stays scannable), always toggleable. The disclosure state is per-group local UI.
+ *
+ * The `blurb` — what this provider connects and what's shared — folds into a {@link SectionInfo} at
+ * the **foot** of the group, so opening a group lands you on its controls rather than on a paragraph
+ * about them; the explanation is one caret below, closed at every depth.
  */
 function ConnectorGroup({
   title,
@@ -322,8 +321,12 @@ function ConnectorGroup({
         </span>
       }
     >
-      {blurb && <p className="mt-1 text-xs text-ink4">{blurb}</p>}
       <div className="mt-3">{children}</div>
+      {blurb && (
+        <SectionInfo>
+          <p>{blurb}</p>
+        </SectionInfo>
+      )}
     </Collapsible>
   );
 }
@@ -342,23 +345,17 @@ function IndexingSpeedControl({
   value: "fast" | "gentle";
   onChange: (speed: "fast" | "gentle") => void;
 }) {
-  // The Fast/Gentle detail is a wall of text most people set once and forget, so it's collapsed by
-  // default — but **open for Power** density (who tune this kind of thing), collapsed at Minimal/
-  // Standard. The control + one-line summary stay visible at every depth.
-  const { showPower } = useDepth();
+  // The Fast/Gentle detail is a wall of text most people set once and forget, so all of it — what
+  // the toggle paces, and what each mode does — folds into one {@link SectionInfo} below the
+  // control: closed at **every** depth, Power included. Density reveals features, not essays; the
+  // control itself stays visible everywhere, and help mode still surfaces the same text on demand.
   return (
     <div
       className="mt-4 rounded-[var(--radius)] border border-border p-3"
       data-help="settings-indexing-speed"
     >
       <div className="flex items-start justify-between gap-3">
-        <div>
-          <label className="block text-sm font-medium text-ink2">Indexing speed</label>
-          <p className="mt-1 text-xs text-ink4">
-            How hard PM works your machine while it indexes <strong>Drive files and imports</strong>{" "}
-            (email later). Calendars are tiny and always sync at full speed.
-          </p>
-        </div>
+        <label className="block text-sm font-medium text-ink2">Indexing speed</label>
         <SegmentedControl
           className="mt-0.5 shrink-0"
           value={value}
@@ -369,12 +366,12 @@ function IndexingSpeedControl({
           ]}
         />
       </div>
-      <Collapsible
-        className="mt-2.5"
-        defaultOpen={showPower}
-        title={<span className="text-xs text-ink3">What do Fast and Gentle do?</span>}
-      >
-        <dl className="mt-1.5 space-y-1.5 text-xs leading-relaxed text-ink4">
+      <SectionInfo className="mt-2.5" title="What do Fast and Gentle do?">
+        <p>
+          How hard PM works your machine while it indexes <strong>Drive files and imports</strong>{" "}
+          (email later). Calendars are tiny and always sync at full speed.
+        </p>
+        <dl className="space-y-1.5 leading-relaxed text-ink4">
           <div>
             <dt className="inline font-medium text-ink3">Fast</dt>
             <dd className="inline">
@@ -393,10 +390,8 @@ function IndexingSpeedControl({
             </dd>
           </div>
         </dl>
-        <p className="mt-2 text-xs text-faint">
-          Changes apply right away — even partway through a sync.
-        </p>
-      </Collapsible>
+        <p className="text-faint">Changes apply right away — even partway through a sync.</p>
+      </SectionInfo>
     </div>
   );
 }

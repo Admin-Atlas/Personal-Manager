@@ -4,7 +4,8 @@
 import { useEffect, useState } from "react";
 import { modelRecommendations, setRecommendDenylist } from "../lib/ipc";
 import type { ModelRecommendation, ModelRecommendations } from "../lib/types";
-import { Button, Collapsible, Skeleton, Textarea } from "./ui";
+import { useDepth } from "../theme";
+import { Button, Collapsible, SectionInfo, Skeleton, Textarea } from "./ui";
 
 interface Props {
   /** Assign a recommended model to a role — prepends it to the matching editor list;
@@ -14,9 +15,6 @@ interface Props {
   /** Depth gates: extra cost/capability detail at meta+, the denylist editor at power. */
   showMeta: boolean;
   showPower: boolean;
-  /** Start the section expanded (power depth) or collapsed (min/standard) — the cards/denylist
-   *  are always present, depth only sets the default disclosure state. */
-  defaultExpanded: boolean;
 }
 
 /**
@@ -31,8 +29,8 @@ export function ModelRecommendationCards({
   onUseForBackground,
   showMeta,
   showPower,
-  defaultExpanded,
 }: Props) {
+  const { minimal } = useDepth();
   const [recs, setRecs] = useState<ModelRecommendations | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -73,7 +71,7 @@ export function ModelRecommendationCards({
     <div data-help="settings-recommended-models">
       <Collapsible
         title="Recommended models"
-        defaultOpen={defaultExpanded}
+        defaultOpen={!minimal}
         meta={
           recs?.stale ? (
             <span
@@ -86,11 +84,6 @@ export function ModelRecommendationCards({
           ) : undefined
         }
       >
-        <p className="pt-2 text-xs text-ink4">
-          PM suggests two models from OpenRouter and explains why. Apply either to your chat or
-          background slot above — nothing changes until you Save.
-        </p>
-
         {loading && (
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Skeleton className="h-28 w-full" />
@@ -137,23 +130,7 @@ export function ModelRecommendationCards({
             {showPower && (
               <div className="mt-3">
                 <Collapsible title="Recommendation exclusions">
-                  <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
-                    <p>
-                      Every PM request is sent with{" "}
-                      <span className="font-mono text-ink4">zero-data-retention</span> enforced, so
-                      a provider can&apos;t store or train on your prompts — this is the real
-                      boundary, applied to whichever model you pick. (OpenRouter exposes no
-                      per-model data-retention flag, so PM enforces it per request rather than
-                      guessing from a list.)
-                    </p>
-                    <p>
-                      The list below only removes models from the two suggestions above — it does
-                      not block a model you pick yourself (ZDR already protects every request). One
-                      slug per line, e.g. <span className="font-mono text-ink4">openai</span> or{" "}
-                      <span className="font-mono text-ink4">openai/gpt-5.5</span>.
-                    </p>
-                  </div>
-                  <div className="mt-2">
+                  <div className="pt-2">
                     <Textarea
                       value={denyText}
                       onChange={(e) => setDenyText(e.target.value)}
@@ -171,11 +148,35 @@ export function ModelRecommendationCards({
                       </Button>
                     </div>
                   </div>
+
+                  <SectionInfo title="What exclusions do — and what ZDR already covers">
+                    <p>
+                      Every PM request is sent with{" "}
+                      <span className="font-mono text-ink4">zero-data-retention</span> enforced, so
+                      a provider can&apos;t store or train on your prompts — this is the real
+                      boundary, applied to whichever model you pick. (OpenRouter exposes no
+                      per-model data-retention flag, so PM enforces it per request rather than
+                      guessing from a list.)
+                    </p>
+                    <p>
+                      The list above only removes models from the two suggestions — it does not
+                      block a model you pick yourself (ZDR already protects every request). One slug
+                      per line, e.g. <span className="font-mono text-ink4">openai</span> or{" "}
+                      <span className="font-mono text-ink4">openai/gpt-5.5</span>.
+                    </p>
+                  </SectionInfo>
                 </Collapsible>
               </div>
             )}
           </>
         )}
+
+        <SectionInfo title="How these suggestions work">
+          <p>
+            PM suggests two models from OpenRouter and explains why. Apply either to your chat or
+            background slot above — nothing changes until you Save.
+          </p>
+        </SectionInfo>
       </Collapsible>
     </div>
   );

@@ -18,7 +18,7 @@ import {
   removeStorageComponent,
 } from "../lib/ipc";
 import type { StorageComponent, StorageReport } from "../lib/types";
-import { Button, ConfirmDialog } from "./ui";
+import { Button, ConfirmDialog, SectionInfo } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 
 /** Human-friendly size; estimates are prefixed with "~". */
@@ -142,13 +142,7 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
   return (
     <div data-help="settings-storage">
       <div className="flex items-baseline justify-between">
-        <div>
-          <label className="block text-sm font-medium text-ink2">On-device components</label>
-          <p className="mt-1 text-xs text-ink4">
-            What PM has downloaded to this device, and what you can safely remove. Everything here
-            re-downloads on demand if you need it again.
-          </p>
-        </div>
+        <label className="block text-sm font-medium text-ink2">On-device components</label>
         {report && (
           <span className="shrink-0 font-mono text-xs text-ink3">
             {formatSize(report.total_bytes, false)} total
@@ -185,6 +179,13 @@ export function StorageSettings({ onNavigate }: { onNavigate: (tab: string) => v
         ))}
         {!report && <div className="px-4 py-6 text-center text-sm text-ink4">Scanning…</div>}
       </div>
+
+      <SectionInfo>
+        <p>
+          What PM has downloaded to this device, and what you can safely remove. Everything here
+          re-downloads on demand if you need it again.
+        </p>
+      </SectionInfo>
 
       <ConfirmDialog
         open={pending != null}

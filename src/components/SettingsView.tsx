@@ -73,6 +73,7 @@ import {
   ConfirmDialog,
   Input,
   NavItem,
+  SectionInfo,
   SegmentedControl,
   Select,
   Toggle,
@@ -693,11 +694,11 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   return (
     <div className="flex h-full items-center justify-center p-6">
       <div className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-[var(--radius)] border border-border bg-panel shadow-xl">
+        {/* The window header carries the title only. Its old subtitle ("your API key lives in the
+            OS keychain…") was AI-tab material shown on every tab; it now sits in that tab's
+            "About your API keys" disclosure, next to the keys it describes. */}
         <div className="shrink-0 border-b border-border px-6 py-4">
           <h1 className="font-head text-lg font-semibold text-ink">Settings</h1>
-          <p className="mt-1 text-sm text-ink3">
-            Your API key lives in the OS keychain. The model is swappable anytime.
-          </p>
         </div>
 
         <div className="flex min-h-0 flex-1">
@@ -721,9 +722,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                   <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
                     Appearance
                   </label>
-                  <p className="mt-1 text-xs text-ink4">
-                    Applies instantly and is remembered on this device.
-                  </p>
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-sm text-ink2">System</span>
                     <SegmentedControl
@@ -824,18 +822,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                           )}
                         </div>
                       </div>
-                      <p className="mt-1 text-xs text-ink4">
-                        Latitude, longitude. Blank uses your device's timezone
-                        {(() => {
-                          try {
-                            const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                            return tz && coordsForTimezone(tz) ? ` (${tz})` : "";
-                          } catch {
-                            return "";
-                          }
-                        })()}
-                        . Nothing about your location leaves this device.
-                      </p>
                     </>
                   )}
                   <div className="mt-3 flex items-center justify-between gap-3">
@@ -919,15 +905,33 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       />
                     </button>
                   </div>
+                  {/* Both of Appearance's paragraphs — the "it saves itself" reassurance and the
+                      Location field's format + privacy note — fold into this one disclosure at the
+                      foot. The auto-mode status line and its "couldn't find your location" fallback
+                      stay inline above: they're a readout and a gating hint, not explanation. */}
+                  <SectionInfo title="What these settings do">
+                    <p>Applies instantly and is remembered on this device.</p>
+                    {modePref === "auto" && (
+                      <p>
+                        Location is a latitude, longitude pair. Blank uses your device's timezone
+                        {(() => {
+                          try {
+                            const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                            return tz && coordsForTimezone(tz) ? ` (${tz})` : "";
+                          } catch {
+                            return "";
+                          }
+                        })()}
+                        . Nothing about your location leaves this device.
+                      </p>
+                    )}
+                  </SectionInfo>
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-memory-map">
                   <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
                     Memory map
                   </label>
-                  <p className="mt-1 text-xs text-ink4">
-                    The Map tab — how documents are arranged and how many are plotted.
-                  </p>
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-sm text-ink2">Default grouping</span>
                     <SegmentedControl
@@ -1000,22 +1004,24 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       className="mt-2"
                     />
                   )}
-                  <p className="mt-2 text-xs text-ink4">
-                    Semantic proximity uses a basic on-device layout by default. Project cohesion
-                    gently pulls same-project documents together (Off keeps the layout purely by
-                    meaning). The optional t-SNE component (a one-time download) produces tighter
-                    clusters of related documents — turn it on or off here, or remove it to free
-                    space under Settings → Storage.
-                  </p>
+                  {/* The section's opening blurb and its trailing rationale said one thing between
+                      them — how the map is laid out — so they're one disclosure now. */}
+                  <SectionInfo title="How the map is arranged">
+                    <p>The Map tab — how documents are arranged and how many are plotted.</p>
+                    <p>
+                      Semantic proximity uses a basic on-device layout by default. Project cohesion
+                      gently pulls same-project documents together (Off keeps the layout purely by
+                      meaning). The optional t-SNE component (a one-time download) produces tighter
+                      clusters of related documents — turn it on or off here, or remove it to free
+                      space under Settings → Storage.
+                    </p>
+                  </SectionInfo>
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">
                   <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
                     Time zone
                   </label>
-                  <p className="mt-1 text-xs text-ink4">
-                    Sets “today”, “due soon”, and your calendar agenda. Auto follows this device.
-                  </p>
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-sm text-ink2">Detection</span>
                     <SegmentedControl
@@ -1043,38 +1049,44 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       </Select>
                     </div>
                   )}
+                  {/* The zone in force is a readout — it stays visible; only what the zone *means*
+                      folds away. */}
                   <p className="mt-2 text-xs text-faint">
                     {tzAuto
                       ? `Following this device: ${deviceTimeZone()}`
                       : `Selected: ${timeZone || "—"}`}
                   </p>
+                  <SectionInfo title="What the time zone affects">
+                    <p>
+                      Sets “today”, “due soon”, and your calendar agenda. Auto follows this device.
+                    </p>
+                  </SectionInfo>
                 </div>
 
-                <div
-                  className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4"
-                  data-help="settings-help-mode"
-                >
-                  <div>
+                <div className="mt-4 border-t border-border pt-4" data-help="settings-help-mode">
+                  <div className="flex items-start justify-between gap-3">
                     <label className="block text-sm font-medium text-ink2">Help mode</label>
-                    <p className="mt-1 text-xs text-ink4">
+                    <button
+                      role="switch"
+                      aria-checked={help.enabled}
+                      onClick={() => help.setEnabled(!help.enabled)}
+                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                        help.enabled ? "bg-accent" : "bg-surface"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                          help.enabled ? "translate-x-4" : "translate-x-0.5"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                  <SectionInfo title="What is help mode?">
+                    <p>
                       When on, hovering any highlighted section shows a short explanation of what it
                       does.
                     </p>
-                  </div>
-                  <button
-                    role="switch"
-                    aria-checked={help.enabled}
-                    onClick={() => help.setEnabled(!help.enabled)}
-                    className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                      help.enabled ? "bg-accent" : "bg-surface"
-                    }`}
-                  >
-                    <span
-                      className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                        help.enabled ? "translate-x-4" : "translate-x-0.5"
-                      }`}
-                    />
-                  </button>
+                  </SectionInfo>
                 </div>
               </>
             )}
@@ -1114,10 +1126,15 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                   placeholder={bgKeyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
                   className="mt-1"
                 />
-                <p className="mt-1 text-xs text-ink4">
-                  Used for background work (sorting proposals, learning). Lets you track that spend
-                  separately. Falls back to your main key if blank.
-                </p>
+                {/* Both key fields' explanation in one disclosure at the foot of the pair —
+                    including the keychain sentence that used to head every tab. */}
+                <SectionInfo title="About your API keys">
+                  <p>Your API key lives in the OS keychain. The model is swappable anytime.</p>
+                  <p>
+                    The background key is used for background work (sorting proposals, learning).
+                    Lets you track that spend separately. Falls back to your main key if blank.
+                  </p>
+                </SectionInfo>
 
                 <div className="mt-5 space-y-5 border-t border-border pt-4">
                   <ModelListEditor
@@ -1141,7 +1158,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                   <ModelRecommendationCards
                     showMeta={showMeta}
                     showPower={showPower}
-                    defaultExpanded={showPower}
                     onUseForChat={(m) =>
                       setChatModelsState((prev) => [m, ...prev.filter((x) => x !== m)].slice(0, 50))
                     }
@@ -1168,87 +1184,80 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                         {refreshingPrices ? "Refreshing…" : "Refresh prices"}
                       </Button>
                     </div>
-                    <div className="mt-2">
-                      <Collapsible
-                        title="Spend & breakdown"
-                        defaultOpen={showPower}
-                        meta={`${fmtUsd(cost.total_30d_usd)} · 30d`}
-                      >
-                        <p className="pt-2 text-xs text-ink4">
-                          Your real per-call cost as reported by OpenRouter where available,
-                          otherwise estimated from the tokens each call used × OpenRouter&apos;s
-                          per-token price
-                          {cost.pricing_updated_at
-                            ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
-                            : ""}
-                          .
-                        </p>
-                        <div className="mt-2 flex gap-6 text-sm">
-                          <div>
-                            <div className="text-xs text-ink4">Last 30 days</div>
-                            <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
-                          </div>
-                          <div>
-                            <div className="text-xs text-ink4">All time</div>
-                            <div className="font-mono text-ink2">
-                              {fmtUsd(cost.total_all_time_usd)}
-                            </div>
-                          </div>
-                        </div>
-                        <div className="space-y-2 pt-2 text-xs leading-relaxed text-ink3">
-                          <p>
-                            Each model reply reports the tokens it used (your prompt + its reply).
-                            PM logs those per call. It fetches OpenRouter&apos;s public price list
-                            about once a day and caches it — no extra model call, and your API key
-                            is never used for it.
-                          </p>
-                          <p>
-                            Where OpenRouter reports a call&apos;s actual cost (reflecting any
-                            prompt-cache discount) PM shows that; for older calls without it, cost =
-                            prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
-                            reply&nbsp;price. It&apos;s computed when you open this page, so a later
-                            price change re-prices your history. A model with no reported cost and
-                            not yet in the price cache shows{" "}
-                            <span className="font-mono text-ink4">—</span>, never an
-                            understated&nbsp;$0.
-                          </p>
-                        </div>
-                        {cost.all_time.length > 0 ? (
-                          <div className="mt-3">
-                            <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
-                              By model · most expensive first (all time)
-                            </p>
-                            <table className="w-full text-left text-xs">
-                              <thead className="font-mono uppercase tracking-wide text-ink4">
-                                <tr className="border-b border-rule">
-                                  <th className="py-1 font-medium">Model</th>
-                                  <th className="py-1 text-right font-medium">Reqs</th>
-                                  <th className="py-1 text-right font-medium">Tokens in/out</th>
-                                  <th className="py-1 text-right font-medium">Cost</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {cost.all_time.map((s) => (
-                                  <tr key={s.model} className="border-b border-rule">
-                                    <td className="py-1 pr-2 text-ink2">{s.model}</td>
-                                    <td className="py-1 text-right text-ink3">{s.request_count}</td>
-                                    <td className="py-1 text-right font-mono text-ink4">
-                                      {s.prompt_tokens.toLocaleString()} /{" "}
-                                      {s.completion_tokens.toLocaleString()}
-                                    </td>
-                                    <td className="py-1 text-right font-mono text-ink3">
-                                      {fmtUsd(s.cost_usd)}
-                                    </td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        ) : (
-                          <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
-                        )}
-                      </Collapsible>
+                    {/* The "Spend & breakdown" Collapsible is gone: it hid your own numbers
+                        behind a caret (and unfolded them only for Power), while its `meta` slot
+                        leaked the 30d total back out to prove the point. The totals and the
+                        per-model table are readouts — the thing you opened this section for — so
+                        they stay visible; only the pricing methodology folds away below. */}
+                    <div className="mt-3 flex gap-6 text-sm">
+                      <div>
+                        <div className="text-xs text-ink4">Last 30 days</div>
+                        <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-ink4">All time</div>
+                        <div className="font-mono text-ink2">{fmtUsd(cost.total_all_time_usd)}</div>
+                      </div>
                     </div>
+                    {cost.all_time.length > 0 ? (
+                      <div className="mt-3">
+                        <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
+                          By model · most expensive first (all time)
+                        </p>
+                        <table className="w-full text-left text-xs">
+                          <thead className="font-mono uppercase tracking-wide text-ink4">
+                            <tr className="border-b border-rule">
+                              <th className="py-1 font-medium">Model</th>
+                              <th className="py-1 text-right font-medium">Reqs</th>
+                              <th className="py-1 text-right font-medium">Tokens in/out</th>
+                              <th className="py-1 text-right font-medium">Cost</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {cost.all_time.map((s) => (
+                              <tr key={s.model} className="border-b border-rule">
+                                <td className="py-1 pr-2 text-ink2">{s.model}</td>
+                                <td className="py-1 text-right text-ink3">{s.request_count}</td>
+                                <td className="py-1 text-right font-mono text-ink4">
+                                  {s.prompt_tokens.toLocaleString()} /{" "}
+                                  {s.completion_tokens.toLocaleString()}
+                                </td>
+                                <td className="py-1 text-right font-mono text-ink3">
+                                  {fmtUsd(s.cost_usd)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
+                    )}
+                    <SectionInfo title="How this is calculated">
+                      <p>
+                        Your real per-call cost as reported by OpenRouter where available, otherwise
+                        estimated from the tokens each call used × OpenRouter&apos;s per-token price
+                        {cost.pricing_updated_at
+                          ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
+                          : ""}
+                        .
+                      </p>
+                      <p>
+                        Each model reply reports the tokens it used (your prompt + its reply). PM
+                        logs those per call. It fetches OpenRouter&apos;s public price list about
+                        once a day and caches it — no extra model call, and your API key is never
+                        used for it.
+                      </p>
+                      <p>
+                        Where OpenRouter reports a call&apos;s actual cost (reflecting any
+                        prompt-cache discount) PM shows that; for older calls without it, cost =
+                        prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
+                        reply&nbsp;price. It&apos;s computed when you open this page, so a later
+                        price change re-prices your history. A model with no reported cost and not
+                        yet in the price cache shows <span className="font-mono text-ink4">—</span>,
+                        never an understated&nbsp;$0.
+                      </p>
+                    </SectionInfo>
                   </div>
                 )}
               </>
@@ -1275,24 +1284,13 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                           options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
                         />
                       </div>
-                      <p className="mt-1 text-xs text-faint">
-                        Switching re-indexes your whole library from your Markdown files —
-                        Multilingual downloads a larger model the first time (about 1 GB, once).
-                        Your original files are never touched.
-                      </p>
                       {switchError && <p className="mt-1 text-xs text-st-due">{switchError}</p>}
                     </div>
                   )}
                   <div className="mt-3 flex items-start justify-between gap-3">
-                    <div>
-                      <label className="block text-sm font-medium text-ink2">
-                        Re-rank search results
-                      </label>
-                      <p className="mt-1 text-xs text-ink4">
-                        A second pass re-scores search hits for sharper relevance. First use
-                        downloads a small model; turn off for fastest results.
-                      </p>
-                    </div>
+                    <label className="block text-sm font-medium text-ink2">
+                      Re-rank search results
+                    </label>
                     <button
                       type="button"
                       role="switch"
@@ -1310,16 +1308,36 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       />
                     </button>
                   </div>
+                  {/* Both of the section's paragraphs in one disclosure at the foot. Folding the
+                      "switching re-indexes your library" note is safe *because* the confirm dialog
+                      restates it at the moment it bites — and nothing here is lost either way
+                      (your Markdown files are the source it re-indexes from). */}
+                  <SectionInfo title="About search language & re-ranking">
+                    {langOpts && langOpts.options.length > 1 && (
+                      <p>
+                        Switching language re-indexes your whole library from your Markdown files —
+                        Multilingual downloads a larger model the first time (about 1 GB, once).
+                        Your original files are never touched.
+                      </p>
+                    )}
+                    <p>
+                      Re-ranking runs a second pass that re-scores search hits for sharper
+                      relevance. First use downloads a small model; turn it off for fastest results.
+                    </p>
+                  </SectionInfo>
                 </div>
 
-                <div className="mt-5 border-t border-border pt-4" data-help="settings-learning">
-                  <label className="block text-sm font-medium text-ink2">Preferences</label>
-                  <p className="mt-1 text-xs text-ink4">
-                    What PM has learned about how you work — what belongs where, how things are
-                    named, how answers should read — now lives in the{" "}
-                    <span className="text-ink2">Teach</span> tab as editable preferences. Your
-                    earlier “Learning&nbsp;You” profile was carried over into them automatically.
-                  </p>
+                {/* A section with no controls at all — purely a signpost to the Teach tab — so the
+                    whole thing is the disclosure, its old heading now the caret's label. */}
+                <div className="mt-5 border-t border-border pt-4">
+                  <SectionInfo title="Preferences" helpId="settings-learning">
+                    <p>
+                      What PM has learned about how you work — what belongs where, how things are
+                      named, how answers should read — now lives in the{" "}
+                      <span className="text-ink2">Teach</span> tab as editable preferences. Your
+                      earlier “Learning&nbsp;You” profile was carried over into them automatically.
+                    </p>
+                  </SectionInfo>
                 </div>
               </>
             )}
@@ -1335,50 +1353,61 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
 
             {tab === "data" && (
               <>
-                <div
-                  className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4"
-                  data-help="settings-app-lock"
-                >
-                  <div>
-                    <label className="block text-sm font-medium text-ink2">App lock</label>
-                    <p className="mt-1 text-xs text-ink4">
-                      {appLock?.available
-                        ? "Require Windows Hello (face, fingerprint, or PIN) to open PM. A convenience lock for the window — your store is always encrypted at rest. Takes effect next time you open PM."
-                        : IS_LINUX
-                          ? "Not available on Linux yet. Your store is always encrypted at rest."
-                          : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
-                    </p>
-                    {appLock?.enabled && !appLock.available && (
-                      <p className="mt-1 text-xs text-ink4">
-                        App lock is on, but this device can't verify — PM opens without it here. The
-                        setting stays saved and re-arms on a device that can verify.
-                      </p>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={appLock?.enabled ?? false}
-                    aria-label="App lock"
-                    disabled={!appLock?.available}
-                    title={
-                      appLock?.available
-                        ? undefined
-                        : IS_LINUX
-                          ? "Feature not available on Linux yet"
-                          : "Not available on this device"
-                    }
-                    onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
-                    className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                      appLock?.enabled ? "bg-accent" : "bg-surface"
-                    }`}
-                  >
-                    <span
-                      className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                        appLock?.enabled ? "translate-x-4" : "translate-x-0.5"
+                <div className="mt-4 border-t border-border pt-4" data-help="settings-app-lock">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-ink2">App lock</label>
+                      {/* Only the *available* branch of this line was explanation. The other
+                          two say why the toggle beside them is dead, so they stay inline — as
+                          does the "can't verify here" notice, which is state, not commentary. */}
+                      {!appLock?.available && (
+                        <p className="mt-1 text-xs text-ink4">
+                          {IS_LINUX
+                            ? "Not available on Linux yet. Your store is always encrypted at rest."
+                            : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
+                        </p>
+                      )}
+                      {appLock?.enabled && !appLock.available && (
+                        <p className="mt-1 text-xs text-ink4">
+                          App lock is on, but this device can't verify — PM opens without it here.
+                          The setting stays saved and re-arms on a device that can verify.
+                        </p>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={appLock?.enabled ?? false}
+                      aria-label="App lock"
+                      disabled={!appLock?.available}
+                      title={
+                        appLock?.available
+                          ? undefined
+                          : IS_LINUX
+                            ? "Feature not available on Linux yet"
+                            : "Not available on this device"
+                      }
+                      onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
+                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                        appLock?.enabled ? "bg-accent" : "bg-surface"
                       }`}
-                    />
-                  </button>
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                          appLock?.enabled ? "translate-x-4" : "translate-x-0.5"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                  {appLock?.available && (
+                    <SectionInfo title="What does app lock do?">
+                      <p>
+                        Require Windows Hello (face, fingerprint, or PIN) to open PM. A convenience
+                        lock for the window — your store is always encrypted at rest. Takes effect
+                        next time you open PM.
+                      </p>
+                    </SectionInfo>
+                  )}
                 </div>
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
@@ -1392,24 +1421,22 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     </Button>
                   </div>
                   {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
-                  <div className="mt-3">
-                    <Collapsible title="About your data & export" defaultOpen={showPower}>
-                      <p className="pt-2 text-xs text-ink4">
-                        Your documents and the encrypted store live in one folder (
-                        <span className="font-medium">Personal Manager</span>). Open it to back it
-                        up by hand, or export everything to a single{" "}
-                        <span className="font-medium">.zip</span> — the Markdown vault plus the
-                        encrypted store (the regenerable runtime is left out). The store stays
-                        encrypted in the archive.
-                      </p>
-                      <p className="mt-1 text-xs text-ink4">
-                        Your documents in the Markdown vault are stored unencrypted so any tool can
-                        read them. To protect them when your machine is off or logged out, turn on
-                        full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on
-                        Linux).
-                      </p>
-                    </Collapsible>
-                  </div>
+                  <SectionInfo title="About your data & export">
+                    <p>
+                      Your documents and the encrypted store live in one folder (
+                      <span className="font-medium">Personal Manager</span>). Open it to back it up
+                      by hand, or export everything to a single{" "}
+                      <span className="font-medium">.zip</span> — the Markdown vault plus the
+                      encrypted store (the regenerable runtime is left out). The store stays
+                      encrypted in the archive.
+                    </p>
+                    <p>
+                      Your documents in the Markdown vault are stored unencrypted so any tool can
+                      read them. To protect them when your machine is off or logged out, turn on
+                      full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on
+                      Linux).
+                    </p>
+                  </SectionInfo>
                 </div>
 
                 <VaultCard />
@@ -1417,33 +1444,31 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                 <RemovePmData biometricAvailable={appLock?.available ?? false} />
 
                 <div className="mt-5 border-t border-border pt-4" data-help="settings-license">
-                  <Collapsible title="License" defaultOpen={showPower}>
-                    <div className="pt-2 text-xs leading-relaxed text-ink4">
-                      <p>
-                        PM is free software, licensed under the{" "}
-                        <a
-                          href="https://www.gnu.org/licenses/agpl-3.0.html"
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-ink3 underline hover:text-ink"
-                        >
-                          GNU Affero General Public License v3
-                        </a>
-                        . © 2026 Bobby Yu.
-                      </p>
-                      <p className="mt-1">
-                        Source code:{" "}
-                        <a
-                          href="https://github.com/Admin-Atlas/Personal-Manager"
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-ink3 underline hover:text-ink"
-                        >
-                          github.com/Admin-Atlas/Personal-Manager
-                        </a>
-                      </p>
-                    </div>
-                  </Collapsible>
+                  <SectionInfo title="License">
+                    <p>
+                      PM is free software, licensed under the{" "}
+                      <a
+                        href="https://www.gnu.org/licenses/agpl-3.0.html"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-ink3 underline hover:text-ink"
+                      >
+                        GNU Affero General Public License v3
+                      </a>
+                      . © 2026 Bobby Yu.
+                    </p>
+                    <p>
+                      Source code:{" "}
+                      <a
+                        href="https://github.com/Admin-Atlas/Personal-Manager"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-ink3 underline hover:text-ink"
+                      >
+                        github.com/Admin-Atlas/Personal-Manager
+                      </a>
+                    </p>
+                  </SectionInfo>
                 </div>
               </>
             )}
@@ -1459,12 +1484,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                 <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
                   Developer mode
                 </label>
-                <p className="mt-1 text-xs text-ink4">
-                  Reveals read-only inspection surfaces — a dedicated Dev tab (raw tables, row
-                  counts, the corrections log, system &amp; build info) plus internals shown in
-                  place — for debugging and watching how PM works. Strictly read-only: it never
-                  changes your data. Independent of the density preset, and off by default.
-                </p>
                 <div className="mt-3 flex items-center justify-between gap-3">
                   <span className="text-sm text-ink2">Developer mode</span>
                   <button
@@ -1497,6 +1516,16 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     </Button>
                   </div>
                 )}
+                {/* The build/runtime signals above stay put — a readout. Only the paragraph about
+                    what the switch reveals folds. */}
+                <SectionInfo title="What does developer mode reveal?">
+                  <p>
+                    Reveals read-only inspection surfaces — a dedicated Dev tab (raw tables, row
+                    counts, the corrections log, system &amp; build info) plus internals shown in
+                    place — for debugging and watching how PM works. Strictly read-only: it never
+                    changes your data. Independent of the density preset, and off by default.
+                  </p>
+                </SectionInfo>
               </div>
             )}
           </div>
