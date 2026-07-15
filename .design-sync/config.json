@@ -18,6 +18,7 @@
     "ListRow": "src/components/ui/ListRow.tsx",
     "StatusBadge": "src/components/ui/StatusBadge.tsx",
     "Modal": "src/components/ui/Modal.tsx",
+    "Toggle": "src/components/ui/Toggle.tsx",
     "ConfirmDialog": "src/components/ui/ConfirmDialog.tsx",
     "NavItem": "src/components/ui/NavItem.tsx",
     "Progress": "src/components/ui/Progress.tsx",

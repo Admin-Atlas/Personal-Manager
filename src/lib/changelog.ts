@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.16.0-alpha",
+    date: "2026-07-15",
+    highlights: [
+      "The pinboard now has undo. Ctrl+Z (⌘Z on a Mac) takes back what you last did — deleting a card, changing a note's colour, moving something, or the last few seconds of typing — and Ctrl+Y, or Ctrl/⌘+Shift+Z, puts it back. Typing is grouped into short bursts, so one undo takes back a few seconds' worth rather than a single letter, and it leaves your cursor where the change was. The trail lasts for as long as you have PM open; it isn't saved between visits.",
+      "Deleting a note or timeline now asks first. The pop-up tells you what actually goes with it — dated entries that would leave your calendar, or a document you'd already saved to your vault that would stay behind. There's a “Don't ask again” tick if you'd rather it didn't, and a switch in Settings › General to bring it back. A folder's ✕ doesn't ask, because it only ungroups the folder and spills the cards back onto the board.",
+      "Two things undo deliberately won't take back, because it can't do so honestly: ingesting a note (the document is its own copy in your vault, and stays there), and linking a timeline to a project (its entries become that project's real milestones). Linking is the point where the undo trail starts fresh.",
+    ],
+  },
+  {
     version: "3.15.0-alpha",
     date: "2026-07-15",
     highlights: [

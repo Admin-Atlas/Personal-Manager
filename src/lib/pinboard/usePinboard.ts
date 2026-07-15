@@ -21,6 +21,18 @@ import {
   resolveDrop,
   ROWS,
 } from "./grid";
+import {
+  canRedo,
+  canUndo,
+  commit,
+  commitBarrier,
+  commitSilent,
+  initHistory,
+  redo,
+  resetHistory,
+  undo,
+  type History,
+} from "./history";
 import { DEFAULT_TINT } from "./palette";
 import {
   BOARD_VERSION,
@@ -128,12 +140,57 @@ function parseBoard(raw: string | null, cols: number, rows: number): Board {
   }
 }
 
+/** How a change enters the undo history. See {@link commitForPatch} and the mutators below for which
+ *  change is which, and history.ts for why `silent` and `barrier` exist at all. */
+type CommitKind = { mode: "push"; key?: string | null } | { mode: "silent" } | { mode: "barrier" };
+
+const SILENT: CommitKind = { mode: "silent" };
+
+/** The undoable weight of a board: the text it holds. Snapshots share structure for everything the
+ *  user didn't touch, so rects and ids are effectively free — but a note's text is a fresh string on
+ *  every keystroke, and it is the only thing here that can grow without bound. */
+function weighBoard(b: Board): number {
+  let n = 0;
+  for (const w of b.widgets) {
+    n += w.text?.length ?? 0;
+    for (const c of w.children ?? []) n += c.text?.length ?? 0;
+  }
+  return n;
+}
+
+/** How a widget patch should be recorded. The default is one undo step per change; the exceptions are
+ *  the changes that reach past the board. */
+function commitForPatch(id: string, patch: Partial<Widget>): CommitKind {
+  // Ingest metadata mirrors a REAL vault document, which undo cannot delete. Rolling these fields
+  // back would only make the note lie about whether it had been filed.
+  if ("ingestedAt" in patch || "ingestedHash" in patch) return { mode: "silent" };
+  // Linking a timeline to a project writes real milestones to the backend BEFORE this patch lands.
+  // No board snapshot can retract them, and restoring the freeform entries they were made from would
+  // draw both on the calendar — so a link is where the board's history honestly ends. (Unlinking
+  // writes nothing, so it stays an ordinary, undoable step.)
+  if ("project" in patch && patch.project !== undefined) return { mode: "barrier" };
+  // Typing is grouped so one Ctrl+Z doesn't take a single character — keyed per widget and per field
+  // so two notes, or a title and a body, never merge into each other.
+  if ("text" in patch) return { mode: "push", key: `text:${id}` };
+  if ("title" in patch) return { mode: "push", key: `title:${id}` };
+  // Everything else — colour, geometry, view toggles — is its own step. Three colour clicks should be
+  // three undos; and the swatches only show while editing, so a shared key would let a colour change
+  // be swallowed by the text bucket around it.
+  return { mode: "push" };
+}
+
 /** Board state + the mutators the view needs. Loads once from the store on mount and
  *  re-persists every change. `bounds` is the board's maximum cell extent (the screen size —
  *  see PinboardView): stored widgets are clamped to it on load and new widgets placed within it,
- *  so a widget dragged into the enlarged board survives a reload instead of snapping back. */
+ *  so a widget dragged into the enlarged board survives a reload instead of snapping back.
+ *
+ *  Undo lives HERE rather than around the view's handlers, because this is the only writer: widgets
+ *  are also created and destroyed inside `resolveDrop` (filing, folding) and dropped by `parseBoard`,
+ *  paths no caller sees — and nothing outside could rebuild a deleted widget's id, text and rect
+ *  anyway. One funnel, one place to be right. */
 export function usePinboard(bounds: { cols: number; rows: number } = { cols: COLS, rows: ROWS }) {
-  const [board, setBoard] = useState<Board>(EMPTY_BOARD);
+  const [hist, setHist] = useState<History<Board>>(() => initHistory(EMPTY_BOARD));
+  const board = hist.present;
   const loaded = useRef(false);
   // Read through a ref so the mount-only load effect and the stable mutators always see the
   // current bounds without re-subscribing (bounds is derived from the fixed screen size, so it
@@ -143,22 +200,44 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
 
   // Load the stored board once. Until this resolves, `loaded` stays false so the persist
   // effect below won't write the empty default over a real board.
+  const [ready, setReady] = useState(false);
   useEffect(() => {
     let cancelled = false;
     getPref(PREF_KEY)
       .then((raw) => {
-        if (!cancelled) setBoard(parseBoard(raw, boundsRef.current.cols, boundsRef.current.rows));
+        // RESET, not commit: the board didn't change, it arrived. Committing it would leave the empty
+        // default sitting in `past`, and the very first Ctrl+Z would wipe the user's board.
+        if (!cancelled) {
+          setHist(resetHistory(parseBoard(raw, boundsRef.current.cols, boundsRef.current.rows)));
+        }
       })
       .catch(() => {
-        /* store not ready — keep the empty board */
+        /* store not ready — keep the empty board (history already holds exactly that) */
       })
       .finally(() => {
         loaded.current = true;
+        if (!cancelled) setReady(true);
       });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  /** The one writer. `fn` produces the next board from the current one; `kind` says how that enters
+   *  the undo history. `now` is read out here so the state updater stays pure (React may run it
+   *  twice under StrictMode). */
+  const change = useCallback((fn: (b: Board) => Board, kind: CommitKind = { mode: "push" }) => {
+    const now = Date.now();
+    setHist((h) => {
+      const next = fn(h.present);
+      if (kind.mode === "silent") return commitSilent(h, next);
+      if (kind.mode === "barrier") return commitBarrier(h, next);
+      return commit(h, next, { key: kind.key ?? null, now, weigh: weighBoard });
+    });
+  }, []);
+
+  const undoBoard = useCallback(() => setHist((h) => undo(h)), []);
+  const redoBoard = useCallback(() => setHist((h) => redo(h)), []);
 
   // Persist the board — DEBOUNCED (F-15). The board object changes on every keystroke (a note's text
   // lives in it), and writing the whole JSON to the encrypted store each time is one IPC + SQLCipher
@@ -190,31 +269,31 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
   // functional update) so it can be returned synchronously.
   const addNote = useCallback(() => {
     const id = makeId();
-    setBoard((b) => {
+    change((b) => {
       const rect = findFreeRect(b.widgets, 7, 5, boundsRef.current.cols, boundsRef.current.rows);
       const widget: Widget = { id, kind: "note", rect, text: "", color: DEFAULT_TINT };
       return { ...b, widgets: [...b.widgets, widget] };
     });
     return id;
-  }, []);
+  }, [change]);
 
   const addTimeline = useCallback(() => {
     const id = makeId();
-    setBoard((b) => {
+    change((b) => {
       const rect = findFreeRect(b.widgets, 9, 8, boundsRef.current.cols, boundsRef.current.rows);
       // Seed an empty title so the header shows its "Timeline" placeholder (matching notes/folders).
       const widget: Widget = { id, kind: "timeline", rect, title: "", items: [] };
       return { ...b, widgets: [...b.widgets, widget] };
     });
     return id;
-  }, []);
+  }, [change]);
 
   /** An EMPTY folder, made on purpose. Nothing auto-dissolves it: it lives until the user ungroups
    *  it, so it can sit there waiting to be filled. `children: []` is not optional — `isValidWidget`
    *  silently drops a folder whose `children` isn't an array, which would lose it on the next load. */
   const addFolder = useCallback(() => {
     const id = makeId();
-    setBoard((b) => {
+    change((b) => {
       const rect = findFreeRect(
         b.widgets,
         FOLDER_W,
@@ -233,151 +312,196 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
       return { ...b, widgets: [...b.widgets, widget] };
     });
     return id;
-  }, []);
+  }, [change]);
 
-  const updateWidget = useCallback((id: string, patch: Partial<Widget>) => {
-    setBoard((b) => ({ ...b, widgets: mapWidget(b.widgets, id, (w) => ({ ...w, ...patch })) }));
-  }, []);
+  const updateWidget = useCallback(
+    (id: string, patch: Partial<Widget>) => {
+      change(
+        (b) => ({ ...b, widgets: mapWidget(b.widgets, id, (w) => ({ ...w, ...patch })) }),
+        commitForPatch(id, patch),
+      );
+    },
+    [change],
+  );
 
   /** Reposition a widget (used by resize; move gestures go through {@link dropWidget}). */
-  const moveWidget = useCallback((id: string, rect: Rect) => {
-    setBoard((b) => ({
-      ...b,
-      widgets: b.widgets.map((w) => (w.id === id ? { ...w, rect } : w)),
-    }));
-  }, []);
+  const moveWidget = useCallback(
+    (id: string, rect: Rect) => {
+      change((b) => ({
+        ...b,
+        widgets: b.widgets.map((w) => (w.id === id ? { ...w, rect } : w)),
+      }));
+    },
+    [change],
+  );
 
   /** Commit a MOVE drop: may file the widget into the folder under the POINTER, merge two
    *  identically-placed widgets into a folder, or just reposition (see {@link resolveDrop}).
    *  `pointer` is the board cell the mouse was over on release, and is required rather than
    *  optional so every caller has to say what it means — `null` (unknown) files into nothing,
    *  which is the safe reading. */
-  const dropWidget = useCallback((id: string, rect: Rect, pointer: CellPoint | null) => {
-    setBoard((b) => ({
-      ...b,
-      widgets: resolveDrop(
-        b.widgets,
-        id,
-        rect,
-        boundsRef.current.cols,
-        boundsRef.current.rows,
-        makeId,
-        pointer,
-      ),
-    }));
-  }, []);
-
-  const removeWidget = useCallback((id: string) => {
-    setBoard((b) => {
-      const top = b.widgets.find((w) => w.id === id);
-      if (top) {
-        // A top-level FOLDER ungroups (spill its children back onto the board — non-destructive, so
-        // deleting a tile never nukes the user's notes); a note/timeline is deleted outright.
-        if (top.kind === "folder") {
-          const { cols, rows } = boundsRef.current;
-          let others = b.widgets.filter((w) => w.id !== id);
-          for (const child of top.children ?? []) {
-            const rect = findFreeRect(others, child.rect.w, child.rect.h, cols, rows);
-            others = [...others, { ...child, rect }];
-          }
-          return { ...b, widgets: others };
-        }
-        return { ...b, widgets: b.widgets.filter((w) => w.id !== id) };
-      }
-      // A folder CHILD: remove it from its parent. The folder stays, however few cards are left —
-      // it's the user's object, and its ✕ ("Ungroup") is how it goes away.
-      return {
+  const dropWidget = useCallback(
+    (id: string, rect: Rect, pointer: CellPoint | null) => {
+      change((b) => ({
         ...b,
-        widgets: b.widgets.map((w) =>
-          w.kind === "folder" && w.children?.some((c) => c.id === id)
-            ? { ...w, children: (w.children ?? []).filter((c) => c.id !== id) }
-            : w,
+        widgets: resolveDrop(
+          b.widgets,
+          id,
+          rect,
+          boundsRef.current.cols,
+          boundsRef.current.rows,
+          makeId,
+          pointer,
         ),
-      };
-    });
-  }, []);
+      }));
+    },
+    [change],
+  );
+
+  const removeWidget = useCallback(
+    (id: string) => {
+      change((b) => {
+        const top = b.widgets.find((w) => w.id === id);
+        if (top) {
+          // A top-level FOLDER ungroups (spill its children back onto the board — non-destructive, so
+          // deleting a tile never nukes the user's notes); a note/timeline is deleted outright.
+          if (top.kind === "folder") {
+            const { cols, rows } = boundsRef.current;
+            let others = b.widgets.filter((w) => w.id !== id);
+            for (const child of top.children ?? []) {
+              const rect = findFreeRect(others, child.rect.w, child.rect.h, cols, rows);
+              others = [...others, { ...child, rect }];
+            }
+            return { ...b, widgets: others };
+          }
+          return { ...b, widgets: b.widgets.filter((w) => w.id !== id) };
+        }
+        // A folder CHILD: remove it from its parent. The folder stays, however few cards are left —
+        // it's the user's object, and its ✕ ("Ungroup") is how it goes away.
+        return {
+          ...b,
+          widgets: b.widgets.map((w) =>
+            w.kind === "folder" && w.children?.some((c) => c.id === id)
+              ? { ...w, children: (w.children ?? []).filter((c) => c.id !== id) }
+              : w,
+          ),
+        };
+      });
+    },
+    [change],
+  );
 
   /** Pull a child out of a folder back onto the board, into a free slot. The source folder stays put
    *  (empty if that was its last card) — only the user's ✕ ungroups it. */
-  const popOutChild = useCallback((folderId: string, childId: string) => {
-    setBoard((b) => {
-      const { cols, rows } = boundsRef.current;
-      const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
-      const child = folder?.children?.find((c) => c.id === childId);
-      if (!folder || !child) return b;
-      const remaining = (folder.children ?? []).filter((c) => c.id !== childId);
-      // A free slot, so the popped card lands in the clear. It is NOT put back through resolveDrop:
-      // findFreeRect falls back to an OVERLAPPING origin when the board is full, which would let a
-      // card pop straight back into the folder it just came out of.
-      const landing = findFreeRect(b.widgets, child.rect.w, child.rect.h, cols, rows);
-      const ws = b.widgets.map((w) => (w.id === folderId ? { ...w, children: remaining } : w));
-      return { ...b, widgets: [...ws, { ...child, rect: landing }] };
-    });
-  }, []);
+  const popOutChild = useCallback(
+    (folderId: string, childId: string) => {
+      change((b) => {
+        const { cols, rows } = boundsRef.current;
+        const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
+        const child = folder?.children?.find((c) => c.id === childId);
+        if (!folder || !child) return b;
+        const remaining = (folder.children ?? []).filter((c) => c.id !== childId);
+        // A free slot, so the popped card lands in the clear. It is NOT put back through resolveDrop:
+        // findFreeRect falls back to an OVERLAPPING origin when the board is full, which would let a
+        // card pop straight back into the folder it just came out of.
+        const landing = findFreeRect(b.widgets, child.rect.w, child.rect.h, cols, rows);
+        const ws = b.widgets.map((w) => (w.id === folderId ? { ...w, children: remaining } : w));
+        return { ...b, widgets: [...ws, { ...child, rect: landing }] };
+      });
+    },
+    [change],
+  );
 
-  /** Move a widget to the end of the list (= painted on top) when it's interacted with. */
-  const raiseWidget = useCallback((id: string) => {
-    setBoard((b) => {
-      if (b.widgets[b.widgets.length - 1]?.id === id) return b;
-      const w = b.widgets.find((x) => x.id === id);
-      if (!w) return b;
-      return { ...b, widgets: [...b.widgets.filter((x) => x.id !== id), w] };
-    });
-  }, []);
+  /** Move a widget to the end of the list (= painted on top) when it's interacted with. SILENT: it
+   *  fires on every grab, so recording it would make merely touching a card an undo step — and undoing
+   *  a z-order change nobody asked for is worse than not being able to. */
+  const raiseWidget = useCallback(
+    (id: string) => {
+      change((b) => {
+        if (b.widgets[b.widgets.length - 1]?.id === id) return b;
+        const w = b.widgets.find((x) => x.id === id);
+        if (!w) return b;
+        return { ...b, widgets: [...b.widgets.filter((x) => x.id !== id), w] };
+      }, SILENT);
+    },
+    [change],
+  );
 
   /** The same, one level down: raise a child within its folder's own board, where cards overlap just
-   *  like they do outside. Separate from {@link raiseWidget}, which only walks the top level. */
-  const raiseChild = useCallback((folderId: string, childId: string) => {
-    setBoard((b) => {
-      const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
-      const kids = folder?.children;
-      if (!kids || kids[kids.length - 1]?.id === childId) return b;
-      const child = kids.find((c) => c.id === childId);
-      if (!child) return b;
-      return {
-        ...b,
-        widgets: b.widgets.map((w) =>
-          w.id === folderId
-            ? { ...w, children: [...kids.filter((c) => c.id !== childId), child] }
-            : w,
-        ),
-      };
-    });
-  }, []);
+   *  like they do outside. Separate from {@link raiseWidget}, which only walks the top level. Silent
+   *  for the same reason. */
+  const raiseChild = useCallback(
+    (folderId: string, childId: string) => {
+      change((b) => {
+        const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
+        const kids = folder?.children;
+        if (!kids || kids[kids.length - 1]?.id === childId) return b;
+        const child = kids.find((c) => c.id === childId);
+        if (!child) return b;
+        return {
+          ...b,
+          widgets: b.widgets.map((w) =>
+            w.id === folderId
+              ? { ...w, children: [...kids.filter((c) => c.id !== childId), child] }
+              : w,
+          ),
+        };
+      }, SILENT);
+    },
+    [change],
+  );
 
-  const addTimelineItem = useCallback((id: string) => {
-    const item: TimelineItem = { id: makeId(), date: "", label: "" };
-    setBoard((b) => ({
-      ...b,
-      widgets: mapWidget(b.widgets, id, (w) => ({ ...w, items: [...(w.items ?? []), item] })),
-    }));
-  }, []);
+  const addTimelineItem = useCallback(
+    (id: string) => {
+      const item: TimelineItem = { id: makeId(), date: "", label: "" };
+      change((b) => ({
+        ...b,
+        widgets: mapWidget(b.widgets, id, (w) => ({ ...w, items: [...(w.items ?? []), item] })),
+      }));
+    },
+    [change],
+  );
 
   const updateTimelineItem = useCallback(
     (id: string, itemId: string, patch: Partial<TimelineItem>) => {
-      setBoard((b) => ({
+      change(
+        (b) => ({
+          ...b,
+          widgets: mapWidget(b.widgets, id, (w) => ({
+            ...w,
+            items: (w.items ?? []).map((it) => (it.id === itemId ? { ...it, ...patch } : it)),
+          })),
+        }),
+        // Typed into, like a note — grouped per entry so an undo takes a few seconds of the label,
+        // not one character.
+        { mode: "push", key: `item:${id}:${itemId}` },
+      );
+    },
+    [change],
+  );
+
+  const removeTimelineItem = useCallback(
+    (id: string, itemId: string) => {
+      change((b) => ({
         ...b,
         widgets: mapWidget(b.widgets, id, (w) => ({
           ...w,
-          items: (w.items ?? []).map((it) => (it.id === itemId ? { ...it, ...patch } : it)),
+          items: (w.items ?? []).filter((it) => it.id !== itemId),
         })),
       }));
     },
-    [],
+    [change],
   );
-
-  const removeTimelineItem = useCallback((id: string, itemId: string) => {
-    setBoard((b) => ({
-      ...b,
-      widgets: mapWidget(b.widgets, id, (w) => ({
-        ...w,
-        items: (w.items ?? []).filter((it) => it.id !== itemId),
-      })),
-    }));
-  }, []);
 
   return {
     board,
+    /** False until the stored board has arrived. The add buttons wait on it: a widget created before
+     *  the load lands is overwritten by it, and with a history that would be an unrecoverable loss. */
+    ready,
+    undo: undoBoard,
+    redo: redoBoard,
+    canUndo: canUndo(hist),
+    canRedo: canRedo(hist),
     addNote,
     addTimeline,
     addFolder,
