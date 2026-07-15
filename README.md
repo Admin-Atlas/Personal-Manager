@@ -59,18 +59,26 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
 - **A "what needs your attention" layer.** Approaching deadlines, today's events and
   prep-ahead nudges become stable, tracked items you can mark done — not a paragraph the
   model rewrites each morning. Resolve one and it stays resolved.
-- **Milestones & deadlines** on each project feed straight into the briefing and Focus, and
-  the same conversation, chat or briefing all read from one honest picture of what matters.
+- **Milestones & deadlines** on each project feed straight into the briefing, Focus and the
+  calendar — sorted by deadline, by name, or by hand — and the same conversation, chat or
+  briefing all read from one honest picture of what matters.
 - **Per-project view.** Click in and everything narrows to that project: its files beside a
   chat that answers only from them.
+- **A pinboard to think on.** A board for notes, checklists and timelines you can drag,
+  resize and tidy into folders, with undo when you change your mind. Nothing on it is
+  trapped there: a note can become a real document in your vault when it's ready, and a
+  timeline can become a project's milestones.
 - **A map of your knowledge.** See your documents laid out by meaning — related material
   clusters together — as a navigable map you can explore.
-- **Read-only calendar.** Gather Google, Outlook and iCal calendars into one agenda with
-  Month/Week/Day/Year views, schedule-aware chat answers, and an automatic "Due soon" when an
-  event names a project.
+- **One calendar, never written to.** Gather Google, Outlook and iCal calendars into one
+  agenda — Month, Week, Day, Year and Agenda views, extra timezones down the side, and your
+  own working hours — with schedule-aware chat answers and an automatic "Due soon" when an
+  event names a project. Your milestones and pinboard timelines show alongside as markers you
+  can toggle off. PM only ever reads your calendars; it never writes to them.
 - **Bring your own model.** Choose any model through OpenRouter — separate chat and
-  background models, automatic fallback on rate limits, spend at a glance, and zero-data-
-  retention requested on every call.
+  background models, spend at a glance, and zero-data-retention requested on every call. PM
+  starts you on a cheap default; add a second model and turn on auto-switch to get automatic
+  fallback when one is rate-limited.
 - **Voice input.** Speak into the chat box and PM transcribes it **on your device** into
   editable text — no audio leaves the machine.
 - **Command palette.** A single keystroke (Ctrl/Cmd+K) to jump to any project, file, or past

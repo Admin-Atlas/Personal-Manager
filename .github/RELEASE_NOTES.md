@@ -1,4 +1,4 @@
-PM desktop release — **v3.9.1-alpha**.
+PM desktop release — **v3.17.1-alpha**.
 
 ## Install
 
@@ -44,35 +44,50 @@ than keeping two around.
 installed the **`.rpm`**, update it with your package manager (`dnf upgrade`) when a new
 release lands.
 
-## What's new in 3.9.1-alpha
+## What's new in 3.17.1-alpha
 
-This release rolls up everything since v3.6.2 — here's the tour at a glance:
+This release rolls up everything since v3.9.1 — here's the tour at a glance:
 
-- **See other timezones on the calendar, and set your own hours.** In Day and Week view,
-  add up to two more timezones from the **Zones** button and they show as extra columns
-  down the left beside your local time — handy for a call with another city. The **▾** on
-  the Work and Day buttons lets you frame the view to your own hours (Work sits around a
-  comfortable 9-to-5, Day follows your local sunrise-to-sunset), and events now show their
-  **start and end** time (e.g. 09:30–10:45), not just the start.
-- **A tidier pinboard.** Notes and timelines can now carry a **title**, the **Ingest**
-  button moved up into the top bar so notes get their full height back, and dropping a note
-  exactly on top of another the same size folds the two into a neat **folder** tile you can
-  name, open in place, and drag cards back out of. Every colour also tells you its name on
-  hover now — the note tint dots and every theme swatch in Settings.
-- **Honest vault recovery when Windows blocks the folder.** If Windows ever blocks PM from
-  its own vault folder, PM now says exactly that and offers a one-click **Repair access**,
-  instead of a confusing wall of "the vault is locked" messages. Sharing a vault across
-  Windows accounts is now safe by construction — PM checks the destination can hold it,
-  locks it down and confirms it still opens there *before* committing the move — and you can
-  properly **delete a shared vault**, with everyone who joined told plainly and moved back to
-  a vault of their own. Your data was never at risk; now PM says so, on every screen.
-- **Windows updates no longer fail silently.** If Windows **Smart App Control** is switched
-  on, it blocks PM's update installer with no visible error — clicking "Restart now" used to
-  quietly reopen on the old version. PM now spots that and tells you the one thing that fixes
-  it, instead of retrying the same broken update on every launch.
-- **A cleaner exit.** Finishing "Remove PM data" now actually closes the app, a full
-  uninstall on Windows no longer strands a leftover "PM" folder, and you get a clear reminder
-  before erasing a vault and database that can't be recovered.
+- **⚠ One thing to do after updating: open the Documents tab and click Rebuild, once.**
+  Files you'd connected from **Google Drive**, **OneDrive** or a watched folder were only
+  searchable by a short summary of themselves, so search, chat and the filing suggestions in
+  Review could all miss what was deeper inside them. They're now read and indexed **in full**
+  — and that one **Rebuild** is what brings the files you already have up to date. It re-reads
+  your connected files from their source, one at a time, so you'll see each one processed.
+  Anything offline at the time stays findable by its summary and catches up on its next sync.
+- **A pinboard you can properly work on.** Folders are now made on purpose with a **+ Folder**
+  button, they're **resizable**, and they stay until you ungroup them rather than evaporating
+  when they're down to one card. A card only files into a folder if your **mouse** is over it
+  when you let go — so a big note can finally sit beside a folder without being swallowed —
+  and folders no longer swallow each other. Opening one as an overlay now gives you a real
+  board to drag, resize and overlap on, not a list.
+- **The pinboard has undo, and asks before it deletes.** **Ctrl+Z** (**⌘Z** on a Mac) takes
+  back your last change and **Ctrl+Y** puts it back. Deleting a note or timeline now tells you
+  what actually goes with it first — with a "Don't ask again" tick, and a switch in
+  **Settings › General** to bring the asking back. Two things undo deliberately won't take
+  back, because it can't do so honestly: **ingesting** a note, and **linking** a timeline to a
+  project.
+- **Your milestones and timelines now show on the calendar.** Any dated milestone appears as
+  an all-day marker in its own colour across Month, Week, Day and Agenda — click it to jump
+  straight to its project — and every dated entry on a pinboard timeline does the same. Hide
+  either from the **Calendars** menu. The Milestones panel also **sorts** now: by deadline, by
+  name, or by hand, from a **Manual / Deadline / Name** control in its header.
+- **The calendar scrolls, and its timezones moved somewhere you'll find them.** Month and Year
+  views now scroll smoothly through past and future instead of jumping a whole month or year
+  at a time, settling neatly on a week or a row of months. Extra timezones are added from the
+  **top-left corner of the Day or Week grid**, where the hour column meets the dates, and the
+  list now reads as **Continent / Country / City** so you can search by any of them.
+- **A far cheaper model out of the box.** PM now starts you on **Ling-2.6-flash** instead of
+  Claude Sonnet 4.6 — a few hundred times less per word — which matters most for the work PM
+  does when you're not watching it: naming your chats, summarising them, and proposing where
+  each new document belongs. Sonnet is still there in **Settings › AI**. The honest trade: it
+  reads a little less at once (262,000 tokens against a million), and it's served by a single
+  provider, so if that provider has a bad day chat **waits** rather than quietly moving
+  elsewhere — adding a second model and turning on **auto-switch** gives you that safety net
+  back. If you've already picked your own models, nothing changes.
+- **Settings is much quieter.** Every section now leads with what you came to change — the
+  switches, the pickers, the connect buttons — and folds its explanation behind a caret
+  underneath. Nothing was deleted, and the warnings you'd regret missing stay out in the open.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
