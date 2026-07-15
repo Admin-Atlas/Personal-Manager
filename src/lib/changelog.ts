@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.18.1-alpha",
+    date: "2026-07-15",
+    highlights: [
+      "Rebuilding your documents no longer loses its place when you switch tabs. It never actually stopped — the work carried on the whole time — but the Documents tab forgot it was happening the moment you looked away, came back showing nothing, and left you assuming it had died. Now the progress is yours to leave: switch tabs, go and do something else, and the bar picks up exactly where it is when you return.",
+      "It also survives closing the app. If PM is shut mid-rebuild, it starts the rebuild again by itself next time you open it. Being straight with you: a rebuild can't run while the app is closed, and it has no way to pick up mid-file, so this restarts it rather than resuming it. It's still the right thing to do — a rebuild that's been interrupted leaves your search incomplete until it finishes, and previously nothing told you that or fixed it.",
+      "Fixed a real one: rebuilding twice at once could destroy the first rebuild's work. Switching away and back reset the button, so a second Rebuild could start while the first was still going — and the second one clears the index out before it begins. PM now refuses the second and tells you the first is still running.",
+    ],
+  },
+  {
     version: "3.18.0-alpha",
     date: "2026-07-15",
     highlights: [

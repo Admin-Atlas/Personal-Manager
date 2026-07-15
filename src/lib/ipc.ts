@@ -49,6 +49,7 @@ import type {
   LocalFolderSyncState,
   LocalSubfolder,
   Message,
+  IngestJobState,
   ModelInfo,
   OcrStatus,
   OneDriveAccount,
@@ -496,10 +497,13 @@ export function ingestPaths(
 }
 
 /** Drop the index and rebuild it from the Markdown vault. */
-export function rebuildIndex(onEvent: (event: IngestEvent) => void): Promise<void> {
-  const channel = new Channel<IngestEvent>();
-  channel.onmessage = onEvent;
-  return invoke<void>("rebuild_index", { onEvent: channel });
+/** Drop the search index and rebuild it from the Markdown vault, then re-index connected
+ *  (index-only) items from their full bodies. Runs detached: it keeps going if the caller unmounts,
+ *  or even if the app is closed and reopened (it restarts on launch). Progress is broadcast on
+ *  `ingest://progress` — subscribe with {@link onIngestProgress} and read {@link rebuildStatus} on
+ *  mount for anything missed. Rejects if a rebuild is already running. */
+export function rebuildIndex(): Promise<void> {
+  return invoke<void>("rebuild_index");
 }
 
 // --- Developer mode (issue #78): read-only inspection surfaces ---
@@ -766,6 +770,22 @@ export const driveSyncStatus = () => invoke<DriveSyncState>("drive_sync_status")
 
 /** Ask the running sync to stop after the current file. Already-indexed files are kept. */
 export const stopDriveSync = () => invoke<void>("stop_drive_sync");
+
+/** The in-flight rebuild's snapshot (or `running:false` when idle). Read on mount so a view that
+ *  wasn't there when the rebuild started still shows its progress — the rebuild is detached from
+ *  whoever started it, so the per-call channel below only reaches a listener that stayed mounted. */
+export const rebuildStatus = () => invoke<IngestJobState>("rebuild_status");
+
+/** Resume a rebuild interrupted by a previous app close/crash. Called once on launch; resolves true
+ *  if one was started. A rebuild keeps no per-document checkpoint, so this restarts it rather than
+ *  continuing it — the marker only survives when the index was left partial, and a partial index
+ *  must be rebuilt regardless. */
+export const resumeRebuild = () => invoke<boolean>("resume_rebuild");
+
+/** Subscribe to global rebuild progress (fires regardless of which view started it, and keeps
+ *  firing after that view unmounts). */
+export const onIngestProgress = (handler: (e: IngestEvent) => void): Promise<UnlistenFn> =>
+  listen<IngestEvent>("ingest://progress", (e) => handler(e.payload));
 
 /** Resume a sync interrupted by a previous app close/crash mid-index. Called once on launch; resolves
  *  true if a resume was started. Already-indexed files survive, so it only does the outstanding work. */
