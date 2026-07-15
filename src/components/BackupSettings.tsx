@@ -52,10 +52,9 @@ import type {
 } from "../lib/types";
 import { formatDateTime } from "../lib/format";
 import { isOpaquePhase, describeFailures } from "../lib/backup";
-import { Button, Collapsible, Input } from "./ui";
+import { Button, Input, SectionInfo } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { IngestProgress } from "./IngestProgress";
-import { useDepth } from "../theme";
 
 const PHASE_LABEL: Record<BackupPhase, string> = {
   snapshot: "Preparing a snapshot",
@@ -74,8 +73,6 @@ const FREQ_LABEL: Record<BackupSchedule["frequency"], string> = {
 };
 
 export function BackupSettings() {
-  const { showPower } = useDepth();
-
   // Live progress (from the global backup://progress event + a status snapshot on mount).
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState<BackupPhase | null>(null);
@@ -570,12 +567,18 @@ export function BackupSettings() {
   return (
     <div className="mt-5 border-t border-border pt-4" data-help="settings-backup">
       <label className="block text-sm font-medium text-ink2">Encrypted backup</label>
+      {/* The no-recovery sentence stays inline and unfoldable — the one line whose absence
+          costs a vault. The description of what a backup *is* folds beneath it. */}
       <p className="mt-1 text-sm text-ink3">
-        A backup is a single encrypted file that holds a complete copy of your whole vault — every
-        note, the database, and your settings. You lock it with a passphrase you choose; restoring
-        needs that same file and passphrase, here or on any other computer. There&rsquo;s no way to
-        recover a backup without its passphrase, so keep it somewhere safe.
+        There&rsquo;s no way to recover a backup without its passphrase, so keep it somewhere safe.
       </p>
+      <SectionInfo title="What is a backup?">
+        <p>
+          A backup is a single encrypted file that holds a complete copy of your whole vault — every
+          note, the database, and your settings. You lock it with a passphrase you choose; restoring
+          needs that same file and passphrase, here or on any other computer.
+        </p>
+      </SectionInfo>
 
       {/* Status summary — so reopening the app shows where backups stand at a glance. */}
       {showStatus && schedule && (
@@ -660,8 +663,7 @@ export function BackupSettings() {
           Backup passphrase
         </label>
         <p className="mt-1 text-xs text-ink4">
-          Choose the passphrase that locks your backups. It&rsquo;s a separate secret from your app
-          lock, and it&rsquo;s the only thing that can unlock a backup later — there&rsquo;s no
+          This passphrase is the only thing that can unlock a backup later — there&rsquo;s no
           recovery if you lose it, so store it somewhere safe (a password manager).
         </p>
         <div className="mt-2 flex max-w-sm flex-col gap-2">
@@ -701,12 +703,21 @@ export function BackupSettings() {
                 </Button>
               </div>
               <p className="text-xs text-ink4">
-                Optional. Stores only the passphrase in your OS keychain — never your data — so
-                automatic backups can run without asking. Required to turn on a schedule below.
+                Optional — but required to turn on a schedule below.
               </p>
             </div>
           )}
         </div>
+        <SectionInfo title="How the backup passphrase works">
+          <p>
+            Choose the passphrase that locks your backups. It&rsquo;s a separate secret from your
+            app lock.
+          </p>
+          <p>
+            <span className="font-medium">Remember on this device</span> stores only the passphrase
+            in your OS keychain — never your data — so automatic backups can run without asking.
+          </p>
+        </SectionInfo>
       </div>
 
       {/* --- 2 · Save a backup now --- */}
@@ -714,12 +725,6 @@ export function BackupSettings() {
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
           Save a backup now
         </label>
-        <p className="mt-1 text-xs text-ink4">
-          Packs your whole vault into one encrypted <span className="font-mono">.pmbackup</span>{" "}
-          file and locks it with the passphrase above. That file{" "}
-          <span className="font-medium">is your data</span> — compressed and encrypted — not your
-          passphrase; you need both to restore.
-        </p>
         <div className="mt-2 flex max-w-sm flex-col gap-2">
           <div className="flex flex-wrap gap-2">
             <Button variant="primary" onClick={doBackup} disabled={!backupValid}>
@@ -747,6 +752,14 @@ export function BackupSettings() {
             </p>
           )}
         </div>
+        <SectionInfo title="What gets saved?">
+          <p>
+            Packs your whole vault into one encrypted <span className="font-mono">.pmbackup</span>{" "}
+            file and locks it with the passphrase above. That file{" "}
+            <span className="font-medium">is your data</span> — compressed and encrypted — not your
+            passphrase; you need both to restore.
+          </p>
+        </SectionInfo>
       </div>
 
       {/* --- Restore a backup --- */}
@@ -754,12 +767,6 @@ export function BackupSettings() {
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
           Restore a backup
         </label>
-        <p className="mt-1 text-xs text-ink4">
-          Have a <span className="font-mono">.pmbackup</span> file? It&rsquo;s your whole vault,
-          compressed and encrypted. Choose it and enter its passphrase — restore unpacks it into a
-          new folder and verifies it first, so your current vault is untouched until you switch to
-          the restored one.
-        </p>
         <div className="mt-2 flex max-w-sm flex-col gap-2">
           <div className="flex items-center gap-2">
             <Button variant="secondary" onClick={chooseRestoreFile} disabled={running}>
@@ -792,6 +799,14 @@ export function BackupSettings() {
             </>
           )}
         </div>
+        <SectionInfo title="How restoring works">
+          <p>
+            Have a <span className="font-mono">.pmbackup</span> file? It&rsquo;s your whole vault,
+            compressed and encrypted. Choose it and enter its passphrase — restore unpacks it into a
+            new folder and verifies it first, so your current vault is untouched until you switch to
+            the restored one.
+          </p>
+        </SectionInfo>
       </div>
 
       {/* --- Proton Drive (off-machine destination + automatic backups) --- */}
@@ -799,12 +814,6 @@ export function BackupSettings() {
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
           Proton Drive
         </label>
-        <p className="mt-1 text-xs text-ink4">
-          Keep your encrypted backups off-machine on your own Proton Drive — end-to-end-encrypted
-          cold storage. PM uses Proton&rsquo;s official command-line tool and never sees your Proton
-          login.
-        </p>
-
         {proton === null ? (
           <p className="mt-2 text-xs text-ink4">Checking for the Proton Drive CLI&hellip;</p>
         ) : !proton.installed ? (
@@ -940,6 +949,13 @@ export function BackupSettings() {
             )}
           </div>
         )}
+        <SectionInfo title="How Proton Drive backups work">
+          <p>
+            Keep your encrypted backups off-machine on your own Proton Drive — end-to-end-encrypted
+            cold storage. PM uses Proton&rsquo;s official command-line tool and never sees your
+            Proton login.
+          </p>
+        </SectionInfo>
       </div>
 
       {/* --- Google Drive (off-machine destination via the Drive API — already connected, so this
@@ -948,13 +964,6 @@ export function BackupSettings() {
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
           Google Drive
         </label>
-        <p className="mt-1 text-xs text-ink4">
-          Keep your encrypted backups on your own Google Drive. They&rsquo;re already encrypted
-          before they leave your computer; PM only ever touches its own &ldquo;Personal Manager
-          Backups&rdquo; folder (the <span className="font-mono">drive.file</span> permission),
-          never the rest of your Drive.
-        </p>
-
         {gdrive === null ? (
           <p className="mt-2 text-xs text-ink4">Checking your Google Drive connection&hellip;</p>
         ) : !gdriveGranted ? (
@@ -1090,6 +1099,14 @@ export function BackupSettings() {
             )}
           </div>
         )}
+        <SectionInfo title="How Google Drive backups work">
+          <p>
+            Keep your encrypted backups on your own Google Drive. They&rsquo;re already encrypted
+            before they leave your computer; PM only ever touches its own &ldquo;Personal Manager
+            Backups&rdquo; folder (the <span className="font-mono">drive.file</span> permission),
+            never the rest of your Drive.
+          </p>
+        </SectionInfo>
       </div>
 
       {/* --- Automatic backups — one schedule fans out to every destination you turn on --- */}
@@ -1097,10 +1114,6 @@ export function BackupSettings() {
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
           Automatic backups
         </label>
-        <p className="mt-1 text-xs text-ink4">
-          PM backs up your current vault on a schedule, using the passphrase you remembered above,
-          to whichever destinations you turn on here.
-        </p>
         {scheduleError ? (
           <div className="mt-2 flex items-center gap-2">
             <span className="text-xs text-st-due">Couldn&rsquo;t load the schedule.</span>
@@ -1199,26 +1212,30 @@ export function BackupSettings() {
             )}
           </div>
         )}
+        <SectionInfo title="How automatic backups work">
+          <p>
+            PM backs up your current vault on a schedule, using the passphrase you remembered above,
+            to whichever destinations you turn on here.
+          </p>
+        </SectionInfo>
       </div>
 
       <div className="mt-4">
-        <Collapsible title="How encrypted backup works" defaultOpen={showPower}>
-          <div className="pt-2 text-xs leading-relaxed text-ink4">
-            <p>
-              A backup bundles your encrypted database, the Markdown vault, and the vault metadata,
-              compresses it with zstd, then encrypts the whole archive with a key stretched from
-              your passphrase (Argon2id). The archive is self-contained: it can be restored on a
-              different computer with only the passphrase.
-            </p>
-            <p className="mt-1">
-              This is different from <span className="font-medium">Export all data</span> (a plain
-              .zip that only opens on this machine) and from{" "}
-              <span className="font-medium">Export plaintext Markdown</span> (a readable,
-              unencrypted copy of your notes). Keep your passphrase safe — a backup can&rsquo;t be
-              recovered without it.
-            </p>
-          </div>
-        </Collapsible>
+        <SectionInfo title="How encrypted backup works">
+          <p>
+            A backup bundles your encrypted database, the Markdown vault, and the vault metadata,
+            compresses it with zstd, then encrypts the whole archive with a key stretched from your
+            passphrase (Argon2id). The archive is self-contained: it can be restored on a different
+            computer with only the passphrase.
+          </p>
+          <p>
+            This is different from <span className="font-medium">Export all data</span> (a plain
+            .zip that only opens on this machine) and from{" "}
+            <span className="font-medium">Export plaintext Markdown</span> (a readable, unencrypted
+            copy of your notes). Keep your passphrase safe — a backup can&rsquo;t be recovered
+            without it.
+          </p>
+        </SectionInfo>
       </div>
     </div>
   );

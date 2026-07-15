@@ -31,7 +31,7 @@ import type {
 } from "../lib/types";
 import { useDetachedSync } from "../lib/useDetachedSync";
 import { formatWhen } from "../lib/format";
-import { Button, Collapsible, ConfirmDialog } from "./ui";
+import { Button, Collapsible, ConfirmDialog, SectionInfo } from "./ui";
 import { SyncProgress } from "./SyncProgress";
 import { SyncReport } from "./SyncReport";
 import { ConnectorItemRow } from "./ConnectorItemRow";
@@ -265,22 +265,6 @@ export function CloudDriveConnection({
   return (
     <div data-help={meta.help}>
       <span className="text-sm font-medium text-ink">{meta.title}</span>
-      <p className="mt-1 text-xs text-ink4">{meta.blurb}</p>
-      {provider === "microsoft" && (
-        <p className="mt-1 text-xs text-ink4">
-          Disconnecting forgets PM&rsquo;s access on this device. Microsoft can&rsquo;t revoke an
-          app&rsquo;s access from within the app, so to fully remove it, manage app access at{" "}
-          <a
-            href={MICROSOFT_APPS_URL}
-            target="_blank"
-            rel="noreferrer"
-            className="underline hover:text-ink2"
-          >
-            account.live.com
-          </a>
-          .
-        </p>
-      )}
 
       {!configured ? (
         <p className="mt-2 text-xs text-ink4">
@@ -429,6 +413,13 @@ export function CloudDriveConnection({
         </p>
       )}
 
+      {/* The connector's standing explanation, folded at the foot so the account list and the
+          connect button sit together. The wrapper's `data-help={meta.help}` is already the
+          help-mode anchor for this material, so no helpId here — it would duplicate the id. */}
+      <SectionInfo title={`How ${meta.title} works`}>
+        <p>{meta.blurb}</p>
+      </SectionInfo>
+
       <ConfirmDialog
         open={confirmEmail != null}
         title={meta.disconnectTitle}
@@ -441,8 +432,29 @@ export function CloudDriveConnection({
         }}
         onClose={() => setConfirmEmail(null)}
       >
-        This forgets the account's sign-in. Its indexed items are kept and stay findable, but marked
-        “source unreachable” until you reconnect — they are never deleted.
+        <p>
+          This forgets the account&rsquo;s sign-in. Its indexed items are kept and stay findable,
+          but marked &ldquo;source unreachable&rdquo; until you reconnect — they are never deleted.
+        </p>
+        {/* Microsoft alone can't be revoked from inside the app, so PM disconnecting is only half
+            the job. This caveat lives here rather than in the connector's SectionInfo: it's the one
+            moment it's actionable, and a fold would have made it the only copy — the help registry
+            doesn't carry it. */}
+        {provider === "microsoft" && (
+          <p className="mt-2">
+            Microsoft can&rsquo;t revoke an app&rsquo;s access from within the app, so PM forgets it
+            here but Microsoft still lists it. To finish removing it, manage app access at{" "}
+            <a
+              href={MICROSOFT_APPS_URL}
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-ink2"
+            >
+              account.live.com
+            </a>
+            .
+          </p>
+        )}
       </ConfirmDialog>
     </div>
   );

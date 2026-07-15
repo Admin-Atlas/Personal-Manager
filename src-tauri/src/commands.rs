@@ -32,9 +32,18 @@ use crate::{
     vault, AppState, BusyGuard, VaultRuntime,
 };
 
-/// Fallback model when the user hasn't chosen one. Swappable in Settings and
-/// stored as a plain string (spec §6 — never locked into a model).
-const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.6";
+/// Fallback model when the user hasn't chosen one, for BOTH roles. Swappable in
+/// Settings and stored as a plain string (spec §6 — never locked into a model).
+///
+/// Whatever this names MUST have a zero-data-retention endpoint: `chat_body` pins
+/// `zdr: true` + `data_collection: "deny"` on every request, so a model with no
+/// compliant endpoint fails closed and the default would brick chat out of the box.
+/// Verify against `/api/v1/endpoints/zdr` before changing it — the public catalogue
+/// carries no per-model data-policy field, so it can't be checked at runtime.
+/// Ling-2.6-flash qualifies via Novita (training/retention both off) and costs
+/// ~$0.01/$0.03 per Mtok against Sonnet 4.6's $3/$15, which the background role
+/// (titles, summaries, sorting proposals) spends on unattended.
+const DEFAULT_MODEL: &str = "inclusionai/ling-2.6-flash";
 
 /// Settings keys for the two model roles. Each holds a JSON array of model ids
 /// (ordered, first = primary); the `*_AUTO_SWITCH` keys hold "true"/"false".

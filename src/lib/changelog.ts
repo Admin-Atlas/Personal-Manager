@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.17.0-alpha",
+    date: "2026-07-15",
+    highlights: [
+      "PM now starts you on a far cheaper model. Out of the box, chat and background work both use Ling-2.6-flash instead of Claude Sonnet 4.6 — a few hundred times less per word, which matters most for the work PM does when you're not watching it: naming your chats, summarising them, and proposing where each new document belongs. Sonnet is still there in Settings › AI whenever you want it. If you've already picked your own models, nothing changes — this only sets the starting point for anyone who hasn't.",
+      "The honest trade: the new default reads a little less at once than Sonnet did (262,000 tokens against a million — still far more than a normal chat needs), and it's served by a single provider, so if that provider has a bad day chat waits rather than quietly moving elsewhere. Adding a second model in Settings › AI and turning on auto-switch gives you that safety net back.",
+      "Settings is much quieter. Every section now leads with what you came to change — the switches, the pickers, the connect buttons — and folds its explanation away behind a caret underneath. Nothing was deleted; it's one click away, and Help mode still explains anything you hover. What deliberately stays out in the open: warnings you'd regret missing (there's no recovering a backup without its passphrase), and the notes telling you why a button is greyed out.",
+      "Those explanations used to unfold themselves for the Power density, on the theory that a power user wants more detail. That had it backwards — the person most likely to already know how backups work was the one being handed the essay. They now start folded for everyone, at every density. Your connected accounts — Google, Microsoft, Apple — are unaffected and still sit open where they always did.",
+    ],
+  },
+  {
     version: "3.16.0-alpha",
     date: "2026-07-15",
     highlights: [

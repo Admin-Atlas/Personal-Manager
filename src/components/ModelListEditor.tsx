@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { ModelPicker } from "./ModelPicker";
-import { Button } from "./ui";
+import { Button, SectionInfo } from "./ui";
 
 interface Props {
   label: string;
@@ -49,7 +49,6 @@ export function ModelListEditor({
   return (
     <div data-help={helpId}>
       <label className="block text-sm font-medium text-ink2">{label}</label>
-      {description && <p className="mt-0.5 text-xs text-ink4">{description}</p>}
 
       <div className="mt-2 space-y-1.5">
         {models.length === 0 && (
@@ -108,13 +107,7 @@ export function ModelListEditor({
       <ModelPicker value="" triggerLabel="Add a model…" onChange={add} />
 
       <div className="mt-2 flex items-start justify-between gap-3">
-        <div>
-          <span className="text-xs font-medium text-ink2">Auto-switch on limit</span>
-          <p className="text-[11px] text-ink4">
-            When the active model hits its limit, automatically fall through to the next in the
-            list. Add a second model to use it.
-          </p>
-        </div>
+        <span className="text-xs font-medium text-ink2">Auto-switch on limit</span>
         <button
           type="button"
           role="switch"
@@ -131,6 +124,14 @@ export function ModelListEditor({
           />
         </button>
       </div>
+
+      <SectionInfo title="What this model does">
+        {description && <p>{description}</p>}
+        <p>
+          When the active model hits its limit, auto-switch falls through to the next in the list.
+          Add a second model to use it.
+        </p>
+      </SectionInfo>
     </div>
   );
 }

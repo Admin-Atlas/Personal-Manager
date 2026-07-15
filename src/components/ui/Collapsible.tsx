@@ -6,10 +6,12 @@
 // stream card" vocabulary from the design (§15.3): wire it to real, present content
 // (ingest results, citations) today; it's ready for agent reasoning streams in v4.
 //
-// `defaultOpen` is uncontrolled-with-a-seed: callers pass it from useDepth() (e.g.
-// collapsed at "min", expanded at "power") so density drives the initial state without
-// the primitive itself reaching into theme. The body animates via the grid 0fr↔1fr
-// trick (no height measurement); the transition is dropped under prefers-reduced-motion.
+// `defaultOpen` is uncontrolled-with-a-seed: callers pass it from useDepth() (e.g. the
+// connector groups use `!minimal` — collapsed at "min", open above it) so density drives
+// the initial state without the primitive itself reaching into theme. That seeding is for
+// bodies of *controls*; a body of pure explanation goes through `SectionInfo`, which starts
+// closed at every depth and takes no `defaultOpen` at all. The body animates via the grid
+// 0fr↔1fr trick (no height measurement); the transition is dropped under prefers-reduced-motion.
 
 import { useState, type ReactNode } from "react";
 import { useTheme } from "../../theme";
