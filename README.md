@@ -75,8 +75,10 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
   own working hours — with schedule-aware chat answers and an automatic "Due soon" when an
   event names a project. Your milestones and pinboard timelines show alongside as markers you
   can toggle off. PM only ever reads your calendars; it never writes to them.
-- **Bring your own model.** Choose any model through OpenRouter — separate chat and
-  background models, spend at a glance, and zero-data-retention requested on every call. PM
+- **Bring your own model.** Choose your model through OpenRouter — separate chat and
+  background models, spend at a glance, and zero-data-retention requested on every call. The
+  list offers only models a provider will actually serve on those terms, so a model can't
+  quietly become the less private option; you can still enter any model id by hand. PM
   starts you on a cheap default; add a second model and turn on auto-switch to get automatic
   fallback when one is rate-limited.
 - **Voice input.** Speak into the chat box and PM transcribes it **on your device** into

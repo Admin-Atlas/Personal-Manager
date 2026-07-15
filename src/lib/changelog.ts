@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.18.2-alpha",
+    date: "2026-07-15",
+    highlights: [
+      "Under-the-hood tidying: PM's own documentation caught up with the last two updates. Nothing in the app changed — the README was still telling you that you could pick any model through OpenRouter, which stopped being true when the model list started filtering out ones that can't answer privately.",
+    ],
+  },
+  {
     version: "3.18.1-alpha",
     date: "2026-07-15",
     highlights: [
