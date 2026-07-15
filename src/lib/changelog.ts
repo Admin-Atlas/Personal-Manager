@@ -19,6 +19,20 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.17.1-alpha",
+    date: "2026-07-15",
+    highlights: [
+      "PM 3.17.1 rolls up everything since the last release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
+      "One thing to do after updating: open the Documents tab and click Rebuild, once. Files you'd connected from Google Drive, OneDrive or a watched folder were only searchable by a short summary of themselves, so search, chat and the filing suggestions in Review could all miss what was deeper inside them. They're now read and indexed in full — and that one Rebuild is what brings the files you already have up to date. Anything offline at the time stays findable by its summary and catches up on its next sync.",
+      "The pinboard is now something you can properly work on. Folders are made on purpose with a + Folder button, they're resizable, and they stay until you ungroup them rather than evaporating when they're down to one card. A card only files into a folder if your mouse is over it when you let go — so a big note can finally sit next to a folder without being swallowed — and folders no longer swallow each other. Opening one as an overlay gives you a real board to drag, resize and overlap on, not a list.",
+      "The pinboard has undo, and asks before it deletes. Ctrl+Z (⌘Z on a Mac) takes back your last change, Ctrl+Y puts it back, and deleting a note or timeline now tells you what actually goes with it first — with a “Don't ask again” tick, and a switch in Settings › General to bring the asking back. Two things undo deliberately won't take back, because it can't do so honestly: ingesting a note, and linking a timeline to a project.",
+      "Your milestones and timelines now show on the calendar. Any dated milestone appears as an all-day marker in its own colour across Month, Week, Day and Agenda — click it to jump to its project — and every dated entry on a pinboard timeline does the same. You can hide either from the Calendars menu. The Milestones panel also sorts now: by deadline, by name, or by hand, from a Manual / Deadline / Name control in its header.",
+      "The calendar scrolls, and its timezones moved somewhere you'll find them. Month and Year views now scroll smoothly through past and future instead of jumping a whole month or year, settling neatly on a week or a row of months. Extra timezones are added from the top-left corner of the Day or Week grid, where the hour column meets the dates, and the list reads as Continent / Country / City so you can search by any of them.",
+      "PM now starts you on a far cheaper model — Ling-2.6-flash instead of Claude Sonnet 4.6, a few hundred times less per word — which matters most for the work PM does when you're not watching it. Sonnet is still there in Settings › AI. The honest trade: it reads a little less at once, and it's served by a single provider, so if that provider has a bad day chat waits rather than quietly moving elsewhere; adding a second model and turning on auto-switch gives you that safety net back. If you've already picked your own models, nothing changes.",
+      "Settings is much quieter. Every section leads with what you came to change and folds its explanation behind a caret underneath — for everyone, at every density. Nothing was deleted, and warnings you'd regret missing stay out in the open.",
+    ],
+  },
+  {
     version: "3.17.0-alpha",
     date: "2026-07-15",
     highlights: [
