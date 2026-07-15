@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-/** The Pinboard model (spec §4 — a bounded planning board). Persisted to localStorage as
- *  presentation/arrangement state, like the theme — not backend data (it isn't a source of
- *  truth and needs no encryption). All geometry is in **grid cells**, not pixels, so the
- *  board renders crisply at any cell size. */
+/** The Pinboard model (spec §4 — a bounded planning board). The board is user content (notes,
+ *  timelines), so it is persisted to the encrypted `settings` table over IPC — see usePinboard.
+ *  All geometry is in **grid cells**, not pixels, so the board renders crisply at any cell size. */
 
 export type WidgetKind = "note" | "timeline" | "folder";
 
@@ -14,6 +13,13 @@ export interface Rect {
   y: number;
   w: number;
   h: number;
+}
+
+/** A single point on the board, in grid cells — e.g. the cell the mouse pointer is over. Distinct
+ *  from a Rect: filing a drop into a folder is decided by the POINTER, not by the dragged rect. */
+export interface CellPoint {
+  x: number;
+  y: number;
 }
 
 /** One dated entry on a timeline widget. `date` is an ISO date (YYYY-MM-DD); rendered DD-MM-YYYY. */
@@ -71,7 +77,7 @@ export interface Widget {
 }
 
 export interface Board {
-  /** Schema version, so a future shape change can migrate or discard old localStorage state. */
+  /** Schema version, so a future shape change can migrate or discard an old stored board. */
   version: number;
   widgets: Widget[];
 }

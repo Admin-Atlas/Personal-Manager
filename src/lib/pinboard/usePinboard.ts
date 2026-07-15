@@ -13,8 +13,9 @@ import { getPref, setPref } from "../ipc";
 import {
   clampRect,
   COLS,
-  dissolveFolders,
   findFreeRect,
+  FOLDER_H,
+  FOLDER_W,
   minSize,
   reflowToWidth,
   resolveDrop,
@@ -26,6 +27,7 @@ import {
   EMPTY_BOARD,
   PINBOARD_PREF_KEY,
   type Board,
+  type CellPoint,
   type Rect,
   type TimelineItem,
   type Widget,
@@ -117,10 +119,10 @@ function parseBoard(raw: string | null, cols: number, rows: number): Board {
       }
       return { ...w, rect };
     });
-    // Re-flow any widget that overhangs the fixed width back on-screen (wrapping to a new row), then
-    // heal any folder a corrupt/hand-edited pref left with ≤1 child.
-    const reflowed = reflowToWidth(sane, cols, rowCap);
-    return { version: BOARD_VERSION, widgets: dissolveFolders(reflowed, cols, rowCap) };
+    // Re-flow any widget that overhangs the fixed width back on-screen (wrapping to a new row). A
+    // folder is NOT normalised by child count: an empty or single-card folder is a legitimate thing
+    // the user made (+ Folder) and must survive a reload.
+    return { version: BOARD_VERSION, widgets: reflowToWidth(sane, cols, rowCap) };
   } catch {
     return EMPTY_BOARD;
   }
@@ -207,6 +209,32 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     return id;
   }, []);
 
+  /** An EMPTY folder, made on purpose. Nothing auto-dissolves it: it lives until the user ungroups
+   *  it, so it can sit there waiting to be filled. `children: []` is not optional — `isValidWidget`
+   *  silently drops a folder whose `children` isn't an array, which would lose it on the next load. */
+  const addFolder = useCallback(() => {
+    const id = makeId();
+    setBoard((b) => {
+      const rect = findFreeRect(
+        b.widgets,
+        FOLDER_W,
+        FOLDER_H,
+        boundsRef.current.cols,
+        boundsRef.current.rows,
+      );
+      const widget: Widget = {
+        id,
+        kind: "folder",
+        rect,
+        title: "",
+        children: [],
+        expandMode: "inline",
+      };
+      return { ...b, widgets: [...b.widgets, widget] };
+    });
+    return id;
+  }, []);
+
   const updateWidget = useCallback((id: string, patch: Partial<Widget>) => {
     setBoard((b) => ({ ...b, widgets: mapWidget(b.widgets, id, (w) => ({ ...w, ...patch })) }));
   }, []);
@@ -219,9 +247,12 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     }));
   }, []);
 
-  /** Commit a MOVE drop: may merge two identically-placed widgets into a folder, drop a widget into
-   *  an overlapped folder, or just reposition (see {@link resolveDrop}). */
-  const dropWidget = useCallback((id: string, rect: Rect) => {
+  /** Commit a MOVE drop: may file the widget into the folder under the POINTER, merge two
+   *  identically-placed widgets into a folder, or just reposition (see {@link resolveDrop}).
+   *  `pointer` is the board cell the mouse was over on release, and is required rather than
+   *  optional so every caller has to say what it means — `null` (unknown) files into nothing,
+   *  which is the safe reading. */
+  const dropWidget = useCallback((id: string, rect: Rect, pointer: CellPoint | null) => {
     setBoard((b) => ({
       ...b,
       widgets: resolveDrop(
@@ -231,6 +262,7 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
         boundsRef.current.cols,
         boundsRef.current.rows,
         makeId,
+        pointer,
       ),
     }));
   }, []);
@@ -252,36 +284,34 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
         }
         return { ...b, widgets: b.widgets.filter((w) => w.id !== id) };
       }
-      // A folder CHILD: remove it from its parent, then auto-dissolve if the folder is now ≤1.
-      const widgets = b.widgets.map((w) =>
-        w.kind === "folder" && w.children?.some((c) => c.id === id)
-          ? { ...w, children: (w.children ?? []).filter((c) => c.id !== id) }
-          : w,
-      );
+      // A folder CHILD: remove it from its parent. The folder stays, however few cards are left —
+      // it's the user's object, and its ✕ ("Ungroup") is how it goes away.
       return {
         ...b,
-        widgets: dissolveFolders(widgets, boundsRef.current.cols, boundsRef.current.rows),
+        widgets: b.widgets.map((w) =>
+          w.kind === "folder" && w.children?.some((c) => c.id === id)
+            ? { ...w, children: (w.children ?? []).filter((c) => c.id !== id) }
+            : w,
+        ),
       };
     });
   }, []);
 
-  /** Pull a child out of a folder back onto the board — at `rect` when dragged there, else a free
-   *  slot. Releasing it back over a folder re-files it; the source folder auto-dissolves if drained. */
-  const popOutChild = useCallback((folderId: string, childId: string, rect?: Rect) => {
+  /** Pull a child out of a folder back onto the board, into a free slot. The source folder stays put
+   *  (empty if that was its last card) — only the user's ✕ ungroups it. */
+  const popOutChild = useCallback((folderId: string, childId: string) => {
     setBoard((b) => {
       const { cols, rows } = boundsRef.current;
       const folder = b.widgets.find((w) => w.id === folderId && w.kind === "folder");
       const child = folder?.children?.find((c) => c.id === childId);
       if (!folder || !child) return b;
       const remaining = (folder.children ?? []).filter((c) => c.id !== childId);
-      const landing = rect
-        ? clampRect(rect, cols, rows, minSize(child.kind))
-        : findFreeRect(b.widgets, child.rect.w, child.rect.h, cols, rows);
-      let ws = b.widgets.map((w) => (w.id === folderId ? { ...w, children: remaining } : w));
-      ws = [...ws, { ...child, rect: landing }];
-      ws = resolveDrop(ws, child.id, landing, cols, rows, makeId); // dropped onto a folder → re-file
-      ws = dissolveFolders(ws, cols, rows); // source folder may now be ≤1 child
-      return { ...b, widgets: ws };
+      // A free slot, so the popped card lands in the clear. It is NOT put back through resolveDrop:
+      // findFreeRect falls back to an OVERLAPPING origin when the board is full, which would let a
+      // card pop straight back into the folder it just came out of.
+      const landing = findFreeRect(b.widgets, child.rect.w, child.rect.h, cols, rows);
+      const ws = b.widgets.map((w) => (w.id === folderId ? { ...w, children: remaining } : w));
+      return { ...b, widgets: [...ws, { ...child, rect: landing }] };
     });
   }, []);
 
@@ -330,6 +360,7 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
     board,
     addNote,
     addTimeline,
+    addFolder,
     updateWidget,
     moveWidget,
     dropWidget,
