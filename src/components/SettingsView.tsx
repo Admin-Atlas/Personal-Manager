@@ -53,6 +53,7 @@ import {
   readMapMode,
   type MapLayoutMode,
 } from "../lib/mapPrefs";
+import { readConfirmDelete, writeConfirmDelete } from "../lib/pinboard/prefs";
 import {
   useTheme,
   useDepth,
@@ -66,7 +67,16 @@ import {
   deviceTimeZone,
   allTimeZones,
 } from "../theme";
-import { Button, Collapsible, ConfirmDialog, Input, NavItem, SegmentedControl, Select } from "./ui";
+import {
+  Button,
+  Collapsible,
+  ConfirmDialog,
+  Input,
+  NavItem,
+  SegmentedControl,
+  Select,
+  Toggle,
+} from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -113,6 +123,9 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   } = useTheme();
   const { devMode, setDevMode } = useDevMode();
   const { showMeta, showPower } = useDepth();
+  // Seeded from localStorage rather than watched: the toggle is the only writer here, and the
+  // Pinboard reads the pref fresh at the moment you click delete (see pinboard/prefs.ts).
+  const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
   const [key, setKey] = useState("");
   const [bgKey, setBgKey] = useState("");
   const [chatModels, setChatModelsState] = useState<string[]>([]);
@@ -867,6 +880,22 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                         );
                       })}
                     </div>
+                  </div>
+                  <div
+                    className="mt-3 flex items-center justify-between gap-3"
+                    data-help="settings-pinboard-confirm-delete"
+                  >
+                    <span className="text-sm text-ink2">
+                      Confirm before deleting a pinboard card
+                    </span>
+                    <Toggle
+                      checked={confirmDelete}
+                      onChange={(on) => {
+                        setConfirmDelete(on);
+                        writeConfirmDelete(on);
+                      }}
+                      ariaLabel="Ask before deleting a note or timeline"
+                    />
                   </div>
                   <div
                     className="mt-3 flex items-center justify-between gap-3"

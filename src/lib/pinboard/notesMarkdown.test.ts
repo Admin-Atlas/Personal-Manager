@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  caretForRestore,
   indentLines,
   listIndentBeforeCaret,
   outdentLines,
@@ -104,5 +105,51 @@ describe("listIndentBeforeCaret — Backspace-outdents inside a list item's inde
     expect(listIndentBeforeCaret("[] task", 0)).toBeNull(); // flush → nothing to outdent
     expect(listIndentBeforeCaret("  plain text", 2)).toBeNull(); // indented, but not a list item
     expect(listIndentBeforeCaret("  [] task", 5)).toBeNull(); // caret is in the content, not the indent
+  });
+});
+
+describe("caretForRestore — where the caret lands after an undo", () => {
+  it("puts the caret where an undone insertion was, not at the end", () => {
+    // Typed "bcd" into the middle, then undid it: the caret belongs where the text vanished from.
+    expect(caretForRestore("abcdef", "aef")).toBe(1);
+  });
+
+  it("handles an undone deletion the same way", () => {
+    expect(caretForRestore("aef", "abcdef")).toBe(4);
+  });
+
+  it("puts the caret at the end of an append that was undone", () => {
+    expect(caretForRestore("hello world", "hello")).toBe(5);
+  });
+
+  it("bounds the suffix run so repeats can't be counted twice", () => {
+    // The discriminating case: "aa" and "aaa" share a 2-char prefix AND a 2-char suffix, but "aaa"
+    // is only 3 long. An unbounded suffix scan would over-count and put the caret at 1; the caret
+    // belongs after the character that was added.
+    expect(caretForRestore("aa", "aaa")).toBe(3);
+    expect(caretForRestore("aaa", "aa")).toBe(2);
+  });
+
+  it("is the length itself when nothing is shared", () => {
+    expect(caretForRestore("abc", "xyz")).toBe(3);
+  });
+
+  it("handles either side being empty", () => {
+    expect(caretForRestore("", "abc")).toBe(3);
+    expect(caretForRestore("abc", "")).toBe(0);
+  });
+
+  it("never returns a position outside the restored text", () => {
+    for (const [from, to] of [
+      ["", ""],
+      ["a", "a"],
+      ["abc", "abc"],
+      ["aaaa", "aa"],
+      ["x", "xxxxx"],
+    ] as const) {
+      const c = caretForRestore(from, to);
+      expect(c).toBeGreaterThanOrEqual(0);
+      expect(c).toBeLessThanOrEqual(to.length);
+    }
   });
 });

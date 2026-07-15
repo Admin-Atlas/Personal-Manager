@@ -90,6 +90,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "In your own words",
     body: "Type a preference as a plain sentence and PM fills in the fields for you. Check them before saving — nothing is stored until you do.",
   },
+  "settings-pinboard-confirm-delete": {
+    title: "Confirm before deleting a pinboard card",
+    body: "Ask before a note or timeline is deleted from the Pinboard, so an important one can't go with a stray click. The pop-up tells you what actually goes with it — entries that would leave your calendar, or a document already saved to your vault that would stay behind. If you ticked 'Don't ask again' in that pop-up, this is where you turn it back on. It's per-device, and it doesn't apply to a folder's ✕, which only ungroups it and spills the cards back onto the board. Either way, Ctrl+Z (⌘Z on a Mac) undoes a deletion.",
+  },
   "settings-teach-tab": {
     title: "Review & Teach tabs",
     body: "Show or hide the two 'learning tools' — Review (approve the assistant's filing of new items) and Teach (correct its naming rules and preferences) — together in the sidebar. They're on for the Standard and Power presets and off for Minimal, but you can override that here. Turn them off once the assistant files things well enough on its own that you no longer want to curate; nothing is lost — new items still index and auto-file, and PM keeps applying what you've already taught it. Turn them back on any time.",
@@ -468,7 +472,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Pinboard (spec §4) — a free-form planning board
   "pinboard-board": {
     title: "Your planning board",
-    body: "A free space to think. Add notes, timelines and folders, then drag them anywhere and resize from the bottom-right corner — they snap to a grid and stay where you put them between visits. Cards are free to overlap; to file one into a folder, drop it with your mouse pointer over the folder. The board is saved on this device, encrypted with the rest of your data, and is separate from your indexed documents.",
+    body: "A free space to think. Add notes, timelines and folders, then drag them anywhere and resize from the bottom-right corner — they snap to a grid and stay where you put them between visits. Cards are free to overlap; to file one into a folder, drop it with your mouse pointer over the folder. Ctrl+Z (⌘Z on a Mac) undoes what you last did here — a deletion, a colour, a move, or the last few seconds of typing — and Ctrl+Y (or Ctrl/⌘+Shift+Z) puts it back; the trail is kept for this visit, not saved between them. The board is saved on this device, encrypted with the rest of your data, and is separate from your indexed documents.",
   },
   "pinboard-add-note": {
     title: "Add a note",

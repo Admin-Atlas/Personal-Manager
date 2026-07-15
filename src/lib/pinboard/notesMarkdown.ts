@@ -372,3 +372,26 @@ export function toggleWrap(
     selEnd: pos,
   };
 }
+
+/**
+ * Where to put the caret after an undo/redo swaps a textarea's text out from under it.
+ *
+ * Restoring the string but leaving the caret at the end feels broken — you undo three seconds of
+ * typing mid-paragraph and land at the bottom of the note. The edit is bracketed by whatever the two
+ * versions still share, so the caret belongs at the end of the common PREFIX: that's the point the
+ * two texts start to differ, i.e. where the change was.
+ *
+ * The common SUFFIX is what makes it right for a deletion as well as an insertion, and it must be
+ * bounded so the two runs can't overlap and count the same characters twice (they would on repeated
+ * characters — "aa" → "aaa" shares a 2-char prefix AND a 2-char suffix of a 3-char string).
+ */
+export function caretForRestore(from: string, to: string): number {
+  let prefix = 0;
+  const max = Math.min(from.length, to.length);
+  while (prefix < max && from[prefix] === to[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < max - prefix && from[from.length - 1 - suffix] === to[to.length - 1 - suffix]) {
+    suffix++;
+  }
+  return to.length - suffix;
+}

@@ -31,6 +31,7 @@ import { Markdown } from "../lib/markdown";
 import { CELL, boundsForPx, folderAtPointer } from "../lib/pinboard/grid";
 import {
   applyLineMarker,
+  caretForRestore,
   continueList,
   indentLines,
   listIndentBeforeCaret,
@@ -40,6 +41,7 @@ import {
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
 import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinboard/useBoardDrag";
+import { readConfirmDelete, writeConfirmDelete } from "../lib/pinboard/prefs";
 import { usePinboard } from "../lib/pinboard/usePinboard";
 // The tint set + names live in one place (src/lib/pinboard/palette.ts) so the board's colours
 // stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
@@ -47,7 +49,7 @@ import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
 import type { CellPoint, Rect, TimelineItem, Widget } from "../lib/pinboard/types";
 import type { Milestone } from "../lib/types";
 import { useDepth } from "../theme";
-import { Button, Modal, SegmentedControl, Textarea, Tooltip } from "./ui";
+import { Button, ConfirmDialog, Modal, SegmentedControl, Textarea, Tooltip } from "./ui";
 
 /** The live filing state of a note's ingested document, keyed by `note:<widgetId>`. */
 type DocStatus = { reviewed: boolean; project: string };
@@ -58,6 +60,38 @@ function cheapHash(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = (((h << 5) + h) ^ s.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);
+}
+
+/** Find a widget by id anywhere on the board — top level or inside a folder (folders never nest, so
+ *  a depth-1 walk reaches everything). */
+function findWidget(widgets: Widget[], id: string): Widget | undefined {
+  for (const w of widgets) {
+    if (w.id === id) return w;
+    const child = w.children?.find((c) => c.id === id);
+    if (child) return child;
+  }
+  return undefined;
+}
+
+/** What deleting this card actually costs — the part worth being told before you agree to it. A note
+ *  and a timeline are both just gone, but each can have left something behind that the board can't
+ *  take back with it. */
+function deleteCost(w: Widget, status?: DocStatus): string | null {
+  if (w.kind === "note" && w.ingestedAt) {
+    const where = status?.reviewed ? `filed under ${status.project}` : "waiting in Review";
+    return `You ingested this note, and that document (${where}) is its own copy in your vault — it stays there, and deleting this note won't remove it.`;
+  }
+  if (w.kind === "timeline" && !w.project && (w.items?.length ?? 0) > 0) {
+    const n = w.items?.length ?? 0;
+    const dated = w.items?.filter((it) => it.date).length ?? 0;
+    return dated > 0
+      ? `Its ${n} ${n === 1 ? "entry goes" : "entries go"} with it, and ${dated === 1 ? "the dated one disappears" : `the ${dated} dated ones disappear`} from your calendar.`
+      : `Its ${n} ${n === 1 ? "entry goes" : "entries go"} with it.`;
+  }
+  if (w.kind === "timeline" && w.project) {
+    return `This timeline is linked to ${w.project}. Only the card goes — the project's milestones stay exactly as they are.`;
+  }
+  return null;
 }
 
 /** A cell rect as absolute-positioning styles — for overlays drawn over a widget's own tile. */
@@ -201,6 +235,9 @@ export function PinboardView() {
   );
   const {
     board,
+    ready,
+    undo,
+    redo,
     addNote,
     addTimeline,
     addFolder,
@@ -258,6 +295,48 @@ export function PinboardView() {
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [refreshDocs]);
+
+  // Undo/redo for the whole board. Scope is simply "the Pinboard is open": this view is mounted only
+  // while it's the current tab, so a window listener is already scoped to it. (Do NOT gate on focus
+  // being inside the board — deleting a card leaves focus on <body>, i.e. "outside", which would kill
+  // Ctrl+Z exactly when it's most wanted.)
+  //
+  // We must OWN the shortcut rather than let the textarea's native undo run: the note's textarea is
+  // controlled, so native undo already launders itself into board state through onChange, and the
+  // formatting/list helpers write values through React, which corrupts the native stack anyway. Two
+  // listeners because keydown alone misses the WebView's own Edit ▸ Undo (context menu): `beforeinput`
+  // catches the resulting `historyUndo`. `beforeinput` is scoped to the board element so we never
+  // interfere with native undo in the rest of the app.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      // e.code, not e.key: the physical Z/Y, so a non-QWERTY layout still works (matches formatForKey).
+      const isZ = e.code === "KeyZ";
+      const isY = e.code === "KeyY";
+      if (!isZ && !isY) return;
+      // Ctrl+Y and Ctrl/Cmd+Shift+Z both redo — Windows and mac conventions respectively, and both
+      // are common on Linux.
+      const wantRedo = isY || e.shiftKey;
+      if (isY && e.shiftKey) return;
+      e.preventDefault();
+      if (wantRedo) redo();
+      else undo();
+    };
+    const onBeforeInput = (e: Event) => {
+      const t = (e as InputEvent).inputType;
+      if (t !== "historyUndo" && t !== "historyRedo") return;
+      e.preventDefault();
+      if (t === "historyRedo") redo();
+      else undo();
+    };
+    window.addEventListener("keydown", onKey);
+    const el = boardRef.current;
+    el?.addEventListener("beforeinput", onBeforeInput);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      el?.removeEventListener("beforeinput", onBeforeInput);
+    };
+  }, [undo, redo]);
 
   // Track the folder under the pointer so it can be ringed — on THIS board a drop may file into one.
   // (The folder overlay's board passes no equivalent: folders don't nest, so nothing files in there.)
@@ -326,6 +405,33 @@ export function PinboardView() {
     ? board.widgets.find((w) => w.id === dropFolderId && w.kind === "folder")
     : undefined;
 
+  // Deleting a note or timeline asks first, unless the user has turned that off. ONE interception
+  // point for all four call sites (board tiles + both folder views), because it's the same
+  // removeWidget underneath. A FOLDER's ✕ is deliberately not routed through here: it ungroups,
+  // spilling its cards back onto the board, so there's nothing to lose — and undo covers it.
+  const [pendingDelete, setPendingDelete] = useState<Widget | null>(null);
+  const [dontAskAgain, setDontAskAgain] = useState(false);
+  const requestDelete = useCallback(
+    (id: string) => {
+      const w = findWidget(board.widgets, id);
+      // Read the pref here, not on mount: Settings is an overlay over a still-mounted Pinboard, so a
+      // cached copy would go stale the moment the toggle was flipped behind it.
+      if (!w || !readConfirmDelete()) {
+        removeWidget(id);
+        return;
+      }
+      setDontAskAgain(false);
+      setPendingDelete(w);
+    },
+    [board.widgets, removeWidget],
+  );
+  const confirmDelete = useCallback(() => {
+    if (!pendingDelete) return;
+    if (dontAskAgain) writeConfirmDelete(false);
+    removeWidget(pendingDelete.id);
+    setPendingDelete(null);
+  }, [pendingDelete, dontAskAgain, removeWidget]);
+
   // An opened folder's overlay is 80% of the board — which is a fixed device-screen canvas, so this
   // is one stable size rather than something that drifts with the window or with wherever the lowest
   // note happens to sit. Clamped to the scrim's own box (which starts below the h-9 title bar and is
@@ -351,7 +457,8 @@ export function PinboardView() {
           <h1 className="font-head text-lg font-semibold text-ink">Pinboard</h1>
           {showMeta && (
             <p className="text-xs text-ink4">
-              A space to think — drag to arrange, resize from the corner. Saved on this device.
+              A space to think — drag to arrange, resize from the corner. {MOD}Z undoes. Saved on
+              this device.
             </p>
           )}
         </div>
@@ -364,6 +471,7 @@ export function PinboardView() {
           <Button
             variant="secondary"
             onClick={handleAddNote}
+            disabled={!ready}
             className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-note"
           >
@@ -373,6 +481,7 @@ export function PinboardView() {
           <Button
             variant="secondary"
             onClick={handleAddTimeline}
+            disabled={!ready}
             className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-timeline"
           >
@@ -382,6 +491,7 @@ export function PinboardView() {
           <Button
             variant="secondary"
             onClick={handleAddFolder}
+            disabled={!ready}
             className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-folder"
           >
@@ -420,7 +530,7 @@ export function PinboardView() {
                   widget={w}
                   showPower={showPower}
                   onChange={updateWidget}
-                  onDelete={removeWidget}
+                  onDelete={requestDelete}
                   onStartDrag={startDrag}
                   status={docStatus.get(`note:${w.id}`)}
                   onIngested={refreshDocs}
@@ -430,7 +540,7 @@ export function PinboardView() {
                   widget={w}
                   showPower={showPower}
                   onChange={updateWidget}
-                  onDelete={removeWidget}
+                  onDelete={requestDelete}
                   onStartDrag={startDrag}
                   onAddItem={addTimelineItem}
                   onUpdateItem={updateTimelineItem}
@@ -480,7 +590,7 @@ export function PinboardView() {
                   folder={expandedFolder}
                   showPower={showPower}
                   onChange={updateWidget}
-                  onDelete={removeWidget}
+                  onDelete={requestDelete}
                   onPopOut={popOutChild}
                   onRaiseChild={raiseChild}
                   onAddItem={addTimelineItem}
@@ -510,7 +620,7 @@ export function PinboardView() {
                 <FolderPanel
                   folder={expandedFolder}
                   onChange={updateWidget}
-                  onDelete={removeWidget}
+                  onDelete={requestDelete}
                   onPopOut={popOutChild}
                   onAddItem={addTimelineItem}
                   onUpdateItem={updateTimelineItem}
@@ -523,6 +633,42 @@ export function PinboardView() {
             ))}
         </BoardSurface>
       </div>
+
+      {/* Deleting a card is the one thing on the board you can't get back by dragging. Ctrl+Z covers
+          it now, but that only helps someone who knows about Ctrl+Z and notices in time. */}
+      <ConfirmDialog
+        open={!!pendingDelete}
+        title={pendingDelete?.kind === "timeline" ? "Delete this timeline?" : "Delete this note?"}
+        danger
+        confirmLabel="Delete"
+        onConfirm={confirmDelete}
+        onClose={() => setPendingDelete(null)}
+      >
+        {pendingDelete && (
+          <>
+            <p>
+              {pendingDelete.title?.trim() ? (
+                <>
+                  “<span className="text-ink2">{pendingDelete.title.trim()}</span>” will be removed
+                  from the board.
+                </>
+              ) : (
+                <>This card will be removed from the board.</>
+              )}{" "}
+              {deleteCost(pendingDelete, docStatus.get(`note:${pendingDelete.id}`))}
+            </p>
+            <label className="mt-3 flex items-center gap-2 text-xs text-ink3">
+              <input
+                type="checkbox"
+                checked={dontAskAgain}
+                onChange={(e) => setDontAskAgain(e.target.checked)}
+                className="h-3.5 w-3.5 accent-[var(--accent)]"
+              />
+              Don&apos;t ask again (you can turn this back on in Settings)
+            </label>
+          </>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }
@@ -723,6 +869,36 @@ const NoteBody = memo(function NoteBody({
     if (editing) taRef.current?.focus();
   }, [editing]);
 
+  // An undo/redo swaps `text` out from under the caret, and React parks a controlled textarea's caret
+  // at the end when the value shrinks — so undoing a few seconds of typing mid-note would dump you at
+  // the bottom of it. Put the caret back where the change actually was.
+  //
+  // ONLY for a change this note didn't make itself. `selfEdit` is the discriminator, and it has to
+  // be: the browser has already placed the caret correctly for a keystroke, and where a string is
+  // ambiguous (type "a" at the start of "aaaaa") the text alone cannot tell us where the edit was —
+  // guessing would move the caret out from under someone who is simply typing.
+  const lastText = useRef(text);
+  const selfEdit = useRef(false);
+  useLayoutEffect(() => {
+    const ta = taRef.current;
+    const from = lastText.current;
+    lastText.current = text;
+    if (selfEdit.current) {
+      selfEdit.current = false;
+      return;
+    }
+    if (!ta || from === text || document.activeElement !== ta) return;
+    ta.selectionStart = ta.selectionEnd = caretForRestore(from, text);
+  }, [text]);
+  /** Change this note's text, flagging it as ours so the caret restore above stands aside. */
+  const editText = useCallback(
+    (next: string) => {
+      selfEdit.current = true;
+      onChange(widget.id, { text: next });
+    },
+    [onChange, widget.id],
+  );
+
   // Stay in edit mode until the user clicks elsewhere on the board — NOT when the window merely
   // loses OS focus (tabbing out of the app used to collapse the note, because the textarea blurred).
   // Exit only on a pointer-down outside this note; re-focus the textarea when the window returns
@@ -773,7 +949,7 @@ const NoteBody = memo(function NoteBody({
       const ta = taRef.current;
       if (!ta) return;
       const res = make(text, ta.selectionStart, ta.selectionEnd);
-      onChange(widget.id, { text: res.text });
+      editText(res.text);
       setEditing(true);
       requestAnimationFrame(() => {
         const t = taRef.current;
@@ -783,7 +959,7 @@ const NoteBody = memo(function NoteBody({
         t.selectionEnd = res.selEnd;
       });
     },
-    [text, onChange, widget.id],
+    [text, editText],
   );
 
   // Cmd/Ctrl formatting shortcuts win first; then Enter continues the current list (next bullet /
@@ -823,7 +999,7 @@ const NoteBody = memo(function NoteBody({
     const res = continueList(ta.value, ta.selectionStart);
     if (!res) return;
     e.preventDefault();
-    onChange(widget.id, { text: res.text });
+    editText(res.text);
     requestAnimationFrame(() => {
       if (taRef.current) taRef.current.selectionStart = taRef.current.selectionEnd = res.caret;
     });
@@ -893,7 +1069,7 @@ const NoteBody = memo(function NoteBody({
         <Textarea
           ref={taRef}
           value={text}
-          onChange={(e) => onChange(widget.id, { text: e.target.value })}
+          onChange={(e) => editText(e.target.value)}
           onKeyDown={onKeyDown}
           onFocus={() => setEditing(true)}
           // No onBlur exit — edit mode ends only on a click outside the note (see the effect above),
