@@ -50,7 +50,6 @@ import type {
   LocalSubfolder,
   Message,
   ModelInfo,
-  ModelRecommendations,
   OcrStatus,
   OneDriveAccount,
   OneDriveFolder,
@@ -194,16 +193,6 @@ export const costSummary = () => invoke<CostSummary>("cost_summary");
 
 /** Force a re-pull of OpenRouter pricing; returns the refreshed summary. */
 export const refreshPricing = () => invoke<CostSummary>("refresh_pricing");
-
-// --- Model recommender (spec §6) ---
-
-/** PM's two live model recommendations (Day-to-day / Advanced) for the Settings cards.
- *  Reads the cached catalogue (refreshed on the cost logger's daily cadence). */
-export const modelRecommendations = () => invoke<ModelRecommendations>("model_recommendations");
-
-/** Persist the optional recommender denylist (provider or model slugs). */
-export const setRecommendDenylist = (denylist: string[]) =>
-  invoke<void>("set_recommend_denylist", { denylist });
 
 /** Toggle the UI help/explain mode (Step 4b). */
 export const setHelpMode = (enabled: boolean) => invoke<void>("set_help_mode", { enabled });

@@ -5,6 +5,8 @@
 //! The API key is read from the keychain on the Rust side and never reaches the
 //! webview.
 
+use std::collections::HashSet;
+
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +14,10 @@ use crate::error::{Error, Result};
 
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const MODELS_ENDPOINT: &str = "https://openrouter.ai/api/v1/models";
+/// The authoritative list of Zero-Data-Retention endpoints, keyed by `model_id`. Public, like
+/// the catalogue. This is what lets PM filter the picker to models it can actually serve
+/// rather than only failing closed at request time.
+const ZDR_ENDPOINT: &str = "https://openrouter.ai/api/v1/endpoints/zdr";
 
 /// One shared HTTP client for every OpenRouter call (F-16). A fresh `Client::builder().build()` per
 /// request threw away the connection pool each time; a single `LazyLock` client reuses pooled TLS
@@ -82,14 +88,16 @@ pub struct ModelInfo {
     pub input_modalities: Vec<String>,
 }
 
-/// The fuller per-model record the model **recommender** (spec §6) reasons over and
-/// that the daily price refresh caches. On top of pricing it carries the prompt-cache
-/// read rate (PM reuses stable prompt prefixes, so cache reads dominate effective cost),
-/// the model's `supported_parameters` (the structured-output / tool-calling reliability
-/// check), and the Artificial-Analysis `intelligence_index` from the catalogue's
-/// `benchmarks` block — a *general-capability* signal, NOT a faithfulness metric (see
-/// [`crate::recommend`]). Every field is optional because the catalogue is sparse: most
-/// models carry no benchmarks, and some report no price.
+/// The fuller per-model record the daily price refresh caches. On top of pricing it carries
+/// the prompt-cache read rate (PM reuses stable prompt prefixes, so cache reads dominate
+/// effective cost), the model's `supported_parameters`, and the Artificial-Analysis
+/// `intelligence_index` from the catalogue's `benchmarks` block — a *general-capability*
+/// signal, NOT a faithfulness metric. Every field is optional because the catalogue is
+/// sparse: most models carry no benchmarks, and some report no price.
+///
+/// The last three fields are write-only today (populated by the price refresh, surfaced in
+/// the dev inspector) — they fed the model recommender, removed in v3.18.0-alpha. They are
+/// kept because migration v8's columns are append-only and the dev inspector reads them.
 #[derive(Clone, Debug, Default)]
 pub struct ModelDetail {
     pub id: String,
@@ -104,10 +112,10 @@ pub struct ModelDetail {
     pub intelligence_index: Option<f64>,
 }
 
-/// Fetch the full OpenRouter model catalogue as the richer [`ModelDetail`] the
-/// recommender + price cache need. This endpoint is public (no API key required), but we
-/// still go through Rust so the webview never talks to OpenRouter directly. Sorted
-/// newest-first by OpenRouter; we preserve order.
+/// Fetch the full OpenRouter model catalogue as the richer [`ModelDetail`] the price cache
+/// needs. This endpoint is public (no API key required), but we still go through Rust so the
+/// webview never talks to OpenRouter directly. Sorted newest-first by OpenRouter; we preserve
+/// order. **Unfiltered** — [`list_models`] applies the ZDR filter for the picker.
 pub async fn fetch_catalogue() -> Result<Vec<ModelDetail>> {
     #[derive(Deserialize)]
     struct Resp {
@@ -202,7 +210,7 @@ pub async fn fetch_catalogue() -> Result<Vec<ModelDetail>> {
 
 /// Pull the Artificial-Analysis `intelligence_index` out of a model's sparse `benchmarks`
 /// block, tolerating absence and non-numeric values (→ None). A general-capability proxy
-/// only — the API has no faithfulness metric (see [`crate::recommend`]).
+/// only — the API has no faithfulness metric.
 fn parse_intelligence_index(benchmarks: Option<&serde_json::Value>) -> Option<f64> {
     benchmarks
         .and_then(|b| b.get("artificial_analysis"))
@@ -210,10 +218,86 @@ fn parse_intelligence_index(benchmarks: Option<&serde_json::Value>) -> Option<f6
         .and_then(|v| v.as_f64())
 }
 
-/// Fetch the catalogue trimmed to the [`ModelInfo`] the Settings model picker shows.
+/// Fetch the set of model ids that have at least one Zero-Data-Retention endpoint.
+///
+/// `chat_body` pins `zdr: true` on every request, which makes a model with no ZDR endpoint
+/// **uncallable** rather than merely less private — so this is the set PM can actually serve.
+/// Public/unauthenticated, like the catalogue. Match key is `model_id`.
+async fn fetch_zdr_model_ids() -> Result<HashSet<String>> {
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Vec<RawEndpoint>,
+    }
+    #[derive(Deserialize)]
+    struct RawEndpoint {
+        model_id: String,
+    }
+
+    let response = HTTP
+        .get(ZDR_ENDPOINT)
+        .timeout(std::time::Duration::from_secs(30))
+        .header(
+            "HTTP-Referer",
+            "https://github.com/Admin-Atlas/Personal-Manager",
+        )
+        .header("X-Title", "PM")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = crate::error::truncate_detail(&response.text().await.unwrap_or_default());
+        return Err(Error::Other(format!(
+            "OpenRouter ZDR endpoint request failed ({status}): {detail}"
+        )));
+    }
+
+    let parsed: Resp = response.json().await?;
+    Ok(parsed.data.into_iter().map(|e| e.model_id).collect())
+}
+
+/// True when a model id is one of OpenRouter's **router pseudo-models** (`openrouter/free`,
+/// `openrouter/auto`, …). These never appear in the ZDR endpoint feed because they aren't
+/// concrete endpoints — they pick an underlying model per request, at which point our
+/// `provider: {zdr, data_collection}` pin applies to whatever they resolve to. So they are
+/// safe under PM's enforcement and must survive the filter; dropping them would remove
+/// `openrouter/free` (a real, in-use model) from the picker.
+fn is_router_model(id: &str) -> bool {
+    id.starts_with("openrouter/")
+}
+
+/// Keep only models PM can actually serve: those with a ZDR endpoint, plus the routers.
+/// Pure so the policy is unit-testable without the network.
+fn retain_zdr_servable(models: Vec<ModelDetail>, zdr_ids: &HashSet<String>) -> Vec<ModelDetail> {
+    models
+        .into_iter()
+        .filter(|m| zdr_ids.contains(&m.id) || is_router_model(&m.id))
+        .collect()
+}
+
+/// Fetch the catalogue trimmed to the [`ModelInfo`] the Settings model picker shows,
+/// **filtered to what PM's privacy enforcement can actually serve** (spec §6).
+///
+/// PM pins `zdr: true` + `data_collection: "deny"` on every request ([`chat_body`]), so a
+/// model with no compliant endpoint doesn't degrade — it 404s. Offering such a model in the
+/// picker is therefore offering a broken choice, which is exactly how the removed recommender
+/// could serve `anthropic/claude-fable-5` (6 endpoints, 0 ZDR). Filtering here makes that
+/// class of failure unreachable from the list.
+///
+/// **Fails closed**: if the ZDR list can't be fetched we return the error rather than fall
+/// back to the unfiltered catalogue — showing every model on a network blip would silently
+/// reintroduce the non-servable ones. The picker surfaces the error; typing a custom model id
+/// still works (spec §6 — PM is never locked to the catalogue), and a non-compliant one fails
+/// closed at request time with the hint from [`request_error`].
+///
+/// Only the ZDR axis is filtered on, not `data_collection`. Verified live (15-07-2026): all
+/// 42 ZDR-serving providers also report `training: false`, so the deny axis excludes nothing
+/// the ZDR axis hasn't already — and the per-request pin enforces both regardless. That keeps
+/// this on documented, stable API surface (`/api/v1/endpoints/zdr`) rather than the
+/// undocumented frontend provider feed.
 pub async fn list_models() -> Result<Vec<ModelInfo>> {
-    Ok(fetch_catalogue()
-        .await?
+    let (catalogue, zdr_ids) = tokio::try_join!(fetch_catalogue(), fetch_zdr_model_ids())?;
+    Ok(retain_zdr_servable(catalogue, &zdr_ids)
         .into_iter()
         .map(|m| ModelInfo {
             id: m.id,
@@ -311,14 +395,21 @@ fn chat_body(
     } else {
         body["models"] = serde_json::json!(models);
     }
-    // PRIVACY (spec §6) — enforce Zero-Data-Retention on EVERY request, not just on
-    // recommended models. `zdr: true` keeps the request on endpoints that don't retain
-    // prompts; `data_collection: "deny"` blocks providers that train on / store data.
+    // PRIVACY (spec §6) — enforce Zero-Data-Retention on EVERY request, whichever model the
+    // user picked. `zdr: true` keeps the request on endpoints that don't retain prompts;
+    // `data_collection: "deny"` blocks providers that train on / store data. Two distinct
+    // axes: some providers don't train but do retain (abuse-scanning/legal), so neither
+    // implies the other and we pin both.
+    //
     // OpenRouter combines these with the account-level policy using OR semantics — a
     // per-request flag can only *add* enforcement, never weaken it — so this is safe
-    // regardless of the user's account config and is the real privacy boundary: the
-    // public catalogue exposes no per-model data-policy field (verified against /models
-    // and /models/:id/endpoints, neither carries one). If no compliant endpoint exists
+    // regardless of the user's account config and is the real privacy boundary. It stays
+    // the boundary even though `list_models` now filters the picker against
+    // /api/v1/endpoints/zdr: that filter is reachability (don't offer a model we can't
+    // serve), while this pin is enforcement, and it still covers ids that bypass the picker
+    // — a custom-typed model, a stored id, DEFAULT_MODEL, or whatever a router resolves to.
+    // (The catalogue's model objects still carry no data-policy field; /endpoints/zdr is a
+    // separate feed, keyed by model_id.) If no compliant endpoint exists
     // for a model the request fails closed (privacy-preserving) and auto-switch falls
     // through to the next model in the list.
     body["provider"] = serde_json::json!({ "zdr": true, "data_collection": "deny" });
@@ -579,8 +670,62 @@ mod tests {
         assert_eq!(many["models"], serde_json::json!(["a/b", "c/d"]));
         assert!(many.get("model").is_none());
         assert_eq!(many["provider"]["zdr"], serde_json::json!(true));
+        // Both privacy axes on the fallback form too: they're independent (a provider can
+        // decline to train yet still retain), so asserting only zdr would let a regression
+        // that dropped data_collection through on the multi-model path.
+        assert_eq!(
+            many["provider"]["data_collection"],
+            serde_json::json!("deny")
+        );
         assert_eq!(many["usage"]["include"], serde_json::json!(true));
         assert!(many.get("stream_options").is_none());
+    }
+
+    fn detail(id: &str) -> ModelDetail {
+        ModelDetail {
+            id: id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zdr_filter_keeps_compliant_models_and_drops_unservable_ones() {
+        // The picker must not offer a model PM cannot serve: chat_body pins zdr:true, so a
+        // model with no ZDR endpoint 404s rather than degrading. This is the fable-5 class of
+        // bug that the removed recommender shipped (6 endpoints, none of them ZDR).
+        let zdr: HashSet<String> = ["ok/servable".to_string()].into_iter().collect();
+        let kept = retain_zdr_servable(
+            vec![detail("ok/servable"), detail("anthropic/fable-5")],
+            &zdr,
+        );
+        let ids: Vec<&str> = kept.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["ok/servable"]);
+    }
+
+    #[test]
+    fn zdr_filter_keeps_router_pseudo_models() {
+        // Routers are absent from the ZDR feed (they aren't concrete endpoints) yet are
+        // servable: the per-request pin applies to whatever they resolve to. Filtering them
+        // out would delete openrouter/free — a real, in-use model — from the picker.
+        let zdr: HashSet<String> = HashSet::new();
+        let kept = retain_zdr_servable(
+            vec![
+                detail("openrouter/free"),
+                detail("openrouter/auto"),
+                detail("x/no-zdr"),
+            ],
+            &zdr,
+        );
+        let ids: Vec<&str> = kept.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["openrouter/free", "openrouter/auto"]);
+    }
+
+    #[test]
+    fn router_match_respects_the_namespace_boundary() {
+        assert!(is_router_model("openrouter/free"));
+        // A lookalike vendor namespace must not inherit the router carve-out.
+        assert!(!is_router_model("openrouter-mirror/free"));
+        assert!(!is_router_model("openai/gpt-5.5"));
     }
 
     #[test]

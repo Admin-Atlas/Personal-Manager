@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.18.0-alpha",
+    date: "2026-07-15",
+    highlights: [
+      "The model list in Settings › AI now only offers models PM can actually use. PM sends every request with zero-data-retention enforced, so a provider can't store or train on your prompts — and a model with no provider willing to work that way doesn't quietly become less private, it simply doesn't answer. Those models are now filtered out of the picker rather than left there to fail, which takes the list from around 340 models to around 220. Every one that remains is one your prompts are safe with.",
+      "Recommended models is gone. It suggested two models and, in fairness, sometimes suggested one that couldn't answer at all — it ranked on price and capability, and had no way to know whether a provider would agree to zero-data-retention. Rather than teach it, PM now applies that knowledge to the whole list above, where it helps whichever model you pick. The default, Ling-2.6-flash, is doing the job well on its own. Your saved models are untouched.",
+      "If you'd set up recommendation exclusions, that list has gone with it. It only ever hid models from those two suggestions and never blocked anything you chose yourself, so nothing you rely on changes.",
+      "You can still type a model id by hand, as always — PM isn't locked to the list.",
+    ],
+  },
+  {
     version: "3.17.1-alpha",
     date: "2026-07-15",
     highlights: [

@@ -234,10 +234,6 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Time zone",
     body: "The zone PM reasons about dates in — which day is 'today', when something is 'due soon', and the times in your calendar agenda and briefing. Auto follows this device; switch to Manual to pin a specific zone (useful when you travel and don't want the boundaries to shift).",
   },
-  "settings-recommended-models": {
-    title: "Recommended models",
-    body: "Two live suggestions from OpenRouter's catalogue. Day-to-day is the cheapest model that still handles tool-calling and a decent context — ideal for high-volume sorting and everyday chat. Advanced is the highest-capability, most faithful model for high-stakes, citation-critical chat. Each shows why it was picked and its effective (cache-weighted) price. PM enforces zero-data-retention on every request, so providers can't store or train on your prompts — that's the 'ZDR' marker. Apply either to your chat or background slot; nothing changes until you Save.",
-  },
   "settings-usage-cost": {
     title: "Usage & cost",
     body: "What you've spent on model calls, priced from OpenRouter's public rates (refreshed about once a day). Shows last-30-days and all-time totals; expand 'How this is calculated' for the method and a per-model spend ranking. 'Refresh prices' re-pulls the latest rates. Costs are computed from token counts at read time, so a price change re-prices your history.",

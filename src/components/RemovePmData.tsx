@@ -228,11 +228,12 @@ export function RemovePmData({ biometricAvailable }: Props) {
 
   // Auto-launch the uninstaller as soon as a full wipe reports success — unless there's a revoke
   // reminder the user must read first, in which case wait for their "Finish uninstall" click.
+  // finishUninstall is deliberately not a dep: it only closes over stable refs/setters, so
+  // exhaustive-deps doesn't ask for it and listing it would re-fire the effect for nothing.
   useEffect(() => {
     if (stage === "done" && report?.fullPurge && !uninstallHint && !actionRequired) {
       void finishUninstall();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stage, report, uninstallHint, actionRequired]);
 
   return (

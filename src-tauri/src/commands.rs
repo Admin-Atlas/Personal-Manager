@@ -28,8 +28,8 @@ use crate::sidecar::SidecarStatus;
 use crate::{
     applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, cloud_sync,
     context_budget, cost, db, drive, entities, flags, index_only, localfolder, lock_session,
-    microsoft, onedrive, openrouter, outlook_calendar, paths, preferences, recommend, secrets,
-    vault, AppState, BusyGuard, VaultRuntime,
+    microsoft, onedrive, openrouter, outlook_calendar, paths, preferences, secrets, vault,
+    AppState, BusyGuard, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one, for BOTH roles. Swappable in
@@ -38,8 +38,9 @@ use crate::{
 /// Whatever this names MUST have a zero-data-retention endpoint: `chat_body` pins
 /// `zdr: true` + `data_collection: "deny"` on every request, so a model with no
 /// compliant endpoint fails closed and the default would brick chat out of the box.
-/// Verify against `/api/v1/endpoints/zdr` before changing it — the public catalogue
-/// carries no per-model data-policy field, so it can't be checked at runtime.
+/// It is checked at runtime: `openrouter::list_models` filters the picker against
+/// `/api/v1/endpoints/zdr`, so a non-compliant id can't be chosen from the list — but
+/// this const bypasses the picker, so verify it against that endpoint when changing it.
 /// Ling-2.6-flash qualifies via Novita (training/retention both off) and costs
 /// ~$0.01/$0.03 per Mtok against Sonnet 4.6's $3/$15, which the background role
 /// (titles, summaries, sorting proposals) spends on unattended.
@@ -61,11 +62,6 @@ const TIME_ZONE_KEY: &str = "time_zone";
 /// UI gate only — it never gates the DB key (see `applock`). Lives in `settings`
 /// (security preference → backend), not localStorage.
 const APP_LOCK_ENABLED_KEY: &str = "app_lock_enabled";
-
-/// Optional, user-editable denylist (provider or model slugs) the recommender excludes
-/// as defense-in-depth — JSON array of strings. The real privacy boundary is the
-/// request-level ZDR enforcement in `openrouter::chat_body`; this is secondary (spec §6).
-const RECOMMEND_DENYLIST_KEY: &str = "recommend_denylist";
 
 /// Caps for chat: the most we'll store for a single message, and how many prior
 /// turns we replay into a request. A long conversation or one giant pasted message
@@ -5665,94 +5661,16 @@ pub async fn refresh_pricing(app: AppHandle) -> Result<CostSummary> {
     build_cost_summary(&conn)
 }
 
-// --- model recommender (spec §6) ---
-
-/// PM's two live model recommendations for the Settings cards. `day_to_day` /`advanced`
-/// are `null` when the cache can't yet produce a pick (e.g. offline before any fetch) —
-/// the UI shows "unavailable", never a silent non-compliant fallback. `zdr_enforced` is
-/// always true (PM sends Zero-Data-Retention on every request — see `openrouter::chat_body`);
-/// the UI shows it on each card so the user sees why a model is safe. `stale` flags a cache
-/// older than the daily refresh window (a failed/offline refresh), so the UI can mark the
-/// picks possibly out of date.
-#[derive(Serialize)]
-pub struct ModelRecommendations {
-    pub day_to_day: Option<recommend::Recommendation>,
-    pub advanced: Option<recommend::Recommendation>,
-    pub denylist: Vec<String>,
-    pub zdr_enforced: bool,
-    pub stale: bool,
-}
-
-/// Compute the two recommendations from the cached catalogue + curated tier list + the
-/// user denylist. Reuses the cost logger's daily price refresh (no second fetch) and is
-/// fail-safe: a best-effort refresh keeps the last-good list when offline, and an
-/// empty/stale cache yields `null` picks with `stale = true` rather than an invented one.
-#[tauri::command]
-pub async fn model_recommendations(app: AppHandle) -> Result<ModelRecommendations> {
-    let _ = ensure_catalogue_fresh(&app).await; // best-effort; offline keeps the last-good list
-    let state = app.state::<AppState>();
-    let conn = state.conn()?;
-    let catalogue = cached_catalogue(&conn)?;
-    let denylist = recommend_denylist(&conn)?;
-    // Reuse the cost logger's staleness rule: if the best-effort refresh above couldn't
-    // freshen the cache (offline), the newest fetch is old → flag the picks as stale.
-    let hours: Option<f64> = conn
-        .query_row(
-            "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let stale = cost::pricing_is_stale(hours);
-    let curated = curated_tiers();
-    let (day_to_day, advanced) = recommend::recommend(&catalogue, &curated, &denylist);
-    Ok(ModelRecommendations {
-        day_to_day,
-        advanced,
-        denylist,
-        zdr_enforced: true,
-        stale,
-    })
-}
-
-/// Persist the recommender denylist (provider/model slugs). Cleaned like model lists:
-/// trimmed, empties dropped, capped.
-#[tauri::command]
-pub fn set_recommend_denylist(state: State<'_, AppState>, denylist: Vec<String>) -> Result<()> {
-    let cleaned: Vec<String> = denylist
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .take(100)
-        .collect();
-    let json = serde_json::to_string(&cleaned).map_err(|e| Error::Other(e.to_string()))?;
-    let conn = state.conn()?;
-    db::set_setting(&conn, RECOMMEND_DENYLIST_KEY, &json)
-}
-
-/// The curated faithfulness list, embedded at compile time so it ships in the binary (a
-/// relocatable app has no fixed runtime path). A parse failure degrades to an empty list —
-/// the live intelligence index still drives the Advanced pick — never a crash.
-fn curated_tiers() -> recommend::CuratedTiers {
-    const RAW: &str = include_str!("../recommend_tiers.json");
-    serde_json::from_str(RAW).unwrap_or_default()
-}
-
-/// Read the stored recommender denylist (empty when unset/unparseable).
-fn recommend_denylist(conn: &Connection) -> Result<Vec<String>> {
-    Ok(db::get_setting(conn, RECOMMEND_DENYLIST_KEY)?
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-        .unwrap_or_default())
-}
-
-/// Reconstruct the recommender's view of the catalogue from the daily price/signal cache
-/// (`model_pricing`, extended in migration v8). Reading from the cache — not a live fetch —
-/// is what lets recommendations survive offline. Only the **latest refresh batch** is in
-/// scope (`fetched_at = MAX(fetched_at)`): a model that has left OpenRouter keeps an older
-/// timestamp and is excluded, so the recommender never surfaces a model that can no longer
-/// be served under PM's ZDR enforcement. (The cost-summary join reads `model_pricing`
-/// unfiltered, so historical spend on a now-removed model is still priced.)
+/// Reconstruct a view of the catalogue from the daily price/signal cache (`model_pricing`,
+/// extended in migration v8). Reading from the cache — not a live fetch — is what lets the
+/// chat context meter work offline. Only the **latest refresh batch** is in scope
+/// (`fetched_at = MAX(fetched_at)`): a model that has left OpenRouter keeps an older
+/// timestamp and is excluded. (The cost-summary join reads `model_pricing` unfiltered, so
+/// historical spend on a now-removed model is still priced.)
+///
+/// Note this cache is **not** ZDR-filtered — that filter lives in `openrouter::list_models`,
+/// on the picker. This feeds the context meter, which only needs a window size for a model
+/// the user already has selected.
 fn cached_catalogue(conn: &Connection) -> Result<Vec<openrouter::ModelDetail>> {
     let mut stmt = conn.prepare(
         "SELECT model, COALESCE(name, ''), context_length, prompt_price, completion_price, \
@@ -5839,43 +5757,6 @@ async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
         cost::pricing_is_stale(hours)
     };
     if stale {
-        refresh_pricing_now(app).await?;
-    }
-    Ok(())
-}
-
-/// Like [`ensure_pricing_fresh`], but for the recommender: also force a refresh when the
-/// cached catalogue is missing the v8 signal columns. An install that ran the cost logger
-/// before this feature has a price-only cache with a recent `fetched_at` (so the age check
-/// alone would skip the refresh) but NULL recommender signals — without this the cards would
-/// show "no recommendations yet" until the next daily refresh. Resolves the decision under a
-/// short lock, then fetches without holding it (rule #4).
-async fn ensure_catalogue_fresh(app: &AppHandle) -> Result<()> {
-    let needs_refresh = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        let hours: Option<f64> = conn
-            .query_row(
-                "SELECT (julianday('now') - julianday(replace(MAX(fetched_at),'Z',''))) * 24.0 FROM model_pricing",
-                [],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten();
-        // Does the newest batch actually carry the recommender signals? A price-only cache
-        // written before this feature won't, so treat that as needing a refresh even if fresh.
-        let has_signals: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM model_pricing \
-                 WHERE fetched_at = (SELECT MAX(fetched_at) FROM model_pricing) \
-                   AND context_length IS NOT NULL AND supported_parameters IS NOT NULL)",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        cost::pricing_is_stale(hours) || !has_signals
-    };
-    if needs_refresh {
         refresh_pricing_now(app).await?;
     }
     Ok(())
