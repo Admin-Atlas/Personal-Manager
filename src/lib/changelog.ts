@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.22.1-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Renaming a project no longer empties its pinboard timeline. A timeline widget pinned to a project tracked it by name, so renaming (or merging) the project moved its milestones and left the widget pointing at a name that no longer existed — and it silently went blank. Renaming now carries those widgets across too, without touching anything else on your board.",
+    ],
+  },
+  {
     version: "3.22.0-alpha",
     date: "2026-07-16",
     highlights: [
