@@ -235,7 +235,9 @@ export function PinboardView() {
   );
   const {
     board,
-    ready,
+    load,
+    retryLoad,
+    saveFailed,
     undo,
     redo,
     addNote,
@@ -453,13 +455,24 @@ export function PinboardView() {
     // (below) instead of inflating this column and pushing the header's buttons off-screen.
     <div className="flex h-full min-w-0 min-h-0 flex-1 flex-col">
       <header className="flex items-center justify-between gap-3 border-b border-rule px-6 py-3">
-        <div>
+        <div className="min-w-0">
           <h1 className="font-head text-lg font-semibold text-ink">Pinboard</h1>
-          {showMeta && (
-            <p className="text-xs text-ink4">
-              A space to think — drag to arrange, resize from the corner. {MOD}Z undoes. Saved on
-              this device.
+          {/* The save warning is NOT gated on `showMeta`: the prose below it is chrome and folds away
+              at min Depth, but "your work isn't being saved" is a loss warning, and those show at
+              every Depth. It also replaces the prose rather than sitting under it — the last line of
+              that sentence is the very promise being broken. */}
+          {saveFailed ? (
+            <p className="text-xs text-st-due">
+              Couldn&rsquo;t save your board to this device — recent changes may be lost. Your next
+              change will try again.
             </p>
+          ) : (
+            showMeta && (
+              <p className="text-xs text-ink4">
+                A space to think — drag to arrange, resize from the corner. {MOD}Z undoes.{" "}
+                {load === "ready" && "Saved on this device."}
+              </p>
+            )
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -471,7 +484,7 @@ export function PinboardView() {
           <Button
             variant="secondary"
             onClick={handleAddNote}
-            disabled={!ready}
+            disabled={load !== "ready"}
             className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-note"
           >
@@ -481,7 +494,7 @@ export function PinboardView() {
           <Button
             variant="secondary"
             onClick={handleAddTimeline}
-            disabled={!ready}
+            disabled={load !== "ready"}
             className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-timeline"
           >
@@ -491,7 +504,7 @@ export function PinboardView() {
           <Button
             variant="secondary"
             onClick={handleAddFolder}
-            disabled={!ready}
+            disabled={load !== "ready"}
             className="px-2.5 py-1 text-xs"
             data-help="pinboard-add-folder"
           >
@@ -507,12 +520,34 @@ export function PinboardView() {
           dragging={!!draggingId}
           dataHelp="pinboard-board"
         >
-          {board.widgets.length === 0 && (
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-              <p className="text-sm text-ink4">
-                Add a note to start planning — it stays here between visits.
-              </p>
+          {/* A failed load leaves the SAME empty board on screen as a fresh install, so it must say
+              which one this is. "Add a note to start planning" would be two lies at once: that the
+              board is empty, and that what you add to it stays. */}
+          {load === "failed" ? (
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="max-w-sm px-6 text-center">
+                <p className="text-sm text-st-due">Couldn&rsquo;t open your pinboard.</p>
+                <p className="mt-1 text-xs text-ink4">
+                  Your board is still saved — PM just couldn&rsquo;t read it, so it won&rsquo;t
+                  change anything until it can.
+                </p>
+                <Button
+                  variant="secondary"
+                  onClick={retryLoad}
+                  className="mt-3 px-2.5 py-1 text-xs"
+                >
+                  Retry
+                </Button>
+              </div>
             </div>
+          ) : (
+            board.widgets.length === 0 && (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <p className="text-sm text-ink4">
+                  Add a note to start planning — it stays here between visits.
+                </p>
+              </div>
+            )
           )}
 
           {board.widgets.map((w) => (

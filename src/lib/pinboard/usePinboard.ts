@@ -22,8 +22,6 @@ import {
   ROWS,
 } from "./grid";
 import {
-  canRedo,
-  canUndo,
   commit,
   commitBarrier,
   commitSilent,
@@ -140,6 +138,16 @@ function parseBoard(raw: string | null, cols: number, rows: number): Board {
   }
 }
 
+/** How the stored board's arrival went, and the ONLY thing that decides whether the board may be
+ *  written back:
+ *  - `loading` — nothing known yet.
+ *  - `ready` — a board arrived (an empty one is a real answer: a fresh install has no board).
+ *  - `failed` — the store didn't answer. The board on screen is the empty default, which is NOT the
+ *    user's board; it is what we fall back to when we don't know theirs. Persisting it would destroy
+ *    the real one, so a failed load never arms persistence and the view says so instead of pretending
+ *    the board is empty. */
+export type BoardLoad = "loading" | "ready" | "failed";
+
 /** How a change enters the undo history. See {@link commitForPatch} and the mutators below for which
  *  change is which, and history.ts for why `silent` and `barrier` exist at all. */
 type CommitKind = { mode: "push"; key?: string | null } | { mode: "silent" } | { mode: "barrier" };
@@ -191,37 +199,50 @@ function commitForPatch(id: string, patch: Partial<Widget>): CommitKind {
 export function usePinboard(bounds: { cols: number; rows: number } = { cols: COLS, rows: ROWS }) {
   const [hist, setHist] = useState<History<Board>>(() => initHistory(EMPTY_BOARD));
   const board = hist.present;
-  const loaded = useRef(false);
   // Read through a ref so the mount-only load effect and the stable mutators always see the
   // current bounds without re-subscribing (bounds is derived from the fixed screen size, so it
   // doesn't actually change, but this keeps the hooks honest).
   const boundsRef = useRef(bounds);
   boundsRef.current = bounds;
 
-  // Load the stored board once. Until this resolves, `loaded` stays false so the persist
-  // effect below won't write the empty default over a real board.
-  const [ready, setReady] = useState(false);
+  const [load, setLoad] = useState<BoardLoad>("loading");
+  const [saveFailed, setSaveFailed] = useState(false);
+  // ARMED IN EXACTLY ONE PLACE: the load's success path, below. Every write goes through the two
+  // effects further down, and both refuse to run until this is true — so "we never learned what the
+  // board is" cannot end with us writing what it isn't.
+  const armed = useRef(false);
+  const [attempt, setAttempt] = useState(0);
+
+  // Load the stored board. `attempt` re-runs it for the view's Retry.
   useEffect(() => {
     let cancelled = false;
+    setLoad("loading");
     getPref(PREF_KEY)
       .then((raw) => {
+        // A cancelled load must not arm: it belongs to a superseded attempt (or a StrictMode
+        // double-mount), and its board is about to be replaced by the one still in flight.
+        if (cancelled) return;
         // RESET, not commit: the board didn't change, it arrived. Committing it would leave the empty
         // default sitting in `past`, and the very first Ctrl+Z would wipe the user's board.
-        if (!cancelled) {
-          setHist(resetHistory(parseBoard(raw, boundsRef.current.cols, boundsRef.current.rows)));
-        }
+        setHist(resetHistory(parseBoard(raw, boundsRef.current.cols, boundsRef.current.rows)));
+        armed.current = true;
+        setLoad("ready");
       })
       .catch(() => {
-        /* store not ready — keep the empty board (history already holds exactly that) */
-      })
-      .finally(() => {
-        loaded.current = true;
-        if (!cancelled) setReady(true);
+        // The store didn't answer. Leave the empty board on screen but DON'T arm persistence: this
+        // board is our fallback, not the user's, and writing it back — on the next edit or on the
+        // unmount flush — would overwrite the real one with nothing. The view reports this rather
+        // than showing an empty board that claims to be saved.
+        if (cancelled) return;
+        setLoad("failed");
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [attempt]);
+
+  /** Try the load again after a failure (the store may simply not have been ready yet). */
+  const retryLoad = useCallback(() => setAttempt((n) => n + 1), []);
 
   /** The one writer. `fn` produces the next board from the current one; `kind` says how that enters
    *  the undo history. `now` is read out here so the state updater stays pure (React may run it
@@ -239,29 +260,42 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
   const undoBoard = useCallback(() => setHist((h) => undo(h)), []);
   const redoBoard = useCallback(() => setHist((h) => redo(h)), []);
 
+  const boardRef = useRef(board);
+  boardRef.current = board;
+
+  /** The one write. A failure is REPORTED, not swallowed: the header tells the user their board is
+   *  "Saved on this device", and a promise that can quietly be false is worse than no promise —
+   *  they'd keep typing into a board that isn't being kept.
+   *
+   *  No retry logic is needed to go with it. Every write sends the whole board, so the next change
+   *  (and the unmount flush) re-sends everything the failed write was carrying: a transient failure
+   *  heals itself, and `saveFailed` clears when one actually lands. */
+  const persist = useCallback(async (b: Board) => {
+    try {
+      await setPref(PREF_KEY, JSON.stringify(b));
+      setSaveFailed(false);
+    } catch {
+      setSaveFailed(true);
+    }
+  }, []);
+
   // Persist the board — DEBOUNCED (F-15). The board object changes on every keystroke (a note's text
   // lives in it), and writing the whole JSON to the encrypted store each time is one IPC + SQLCipher
   // write per character. Coalesce to a single write ~500 ms after the last change; a `boardRef` keeps
   // the latest value so the trailing timer (and the unmount flush below) writes what's current.
-  const boardRef = useRef(board);
-  boardRef.current = board;
   useEffect(() => {
-    if (!loaded.current) return;
-    const handle = setTimeout(() => {
-      setPref(PREF_KEY, JSON.stringify(boardRef.current)).catch(() => {
-        /* ignore — the board just won't persist this change */
-      });
-    }, 500);
+    if (!armed.current) return;
+    const handle = setTimeout(() => void persist(boardRef.current), 500);
     return () => clearTimeout(handle);
-  }, [board]);
-  // Flush the latest board on unmount so a fast navigate-away/close doesn't drop the tail edit.
+  }, [board, persist]);
+  // Flush the latest board on unmount so a fast navigate-away/close doesn't drop the tail edit. This
+  // one can only ever be best-effort: there is no UI left to report a failure to, and the debounced
+  // write above has already carried everything older than the last ~500 ms.
   useEffect(
     () => () => {
-      if (loaded.current) {
-        setPref(PREF_KEY, JSON.stringify(boardRef.current)).catch(() => {});
-      }
+      if (armed.current) void persist(boardRef.current);
     },
-    [],
+    [persist],
   );
 
   // add* return the new widget's id so the view can scroll it into sight — a note placed on a
@@ -495,13 +529,16 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
 
   return {
     board,
-    /** False until the stored board has arrived. The add buttons wait on it: a widget created before
-     *  the load lands is overwritten by it, and with a history that would be an unrecoverable loss. */
-    ready,
+    /** Whether the stored board arrived. The add buttons wait on `ready`: a widget created before the
+     *  load lands is overwritten by it, and with a history that would be an unrecoverable loss. */
+    load,
+    /** Retry a `failed` load. */
+    retryLoad,
+    /** The last write to the store failed, so what's on screen isn't (all) on disk. Sticky until a
+     *  write succeeds — the board keeps working, it just isn't being kept. */
+    saveFailed,
     undo: undoBoard,
     redo: redoBoard,
-    canUndo: canUndo(hist),
-    canRedo: canRedo(hist),
     addNote,
     addTimeline,
     addFolder,

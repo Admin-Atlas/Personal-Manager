@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.3-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Your pinboard can no longer be replaced by an empty one. If PM couldn't read your board when you opened the Pinboard — a moment's trouble reading from your data folder was enough — it showed an empty board and then treated that as yours: simply switching to another tab saved the blank one over the real one. PM now says it couldn't open your board, leaves what's saved untouched until it can read it properly, and gives you a Retry.",
+      "The Pinboard now tells you when it can't save. It promises your board is \"saved on this device\", but if a save actually failed it said nothing at all and carried on — so you could keep arranging a board that wasn't being kept. It now says so plainly, and your next change tries again by itself.",
+    ],
+  },
+  {
     version: "3.19.2-alpha",
     date: "2026-07-16",
     highlights: [

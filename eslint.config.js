@@ -31,6 +31,11 @@ export default tseslint.config(
       // The spec + decision log + scratch notes (git-ignored, local-only — not first-party
       // source). Lint shouldn't reach into it (e.g. a stray docs/calendar-view/*.js prototype).
       "docs",
+      // Agent worktrees are whole checkouts of THIS repo on other branches (git-ignored,
+      // local-only). Linting them audits code that isn't on the branch under test: the gate
+      // double-counts every finding, and a half-finished experiment in a worktree could fail
+      // `just check` on a clean main, pointing at a path that isn't part of the build.
+      ".claude/worktrees",
       "node_modules",
       // design-sync (claude.ai/design) build output & staged converter scripts —
       // regenerated, vendored, git-ignored. The hand-authored .design-sync/previews/
