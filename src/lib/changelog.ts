@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.4-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Removing PM's data now clears every vault key it kept, not just the current one. \"Remove PM data\" promises to erase every secret PM has stored on your machine. If you had joined someone else's shared vault and later left it, PM deliberately keeps its key so rejoining is silent — but the erase only ever cleared the vault you were using at the time, so that key stayed on the machine afterwards, for a vault that may still be sitting in a shared folder. Every key PM has cached is now erased, including from vaults you left before this update.",
+      "Moving your vault now takes all of it. Two encrypted files — your entity rules and the list of files indexed from cloud accounts — were left behind in the old folder every time the vault moved. Backups always included them, so nothing was ever lost, but making a vault private left readable copies in the folder you were leaving. They now travel with the vault, and deleting a shared vault properly empties the folder instead of leaving those files in it.",
+      "Unlocking your vault no longer fails because Windows couldn't remember the key. If PM couldn't save your key for next time — a credential store that's disabled or damaged — it treated that as a failed unlock and refused to open a vault your passphrase had already opened correctly, with no way forward. It now opens as normal and simply mentions you'll be asked for the passphrase again next launch.",
+    ],
+  },
+  {
     version: "3.19.3-alpha",
     date: "2026-07-16",
     highlights: [

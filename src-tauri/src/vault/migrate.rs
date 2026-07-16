@@ -218,7 +218,27 @@ pub(crate) fn copy_tree_verified(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy a vault's artifacts (DB, Markdown tree, metadata) from one root to another,
+/// Every non-DB, non-Markdown file that belongs to a vault root, as one list so the copy and
+/// the delete below can never drift apart again — the drift this list exists to prevent left
+/// `entities.pmrules` and `index-only.pmindex` behind at the old root on every move, while the
+/// backup packer and the wipe both correctly treated them as vault members. Both are encrypted
+/// sidecars whose AAD binds the vault id and stem, not the path, so they survive a relocation.
+fn vault_sidecar_files(root: &Path) -> Vec<PathBuf> {
+    vec![
+        meta_path(root),
+        // The linked-accounts sidecar travels with the vault so a link made before a move
+        // survives it (the move's ACL lockdown re-applies these principals).
+        root.join(access::ACCESS_FILENAME),
+        // The portable entity rules and the index-only manifest are vault members (they are
+        // packed into a .pmbackup and removed by the wipe). Leaving them at the old root
+        // stranded ciphertext an ex-joiner could still read — and they are the reason a
+        // "deleted" shared folder could never actually be removed.
+        root.join(crate::entities::RULES_FILENAME),
+        root.join(crate::index_only::MANIFEST_FILENAME),
+    ]
+}
+
+/// Copy a vault's artifacts (DB, Markdown tree, metadata, sidecars) from one root to another,
 /// verifying each copy. The source is left intact — the caller removes it only after the
 /// move commits — so an interrupted copy never harms the live vault. Used instead of a
 /// rename so a move can cross volumes.
@@ -229,15 +249,16 @@ pub(crate) fn copy_vault_artifacts(from_root: &Path, to_root: &Path) -> Result<(
         &from_root.join(MARKDOWN_SUBDIR),
         &to_root.join(MARKDOWN_SUBDIR),
     )?;
-    let meta = meta_path(from_root);
-    if meta.exists() {
-        copy_file_verified(&meta, &meta_path(to_root))?;
-    }
-    // The linked-accounts sidecar travels with the vault so a link made before a move
-    // survives it (the move's ACL lockdown re-applies these principals).
-    let access_file = from_root.join(access::ACCESS_FILENAME);
-    if access_file.exists() {
-        copy_file_verified(&access_file, &to_root.join(access::ACCESS_FILENAME))?;
+    for from in vault_sidecar_files(from_root) {
+        if from.exists() {
+            // Every sidecar is optional: a vault that has never minted an entity has no rules
+            // file, and reconcile-on-open would rebuild both from the DB mirror anyway. Copying
+            // them keeps the OLD root clean, which is the half that matters.
+            let name = from
+                .file_name()
+                .ok_or_else(|| Error::Other("vault sidecar has no filename".into()))?;
+            copy_file_verified(&from, &to_root.join(name))?;
+        }
     }
     Ok(())
 }
@@ -245,13 +266,20 @@ pub(crate) fn copy_vault_artifacts(from_root: &Path, to_root: &Path) -> Result<(
 /// Remove a vault's artifacts from a root (after a move has committed, or to clear the
 /// destination before a restore). Best-effort: a leftover file is a harmless orphan. The
 /// WAL/SHM sidecars are normally gone after a clean close, but are swept too just in case.
+///
+/// Deliberately does NOT remove `vault.lock`: this also runs from boot recovery paths
+/// (restore, discard-partial-target) where another instance may legitimately hold the lock on
+/// a shared root, and deleting a foreign lock invites split-brain. The baton request/ack files
+/// are ephemeral signalling and do go (mirroring the wipe).
 pub(crate) fn delete_vault_artifacts(root: &Path) {
     let _ = std::fs::remove_file(root.join(DB_FILENAME));
     let _ = std::fs::remove_file(root.join(format!("{DB_FILENAME}-wal")));
     let _ = std::fs::remove_file(root.join(format!("{DB_FILENAME}-shm")));
     let _ = std::fs::remove_dir_all(root.join(MARKDOWN_SUBDIR));
-    let _ = std::fs::remove_file(meta_path(root));
-    let _ = std::fs::remove_file(root.join(access::ACCESS_FILENAME));
+    for file in vault_sidecar_files(root) {
+        let _ = std::fs::remove_file(file);
+    }
+    let _ = super::lock::clear_baton_files(root);
 }
 
 /// A tiny provenance marker PM drops into a relocation destination while a move is in flight, so
@@ -1132,21 +1160,74 @@ mod tests {
     }
 
     #[test]
-    fn vault_artifacts_carry_the_access_sidecar() {
-        // The linked-accounts sidecar must travel with a move (so the lockdown can
-        // re-apply the principals) and be removed with the rest of the artifacts.
+    fn vault_artifacts_carry_every_sidecar() {
+        // A move must take the WHOLE artifact set, and a delete must remove it. The set drifted
+        // once: the two encrypted sidecars were vault members to the backup packer and the wipe
+        // but not to these two helpers, so every move stranded readable ciphertext at the old
+        // root. Anything the backup packs, these must carry.
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("old");
         let to = root.path().join("new");
         std::fs::create_dir_all(&from).unwrap();
         std::fs::write(from.join(DB_FILENAME), b"db").unwrap();
         std::fs::write(from.join(access::ACCESS_FILENAME), b"{}").unwrap();
+        std::fs::write(from.join(crate::entities::RULES_FILENAME), b"rules").unwrap();
+        std::fs::write(from.join(crate::index_only::MANIFEST_FILENAME), b"index").unwrap();
 
         copy_vault_artifacts(&from, &to).unwrap();
-        assert!(to.join(access::ACCESS_FILENAME).exists());
+        for name in [
+            access::ACCESS_FILENAME,
+            crate::entities::RULES_FILENAME,
+            crate::index_only::MANIFEST_FILENAME,
+        ] {
+            assert!(to.join(name).exists(), "{name} must travel with the vault");
+        }
 
-        delete_vault_artifacts(&to);
-        assert!(!to.join(access::ACCESS_FILENAME).exists());
+        // The source is untouched until the caller commits the move.
+        assert!(from.join(crate::entities::RULES_FILENAME).exists());
+
+        delete_vault_artifacts(&from);
+        for name in [
+            access::ACCESS_FILENAME,
+            crate::entities::RULES_FILENAME,
+            crate::index_only::MANIFEST_FILENAME,
+        ] {
+            assert!(
+                !from.join(name).exists(),
+                "{name} must not be stranded at the old root"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vault_with_no_sidecars_still_moves() {
+        // Every sidecar is optional (a vault that never minted an entity has no rules file).
+        // A missing one must not fail the move — copy_file_verified would error on absent input.
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("old");
+        let to = root.path().join("new");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join(DB_FILENAME), b"db").unwrap();
+
+        copy_vault_artifacts(&from, &to).unwrap();
+        assert!(to.join(DB_FILENAME).exists());
+        assert!(!to.join(crate::entities::RULES_FILENAME).exists());
+    }
+
+    #[test]
+    fn delete_vault_artifacts_spares_the_writer_lock() {
+        // The lock is NOT ours to delete: this helper also runs from boot recovery, where
+        // another instance may hold the lock on a shared root. Removing a foreign lock would
+        // invite two writers into one vault. The ephemeral baton files do go.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(DB_FILENAME), b"db").unwrap();
+        std::fs::write(root.path().join("vault.lock"), b"held").unwrap();
+
+        delete_vault_artifacts(root.path());
+        assert!(
+            root.path().join("vault.lock").exists(),
+            "a foreign writer lock must survive an artifact delete"
+        );
     }
 
     #[test]

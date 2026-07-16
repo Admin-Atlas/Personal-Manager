@@ -875,7 +875,8 @@ fn emit_vault_meta_warning(app: &AppHandle, report: &vault::MetaAuthReport) {
 }
 
 /// Unlock the current (passphrase) vault: derive + verify, open the store, and cache
-/// the derived key in this profile so the next launch is silent.
+/// the derived key in this profile so the next launch is silent. The cache is best-effort —
+/// nothing in this session reads it back (see below).
 #[tauri::command]
 pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: String) -> Result<()> {
     // I-03: wipe the passphrase plaintext from memory on return.
@@ -884,13 +885,32 @@ pub fn unlock_vault(app: AppHandle, state: State<'_, AppState>, passphrase: Stri
     let meta = vault::load_meta(&resolved.vault_root)?
         .ok_or_else(|| Error::Other("this vault has no metadata to unlock".into()))?;
     let (conn, key, meta_report) = vault::open_with_passphrase(&resolved, &meta, &passphrase)?;
-    secrets::set_cached_vault_key(&meta.vault_id, key.expose())?;
+    // Cache-first is deliberate, and matches `adopt_shared_vault` and every migration: a cache
+    // failure costs one passphrase prompt next launch, never a failed unlock. It used to be a `?`
+    // — so a broken OS credential store (Credential Manager disabled, no Secret Service) meant the
+    // CORRECT passphrase opened the store and then threw the connection away, locking the user out
+    // of all their data until they repaired an OS service the error didn't name. The store is
+    // already open at this point; nothing below reads the cache back.
+    //
+    // NOTE for the next reader: the identical-looking `?` in `switch_to_vault` is CORRECT and must
+    // stay — there the keychain write is load-bearing (the boot path reads it back) and it fails
+    // safely, before the pointer commits.
+    let mut cache_warning = None;
+    if let Err(e) = secrets::set_cached_vault_key(&meta.vault_id, key.expose()) {
+        cache_warning = Some(format!(
+            "PM couldn't keep the key on this account ({e}) — you'll be asked for the \
+             passphrase again next launch."
+        ));
+    }
     let runtime = vault_runtime_for(&resolved, &meta, key.expose())?;
     state.open_session(conn, runtime)?;
     // Now that the store is open, engage the cooperative writer lock for this vault.
     lock_session::engage(&app)?;
     // M-3: if the meta was repaired on open, tell the user (non-blocking).
     emit_vault_meta_warning(&app, &meta_report);
+    if let Some(msg) = cache_warning {
+        let _ = app.emit("vault://meta-warning", msg);
+    }
     Ok(())
 }
 
@@ -1018,9 +1038,14 @@ pub fn link_vault_account(app: AppHandle, account: String) -> Result<VaultOpOutc
             )));
         }
         vault::acl::GrantCheck::Inconclusive(detail) => {
+            // Names only actions that EXIST. This used to say "remove and re-add the account" —
+            // but PM has no unlink, so the one instruction we handed the user at the one moment
+            // they needed it pointed at a button nobody ever built. Adding again is idempotent,
+            // and Repair access is the real tool when the folder itself stops answering.
             warnings.push(format!(
                 "PM granted access to {account} but couldn't confirm it landed ({detail}). \
-                 If they can't open the vault, remove and re-add the account."
+                 If they can't open the vault, add the account again — and if the folder \
+                 itself stops opening, use Repair access."
             ));
         }
     }
@@ -1269,6 +1294,13 @@ pub fn delete_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result
     // was ours alone (leaving any unrelated files the user kept there).
     let _ = state.take_conn();
     let _ = state.clear_vault_runtime();
+    // Release OUR writer lock before the sweep: `vault.lock` sits in the folder we are about to
+    // empty, and delete_vault_artifacts deliberately spares it (it can't tell our lock from
+    // another instance's). Held, it guaranteed the empty check below never passed — so the
+    // "deleted" shared folder always survived holding blobs an ex-joiner could still read. The
+    // tail re-engages on the local vault, and disengage is idempotent.
+    lock_session::disengage(&app);
+    let _ = vault::lock::release(&root, &state.instance_id);
     let _ = vault::acl::reset_inheritance(&root);
     vault::migrate::delete_vault_artifacts(&root);
     if let Ok(mut entries) = std::fs::read_dir(&root) {
