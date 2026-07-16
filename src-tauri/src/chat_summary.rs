@@ -231,7 +231,7 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
 
         // 2. Resolve the background model + key (off the model call's lock). No key set ⇒ we cannot
         //    summarise; leave the cursor where it is so the next launch retries once a key exists.
-        let Some(api_key) = secrets::get_openrouter_key()? else {
+        let Some(api_key) = secrets::get_background_or_primary_key()? else {
             break;
         };
         let models = {
@@ -366,7 +366,7 @@ pub(crate) async fn compress_now(
     };
 
     // 2. Resolve the background model + key off the lock; no key ⇒ we cannot compress.
-    let Some(api_key) = secrets::get_openrouter_key()? else {
+    let Some(api_key) = secrets::get_background_or_primary_key()? else {
         return Ok(None);
     };
     let models = {
@@ -512,9 +512,18 @@ where
 
 /// Whether the vault is unlocked and an OpenRouter key is set — the minimum to summarise. (Unlike the
 /// indexer we do not need the sidecar: summarising is a pure model call, no local embedder.)
+///
+/// The key is the BACKGROUND key, falling back to the primary — the same resolution the call itself
+/// uses, so the gate can never say "no" to a setup the work would have run on. It used to demand the
+/// PRIMARY key specifically, which meant a background-key-only setup was refused outright: the whole
+/// point of the two-key split is that background spend is separable, and this is background work.
 fn ready(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
-    state.conn().is_ok() && secrets::get_openrouter_key().ok().flatten().is_some()
+    state.conn().is_ok()
+        && secrets::get_background_or_primary_key()
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 /// Eagerly extend the just-active conversation's summary after its reply lands (card C's primary trigger).

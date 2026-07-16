@@ -61,6 +61,42 @@ pub struct Completion {
     pub text: String,
     pub model: Option<String>,
     pub usage: Usage,
+    /// The model stopped because it hit its token ceiling (`finish_reason == "length"`), not because
+    /// it had finished. The text is real and worth keeping — but it is not a finished answer, and
+    /// this was previously dropped on the floor, so a reply that trailed off mid-sentence was stored
+    /// as a complete turn and later quoted as one. Not an error: the caller marks the turn honest.
+    pub truncated: bool,
+}
+
+/// The error a stream chunk reports, if any.
+///
+/// Mid-stream failures do NOT arrive as an HTTP status — the response was already 200 and some
+/// tokens may already have been emitted. They arrive as a `data:` event carrying an `error` object.
+/// Ignoring it meant the loop just ran out of chunks and returned the truncated text as a
+/// SUCCESSFUL completion, which the caller then persisted as a complete assistant turn.
+///
+/// Pure, so the shape-matching — the part that can silently be wrong — is testable without a socket.
+fn chunk_error(value: &serde_json::Value) -> Option<Error> {
+    let err = value.get("error")?;
+    let detail = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("the model stream reported an error");
+    // The code is advisory here (the transport said 200). Routing through `request_error` means a
+    // ZDR refusal that arrives mid-stream gets the same actionable copy as one at request time.
+    let status = err
+        .get("code")
+        .and_then(|c| c.as_u64())
+        .and_then(|c| u16::try_from(c).ok())
+        .and_then(|c| reqwest::StatusCode::from_u16(c).ok())
+        .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+    Some(request_error(status, detail))
+}
+
+/// Whether a chunk says the model stopped because it ran out of room, rather than because it had
+/// finished. Any other reason ("stop", "tool_calls", …) is a normal end.
+fn is_length_stop(value: &serde_json::Value) -> bool {
+    value["choices"][0]["finish_reason"].as_str() == Some("length")
 }
 
 /// Extract token usage from a response/chunk's `usage` object (absent fields → None). `cost` is
@@ -478,6 +514,7 @@ where
     let mut usage = Usage::default();
     // Raw bytes, decoded only one complete line at a time: a multi-byte UTF-8
     // char split across two network chunks must not be lossily decoded in halves.
+    let mut truncated = false;
     let mut buffer: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
 
@@ -495,18 +532,31 @@ where
                     text: full,
                     model: served,
                     usage,
+                    truncated,
                 });
             }
             if data.is_empty() {
                 continue;
             }
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                // A mid-stream failure. Erroring routes into `send_message`'s existing error path
+                // (ChatEvent::Error), whose dangling-user-turn self-heal already covers the user row
+                // persisted before the stream began. `full` is dropped on purpose: a partial reply
+                // from a failed call is exactly what must not be kept.
+                if let Some(e) = chunk_error(&value) {
+                    return Err(e);
+                }
                 // The chunk carries which model actually served the request — keep
                 // the first one we see so the stored message reflects any fallback.
                 if served.is_none() {
                     if let Some(m) = value["model"].as_str() {
                         served = Some(m.to_string());
                     }
+                }
+                // Why the reply stopped. Flag, not error — the text is worth keeping; the caller
+                // marks the stored turn honest (see `Completion::truncated`).
+                if is_length_stop(&value) {
+                    truncated = true;
                 }
                 // The final chunk (empty choices) carries token usage — we asked for
                 // it via stream_options; keep it whenever present.
@@ -539,6 +589,7 @@ where
         text: full,
         model: served,
         usage,
+        truncated,
     })
 }
 
@@ -599,12 +650,67 @@ pub async fn complete(
         text,
         model: value["model"].as_str().map(str::to_string),
         usage: parse_usage(&value),
+        // Same signal, same meaning — the non-streaming path gets it in one response rather than a
+        // chunk, and callers must not have to care which path produced the Completion.
+        truncated: value["choices"][0]["finish_reason"].as_str() == Some("length"),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mid_stream_error_chunk_is_an_error() {
+        // The whole bug: the HTTP status is 200 and the failure arrives INSIDE the stream. Ignoring
+        // it let the loop run out of chunks and return the truncated text as a success, which the
+        // caller then persisted to messages + the vault + the index as a complete assistant turn.
+        let chunk = serde_json::json!({
+            "error": {"code": 502, "message": "upstream provider is down"}
+        });
+        let err = chunk_error(&chunk).expect("an error chunk must not be ignored");
+        assert!(err.to_string().contains("upstream provider is down"));
+
+        // A ZDR refusal arriving mid-stream gets the same actionable copy as one at request time —
+        // that is the point of routing through `request_error` rather than a bare message.
+        let zdr = serde_json::json!({
+            "error": {"code": 404, "message": "No endpoints found matching your data policy"}
+        });
+        assert!(chunk_error(&zdr)
+            .unwrap()
+            .to_string()
+            .contains("auto-switch"));
+
+        // A malformed error object is still an error — never a silent success.
+        assert!(chunk_error(&serde_json::json!({"error": {}})).is_some());
+    }
+
+    #[test]
+    fn an_ordinary_chunk_is_not_an_error() {
+        // The common case runs through this on every token; it must never false-positive.
+        let chunk = serde_json::json!({
+            "model": "x/y",
+            "choices": [{"delta": {"content": "hello"}}]
+        });
+        assert!(chunk_error(&chunk).is_none());
+        assert!(!is_length_stop(&chunk));
+    }
+
+    #[test]
+    fn a_length_stop_is_flagged_but_other_reasons_are_not() {
+        let length = serde_json::json!({"choices": [{"finish_reason": "length"}]});
+        assert!(is_length_stop(&length), "hit the token ceiling mid-thought");
+
+        // A normal end must not be marked — otherwise every complete reply gets the caveat.
+        for reason in ["stop", "tool_calls", "content_filter"] {
+            let v = serde_json::json!({"choices": [{"finish_reason": reason}]});
+            assert!(!is_length_stop(&v), "{reason} is a normal end");
+        }
+        // Streaming chunks carry no finish_reason until the last one.
+        assert!(!is_length_stop(
+            &serde_json::json!({"choices": [{"delta": {}}]})
+        ));
+    }
 
     #[test]
     fn drain_lines_decodes_multibyte_split_across_chunks() {

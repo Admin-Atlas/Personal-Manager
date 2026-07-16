@@ -1672,11 +1672,33 @@ pub fn rename_conversation(
             "UPDATE conversations SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![title, conversation_id],
         )?;
-        // No-op when the session row doesn't exist yet (a conversation with no recorded turn-pair) — that chat
-        // is not eligible for background titling anyway, so the user's title is safe regardless.
+        // Latch "the user named this" — card 7E's rule is that a user edit always wins.
+        //
+        // This was an UPDATE, with a comment reasoning that a conversation holding no recorded
+        // turn-pair has no `chat_sessions` row, so the UPDATE no-ops, "so the user's title is safe
+        // regardless". The premise is right and the conclusion is wrong: that chat is not eligible
+        // for background titling YET. Send the first message and `record_turn_pair` births the row
+        // at the DEFAULT `title_state = 'pending'` — so the titler saw a pending chat, and
+        // overwrote the name the user had already chosen. Rename-then-send is an ordinary way to
+        // start a conversation.
+        //
+        // So latch it whether or not the row exists. `scope` is derived exactly as `record_turn_pair`
+        // does (project → 'project', else 'general'); `vault_path` is nullable by DDL and stays NULL
+        // until the first turn-pair, and `ensure_session`'s conflict arm writes only vault_path +
+        // last_active_at — so the row's later birth fills it in around this latch instead of
+        // resetting it.
+        let scope: String = conn
+            .query_row(
+                "SELECT CASE WHEN COALESCE(TRIM(project), '') = '' THEN 'general' ELSE 'project' END \
+                 FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "general".into());
         conn.execute(
-            "UPDATE chat_sessions SET title_state = 'custom' WHERE conversation_id = ?1",
-            params![conversation_id],
+            "INSERT INTO chat_sessions(conversation_id, scope, title_state) VALUES (?1, ?2, 'custom') \
+             ON CONFLICT(conversation_id) DO UPDATE SET title_state = 'custom'",
+            params![conversation_id, scope],
         )?;
     }
     // Mirror the rename onto the linked chat document + its vault front-matter (B5-6), so the Documents list,
@@ -2062,7 +2084,20 @@ pub async fn send_message(
             return Err(e);
         }
     };
-    let reply = completion.text;
+    // A reply that hit the model's token ceiling is real text, but it is not a finished answer — it
+    // stops mid-thought. It is persisted to `messages`, to the vault file and to the index, so
+    // storing it unmarked means PM later retrieves and quotes a trailing-off sentence as though the
+    // model meant to end there. Mark it once, here, so every downstream copy carries the caveat.
+    // (A mid-stream provider ERROR is a different animal and now returns Err above — a failure must
+    // not be persisted as a turn at all.)
+    let reply = if completion.truncated {
+        format!(
+            "{}\n\n_(This reply was cut off — the model reached its maximum length.)_",
+            completion.text.trim_end()
+        )
+    } else {
+        completion.text
+    };
     let usage = completion.usage;
     // Record the model that actually answered — the served one (so a fallback is
     // reflected), falling back to the requested primary if it wasn't reported.
@@ -5477,7 +5512,15 @@ pub fn onedrive_status(state: State<'_, AppState>) -> Result<OneDriveStatus> {
 /// (shared by every OneDrive account). Setting it connects nothing on its own.
 #[tauri::command]
 pub fn set_microsoft_client(client_id: String) -> Result<()> {
-    secrets::set_microsoft_client(client_id.trim())
+    // The last of the blank-string-secret class (`set_openrouter_key`, `set_google_client` and the
+    // secrets getters all already guard it). A stored "" passes `.is_some()`, so `has_client()`
+    // reported CONFIGURED and every OAuth attempt then failed opaquely somewhere deep in the flow,
+    // instead of saying "no client set" at the one place that knows.
+    let id = client_id.trim();
+    if id.is_empty() {
+        return Err(Error::Other("Client ID is empty".into()));
+    }
+    secrets::set_microsoft_client(id)
 }
 
 /// Clear the Microsoft client id and sign out every OneDrive account (they all depend on it). Indexed
