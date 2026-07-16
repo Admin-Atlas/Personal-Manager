@@ -445,11 +445,11 @@ export default function App() {
     if (keySet) void resumeOneDriveSync().catch(() => {});
   }, [keySet]);
 
-  // Resume a rebuild interrupted by a previous close/crash. Unlike the connector resumes above this
-  // one RESTARTS the rebuild rather than continuing it — a rebuild drops the index before it
-  // re-ingests and keeps no per-document checkpoint. That is the honest trade: the marker only
-  // survives when the index was left half-built, and a half-built index means search is quietly
-  // degraded until it's rebuilt. A no-op when there's nothing pending.
+  // Resume a rebuild interrupted by a previous close/crash. Like the connector resumes above, this one
+  // genuinely CONTINUES the interrupted pass rather than restarting it (#371): each document the pass
+  // committed carries its id, so the resumed run skips them and does only what was left — unless PM
+  // updated in between and would now chunk differently, in which case it honestly rebuilds everything.
+  // A no-op when there's nothing pending.
   useEffect(() => {
     if (keySet) void resumeRebuild().catch(() => {});
   }, [keySet]);

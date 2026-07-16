@@ -310,10 +310,12 @@ pub struct AppState {
     /// rebuild modal) can resume showing progress after the user navigates away and back — the
     /// ingest sibling of `drive_sync`.
     pub ingest_job: Mutex<IngestJobState>,
-    /// Single-flight guard for the rebuild. Rebuild is destructive-first (it drops the index, then
-    /// re-ingests), so two overlapping runs are not merely wasteful: the second's `DELETE FROM
-    /// documents` destroys the first's in-progress work. The UI's own guard is component-local and
-    /// resets on remount, which made that reachable by simply switching tabs and clicking again.
+    /// Single-flight guard for the rebuild, and the flag every other indexing writer defers to while one
+    /// runs (see [`AppState::rebuild_running`]). Two overlapping rebuilds are not merely wasteful — they
+    /// fight over the same rows, and on the vector-width arm (which still clears the store) the second's
+    /// `DELETE FROM documents` destroys the first's in-progress work. The UI's own guard is
+    /// component-local and resets on remount, which made that reachable by simply switching tabs and
+    /// clicking again.
     pub ingest_busy: AtomicBool,
     /// Snapshot of the semantic-map layout precompute (single-flight; running/method/last-error), so
     /// the Map can show progress and a second request folds into the running one. See `layout`.
@@ -413,6 +415,19 @@ impl AppState {
             .lock()
             .map(|t| t.elapsed())
             .unwrap_or_default()
+    }
+
+    /// Whether an index rebuild is running right now. Every other writer of `documents`/`chunks` checks
+    /// this and stands down (#371): a rebuild re-reads the whole vault and then sweeps away the documents
+    /// it never saw, so a concurrent writer racing that pass could have its brand-new document swept, or —
+    /// on the vector-width arm, the one that still clears the store first — written straight into the
+    /// wiped window and lost.
+    ///
+    /// The sweep does not RELY on this (it re-checks each candidate's file on disk before deleting, so a
+    /// racing writer's document is kept regardless). This is the cheaper, earlier guard: don't start the
+    /// contending work at all.
+    pub fn rebuild_running(&self) -> bool {
+        self.ingest_busy.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether a Drive or OneDrive sync is currently running — the idle indexer defers to either so they

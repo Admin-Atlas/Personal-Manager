@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::ipc::Channel;
@@ -1176,11 +1176,121 @@ fn copy_original_to_vault(
 /// runs afterwards — the async full-body re-index of index-only items (network I/O this blocking fn
 /// can't do). Returns `(ingested, failed)` so the caller emits the terminal `Finished` once that phase
 /// is done, rather than this fn ending the run prematurely.
+/// The id of one rebuild pass — a uuid minted per run and stamped onto every document as that document
+/// commits (`documents.rebuild_pass`, v35). It **is** the checkpoint #371 asks for: a resumed pass carries
+/// the SAME id, so the documents its interrupted predecessor already finished are recognised and skipped;
+/// a fresh Rebuild mints a NEW id, so nothing is skipped and "my index looks wrong, rebuild it" still
+/// redoes everything.
+pub(crate) fn new_pass_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// What a pass should do with one enumerated vault file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RebuildPlan {
+    /// This same pass already committed it, before whatever interruption stopped the run — skip it.
+    /// The whole point of #371: the resumed run does only the work that was left.
+    AlreadyDone,
+    /// No pass, or an older one, owns this document: re-split, re-embed, write it in place.
+    Rebuild,
+}
+
+/// The resume rule. Pure, so the one decision the incremental rebuild turns on is testable without a
+/// store, a sidecar or an `AppState` — the shape [`crate::index_only::react`] uses for the same reason.
+///
+/// Deliberately NOT keyed on `content_hash`: a Rebuild's dominant trigger is a splitter/embedder change,
+/// where every hash is identical and every chunk boundary must still move. Nor on a per-document copy of
+/// the retrieval config: on a manual repair nothing has changed, so every document would be skipped and
+/// the repair would do nothing. "Did THIS run already do it" is the only question resume needs answered.
+pub(crate) fn plan_rebuild_one(stored_pass: Option<&str>, pass: &str) -> RebuildPlan {
+    match stored_pass {
+        Some(stored) if stored == pass => RebuildPlan::AlreadyDone,
+        _ => RebuildPlan::Rebuild,
+    }
+}
+
+/// What the final sweep should do with a document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReapPlan {
+    Keep,
+    /// The vault file behind it is provably gone — delete the row.
+    Delete,
+}
+
+/// What the sweep managed to learn about a document's vault file, taken FRESH at sweep time.
+///
+/// The three-way split is the whole safety of the sweep. `std::path::Path::exists()` collapses
+/// "definitely not there" and "I couldn't tell" into one `false` — so a vault on a network share that
+/// drops mid-pass, or a folder an antivirus scanner briefly locks, would report every file as absent and
+/// the sweep would delete the entire library. A deletion decision may only ever be made on a PROVABLE
+/// absence, which is what `try_exists` distinguishes and this enum preserves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileState {
+    Present,
+    /// The filesystem positively reported no such file.
+    Gone,
+    /// We could not tell (permission denied, an unreachable root, an I/O error).
+    Unknown,
+}
+
+impl FileState {
+    fn of(path: &Path) -> Self {
+        match path.try_exists() {
+            Ok(true) => FileState::Present,
+            Ok(false) => FileState::Gone,
+            Err(_) => FileState::Unknown,
+        }
+    }
+}
+
+/// May the sweep delete anything at all? Only on a **provably complete** walk — every vault dir entry
+/// enumerated. A partial walk can mean the vault root itself only half-read, where "we never saw it" is
+/// not "the user deleted it"; sweeping on that picture could delete most of the library. Withholding it
+/// costs nothing: the next complete pass reaps instead.
+///
+/// Deliberately NOT gated on per-document failures. A document that failed this pass still has its vault
+/// file sitting there, so [`plan_reap`] keeps it on presence alone — a failure endangers no reap
+/// decision. Gating on failures *looks* safer and is worse: one permanently-broken file (an orphaned
+/// chat `.md`, two vault files sharing a content hash) would withhold the sweep on EVERY future rebuild,
+/// so a document the user deleted could never be reaped again.
+pub(crate) fn may_reap(enumeration_complete: bool) -> bool {
+    enumeration_complete
+}
+
+/// Is one document a leftover the sweep should delete? Keyed on the vault file alone, because the vault
+/// IS the truth: no file, no document.
+///
+/// Deliberately independent of the pass stamp. A document another writer added after the walk enumerated
+/// (a drag-drop ingest racing the pass) carries no stamp yet its file is right there — `Present` keeps
+/// it, and PM always writes the vault file before the index row, so a half-finished insert can never
+/// look `Gone`. Conversely a document this pass DID rebuild, whose file the user then deleted while the
+/// app was closed between an interruption and its resume, is skipped by the resume and never re-read —
+/// keying on the file still reaps it.
+pub(crate) fn plan_reap(file: FileState) -> ReapPlan {
+    match file {
+        FileState::Gone => ReapPlan::Delete,
+        FileState::Present | FileState::Unknown => ReapPlan::Keep,
+    }
+}
+
+/// Which pass last rebuilt the document at `vault_path`, if PM holds one at all.
+fn stored_pass(conn: &Connection, vault_path: &str) -> Result<Option<Option<String>>> {
+    Ok(conn
+        .query_row(
+            "SELECT rebuild_pass FROM documents WHERE vault_path = ?1",
+            params![vault_path],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?)
+}
+
 pub fn rebuild(
     app: &AppHandle,
     on_event: &ProgressSink,
     extra_total: usize,
-) -> Result<(usize, usize)> {
+    pass: &str,
+    on_pass_start: &dyn Fn() -> Result<()>,
+) -> Result<(usize, usize, usize)> {
     let state = app.state::<AppState>();
 
     // Indexing is active use — hold the idle chat-indexer (card 7B) off so it doesn't contend with it.
@@ -1230,43 +1340,93 @@ pub fn rebuild(
         )));
     }
 
-    // The model is confirmed ready — only now is it safe to be destructive. Clear the store
-    // (chunk_vec / chunks_fts are cleared explicitly; documents → chunks cascades by FK) and resize
-    // the now-empty vector column to this embedder's width before re-embedding.
+    // The model is confirmed ready, so the mutating phase is about to begin: let the caller persist its
+    // crash-resume marker FIRST, and propagate its error. If the marker can't be recorded, an
+    // interruption would strand a half-rebuilt index with nothing to resume from — so refuse to start
+    // work we could not recover, with the index still fully intact. (Deliberately after the warmup: a
+    // model that can't load destroys nothing, so it must not leave a marker that makes every subsequent
+    // launch retry a rebuild that fails identically.)
+    on_pass_start()?;
+
+    // TWO ARMS. A changed vector width means every stored vector is the wrong model AND the wrong shape,
+    // so nothing is reusable — and `chunk_vec` must be EMPTY before it can be resized (`ensure_vec_dim`
+    // refuses a populated table, by design). That arm keeps the historical wipe. Every other rebuild — a
+    // splitter change, a manual repair, a resume — reuses nothing but destroys nothing either: rows are
+    // upserted in place and only genuine leftovers are swept at the end.
+    //
+    // The wipe arm is still resumable: the resize lands before the loop, so a resumed run finds the width
+    // already correct, takes the incremental arm, and skips whatever the interrupted run had committed.
+    // `ensure_vec_dim` early-returns when the width already matches, so calling it on both arms is a
+    // no-op on the incremental one.
+    let wipe = {
+        let conn = state.conn()?;
+        crate::db::vec0_dim(&conn)? != embedder.dimension
+    };
     {
         let conn = state.conn()?;
-        conn.execute_batch(
-            "DELETE FROM chunks_fts; DELETE FROM chunk_vec; DELETE FROM chunks; DELETE FROM documents;",
-        )?;
+        if wipe {
+            conn.execute_batch(
+                "DELETE FROM chunks_fts; DELETE FROM chunk_vec; DELETE FROM chunks; DELETE FROM documents;",
+            )?;
+        }
         crate::db::ensure_vec_dim(&conn, embedder.dimension)?;
     }
     let (vault, cipher) = state.markdown_io()?;
     // Collect the vault-markdown files up front so we know the total before the loop — the UI
     // shows a determinate bar from this count. Accept both plaintext (`.md`) and encrypted
     // (`.md.pmenc`) files; the cipher decides per file how to read them (read-by-magic). An
-    // unreadable dir entry is skipped rather than aborting the whole rebuild.
-    let files: Vec<PathBuf> = std::fs::read_dir(&vault)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| is_vault_markdown(path))
-        .collect();
+    // unreadable dir entry no longer just disappears: it makes the picture PARTIAL, which withholds the
+    // final sweep (see [`may_reap`]) — "we never saw it" must never be mistaken for "the user deleted it".
+    let mut complete = true;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&vault)? {
+        match entry {
+            Ok(e) => {
+                let path = e.path();
+                if is_vault_markdown(&path) {
+                    files.push(path);
+                }
+            }
+            Err(_) => complete = false,
+        }
+    }
     on_event.send(IngestEvent::Counted {
         total: files.len() + extra_total,
     });
-    let (mut ingested, mut failed) = (0usize, 0usize);
+    let (mut ingested, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for path in files {
         let name = file_name(&path);
+        // The resume check, taken BEFORE any read/split/embed — this is where an interrupted run's saved
+        // work is actually banked, so it must gate the expensive part, not merely the write.
+        let already = {
+            let conn = state.conn()?;
+            stored_pass(&conn, &name)?.is_some_and(|stored| {
+                plan_rebuild_one(stored.as_deref(), pass) == RebuildPlan::AlreadyDone
+            })
+        };
+        // `Started` first even when we're about to skip: the views render a file's terminal event by
+        // amending the row `Started` opened (`replaceLastWorking`), so a bare `Skipped` would show up as
+        // a nameless row. Every other ingest path announces then completes; this one must too.
         on_event.send(IngestEvent::Started {
             path: path.to_string_lossy().into(),
             name,
         });
+        if already {
+            skipped += 1;
+            on_event.send(IngestEvent::Skipped {
+                path: path.to_string_lossy().into(),
+                reason: "already rebuilt by the run that was interrupted".into(),
+            });
+            continue;
+        }
         // A chat session's `.md` must round-trip its chat IDENTITY (source_type/source_id, per-chunk
         // turn pointer + timestamp, and the session→document link), not re-index as a plain document —
         // otherwise citations lose their jump-to-turn and a later idle sweep births a duplicate. Route it
         // through the live chat engine, which reads the (un-wiped) messages table and rebuilds all of that.
         let outcome = if is_chat_vault_file(&cipher, &path) {
-            rebuild_chat(&state, &cipher, &path)
+            rebuild_chat(&state, &cipher, &path, pass)
         } else {
-            rebuild_one(&state, &gateway, &cipher, &path).map(Some)
+            rebuild_one(&state, &gateway, &cipher, &path, pass).map(Some)
         };
         match outcome {
             Ok(Some(document)) => {
@@ -1288,12 +1448,41 @@ pub fn rebuild(
         }
     }
 
-    // The index now reflects the current retrieval config end-to-end, so stamp the vault —
-    // this clears the one-time "Rebuild recommended" prompt.
-    {
-        let conn = state.conn()?;
-        crate::db::set_retrieval_stamp(&conn, &RetrievalConfig::current_for(&embedder))?;
+    // THE SWEEP — the "delete only the stragglers, at the end" half of #371, and the only destructive
+    // step left on the incremental arm. It reaps the documents whose vault file the user deleted, which
+    // is the one useful thing the old wipe did implicitly. Two independent gates, because this deletes
+    // real user documents:
+    //   1. [`may_reap`] — run at all only on a provably complete walk. A partial one withholds the sweep
+    //      entirely and the next complete pass reaps instead.
+    //   2. [`plan_reap`] — per candidate, a FRESH three-way check ([`FileState`]): delete only on a
+    //      PROVABLE absence, never on "couldn't tell".
+    // Index-only documents are excluded: their `vault_path` is the synthetic `idx://<source_id>` sentinel
+    // that no file will ever back, and the manifest — not the vault walk — is their source of truth.
+    if may_reap(complete) {
+        let candidates: Vec<(i64, String)> = {
+            let conn = state.conn()?;
+            let mut stmt =
+                conn.prepare("SELECT id, vault_path FROM documents WHERE source_type != ?1")?;
+            let rows = stmt
+                .query_map(params![SOURCE_TYPE_INDEX_ONLY], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (doc_id, doc_vault_path) in candidates {
+            if plan_reap(FileState::of(&vault.join(&doc_vault_path))) == ReapPlan::Delete {
+                let mut conn = state.conn()?;
+                let tx = conn.transaction()?;
+                delete_document(&tx, doc_id)?;
+                tx.commit()?;
+            }
+        }
     }
+
+    // The retrieval stamp is deliberately NOT written here. It may only be written once BOTH phases have
+    // finished cleanly, and phase 2 (the index-only full-body re-fetch) runs after this returns — so the
+    // caller owns it. See `commands::rebuild_passes`.
 
     // Rebuild re-resolved every document's entity from its frontmatter canonical; push any
     // resulting entity change out to the portable rules file (a no-op when nothing changed).
@@ -1338,7 +1527,7 @@ pub fn rebuild(
 
     // The terminal `Finished` is sent by the caller (`commands::rebuild_index`) AFTER it has run the
     // async full-body re-index of index-only items; hand back the counts so it can fold them in.
-    Ok((ingested, failed))
+    Ok((ingested, skipped, failed))
 }
 
 fn rebuild_one(
@@ -1346,6 +1535,7 @@ fn rebuild_one(
     gateway: &ModelGateway<'_>,
     cipher: &MarkdownCipher,
     vault_file: &Path,
+    pass: &str,
 ) -> Result<Document> {
     let raw = cipher.read(vault_file)?;
     let (fields, body) = parse_frontmatter(&raw)
@@ -1431,13 +1621,14 @@ fn rebuild_one(
             }
         },
     };
-    index_document(
+    upsert_document(
         state,
         &meta,
         &chunks,
         &embeddings,
         photo.as_ref(),
         spreadsheet.as_ref(),
+        pass,
     )
 }
 
@@ -1455,19 +1646,27 @@ fn is_chat_vault_file(cipher: &MarkdownCipher, vault_file: &Path) -> bool {
         == Some(SOURCE_TYPE_CHAT)
 }
 
-/// Rebuild a chat session from its vault `.md`. Rebuild wiped `documents` + `chunks` (FK-nulling
-/// `chat_sessions.document_id`), but left `conversations` / `messages` / `chat_sessions` intact — so the
-/// authored turns are still the source of truth. We reset the index cursor to NULL and re-run the SAME
-/// engine the live/idle indexer uses ([`chat_index::index_session`]): it re-births the `documents` row with
-/// the chat's `source_type`/`source_id`, re-appends every completed turn-pair stamping per-chunk
-/// `chat_turn_id` + `chunk_at`, and re-links `chat_sessions.document_id`. That is what keeps chat citations
-/// (jump-to-turn) and per-chunk recency intact across a Rebuild, and stops the next idle sweep from birthing
-/// a duplicate document. Returns the re-birthed [`Document`], or `None` for a chat with no substantive turns
-/// (small-talk-only ⇒ no document, by design).
+/// Rebuild a chat session from its vault `.md`. `conversations` / `messages` / `chat_sessions` are never
+/// touched by a rebuild — the authored turns are still the source of truth. We drop the chat's existing
+/// document, reset the index cursor to NULL, and re-run the SAME engine the live/idle indexer uses
+/// ([`chat_index::index_session`]): it re-births the `documents` row with the chat's `source_type`/`source_id`,
+/// re-appends every completed turn-pair stamping per-chunk `chat_turn_id` + `chunk_at`, and re-links
+/// `chat_sessions.document_id`. That is what keeps chat citations (jump-to-turn) and per-chunk recency intact
+/// across a Rebuild, and stops the next idle sweep from birthing a duplicate document. Returns the re-birthed
+/// [`Document`], or `None` for a chat with no substantive turns (small-talk-only ⇒ no document, by design).
+///
+/// A chat is the ONE document a rebuild still re-births rather than upserting, so its id churns where a
+/// vault document's no longer does. That is deliberate: `index_session` and the append-only cursor it shares
+/// with the live indexer are both written against a birth-from-empty premise, and reworking that seam to be
+/// idempotent is a far larger, riskier change than #371 — for no user-visible gain, since the resume skip
+/// (checked before this is ever called) already spares a finished chat the work. What it costs is what the
+/// old wipe cost every document: this chat's `corrections.document_id` links are nulled and its historical
+/// citations dangle — unchanged from before, and no worse.
 fn rebuild_chat(
     state: &AppState,
     cipher: &MarkdownCipher,
     vault_file: &Path,
+    pass: &str,
 ) -> Result<Option<Document>> {
     let raw = cipher.read(vault_file)?;
     let (fields, _body) = parse_frontmatter(&raw)
@@ -1478,23 +1677,49 @@ fn rebuild_chat(
         .ok_or_else(|| Error::Other("chat vault file missing chat_conversation_id".into()))?;
 
     {
-        let conn = state.conn()?;
-        conn.execute(
+        let mut conn = state.conn()?;
+        // Clear the previous document BEFORE `index_session` re-births one. Without the wipe that used to
+        // precede this, the old row still owns this chat's `vault_path` — which is NOT NULL UNIQUE — so the
+        // re-birth would collide and fail every chat on every rebuild. Deleting through the shared cascade
+        // also drops its chunks/vectors/FTS rows, which nothing else would have reclaimed.
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT document_id FROM chat_sessions WHERE conversation_id = ?1",
+                params![conversation_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let tx = conn.transaction()?;
+        if let Some(doc_id) = existing {
+            delete_document(&tx, doc_id)?;
+        }
+        tx.execute(
             "UPDATE chat_sessions SET document_id = NULL, last_indexed_turn_id = NULL \
              WHERE conversation_id = ?1",
             params![conversation_id],
         )?;
+        tx.commit()?;
     }
     crate::chat_index::index_session(state, conversation_id)?;
 
     // The session row exists (its vault file implies an earlier `record_turn_pair` upsert). document_id is
     // NULL again only if index_session found nothing substantive to index (small-talk-only chat).
     let conn = state.conn()?;
-    let doc_id: Option<i64> = conn.query_row(
-        "SELECT document_id FROM chat_sessions WHERE conversation_id = ?1",
-        params![conversation_id],
-        |r| r.get(0),
-    )?;
+    // `.optional()` because the session row may not exist at all: a chat deletion drops `conversations`
+    // (cascading `chat_sessions`) and then removes the vault file as a separate, non-transactional step,
+    // so a file left behind by a failed/locked delete is a reachable orphan. Without this the bare
+    // `query_row` returns QueryReturnedNoRows, the `?` fails this file, and — since the sweep only runs on
+    // a clean pass — that one orphan would withhold the straggler sweep on every rebuild, forever.
+    // There is no document to rebuild, so report it as such and move on.
+    let doc_id: Option<i64> = conn
+        .query_row(
+            "SELECT document_id FROM chat_sessions WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
     let Some(id) = doc_id else {
         return Ok(None);
     };
@@ -1529,6 +1754,9 @@ fn rebuild_chat(
             id
         ],
     )?;
+    // Claim it for this pass, so a resume skips this chat instead of re-indexing every turn again — and so
+    // the sweep reads it as rebuilt rather than as a leftover.
+    stamp_rebuild_pass(&conn, id, pass)?;
     Ok(Some(load_document(&conn, id)?))
 }
 
@@ -1548,10 +1776,34 @@ pub(crate) fn index_document(
     let tx = conn.transaction()?;
 
     let doc_id = insert_document_row(&tx, meta)?;
+    insert_satellites(&tx, doc_id, photo, spreadsheet)?;
 
-    // A photo carries an extra satellite row (its capture/OCR/copy truth), written in the SAME
-    // transaction so a document and its photo row are always consistent. `visual_description` is left
-    // to its NULL default (reserved for Stage-4 image understanding — no writer this stage).
+    insert_chunks(
+        &tx,
+        doc_id,
+        chunks,
+        embeddings,
+        meta.source.is_index_only(),
+        meta.source.stored_summary.as_deref(),
+    )?;
+
+    tx.commit()?;
+    load_document(&conn, doc_id)
+}
+
+/// Write a document's satellite rows — the photo's capture/OCR/copy truth, or a spreadsheet's sheet/row
+/// counts + truncation record — in the SAME transaction as the document itself, so a row and its
+/// satellite are never inconsistent. `photos.visual_description` and `spreadsheets.structured_data_summary`
+/// are left to their NULL defaults (reserved for later enrichment; no writer this stage).
+///
+/// Extracted so the rebuild's in-place [`upsert_document`] writes them identically to a fresh
+/// [`index_document`] — the satellite shape must not drift between the two paths.
+fn insert_satellites(
+    tx: &Connection,
+    doc_id: i64,
+    photo: Option<&PhotoRecord>,
+    spreadsheet: Option<&SpreadsheetRecord>,
+) -> Result<()> {
     if let Some(p) = photo {
         tx.execute(
             "INSERT INTO photos \
@@ -1574,11 +1826,6 @@ pub(crate) fn index_document(
             ],
         )?;
     }
-
-    // A spreadsheet carries an extra satellite row (its sheet/row counts + the truncation record),
-    // written in the SAME transaction so a document and its spreadsheet row are always consistent.
-    // `structured_data_summary` is left to its NULL default — reserved for later column-type/aggregate
-    // enrichment, with no writer this card (parallel to `photos.visual_description`).
     if let Some(sp) = spreadsheet {
         tx.execute(
             "INSERT INTO spreadsheets (document_id, sheet_count, total_rows, chunked_rows) \
@@ -1586,18 +1833,141 @@ pub(crate) fn index_document(
             params![doc_id, sp.sheet_count, sp.total_rows, sp.chunked_rows],
         )?;
     }
+    Ok(())
+}
 
-    insert_chunks(
-        &tx,
-        doc_id,
-        chunks,
-        embeddings,
-        meta.source.is_index_only(),
-        meta.source.stored_summary.as_deref(),
-    )?;
-
+/// Write one document a REBUILD has just re-split: update the row the vault already owns for this
+/// `vault_path`, insert one when it doesn't exist, and stamp it with this run's `pass` either way — all in
+/// ONE transaction, so the checkpoint can never claim work that didn't commit.
+///
+/// The in-place half is what makes #371's resume possible, and it keeps `documents.id` STABLE across a
+/// Rebuild, which the old drop-and-recreate never did. Everything keyed to that id now survives:
+/// `corrections.document_id` (declared `ON DELETE SET NULL`, so every rebuild silently orphaned the whole
+/// Learning-You correction corpus from its documents), the `messages.citations` blobs behind chat
+/// citations, and the reader's saved document links.
+fn upsert_document(
+    state: &AppState,
+    meta: &DocMeta,
+    chunks: &[splitter::Chunk],
+    embeddings: &[Vec<f32>],
+    photo: Option<&PhotoRecord>,
+    spreadsheet: Option<&SpreadsheetRecord>,
+    pass: &str,
+) -> Result<Document> {
+    let mut conn = state.conn()?;
+    let tx = conn.transaction()?;
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM documents WHERE vault_path = ?1",
+            params![meta.vault_path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let doc_id = match existing {
+        Some(doc_id) => {
+            update_document_row(&tx, doc_id, meta)?;
+            // The satellites are keyed by `document_id`, and `photos.file_hash` is UNIQUE — so a bare
+            // re-insert would collide with the row this very document already owns. The wipe is what used
+            // to make that impossible; clear them first, then re-write from the front-matter truth.
+            tx.execute("DELETE FROM photos WHERE document_id = ?1", params![doc_id])?;
+            tx.execute(
+                "DELETE FROM spreadsheets WHERE document_id = ?1",
+                params![doc_id],
+            )?;
+            insert_satellites(&tx, doc_id, photo, spreadsheet)?;
+            replace_chunks(
+                &tx,
+                doc_id,
+                chunks,
+                embeddings,
+                meta.source.is_index_only(),
+                meta.source.stored_summary.as_deref(),
+            )?;
+            doc_id
+        }
+        None => {
+            let doc_id = insert_document_row(&tx, meta)?;
+            insert_satellites(&tx, doc_id, photo, spreadsheet)?;
+            insert_chunks(
+                &tx,
+                doc_id,
+                chunks,
+                embeddings,
+                meta.source.is_index_only(),
+                meta.source.stored_summary.as_deref(),
+            )?;
+            doc_id
+        }
+    };
+    stamp_rebuild_pass(&tx, doc_id, pass)?;
     tx.commit()?;
     load_document(&conn, doc_id)
+}
+
+/// Record that `pass` rebuilt this document (v35). Always called inside the document's own transaction,
+/// so the stamp and the chunks it vouches for commit together — a checkpoint that could outlive a
+/// rolled-back write would make resume skip work that never landed.
+pub(crate) fn stamp_rebuild_pass(tx: &Connection, doc_id: i64, pass: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE documents SET rebuild_pass = ?1 WHERE id = ?2",
+        params![pass, doc_id],
+    )?;
+    Ok(())
+}
+
+/// The UPDATE half of [`insert_document_row`] — the same columns, resolved the same way, for a document
+/// the vault already holds. Kept beside the INSERT so the two can't drift. `vault_path` is the key this
+/// matched on, so it is never rewritten.
+///
+/// `byte_size` is the one column deliberately COALESCEd rather than assigned: it is measured at ingest
+/// from the ORIGINAL file, and the vault front-matter never carries it — so `rebuild_one` always passes
+/// `None` and a plain assignment would null it on every pass (it did, on every rebuild, until this).
+fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<()> {
+    let tags_json =
+        serde_json::to_string(&meta.tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
+    let entity_id = crate::entities::resolve_project(tx, &meta.project, true)?;
+    let source_account = meta
+        .source
+        .source_id
+        .as_deref()
+        .and_then(crate::drive::account_of);
+    tx.execute(
+        "UPDATE documents SET \
+         source_path = ?1, title = ?2, content_hash = ?3, ext = ?4, \
+         byte_size = COALESCE(?5, byte_size), created_at = ?6, ingested_at = ?7, project = ?8, \
+         tags = ?9, importance = ?10, reviewed = ?11, last_activity = ?12, entity_id = ?13, \
+         source_type = ?14, source_state = ?15, source_id = ?16, external_ref = ?17, \
+         source_modified_at = ?18, source_content_hash = ?19, stored_summary = ?20, \
+         source_parent_folder_id = ?21, source_parent_folder_name = ?22, source_account = ?23 \
+         WHERE id = ?24",
+        params![
+            meta.source_path,
+            meta.title,
+            meta.content_hash,
+            meta.ext,
+            meta.byte_size,
+            meta.created_at,
+            meta.ingested_at,
+            meta.project,
+            tags_json,
+            meta.importance,
+            meta.reviewed as i64,
+            meta.last_activity,
+            entity_id,
+            meta.source.source_type,
+            meta.source.source_state,
+            meta.source.source_id,
+            meta.source.external_ref,
+            meta.source.source_modified_at,
+            meta.source.source_content_hash,
+            meta.source.stored_summary,
+            meta.source.source_parent_folder_id,
+            meta.source.source_parent_folder_name,
+            source_account,
+            doc_id,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Insert just the `documents` row from a [`DocMeta`] (resolving its entity from the canonical project
@@ -3078,6 +3448,170 @@ mod tests {
         .unwrap();
         let index_id = conn.last_insert_rowid();
         (dir, conn, vault_id, index_id)
+    }
+
+    #[test]
+    fn plan_rebuild_one_skips_only_this_very_pass() {
+        // The resume rule (#371). A pass id is minted per RUN, so "this run already did it" is the only
+        // thing that skips work.
+        assert_eq!(
+            plan_rebuild_one(Some("pass-a"), "pass-a"),
+            RebuildPlan::AlreadyDone
+        );
+        // Never rebuilt, or rebuilt long ago under a v34 store (NULL) → do the work.
+        assert_eq!(plan_rebuild_one(None, "pass-a"), RebuildPlan::Rebuild);
+        // THE case that keeps "Rebuild" meaning rebuild: a fresh run mints a new id, so a document a
+        // PREVIOUS rebuild finished is redone. If this ever returned AlreadyDone, every rebuild after the
+        // first would silently do nothing and the repair button would be a lie.
+        assert_eq!(
+            plan_rebuild_one(Some("pass-a"), "pass-b"),
+            RebuildPlan::Rebuild
+        );
+    }
+
+    #[test]
+    fn may_reap_only_on_a_provably_complete_walk() {
+        assert!(may_reap(true), "whole walk enumerated → safe to sweep");
+        // A dir entry we couldn't read: a file may exist that we never enumerated, and in the worst case
+        // the vault root itself is half-readable — sweeping that picture could delete the library.
+        assert!(!may_reap(false), "a partial walk must never sweep");
+    }
+
+    #[test]
+    fn plan_reap_deletes_only_on_a_provable_absence() {
+        // The sweep's whole purpose: the user deleted the vault file.
+        assert_eq!(plan_reap(FileState::Gone), ReapPlan::Delete);
+        // Still there → keep, whether we rebuilt it this pass or another writer added it underneath us.
+        assert_eq!(plan_reap(FileState::Present), ReapPlan::Keep);
+        // THE data-loss guard. "I couldn't tell" is not "it's gone": a vault on a network share that
+        // drops, or a folder an antivirus scanner locks, must never be read as the user deleting their
+        // library. `Path::exists()` would collapse this into `false` — hence `FileState`.
+        assert_eq!(plan_reap(FileState::Unknown), ReapPlan::Keep);
+    }
+
+    #[test]
+    fn file_state_reports_a_real_absence_as_gone_not_unknown() {
+        // Pins `FileState::of`'s mapping against the file system itself, so the sweep's one destructive
+        // input can't silently invert.
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("here.md");
+        std::fs::write(&present, "x").unwrap();
+        assert_eq!(FileState::of(&present), FileState::Present);
+        assert_eq!(FileState::of(&dir.path().join("nope.md")), FileState::Gone);
+    }
+
+    #[test]
+    fn upsert_keeps_the_document_id_so_corrections_survive_a_rebuild() {
+        // `corrections.document_id` is declared ON DELETE SET NULL (migrations.rs), so the old
+        // drop-and-recreate rebuild silently unlinked the ENTIRE Learning-You corpus from its documents on
+        // every pass — unreconstructably. Rebuilding in place is what fixes that, and this is the pin.
+        let (_d, conn, vault_id, _idx) = store_with_one_of_each();
+        conn.execute(
+            "INSERT INTO corrections(document_id, field, before_val, after_val, title) \
+             VALUES (?1, 'project', '\"Unsorted\"', '\"Atlas\"', 'V')",
+            params![vault_id],
+        )
+        .unwrap();
+
+        let meta = DocMeta {
+            source_path: None,
+            vault_path: "v.md".into(),
+            title: "V, re-titled".into(),
+            content_hash: "hv".into(),
+            ext: None,
+            byte_size: None,
+            created_at: None,
+            ingested_at: "2026-07-16T00:00:00Z".into(),
+            project: "Unsorted".into(),
+            tags: vec![],
+            importance: None,
+            reviewed: false,
+            last_activity: None,
+            source: SourceMeta::default(),
+        };
+        update_document_row(&conn, vault_id, &meta).unwrap();
+
+        let still_linked: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM corrections WHERE document_id = ?1",
+                params![vault_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_linked, 1,
+            "the correction must still point at its document"
+        );
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM documents WHERE id = ?1",
+                params![vault_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "V, re-titled", "the row is updated, not merely kept");
+    }
+
+    #[test]
+    fn upsert_preserves_a_byte_size_the_vault_cannot_restore() {
+        // `byte_size` is measured at ingest from the ORIGINAL file and never written to the vault
+        // front-matter, so every rebuild passes None for it. A plain assignment nulled it on every pass;
+        // the COALESCE in `update_document_row` is what keeps it.
+        let (_d, conn, vault_id, _idx) = store_with_one_of_each();
+        conn.execute(
+            "UPDATE documents SET byte_size = 4096 WHERE id = ?1",
+            params![vault_id],
+        )
+        .unwrap();
+
+        let meta = DocMeta {
+            source_path: None,
+            vault_path: "v.md".into(),
+            title: "V".into(),
+            content_hash: "hv".into(),
+            ext: None,
+            byte_size: None, // exactly what `rebuild_one` supplies
+            created_at: None,
+            ingested_at: "2026-07-16T00:00:00Z".into(),
+            project: "Unsorted".into(),
+            tags: vec![],
+            importance: None,
+            reviewed: false,
+            last_activity: None,
+            source: SourceMeta::default(),
+        };
+        update_document_row(&conn, vault_id, &meta).unwrap();
+
+        let size: Option<i64> = conn
+            .query_row(
+                "SELECT byte_size FROM documents WHERE id = ?1",
+                params![vault_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            size,
+            Some(4096),
+            "a rebuild must not forget the file's size"
+        );
+    }
+
+    #[test]
+    fn stamping_a_pass_is_what_a_resume_reads_back() {
+        // The checkpoint round-trip: what `stamp_rebuild_pass` writes is what the loop's skip check reads.
+        let (_d, conn, vault_id, _idx) = store_with_one_of_each();
+        assert_eq!(
+            stored_pass(&conn, "v.md").unwrap(),
+            Some(None),
+            "a v34 row exists but carries no pass"
+        );
+        stamp_rebuild_pass(&conn, vault_id, "pass-a").unwrap();
+        assert_eq!(
+            stored_pass(&conn, "v.md").unwrap(),
+            Some(Some("pass-a".into()))
+        );
+        // A file with no document at all reads as absent — distinct from "present but unstamped".
+        assert_eq!(stored_pass(&conn, "gone.md").unwrap(), None);
     }
 
     #[test]

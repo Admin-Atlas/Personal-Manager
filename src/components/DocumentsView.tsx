@@ -472,8 +472,8 @@ export function DocumentsView({ onReviewClick }: Props) {
     try {
       // Progress arrives on the global subscription set up at mount, not through this call — so
       // the rebuild keeps reporting even after this view unmounts. The backend refuses a second
-      // concurrent run outright; rebuild is destructive-first, so overlapping runs would eat
-      // each other's work.
+      // concurrent run outright: two passes would fight over the same rows, and on a search-language
+      // change (the one arm that still clears the index first) one would eat the other's work.
       await rebuildIndex();
     } catch (e) {
       setError(String(e));
@@ -618,7 +618,7 @@ export function DocumentsView({ onReviewClick }: Props) {
             onClick={() => setConfirmRebuild(true)}
             disabled={busy || installingOcr}
             data-help="documents-rebuild"
-            title="Drop the index and rebuild it from the Markdown vault"
+            title="Re-read the Markdown vault and rebuild the search index"
           >
             Rebuild
           </Button>
@@ -1083,7 +1083,6 @@ export function DocumentsView({ onReviewClick }: Props) {
       <ConfirmDialog
         open={confirmRebuild}
         title="Rebuild the index?"
-        danger
         confirmLabel="Rebuild"
         onConfirm={() => {
           setConfirmRebuild(false);
@@ -1091,8 +1090,9 @@ export function DocumentsView({ onReviewClick }: Props) {
         }}
         onClose={() => setConfirmRebuild(false)}
       >
-        This drops the search index and rebuilds it from the Markdown vault. Your documents
-        aren&apos;t deleted, but rebuilding can take a while on a large library.
+        PM re-reads every file in your vault and rebuilds how it searches them. Your documents
+        aren&apos;t touched, search keeps working while it runs, and if it&apos;s interrupted it
+        picks up where it left off. It can take a while on a large library.
       </ConfirmDialog>
 
       <ConfirmDialog

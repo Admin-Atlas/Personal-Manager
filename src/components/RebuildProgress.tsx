@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The guided Re-index modal. Given `open`, it runs `rebuildIndex` once — dropping the search index
-// and rebuilding it from the Markdown vault — and follows progress on the global `ingest://progress`
+// The guided Re-index modal. Given `open`, it runs `rebuildIndex` once — re-reading the Markdown vault
+// and rebuilding the search index from it — and follows progress on the global `ingest://progress`
 // event the Documents view also listens to. Self-contained so the Settings language switcher can
 // launch it without re-implementing the rebuild plumbing; the Documents "Rebuild" banner remains its
 // own (older, inline) entry point.
+//
+// This modal's main caller — the search-language switch — is the ONE case that still clears the index
+// before rebuilding: the vector column can't be resized to the new model's width while it holds rows.
+// Every other rebuild (including the Documents button's) now rebuilds each document in place, so this
+// modal's "your search is briefly incomplete" framing is specific to the language switch, not to
+// rebuilds in general. See `ingest::rebuild`.
 //
 // The rebuild is detached from this modal: closing it (or the tab) doesn't stop the work, and the
 // backend's snapshot lets whatever mounts next pick the progress back up.

@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.0-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Rebuilding the search index no longer starts over if it's interrupted. Close PM (or lose power) at 95% through a rebuild and it used to throw all of that away and begin again from nothing — the slowest thing PM does, done twice. Now it picks up exactly where it left off, including the connected files it had already re-read from Google Drive or OneDrive, so nothing gets downloaded or re-read twice.",
+      "Search keeps working while a rebuild runs. A rebuild used to clear the whole index first and refill it, so for as long as it took — sometimes hours on a big library — searching and chat found less and less of your library. Now each document is rebuilt in place, so your search stays intact the whole way through. (Switching search language is the one exception: that one still has to clear the index first, because the whole shape of it changes.)",
+      "Rebuilding no longer forgets what you'd taught PM. Every rebuild used to quietly cut the link between your filing corrections and the documents they were about, which is the record PM learns your habits from. Those links now survive. Old links to documents in past chats survive too, so citations in your chat history keep working after a rebuild.",
+      "PM now stands its ground while it's rebuilding. Adding documents, syncing a connected account, or changing your vault while a rebuild was running could quietly collide with it. Those now wait — and tell you why — instead of racing it.",
+    ],
+  },
+  {
     version: "3.18.2-alpha",
     date: "2026-07-15",
     highlights: [

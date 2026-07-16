@@ -976,6 +976,23 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE calendars ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v35: which rebuild PASS last rebuilt this row's chunks (#371) — the checkpoint that makes an
+    // interrupted Rebuild resumable instead of restarting. A pass mints one id (a uuid) and stamps every
+    // document as it commits it, so a resume skips what the previous run already finished and the final
+    // sweep can tell "this file is gone" from "this file is not done yet".
+    //
+    // Why a pass id and NOT the obvious keys. `content_hash` is WRONG: a Rebuild's dominant trigger is a
+    // splitter/embedder change (`retrieval_rebuild_needed`), where every hash is IDENTICAL and every chunk
+    // boundary must move — hashing would skip the whole vault and stamp it clean. A per-document copy of
+    // the retrieval config is wrong for the opposite reason: on a manual "my index looks broken" Rebuild
+    // nothing has changed, so every document would be skipped and the repair would do nothing. A pass id
+    // means exactly "this run already did this document" — the only question resume needs answered.
+    //
+    // Additive + nullable (rule #3): every existing row reads as NULL = "no pass has claimed this" = stale,
+    // so the first Rebuild after this migration does full work, exactly as today. Nothing else reads it.
+    r#"
+    ALTER TABLE documents ADD COLUMN rebuild_pass TEXT;   -- id of the rebuild pass that last built these chunks; NULL = pre-v35 or never rebuilt
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1025,7 +1042,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 34,
+            version, 35,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1037,7 +1054,7 @@ mod tests {
              Drive parent-folder tag + normalized source_account is v29; \
              spreadsheet ingestion table is v30; project activity log is v31; \
              structured flag layer is v32; per-flag instance timestamp (F-18) is v33; \
-             per-calendar quiet flag is v34)"
+             per-calendar quiet flag is v34; rebuild pass stamp (#371) is v35)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

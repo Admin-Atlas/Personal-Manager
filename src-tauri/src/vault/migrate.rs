@@ -423,6 +423,17 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
     plan.validate()?;
     let state = app.state::<AppState>();
     let state = state.inner();
+    // Never while a rebuild is walking the vault (#371). A migration re-keys every Markdown file and can
+    // relocate the whole root out from under a pass that is mid-walk — reading files by a path that stops
+    // existing, and re-encrypting the very files it is reading. This is the one guarded seam every mode
+    // change funnels through, so it covers make-shareable, change-passphrase and relocate alike.
+    if state.rebuild_running() {
+        return Err(Error::Other(
+            "PM is rebuilding the search index right now, and it's reading every file in your vault. \
+             Wait for it to finish (the Documents tab shows its progress), then change your vault again."
+                .into(),
+        ));
+    }
     let data_dir = paths::data_dir(app)?;
     let resolved = resolve(app)?;
     let old_meta = load_meta(&resolved.vault_root)?
