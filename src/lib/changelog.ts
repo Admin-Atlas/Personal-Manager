@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.20.0-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Your calendar list now keeps itself in sync. Before, PM only learned which calendars an account had at the moment you connected it — so a calendar you created later never appeared, and one you deleted upstream kept failing every sync and pinning the whole account as 'unreachable'. Now each sync rechecks the list: new calendars show up on their own (untick any you don't want), and deleted ones are cleaned up — but only when PM has provably seen your whole list, so a dropped connection can never remove a calendar by mistake.",
+    ],
+  },
+  {
     version: "3.19.10-alpha",
     date: "2026-07-16",
     highlights: [

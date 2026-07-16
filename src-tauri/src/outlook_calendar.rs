@@ -55,14 +55,15 @@ pub async fn me_account(token: &microsoft::Token) -> Result<(String, String)> {
 
 /// Fetch one account's calendars, authorised with its `token_key`. Returns the provider-neutral
 /// registration input the shared [`crate::calendar::register_calendars`] consumes.
-pub async fn list_calendars(token_key: &str) -> Result<Vec<RawCalendarInput>> {
+pub async fn list_calendars(token_key: &str) -> Result<(Vec<RawCalendarInput>, bool)> {
     let url = format!(
         "{}/me/calendars?$select=id,name,color,isDefaultCalendar&$top=200",
         microsoft::GRAPH_API
     );
-    // Graph's `@odata.nextLink` IS the page cursor (a full URL); the first page uses the initial
-    // URL. The page guard is a pure runaway backstop, so the truncated flag is discarded.
-    let (all, _truncated) = crate::connector_sync::paginate(MAX_PAGES, |cursor| {
+    // Graph's `@odata.nextLink` IS the page cursor (a full URL); the first page uses the initial URL.
+    // The runaway guard's `truncated` flag now travels back so a reconcile prunes vanished calendars
+    // only off a provably COMPLETE list (`complete == !truncated`) — never off a cut-short page-run.
+    let (all, truncated) = crate::connector_sync::paginate(MAX_PAGES, |cursor| {
         let url = url.as_str();
         async move {
             let u = cursor.unwrap_or_else(|| url.to_string());
@@ -71,7 +72,7 @@ pub async fn list_calendars(token_key: &str) -> Result<Vec<RawCalendarInput>> {
         }
     })
     .await?;
-    Ok(all)
+    Ok((all, !truncated))
 }
 
 /// Fetch one calendar's events within `[time_min, time_max]` (RFC3339), recurrences pre-expanded via

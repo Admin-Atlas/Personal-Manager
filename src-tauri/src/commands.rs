@@ -4076,7 +4076,10 @@ async fn do_connect_google_calendar(
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
     let inputs: Vec<_> = raw.iter().map(|c| c.to_input()).collect();
-    calendar::register_calendars(&conn, &account, "google", &inputs, |_| true)?;
+    // Connect UPSERTS the (in-hand, single-page) list but never prunes: a reconnect must not delete
+    // page-two calendars a prior full sync registered. The first `sync_calendar` reconcile prunes off
+    // a proper paginated, complete list.
+    calendar::register_calendars(&conn, &account, "google", &inputs, false, |_| true)?;
     calendar::list_sources(&conn, Some("google"))?
         .into_iter()
         .find(|a| a.id == account)
@@ -4144,7 +4147,7 @@ async fn migrate_legacy_google_calendar(app: &AppHandle) -> Result<()> {
     if FETCH_TRIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return Ok(());
     }
-    let raw = calendar::fetch_calendar_list(secrets::GOOGLE_TOKEN_CALENDAR).await?;
+    let (raw, _) = calendar::fetch_calendar_list(secrets::GOOGLE_TOKEN_CALENDAR).await?;
     let Some(email) = raw.iter().find(|c| c.primary).map(|c| c.id.clone()) else {
         return Ok(()); // can't identify the account yet; try again next time
     };
@@ -4158,7 +4161,8 @@ async fn migrate_legacy_google_calendar(app: &AppHandle) -> Result<()> {
         let old_selection = calendar::selected_calendar_ids(&conn)?; // legacy remote ids
         calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
         let inputs: Vec<_> = raw.iter().map(|c| c.to_input()).collect();
-        calendar::register_calendars(&conn, &account, "google", &inputs, |it| {
+        // A fresh `gcal:<email>` source, so there is nothing to prune yet; upsert-only (false).
+        calendar::register_calendars(&conn, &account, "google", &inputs, false, |it| {
             old_selection.iter().any(|id| id == &it.remote_id)
         })?;
     }
@@ -4179,12 +4183,13 @@ pub async fn connect_outlook_calendar(app: AppHandle) -> Result<calendar::Calend
     let email = email.trim().to_lowercase();
     let token_key = outlook_calendar::account_token_key(&email);
     microsoft::save_token(&token_key, &token)?;
-    let raw = outlook_calendar::list_calendars(&token_key).await?;
+    let (raw, _) = outlook_calendar::list_calendars(&token_key).await?;
     let account = outlook_calendar::account_id(&email);
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "microsoft", Some(&email), &name)?;
-    calendar::register_calendars(&conn, &account, "microsoft", &raw, |_| true)?;
+    // Upsert-only on connect (never prune); the first `sync_calendar` reconcile prunes off a complete list.
+    calendar::register_calendars(&conn, &account, "microsoft", &raw, false, |_| true)?;
     calendar::list_sources(&conn, Some("microsoft"))?
         .into_iter()
         .find(|a| a.id == account)
@@ -4348,6 +4353,57 @@ async fn sync_one_calendar(
     Ok(n)
 }
 
+/// Re-fetch each connected OAuth account's calendar LIST and reconcile the registry before events are
+/// pulled: a calendar created upstream appears (selected, so it shows on the Calendar tab), and a
+/// calendar deleted upstream is pruned — but ONLY when the list came back provably COMPLETE, so a
+/// truncated page-run or an unreachable account can never delete a real calendar (its selected/quiet
+/// choices and mirrored events). Best-effort per account: a failed list fetch is skipped here, and the
+/// account's state is still settled by the event-sync pass. Never holds the DB lock across a fetch
+/// (rule #4). ICS feeds carry no separate list to reconcile (one feed is one calendar).
+async fn reconcile_calendar_lists(app: &AppHandle) {
+    let accounts: Vec<calendar::CalendarAccount> = {
+        let state = app.state::<AppState>();
+        let Ok(conn) = state.conn() else {
+            return;
+        };
+        let mut v = calendar::list_sources(&conn, Some("google")).unwrap_or_default();
+        v.extend(calendar::list_sources(&conn, Some("microsoft")).unwrap_or_default());
+        v
+    };
+    for acc in accounts {
+        let Some(email) = acc.email.clone() else {
+            continue;
+        };
+        let fetched: Result<(Vec<calendar::RawCalendarInput>, bool)> = match acc.provider.as_str() {
+            "google" => calendar::fetch_calendar_list(&google_calendar_token_key(&email))
+                .await
+                .map(|(raw, complete)| (raw.iter().map(|c| c.to_input()).collect(), complete)),
+            "microsoft" => {
+                outlook_calendar::list_calendars(&outlook_calendar::account_token_key(&email)).await
+            }
+            _ => continue,
+        };
+        // An unreachable account (token/refresh/list failure) is skipped, NOT pruned — the event pass
+        // marks it 'unreachable'. Only a successful AND complete list may delete a vanished calendar.
+        let Ok((items, complete)) = fetched else {
+            continue;
+        };
+        let state = app.state::<AppState>();
+        let Ok(conn) = state.conn() else {
+            continue;
+        };
+        let _ = calendar::register_calendars(
+            &conn,
+            &acc.id,
+            &acc.provider,
+            &items,
+            complete,
+            // A newly-discovered calendar is shown by default (selected); the user can untick it.
+            |_| true,
+        );
+    }
+}
+
 /// Pull events from every selected calendar (all providers + ICS subscriptions) into the mirror.
 /// Returns the total events synced. Best-effort per source and never holds the DB lock across a fetch
 /// (rule #4); a source whose every calendar failed flips to `unreachable` while the rest keep their
@@ -4355,6 +4411,10 @@ async fn sync_one_calendar(
 #[tauri::command]
 pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let _ = migrate_legacy_google_calendar(&app).await;
+    // Pick up calendars created or deleted upstream before syncing events, so a new calendar shows up
+    // and a deleted one stops pinning the account 'unreachable' every sync (deletions honoured only on
+    // a provably complete list — see `reconcile_calendar_lists`).
+    reconcile_calendar_lists(&app).await;
 
     // Phase 1 (brief lock): snapshot what to sync.
     let (calendars, feeds, (time_min, time_max), tz) = {
