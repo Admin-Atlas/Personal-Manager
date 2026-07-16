@@ -643,19 +643,32 @@ pub(crate) fn reconcile_chat_index(state: &AppState) -> Result<Summary> {
 
 /// The pure idle-gate decision, factored out so it is unit-tested without a wall-clock and so the future
 /// screen-capture subsystem can share the same gate: run a background sweep only when the user has been
-/// idle past `threshold`, no Drive/OneDrive sync is using the engine, and no sweep is already in flight.
+/// idle past `threshold`, no Drive/OneDrive sync is using the engine, no rebuild is in flight, and no
+/// sweep is already running.
+///
+/// `rebuilding` is the #371 gate: a rebuild re-reads the whole vault and then sweeps away the documents it
+/// never saw, so an indexer birthing a chat document underneath it is writing into a pass that has already
+/// walked past — pointless at best. The rebuild skips finished chats itself, so deferring costs nothing:
+/// the next idle tick picks up whatever is left.
 pub(crate) fn should_run_now(
     idle_for: Duration,
     threshold: Duration,
     sync_active: bool,
+    rebuilding: bool,
     already_running: bool,
 ) -> bool {
-    idle_for >= threshold && !sync_active && !already_running
+    idle_for >= threshold && !sync_active && !rebuilding && !already_running
 }
 
 /// Run a reconcile sweep under the single-flight guard the launch sweep and the idle loop share, so the
 /// two never overlap. Blocking (it embeds) — only ever called from a blocking context.
 fn run_sweep_guarded(state: &AppState, label: &str) {
+    // Stand down while a rebuild owns the index (#371) — it re-indexes every chat from the vault itself,
+    // so a sweep now would be duplicated work racing a pass that may already have walked past this chat.
+    // The launch sweep reaches here too, and a rebuild resumed on launch starts in the same breath.
+    if state.rebuild_running() {
+        return;
+    }
     let Some(_guard) = crate::BusyGuard::acquire(&state.chat_index_busy) else {
         return; // another sweep is already in flight
     };
@@ -715,17 +728,18 @@ pub fn spawn_idle_indexer(app: AppHandle) {
         let threshold = Duration::from_secs(IDLE_THRESHOLD_SECS);
         loop {
             tokio::time::sleep(Duration::from_secs(IDLE_TICK_SECS)).await;
-            let (idle, sync_active, busy, ready) = {
+            let (idle, sync_active, rebuilding, busy, ready) = {
                 let state = app.state::<AppState>();
                 let ready = state.conn().is_ok() && state.sidecar.is_ready();
                 (
                     state.idle_for(),
                     state.sync_active(),
+                    state.rebuild_running(),
                     state.chat_index_busy.load(Ordering::SeqCst),
                     ready,
                 )
             };
-            if !ready || !should_run_now(idle, threshold, sync_active, busy) {
+            if !ready || !should_run_now(idle, threshold, sync_active, rebuilding, busy) {
                 continue;
             }
             let app2 = app.clone();
@@ -1236,12 +1250,13 @@ mod tests {
     }
 
     #[test]
-    fn should_run_now_gates_on_idle_sync_and_single_flight() {
+    fn should_run_now_gates_on_idle_sync_rebuild_and_single_flight() {
         let threshold = Duration::from_secs(900);
         // Idle long enough, nothing else running → go.
         assert!(should_run_now(
             Duration::from_secs(1000),
             threshold,
+            false,
             false,
             false
         ));
@@ -1250,6 +1265,7 @@ mod tests {
             Duration::from_secs(60),
             threshold,
             false,
+            false,
             false
         ));
         // A sync is running → defer to it.
@@ -1257,12 +1273,22 @@ mod tests {
             Duration::from_secs(1000),
             threshold,
             true,
+            false,
+            false
+        ));
+        // A rebuild owns the index → defer to it, however idle the user is (#371).
+        assert!(!should_run_now(
+            Duration::from_secs(1000),
+            threshold,
+            false,
+            true,
             false
         ));
         // A sweep is already in flight → single-flight.
         assert!(!should_run_now(
             Duration::from_secs(1000),
             threshold,
+            false,
             false,
             true
         ));

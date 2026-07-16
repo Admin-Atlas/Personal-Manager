@@ -112,7 +112,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "documents-rebuild": {
     title: "Rebuild",
-    body: "Rebuilds PM's search index from scratch. It re-reads every document, note and chat from your vault and re-splits them with the current settings, then re-reads your connected files (Google Drive, OneDrive, watched folders) from their source so each is indexed on its full contents — not just its saved summary. Your documents, projects, tags and importance are never changed. Safe to run anytime; large connected sources make it take longer, and anything offline is skipped and caught up on the next sync.",
+    body: "Rebuilds how PM searches your library. It re-reads every document, note and chat from your vault and re-splits them with the current settings, then re-reads your connected files (Google Drive, OneDrive, watched folders) from their source so each is indexed on its full contents — not just its saved summary. Each one is rebuilt in place, so search keeps working the whole time, and if PM is closed part-way through it picks up where it left off instead of starting over. Your documents, projects, tags and importance are never changed. Safe to run anytime; large connected sources make it take longer, and anything offline is left as it is and caught up on the next sync.",
   },
   "documents-review-banner": {
     title: "Documents to review",

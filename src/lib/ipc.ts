@@ -496,10 +496,12 @@ export function ingestPaths(
   return invoke<void>("ingest_paths", { paths, copyPhotosToVault, onEvent: channel });
 }
 
-/** Drop the index and rebuild it from the Markdown vault. */
-/** Drop the search index and rebuild it from the Markdown vault, then re-index connected
- *  (index-only) items from their full bodies. Runs detached: it keeps going if the caller unmounts,
- *  or even if the app is closed and reopened (it restarts on launch). Progress is broadcast on
+/** Re-read the Markdown vault and rebuild the search index from it, then re-index connected
+ *  (index-only) items from their full bodies. Each document is rebuilt in place and documents whose
+ *  vault file is gone are swept at the end, so search keeps working throughout — the exception is a
+ *  changed search language, where the vector index must be cleared before it can be resized.
+ *  Runs detached: it keeps going if the caller unmounts, or even if the app is closed and reopened
+ *  (it resumes on launch, continuing rather than restarting). Progress is broadcast on
  *  `ingest://progress` — subscribe with {@link onIngestProgress} and read {@link rebuildStatus} on
  *  mount for anything missed. Rejects if a rebuild is already running. */
 export function rebuildIndex(): Promise<void> {
@@ -777,9 +779,9 @@ export const stopDriveSync = () => invoke<void>("stop_drive_sync");
 export const rebuildStatus = () => invoke<IngestJobState>("rebuild_status");
 
 /** Resume a rebuild interrupted by a previous app close/crash. Called once on launch; resolves true
- *  if one was started. A rebuild keeps no per-document checkpoint, so this restarts it rather than
- *  continuing it — the marker only survives when the index was left partial, and a partial index
- *  must be rebuilt regardless. */
+ *  if one was started. It genuinely CONTINUES the interrupted pass: every document that pass had
+ *  already committed is recognised and skipped, so only the work that was left is redone — including
+ *  the connected files it would otherwise re-download. */
 export const resumeRebuild = () => invoke<boolean>("resume_rebuild");
 
 /** Subscribe to global rebuild progress (fires regardless of which view started it, and keeps

@@ -6,7 +6,7 @@
 //! the streaming chat command stays responsive.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -22,6 +22,7 @@ use crate::milestones::{self, Milestone};
 use crate::project_activity;
 use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
+use crate::retrieval_config::RetrievalConfig;
 use crate::retrieval_diag;
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::sidecar::SidecarStatus;
@@ -2420,6 +2421,23 @@ pub async fn ensure_sidecar(app: AppHandle) -> Result<()> {
     .map_err(|e| Error::Other(format!("setup task panicked: {e}")))?
 }
 
+/// Refuse a user-started indexing operation that would race a running rebuild (#371).
+///
+/// A rebuild re-reads the whole vault, upserts each document, then sweeps away the ones it never saw; on
+/// the vector-width arm it clears the store outright first. Either way, work started underneath it is the
+/// thing at risk — so the automatic writers (the folder watcher, the idle chat-indexer) quietly defer,
+/// while these user-pressed paths say so out loud. Nothing was going to happen either way; the difference
+/// is whether the user finds out. `what` completes "…rebuilding the search index right now, so {what}".
+fn refuse_if_rebuilding(app: &AppHandle, what: &str) -> Result<()> {
+    if app.state::<AppState>().rebuild_running() {
+        return Err(Error::Other(format!(
+            "PM is rebuilding the search index right now, so {what}. Open the Documents tab to watch it, \
+             then try again once it's finished."
+        )));
+    }
+    Ok(())
+}
+
 /// Ingest files/folders: convert → chunk → embed → index. Progress streams over
 /// `on_event`. The whole pipeline is blocking, so it runs on a blocking thread.
 ///
@@ -2434,6 +2452,7 @@ pub async fn ingest_paths(
     copy_photos_to_vault: Option<bool>,
     on_event: Channel<IngestEvent>,
 ) -> Result<()> {
+    refuse_if_rebuilding(&app, "it can't take new documents")?;
     let opts = ingest::IngestOpts {
         copy_photos_to_vault: copy_photos_to_vault.unwrap_or(false),
     };
@@ -2454,16 +2473,54 @@ pub async fn ingest_paths(
 #[tauri::command]
 pub async fn rebuild_index(app: AppHandle) -> Result<()> {
     let sink = ingest::ProgressSink::new(app.clone());
-    rebuild_core(app, sink).await
+    // A user-started Rebuild always mints a FRESH pass id, so nothing is skipped: "my index looks wrong,
+    // rebuild it" must redo every document, not notice they all carry a stamp and do nothing. Only a
+    // RESUME reuses a stored id (see `resume_rebuild`) — that is the whole distinction.
+    rebuild_core(app, sink, ingest::new_pass_id()).await
+}
+
+/// What `REBUILD_PENDING_KEY` holds while a rebuild is in flight: the run's pass id, plus the retrieval
+/// config that run is building under (#371).
+///
+/// Both halves are needed to decide whether a stored pass may be RESUMED. The pass id says which run's
+/// stamps to trust; the config says whether this build would still produce the same chunks as that run
+/// did. A marker whose config no longer matches must not be resumed — its committed documents carry
+/// chunks today's build would not produce, and skipping them would silently bank them forever.
+#[derive(Serialize, Deserialize)]
+struct RebuildMarker {
+    pass: String,
+    config: RetrievalConfig,
+}
+
+impl RebuildMarker {
+    fn encode(pass: &str, config: &RetrievalConfig) -> Result<String> {
+        serde_json::to_string(&RebuildMarker {
+            pass: pass.to_string(),
+            config: config.clone(),
+        })
+        .map_err(|e| Error::Other(format!("encode rebuild marker: {e}")))
+    }
+
+    /// The pass id this marker's run may be resumed under, given what THIS build would produce — or
+    /// `None` when the interrupted pass can't be continued and the caller must mint a fresh one.
+    ///
+    /// `None` covers both the pre-v3.19 marker (a bare `"1"`, which parses as neither a pass nor a
+    /// config) and a marker written by a build whose retrieval config differs from this one. Either way
+    /// the honest answer is the same: don't trust those stamps, rebuild everything.
+    fn resumable_pass(marker: &str, current: &RetrievalConfig) -> Option<String> {
+        let parsed: RebuildMarker = serde_json::from_str(marker).ok()?;
+        (&parsed.config == current).then_some(parsed.pass)
+    }
 }
 
 /// The rebuild itself, over whatever progress sink the caller supplies — a user-started rebuild
 /// (channel + global) or one resumed on launch (global only). Owns the single-flight guard, the
 /// shared snapshot's lifecycle, and the crash-resume marker, so every entry point gets them.
-async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink) -> Result<()> {
-    // Single-flight. Rebuild is destructive-first, so a second concurrent run's `DELETE FROM
-    // documents` would destroy the first run's in-progress work — reachable before this guard by
-    // switching tabs (which resets the UI's own component-local guard) and clicking Rebuild again.
+async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink, pass: String) -> Result<()> {
+    // Single-flight. Two rebuilds at once would fight over the same rows and, on the width-change arm,
+    // one's `DELETE FROM documents` would still eat the other's in-progress work — reachable before this
+    // guard by switching tabs (which resets the UI's own component-local guard) and clicking Rebuild
+    // again. It is also the flag every other indexing writer now defers to (see `rebuild_running`).
     // Refuse loudly rather than silently no-op: the user pressed a button and deserves an answer.
     // `state` is bound first so it outlives the guard borrowed out of it (locals drop in reverse).
     let state = app.state::<AppState>();
@@ -2476,9 +2533,8 @@ async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink) -> Result<()> 
     };
 
     // Count reachable index-only items up front so the progress bar's total spans BOTH phases (the
-    // vault rebuild AND the full-body re-index). Row ids change across the rebuild — it drops and
-    // recreates them — so the second phase re-queries the set; the count is stable because a local
-    // rebuild never changes a source's reachability.
+    // vault rebuild AND the full-body re-index). The count is stable because a local rebuild never
+    // changes a source's reachability.
     let extra_total = {
         let conn = state.conn()?;
         conn.query_row(
@@ -2488,26 +2544,46 @@ async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink) -> Result<()> 
         )? as usize
     };
 
-    // Claim the snapshot for this run and persist the resume marker. The marker is written BEFORE
-    // any destructive work: from the first `DELETE FROM documents` until the clean exit below, the
-    // index is partial, and a close in that window must be recoverable on the next launch.
-    {
-        if let Ok(mut snap) = state.ingest_job.lock() {
-            *snap = crate::IngestJobState {
-                running: true,
-                ..Default::default()
-            };
-        }
-        if let Ok(conn) = state.conn() {
-            let _ = db::set_setting(&conn, REBUILD_PENDING_KEY, "1");
-        }
+    if let Ok(mut snap) = state.ingest_job.lock() {
+        *snap = crate::IngestJobState {
+            running: true,
+            ..Default::default()
+        };
     }
 
-    let result = rebuild_passes(&app, &sink, extra_total).await;
+    // The resume marker carries this run's PASS ID **and the retrieval config it is building under**, so
+    // a relaunch doesn't merely know "a rebuild was unfinished" — it knows WHICH one, and whether this
+    // build would still produce the same chunks (#371).
+    //
+    // The config half is load-bearing, not bookkeeping. The marker is durable, so a rebuild interrupted
+    // at 50% can be resumed by a DIFFERENT BUILD — close PM mid-rebuild, the updater installs a version
+    // with a new `SPLITTER_VERSION`, and the resume fires on next launch. Skipping on pass id alone would
+    // then bank the half of the vault the old build chunked, finish the rest with the new splitter, and
+    // stamp the vault as fully current — a permanently mixed-config index with the "Rebuild recommended"
+    // prompt cleared, so nothing would ever tell the user. See `resume_rebuild` for the other half.
+    //
+    // `ingest::rebuild` writes it, not this function: only it knows when the mutating phase actually
+    // begins, and it must land after the model warmup proves the embedder works. A warmup failure
+    // destroys nothing, so it must not leave a marker behind that makes every future launch retry a
+    // rebuild that fails identically — which is what writing it here unconditionally did.
+    let marker_app = app.clone();
+    let marker_pass = pass.clone();
+    let on_pass_start = move || -> Result<()> {
+        let state = marker_app.state::<AppState>();
+        let conn = state.conn()?;
+        let config = RetrievalConfig::current_for(&db::selected_embedder(&conn)?);
+        db::set_setting(
+            &conn,
+            REBUILD_PENDING_KEY,
+            &RebuildMarker::encode(&marker_pass, &config)?,
+        )
+    };
+
+    let result = rebuild_passes(&app, &sink, extra_total, &pass, on_pass_start).await;
 
     // Clear `running` on every path, success or failure, so a failed rebuild can't wedge the UI
     // showing a phantom in-flight job for the rest of the session. The marker only clears on
-    // success: a failure leaves the index partial, which is exactly what resume is for.
+    // success: a failure leaves the pass unfinished, which is exactly what resume is for.
     {
         if let Ok(mut snap) = state.ingest_job.lock() {
             snap.running = false;
@@ -2519,69 +2595,130 @@ async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink) -> Result<()> 
         }
     }
 
-    let (ingested, failed) = result?;
+    let (ingested, skipped, failed) = result?;
     sink.send(IngestEvent::Finished {
         ingested,
-        skipped: 0,
+        skipped,
         failed,
     });
     Ok(())
 }
 
-/// Both rebuild phases: drop-and-rebuild from the vault, then upgrade index-only items to a full
-/// body. Split out so `rebuild_core` can bracket it with the guard/snapshot/marker teardown on
-/// every exit path, including the error ones.
-async fn rebuild_passes(
+/// Both rebuild phases: rebuild from the vault, then upgrade index-only items to a full body. Split out
+/// so `rebuild_core` can bracket it with the guard/snapshot/marker teardown on every exit path, including
+/// the error ones.
+async fn rebuild_passes<F>(
     app: &AppHandle,
     sink: &ingest::ProgressSink,
     extra_total: usize,
-) -> Result<(usize, usize)> {
+    pass: &str,
+    on_pass_start: F,
+) -> Result<(usize, usize, usize)>
+where
+    F: Fn() -> Result<()> + Send + 'static,
+{
     // `spawn_blocking` needs 'static, so the blocking phase gets its own clone of the sink — as the
     // pre-sink code did with the bare Channel. Both clones address the same snapshot and emit the
     // same global event, so progress is continuous across the phase boundary.
     let app2 = app.clone();
     let sink2 = sink.clone();
-    let (ingested, failed) =
-        tokio::task::spawn_blocking(move || ingest::rebuild(&app2, &sink2, extra_total))
-            .await
-            .map_err(|e| Error::Other(format!("rebuild task panicked: {e}")))??;
-    let (upgraded, up_failed) = upgrade_index_only_to_full_body(app, sink).await?;
-    Ok((ingested + upgraded, failed + up_failed))
+    let pass2 = pass.to_string();
+    let (ingested, skipped, failed) = tokio::task::spawn_blocking(move || {
+        ingest::rebuild(&app2, &sink2, extra_total, &pass2, &on_pass_start)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("rebuild task panicked: {e}")))??;
+    let (upgraded, up_skipped, up_failed) =
+        upgrade_index_only_to_full_body(app, sink, pass).await?;
+    let failed_total = failed + up_failed;
+
+    // Stamp the vault ONLY once BOTH phases have finished with nothing failed — that, and only that, means
+    // the stored index really does reflect the current retrieval config end to end. The stamp clears the
+    // "Rebuild recommended" prompt, so it is the user's ONLY signal that a rebuild is owed: writing it
+    // after a pass that left documents on their old chunks (a vault file that wouldn't read, a connector
+    // item phase 2 couldn't re-fetch) would retire that signal while the reason for it still stands, and
+    // nothing would ever raise it again. Withholding it keeps the prompt up, and the next Rebuild heals
+    // them. It lives here, not in `ingest::rebuild`, because only this layer has seen both phases.
+    //
+    // Skips don't block it: a skipped document was built by this same pass under this same config, which
+    // `resume_rebuild` verifies against the marker before it agrees to reuse a pass id at all.
+    if failed_total == 0 {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let config = RetrievalConfig::current_for(&db::selected_embedder(&conn)?);
+        db::set_retrieval_stamp(&conn, &config)?;
+    }
+    Ok((ingested + upgraded, skipped + up_skipped, failed_total))
 }
 
-/// After a Rebuild has restored index-only items from their ~500-char summaries, upgrade each
-/// reachable one to a full-body index: re-fetch its live body and re-embed (via
+/// Upgrade every reachable index-only item to a full-body index: re-fetch its live body and re-embed (via
 /// [`reindex_index_only_core`], which preserves the item's classification), one at a time with per-item
-/// progress. An unreachable item (offline source / expired auth / removed file) is left on its summary
-/// and healed by the next connector Sync. Best-effort: a per-item failure is reported and counted,
-/// never fatal. Returns `(upgraded, failed)`.
+/// progress. Their bodies are remote and never held locally, so this network pass is the ONLY thing that
+/// can re-chunk them under a changed splitter/embedder — which is why it runs on every rebuild, not just
+/// the ones that restored a summary. Best-effort: a per-item failure is reported and counted, never fatal.
+/// Returns `(upgraded, skipped, failed)`.
+///
+/// **What a failure leaves behind, honestly.** An item PM can't re-fetch (offline source, expired auth) is
+/// left exactly as it was — which since #371 means it keeps its existing full-body chunks rather than being
+/// knocked down to its ~500-char summary first. That is strictly better to search, but it does mean the
+/// next connector Sync will NOT heal it the way it used to: `summary_indexed` only fires for a row that
+/// really is summary-derived, and this row isn't. So if the failure happened during a splitter/embedder
+/// change, that item keeps chunks cut by the old config until another Rebuild reaches it. The signal that
+/// one is owed is the retrieval stamp, which `ingest::rebuild` withholds whenever a pass had failures.
+///
+/// Resumable since #371, on the same pass stamp as the vault loop: an item this pass already upgraded is
+/// skipped, so a rebuild interrupted at 95% doesn't re-download every connected file on the next launch —
+/// the single most expensive thing an interrupted rebuild used to repeat.
 async fn upgrade_index_only_to_full_body(
     app: &AppHandle,
     on_event: &ingest::ProgressSink,
-) -> Result<(usize, usize)> {
-    let items: Vec<(i64, String)> = {
+    pass: &str,
+) -> Result<(usize, usize, usize)> {
+    let items: Vec<(i64, String, Option<String>)> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, title FROM documents \
+            "SELECT id, title, rebuild_pass FROM documents \
              WHERE source_type = 'index_only' AND source_state = 'ok' ORDER BY id",
         )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
-    let (mut upgraded, mut failed) = (0usize, 0usize);
-    for (doc_id, title) in items {
+    let (mut upgraded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    for (doc_id, title, item_pass) in items {
+        // `Started` first even when we're about to skip — the views amend the row `Started` opened, so a
+        // bare `Skipped` renders as a nameless entry.
         on_event.send(IngestEvent::Started {
             path: format!("idx://{doc_id}"),
             name: title,
         });
+        if ingest::plan_rebuild_one(item_pass.as_deref(), pass) == ingest::RebuildPlan::AlreadyDone
+        {
+            skipped += 1;
+            on_event.send(IngestEvent::Skipped {
+                path: format!("idx://{doc_id}"),
+                reason: "already rebuilt by the run that was interrupted".into(),
+            });
+            continue;
+        }
         let outcome = match reindex_index_only_core(app, doc_id).await {
             Ok(_) => {
                 let state = app.state::<AppState>();
-                let conn = state.conn()?;
-                ingest::load_document(&conn, doc_id)
+                // Claim it for this pass in the same breath as loading it back. A transient failure here
+                // is this ITEM's failure, not the whole pass's — a bare `?` would abort the upgrade of
+                // every remaining item over one momentary DB lock.
+                state.conn().and_then(|conn| {
+                    ingest::stamp_rebuild_pass(&conn, doc_id, pass)?;
+                    ingest::load_document(&conn, doc_id)
+                })
             }
             Err(e) => Err(e),
         };
@@ -2591,7 +2728,7 @@ async fn upgrade_index_only_to_full_body(
                 on_event.send(IngestEvent::Done { document });
             }
             Err(e) => {
-                // Leave it on its summary (the next Sync heals it) and report — never fatal.
+                // Leave it as it is (the next Sync heals it) and report — never fatal.
                 failed += 1;
                 on_event.send(IngestEvent::Failed {
                     path: format!("idx://{doc_id}"),
@@ -2600,7 +2737,7 @@ async fn upgrade_index_only_to_full_body(
             }
         }
     }
-    Ok((upgraded, failed))
+    Ok((upgraded, skipped, failed))
 }
 
 /// Dev-only: drive the index-only substrate (board card 3) through its reducer, without a real
@@ -4462,10 +4599,19 @@ pub fn rebuild_status(state: State<'_, AppState>) -> Result<crate::IngestJobStat
 /// Resume a rebuild a previous app session started but didn't finish (the app was closed/crashed
 /// mid-rebuild). Called once on launch. Returns whether a resume was kicked off.
 ///
-/// A rebuild can't run while the app is closed, and it keeps no per-document checkpoint, so this
-/// **restarts** it rather than continuing it. That is the honest behaviour and still the right one:
-/// the marker only survives if the index was left partial, and a partial index is already dropped —
-/// search stays quietly degraded until it's rebuilt. No marker → nothing to resume.
+/// Genuinely **continues** the interrupted pass since #371: the marker holds that pass's id, and every
+/// document it managed to commit carries the same id (`documents.rebuild_pass`), so the resumed run
+/// recognises them, skips them, and does only the work that was left — the guarantee the connectors' sync
+/// already gave. A rebuild closed at 95% no longer re-embeds the whole vault, and no longer re-downloads
+/// every connected file. No marker → nothing to resume.
+///
+/// **A pass is only continued if this build would still produce the same chunks.** The marker records the
+/// retrieval config its run was building under, and a mismatch mints a fresh pass id instead — so the
+/// resume degrades to a full rebuild rather than banking chunks the running build no longer agrees with.
+/// This is the case where PM auto-updated between the interruption and the resume: without the check, a
+/// new `SPLITTER_VERSION` would leave half the vault on the old boundaries and then stamp it all current.
+/// A pre-v3.19 marker (a bare `"1"`) fails to parse and takes the same path — a full restart, exactly as
+/// that version behaved.
 #[tauri::command]
 pub fn resume_rebuild(app: AppHandle) -> Result<bool> {
     let marker: Option<String> = {
@@ -4474,9 +4620,18 @@ pub fn resume_rebuild(app: AppHandle) -> Result<bool> {
         db::get_setting(&conn, REBUILD_PENDING_KEY)?
     };
     // Cleared markers are stored as "" rather than deleted, so treat empty as nothing-to-do.
-    if marker.is_none_or(|m| m.is_empty()) {
+    let Some(marker) = marker.filter(|m| !m.is_empty()) else {
         return Ok(false);
-    }
+    };
+    // Resume the interrupted pass, or mint a fresh one when its work can no longer be trusted. Note the
+    // vault's STORED stamp can't answer this: during an interrupted pass it still holds the PRE-rebuild
+    // config (the stamp is only written when a run finishes), so the marker has to carry it.
+    let pass = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let current = RetrievalConfig::current_for(&db::selected_embedder(&conn)?);
+        RebuildMarker::resumable_pass(&marker, &current).unwrap_or_else(ingest::new_pass_id)
+    };
     // Don't stack on a rebuild already running this session.
     if app
         .state::<AppState>()
@@ -4488,7 +4643,7 @@ pub fn resume_rebuild(app: AppHandle) -> Result<bool> {
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let sink = ingest::ProgressSink::new(app2.clone());
-        let _ = rebuild_core(app2, sink).await;
+        let _ = rebuild_core(app2, sink, pass).await;
     });
     Ok(true)
 }
@@ -4504,6 +4659,7 @@ pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncS
 /// [`cloud_sync::drive_sync_core`] for the behaviour; this is the command the UI's "Sync now" calls.
 #[tauri::command]
 pub async fn sync_drive(app: AppHandle, account: Option<String>) -> Result<usize> {
+    refuse_if_rebuilding(&app, "a sync would be indexing into a moving target")?;
     cloud_sync::drive_sync_core(&app, account).await
 }
 
@@ -4605,6 +4761,7 @@ pub fn stop_local_folder_sync(state: State<'_, AppState>) -> Result<()> {
 /// Sync one tracked folder (or every folder when `folder` is `None`) — the "Sync now" command.
 #[tauri::command]
 pub async fn sync_local_folder(app: AppHandle, folder: Option<String>) -> Result<usize> {
+    refuse_if_rebuilding(&app, "a sync would be indexing into a moving target")?;
     localfolder::local_sync_core(&app, folder).await
 }
 
@@ -5355,6 +5512,7 @@ pub fn onedrive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSy
 /// "Sync now" calls; see [`cloud_sync::onedrive_sync_core`] for the behaviour.
 #[tauri::command]
 pub async fn sync_onedrive(app: AppHandle, account: Option<String>) -> Result<usize> {
+    refuse_if_rebuilding(&app, "a sync would be indexing into a moving target")?;
     cloud_sync::onedrive_sync_core(&app, account).await
 }
 
@@ -7393,6 +7551,51 @@ pub fn set_backup_destinations(
         if gdrive_enabled { "true" } else { "false" },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod rebuild_marker_tests {
+    use super::RebuildMarker;
+    use crate::registry;
+    use crate::retrieval_config::RetrievalConfig;
+
+    fn current() -> RetrievalConfig {
+        RetrievalConfig::current_for(&registry::active_embedder())
+    }
+
+    #[test]
+    fn a_pass_resumes_only_under_the_config_it_was_built_with() {
+        let cfg = current();
+        let marker = RebuildMarker::encode("pass-a", &cfg).unwrap();
+
+        // Same build, same config → continue the interrupted pass. This is the #371 win.
+        assert_eq!(
+            RebuildMarker::resumable_pass(&marker, &cfg),
+            Some("pass-a".to_string())
+        );
+
+        // THE case this exists for: PM auto-updated between the interruption and the resume, and the new
+        // build chunks differently. The pass's committed documents carry boundaries this build would not
+        // produce, so its stamps must NOT be trusted — resume must decline and rebuild everything.
+        // Any field feeding `current_for` would do; the splitter version is the one that actually moves
+        // between releases.
+        let mut newer = cfg.clone();
+        newer.splitter_version += 1;
+        assert_eq!(
+            RebuildMarker::resumable_pass(&marker, &newer),
+            None,
+            "a pass built by a different splitter must never be resumed"
+        );
+    }
+
+    #[test]
+    fn a_pre_v3_19_marker_declines_to_resume_rather_than_matching_nothing() {
+        // Before #371 the marker was the literal "1". It carries no pass and no config, so the only
+        // honest answer is "don't trust any stamp" → a full rebuild, exactly as that version behaved.
+        assert_eq!(RebuildMarker::resumable_pass("1", &current()), None);
+        // Garbage must not panic its way through launch either.
+        assert_eq!(RebuildMarker::resumable_pass("{not json", &current()), None);
+    }
 }
 
 #[cfg(test)]

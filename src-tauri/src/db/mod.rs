@@ -826,7 +826,8 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE flags; \
+            "ALTER TABLE documents DROP COLUMN rebuild_pass; \
+             DROP TABLE flags; \
              ALTER TABLE chunks DROP COLUMN chat_turn_id; \
              ALTER TABLE chunks DROP COLUMN chunk_at; \
              DROP TABLE chat_sessions; \
@@ -975,7 +976,8 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE flags; \
+            "ALTER TABLE documents DROP COLUMN rebuild_pass; \
+             DROP TABLE flags; \
              ALTER TABLE chunks DROP COLUMN chat_turn_id; \
              ALTER TABLE chunks DROP COLUMN chunk_at; \
              DROP TABLE chat_sessions; \

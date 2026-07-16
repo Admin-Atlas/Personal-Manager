@@ -570,13 +570,16 @@ pub fn register_pointer(
     Ok(document)
 }
 
-/// Restore the index-only documents from the encrypted manifest after a [`crate::ingest::rebuild`]
-/// has cleared the store — they have no Markdown file, so the rebuild vault-walk skipped them. The
-/// bodies are remote and not held, so each item is re-embedded from its **stored summary**: a
-/// degraded but honest offline index that stays findable + fully classified; a later connector
-/// "refresh" re-fetches + re-embeds the full body. Reuses the already-warmed `gateway` and never
-/// resizes `chunk_vec` (the vault loop sized it). An item with no summary is skipped (nothing to
-/// embed) but kept in the manifest for that later refresh. Returns `(restored, failed)`.
+/// Restore the index-only documents from the encrypted manifest during a [`crate::ingest::rebuild`] —
+/// they have no Markdown file, so the rebuild vault-walk skips them. The bodies are remote and not held,
+/// so a restored item is re-embedded from its **stored summary**: a degraded but honest offline index that
+/// stays findable + fully classified, which phase 2 then upgrades to a full body. Reuses the already-warmed
+/// `gateway` and never resizes `chunk_vec` (the vault loop sized it). An item with no summary fails (nothing
+/// to embed) but is kept in the manifest for a later refresh. Returns `(restored, failed)`.
+///
+/// Since #371 this only has anything to do on the vector-width-change arm, which is the one that still
+/// clears the store: on every other rebuild the rows are all still present, so each item reports "no restore
+/// needed" and is left alone rather than being downgraded to its summary. See [`restore_item`].
 pub fn rebuild_from_manifest(
     state: &AppState,
     gateway: &ModelGateway<'_>,
@@ -590,7 +593,10 @@ pub fn rebuild_from_manifest(
     let (mut restored, mut failed) = (0usize, 0usize);
     for item in &manifest.items {
         match restore_item(state, gateway, vault_root, cipher, item) {
-            Ok(()) => restored += 1,
+            Ok(true) => restored += 1,
+            // Already present (or a healed promote): no work, and nothing to report — phase 2 owns this row
+            // now, and counting it here would double-count it against the same progress total.
+            Ok(false) => {}
             Err(e) => {
                 failed += 1;
                 eprintln!("index_only: could not rebuild '{}': {e}", item.source_id);
@@ -631,20 +637,43 @@ fn heal_if_promoted(
     Ok(promoted)
 }
 
-/// Re-create one index-only document row from its manifest item, re-embedding from the summary.
+/// Re-create one index-only document row from its manifest item, re-embedding from the summary. Returns
+/// whether a row was actually created — `false` means the item needed no restoring (see below).
 fn restore_item(
     state: &AppState,
     gateway: &ModelGateway<'_>,
     vault_root: &Path,
     cipher: &ManifestCipher,
     item: &ManifestItem,
-) -> Result<()> {
+) -> Result<bool> {
     // F-21: skip + self-heal a stale entry whose source was already promoted to a full import, rather
     // than colliding on the `source_id` UNIQUE index and failing this item on every future Rebuild.
     {
         let conn = state.conn()?;
         if heal_if_promoted(&conn, vault_root, cipher, &item.source_id)? {
-            return Ok(());
+            return Ok(false);
+        }
+    }
+    // Since #371 the rebuild upserts in place instead of wiping first, so on every arm but a vector-width
+    // change this row is still HERE — it never needed restoring. Two reasons that matters, beyond the
+    // `source_id`/`vault_path` UNIQUE collision an unconditional insert would now hit:
+    //   - Restoring a live full-body row from its ~500-char summary is an active DOWNGRADE — precisely the
+    //     retrieval regression #360 shipped a fix for. Leaving the row alone keeps the good index.
+    //   - The row's chunks may still be stale (this could be a splitter change), but the body is remote and
+    //     not held, so only a re-fetch can re-chunk it. That is exactly what phase 2
+    //     (`upgrade_index_only_to_full_body`) does next, and it claims the row for the pass when it lands.
+    {
+        let conn = state.conn()?;
+        let present = conn
+            .query_row(
+                "SELECT 1 FROM documents WHERE source_id = ?1 AND source_type = ?2",
+                params![item.source_id, ingest::SOURCE_TYPE_INDEX_ONLY],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if present {
+            return Ok(false);
         }
     }
     let summary = item
@@ -689,7 +718,7 @@ fn restore_item(
         },
     };
     embed_and_index(state, gateway, &summary, &meta)?;
-    Ok(())
+    Ok(true)
 }
 
 // --- observe-and-react: the source-agnostic change-event semantics ---
