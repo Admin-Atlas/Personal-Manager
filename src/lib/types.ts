@@ -184,6 +184,10 @@ export interface VaultStatus {
   /** Set when the shared vault this profile points at was DELETED by its owner (a tombstone
    *  marks the folder). The app shows a one-time notice and switches back to a local vault. */
   deleted_notice: DeletedVaultNotice | null;
+  /** Whether the current Windows account owns the active vault. True for a device vault or a legacy
+   *  shared vault (no owner recorded); a shared vault stamped with an owner is owned only by its
+   *  creator's account, so a joiner sees false. Connectors are set up only by the owner. */
+  is_owner: boolean;
 }
 
 /** Non-fatal warnings from a vault operation (a folder-ACL or discovery-marker hiccup);

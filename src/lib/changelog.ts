@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.22.0-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "In a shared vault, connectors now clearly belong to the vault's owner. When you share a vault with another Windows account on your PC, syncing a connector like Google Drive or OneDrive relies on sign-in details that live in one account's private keychain — so a second account could never actually sync them, and trying just produced a confusing 'connection failed'. Now PM says so plainly: the vault's owner sets up the connectors, and everyone who shares the vault still sees everything that gets indexed. (Existing shared vaults are unaffected — this applies to vaults shared from this version onward.)",
+    ],
+  },
+  {
     version: "3.21.0-alpha",
     date: "2026-07-16",
     highlights: [

@@ -159,6 +159,15 @@ pub struct VaultMeta {
     pub verifier: Option<Verifier>,
     #[serde(default)]
     pub markdown: MarkdownPolicy,
+    /// The OS SID of the account that CREATED this shareable vault (Windows-only; `None` for a device
+    /// vault, a non-Windows vault, or a legacy shared vault created before owner identity existed).
+    /// Non-secret (the discovery advert already publishes the owner's username) and, being an ordinary
+    /// field, MAC-covered like every other — so it is tamper-evident. Gates connector setup to the
+    /// vault owner: OAuth tokens live in the per-account keychain, so a joiner can't sync them anyway.
+    /// `skip_serializing_if`/`default` keep the field ABSENT for existing vaults, so their stored MAC
+    /// (computed over the serialized fields) still verifies unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub owner_sid: Option<String>,
     /// Keyed BLAKE3 MAC (hex) over the authenticated meta fields, under a master subkey (M-3).
     /// Absent on a legacy vault written before meta authentication; stamped on the first authenticated
     /// open and enforced thereafter. `skip_serializing_if`/`default` keep older files loading and keep
@@ -180,10 +189,50 @@ impl VaultMeta {
             kdf: None,
             verifier: None,
             markdown: MarkdownPolicy::default(),
+            owner_sid: None, // a device vault has no sharing owner
             // Stamped lazily on the first authenticated open (the device key isn't created yet here).
             meta_mac: None,
         }
     }
+}
+
+/// Whether the current OS account owns this vault. A device vault or a legacy shared vault (no
+/// `owner_sid` recorded) has no ownership restriction → `true`. A shared vault stamped with an owner
+/// SID is owned only by the account whose SID matches. Ownership is Windows-only (shared vaults are
+/// Windows-only); elsewhere, and on any SID-resolution failure, this returns `true` — fail open, so a
+/// hiccup never locks the real owner out of their own connectors.
+pub fn is_vault_owner(meta: &VaultMeta) -> bool {
+    is_owner_given(&meta.owner_sid, current_user_sid_opt().as_deref())
+}
+
+/// The pure ownership decision, extracted so it is unit-testable without a live SID lookup.
+fn is_owner_given(owner_sid: &Option<String>, current: Option<&str>) -> bool {
+    match owner_sid {
+        None => true,
+        Some(owner) => current.map(|c| c == owner).unwrap_or(true),
+    }
+}
+
+/// The current account's SID for the ownership check — `None` off-Windows or on lookup failure.
+#[cfg(windows)]
+fn current_user_sid_opt() -> Option<String> {
+    acl::current_user_sid().ok()
+}
+
+#[cfg(not(windows))]
+fn current_user_sid_opt() -> Option<String> {
+    None
+}
+
+/// The owner SID to stamp into a NEW shareable vault's meta (Windows-only; `None` elsewhere).
+#[cfg(windows)]
+fn owner_sid_for_new_share() -> Option<String> {
+    acl::current_user_sid().ok()
+}
+
+#[cfg(not(windows))]
+fn owner_sid_for_new_share() -> Option<String> {
+    None
 }
 
 /// Path to a vault's metadata file inside its folder.
@@ -693,6 +742,9 @@ fn build_passphrase_meta(
             encryption: MarkdownEncryption::XChaCha20Poly1305,
             subkey: MARKDOWN_SUBKEY_SCHEME.to_string(),
         },
+        // Record who created the shareable vault, so connector setup can be gated to the owner (a
+        // joiner can't sync a connector anyway — the tokens live in the owner's per-account keychain).
+        owner_sid: owner_sid_for_new_share(),
         // Stamped on the first authenticated open (uniform with the device path).
         meta_mac: None,
     };
@@ -875,6 +927,19 @@ fn log_meta_auth(vault_root: &Path, meta: &VaultMeta, master: &[u8; KEY_LEN]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_falls_open_without_a_recorded_owner_and_matches_by_sid() {
+        // Device / legacy vault: no owner recorded → always the owner (no restriction).
+        assert!(is_owner_given(&None, Some("S-1-5-21-anyone")));
+        assert!(is_owner_given(&None, None));
+        // A stamped owner: only the matching SID owns it.
+        let owner = Some("S-1-5-21-owner".to_string());
+        assert!(is_owner_given(&owner, Some("S-1-5-21-owner")));
+        assert!(!is_owner_given(&owner, Some("S-1-5-21-joiner")));
+        // SID unresolved (or off-Windows) → fail open, so a hiccup never locks the real owner out.
+        assert!(is_owner_given(&owner, None));
+    }
 
     /// Cheap Argon2id params so tests don't allocate hundreds of MiB.
     fn cheap_params() -> KdfParams {
