@@ -501,8 +501,24 @@ fn load_chunks(conn: &Connection, ids: &[i64]) -> Result<Vec<RetrievedChunk>> {
     // a non-chat document has no session row, so `conversation_id` comes back NULL. `chat_turn_id` /
     // `chunk_at` are NULL for every non-chat chunk. Together they let `citations_from` tag a chat
     // citation with a turn pointer (card 7E PR3) without a second query.
+    // An index-only chunk's `content` column is a fixed placeholder ("(body available at the
+    // source)") — the body bytes are never stored locally, by design. Reading it as text is the
+    // defect #360 fixed for the filing AI, and it survived HERE, at the seam every consumer of a
+    // retrieved passage goes through: the reranker scored that one sentence and so systematically
+    // BURIED every connected file, chat grounding cited sources it could not read, and snippets
+    // showed the placeholder. Coalescing to `stored_summary` at the load seam fixes all three at
+    // once — a caller that re-derives the text is how this recurred in the first place.
+    //
+    // A vault document has NULL `stored_summary`, so it falls through to its real chunk content
+    // exactly as before. An index-only doc with no summary yet falls through to the placeholder,
+    // which is still the honest answer: there is nothing else to say about it.
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.document_id, d.title, d.source_path, d.vault_path, c.heading, c.content, c.ordinal, \
+        "SELECT c.id, c.document_id, d.title, d.source_path, d.vault_path, c.heading, \
+                COALESCE( \
+                    CASE WHEN d.source_type = 'index_only' THEN NULLIF(d.stored_summary, '') END, \
+                    c.content \
+                ), \
+                c.ordinal, \
                 d.source_type, c.chat_turn_id, c.chunk_at, cs.conversation_id \
          FROM chunks c JOIN documents d ON d.id = c.document_id \
          LEFT JOIN chat_sessions cs ON cs.document_id = d.id \

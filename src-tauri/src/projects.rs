@@ -613,9 +613,17 @@ fn extract_json_object(raw: &str) -> Option<&str> {
 /// Collect short samples from a project's documents for an attribute proposal: each
 /// document's title plus the opening of its first chunk. Caps the document count.
 pub fn document_samples(conn: &Connection, project: &str) -> Result<Vec<String>> {
+    // Same index-only coalesce as `retrieval::load_chunks` and the filing AI's query (#360): an
+    // index-only doc's chunk `content` is a placeholder, never its body, so sampling it fed the
+    // attribute model the same sentence for every connected file. `stored_summary` is what PM
+    // actually knows about them. Vault docs have NULL `stored_summary` and fall through unchanged.
     let mut stmt = conn.prepare(
         "SELECT d.title, \
-                COALESCE((SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), '') \
+                COALESCE( \
+                    CASE WHEN d.source_type = 'index_only' THEN NULLIF(d.stored_summary, '') END, \
+                    (SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), \
+                    '' \
+                ) \
          FROM documents d WHERE d.project = ?1 \
          ORDER BY COALESCE(d.last_activity, d.ingested_at) DESC, d.id DESC LIMIT ?2",
     )?;

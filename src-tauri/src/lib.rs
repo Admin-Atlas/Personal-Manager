@@ -663,8 +663,19 @@ impl AppState {
             Ok(c) => c,
             Err(_) => return,
         };
-        if let Err(e) = index_only::reconcile_on_open(&conn, &vault_root, &cipher) {
-            eprintln!("index_only: manifest reconcile skipped ({e})");
+        match index_only::reconcile_on_open(&conn, &vault_root, &cipher) {
+            // F-04: the reconcile resolves each item's project with `create_if_new`, so a manifest
+            // naming a project the mirror lacks MINTS an entity here. Push it to the portable rules
+            // file or the next boot's file-is-truth pass rolls it straight back — the mint repeats,
+            // and round it goes forever. Dropping the connection first: `sync_entity_rules` takes
+            // its own, and re-entering `conn()` under the guard self-deadlocks the whole app.
+            Ok(minted) => {
+                drop(conn);
+                if minted {
+                    self.sync_entity_rules();
+                }
+            }
+            Err(e) => eprintln!("index_only: manifest reconcile skipped ({e})"),
         }
     }
 
