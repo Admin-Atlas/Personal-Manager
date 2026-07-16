@@ -663,6 +663,16 @@ impl AppState {
             Ok(c) => c,
             Err(_) => return,
         };
+        // v19 follow-up: retire identical shared-drive twins (harmless duplicates); a divergent twin is
+        // left in place for a user-facing merge (deferred). Best-effort, cheap after the first pass.
+        match crate::drive::resolve_shared_drive_twins(&conn) {
+            Ok(s) if s.retired + s.divergent + s.adopted > 0 => eprintln!(
+                "drive: shared-drive twins — retired {}, {} divergent left for review, adopted {}",
+                s.retired, s.divergent, s.adopted
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("drive: shared-drive twin sweep skipped ({e})"),
+        }
         match index_only::reconcile_on_open(&conn, &vault_root, &cipher) {
             // F-04: the reconcile resolves each item's project with `create_if_new`, so a manifest
             // naming a project the mirror lacks MINTS an entity here. Push it to the portable rules
