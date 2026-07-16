@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.2-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Photos you save into an encrypted vault now survive a passphrase change. When you tick \"save a copy to the vault\" for an image, PM keeps that copy encrypted alongside your notes. Changing your vault's passphrase re-locked the notes but quietly left those images locked to the old one — so the copy you kept, often after deleting the original, could no longer be opened. Photos are now re-locked along with everything else, and making a vault private unlocks them too. If you changed a passphrase before this update, those images can only be recovered from a backup made beforehand — PM will now fall back to showing the original file or the photo's text rather than failing outright.",
+      'Saving a copy of an image you\'d already added now sticks. Re-adding a photo with "save a copy to the vault" ticked said it had saved one, but only half the record was written — so the next time you rebuilt the search index, PM forgot the copy existed and left it stranded in your vault. The copy is now recorded properly, and a rebuild repairs any that were stranded this way.',
+      "Exporting your vault as plain files now includes your saved photos. The export is there so you're never locked in, but it only ever wrote out your notes — the saved images stayed behind, encrypted. They now come out too, under their real filenames.",
+    ],
+  },
+  {
     version: "3.19.1-alpha",
     date: "2026-07-16",
     highlights: [

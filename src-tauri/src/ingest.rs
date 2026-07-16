@@ -51,6 +51,13 @@ const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic"];
 /// Legacy `.xls` was dropped with the xlrd parser surface (H-1 subset) — only modern `.xlsx` and `.csv`.
 const SPREADSHEET_EXTS: &[&str] = &["xlsx", "csv"];
 
+/// The one subfolder of the Markdown vault: opt-in saved photo originals, content-addressed and
+/// written with the same cipher as the Markdown around them. The vault is otherwise flat, so every
+/// walk that enumerates documents (`rebuild`, [`convert_markdown`], [`export_plaintext`]) is
+/// non-recursive and skips this by construction — which is exactly why the photo half of a key
+/// migration ([`convert_photo_originals`]) and of the plaintext export are separate, explicit steps.
+const PHOTOS_SUBDIR: &str = "photos";
+
 /// Per-run ingest options threaded from the command. `copy_photos_to_vault` is the drag-drop opt-in
 /// to save an original image into `vault/photos/` (default off).
 #[derive(Clone, Copy, Default)]
@@ -469,13 +476,10 @@ fn ingest_photo(
             // A dedupe hit, but the user may have re-dropped this image with "save a copy" now
             // checked (e.g. a screenshot they want to keep before deleting it). Honor that opt-in
             // even though we skip re-indexing: copy the original (idempotent — named by hash) and
-            // flip the existing photos row's saved_to_vault/vault_path so the record reflects it.
+            // record it in BOTH places that describe a saved copy.
             if opts.copy_photos_to_vault {
                 let rel = copy_original_to_vault(vault, cipher, &bytes, &file_hash, ext)?;
-                conn.execute(
-                    "UPDATE photos SET saved_to_vault = 1, vault_path = ?1 WHERE file_hash = ?2",
-                    params![rel, file_hash],
-                )?;
+                record_saved_photo_copy(&conn, vault, cipher, &file_hash, &rel)?;
                 return Ok(Outcome::Skipped(
                     "already ingested — saved a copy to the vault".into(),
                 ));
@@ -1161,11 +1165,37 @@ fn copy_original_to_vault(
     file_hash: &str,
     ext: Option<&str>,
 ) -> Result<String> {
-    let dir = vault.join("photos");
+    let dir = vault.join(PHOTOS_SUBDIR);
     std::fs::create_dir_all(&dir)?;
-    let on_disk = cipher.on_disk_name(&format!("{file_hash}.{}", ext.unwrap_or("img")));
+    let on_disk = cipher.on_disk_name(&photo_copy_base_name(file_hash, ext));
     cipher.write_bytes_to(&dir.join(&on_disk), bytes)?;
-    Ok(format!("photos/{on_disk}"))
+    Ok(format!("{PHOTOS_SUBDIR}/{on_disk}"))
+}
+
+/// The logical (pre-`.pmenc`) filename of a saved photo original. Content-addressed, so re-saving
+/// the same image overwrites its own copy instead of accumulating duplicates — which is what makes
+/// [`copy_original_to_vault`] idempotent and lets [`find_saved_photo_copy`] locate a copy from
+/// front-matter alone.
+fn photo_copy_base_name(file_hash: &str, ext: Option<&str>) -> String {
+    format!("{file_hash}.{}", ext.unwrap_or("img"))
+}
+
+/// Locate an opt-in saved original for `file_hash` in `vault/photos/`, returning its vault-relative
+/// path. Used to heal a photo whose front-matter lost track of its copy (see [`rebuild_one`]).
+///
+/// Tries both on-disk forms, because a photo keeps the name it was saved under: a vault whose
+/// encryption policy later flipped has its originals re-encoded **in place** by
+/// [`convert_photo_originals`], so the `.pmenc` suffix reflects the policy at save time, not now.
+fn find_saved_photo_copy(vault: &Path, file_hash: &str, ext: Option<&str>) -> Option<String> {
+    let base = photo_copy_base_name(file_hash, ext);
+    let encrypted = format!("{base}{}", crate::vault::ENCRYPTED_SUFFIX);
+    [base, encrypted].into_iter().find_map(|name| {
+        vault
+            .join(PHOTOS_SUBDIR)
+            .join(&name)
+            .is_file()
+            .then(|| format!("{PHOTOS_SUBDIR}/{name}"))
+    })
 }
 
 /// Drop the derived index and rebuild it from the Markdown vault. Proves the
@@ -1565,8 +1595,19 @@ fn rebuild_one(
     // A photo round-trips its satellite row from the front-matter photo block (OCR is never re-run —
     // the text is already in the vault body); a spreadsheet likewise round-trips its counts, so a
     // Rebuild reconstructs the `spreadsheets` row without re-parsing the original file.
-    let photo = photo_from_fields(&fields, &content_hash, body);
+    let mut photo = photo_from_fields(&fields, &content_hash, body);
     let spreadsheet = spreadsheet_from_fields(&fields);
+
+    if let (Some(p), Some(vault_dir)) = (photo.as_mut(), vault_file.parent()) {
+        heal_photo_copy(
+            p,
+            vault_dir,
+            cipher,
+            &file_name(vault_file),
+            fields.get("ext").map(String::as_str),
+        )?;
+    }
+    let photo = photo;
 
     // Organisation metadata round-trips from the vault so a rebuild reproduces
     // the organised store (spec §3 acceptance). Missing fields fall back to the
@@ -2482,6 +2523,151 @@ fn photo_from_fields(
     })
 }
 
+/// Record an opt-in saved original in **both** places that describe one: the photo's vault Markdown
+/// (the truth a Rebuild reconstructs the row FROM) and its `photos` row (what the reader queries).
+///
+/// The two must move together, and this function exists so they cannot drift apart at a call site.
+/// Flipping only the row is a promise the next Rebuild breaks: it re-reads
+/// `photo_saved_to_vault: false` from the untouched front-matter, resets the flag, and orphans the
+/// copy — in an encrypted vault, unreachable by every surface PM has, and the feature's whole pitch
+/// is that the user may have deleted the original by then. That was the bug until v3.19.2.
+///
+/// Order matters: vault truth first, row second. A failure part-way then leaves "no copy recorded",
+/// which is self-consistent and costs nothing (the bytes are hash-named, so re-saving rewrites the
+/// same file), rather than a row promising a file nothing can find.
+///
+/// `conn` is the caller's guard: `state.conn()` is NOT reentrant.
+fn record_saved_photo_copy(
+    conn: &Connection,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    file_hash: &str,
+    copy_rel: &str,
+) -> Result<()> {
+    if let Some(md_rel) = photo_doc_vault_path(conn, file_hash)? {
+        rewrite_photo_vault_block(vault, cipher, &md_rel, copy_rel)?;
+    }
+    conn.execute(
+        "UPDATE photos SET saved_to_vault = 1, vault_path = ?1 WHERE file_hash = ?2",
+        params![copy_rel, file_hash],
+    )?;
+    Ok(())
+}
+
+/// Heal a photo block that lost track of its saved copy, in place. Returns whether it healed.
+///
+/// Pre-v3.19.2 builds flipped only the `photos` row on a dedupe-hit save (see
+/// [`record_saved_photo_copy`]), so a real user's vault can hold a block saying "no copy" with the
+/// copy sitting right there in `photos/`. A rebuild reconstructs the row from the block, which is
+/// what turns that divergence into actual loss — so heal at exactly that moment: believe the disk,
+/// and write the correction back so the heal is durable rather than re-derived on every rebuild.
+///
+/// Only ever adds a copy that is provably present, and never second-guesses a block that already
+/// knows its own state — so it cannot invent a `vault_path` or overrule a deliberate `false`.
+fn heal_photo_copy(
+    photo: &mut PhotoRecord,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    md_name: &str,
+    ext: Option<&str>,
+) -> Result<bool> {
+    if photo.saved_to_vault {
+        return Ok(false);
+    }
+    let Some(rel) = find_saved_photo_copy(vault, &photo.file_hash, ext) else {
+        return Ok(false);
+    };
+    photo.saved_to_vault = true;
+    photo.vault_path = Some(rel.clone());
+    rewrite_photo_vault_block(vault, cipher, md_name, &rel)?;
+    Ok(true)
+}
+
+/// The vault Markdown path of the photo document whose original hashes to `file_hash`, if there is
+/// one. Takes the caller's connection: `state.conn()` is a non-reentrant mutex, so re-taking it
+/// under a held guard self-deadlocks the whole app.
+///
+/// `None` covers the honest case where the hash matched a NON-photo document (a dedupe hit against
+/// an ordinary file with identical bytes), which has no photo block to record anything in.
+fn photo_doc_vault_path(conn: &Connection, file_hash: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT d.vault_path FROM documents d JOIN photos p ON p.document_id = d.id \
+             WHERE p.file_hash = ?1",
+            params![file_hash],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Record an opt-in saved original in the photo's own vault Markdown — the truth a Rebuild
+/// reconstructs its `photos` row from. Preserves every other front-matter field and the body,
+/// mirroring [`rewrite_vault_metadata`]'s field-preserving construction (this is the photo-block
+/// analogue: that one rewrites organisation metadata and preserves the photo block; this one
+/// rewrites the photo block and preserves the organisation metadata).
+///
+/// A file whose front-matter says it isn't a photo is left untouched rather than treated as an
+/// error — see [`photo_doc_vault_path`] for how a non-photo can be reached at all.
+fn rewrite_photo_vault_block(
+    vault: &Path,
+    cipher: &MarkdownCipher,
+    md_rel: &str,
+    copy_rel: &str,
+) -> Result<()> {
+    let file = vault.join(md_rel);
+    let decoded = cipher.read(&file)?;
+    let (fields, body) = parse_frontmatter(&decoded)
+        .ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
+
+    let content_hash = fields.get("content_hash").map(String::as_str).unwrap_or("");
+    let Some(mut photo) = photo_from_fields(&fields, content_hash, body) else {
+        return Ok(());
+    };
+    photo.saved_to_vault = true;
+    photo.vault_path = Some(copy_rel.to_string());
+
+    let tags = fields
+        .get("tags")
+        .map(|s| parse_yaml_list(s))
+        .unwrap_or_default();
+    let importance = nullable(fields.get("importance"));
+    let front = Frontmatter {
+        title: fields
+            .get("title")
+            .map(String::as_str)
+            .unwrap_or("Untitled"),
+        source_path: fields.get("source_path").map(String::as_str).unwrap_or(""),
+        ext: fields
+            .get("ext")
+            .map(String::as_str)
+            .filter(|s| !s.is_empty()),
+        content_hash,
+        created_at: fields.get("created_at").map(String::as_str).unwrap_or(""),
+        ingested_at: fields.get("ingested_at").map(String::as_str).unwrap_or(""),
+        project: fields
+            .get("project")
+            .map(String::as_str)
+            .unwrap_or("Unsorted"),
+        tags: &tags,
+        importance: importance.as_deref(),
+        last_activity: fields
+            .get("last_activity")
+            .map(String::as_str)
+            .unwrap_or(""),
+        reviewed: fields
+            .get("reviewed")
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false),
+        photo: Some(&photo),
+        spreadsheet: None, // mutually exclusive with `photo`, and this file is a photo
+        source_id: fields.get("source_id").map(String::as_str),
+        external_ref: fields.get("external_ref").map(String::as_str),
+    };
+    cipher.write_to(&file, &render_markdown(&front, body))?;
+    Ok(())
+}
+
 /// Reconstruct a spreadsheet's satellite record from parsed front-matter fields, or `None` if this
 /// isn't a spreadsheet document. Shared by the rebuild walk and the metadata-edit rewrite so both
 /// preserve the block identically. Missing counts default to 0, so a hand-edited file still rebuilds.
@@ -3113,6 +3299,79 @@ pub(crate) fn convert_markdown(
     Ok(changed)
 }
 
+/// Re-encode a vault's files from `read_with` to `write_with` — **all** of them: the Markdown
+/// documents *and* the opt-in saved photo originals under `photos/`. Returns the total changed.
+///
+/// This is the single entry point for the file half of a key or policy migration, and it exists to
+/// make one specific bug unrepresentable. The vault is a flat folder of Markdown **plus** the one
+/// [`PHOTOS_SUBDIR`] subfolder, and every walk in this module is deliberately non-recursive — so
+/// "convert the vault" implemented as [`convert_markdown`] alone type-checks, passes its own tests,
+/// and silently strands every saved original under the previous key. It did exactly that until
+/// v3.19.2. Call this; don't hand-roll the pair at the call site.
+pub(crate) fn convert_vault_files(
+    conn: &Connection,
+    dir: &Path,
+    read_with: &MarkdownCipher,
+    write_with: &MarkdownCipher,
+) -> Result<usize> {
+    let documents = convert_markdown(conn, dir, read_with, write_with)?;
+    let originals = convert_photo_originals(dir, read_with, write_with)?;
+    Ok(documents + originals)
+}
+
+/// Re-encode every opt-in saved photo original under `vault/photos/` from `read_with` to
+/// `write_with` — the byte analogue of [`convert_markdown`], and the other half of a key migration.
+/// Prefer [`convert_vault_files`], which pairs the two halves so neither can be forgotten.
+/// Returns how many files changed.
+///
+/// Photo originals are written with the **same Markdown subkey** as the documents around them
+/// ([`copy_original_to_vault`]), so a passphrase change moves their key too. Without this they would
+/// stay encrypted under the *old* subkey forever — unreadable by the very app that saved them, and
+/// gone for good once the user deletes the original they were told they no longer needed.
+///
+/// Idempotent on the same terms as [`convert_markdown`] (already in the target encryption state
+/// *and* under the target key ⇒ skip), so an interrupted migration is safe to re-run.
+///
+/// Unlike Markdown, the file is **not renamed** when the encryption policy flips: a photo's on-disk
+/// name is recorded in `photos.vault_path` *and* in its document's front-matter, so renaming would
+/// mean rewriting both from inside the migration's riskiest phase — to buy nothing functional, since
+/// [`MarkdownCipher::read_bytes`] dispatches on the magic bytes and `aad_stem` already ignores the
+/// suffix (the AAD is identical either way). The cost is cosmetic and worth naming: after a vault is
+/// made private, its saved originals keep a `.pmenc` suffix that no longer describes them. Callers
+/// that locate a copy by name must therefore try both forms — see [`find_saved_photo_copy`].
+///
+/// Takes no `Connection`: it writes no rows, so it stays outside the migration's transaction.
+pub(crate) fn convert_photo_originals(
+    dir: &Path,
+    read_with: &MarkdownCipher,
+    write_with: &MarkdownCipher,
+) -> Result<usize> {
+    let photos = dir.join(PHOTOS_SUBDIR);
+    if !photos.is_dir() {
+        return Ok(0);
+    }
+    let mut changed = 0usize;
+    for entry in std::fs::read_dir(&photos)? {
+        let path = entry?.path();
+        if !path.is_file() {
+            continue;
+        }
+        let raw = std::fs::read(&path)?;
+        // "Already in the exact target form" minus the name (see above): the same encryption state
+        // AND the same key — a passphrase change keeps both the name and the state but moves the
+        // subkey, which is precisely the case this function exists for.
+        if crate::vault::crypto::is_encrypted(&raw) == write_with.encryption_on()
+            && read_with.same_key_as(write_with)
+        {
+            continue;
+        }
+        let plain = read_with.decode_bytes(raw, &path)?;
+        write_with.write_bytes_to(&path, &plain)?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 /// Export every Markdown file in `vault` to `dest` as plaintext `.md`, decrypting
 /// encrypted files with `cipher` and dropping the `.pmenc` suffix. Returns the count
 /// written. The core of the "never locked in" escape hatch — kept here (next to the
@@ -3134,6 +3393,24 @@ pub(crate) fn export_plaintext(
         let out_name = MarkdownCipher::logical_name(&file_name(&path));
         std::fs::write(dest.join(out_name), content)?;
         written += 1;
+    }
+    // The saved photo originals live one level down and are encrypted with the same subkey, so the
+    // escape hatch only tells the truth if they come out too — under their real `.png`/`.jpg` name,
+    // which is what makes the exported folder openable by anything other than PM.
+    let photos = vault.join(PHOTOS_SUBDIR);
+    if photos.is_dir() {
+        let out_dir = dest.join(PHOTOS_SUBDIR);
+        std::fs::create_dir_all(&out_dir)?;
+        for entry in std::fs::read_dir(&photos)? {
+            let path = entry?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = cipher.read_bytes(&path)?;
+            let out_name = MarkdownCipher::logical_name(&file_name(&path));
+            std::fs::write(out_dir.join(out_name), bytes)?;
+            written += 1;
+        }
     }
     Ok(written)
 }
@@ -4163,14 +4440,20 @@ mod tests {
     #[test]
     fn photo_dedupe_save_flips_saved_to_vault_by_file_hash() {
         // The dedupe-hit path of `ingest_photo`: when the user re-drops an already-ingested image
-        // with "save a copy" newly checked, we skip re-indexing but still flip the existing photos
-        // row's saved_to_vault flag and record the vault path, keyed by file_hash. This guards that
-        // exact UPDATE against the real migrated schema (a column rename would break it silently).
+        // with "save a copy" newly checked, we skip re-indexing but still record the copy, keyed by
+        // file_hash. Drives the REAL seam (`record_saved_photo_copy`) rather than a hand-copied
+        // UPDATE, so it guards the statement against the migrated schema AND cannot pass while the
+        // production path does something else.
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let cipher = MarkdownCipher::for_test_encrypted("vault-1");
+        write_photo_vault_file(&vault, &cipher, "photo.md.pmenc", "imghash", None);
+
         conn.execute(
             "INSERT INTO documents(vault_path, title, content_hash, source_type) \
-             VALUES ('photos/h.md','Screenshot','imghash','photo')",
+             VALUES ('photo.md.pmenc','Screenshot','imghash','photo')",
             [],
         )
         .unwrap();
@@ -4182,13 +4465,7 @@ mod tests {
         )
         .unwrap();
 
-        let n = conn
-            .execute(
-                "UPDATE photos SET saved_to_vault = 1, vault_path = ?1 WHERE file_hash = ?2",
-                params!["photos/imghash.png", "imghash"],
-            )
-            .unwrap();
-        assert_eq!(n, 1, "exactly the matching photo row is updated");
+        record_saved_photo_copy(&conn, &vault, &cipher, "imghash", "photos/imghash.png").unwrap();
 
         let (saved, path): (i64, Option<String>) = conn
             .query_row(
@@ -4199,6 +4476,224 @@ mod tests {
             .unwrap();
         assert_eq!(saved, 1, "the opt-in flag is now set");
         assert_eq!(path.as_deref(), Some("photos/imghash.png"));
+
+        // The half that was missing, and the half that matters: the vault file — the truth a
+        // Rebuild rebuilds the row from — learned about the copy too. Without this assert the row
+        // above is a promise the next Rebuild silently breaks.
+        let raw = cipher.read(&vault.join("photo.md.pmenc")).unwrap();
+        let (fields, body) = parse_frontmatter(&raw).unwrap();
+        let rebuilt = photo_from_fields(&fields, "imghash", body).expect("still a photo document");
+        assert!(
+            rebuilt.saved_to_vault,
+            "a Rebuild must reconstruct the row KNOWING the copy exists"
+        );
+        assert_eq!(rebuilt.vault_path.as_deref(), Some("photos/imghash.png"));
+    }
+
+    #[test]
+    fn recording_a_saved_copy_leaves_the_rest_of_the_document_alone() {
+        // `rewrite_photo_vault_block` rebuilds the whole front-matter to change one field, so the
+        // risk it carries is silently dropping the fields it doesn't own — organisation metadata a
+        // Rebuild would then lose. Mirror of `rewrite_vault_metadata`'s photo-block preservation.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let cipher = MarkdownCipher::for_test_encrypted("vault-1");
+        write_photo_vault_file(&vault, &cipher, "photo.md.pmenc", "imghash", None);
+
+        rewrite_photo_vault_block(&vault, &cipher, "photo.md.pmenc", "photos/imghash.png").unwrap();
+
+        let raw = cipher.read(&vault.join("photo.md.pmenc")).unwrap();
+        let (fields, body) = parse_frontmatter(&raw).unwrap();
+        assert_eq!(fields.get("project").map(String::as_str), Some("Receipts"));
+        assert_eq!(parse_yaml_list(fields.get("tags").unwrap()), ["scan"]);
+        assert_eq!(nullable(fields.get("importance")).as_deref(), Some("high"));
+        assert_eq!(fields.get("reviewed").map(|s| s.trim()), Some("true"));
+        let rebuilt = photo_from_fields(&fields, "imghash", body).unwrap();
+        assert_eq!(rebuilt.ocr_text.as_deref(), Some("Total due"));
+        assert_eq!(rebuilt.width, Some(100), "the rest of the photo block too");
+        assert_eq!(rebuilt.source_type, PhotoSourceType::Screenshot);
+    }
+
+    /// A photo's vault file as `ingest_photo` writes it, with `saved_to_vault` under the caller's
+    /// control — the starting state for the dedupe-hit and heal tests below.
+    fn write_photo_vault_file(
+        vault: &Path,
+        cipher: &MarkdownCipher,
+        name: &str,
+        hash: &str,
+        saved: Option<&str>,
+    ) {
+        let rec = PhotoRecord {
+            source_path: Some("/imgs/Screenshot.png".into()),
+            source_type: PhotoSourceType::Screenshot,
+            capture_date: "2026-03-12".into(),
+            file_hash: hash.into(),
+            ocr_text: Some("Total due".into()),
+            saved_to_vault: saved.is_some(),
+            vault_path: saved.map(String::from),
+            width: Some(100),
+            height: Some(200),
+            lat: None,
+            lon: None,
+        };
+        let body =
+            photos::photo_markdown(rec.source_type, &rec.capture_date, None, None, "Total due");
+        let title = photos::photo_title(rec.source_type, &rec.capture_date);
+        let front = Frontmatter {
+            title: &title,
+            source_path: rec.source_path.as_deref().unwrap(),
+            ext: Some("png"),
+            content_hash: hash,
+            created_at: &rec.capture_date,
+            ingested_at: "2026-06-28T00:00:00.000Z",
+            project: "Receipts",
+            tags: &["scan".to_string()],
+            importance: Some("high"),
+            last_activity: "2026-06-28T00:00:00.000Z",
+            reviewed: true,
+            photo: Some(&rec),
+            spreadsheet: None,
+            source_id: None,
+            external_ref: None,
+        };
+        cipher
+            .write_to(&vault.join(name), &render_markdown(&front, &body))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_rebuild_heals_a_photo_whose_front_matter_lost_its_copy() {
+        // Already-divergent vaults: a pre-v3.19.2 dedupe-hit save flipped only the row, so the copy
+        // exists on disk while the block denies it. Fixing the write path doesn't help those users —
+        // their NEXT rebuild would still reset the flag and orphan the file. Heal at rebuild time.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join(PHOTOS_SUBDIR)).unwrap();
+        let cipher = MarkdownCipher::for_test_encrypted("vault-1");
+        write_photo_vault_file(&vault, &cipher, "photo.md.pmenc", "imghash", None);
+        cipher
+            .write_bytes_to(
+                &vault.join(PHOTOS_SUBDIR).join("imghash.png.pmenc"),
+                b"the copy the row knew about and the file did not",
+            )
+            .unwrap();
+
+        let mut photo = PhotoRecord {
+            source_path: None,
+            source_type: PhotoSourceType::Screenshot,
+            capture_date: "2026-03-12".into(),
+            file_hash: "imghash".into(),
+            ocr_text: None,
+            saved_to_vault: false, // what the stale block says
+            vault_path: None,
+            width: None,
+            height: None,
+            lat: None,
+            lon: None,
+        };
+        assert!(
+            heal_photo_copy(&mut photo, &vault, &cipher, "photo.md.pmenc", Some("png")).unwrap(),
+            "a copy on disk that the block denies must be healed"
+        );
+        assert!(photo.saved_to_vault);
+        assert_eq!(
+            photo.vault_path.as_deref(),
+            Some("photos/imghash.png.pmenc")
+        );
+
+        // Durable: the correction is written back, so the next rebuild reads it as truth instead of
+        // re-deriving the heal (and so a later `find` failure can't silently undo it).
+        let raw = cipher.read(&vault.join("photo.md.pmenc")).unwrap();
+        let (fields, body) = parse_frontmatter(&raw).unwrap();
+        let rebuilt = photo_from_fields(&fields, "imghash", body).unwrap();
+        assert!(
+            rebuilt.saved_to_vault,
+            "the heal is written back to the vault"
+        );
+        assert_eq!(
+            rebuilt.vault_path.as_deref(),
+            Some("photos/imghash.png.pmenc")
+        );
+    }
+
+    #[test]
+    fn healing_never_invents_a_copy_or_overrules_a_block_that_knows() {
+        // The two ways a heal could do harm: fabricating a vault_path for a copy that isn't there,
+        // and second-guessing a block that already states its own truth.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join(PHOTOS_SUBDIR)).unwrap();
+        let cipher = MarkdownCipher::for_test_encrypted("vault-1");
+        write_photo_vault_file(&vault, &cipher, "photo.md.pmenc", "imghash", None);
+
+        let base = PhotoRecord {
+            source_path: None,
+            source_type: PhotoSourceType::Screenshot,
+            capture_date: "2026-03-12".into(),
+            file_hash: "imghash".into(),
+            ocr_text: None,
+            saved_to_vault: false,
+            vault_path: None,
+            width: None,
+            height: None,
+            lat: None,
+            lon: None,
+        };
+
+        // No copy on disk: stays exactly as the block said.
+        let mut no_copy = base.clone();
+        assert!(
+            !heal_photo_copy(&mut no_copy, &vault, &cipher, "photo.md.pmenc", Some("png")).unwrap()
+        );
+        assert!(!no_copy.saved_to_vault && no_copy.vault_path.is_none());
+
+        // A block that already knows is never touched — even though a copy IS present.
+        cipher
+            .write_bytes_to(&vault.join(PHOTOS_SUBDIR).join("imghash.png.pmenc"), b"x")
+            .unwrap();
+        let mut knows = PhotoRecord {
+            saved_to_vault: true,
+            vault_path: Some("photos/somewhere-else.png".into()),
+            ..base
+        };
+        assert!(
+            !heal_photo_copy(&mut knows, &vault, &cipher, "photo.md.pmenc", Some("png")).unwrap()
+        );
+        assert_eq!(
+            knows.vault_path.as_deref(),
+            Some("photos/somewhere-else.png"),
+            "the block's own path is authoritative and must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn find_saved_photo_copy_finds_a_copy_saved_under_either_policy() {
+        // A photo keeps the name it was saved under: `convert_photo_originals` re-encodes in place
+        // without renaming, so a vault whose encryption later flipped holds a `.pmenc` name that no
+        // longer describes the bytes. The heal probe must not care.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join(PHOTOS_SUBDIR)).unwrap();
+        assert_eq!(find_saved_photo_copy(&vault, "h", Some("png")), None);
+
+        std::fs::write(vault.join(PHOTOS_SUBDIR).join("h.png"), b"x").unwrap();
+        assert_eq!(
+            find_saved_photo_copy(&vault, "h", Some("png")).as_deref(),
+            Some("photos/h.png")
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let vault2 = dir2.path().join("vault");
+        std::fs::create_dir_all(vault2.join(PHOTOS_SUBDIR)).unwrap();
+        std::fs::write(vault2.join(PHOTOS_SUBDIR).join("h.png.pmenc"), b"x").unwrap();
+        assert_eq!(
+            find_saved_photo_copy(&vault2, "h", Some("png")).as_deref(),
+            Some("photos/h.png.pmenc"),
+            "an original saved while the vault was encrypted is still found after make-private"
+        );
+        // A hash with no copy on disk stays unhealed rather than inventing a path.
+        assert_eq!(find_saved_photo_copy(&vault2, "other", Some("png")), None);
     }
 
     #[test]
