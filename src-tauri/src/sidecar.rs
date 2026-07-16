@@ -71,25 +71,58 @@ const MAX_SIDECAR_LINE: usize = 64 * 1024 * 1024;
 /// `pm_sidecar.py` `MAX_INPUT_FILE_BYTES`.
 const MAX_SIDECAR_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The input cap for TEXT-FAMILY files, whose converted Markdown is roughly the size of the input
+/// (a .txt converts to about itself; a .pdf or .docx extracts to a small fraction). Those files
+/// could pass the 128 MiB input cap and then produce a reply that CANNOT fit under
+/// [`MAX_SIDECAR_LINE`] — a guaranteed failure the guard is supposed to prevent, arriving only after
+/// minutes of conversion and costing a child kill + respawn. That broke this guard's own stated
+/// promise that oversized work is "refused before the child is even asked".
+///
+/// 40 MiB, not 64: the reply is Markdown-wrapped and JSON-escaped, so it is somewhat LARGER than the
+/// source. The headroom keeps the refusal honest rather than merely moving the cliff. Far above any
+/// real document either way — 40 MiB of plain text is roughly 20,000 pages.
+const MAX_SIDECAR_TEXT_INPUT_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Extensions whose conversion output is roughly the input's own size. Container/binary formats
+/// (pdf, docx, pptx, epub, …) extract to far less text, so they keep the full 128 MiB allowance.
+/// Mirrors `pm_sidecar.py`'s `TEXT_FAMILY_EXTS`.
+const TEXT_FAMILY_EXTS: &[&str] = &["txt", "md", "markdown", "html", "htm", "json", "xml"];
+
 /// Refuse an over-cap input file before handing its path to the sidecar (F-57), with a clear message
 /// rather than a wedged/OOM'd child. A missing/unreadable file is NOT this guard's concern — it passes
 /// through so the call reports the real IO error (and the Python side keeps its own graceful handling,
 /// e.g. `analyze_image`'s null metadata for an unreadable image).
 fn guard_input_size(path: &Path) -> Result<()> {
     match std::fs::metadata(path) {
-        Ok(m) => check_input_size(m.len()),
+        Ok(m) => check_input_size(m.len(), input_cap_for(path)),
         Err(_) => Ok(()),
+    }
+}
+
+/// The cap that applies to `path`: the reply-safe one for text-family files, else the full input cap.
+/// An unknown/absent extension gets the generous cap — this guard exists to stop a KNOWN-futile
+/// conversion, not to second-guess files it can't classify.
+fn input_cap_for(path: &Path) -> u64 {
+    let text_family = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| TEXT_FAMILY_EXTS.contains(&e.as_str()));
+    if text_family {
+        MAX_SIDECAR_TEXT_INPUT_BYTES
+    } else {
+        MAX_SIDECAR_INPUT_BYTES
     }
 }
 
 /// The pure size check behind [`guard_input_size`], split out so the cap logic is unit-tested without
 /// materialising a multi-hundred-MB file.
-fn check_input_size(size: u64) -> Result<()> {
-    if size > MAX_SIDECAR_INPUT_BYTES {
+fn check_input_size(size: u64, cap: u64) -> Result<()> {
+    if size > cap {
         return Err(Error::Other(format!(
             "file is too large to process ({} MiB; the limit is {} MiB)",
             size / (1024 * 1024),
-            MAX_SIDECAR_INPUT_BYTES / (1024 * 1024)
+            cap / (1024 * 1024)
         )));
     }
     Ok(())
@@ -162,6 +195,12 @@ const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
     pins: OPTIONAL_OCR_PINS,
     uninstall: &["rapidocr", "pillow-heif"],
 };
+
+/// Every optional component, so a caller that must treat them all alike can't miss one. `provision`
+/// is the reason this exists: a venv rebuild removes their markers along with the venv, and each new
+/// component would otherwise need remembering there too.
+const ALL_OPTIONAL_COMPONENTS: &[&OptionalComponent] =
+    &[&OPTIONAL_TSNE_COMPONENT, &OPTIONAL_OCR_COMPONENT];
 
 /// Where the sidecar script and its requirements live, and where the venv goes.
 pub struct SidecarPaths {
@@ -425,19 +464,24 @@ pub struct SidecarManager {
 
 impl SidecarManager {
     pub fn new(paths: SidecarPaths) -> Self {
-        let installed = paths.ready_marker().exists();
-        let status = if installed {
-            SidecarStatus::Ready
-        } else {
-            SidecarStatus::NotInstalled
-        };
-        Self {
+        let manager = Self {
             paths,
             proc: Mutex::new(None),
-            status: Mutex::new(status),
+            status: Mutex::new(SidecarStatus::NotInstalled),
             install: Mutex::new(()),
             req_seq: AtomicU64::new(0),
+        };
+        // Boot status asks the SAME question every other readiness check asks — is the marker
+        // CURRENT — rather than merely whether the file exists. The marker stamps the
+        // requirements hash, so bare existence goes on reporting Ready after an app update
+        // changes requirements.txt, right up until the next `ensure_installed`. In that window
+        // chat grounding trusts `status()` and runs the NEW sidecar script against the OLD pinned
+        // deps. Costs one extra `--version` probe at boot (the hash read is cheap), and a false
+        // NotInstalled only means provision() re-checks — which it was going to do anyway.
+        if manager.is_ready_marker_current().unwrap_or(false) {
+            *manager.status.lock().unwrap() = SidecarStatus::Ready;
         }
+        manager
     }
 
     pub fn status(&self) -> SidecarStatus {
@@ -548,11 +592,23 @@ impl SidecarManager {
         let detected = venv_python_exists
             .then(|| detect_python_version(&self.paths.venv_python()))
             .flatten();
+        // What the user has PAID FOR, noted before the teardown can erase it. The optional markers
+        // live inside the venv dir, so `remove_dir_all` took them with it — silently uninstalling
+        // OCR and t-SNE. Nothing told the user: photos then ingested EXIF-only (no OCR text, and
+        // permanently for those documents unless re-ingested) and the memory map quietly fell back
+        // to PCA. A rebuild is triggered by a torn install or an outdated interpreter — neither of
+        // which is a request to remove components.
+        let mut reinstall: Vec<&OptionalComponent> = Vec::new();
         if should_rebuild_venv(
             venv_python_exists,
             self.paths.ready_marker().exists(),
             detected,
         ) {
+            for component in ALL_OPTIONAL_COMPONENTS {
+                if self.optional_ready(component) {
+                    reinstall.push(component);
+                }
+            }
             // Drop any live child first: on Windows it would hold a lock on the
             // venv's python.exe and block removal.
             *self.proc.lock().unwrap() = None;
@@ -594,6 +650,24 @@ impl SidecarManager {
             kind: classify_pip_failure(&e.to_string()),
             source: e,
         })?;
+
+        // Put back the optional components the rebuild removed. Best-effort and deliberately NOT
+        // fatal: the base venv is what the app needs to function, and failing the whole provision
+        // over an optional extra would turn "OCR is missing" into "nothing works". A failure here
+        // leaves the component genuinely uninstalled — which is at least honest, and Settings →
+        // Storage can reinstall it — rather than a stamped marker lying about a package that isn't
+        // there.
+        //
+        // `install_optional_locked`, not `install_optional`: we already hold `self.install` (see
+        // `ensure_installed_with_progress`) and the base venv is up two statements ago.
+        for component in reinstall {
+            if let Err(e) = self.install_optional_locked(component, |_| {}) {
+                eprintln!(
+                    "sidecar: rebuilt the venv but could not reinstall an optional component ({e}); \
+                     reinstall it from Settings -> Storage"
+                );
+            }
+        }
 
         // Stamp the marker with the requirements hash so we can skip next time.
         let hash = self.requirements_hash().map_err(unknown)?;
@@ -1074,7 +1148,22 @@ impl SidecarManager {
             on_progress(1.0);
             return Ok(());
         }
+        self.install_optional_locked(component, on_progress)
+    }
 
+    /// The pip half of an optional install: pins into an EXISTING venv, then stamp the marker.
+    ///
+    /// Split out because `provision` has to re-install components after a venv rebuild and CANNOT
+    /// call [`install_optional`]: that would re-enter `ensure_installed` and re-take
+    /// `self.install` — which `ensure_installed_with_progress` already holds across the whole
+    /// provision. `Mutex` is not reentrant, so it would deadlock the installer against itself.
+    ///
+    /// So this takes neither the lock nor the base-venv guarantee: the caller owns both.
+    fn install_optional_locked(
+        &self,
+        component: &OptionalComponent,
+        mut on_progress: impl FnMut(f32),
+    ) -> Result<()> {
         let py = self.paths.venv_python();
         // `--progress-bar off` so pip emits clean newline-terminated phase lines (no carriage-return
         // byte bar) we can parse; the side-thread stderr drain in run_pip_streaming avoids a deadlock.
@@ -1824,9 +1913,51 @@ mod tests {
     fn input_size_guard_rejects_over_cap_files() {
         // F-57: exactly at the cap is fine; one byte over is refused, so a 500 MB file is pre-flighted
         // out before it can balloon the Python child's memory.
-        assert!(check_input_size(0).is_ok());
-        assert!(check_input_size(MAX_SIDECAR_INPUT_BYTES).is_ok());
-        assert!(check_input_size(MAX_SIDECAR_INPUT_BYTES + 1).is_err());
+        assert!(check_input_size(0, MAX_SIDECAR_INPUT_BYTES).is_ok());
+        assert!(check_input_size(MAX_SIDECAR_INPUT_BYTES, MAX_SIDECAR_INPUT_BYTES).is_ok());
+        assert!(check_input_size(MAX_SIDECAR_INPUT_BYTES + 1, MAX_SIDECAR_INPUT_BYTES).is_err());
+    }
+
+    #[test]
+    fn the_text_family_cap_refuses_work_that_could_only_fail() {
+        // A text-family file converts to roughly ITSELF, so a 60-128 MiB one cleared the 128 MiB
+        // input cap and then produced a reply that could never fit under the 64 MiB line cap: a
+        // guaranteed failure, after minutes of conversion, costing a child kill + respawn. The
+        // guard's own promise is that oversized work is "refused before the child is even asked".
+        assert_eq!(
+            input_cap_for(Path::new("notes.txt")),
+            MAX_SIDECAR_TEXT_INPUT_BYTES
+        );
+        assert!(check_input_size(60 * 1024 * 1024, input_cap_for(Path::new("big.md"))).is_err());
+
+        // Case-insensitive, like every other extension check in the ingest path.
+        assert_eq!(
+            input_cap_for(Path::new("PAGE.HTML")),
+            MAX_SIDECAR_TEXT_INPUT_BYTES
+        );
+
+        // A container format extracts to far LESS text than it occupies, so it keeps the full
+        // allowance — capping those at 40 MiB would refuse ordinary scanned PDFs.
+        assert_eq!(
+            input_cap_for(Path::new("book.pdf")),
+            MAX_SIDECAR_INPUT_BYTES
+        );
+        assert!(check_input_size(60 * 1024 * 1024, input_cap_for(Path::new("book.pdf"))).is_ok());
+
+        // No extension, or one we don't classify: the generous cap. This guard exists to stop a
+        // KNOWN-futile conversion, not to second-guess files it can't identify.
+        assert_eq!(input_cap_for(Path::new("README")), MAX_SIDECAR_INPUT_BYTES);
+    }
+
+    #[test]
+    fn the_text_cap_leaves_real_headroom_under_the_reply_cap() {
+        // The reply is Markdown-wrapped and JSON-escaped, so it runs LARGER than the source. If the
+        // text cap ever crept up to the reply cap this guard would go back to merely moving the
+        // cliff rather than removing it.
+        assert!(
+            MAX_SIDECAR_TEXT_INPUT_BYTES < MAX_SIDECAR_LINE as u64,
+            "a text file that clears the input cap must be able to fit in one reply line"
+        );
     }
 
     #[test]

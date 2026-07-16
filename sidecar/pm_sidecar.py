@@ -35,6 +35,7 @@ converts/embeds/scores/transcribes bytes; it never executes file contents.
 
 import json
 import logging
+import math
 import os
 import sys
 import traceback
@@ -240,6 +241,15 @@ def clean_text(value):
 # MAX_SIDECAR_INPUT_BYTES.
 MAX_INPUT_FILE_BYTES = 128 * 1024 * 1024
 
+# The cap for TEXT-FAMILY files, whose converted Markdown is roughly the size of the input (a .txt
+# converts to about itself; a .pdf or .docx extracts to a fraction). Those could clear the 128 MiB
+# input cap and then produce a reply that CANNOT fit under the Rust reader's 64 MiB line cap - a
+# guaranteed failure, arriving only after minutes of conversion. 40 MiB leaves headroom, since the
+# reply is Markdown-wrapped and JSON-escaped and so runs somewhat larger than the source. Kept in
+# sync with sidecar.rs MAX_SIDECAR_TEXT_INPUT_BYTES / TEXT_FAMILY_EXTS.
+MAX_TEXT_INPUT_FILE_BYTES = 40 * 1024 * 1024
+TEXT_FAMILY_EXTS = (".txt", ".md", ".markdown", ".html", ".htm", ".json", ".xml")
+
 # An .xlsx is a zip; openpyxl inflates its worksheet / shared-strings XML. The 128 MiB input cap
 # above bounds the on-disk (compressed) size, NOT the inflated size, so a zip-bomb .xlsx could still
 # balloon memory past it. Reject a workbook whose declared uncompressed size, or inflation ratio,
@@ -259,10 +269,15 @@ def _guard_file_size(path):
         size = os.path.getsize(path)
     except OSError:
         return
-    if size > MAX_INPUT_FILE_BYTES:
+    cap = (
+        MAX_TEXT_INPUT_FILE_BYTES
+        if str(path).lower().endswith(TEXT_FAMILY_EXTS)
+        else MAX_INPUT_FILE_BYTES
+    )
+    if size > cap:
         raise ValueError(
             f"file is too large to process ({size // (1024 * 1024)} MiB; "
-            f"the limit is {MAX_INPUT_FILE_BYTES // (1024 * 1024)} MiB)"
+            f"the limit is {cap // (1024 * 1024)} MiB)"
         )
 
 
@@ -419,6 +434,13 @@ def _gps_to_decimal(value, ref):
     dec = deg + minute / 60.0 + sec / 3600.0
     if str(ref).strip().upper() in ("S", "W"):
         dec = -dec
+    # A GPS rational with a zero denominator makes float() produce nan/inf, and a non-finite float
+    # serializes as bare `NaN`/`Infinity` -- which is not valid JSON, so the Rust reader skips the
+    # reply line and blocks on an answer that never comes. One corrupt-EXIF photo would wedge the
+    # whole serialized sidecar (ingest, retrieval, rerank, transcribe, map) until the per-method
+    # timeout expired. A photo with no readable location is the honest answer here.
+    if not math.isfinite(dec):
+        return None
     return round(dec, 6)
 
 
@@ -932,9 +954,32 @@ def main():
             traceback.print_exc(file=sys.stderr)
             response = {"id": req_id, "ok": False, "error": str(exc)}
 
-        # `default=str` so a non-JSON-serializable result stringifies instead of
-        # raising here (outside the try) and silently killing the read loop.
-        out.write(json.dumps(response, default=str) + "\n")
+        # `default=str` so a non-JSON-serializable result stringifies instead of raising here
+        # (outside the try) and silently killing the read loop.
+        #
+        # `allow_nan=False` is the load-bearing half. Python's json emits bare `NaN` / `Infinity`
+        # for non-finite floats, which are NOT valid JSON: the Rust reader can't parse the line, so
+        # it skips it and then blocks forever on a reply that has already been sent. That wedges the
+        # whole serialized sidecar -- ingest, chat retrieval, rerank, transcribe, map -- for
+        # the full
+        # per-method timeout (30 minutes for analyze_image/embed) before the child is killed. One
+        # photo with a zero-denominator GPS rational was enough to do it.
+        #
+        # So a non-finite number becomes a normal, per-request FAILURE: the caller sees an honest
+        # error for that one item and the engine keeps serving everything else. `_gps_to_decimal`
+        # already refuses to produce one; this is the boundary that guarantees no future
+        # handler can.
+        try:
+            payload = json.dumps(response, default=str, allow_nan=False)
+        except ValueError:
+            payload = json.dumps(
+                {
+                    "id": req_id,
+                    "ok": False,
+                    "error": "non-finite number in result (the value could not be represented)",
+                }
+            )
+        out.write(payload + "\n")
         out.flush()
 
 
