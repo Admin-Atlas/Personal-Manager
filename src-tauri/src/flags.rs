@@ -712,7 +712,16 @@ pub struct Detection {
 /// Detection only ever proposes `active` drafts (it never resolves). Artifact matching (a confident
 /// prep-doc → `artifact_ptr`) is a later refinement, so drafts carry no pointer yet. The returned
 /// drafts are sorted for a deterministic order (the stored set keys on `(anchor,type)` regardless).
-pub fn detect(projects: &[ProjectOverview], events: &[CalendarEvent], today: &str) -> Detection {
+///
+/// `zone` is the user's IANA zone, and it decides which DAY an event falls on. It is not a
+/// formatting detail: "happening today" is a civil-day question, and `today` is already computed in
+/// this zone, so classifying event starts in any other one compares two different calendars.
+pub fn detect(
+    projects: &[ProjectOverview],
+    events: &[CalendarEvent],
+    today: &str,
+    zone: Tz,
+) -> Detection {
     let mut out = Detection::default();
 
     // Milestone-anchored: one flag per unmet, dated milestone inside its lead window.
@@ -753,7 +762,14 @@ pub fn detect(projects: &[ProjectOverview], events: &[CalendarEvent], today: &st
             out.skipped_no_uid += 1;
             continue;
         };
-        let Some(days) = milestones::days_until(today, &e.start) else {
+        // The event's day IN THE USER'S ZONE. `days_until` reads the first 10 chars, so passing the
+        // raw start compared `today` (already computed in the user's zone) against the date prefix
+        // of whatever the provider happened to store — a UTC `Z` for Outlook/ICS, the provider's own
+        // offset for Google. For any non-UTC user that is the wrong civil day near the boundary: an
+        // 8pm event in UTC-5 is stored as tomorrow's date, so "Happening today" quietly waited until
+        // the day after, and a late-evening event in UTC+ could fire a day early. `projects.rs` has
+        // always done it this way; only the flag layer read the raw string.
+        let Some(days) = milestones::days_until(today, &clock::zone_date_of(&e.start, zone)) else {
             continue;
         };
         soonest
@@ -835,8 +851,9 @@ pub fn detect_and_store(
     projects: &[ProjectOverview],
     events: &[CalendarEvent],
     today: &str,
+    zone: Tz,
 ) -> Result<DetectionSummary> {
-    let det = detect(projects, events, today);
+    let det = detect(projects, events, today, zone);
     let emitted: HashSet<(String, String, String)> = det
         .drafts
         .iter()
@@ -910,10 +927,10 @@ pub fn detect_and_store(
 /// (it has nothing pre-fetched). The briefing path calls `detect_and_store` directly with the
 /// inputs it already holds. Both fetch the same event window and share the same reducer, so they
 /// agree on the flag set.
-pub fn run_detection(conn: &Connection, today: &str) -> Result<DetectionSummary> {
+pub fn run_detection(conn: &Connection, today: &str, zone: Tz) -> Result<DetectionSummary> {
     let projects = projects::list_overviews(conn, today)?;
     let events = calendar::list_upcoming(conn, DETECT_EVENT_WINDOW_DAYS, today)?;
-    detect_and_store(conn, &projects, &events, today)
+    detect_and_store(conn, &projects, &events, today, zone)
 }
 
 /// RFC3339 timestamp of the last flag-detection pass; stamped on success so the cadence survives
@@ -963,7 +980,7 @@ pub fn spawn_flag_detection_scheduler(app: AppHandle) {
             }
             let zone = crate::commands::resolve_zone(&conn);
             let today = clock::today_sql_in(zone);
-            match run_detection(&conn, &today) {
+            match run_detection(&conn, &today, zone) {
                 Ok(s) => {
                     if s.skipped_no_uid > 0 || s.aged > 0 {
                         eprintln!(
@@ -1245,7 +1262,7 @@ mod tests {
             cal_event(Some("uid-far"), "2026-07-30T09:00:00Z"),   // beyond lead -> no flag
         ];
 
-        let det = detect(&projects, &events, TODAY);
+        let det = detect(&projects, &events, TODAY, Tz::UTC);
         let got: Vec<(&str, &str, &str)> = det
             .drafts
             .iter()
@@ -1274,13 +1291,39 @@ mod tests {
             cal_event(Some("uid-daily"), "2026-07-05T09:00:00Z"), // +2 prepare-ahead
             cal_event(Some("uid-daily"), "2026-07-03T09:00:00Z"), // today — soonest instance wins
         ];
-        let det = detect(&[], &events, TODAY);
+        let det = detect(&[], &events, TODAY, Tz::UTC);
         assert_eq!(det.skipped_no_uid, 2, "both uid-less events counted");
         assert_eq!(det.drafts.len(), 1, "series collapses to one flag");
         assert_eq!(
             det.drafts[0].r#type, TYPE_HAPPENING_TODAY,
             "classified on the soonest instance"
         );
+    }
+
+    #[test]
+    fn an_events_day_is_decided_in_the_users_zone() {
+        // "Happening today" is a civil-day question, and `today` is already computed in the user's
+        // zone — so the event's day has to be too. This classified on the raw start string's date
+        // prefix, i.e. whatever the provider stored: a `Z` for Outlook/ICS, the provider's offset
+        // for Google.
+        //
+        // 2026-07-04T01:30:00Z is still the EVENING OF THE 3rd in New York. For a UTC-5 user whose
+        // `today` is the 3rd, that event is happening today; reading "2026-07-04" off the front of
+        // the string made it tomorrow, so the flag arrived a day late — after the event.
+        let events = vec![cal_event(Some("u1"), "2026-07-04T01:30:00Z")];
+
+        let ny = detect(&[], &events, TODAY, chrono_tz::America::New_York);
+        assert_eq!(ny.drafts.len(), 1);
+        assert_eq!(
+            ny.drafts[0].r#type, TYPE_HAPPENING_TODAY,
+            "9:30pm on the 3rd in New York is happening TODAY, not tomorrow"
+        );
+
+        // Same instant, a UTC user: it really is tomorrow for them. Both are correct answers to
+        // different questions — which is the point.
+        let utc = detect(&[], &events, TODAY, Tz::UTC);
+        assert_eq!(utc.drafts.len(), 1);
+        assert_eq!(utc.drafts[0].r#type, TYPE_PREPARE_AHEAD);
     }
 
     /// The executor reconciles: flags whose condition no longer holds are pruned, while a RESOLVED
@@ -1295,7 +1338,7 @@ mod tests {
             ms(11, Some("2026-06-02"), false),
         ]);
         let e1 = vec![cal_event(Some("uid-a"), "2026-07-03T09:00:00Z")];
-        let s1 = detect_and_store(&conn, &[p1], &e1, TODAY).unwrap();
+        let s1 = detect_and_store(&conn, &[p1], &e1, TODAY, Tz::UTC).unwrap();
         assert_eq!(s1.active, 3);
         assert_eq!(s1.pruned, 0);
 
@@ -1313,7 +1356,7 @@ mod tests {
             ms(10, Some("2026-06-01"), false),
             ms(11, Some("2026-06-02"), true),
         ]);
-        let s2 = detect_and_store(&conn, &[p2], &[], TODAY).unwrap();
+        let s2 = detect_and_store(&conn, &[p2], &[], TODAY, Tz::UTC).unwrap();
         assert_eq!(s2.pruned, 2, "met milestone + vanished event pruned");
         assert_eq!(
             s2.active, 0,
@@ -1336,7 +1379,7 @@ mod tests {
 
         // Pass 1: a prepare-ahead flag for the daily standup's soonest occurrence (07-05); user preps.
         let e1 = vec![cal_event(Some("uid-daily"), "2026-07-05T09:00:00Z")];
-        detect_and_store(&conn, &[], &e1, TODAY).unwrap();
+        detect_and_store(&conn, &[], &e1, TODAY, Tz::UTC).unwrap();
         let f = list_active(&conn, Some(ANCHOR_CALENDAR))
             .unwrap()
             .into_iter()
@@ -1347,7 +1390,7 @@ mod tests {
         // Pass 2: the NEXT occurrence (07-06) comes due. The tombstone is for the earlier occurrence, so
         // it ages out and a fresh active flag re-fires — the bug was that it stayed suppressed forever.
         let e2 = vec![cal_event(Some("uid-daily"), "2026-07-06T09:00:00Z")];
-        let s = detect_and_store(&conn, &[], &e2, TODAY).unwrap();
+        let s = detect_and_store(&conn, &[], &e2, TODAY, Tz::UTC).unwrap();
         assert_eq!(s.aged, 1, "the earlier occurrence's tombstone is aged out");
         let refired = list_active(&conn, Some(ANCHOR_CALENDAR))
             .unwrap()
@@ -1365,7 +1408,7 @@ mod tests {
         let (_dir, conn) = open_test_db();
 
         let e = vec![cal_event(Some("uid-daily"), "2026-07-05T09:00:00Z")];
-        detect_and_store(&conn, &[], &e, TODAY).unwrap();
+        detect_and_store(&conn, &[], &e, TODAY, Tz::UTC).unwrap();
         let f = list_active(&conn, Some(ANCHOR_CALENDAR))
             .unwrap()
             .into_iter()
@@ -1374,7 +1417,7 @@ mod tests {
         resolve(&conn, f.id, SOURCE_ASSERTION, None, None).unwrap();
 
         // Re-scan while the SAME occurrence (07-05) is still upcoming: no aging, no re-fire.
-        let s = detect_and_store(&conn, &[], &e, TODAY).unwrap();
+        let s = detect_and_store(&conn, &[], &e, TODAY, Tz::UTC).unwrap();
         assert_eq!(s.aged, 0, "the same occurrence is not aged out");
         assert_eq!(
             list_active(&conn, Some(ANCHOR_CALENDAR)).unwrap().len(),

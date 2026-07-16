@@ -127,8 +127,16 @@ export function weekdayShort(d: Date): string {
   return d.toLocaleDateString(undefined, { weekday: "short" });
 }
 
-/** Ordering for a day's event list: all-day events first, then by start instant (ISO strings sort
- *  chronologically). Shared by the month grids and both agendas so the sort never drifts. */
+/** Ordering for a day's event list: all-day events first, then by start instant. Shared by the
+ *  month grids and both agendas so the sort never drifts.
+ *
+ *  The string compare is chronological only because the BACKEND guarantees it: every timed start in
+ *  the mirror is normalised to UTC `…Z` as it is parsed (Google's provider-offset RFC3339 included —
+ *  `calendar::to_utc_z`), and all-day rows are bare dates that sort correctly against them. This
+ *  comment used to assert "ISO strings sort chronologically" as though it were a property of ISO
+ *  itself; it is not — `2026-07-16T09:00:00+02:00` sorts after `2026-07-16T08:00:00Z` while
+ *  happening an hour EARLIER. It is a property of what the mirror stores, so it holds here and
+ *  would not on raw provider data. */
 export function compareEventsForDay(a: CalendarEvent, b: CalendarEvent): number {
   if (a.all_day !== b.all_day) return a.all_day ? -1 : 1;
   return String(a.start).localeCompare(String(b.start));

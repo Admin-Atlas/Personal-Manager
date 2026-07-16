@@ -5796,7 +5796,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         // set to the current projects + calendar, then render the ACTIVE (unresolved) flags as the
         // briefing's facts. Best-effort — a detection hiccup must never fail the briefing, so a
         // failure just leaves the prior flag set in place and briefs from it.
-        if let Err(e) = flags::detect_and_store(&conn, &projects, &events, &today) {
+        if let Err(e) = flags::detect_and_store(&conn, &projects, &events, &today, zone) {
             eprintln!("flag detection skipped during briefing refresh: {e}");
         }
         let active = flags::list_active(&conn, None)?;

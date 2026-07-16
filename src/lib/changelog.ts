@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.6-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Reminders about your day now use your day. If you're not on UTC, PM worked out whether an event was \"happening today\" or still ahead of you by reading the date off however your calendar provider happened to store it — not by asking what day it is where you are. An evening event could be treated as tomorrow's, so the nudge arrived the morning after it happened. Your timezone now decides, the same way the rest of PM already did.",
+      'Subscribed calendar feeds that use lowercase now work. The iCalendar standard says property names can be written in any case, but PM only recognised capitals — so a feed writing "dtstart" instead of "DTSTART" quietly appeared completely empty, and one writing "rrule" lost every repeat of a recurring event. Both now read correctly.',
+      'Events from Google and Outlook now sort together properly. Google reports times in the calendar\'s own timezone while Outlook and subscribed feeds report them in UTC, and PM compared them as plain text — so an event could appear in the wrong place in an agenda that mixed the two, and "the next one" could pick the wrong event. All times are now stored the same way. Your calendars will resync once, on their own.',
+      "Deleting a milestone now clears its reminders. The milestone went, but any flag it had raised stayed behind — including ones you'd already dismissed, which nothing ever removed.",
+    ],
+  },
+  {
     version: "3.19.5-alpha",
     date: "2026-07-16",
     highlights: [

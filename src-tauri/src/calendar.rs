@@ -595,10 +595,36 @@ fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEve
 }
 
 /// A Google event start/end node is either `{dateTime}` (timed) or `{date}` (all-day).
+/// A Google RFC3339 timestamp as UTC `…Z`, mirroring `outlook_calendar::graph_datetime_to_iso`'s
+/// output shape. An unparseable value is kept verbatim — a weird string is still better than a
+/// dropped event, and every consumer already tolerates one.
+fn to_utc_z(dt: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(dt.trim())
+        .map(|d| {
+            d.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        })
+        .unwrap_or_else(|_| dt.to_string())
+}
+
 fn parse_when(node: Option<&serde_json::Value>) -> Option<(String, bool)> {
     let node = node?;
     if let Some(dt) = node.get("dateTime").and_then(|v| v.as_str()) {
-        Some((dt.to_string(), false))
+        // Google returns RFC3339 keeping the calendar's OWN offset ("2026-07-16T09:00:00+02:00");
+        // Outlook and ICS both normalise to `…Z`. The mirror stores all three side by side — and
+        // every "soonest first" ordering over it is a STRING comparison: SQL `ORDER BY start`, the
+        // flag layer's soonest-instance pick, and the frontend's `localeCompare`. So a `+02:00`
+        // event sorted as though it happened two hours later than it does, and a cross-provider or
+        // cross-DST agenda could interleave wrongly or pick the wrong "soonest" copy.
+        //
+        // Normalising at the one place Google times ENTER the mirror makes every string comparison
+        // downstream chronological for free — rather than teaching four separate consumers to parse.
+        // Existing rows heal themselves: the normalised value changes the calendar's F-49 event
+        // hash, so the next sync rewrites them once. All-day values stay bare dates (`2026-07-16`),
+        // which is deliberate — they have no instant, and they still sort correctly against `…Z`
+        // stamps on either side of them.
+        Some((to_utc_z(dt), false))
     } else {
         node.get("date")
             .and_then(|v| v.as_str())
@@ -1585,6 +1611,41 @@ mod tests {
         assert_eq!(events[1].summary, "(no title)");
         assert!(events[1].all_day);
         assert_eq!(events[1].uid, None);
+    }
+
+    #[test]
+    fn googles_provider_offset_is_normalised_to_utc_z() {
+        // Google keeps the calendar's own offset; Outlook and ICS normalise to `…Z`. The mirror
+        // holds all three, and every "soonest" ordering over it is a STRING comparison — so a
+        // +02:00 event sorted as though it were two hours later than it actually is.
+        let value = serde_json::json!({
+            "items": [{
+                "id": "b", "summary": "Timed",
+                "start": {"dateTime": "2026-06-20T10:00:00+02:00"},
+                "end":   {"dateTime": "2026-06-20T11:00:00+02:00"}
+            }]
+        });
+        let events = parse_events("cal1", &value);
+        assert_eq!(events[0].start, "2026-06-20T08:00:00Z");
+        assert_eq!(events[0].end.as_deref(), Some("2026-06-20T09:00:00Z"));
+
+        // The whole point: string order now matches real order across providers. Before, the Google
+        // event sorted AFTER the Outlook one while happening half an hour earlier.
+        let outlook_start = "2026-06-20T08:30:00Z";
+        assert!(
+            events[0].start.as_str() < outlook_start,
+            "an 08:00Z event must sort before an 08:30Z one"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_google_time_is_kept_verbatim() {
+        // A weird string is still better than a dropped event — every consumer already tolerates
+        // one, and `days_until`/`julianday` simply decline it.
+        assert_eq!(to_utc_z("not a time"), "not a time");
+        // Already-UTC input is idempotent (and fractional seconds are dropped, matching Outlook).
+        assert_eq!(to_utc_z("2026-06-20T10:00:00Z"), "2026-06-20T10:00:00Z");
+        assert_eq!(to_utc_z("2026-06-20T10:00:00.123Z"), "2026-06-20T10:00:00Z");
     }
 
     #[test]
