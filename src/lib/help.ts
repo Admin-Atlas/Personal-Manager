@@ -294,7 +294,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-drive": {
     title: "Google Drive",
-    body: "Index your Google Drive (read-only) so PM can find and answer from your files. Everything is 'index-only': PM stores a searchable pointer and a short summary, never the file itself — the full file stays in Drive and is fetched when you open it. Connect more than one account; each syncs independently. Tokens live only in your keychain.",
+    body: "Index your Google Drive (read-only) so PM can find and answer from your files. Everything is 'index-only': PM reads each file's full contents to build its search index, but stores only that index plus a short summary — never a copy of the file, which stays in Drive and is fetched when you open it. Connect more than one account; each syncs independently. Tokens live only in your keychain.",
   },
   "settings-drive-firstsync": {
     title: "First sync",
@@ -310,7 +310,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-onedrive": {
     title: "OneDrive",
-    body: "Index your OneDrive (read-only) so PM can find and answer from those files. It's index-only: PM stores a searchable pointer and a short summary, never the file itself — the full file stays in OneDrive and is fetched when you open it. Connect more than one account; each syncs on its own. Tokens live only in your keychain.",
+    body: "Index your OneDrive (read-only) so PM can find and answer from those files. It's index-only: PM reads each file's full contents to build its search index, but stores only that index plus a short summary — never a copy of the file, which stays in OneDrive and is fetched when you open it. Connect more than one account; each syncs on its own. Tokens live only in your keychain.",
   },
   "settings-onedrive-firstsync": {
     title: "First sync",
@@ -356,7 +356,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-backup": {
     title: "Encrypted backup",
-    body: "Beyond a one-off backup, PM can run them on a schedule and keep the last few for you. Scheduled backups only fire when it's safe and unobtrusive — PM unlocked, the machine idle and online, and a passphrase set. Point it at more than one place (say a folder plus Google Drive) and each backup is packed once and copied to all of them. Older backups beyond the number you keep are pruned automatically.",
+    body: "Beyond a one-off backup, PM can run them on a schedule and keep the last few for you. Scheduled backups only fire when it's safe and unobtrusive — PM unlocked and idle for a few minutes, a passphrase set, and nothing else syncing. Point it at more than one place (say a folder plus Google Drive) and each backup is packed once and copied to all of them; a destination that can't be reached right then is simply retried next run. Older backups beyond the number you keep are pruned automatically.",
   },
   "settings-license": {
     title: "License",
