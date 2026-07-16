@@ -248,7 +248,10 @@ pub fn token_key_for(provider: &str, service: &str, email: &str) -> Option<Strin
 }
 
 pub fn get_microsoft_client_id() -> Result<Option<String>> {
-    get(MICROSOFT_CLIENT_ID)
+    // A blank stored id reads as absent, exactly like the OpenRouter keys: the setter now refuses
+    // one, but an entry written before that guard existed must still resolve to the honest "no
+    // client set" rather than a `Some("")` that makes every OAuth attempt fail opaquely.
+    Ok(get(MICROSOFT_CLIENT_ID)?.filter(|v| !v.trim().is_empty()))
 }
 
 /// Store the user's BYO Microsoft client id (public client — there is no secret).

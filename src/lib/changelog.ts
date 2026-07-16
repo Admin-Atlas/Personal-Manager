@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.7-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "A chat reply that fails partway through is no longer saved as if it were the answer. If the model or its provider failed after it had started replying, PM kept the half-finished text, saved it into the conversation and your vault, indexed it, and said nothing — so a broken sentence became something PM could quote back to you later as though it were real. A failure is now reported as a failure. And when a reply is cut short simply because it got long, it's saved with a note saying so rather than pretending it just ended there.",
+      "Renaming a chat before you've sent anything now sticks. PM names conversations for you in the background, but a title you chose yourself is meant to win. Renaming a brand-new chat and then sending your first message let the automatic namer overwrite what you'd picked — which is exactly the moment people rename a chat.",
+      "Background work now bills the background key, as intended. If you've set a separate key for background jobs, the rolling summaries, chat titles and preference learning were all still charged to your main key — so the split you set up didn't reflect where the spend went, and a background-key-only setup refused to run them at all. Nothing changes if you use a single key.",
+      "Setting an empty Microsoft client ID is now refused instead of accepted and then failing later with an unhelpful error.",
+    ],
+  },
+  {
     version: "3.19.6-alpha",
     date: "2026-07-16",
     highlights: [
