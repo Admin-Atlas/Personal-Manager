@@ -181,6 +181,27 @@ class AnalyzeImageTest(unittest.TestCase):
         self.assertIsNone(S._gps_to_decimal((1, 2), "N"))
         self.assertIsNone(S._gps_to_decimal((1, 2, 3), None))
 
+    def test_gps_non_finite_is_no_location_not_a_nan(self):
+        """A GPS rational with a zero denominator makes float() produce nan/inf. A non-finite float
+        serializes as bare `NaN`/`Infinity` — not valid JSON — so the Rust reader skips the reply
+        line and blocks on an answer that never comes, wedging the WHOLE serialized sidecar (ingest,
+        retrieval, rerank, transcribe, map) until the per-method timeout expires. One photo. No
+        location is the honest answer."""
+        self.assertIsNone(S._gps_to_decimal((float("nan"), 0, 0), "N"))
+        self.assertIsNone(S._gps_to_decimal((float("inf"), 0, 0), "N"))
+        # The negation runs before the check, so a non-finite southern value is caught too.
+        self.assertIsNone(S._gps_to_decimal((float("inf"), 0, 0), "S"))
+
+    def test_a_non_finite_result_fails_one_request_not_the_engine(self):
+        """The structural guard behind the above: whatever any handler returns, a non-finite number
+        must never reach the wire as bare `NaN`. This is what makes the fix hold for handlers that
+        don't exist yet."""
+        with self.assertRaises(ValueError):
+            json.dumps({"result": float("nan")}, allow_nan=False)
+        # And the error reply PM sends instead is itself valid JSON.
+        fallback = json.dumps({"id": 1, "ok": False, "error": "non-finite number in result"})
+        self.assertEqual(json.loads(fallback)["ok"], False)
+
     def test_run_ocr_parses_object_and_list_shapes(self):
         # New rapidocr: object with a .txts tuple.
         obj = _OcrResultObj(("hello", "world"))

@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.8-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "One bad photo can no longer freeze everything PM does with your files. A photo whose GPS data is corrupt produced a number that can't be written down — and because PM's document engine handles one job at a time, that single photo jammed the queue for half an hour: no importing, no search, no voice notes, no memory map, with nothing on screen to say why. Corrupt location data is now simply treated as no location, and any impossible number fails just that one job instead of the whole engine.",
+      "Your OCR and memory-map add-ons now survive a repair. If PM had to rebuild its document engine — after a torn install, or when it found a newer Python — it deleted the add-ons you'd installed without saying a word: photos silently stopped having their text read, and the memory map quietly dropped to a simpler layout. They're now reinstalled automatically, and if that can't be done you're told rather than left guessing.",
+      "Very large text files are now turned away up front instead of after several minutes. A big .txt, .md or .html file was accepted, converted, and only then rejected for being too big to hand back — so you waited, and got an error the whole time was spent earning. The limit for those files now reflects what PM can actually return.",
+      "After an update, PM no longer claims its document engine is ready before checking. It could report Ready while still set up for the previous version's requirements, so the first thing you did in that window ran against the wrong setup.",
+    ],
+  },
+  {
     version: "3.19.7-alpha",
     date: "2026-07-16",
     highlights: [
