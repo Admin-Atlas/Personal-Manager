@@ -3271,7 +3271,8 @@ pub(crate) fn symlink_escapes_root(path: &Path, root: &Path) -> bool {
         return false;
     }
     match (std::fs::canonicalize(path), std::fs::canonicalize(root)) {
-        (Ok(real), Ok(real_root)) => !real.starts_with(&real_root),
+        // Both canonical → the one shared containment primitive decides "is P inside R" (L-5).
+        (Ok(real), Ok(real_root)) => !crate::pathguard::within_root(&real, &real_root),
         _ => true,
     }
 }
