@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.10-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "PM now describes its cloud indexing accurately. The Google Drive and OneDrive help said PM keeps 'a searchable pointer and a short summary' — which undersold it: PM actually reads each file's full contents to build its search index, it just never keeps a copy of the file. The wording now matches what search can really do.",
+      "The scheduled-backup help now describes what actually happens: a backup runs when PM is unlocked and idle with a passphrase set and nothing else syncing, and if a destination can't be reached right then it's simply retried next time — rather than promising an 'online' check only some destinations make.",
+    ],
+  },
+  {
     version: "3.19.9-alpha",
     date: "2026-07-16",
     highlights: [
