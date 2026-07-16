@@ -521,6 +521,10 @@ pub struct VaultStatus {
     /// marks the folder) — the folder, and when it was deleted. The UI shows a one-time notice
     /// and switches back to a local vault, instead of the generic "couldn't open" screen.
     pub deleted_notice: Option<DeletedVaultNotice>,
+    /// Whether the CURRENT Windows account owns the active vault. True for a device vault or a legacy
+    /// shared vault (no owner recorded); a shared vault stamped with an owner SID is owned only by its
+    /// creator's account, so a joiner sees `false`. Lets the UI present connectors as owner-managed.
+    pub is_owner: bool,
 }
 
 /// The joiner-facing record that a pointed shared vault was deleted by its owner (from the
@@ -619,7 +623,30 @@ pub fn vault_status(app: AppHandle, state: State<'_, AppState>) -> Result<VaultS
         has_set_aside_vault,
         retired_root,
         deleted_notice,
+        is_owner: meta.as_ref().map(vault::is_vault_owner).unwrap_or(true),
     })
+}
+
+/// Reject a connector-setup action when the current account doesn't own the (shared) vault. Owner-only
+/// connectors: OAuth tokens live in the per-Windows-account keychain, so a joiner literally cannot sync
+/// an account they connect — gating the setup replaces the opaque "connection fails" with an honest
+/// message. Fails OPEN on a device / legacy vault (no owner recorded) and if the meta can't be read, so
+/// it never blocks the real owner. Windows-only ownership; a no-op everywhere else.
+fn require_vault_owner(app: &AppHandle) -> Result<()> {
+    let is_owner = vault::resolve(app)
+        .ok()
+        .and_then(|r| vault::load_meta(&r.vault_root).ok().flatten())
+        .map(|m| vault::is_vault_owner(&m))
+        .unwrap_or(true);
+    if is_owner {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            "Connectors on a shared vault are set up by its owner on this PC. Ask the vault's owner to \
+             connect this account — you'll still see everything they index."
+                .into(),
+        ))
+    }
 }
 
 /// Retry opening the store after a transient boot-time open failure (B1-6). Re-runs the
@@ -4094,6 +4121,7 @@ pub async fn connect_google_calendar_account(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<calendar::CalendarAccount> {
+    require_vault_owner(&app)?;
     do_connect_google_calendar(&app, own_client(client_id, client_secret)?).await
 }
 
@@ -4176,6 +4204,7 @@ async fn migrate_legacy_google_calendar(app: &AppHandle) -> Result<()> {
 /// account via `/me`, store the token, and register the account + its calendars (all selected).
 #[tauri::command]
 pub async fn connect_outlook_calendar(app: AppHandle) -> Result<calendar::CalendarAccount> {
+    require_vault_owner(&app)?;
     let token = microsoft::run_consent(microsoft::CALENDAR_SCOPE, "Outlook Calendar").await?;
     let (email, name) = outlook_calendar::me_account(&token).await?;
     // Normalise the account identity so a differently-cased reconnect doesn't duplicate the account
@@ -4253,7 +4282,8 @@ pub fn remove_ics_feed(state: State<'_, AppState>, id: String) -> Result<()> {
 
 /// Store the user's BYO Google "Desktop app" client credentials (keychain only).
 #[tauri::command]
-pub fn set_google_client(client_id: String, client_secret: String) -> Result<()> {
+pub fn set_google_client(app: AppHandle, client_id: String, client_secret: String) -> Result<()> {
+    require_vault_owner(&app)?;
     let id = client_id.trim();
     let secret = client_secret.trim();
     if id.is_empty() || secret.is_empty() {
@@ -4583,6 +4613,7 @@ pub async fn connect_drive(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<drive::DriveAccount> {
+    require_vault_owner(&app)?;
     let own = own_client(client_id, client_secret)?;
     // Request read-only Drive AND read-only Sheets together (space-joined per OAuth), so the account
     // grants both in one consent. Sheets powers the metadata-only Google Sheets index; an account that
@@ -5564,7 +5595,8 @@ pub fn onedrive_status(state: State<'_, AppState>) -> Result<OneDriveStatus> {
 /// Save the user's BYO Microsoft client id (public client — no secret). Keychain-only; provider-level
 /// (shared by every OneDrive account). Setting it connects nothing on its own.
 #[tauri::command]
-pub fn set_microsoft_client(client_id: String) -> Result<()> {
+pub fn set_microsoft_client(app: AppHandle, client_id: String) -> Result<()> {
+    require_vault_owner(&app)?;
     // The last of the blank-string-secret class (`set_openrouter_key`, `set_google_client` and the
     // secrets getters all already guard it). A stored "" passes `.is_some()`, so `has_client()`
     // reported CONFIGURED and every OAuth attempt then failed opaquely somewhere deep in the flow,
@@ -5594,6 +5626,7 @@ pub fn clear_microsoft_client(state: State<'_, AppState>) -> Result<()> {
 /// Returns the connected account. The BYO Microsoft client id must already be configured.
 #[tauri::command]
 pub async fn connect_onedrive(app: AppHandle) -> Result<onedrive::OneDriveAccount> {
+    require_vault_owner(&app)?;
     let token = microsoft::run_consent(microsoft::ONEDRIVE_SCOPE, "OneDrive").await?;
     let (email, name) = onedrive::me_account(&token).await?;
     microsoft::save_token(&onedrive::account_token_key(&email), &token)?;
