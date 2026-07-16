@@ -8,12 +8,21 @@
 //! machine, regardless of speed (spec §2.2). Never hardcode the cost on the read
 //! path — always use the stored params.
 //!
-//! ## Passphrase policy — the single home for both rules
+//! ## Passphrase policy — the single home for all three rules
 //! 1. **No normalization, ever.** The passphrase is hashed as exact bytes on every path —
 //!    create, change, unlock, verify, restore. Leading/trailing whitespace is significant; no
 //!    call site (backend or frontend) may trim or normalize, or a vault created with a padded
-//!    passphrase would fail to unlock. Locked by a unit test below.
-//! 2. **Strength floor at create/change only.** [`validate_passphrase_strength`] gates every
+//!    passphrase would fail to unlock. Locked by a unit test below. v3.19.1 closed the last
+//!    breach: `migrate::plan_new_key_and_meta` trimmed before deriving while every read path
+//!    hashed raw — the very lockout this rule was written to prevent. A test one layer below a
+//!    caller cannot see that caller's trim; guard the rule where the decision is made.
+//! 2. **Padding is REFUSED, not trimmed** (v3.19.1). [`validate_passphrase_strength`] rejects a
+//!    passphrase with leading/trailing whitespace, so Rule 1's exactness can never again become a
+//!    trap. Refusing is not normalizing — accepted bytes are still hashed untouched — and, being a
+//!    Rule-3 check, it never runs on unlock/restore, so pre-3.19.1 padded vaults and archives stay
+//!    openable forever under their trimmed-form key. Spaces *inside* a passphrase stay valid and
+//!    encouraged: this is a passPHRASE.
+//! 3. **Strength floor at create/change only.** [`validate_passphrase_strength`] gates every
 //!    create-or-change entry point (never unlock/verify/restore, where an existing
 //!    weak-but-valid passphrase must still open data).
 
@@ -58,6 +67,23 @@ pub const MIN_PASSPHRASE_SCORE: u8 = 3;
 /// NEVER call this on an unlock/verify/restore path: an old, weak-but-valid passphrase must still open
 /// existing data. Returns a clear, user-facing message on rejection.
 pub fn validate_passphrase_strength(passphrase: &str) -> Result<()> {
+    // Rule 1 makes the exact bytes the secret, which turns leading/trailing whitespace into a pure
+    // footgun: invisible in a password field, trivially added by a paste, impossible to reproduce
+    // from memory — and, until 3.19.1, the cause of a real lockout. REFUSING it is not normalizing:
+    // what we accept is still hashed untouched, so Rule 1 stands while the class dies at the source.
+    // Refusal also keeps the recovery hint honest — no padded vault can be minted from here on, so
+    // every padded vault that can ever exist predates 3.19.1 and is keyed to its trimmed form, which
+    // makes "try it without the spaces" permanently the right advice.
+    //
+    // Checked FIRST: it is the cheapest and most actionable rejection, and it must not be masked by
+    // "too short" when the padding is what the user needs to hear about. Create/change only, per this
+    // function's contract — an existing padded vault or archive must still open, forever.
+    if passphrase != passphrase.trim() {
+        return Err(Error::Other(
+            "passphrase can't start or end with a space — remove it (spaces inside are fine)"
+                .into(),
+        ));
+    }
     if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
         return Err(Error::Other(format!(
             "passphrase is too short — use at least {MIN_PASSPHRASE_LEN} characters"
@@ -235,6 +261,57 @@ mod tests {
         assert!(validate_passphrase_strength("1234567890").is_err());
         // A genuine passphrase clears both the length and the score floor.
         assert!(validate_passphrase_strength("correct horse battery staple").is_ok());
+    }
+
+    #[test]
+    fn padding_is_refused_at_create_but_spaces_inside_are_welcome() {
+        // Rule 2. Padding is invisible in a password field and unreproducible from memory, so with
+        // Rule 1's exact-bytes hashing it is a lockout waiting to happen — refuse it rather than
+        // silently trim it (trimming is what keyed a vault to a string its owner never typed).
+        for padded in [
+            "  correct horse battery staple",
+            "correct horse battery staple  ",
+            "\tcorrect horse battery staple\n",
+        ] {
+            let err = validate_passphrase_strength(padded)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("start or end with a space"),
+                "padded passphrase must be refused for its PADDING, got: {err}"
+            );
+        }
+        // Reported before the length floor: "  ab  " is both padded and short, and the padding is
+        // the actionable half — being told "too short" would send the user the wrong way.
+        assert!(validate_passphrase_strength("  ab  ")
+            .unwrap_err()
+            .to_string()
+            .contains("start or end with a space"));
+        // This is a passPHRASE: interior spaces are the point, not a defect.
+        assert!(validate_passphrase_strength("correct horse battery staple").is_ok());
+    }
+
+    #[test]
+    fn the_padding_rule_can_never_reach_an_unlock() {
+        // The one-way door. Rule 2 lives inside validate_passphrase_strength precisely because that
+        // function is create/change-only (Rule 3): every pre-3.19.1 vault keyed to a PADDED string
+        // must keep opening forever. If this check ever ran on unlock/verify/restore it would brick
+        // exactly the vaults it was written to rescue — irreversibly, since nothing on disk records
+        // which form built a key. derive_master is the whole read path, and it validates nothing.
+        let padded = "  correct horse battery staple  ";
+        let params = KdfParams {
+            algorithm: "argon2id".to_string(),
+            version: ARGON2_VERSION,
+            m_cost_kib: 64,
+            t_cost: 1,
+            p_cost: 1,
+            key_len: KEY_LEN as u32,
+        };
+        assert!(validate_passphrase_strength(padded).is_err());
+        assert!(
+            derive_master(padded, &[7u8; SALT_LEN], &params).is_ok(),
+            "a padded passphrase must still DERIVE — the floor is a create-time gate, never a read-time one"
+        );
     }
 
     #[test]

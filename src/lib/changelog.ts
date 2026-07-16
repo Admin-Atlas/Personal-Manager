@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.1-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Fixed a passphrase trap in shared vaults. If you set up or changed a shared vault's passphrase with a space at the start or end, PM quietly dropped those spaces when it locked the vault — but not when it unlocked it — so the passphrase you'd chosen wouldn't open your own vault. Your passphrase is now taken exactly as you type it, spaces and all. Vaults set up before this update still open with the spaces left off: PM now says so if what you're typing starts or ends with a space, and changing the passphrase re-keys the vault to exactly what you type.",
+      "A passphrase can no longer start or end with a space. It's almost always a stray one from a copy-and-paste, you can't see it in a password box, and you'd have to type it exactly right forever after — so PM now says so while you're choosing, rather than letting you find out the hard way. Spaces inside are still very much welcome: a passphrase of a few plain words is still the best kind.",
+    ],
+  },
+  {
     version: "3.19.0-alpha",
     date: "2026-07-16",
     highlights: [

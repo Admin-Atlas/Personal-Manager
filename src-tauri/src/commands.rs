@@ -920,10 +920,13 @@ pub fn forget_vault_passphrase(app: AppHandle) -> Result<()> {
 pub struct PassphraseScore {
     /// zxcvbn strength, 0 (weakest) .. 4 (strongest).
     pub score: u8,
-    /// True iff it clears the create/change floor (length AND score).
+    /// True iff it clears the create/change floor (padding AND length AND score).
     pub acceptable: bool,
     /// Non-empty but below the length floor (so the UI can say "too short" specifically).
     pub too_short: bool,
+    /// Starts or ends with whitespace, which create/change refuses (kdf.rs policy Rule 2) — so the
+    /// meter can name the real problem instead of scoring bytes the backend will reject anyway.
+    pub padded: bool,
     /// A short human warning when weak, else null.
     pub warning: Option<String>,
     /// Actionable suggestions to strengthen it.
@@ -942,6 +945,7 @@ pub fn score_passphrase(passphrase: String) -> PassphraseScore {
             score: 0,
             acceptable: false,
             too_short: false,
+            padded: false,
             warning: None,
             suggestions: Vec::new(),
         };
@@ -949,7 +953,11 @@ pub fn score_passphrase(passphrase: String) -> PassphraseScore {
     let estimate = zxcvbn::zxcvbn(&passphrase, &[]);
     let score = u8::from(estimate.score());
     let too_short = len < vault::kdf::MIN_PASSPHRASE_LEN;
-    let acceptable = !too_short && score >= vault::kdf::MIN_PASSPHRASE_SCORE;
+    // Mirror validate_passphrase_strength's order and verdict exactly — this struct's whole purpose
+    // is that the meter and the gate agree. A padded passphrase is unacceptable however strong it
+    // scores, so the Save button it drives must not offer a submit the backend will refuse.
+    let padded = passphrase.trim() != passphrase.as_str();
+    let acceptable = !padded && !too_short && score >= vault::kdf::MIN_PASSPHRASE_SCORE;
     let (warning, suggestions) = match estimate.feedback() {
         Some(f) => (
             f.warning().map(|w| w.to_string()),
@@ -961,6 +969,7 @@ pub fn score_passphrase(passphrase: String) -> PassphraseScore {
         score,
         acceptable,
         too_short,
+        padded,
         warning,
         suggestions,
     }

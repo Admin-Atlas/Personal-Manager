@@ -11,12 +11,15 @@
 import { useState } from "react";
 import { adoptSharedVault, vaultFaultOf } from "../lib/ipc";
 import type { SharedVaultAd } from "../lib/types";
+import { paddedPassphraseHint } from "../lib/vaultPassphrase";
 import { Button, Input } from "./ui";
 
 /** The join-failure story by classified fault code — a joiner-persona message for each
  *  distinct cause, so "the owner hasn't added you" is never read as "wrong passphrase"
- *  (the lockout incident's most damaging conflation). Falls back to the raw message. */
-export function joinErrorMessage(e: unknown): string {
+ *  (the lockout incident's most damaging conflation). Falls back to the raw message.
+ *  `passphrase` is what the user typed: a joiner is the likeliest victim of a pre-3.19.1
+ *  padded-passphrase vault, and the only one who can act on the hint. */
+export function joinErrorMessage(e: unknown, passphrase = ""): string {
   const fault = vaultFaultOf(e);
   switch (fault?.code) {
     case "denied":
@@ -26,7 +29,10 @@ export function joinErrorMessage(e: unknown): string {
         "on the account that set it up and use Repair access.)"
       );
     case "wrong-passphrase":
-      return "That passphrase doesn't match this vault. The folder itself is fine.";
+      return (
+        "That passphrase doesn't match this vault. The folder itself is fine." +
+        paddedPassphraseHint(passphrase)
+      );
     case "no-vault":
       return "No PM vault in that folder — pick the folder that holds vault-meta.json and pm.sqlite.";
     case "corrupt":
@@ -66,7 +72,7 @@ export function VaultJoin({
       await adoptSharedVault(vault.vault_root, pass);
       onJoined();
     } catch (e) {
-      setError(joinErrorMessage(e));
+      setError(joinErrorMessage(e, pass));
       setBusy(false);
     }
   }

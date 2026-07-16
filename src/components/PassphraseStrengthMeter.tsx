@@ -60,9 +60,13 @@ export function PassphraseStrengthMeter({
 
   if (!score) return null;
 
-  const hint = score.too_short
-    ? "Use at least 10 characters."
-    : (score.warning ?? score.suggestions[0] ?? null);
+  // Same order as the backend floor: padding first (it's the actionable half, and being told
+  // "too short" or "too guessable" would send the user the wrong way), then length, then zxcvbn.
+  const hint = score.padded
+    ? "Can't start or end with a space — remove it. Spaces inside are fine."
+    : score.too_short
+      ? "Use at least 10 characters."
+      : (score.warning ?? score.suggestions[0] ?? null);
 
   return (
     <div className="flex flex-col gap-1" aria-live="polite">
