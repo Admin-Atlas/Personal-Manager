@@ -320,19 +320,91 @@ fn vault_key_entry(vault_id: &str) -> String {
     format!("vault_key::{vault_id}")
 }
 
+/// The ids of every vault this profile has cached a key for, as a JSON array in the keychain.
+///
+/// It exists because the keychain cannot be enumerated: a wipe deletes exactly the keys it can
+/// NAME, and it used to reconstruct only the *currently resolved* vault's id. Every other cached
+/// key outlived "Remove PM data" — a shared vault the profile adopted and then detached from
+/// keeps its cache deliberately (for a silent rejoin), so its raw SQLCipher master key survived
+/// an explicit erase-everything, for a vault that may still exist in a shared folder. This
+/// registry is the list of names the wipe needs.
+const VAULT_KEY_IDS: &str = "vault_key_ids";
+
+/// The registry's parsed contents; an unreadable or absent registry reads as empty, never an
+/// error — it is a best-effort index over the real entries, not a source of truth.
+fn cached_vault_ids() -> Vec<String> {
+    get(VAULT_KEY_IDS)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Add an id to a registry list, deduplicated and sorted. Pure — the string handling is the part
+/// that can be wrong, and it is the part the keychain can't be tested against.
+fn with_id(ids: &[String], vault_id: &str) -> Vec<String> {
+    let mut out: Vec<String> = ids.to_vec();
+    if !out.iter().any(|i| i == vault_id) {
+        out.push(vault_id.to_string());
+    }
+    out.sort();
+    out
+}
+
+/// Remove an id from a registry list. Pure.
+fn without_id(ids: &[String], vault_id: &str) -> Vec<String> {
+    ids.iter().filter(|i| *i != vault_id).cloned().collect()
+}
+
+/// Record (or forget) a vault id in the registry. Best-effort by design: it mirrors the
+/// cache-first posture of every caller — a registry failure must never fail an unlock or an
+/// adopt, because the cost of a miss is one extra passphrase prompt, while the cost of a hard
+/// error here is a vault the user can't open at all.
+fn remember_vault_id(vault_id: &str, present: bool) {
+    let ids = cached_vault_ids();
+    let next = if present {
+        with_id(&ids, vault_id)
+    } else {
+        without_id(&ids, vault_id)
+    };
+    if next == ids {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(&next) {
+        let _ = set(VAULT_KEY_IDS, &json);
+    }
+}
+
 /// This profile's cached derived key for a shareable vault, if it has unlocked it before.
 pub fn get_cached_vault_key(vault_id: &str) -> Result<Option<Secret>> {
-    Ok(get(&vault_key_entry(vault_id))?.map(Secret::from))
+    let value = get(&vault_key_entry(vault_id))?;
+    // Self-heal: a key cached before the registry existed is still real, and a successful read
+    // is proof it is there. This is how pre-existing installs become wipeable without a migration.
+    if value.is_some() {
+        remember_vault_id(vault_id, true);
+    }
+    Ok(value.map(Secret::from))
 }
 
 /// Cache the derived key (64-hex) for a shareable vault in this profile's keychain.
 pub fn set_cached_vault_key(vault_id: &str, key_hex: &str) -> Result<()> {
-    set(&vault_key_entry(vault_id), key_hex)
+    set(&vault_key_entry(vault_id), key_hex)?;
+    remember_vault_id(vault_id, true);
+    Ok(())
 }
 
 /// Forget this profile's cached key for a vault ("forget passphrase on this device").
 pub fn clear_cached_vault_key(vault_id: &str) -> Result<()> {
-    delete(&vault_key_entry(vault_id))
+    delete(&vault_key_entry(vault_id))?;
+    remember_vault_id(vault_id, false);
+    Ok(())
+}
+
+/// Every vault id this profile has ever cached a key for, for the wipe's key reconstruction.
+/// Best-effort: the caller unions this with the ids it can resolve from disk, so a lost registry
+/// degrades to the old behaviour rather than skipping the current vault.
+pub fn known_cached_vault_ids() -> Vec<String> {
+    cached_vault_ids()
 }
 
 // --- Full keychain teardown ("Remove PM data" → OS keychain, spec §6/§8.7) ---
@@ -357,6 +429,10 @@ const FIXED_KEYS: &[&str] = &[
     GOOGLE_TOKEN_CALENDAR, // legacy fixed calendar token (pre per-account)
     CALENDAR_ICS_FEEDS,
     MICROSOFT_CLIENT_ID,
+    // The registry of cached-vault-key ids. It names other entries, so it goes LAST in spirit:
+    // the caller reads it (via `known_cached_vault_ids`) to build the wipe list before any
+    // deletion runs, and then it is deleted like any other secret PM wrote.
+    VAULT_KEY_IDS,
 ];
 
 /// Every keychain key a wipe must delete: the fixed keys, then the dynamic per-account /
@@ -456,6 +532,31 @@ mod tests {
             FIXED_KEYS.len() + token_keys.len() + 2 * emails.len() + vaults.len(),
             "one key per fixed + token + (id,secret) per email + vault"
         );
+    }
+
+    #[test]
+    fn the_cached_key_registry_is_in_the_wipe_list() {
+        // The registry names the per-vault keys, so a wipe that forgot it would leave a list of
+        // exactly which vaults this profile once held keys for — after "remove everything".
+        assert!(all_secret_keys(&[], &[], &[]).contains(&VAULT_KEY_IDS.to_string()));
+    }
+
+    #[test]
+    fn registry_ids_dedupe_sort_and_remove() {
+        // The keychain has no test shim, so the string handling — the only part that can be
+        // wrong — is pure and tested here.
+        let ids = with_id(&[], "v2");
+        assert_eq!(ids, vec!["v2".to_string()]);
+        let ids = with_id(&ids, "v1");
+        assert_eq!(ids, vec!["v1".to_string(), "v2".to_string()], "sorted");
+        assert_eq!(with_id(&ids, "v1"), ids, "re-adding an id is a no-op");
+        assert_eq!(without_id(&ids, "v1"), vec!["v2".to_string()]);
+        assert_eq!(
+            without_id(&ids, "nope"),
+            ids,
+            "removing an absent id is a no-op"
+        );
+        assert!(without_id(&without_id(&ids, "v1"), "v2").is_empty());
     }
 
     #[test]

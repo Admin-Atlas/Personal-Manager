@@ -271,6 +271,24 @@ fn remove_vault_artifacts(resolved: &vault::ResolvedVault, data_dir: &Path) -> u
     freed
 }
 
+/// Union the vault ids a wipe must NAME, from its three best-effort sources. Pure, because this
+/// is the whole correctness surface — the keychain can't be enumerated, so an id missing here is
+/// a secret that survives "remove everything", silently and forever. Deduplicated, since deleting
+/// the same key twice would double-count the "entries removed" the report shows the user.
+fn cached_vault_ids_to_wipe(
+    registry: Vec<String>,
+    resolved: Option<String>,
+    retired: Option<String>,
+) -> Vec<String> {
+    let mut out = registry;
+    for id in [resolved, retired].into_iter().flatten() {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// Gather (but do not yet act on) everything the keychain teardown needs, while the store is still
 /// open. Best-effort: a locked / forgotten-passphrase vault has no connection, and that user must
 /// still be able to erase their secrets, so no store just means no per-account tokens to enumerate —
@@ -285,13 +303,33 @@ fn plan_keychain_wipe(
         Ok(conn) => enumerate_oauth_accounts(&conn).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    // The current vault's cached-key entry (`vault_key::<id>`); reads the unencrypted meta, so it
-    // resolves even when the store is locked. Best-effort — a plain device vault has no cached key.
-    let vault_ids = vault::resolve(app)
-        .ok()
-        .and_then(|r| vault::load_meta(&r.vault_root).ok().flatten())
-        .map(|m| vec![m.vault_id])
-        .unwrap_or_default();
+    // Every vault whose key this profile has cached (`vault_key::<id>`) — not just the current
+    // one. The keychain can't be enumerated, so a key survives unless the wipe can NAME it, and
+    // naming only the resolved vault left a live SQLCipher master key behind for any vault the
+    // profile had moved on from: `detach_from_shared_vault` KEEPS its cached key on purpose (for a
+    // silent rejoin), so a detached shared vault's key outlived "remove everything" while the
+    // folder it opens may still be sitting on the machine. Three sources, unioned:
+    //
+    //  1. the registry of ids this profile ever cached (secrets::known_cached_vault_ids),
+    //  2. the currently resolved vault's meta — the old behaviour, kept so a lost or
+    //     never-written registry can only ever degrade to it, never below it,
+    //  3. the retired pointer's root, which covers a profile that detached BEFORE the registry
+    //     shipped and whose folder still answers.
+    //
+    // All best-effort: an unreachable root just contributes nothing. Read here, in step 1, while
+    // the retired pointer still exists — step 2 deletes it.
+    let vault_ids = cached_vault_ids_to_wipe(
+        secrets::known_cached_vault_ids(),
+        vault::resolve(app)
+            .ok()
+            .and_then(|r| vault::load_meta(&r.vault_root).ok().flatten())
+            .map(|m| m.vault_id),
+        paths::data_dir(app)
+            .ok()
+            .and_then(|d| vault::pointer::load_retired(&d).ok().flatten())
+            .and_then(|p| vault::load_meta(&p.vault_root).ok().flatten())
+            .map(|m| m.vault_id),
+    );
 
     let mut google_token_keys = Vec::new();
     let mut microsoft_token_keys = Vec::new();
@@ -690,6 +728,54 @@ pub async fn confirm_wipe_identity(window: tauri::WebviewWindow) -> Result<bool>
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn a_detached_shared_vaults_cached_key_is_named_by_the_wipe() {
+        // The bug: this collected ONLY the resolved vault's id. `detach_from_shared_vault` keeps
+        // its cached key on purpose (for a silent rejoin), so after a detach the profile resolves
+        // its own device vault and the shared vault's raw SQLCipher master key survived "Remove PM
+        // data" — for a vault that may still be sitting in a folder on the same machine.
+        let ids = cached_vault_ids_to_wipe(
+            vec!["shared-vault".into()],
+            Some("device-vault".into()),
+            None,
+        );
+        assert!(
+            ids.contains(&"shared-vault".to_string()),
+            "a key cached for a vault we no longer point at must still be wiped"
+        );
+        assert!(ids.contains(&"device-vault".to_string()));
+    }
+
+    #[test]
+    fn a_lost_registry_degrades_to_the_old_behaviour_never_below_it() {
+        // The registry is best-effort (a keychain write can fail, and installs predating it have
+        // none). Losing it must cost the extra ids, never the current vault's — otherwise this
+        // "fix" would wipe LESS than the code it replaced.
+        let ids = cached_vault_ids_to_wipe(vec![], Some("device-vault".into()), None);
+        assert_eq!(ids, vec!["device-vault".to_string()]);
+    }
+
+    #[test]
+    fn the_retired_pointer_covers_a_detach_that_predates_the_registry() {
+        // Third source: a profile that detached before the registry shipped has no registry entry,
+        // but its retired pointer still names the folder — and that folder's meta still names the
+        // id whose key we cached.
+        let ids = cached_vault_ids_to_wipe(vec![], None, Some("old-shared".into()));
+        assert_eq!(ids, vec!["old-shared".to_string()]);
+    }
+
+    #[test]
+    fn wipe_ids_never_repeat() {
+        // All three sources routinely name the SAME vault (registry + resolved is the common
+        // case). A duplicate would delete the same key twice and inflate the entries-removed count.
+        let ids = cached_vault_ids_to_wipe(
+            vec!["v1".into(), "v2".into()],
+            Some("v1".into()),
+            Some("v2".into()),
+        );
+        assert_eq!(ids, vec!["v1".to_string(), "v2".to_string()]);
+    }
 
     /// A minimal in-memory `connector_sources` with just the columns the enumeration reads, so the
     /// pure provider/service → token-key mapping can be tested without the full migration stack.
