@@ -107,12 +107,32 @@ pub struct RawCalendar {
 
 // --- network (async, DB-free; callers hold no lock across these) ---
 
-/// Fetch one Google account's calendar list, authorised with that account's `token_key`
-/// (`google_oauth_token_calendar::<email>`).
-pub async fn fetch_calendar_list(token_key: &str) -> Result<Vec<RawCalendar>> {
-    let value =
-        google::authorized_get(token_key, &format!("{CALENDAR_API}/users/me/calendarList")).await?;
-    Ok(parse_calendars(&value))
+/// Fetch one Google account's full calendar list, authorised with that account's `token_key`
+/// (`google_oauth_token_calendar::<email>`). Follows `nextPageToken` so an account with many
+/// calendars isn't silently truncated at one page (Google defaults `calendarList` to 100/page).
+/// Returns the calendars plus whether the listing is **complete** — `false` when the runaway page
+/// guard tripped, so a reconcile must NOT prune a calendar merely absent from an incomplete list
+/// (the provable-absence rule; see [`register_calendars`]).
+pub async fn fetch_calendar_list(token_key: &str) -> Result<(Vec<RawCalendar>, bool)> {
+    let mut base = reqwest::Url::parse(&format!("{CALENDAR_API}/users/me/calendarList"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    base.query_pairs_mut().append_pair("maxResults", "250");
+    let (out, truncated) = crate::connector_sync::paginate(MAX_PAGES, |page_token| {
+        let mut url = base.clone();
+        async move {
+            if let Some(tok) = &page_token {
+                url.query_pairs_mut().append_pair("pageToken", tok);
+            }
+            let value = google::authorized_get(token_key, url.as_str()).await?;
+            let next = value
+                .get("nextPageToken")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Ok((parse_calendars(&value), next))
+        }
+    })
+    .await?;
+    Ok((out, !truncated))
 }
 
 /// Fetch a calendar list using an IN-HAND (not-yet-persisted) token — used right after consent to
@@ -993,15 +1013,22 @@ pub fn selected_calendars(conn: &Connection) -> Result<Vec<Calendar>> {
         .collect())
 }
 
-/// Register/refresh an OAuth account's calendars from a freshly-fetched list, pruning any that
-/// vanished upstream. A calendar's mirror id is `<account_source_id>:<remote_id>`. `select` decides a
-/// NEW calendar's initial tick (existing rows keep the user's choice — see [`upsert_calendar`]);
-/// connect/refresh pass `|_| true` (aggregate all), the legacy migration passes the old selection.
+/// Register/refresh an OAuth account's calendars from a freshly-fetched list. A calendar's mirror id
+/// is `<account_source_id>:<remote_id>`. `select` decides a NEW calendar's initial tick (existing rows
+/// keep the user's choice — see [`upsert_calendar`]); connect/refresh pass `|_| true` (aggregate all),
+/// the legacy migration passes the old selection.
+///
+/// `complete` gates the PRUNE of calendars that vanished upstream: prune only when the fetched list is
+/// provably complete. A truncated page-run or an errored/unreachable fetch must never let "we didn't
+/// see it this time" mean "the user deleted it" — the same provable-absence rule [`ingest`]'s
+/// `may_reap` uses. An incomplete list still upserts, so a newly-created calendar appears; it just
+/// won't delete a survivor's row (and its selected/quiet choices + mirrored events) on a bad list.
 pub fn register_calendars(
     conn: &Connection,
     account_source_id: &str,
     provider: &str,
     items: &[RawCalendarInput],
+    complete: bool,
     select: impl Fn(&RawCalendarInput) -> bool,
 ) -> Result<Vec<Calendar>> {
     let mut keep = Vec::with_capacity(items.len());
@@ -1023,7 +1050,9 @@ pub fn register_calendars(
             },
         )?;
     }
-    prune_calendars_not_in(conn, account_source_id, &keep)?;
+    if complete {
+        prune_calendars_not_in(conn, account_source_id, &keep)?;
+    }
     list_calendars_for_source(conn, account_source_id)
 }
 
@@ -1470,6 +1499,86 @@ mod tests {
         assert_eq!(
             count, 1,
             "the count-guard re-inserts when the mirror was cleared"
+        );
+    }
+
+    #[test]
+    fn register_calendars_prunes_a_vanished_calendar_only_off_a_complete_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let src = "gcal:me@x.com";
+        upsert_source(&conn, src, "google", Some("me@x.com"), "me@x.com").unwrap();
+        let inp = |remote: &str, name: &str| RawCalendarInput {
+            remote_id: remote.into(),
+            name: name.into(),
+            color: None,
+            is_primary: false,
+        };
+        let ids = |conn: &Connection| -> Vec<String> {
+            list_calendars_for_source(conn, src)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.id)
+                .collect()
+        };
+
+        // Two calendars land off a complete list, selected by default.
+        register_calendars(
+            &conn,
+            src,
+            "google",
+            &[inp("a", "A"), inp("b", "B")],
+            true,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(ids(&conn), vec!["gcal:me@x.com:a", "gcal:me@x.com:b"]);
+
+        // The user unticks + quiets B — real per-calendar choices a re-sync must preserve.
+        set_calendar_selected(&conn, "gcal:me@x.com:b", false).unwrap();
+        set_calendar_quiet(&conn, "gcal:me@x.com:b", true).unwrap();
+
+        // An INCOMPLETE list omitting B must NOT delete B (provable-absence), yet must still add a
+        // newly-seen C.
+        register_calendars(
+            &conn,
+            src,
+            "google",
+            &[inp("a", "A"), inp("c", "C")],
+            false,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&conn),
+            vec!["gcal:me@x.com:a", "gcal:me@x.com:b", "gcal:me@x.com:c"],
+            "an incomplete list adds C but never prunes the absent B"
+        );
+        let b = list_calendars_for_source(&conn, src)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == "gcal:me@x.com:b")
+            .expect("B survives an incomplete list");
+        assert!(
+            !b.selected && b.quiet,
+            "B keeps the user's untick + quiet across an incomplete re-sync"
+        );
+
+        // A COMPLETE list omitting B now prunes it (Bobby's hard-delete on provable absence), leaving
+        // A and C untouched.
+        register_calendars(
+            &conn,
+            src,
+            "google",
+            &[inp("a", "A"), inp("c", "C")],
+            true,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&conn),
+            vec!["gcal:me@x.com:a", "gcal:me@x.com:c"],
+            "a complete list prunes the vanished B"
         );
     }
 
