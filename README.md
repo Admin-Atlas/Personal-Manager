@@ -14,8 +14,8 @@ your device: the local database (settings, search index, metadata) is always
 encrypted, and your documents live in a Markdown vault you can keep private to this
 device or protect with a passphrase and carry between machines. Little leaves your device:
 the model API calls that power chat, a launch-time update check, a one-time first-run download
-of PM's local models, and — only if you set them up — a read-only calendar fetch and encrypted
-backups to your own cloud.
+of PM's local models, and — only if you set them up — a read-only calendar fetch, a read-only
+sync of any cloud accounts you connect, and encrypted backups to your own cloud.
 
 This repo is the **application code**. Your personal data is never committed — it lives
 in a separate, machine-local data directory (see [Where your data lives](#where-your-data-lives)).
@@ -267,7 +267,8 @@ it up:
 Either way, you can export everything to plain Markdown whenever you like. Outbound traffic
 is limited and enumerable: the model API calls that power chat; a check for updates on launch
 (and the download if you accept one); a one-time first-run download of PM's on-device models
-and Python dependencies; and — only if you turn them on — a read-only calendar fetch and
+and Python dependencies; and — only if you turn them on — a read-only calendar fetch, a
+read-only sync of the cloud accounts you connect (Google Drive, Google Sheets, OneDrive), and
 encrypted backups to your chosen cloud (Proton Drive or Google Drive). Nothing else leaves the
 machine: there is no telemetry, analytics, or crash reporting. The repo holds code only — see
 [`SECURITY.md`](SECURITY.md) for the security policy and how to report an issue privately.

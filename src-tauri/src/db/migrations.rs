@@ -53,6 +53,9 @@ const MIGRATIONS: &[&str] = &[
         byte_size    INTEGER,
         created_at   TEXT,
         ingested_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        -- RESERVED (v2): no reader and no writer other than this default. Kept because the
+        -- additive-only rule forbids dropping a column, not because anything consumes it. An
+        -- ingest that fails now leaves no row at all rather than a row with a status.
         status       TEXT NOT NULL DEFAULT 'ingested'
     );
 
@@ -216,6 +219,8 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE chunks ADD COLUMN start_offset INTEGER;
     ALTER TABLE chunks ADD COLUMN end_offset   INTEGER;
     ALTER TABLE chunks ADD COLUMN kind         TEXT NOT NULL DEFAULT 'leaf';
+    -- RESERVED (v9): written by nothing and read by nothing. Per-chunk provenance ended up in the
+    -- dedicated `chat_turn_id`/`chunk_at` columns (v24) instead, which is why this stayed empty.
     ALTER TABLE chunks ADD COLUMN meta         TEXT;
     CREATE INDEX idx_chunks_uid    ON chunks(document_id, uid);
     CREATE INDEX idx_chunks_parent ON chunks(parent_id);
@@ -536,7 +541,9 @@ const MIGRATIONS: &[&str] = &[
         drive_id   TEXT NOT NULL,
         account_id TEXT NOT NULL REFERENCES connector_sources(id) ON DELETE CASCADE,
         is_owner   INTEGER NOT NULL DEFAULT 0,   -- the one account whose sync indexes + reconciles this drive
-        name       TEXT,                          -- cached drive display name (for the "synced by X" UI)
+        -- RESERVED (v19): the "synced by X" UI reads the ACCOUNT's label, not this; nothing has
+        -- ever written it. Kept per the additive-only rule.
+        name       TEXT,                          -- cached drive display name (unused; see above)
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         PRIMARY KEY (drive_id, account_id)
     );

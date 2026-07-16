@@ -128,6 +128,11 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Approve all",
     body: "Commits every item in the queue with its current values. Anything you changed from the AI's suggestion is logged to teach PM your preferences.",
   },
+  // Added with single-row filing; its help never was.
+  "review-approve-one": {
+    title: "Approve this one",
+    body: "Commits just this document with the values shown, and leaves the rest of the queue alone. Handy when one item is ready but you'd rather come back to the others. Like Approve all, anything you changed from the AI's suggestion teaches PM your preferences.",
+  },
   "review-autofiled": {
     title: "Auto-filed",
     body: "Low-importance items are collapsed here so they don't pile up as a chore. They're still committed when you approve, and stay fully searchable.",
@@ -202,9 +207,13 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Background API key",
     body: "An optional second key used for behind-the-scenes work (sorting suggestions and learning), so you can track that spend separately. Falls back to your main key if left blank.",
   },
+  // "search every model on OpenRouter" stopped being true in v3.18.0-alpha (#369), which filters the
+  // picker to models with a zero-data-retention endpoint — PM pins ZDR on every request, so a
+  // non-compliant model is not merely leaky, it is uncallable. Same wrong claim #373 fixed in the
+  // README; the help said it too.
   "settings-chat-models": {
     title: "Chat model",
-    body: "Which model answers your chats. Add a model from the picker — search every model on OpenRouter, compare the input → output price per million tokens, sort by price, and use the tags (Free, Reasoning, Vision, Coding…). Add more than one and turn on auto-switch to fall through to the next when one hits its daily limit. PM is never locked to one model.",
+    body: "Which model answers your chats. Add one from the picker — search the models PM can actually use, compare the input → output price per million tokens, sort by price, and use the tags (Free, Reasoning, Vision, Coding…). The list is OpenRouter's, filtered to models offering zero data retention: PM demands that on every request, so a model without it couldn't answer you at all. Add more than one and turn on auto-switch to fall through to the next when one hits its daily limit. PM is never locked to one model.",
   },
   "settings-background-models": {
     title: "Background model",
@@ -266,9 +275,22 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Calendar subscription (iCal)",
     body: "Paste a calendar's private 'secret address in iCal format' — no sign-in, no Google Cloud project, and it works even with Advanced Protection. Read-only: it powers your agenda, schedule questions in chat, and the 'Due soon' status when an event names a project. The feed URL is a secret link and lives only in your keychain.",
   },
-  "settings-calendar": {
+  // Apple's iCal group scopes its id (`connectors-ics-apple`); the generic block above keeps the
+  // bare key. Without this, subscribing an Apple calendar highlighted in help mode and said nothing.
+  "connectors-ics-apple": {
+    title: "Apple Calendar subscription",
+    body: "Paste your iCloud calendar's public share link. In Calendar on a Mac or iPhone, share the calendar, turn on 'Public Calendar', and copy the link — PM reads it directly, with no Apple sign-in. Read-only, like every calendar in PM. The link is a secret address and lives only in your keychain.",
+  },
+  // The calendar block went per-provider (`settings-calendar-google` / `-microsoft`) and the key
+  // didn't follow it — so the id the UI actually asked for matched nothing, and the text below could
+  // never be shown. Both providers now have their own entry.
+  "settings-calendar-google": {
     title: "Google Calendar",
     body: "Read-only Google sign-in with your own OAuth client. Once connected, pick which calendars to mirror so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. For a no-sign-in option, use a calendar subscription (iCal) instead. Tokens live only in your keychain.",
+  },
+  "settings-calendar-microsoft": {
+    title: "Outlook Calendar",
+    body: "Read-only Microsoft sign-in with your own app registration — the same one OneDrive uses, so there's nothing extra to set up if you've connected that. Once connected, pick which calendars to mirror so PM can show your agenda, answer schedule questions in chat, and flip a project to 'Due soon' when an event names it. Tokens live only in your keychain.",
   },
   "settings-drive": {
     title: "Google Drive",
@@ -313,6 +335,12 @@ export const HELP: Record<string, HelpEntry> = {
   "settings-data": {
     title: "Data",
     body: "Everything you keep in PM lives in one folder named 'Personal Manager' — the Markdown vault of your documents plus the encrypted store (settings, pinboard, and the search index). Your documents in the vault are stored unencrypted so any tool can read them; their at-rest protection relies on your OS full-disk encryption (BitLocker on Windows, FileVault on macOS), so turn that on. 'Open data folder' reveals it in your file manager so you can copy or back it up by hand. 'Export all data' bundles the vault and the store into a single .zip you choose where to save; the regenerable runtime (the local model environment) is left out, and the store stays encrypted inside the archive.",
+  },
+  // Help mode highlighted the most destructive surface in Settings and then showed nothing on hover
+  // — the one place where "what does this actually do?" most deserves an answer.
+  "settings-remove-data": {
+    title: "Remove PM data",
+    body: "Erases what PM has put on this machine, in the classes you tick. 'Regenerable components' is safe — the Python engine, the OCR and map add-ons, and the speech model all re-download on next use. The other two are not: your vault and database ARE your documents, chats, and projects, and removing your keychain secrets takes the key to the encrypted store along with your API key and every sign-in, so the vault becomes unopenable without them. Tick everything and PM removes itself entirely. Nothing here is recoverable afterwards — take a backup first if you're unsure. Your existing backups are never touched; remove those at their source.",
   },
   "settings-vault": {
     title: "Vault mode",

@@ -13,7 +13,6 @@ export { SegmentedControl, type SegOption, type SegmentedControlProps } from "./
 export { Card, type CardProps } from "./Card";
 export { Collapsible, type CollapsibleProps } from "./Collapsible";
 export { SectionInfo, type SectionInfoProps } from "./SectionInfo";
-export { ListRow, type ListRowProps } from "./ListRow";
 export { StatusBadge, STATUS_LABEL, type StatusBadgeProps } from "./StatusBadge";
 export { Modal, type ModalProps } from "./Modal";
 export { Toggle, type ToggleProps } from "./Toggle";

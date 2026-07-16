@@ -340,13 +340,6 @@ pub fn set_vault_embedder(state: State<'_, AppState>, embedder_id: String) -> Re
     Ok(())
 }
 
-/// The stored IANA time zone (empty string = none set; the backend then uses UTC).
-#[tauri::command]
-pub fn get_time_zone(state: State<'_, AppState>) -> Result<String> {
-    let conn = state.conn()?;
-    Ok(db::get_setting(&conn, TIME_ZONE_KEY)?.unwrap_or_default())
-}
-
 /// Persist the IANA zone the frontend resolved via `Intl`. Validated against the
 /// chrono-tz database so a garbage string can't be stored; an empty value clears it
 /// (the backend falls back to UTC). This is correctness state, not appearance, so it
@@ -6144,10 +6137,11 @@ async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Pull the public OpenRouter catalogue (no key) and upsert every model's prices — and
-/// the recommender's signals (cache rate, context, supported params, capability indices) —
-/// into the cache. One fetch serves both the cost logger and the recommender (no second
-/// fetch/scheduler). Never holds the DB lock across the network call (rule #4).
+/// Pull the public OpenRouter catalogue (no key) and upsert every model's prices into the cache,
+/// which the cost logger reads. Also caches the cache-read rate, context length, supported params
+/// and capability indices: those fed the model recommender, DELETED in v3.18.0-alpha (#369), and
+/// are write-only today — migration v8's columns are append-only and the dev inspector reads them.
+/// Never holds the DB lock across the network call (rule #4).
 async fn refresh_pricing_now(app: &AppHandle) -> Result<()> {
     let models = openrouter::fetch_catalogue().await?;
     let state = app.state::<AppState>();

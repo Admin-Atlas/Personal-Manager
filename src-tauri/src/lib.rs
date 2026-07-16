@@ -1071,7 +1071,6 @@ pub fn run() {
             commands::retrieval_diagnose,
             commands::language_options,
             commands::set_vault_embedder,
-            commands::get_time_zone,
             commands::set_time_zone,
             commands::get_pref,
             commands::set_pref,

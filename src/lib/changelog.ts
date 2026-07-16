@@ -19,6 +19,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.9-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Help mode now answers everywhere it lights up. Four places highlighted as if they had an explanation and then showed nothing when you hovered them — including Remove PM data, the one place in Settings where knowing exactly what a button does matters most. They all have their explanation now, and the model picker's no longer claims you can search every model on OpenRouter (PM only lists the ones it can actually use).",
+      "Times on the Focus tab now match the rest of PM instead of quietly using their own format.",
+      "Under-the-hood tidying: our own description of what PM sends over the network now mentions syncing the cloud accounts you connect — it listed everything else and somehow not that.",
+    ],
+  },
+  {
     version: "3.19.8-alpha",
     date: "2026-07-16",
     highlights: [

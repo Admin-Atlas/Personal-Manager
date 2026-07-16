@@ -822,16 +822,11 @@ export interface BackupSchedule {
   gdrive_last_backup_at: string | null;
 }
 
-/** A connected Google Drive account (mirrors the Rust `DriveAccount`) — for the backup account
- *  picker on first grant. */
-export interface DriveBackupAccount {
-  id: string;
-  email: string;
-  label: string;
-  last_synced_at: string | null;
-  state: string;
-  indexed: number;
-}
+// `DriveBackupAccount` used to live here: a hand-copied second mirror of the Rust `DriveAccount`,
+// which is what `backup_gdrive_status` actually serializes. It drifted, as a copy does — it never
+// grew `has_sheets_scope` — and a mirror that is missing a field the backend sends is a claim about
+// the wire that is simply false. `GdriveBackupStatus.accounts` now uses `DriveAccount` itself, so
+// there is one mirror to keep true instead of two.
 
 /** The Google Drive backup destination's status: which account is set up, whether it has the
  *  `drive.file` write grant yet (a re-consent is required — connector scopes are read-only),
@@ -840,7 +835,7 @@ export interface GdriveBackupStatus {
   account: string | null;
   has_write_scope: boolean;
   enabled: boolean;
-  accounts: DriveBackupAccount[];
+  accounts: DriveAccount[];
 }
 
 // --- Personal Assistant: Microsoft OneDrive connector (board card 4B, spec §8.1) ---
