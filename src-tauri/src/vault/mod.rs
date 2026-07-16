@@ -590,12 +590,14 @@ impl MarkdownCipher {
         Ok(std::fs::read(path)?)
     }
 
-    /// Read + decrypt a file's bytes from disk (the byte analogue of [`read`](Self::read), the byte
-    /// counterpart to [`write_bytes_to`](Self::write_bytes_to)): an encrypted container is decrypted to
-    /// its plaintext bytes; anything else is returned as-is. Used to serve an opt-in saved photo original
-    /// back to the reader regardless of the vault's cipher policy.
-    pub fn read_bytes(&self, path: &Path) -> Result<Vec<u8>> {
-        let bytes = std::fs::read(path)?;
+    /// Decode on-disk bytes to their plaintext, by magic (the byte analogue of
+    /// [`decode`](Self::decode), the counterpart to [`encode_bytes_for`](Self::encode_bytes_for)): an
+    /// encrypted container is decrypted; anything else is handed back untouched. Like `decode`, this
+    /// is what tolerates a folder mid-migration (some plaintext, some ciphertext).
+    ///
+    /// Takes the bytes **by value** — unlike `decode`, which borrows a string — so re-encoding a
+    /// multi-megabyte photo original doesn't copy it just to hand it straight back.
+    pub fn decode_bytes(&self, bytes: Vec<u8>, path: &Path) -> Result<Vec<u8>> {
         if crypto::is_encrypted(&bytes) {
             let key = self.subkey.as_ref().ok_or_else(|| {
                 Error::Other("this vault file is encrypted but no Markdown key is loaded".into())
@@ -604,6 +606,14 @@ impl MarkdownCipher {
         } else {
             Ok(bytes)
         }
+    }
+
+    /// Read + decrypt a file's bytes from disk (the byte analogue of [`read`](Self::read), the byte
+    /// counterpart to [`write_bytes_to`](Self::write_bytes_to)). Used to serve an opt-in saved photo
+    /// original back to the reader regardless of the vault's cipher policy.
+    pub fn read_bytes(&self, path: &Path) -> Result<Vec<u8>> {
+        let bytes = std::fs::read(path)?;
+        self.decode_bytes(bytes, path)
     }
 
     /// Encode Markdown text for writing to `path`, by policy: encrypted into a container
@@ -1054,11 +1064,142 @@ mod tests {
 
     /// An encrypted cipher with a fixed subkey (no KDF needed for the file-IO tests).
     fn enc_cipher() -> MarkdownCipher {
+        enc_cipher_keyed([3u8; 32])
+    }
+
+    /// The same, with a caller-chosen subkey — so a test can model a passphrase CHANGE, which keeps
+    /// the vault id and the encryption policy but moves the Markdown subkey.
+    fn enc_cipher_keyed(subkey: [u8; 32]) -> MarkdownCipher {
         MarkdownCipher {
             vault_id: "vault-1".to_string(),
             encryption: MarkdownEncryption::XChaCha20Poly1305,
-            subkey: Some(Zeroizing::new([3u8; 32])),
+            subkey: Some(Zeroizing::new(subkey)),
         }
+    }
+
+    #[test]
+    fn a_passphrase_change_re_encodes_saved_photo_originals() {
+        // The bug this exists to prevent: `convert_markdown` walks the vault non-recursively, so a
+        // passphrase change re-encoded the `.md` files and silently left `vault/photos/` under the
+        // OLD subkey — permanently unreadable, and the feature's whole pitch is that the user can
+        // delete the original once PM has a copy. Model the real transition: same vault id, same
+        // policy, different subkey.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let photos = vault.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+
+        let old = enc_cipher_keyed([3u8; 32]);
+        let new = enc_cipher_keyed([9u8; 32]);
+        let original = b"\x89PNG\r\n\x1a\nnot really a png, but bytes are bytes".to_vec();
+        let name = "deadbeef.png.pmenc";
+        old.write_bytes_to(&photos.join(name), &original).unwrap();
+
+        // Precondition: the new key genuinely cannot read what the old key wrote. Without this the
+        // test could pass while proving nothing.
+        assert!(
+            new.read_bytes(&photos.join(name)).is_err(),
+            "the new subkey must not already open the old ciphertext"
+        );
+
+        assert_eq!(
+            crate::ingest::convert_photo_originals(&vault, &old, &new).unwrap(),
+            1
+        );
+        assert_eq!(
+            new.read_bytes(&photos.join(name)).unwrap(),
+            original,
+            "the saved original must survive the re-key byte-for-byte"
+        );
+        assert!(
+            crypto::is_encrypted(&std::fs::read(photos.join(name)).unwrap()),
+            "still encrypted at rest, just under the new key"
+        );
+
+        // Idempotent: re-running after an interruption changes nothing.
+        assert_eq!(
+            crate::ingest::convert_photo_originals(&vault, &new, &new).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn making_a_vault_private_decrypts_saved_photo_originals() {
+        // The other direction (passphrase → device): the originals must come back to plaintext, or
+        // "make private" leaves the user's own photos locked to a key the vault no longer has.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let photos = vault.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+
+        let enc = enc_cipher();
+        let plain = MarkdownCipher::plaintext("vault-1");
+        let original = b"raw jpeg bytes".to_vec();
+        // Named as it was saved, under encryption — the name it keeps (we re-encode in place).
+        let name = "cafe1234.jpg.pmenc";
+        enc.write_bytes_to(&photos.join(name), &original).unwrap();
+
+        assert_eq!(
+            crate::ingest::convert_photo_originals(&vault, &enc, &plain).unwrap(),
+            1
+        );
+        let on_disk = std::fs::read(photos.join(name)).unwrap();
+        assert_eq!(on_disk, original, "plaintext on disk after make-private");
+        assert!(!crypto::is_encrypted(&on_disk));
+        assert_eq!(
+            crate::ingest::convert_photo_originals(&vault, &plain, &plain).unwrap(),
+            0,
+            "idempotent once already plaintext"
+        );
+    }
+
+    #[test]
+    fn converting_a_vault_moves_the_documents_and_the_photos_together() {
+        // The actual regression. `convert_photo_originals` working is not the property that broke —
+        // the property that broke is that a key migration converts BOTH halves, and a unit test of
+        // either half alone cannot see the other being forgotten (the same blind spot that let the
+        // #298 passphrase fix ship green: its test guarded the layer BELOW the missed call site).
+        // So test the seam the migration actually calls.
+        let dir = tempfile::tempdir().unwrap();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), key).unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("photos")).unwrap();
+
+        let old = enc_cipher_keyed([3u8; 32]);
+        let new = enc_cipher_keyed([9u8; 32]);
+        old.write_to(&vault.join("a.md.pmenc"), "# A\nalpha")
+            .unwrap();
+        let img = b"photo bytes".to_vec();
+        old.write_bytes_to(&vault.join("photos").join("h.png.pmenc"), &img)
+            .unwrap();
+
+        assert_eq!(
+            crate::ingest::convert_vault_files(&conn, &vault, &old, &new).unwrap(),
+            2,
+            "the document AND the saved original both re-key"
+        );
+        assert_eq!(new.read(&vault.join("a.md.pmenc")).unwrap(), "# A\nalpha");
+        assert_eq!(
+            new.read_bytes(&vault.join("photos").join("h.png.pmenc"))
+                .unwrap(),
+            img,
+            "the photo half is not optional — this is the assert that fails if it is dropped"
+        );
+    }
+
+    #[test]
+    fn a_vault_with_no_saved_photos_converts_cleanly() {
+        // The overwhelmingly common shape: copy-to-vault is opt-in and off by default, so most
+        // vaults have no photos/ dir at all. A missing folder is not an error.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let c = enc_cipher();
+        assert_eq!(
+            crate::ingest::convert_photo_originals(&vault, &c, &c).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1213,6 +1354,35 @@ mod tests {
         );
         assert!(!dest.join("a.md.pmenc").exists(), "no ciphertext suffix");
         assert!(!dest.join("notes.txt").exists(), "non-markdown skipped");
+    }
+
+    #[test]
+    fn export_plaintext_frees_the_saved_photo_originals_too() {
+        // "Never locked in" has to include the images: the originals are encrypted with the same
+        // subkey as the Markdown, so an export that skipped them would hand the user a folder of
+        // documents referencing photos only PM could ever open.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("photos")).unwrap();
+        let c = enc_cipher();
+        c.write_to(&vault.join(c.on_disk_name("a.md")), "# A\nalpha")
+            .unwrap();
+        let img = b"\x89PNG\r\n\x1a\nphoto bytes".to_vec();
+        c.write_bytes_to(&vault.join("photos").join("abc123.png.pmenc"), &img)
+            .unwrap();
+
+        let dest = dir.path().join("export");
+        let n = crate::ingest::export_plaintext(&vault, &c, &dest).unwrap();
+        assert_eq!(n, 2, "the document and the photo both count as written");
+        assert_eq!(
+            std::fs::read(dest.join("photos").join("abc123.png")).unwrap(),
+            img,
+            "decrypted, and under a name an image viewer will actually open"
+        );
+        assert!(
+            !dest.join("photos").join("abc123.png.pmenc").exists(),
+            "no ciphertext suffix survives the export"
+        );
     }
 
     #[test]

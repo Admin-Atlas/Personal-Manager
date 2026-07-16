@@ -5231,12 +5231,22 @@ pub fn read_document_image(state: State<'_, AppState>, doc_id: i64) -> Result<Op
     if saved == 1 {
         if let Some(rel) = vault_path {
             let (vault, cipher) = state.markdown_io()?;
-            let bytes = cipher.read_bytes(&vault.join(&rel))?;
-            let mime = image_mime(&vault::MarkdownCipher::logical_name(&rel));
-            return Ok(Some(ImageData {
-                base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                mime,
-            }));
+            // Degrade, don't fail: a copy that won't decrypt (stranded under a previous passphrase
+            // by a pre-v3.19.2 re-key, or simply missing) must fall through to the original and the
+            // OCR body — the same outcome as never having saved one. Erroring here instead took the
+            // whole reader down over an image, which is the one thing this row is not worth.
+            match cipher.read_bytes(&vault.join(&rel)) {
+                Ok(bytes) => {
+                    let mime = image_mime(&vault::MarkdownCipher::logical_name(&rel));
+                    return Ok(Some(ImageData {
+                        base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        mime,
+                    }));
+                }
+                Err(e) => {
+                    eprintln!("photo {doc_id}: saved vault copy at {rel} is unreadable ({e}); falling back to the original");
+                }
+            }
         }
     }
 

@@ -549,7 +549,13 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
         {
             let mut conn = state.conn()?;
             let tx = conn.transaction()?;
-            ingest::convert_markdown(&tx, &resolved.markdown_dir, &old_cipher, &new_cipher)?;
+            // The WHOLE vault, not just the Markdown: the opt-in saved photo originals are encrypted
+            // with the same subkey, so they move with it or they stay stranded under the old key
+            // forever — the copy the user kept precisely so they could delete the original. Both
+            // halves are idempotent, so an interrupted migration re-runs cleanly; a failure here
+            // leaves the journal at `Markdown` with the backup intact (`copy_tree_verified` is
+            // recursive, so it already holds `photos/`), which is what `recover` restores from.
+            ingest::convert_vault_files(&tx, &resolved.markdown_dir, &old_cipher, &new_cipher)?;
             tx.commit()?;
         }
 
