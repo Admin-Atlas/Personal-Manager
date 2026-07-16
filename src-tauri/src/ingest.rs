@@ -1722,21 +1722,20 @@ fn is_chat_vault_file(cipher: &MarkdownCipher, vault_file: &Path) -> bool {
 }
 
 /// Rebuild a chat session from its vault `.md`. `conversations` / `messages` / `chat_sessions` are never
-/// touched by a rebuild — the authored turns are still the source of truth. We drop the chat's existing
-/// document, reset the index cursor to NULL, and re-run the SAME engine the live/idle indexer uses
-/// ([`chat_index::index_session`]): it re-births the `documents` row with the chat's `source_type`/`source_id`,
-/// re-appends every completed turn-pair stamping per-chunk `chat_turn_id` + `chunk_at`, and re-links
-/// `chat_sessions.document_id`. That is what keeps chat citations (jump-to-turn) and per-chunk recency intact
-/// across a Rebuild, and stops the next idle sweep from birthing a duplicate document. Returns the re-birthed
-/// [`Document`], or `None` for a chat with no substantive turns (small-talk-only ⇒ no document, by design).
+/// touched by a rebuild — the authored turns are still the source of truth. For a chat that already has a
+/// `documents` row we clear its chunk index IN PLACE ([`clear_document_chunks`]) but KEEP the row and its
+/// id, reset only the index cursor to NULL, and re-run the SAME engine the live/idle indexer uses
+/// ([`chat_index::index_session`], in `rebuilding` mode): it re-appends every completed turn-pair onto the
+/// PRESERVED id (its `(Some(id), false)` branch), stamping per-chunk `chat_turn_id` + `chunk_at`. A chat
+/// with no row yet is born fresh, exactly as the live indexer would. Returns the [`Document`], or `None`
+/// for a chat with no substantive turns (small-talk-only ⇒ no document, by design).
 ///
-/// A chat is the ONE document a rebuild still re-births rather than upserting, so its id churns where a
-/// vault document's no longer does. That is deliberate: `index_session` and the append-only cursor it shares
-/// with the live indexer are both written against a birth-from-empty premise, and reworking that seam to be
-/// idempotent is a far larger, riskier change than #371 — for no user-visible gain, since the resume skip
-/// (checked before this is ever called) already spares a finished chat the work. What it costs is what the
-/// old wipe cost every document: this chat's `corrections.document_id` links are nulled and its historical
-/// citations dangle — unchanged from before, and no worse.
+/// Keeping the id is what dissolves the dangling-citation class for chats — the same fix #374 made for
+/// vault documents. Because the `documents` row is never deleted, `corrections.document_id` is no longer
+/// NULLed on every rebuild and jump-to-turn citations keep resolving. The append-only cursor still resets,
+/// so every turn re-embeds from scratch; the birth path (`document_id` NULL) is untouched. A chat whose
+/// preserved row re-indexes to nothing substantive (e.g. a splitter change now trims every turn) is reaped
+/// so we never leave a 0-chunk ghost on the kept id.
 fn rebuild_chat(
     state: &AppState,
     cipher: &MarkdownCipher,
@@ -1753,10 +1752,6 @@ fn rebuild_chat(
 
     {
         let mut conn = state.conn()?;
-        // Clear the previous document BEFORE `index_session` re-births one. Without the wipe that used to
-        // precede this, the old row still owns this chat's `vault_path` — which is NOT NULL UNIQUE — so the
-        // re-birth would collide and fail every chat on every rebuild. Deleting through the shared cascade
-        // also drops its chunks/vectors/FTS rows, which nothing else would have reclaimed.
         let existing: Option<i64> = conn
             .query_row(
                 "SELECT document_id FROM chat_sessions WHERE conversation_id = ?1",
@@ -1766,21 +1761,37 @@ fn rebuild_chat(
             .optional()?
             .flatten();
         let tx = conn.transaction()?;
-        if let Some(doc_id) = existing {
-            delete_document(&tx, doc_id)?;
+        match existing {
+            // Keep the row and its id: clear only its chunk index IN PLACE and reset the cursor, so
+            // `index_session` re-appends onto the SAME id instead of re-birthing. That is what keeps chat
+            // citations + `corrections.document_id` anchored across a Rebuild (#374 for chats). The row
+            // still owns this chat's `vault_path` (NOT NULL UNIQUE), so nothing collides.
+            Some(doc_id) => {
+                clear_document_chunks(&tx, doc_id)?;
+                tx.execute(
+                    "UPDATE chat_sessions SET last_indexed_turn_id = NULL WHERE conversation_id = ?1",
+                    params![conversation_id],
+                )?;
+            }
+            // Never indexed (no substance yet): nothing to clear; reset the cursor so the engine re-reads
+            // from the start and births the row if this pass finds substance.
+            None => {
+                tx.execute(
+                    "UPDATE chat_sessions SET document_id = NULL, last_indexed_turn_id = NULL \
+                     WHERE conversation_id = ?1",
+                    params![conversation_id],
+                )?;
+            }
         }
-        tx.execute(
-            "UPDATE chat_sessions SET document_id = NULL, last_indexed_turn_id = NULL \
-             WHERE conversation_id = ?1",
-            params![conversation_id],
-        )?;
         tx.commit()?;
     }
-    crate::chat_index::index_session(state, conversation_id)?;
+    // `rebuilding = true`: reuse the preserved id and skip the card-F append re-evaluation (the authored
+    // classification is restored from the file just below).
+    crate::chat_index::index_session(state, conversation_id, true)?;
 
     // The session row exists (its vault file implies an earlier `record_turn_pair` upsert). document_id is
     // NULL again only if index_session found nothing substantive to index (small-talk-only chat).
-    let conn = state.conn()?;
+    let mut conn = state.conn()?;
     // `.optional()` because the session row may not exist at all: a chat deletion drops `conversations`
     // (cascading `chat_sessions`) and then removes the vault file as a separate, non-transactional step,
     // so a file left behind by a failed/locked delete is a reachable orphan. Without this the bare
@@ -1798,6 +1809,24 @@ fn rebuild_chat(
     let Some(id) = doc_id else {
         return Ok(None);
     };
+    // Reap a chat whose preserved row re-indexed to nothing substantive (e.g. a splitter change now trims
+    // every turn as trivial): honour the small-talk-only contract (no document) rather than leave a
+    // 0-chunk ghost on the kept id.
+    let chunk_count: i64 = conn.query_row(
+        "SELECT count(*) FROM chunks WHERE document_id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    if chunk_count == 0 {
+        let tx = conn.transaction()?;
+        delete_document(&tx, id)?;
+        tx.execute(
+            "UPDATE chat_sessions SET document_id = NULL WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        tx.commit()?;
+        return Ok(None);
+    }
 
     // index_session re-births the row classified from the chat's ORIGIN scope (`chat_doc_meta`), which would
     // discard a user's later filing/archiving. The vault front-matter is a chat's organisational TRUTH (card
@@ -2319,17 +2348,13 @@ pub(crate) fn replace_chunks(
     insert_chunks(tx, doc_id, chunks, embeddings, index_only, stored_summary)
 }
 
-/// Purge one document entirely: its `chunk_vec` + `chunks_fts` mirror rows, its `chunks`, and the
-/// `documents` row itself. This is the exact cascade a "delete document" uses (card 7G deletes a chat
-/// through it); it also matches the global teardown order at the top of [`rebuild`].
-///
-/// Order matters. `chunk_vec` (sqlite-vec vec0) and `chunks_fts` (FTS5) are NOT FK targets — they are
-/// keyed by `chunks.id` (rowid mirror), so their rows MUST be deleted while the `chunks` rows they key
-/// off still exist (exactly as [`replace_chunks`] does). Then `chunks`, then the `documents` row.
-/// Deleting `documents` is explicit: `chunks.document_id` cascades in the *delete-documents* direction,
-/// but we delete bottom-up, so without this the `documents` row would be left orphaned. Caller owns the
-/// transaction.
-pub(crate) fn delete_document(tx: &Connection, doc_id: i64) -> Result<()> {
+/// Clear a document's chunk index — its `chunk_vec` + `chunks_fts` mirror rows and its `chunks` — but
+/// WITHOUT deleting the `documents` row, so the row and its id survive (with its citations and its
+/// `corrections.document_id` FK). Order matters: the rowid-keyed mirrors (`chunk_vec` vec0, `chunks_fts`
+/// FTS5) are NOT FK targets, so they must be deleted while the `chunks` they key off still exist —
+/// exactly as [`replace_chunks`] does. Caller owns the transaction. [`rebuild_chat`] uses this to
+/// re-index a chat onto its stable id.
+pub(crate) fn clear_document_chunks(tx: &Connection, doc_id: i64) -> Result<()> {
     tx.execute(
         "DELETE FROM chunk_vec WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
         params![doc_id],
@@ -2339,6 +2364,15 @@ pub(crate) fn delete_document(tx: &Connection, doc_id: i64) -> Result<()> {
         params![doc_id],
     )?;
     tx.execute("DELETE FROM chunks WHERE document_id = ?1", params![doc_id])?;
+    Ok(())
+}
+
+/// Purge one document entirely: [`clear_document_chunks`] plus the `documents` row itself. This is the
+/// exact cascade a "delete document" uses (card 7G deletes a chat through it); it also matches the global
+/// teardown order at the top of [`rebuild`]. Deleting `documents` is explicit: `chunks.document_id`
+/// cascades in the *delete-documents* direction, but we delete bottom-up. Caller owns the transaction.
+pub(crate) fn delete_document(tx: &Connection, doc_id: i64) -> Result<()> {
+    clear_document_chunks(tx, doc_id)?;
     tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])?;
     Ok(())
 }

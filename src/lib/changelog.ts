@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.21.0-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Rebuilding your index no longer breaks links to your chats. When PM rebuilds its search index it re-processes every chat — and it used to give each rebuilt chat a brand-new internal identity, quietly breaking saved references to it (the 'jump to this chat' links, and the corrections PM had learned from it). Rebuilt chats now keep their identity, so those links survive — the same fix documents got in an earlier release.",
+      "Cleaned up rare duplicate entries left over from indexing one shared Google Drive on two accounts. If you'd indexed the same shared drive from two connected accounts before PM learned to de-duplicate them, a leftover duplicate could linger. PM now merges away any duplicate whose filing matches — and where two copies were filed differently, it leaves both rather than guess which to keep and risk discarding your filing.",
+    ],
+  },
+  {
     version: "3.20.0-alpha",
     date: "2026-07-16",
     highlights: [

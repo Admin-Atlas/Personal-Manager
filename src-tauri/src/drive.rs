@@ -128,6 +128,120 @@ pub fn shared_drive_of(source_id: &str) -> Option<String> {
         .map(|(drive_id, _)| drive_id.to_string())
 }
 
+/// The account-independent survivor id for a legacy per-account shared-drive **twin**. v19 re-keyed
+/// `gdrive:<email>:sd:<driveId>:<fileId>` → `gdrive:sd:<driveId>:<fileId>`; a twin is the row that
+/// survived that re-key AT ITS OLD ID because its survivor already existed (the migration's `UPDATE OR
+/// IGNORE` left the colliding second row untouched). Returns `None` for anything that is not a legacy
+/// per-account shared-drive id — a My-Drive id, or an already-new-namespace `gdrive:sd:` id.
+pub fn twin_survivor_id(source_id: &str) -> Option<String> {
+    if !source_id.starts_with("gdrive:") || source_id.starts_with("gdrive:sd:") {
+        return None;
+    }
+    let idx = source_id.find(":sd:")?;
+    Some(format!("gdrive:sd:{}", &source_id[idx + 4..]))
+}
+
+/// The outcome of a shared-drive twin sweep (v19 follow-up).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TwinSweep {
+    /// Twins whose filing matched their survivor exactly — retired as harmless duplicates (merged).
+    pub retired: usize,
+    /// Twins whose filing DIFFERED from their survivor — left in place. Which classification wins is a
+    /// user-facing merge decision we never guess at; counted so we know whether any real conflict exists.
+    pub divergent: usize,
+    /// Twins with no survivor (unexpected post-v19) — re-keyed into the new namespace (adopted).
+    pub adopted: usize,
+}
+
+/// Resolve the v19 shared-drive "twins" left stranded when two connected accounts had indexed the same
+/// shared drive BEFORE the account-independent re-key. A twin is a `gdrive:<email>:sd:...` index-only row
+/// whose survivor (`gdrive:sd:...`) already exists. Policy (Bobby, 16-07-2026): a twin whose filing is
+/// IDENTICAL to its survivor is a harmless duplicate and is RETIRED (merged); a twin whose filing DIFFERS
+/// is a merge the user must adjudicate (which classification wins), so we NEVER guess and silently
+/// discard filing — it is left in place and counted, pending a user-facing resolution (deferred). A twin
+/// with no survivor (should not occur post-v19) is adopted into the new namespace so it stops being
+/// stranded, its filing riding along untouched.
+///
+/// Runs as runtime connector cleanup (called from the vault-open reconcile), NEVER inside a migration —
+/// rule #3 forbids a migration DELETE; a runtime reconcile legitimately deletes, as it does for vanished
+/// files. Idempotent: after it runs, no identical twin remains; a divergent twin stays and is re-scanned
+/// (cheaply) each open until the deferred resolution ships. Caller owns the connection.
+pub fn resolve_shared_drive_twins(conn: &Connection) -> Result<TwinSweep> {
+    type TwinRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        Option<i64>,
+    );
+    // (project, tags, importance, reviewed, entity_id) — a survivor's comparable classification.
+    type SurvivorClass = (String, String, Option<String>, i64, Option<i64>);
+    let twins: Vec<TwinRow> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id, project, tags, importance, reviewed, entity_id FROM documents \
+             WHERE source_type = 'index_only' AND source_id LIKE 'gdrive:%:sd:%'",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    let mut sweep = TwinSweep::default();
+    for (id, source_id, project, tags, importance, reviewed, entity_id) in twins {
+        let Some(survivor_id) = twin_survivor_id(&source_id) else {
+            continue; // defensive: not actually a per-account twin
+        };
+        let survivor: Option<SurvivorClass> = conn
+            .query_row(
+                "SELECT project, tags, importance, reviewed, entity_id FROM documents \
+                 WHERE source_type = 'index_only' AND source_id = ?1",
+                params![survivor_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        match survivor {
+            None => {
+                // No survivor: the twin is the only copy — adopt it into the new namespace (its filing
+                // rides along). OR IGNORE guards a late collision; if it collides it is a genuine
+                // duplicate the identical/divergent logic settles on the next pass.
+                conn.execute(
+                    "UPDATE OR IGNORE documents SET source_id = ?1 WHERE id = ?2",
+                    params![survivor_id, id],
+                )?;
+                sweep.adopted += 1;
+            }
+            Some((s_project, s_tags, s_importance, s_reviewed, s_entity)) => {
+                let identical = project == s_project
+                    && tags == s_tags
+                    && importance == s_importance
+                    && reviewed == s_reviewed
+                    && entity_id == s_entity;
+                if identical {
+                    let tx = conn.unchecked_transaction()?;
+                    crate::ingest::delete_document(&tx, id)?;
+                    tx.commit()?;
+                    sweep.retired += 1;
+                } else {
+                    // Divergent filing: a user-facing merge decision — left untouched, deferred.
+                    sweep.divergent += 1;
+                }
+            }
+        }
+    }
+    Ok(sweep)
+}
+
 // --- account registry (connector_sources rows for provider=google service=drive) ----------------
 
 /// A connected Drive account, for the Settings list + status.
@@ -1636,6 +1750,8 @@ mod tests {
     use super::*;
     use crate::index_only::SourceState;
 
+    const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
     fn file(id: &str, mime: &str, md5: Option<&str>, modified: &str) -> DriveFile {
         DriveFile {
             id: id.into(),
@@ -1657,6 +1773,75 @@ mod tests {
         assert!(sid.starts_with("gdrive:a@b.com:"));
         assert_eq!(account_of(&sid).as_deref(), Some("a@b.com"));
         assert_eq!(account_of("not-a-drive-id"), None);
+    }
+
+    #[test]
+    fn twin_survivor_id_maps_only_legacy_per_account_shared_ids() {
+        assert_eq!(
+            twin_survivor_id("gdrive:a@b.com:sd:DRIVE1:FILE9").as_deref(),
+            Some("gdrive:sd:DRIVE1:FILE9")
+        );
+        assert_eq!(
+            twin_survivor_id("gdrive:sd:DRIVE1:FILE9"),
+            None,
+            "already the new account-independent namespace"
+        );
+        assert_eq!(
+            twin_survivor_id("gdrive:a@b.com:FILE9"),
+            None,
+            "a My-Drive id"
+        );
+        assert_eq!(twin_survivor_id("not-a-drive-id"), None);
+    }
+
+    #[test]
+    fn resolve_shared_drive_twins_retires_identical_and_leaves_divergent() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let insert = |sid: &str, project: &str| {
+            conn.execute(
+                "INSERT INTO documents(source_type, source_id, title, project, tags, reviewed, vault_path, content_hash) \
+                 VALUES ('index_only', ?1, ?2, ?3, '[]', 1, ?4, ?5)",
+                params![sid, format!("t-{sid}"), project, format!("v/{sid}"), format!("h-{sid}")],
+            )
+            .unwrap();
+        };
+        // Twin A: identical filing to its survivor → retired.
+        insert("gdrive:sd:D1:F1", "Taxes"); // survivor
+        insert("gdrive:a@b.com:sd:D1:F1", "Taxes"); // identical twin
+                                                    // Twin B: divergent filing → left for the user to resolve.
+        insert("gdrive:sd:D2:F2", "Work"); // survivor
+        insert("gdrive:a@b.com:sd:D2:F2", "Personal"); // divergent twin
+
+        let sweep = resolve_shared_drive_twins(&conn).unwrap();
+        assert_eq!(sweep.retired, 1, "the identical duplicate is merged away");
+        assert_eq!(sweep.divergent, 1, "the divergent one is never guessed");
+        assert_eq!(sweep.adopted, 0);
+
+        let count = |sid: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM documents WHERE source_id = ?1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count("gdrive:a@b.com:sd:D1:F1"),
+            0,
+            "identical twin retired"
+        );
+        assert_eq!(count("gdrive:sd:D1:F1"), 1, "its survivor is kept");
+        assert_eq!(
+            count("gdrive:a@b.com:sd:D2:F2"),
+            1,
+            "the divergent twin survives untouched for a user-facing merge"
+        );
+
+        // Idempotent: a second pass merges nothing more and never re-mutates the divergent one.
+        let again = resolve_shared_drive_twins(&conn).unwrap();
+        assert_eq!(again.retired, 0);
+        assert_eq!(again.divergent, 1);
     }
 
     #[test]

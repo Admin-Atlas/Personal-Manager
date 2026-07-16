@@ -532,10 +532,13 @@ const MIGRATIONS: &[&str] = &[
     // Existing per-account shared-drive pointers are RE-KEYED in place to the new namespace, not
     // dropped: rule #3 requires an old→new mapping that preserves every user classification (and the
     // embeddings ride along for free). Where two accounts had indexed the same drive, the second row
-    // collides on the source_id unique index and is left at its old id for the next sync's reconcile
-    // to retire. Clearing every Drive account's delta cursor forces a re-baseline under the new
-    // namespace (My Drive re-enumerates as no-op Updates; each shared drive is indexed once, by its
-    // owner) — reconciling the rare lingering twin away.
+    // collides on the source_id unique index and is left at its old id (a "twin"). NOTE: the original
+    // claim that "the next sync's reconcile retires the twin" was never true — the reconcile only ever
+    // matches the NEW `gdrive:sd:` namespace, so the twin was invisible to it and stranded forever.
+    // `drive::resolve_shared_drive_twins` (run at vault open, v3.21.0) is what actually retires an
+    // identical twin and surfaces a divergent one. Clearing every Drive account's delta cursor still
+    // forces a re-baseline under the new namespace (My Drive re-enumerates as no-op Updates; each
+    // shared drive is indexed once, by its owner).
     r#"
     CREATE TABLE shared_drive_access (
         drive_id   TEXT NOT NULL,
@@ -554,8 +557,9 @@ const MIGRATIONS: &[&str] = &[
     -- overwrite). `substr(id, instr(id,':sd:')+4)` keeps `<driveId>:<fileId>` verbatim, so the row —
     -- its classification (project/importance/reviewed/entity_id) AND its embedding — survives intact.
     -- Where two accounts indexed the same drive the second row would collide on the source_id unique
-    -- index; OR IGNORE leaves that twin at its old id for the next sync's reconcile to retire (it is a
-    -- pointer, not file bytes, and the surviving copy keeps its label — nothing real is lost).
+    -- index; OR IGNORE leaves that twin at its old id. `drive::resolve_shared_drive_twins` (vault-open,
+    -- v3.21.0) retires an identical twin and surfaces a divergent one — the reconcile never could, as
+    -- it matches only the new `gdrive:sd:` namespace. It is a pointer, not file bytes; nothing is lost.
     UPDATE OR IGNORE documents
        SET source_id = 'gdrive:sd:' || substr(source_id, instr(source_id, ':sd:') + 4)
      WHERE source_type = 'index_only' AND source_id LIKE 'gdrive:%:sd:%';

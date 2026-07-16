@@ -102,7 +102,17 @@ struct SessionPlan {
 /// session + new pairs under a short lock, chunks/embeds each pair off the lock, then lands them all in
 /// one transaction. A best-effort unit — a failure leaves the cursor untouched, so the next sweep
 /// retries from exactly where this one stopped.
-pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Outcome> {
+///
+/// `rebuilding` is set only by [`ingest::rebuild_chat`], which re-indexes a chat onto its EXISTING
+/// (preserved) document id. It suppresses the card-F append re-evaluation: a rebuild replays every turn
+/// as an "append", but the chat's authored classification is restored from the vault file right after,
+/// so re-evaluating here would transiently un-archive the row and (worse) mirror that change into the
+/// file, leaking an un-archive on the next rebuild. The live/idle sweep passes `false`.
+pub(crate) fn index_session(
+    state: &AppState,
+    conversation_id: i64,
+    rebuilding: bool,
+) -> Result<Outcome> {
     // 1. Short lock: the session row, its conversation context, and the pairs past the cursor.
     let (plan, pairs) = {
         let conn = state.conn()?;
@@ -233,7 +243,14 @@ pub(crate) fn index_session(state: &AppState, conversation_id: i64) -> Result<Ou
     let indexed_turns = segments.len();
     let (doc_id, chunks, reclassified) = {
         let mut conn = state.conn()?;
-        commit_session_index(&mut conn, &plan, &segments, newest.turn_id, &newest.at)?
+        commit_session_index_mode(
+            &mut conn,
+            &plan,
+            &segments,
+            newest.turn_id,
+            &newest.at,
+            rebuilding,
+        )?
     };
 
     // If the append re-evaluated the chat's bucket (card F), mirror the new importance/reviewed back into
@@ -407,12 +424,26 @@ pub(crate) fn mirror_title(state: &AppState, conversation_id: i64, title: &str) 
 /// exchanged small talk gets no empty document). Pure DB logic (no sidecar), so the append-only
 /// invariants are unit-tested directly. Caller owns the connection; this opens and commits its own
 /// transaction.
+/// Test-only convenience: commit in normal (non-rebuild) mode. The pure-DB unit tests call this;
+/// `index_session` calls [`commit_session_index_mode`] directly with the live `rebuilding` flag.
+#[cfg(test)]
 fn commit_session_index(
     conn: &mut Connection,
     plan: &SessionPlan,
     segments: &[IndexedSegment],
     cursor_to: i64,
     cursor_at: &str,
+) -> Result<(Option<i64>, usize, bool)> {
+    commit_session_index_mode(conn, plan, segments, cursor_to, cursor_at, false)
+}
+
+fn commit_session_index_mode(
+    conn: &mut Connection,
+    plan: &SessionPlan,
+    segments: &[IndexedSegment],
+    cursor_to: i64,
+    cursor_at: &str,
+    rebuilding: bool,
 ) -> Result<(Option<i64>, usize, bool)> {
     let tx = conn.transaction()?;
 
@@ -479,7 +510,10 @@ fn commit_session_index(
             // throwaway (archived) or already-filed chat into a real discussion — the classification must not
             // be sticky. Only fires on an append (`plan.document_id` was set on entry), never on the birth
             // above (which was just classified). Keys on the appended turns, not the whole history.
-            if plan.document_id.is_some() {
+            // Skipped on a rebuild: rebuild_chat replays every turn as an append but restores the
+            // authored classification from the vault file straight after, so a re-eval here would
+            // transiently un-archive the row and leak that back into the file via the mirror below.
+            if plan.document_id.is_some() && !rebuilding {
                 reclassified = reevaluate_on_append(&tx, doc_id, &plan.scope)?;
             }
         }
@@ -617,7 +651,7 @@ pub(crate) fn reconcile_chat_index(state: &AppState) -> Result<Summary> {
 
     let mut summary = Summary::default();
     for conv in candidates {
-        match index_session(state, conv) {
+        match index_session(state, conv, false) {
             Ok(Outcome::Indexed { turns, chunks }) => {
                 summary.sessions += 1;
                 summary.turns += turns;
@@ -1055,6 +1089,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor, Some(4));
+    }
+
+    #[test]
+    fn a_rebuild_append_does_not_re_evaluate_the_chats_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_session(&conn, "general");
+
+        // Birth the chat document, then archive it (as a user would shelve a chat).
+        let p = plan(&conn, conv);
+        let (doc_id, _, _) = commit_session_index(
+            &mut conn,
+            &p,
+            &[segment(2, "2026-06-28T10:00:01.000Z", "first")],
+            2,
+            "2026-06-28T10:00:01.000Z",
+        )
+        .unwrap();
+        let doc_id = doc_id.unwrap();
+        conn.execute(
+            "UPDATE documents SET importance = 'archive' WHERE id = ?1",
+            params![doc_id],
+        )
+        .unwrap();
+
+        // A REBUILD append (rebuilding = true) must NOT re-evaluate: the row stays archived. rebuild_chat
+        // restores the authored classification from the file itself, so a re-eval here would leak an
+        // un-archive into the vault on the next rebuild.
+        let p_rebuild = plan(&conn, conv);
+        let (_, _, reclassified) = commit_session_index_mode(
+            &mut conn,
+            &p_rebuild,
+            &[segment(4, "2026-06-28T10:05:00.000Z", "second")],
+            4,
+            "2026-06-28T10:05:00.000Z",
+            true,
+        )
+        .unwrap();
+        assert!(!reclassified, "a rebuild append never re-evaluates");
+        let importance: Option<String> = conn
+            .query_row(
+                "SELECT importance FROM documents WHERE id = ?1",
+                params![doc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            importance.as_deref(),
+            Some("archive"),
+            "rebuild leaves the archived bucket untouched"
+        );
+
+        // A NORMAL append (the live sweep) DOES re-evaluate an archived general chat back into review.
+        let p_live = plan(&conn, conv);
+        let (_, _, reclassified) = commit_session_index_mode(
+            &mut conn,
+            &p_live,
+            &[segment(6, "2026-06-28T10:10:00.000Z", "third")],
+            6,
+            "2026-06-28T10:10:00.000Z",
+            false,
+        )
+        .unwrap();
+        assert!(reclassified, "a live append re-evaluates an archived chat");
+        let importance: Option<String> = conn
+            .query_row(
+                "SELECT importance FROM documents WHERE id = ?1",
+                params![doc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            importance, None,
+            "the live append un-archived it back into review"
+        );
     }
 
     #[test]
