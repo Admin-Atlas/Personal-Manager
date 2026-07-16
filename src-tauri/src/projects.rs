@@ -438,7 +438,44 @@ pub fn rename_project_satellites(conn: &Connection, old: &str, new: &str) -> Res
     // 6. Drop the now-childless source triage row (all FK children moved in 2-3; conversations and the
     //    parent/blocker pointers carry no FK, so nothing cascades).
     conn.execute("DELETE FROM projects WHERE name = ?1", params![old])?;
+    // 7. Re-key project-bound pinboard timeline widgets. The board is an opaque JSON blob under
+    //    settings['pinboard']; rewrite only the `project` bindings equal to `old` (a generic JSON walk,
+    //    so every other widget field is preserved and nothing is removed) so a renamed/merged project's
+    //    timeline widget doesn't silently go blank (#279). Inside this transaction, so it commits with
+    //    the rest. PM is single-window and the rename UI is a different tab than the Pinboard, so the
+    //    board isn't mounted during a rename; it re-reads the re-keyed blob on its next mount.
+    if let Some(blob) = crate::db::get_setting(conn, "pinboard")? {
+        if let Some(rekeyed) = rekey_pinboard_project(&blob, old, new) {
+            crate::db::set_setting(conn, "pinboard", &rekeyed)?;
+        }
+    }
     Ok(())
+}
+
+/// Re-key a pinboard blob's project-bound widget bindings from `old` to `new`, across the board's
+/// widgets and one level of folder children. Works on the JSON GENERICALLY (`serde_json::Value`), so
+/// every other widget field is preserved untouched — only a `project` string equal to `old` is
+/// rewritten, and nothing is ever removed. Returns `Some(new_json)` when at least one binding changed,
+/// else `None` (no write needed). A malformed blob returns `None` (left for the frontend's own guard).
+pub fn rekey_pinboard_project(blob: &str, old: &str, new: &str) -> Option<String> {
+    fn rewrite(widgets: &mut [serde_json::Value], old: &str, new: &str, changed: &mut bool) {
+        for w in widgets.iter_mut() {
+            if w.get("project").and_then(|p| p.as_str()) == Some(old) {
+                w["project"] = serde_json::Value::String(new.to_string());
+                *changed = true;
+            }
+            if let Some(children) = w.get_mut("children").and_then(|c| c.as_array_mut()) {
+                rewrite(children, old, new, changed);
+            }
+        }
+    }
+    let mut value: serde_json::Value = serde_json::from_str(blob).ok()?;
+    let widgets = value.get_mut("widgets")?.as_array_mut()?;
+    let mut changed = false;
+    rewrite(widgets, old, new, &mut changed);
+    changed
+        .then(|| serde_json::to_string(&value).ok())
+        .flatten()
 }
 
 /// Trim a value and treat blank as absent.
@@ -640,6 +677,39 @@ pub fn document_samples(conn: &Connection, project: &str) -> Result<Vec<String>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rekey_pinboard_project_rewrites_only_matching_bindings_and_preserves_the_rest() {
+        let blob = r#"{"version":1,"widgets":[
+            {"id":"w1","kind":"timeline","project":"Old","rect":{"x":0},"showOnCalendar":true},
+            {"id":"w2","kind":"note","text":"hi"},
+            {"id":"f1","kind":"folder","children":[
+                {"id":"w3","kind":"timeline","project":"Old","view":"list"},
+                {"id":"w4","kind":"timeline","project":"Other"}
+            ]}
+        ]}"#;
+        let out = rekey_pinboard_project(blob, "Old", "New").expect("a binding changed");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let widgets = v["widgets"].as_array().unwrap();
+        assert_eq!(widgets[0]["project"], "New", "top-level binding re-keyed");
+        assert_eq!(widgets[0]["showOnCalendar"], true, "other fields preserved");
+        assert_eq!(widgets[0]["rect"]["x"], 0);
+        assert_eq!(widgets[1]["text"], "hi", "the untouched note is intact");
+        let children = widgets[2]["children"].as_array().unwrap();
+        assert_eq!(
+            children[0]["project"], "New",
+            "nested folder-child re-keyed"
+        );
+        assert_eq!(children[0]["view"], "list", "its other field preserved");
+        assert_eq!(
+            children[1]["project"], "Other",
+            "a different project is untouched"
+        );
+
+        // No matching binding → None (no write). Malformed blob → None (leave it be).
+        assert!(rekey_pinboard_project(blob, "Nonexistent", "X").is_none());
+        assert!(rekey_pinboard_project("not json", "Old", "New").is_none());
+    }
 
     fn signals<'a>() -> StatusSignals<'a> {
         StatusSignals {
