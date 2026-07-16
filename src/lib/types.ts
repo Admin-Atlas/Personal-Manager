@@ -717,10 +717,12 @@ export interface DriveSyncState {
 export interface PassphraseScore {
   /** zxcvbn strength, 0 (weakest) .. 4 (strongest). */
   score: number;
-  /** True iff it clears the create/change floor (length AND score). */
+  /** True iff it clears the create/change floor (padding AND length AND score). */
   acceptable: boolean;
   /** Non-empty but below the length floor. */
   too_short: boolean;
+  /** Starts or ends with whitespace — refused at create/change (kdf.rs policy Rule 2). */
+  padded: boolean;
   /** A short human warning when weak, else null. */
   warning: string | null;
   /** Actionable suggestions to strengthen it. */

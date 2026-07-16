@@ -127,7 +127,7 @@ export function VaultCard() {
       window.location.reload();
     } catch (e) {
       // Classified copy: folder-denied ≠ wrong passphrase ≠ no vault ≠ damaged store.
-      setError(joinErrorMessage(e));
+      setError(joinErrorMessage(e, pass));
       setBusy(false);
     }
   }

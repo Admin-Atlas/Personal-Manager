@@ -354,6 +354,24 @@ fn current_key_hex(meta: &VaultMeta) -> Result<Secret> {
         .ok_or_else(|| Error::Other("the vault must be unlocked before it can be migrated".into()))
 }
 
+/// The passphrase a plan hands to the KDF: **exactly what the user typed**, or `None` when the
+/// plan carries no passphrase at all (a move of an already-shareable vault, which keeps its key).
+///
+/// The one rule this encodes is `kdf.rs` policy Rule 1 — no normalization, ever. Until 3.19.1 this
+/// site trimmed *before* deriving while every read path hashed raw, keying a vault to a string its
+/// owner could never retype. The trim survives only in the predicate, where it answers "is there a
+/// passphrase at all" and never touches the bytes: a whitespace-only string still means "no re-key",
+/// as it always did. Kept pure and separate so the rule is locked by a test that needs no key
+/// derivation — a test one layer below the decision is precisely what let the original fix ship green.
+pub(crate) fn new_passphrase_for(plan: &MigrationPlan) -> Option<&str> {
+    plan.new_passphrase
+        .as_deref()
+        // Zeroizing<String> -> &String -> &str. A type conversion ONLY: the bug this function
+        // exists to prevent looked exactly like this line but read `.map(|s| s.trim())`.
+        .map(String::as_str)
+        .filter(|p| !p.trim().is_empty())
+}
+
 /// Resolve a plan to the new SQLCipher key (64-hex) and the new metadata, preserving the
 /// vault id. Derives a fresh passphrase key (make-shareable / change-passphrase), reuses
 /// the device key (make-private), or keeps the current key (a move with no key change).
@@ -363,12 +381,7 @@ fn plan_new_key_and_meta(
 ) -> Result<(Secret, VaultMeta)> {
     match plan.target_key_mode {
         KeyMode::Passphrase => {
-            match plan
-                .new_passphrase
-                .as_deref()
-                .map(|s| s.trim())
-                .filter(|p| !p.is_empty())
-            {
+            match new_passphrase_for(plan) {
                 // New passphrase set: derive a new key + meta, keeping the vault id.
                 // prepare_shareable also marks the Markdown encrypted (the invariant).
                 Some(pass) => Ok(prepare_shareable(old_meta, pass).map(|(m, k)| (k, m))?),
@@ -910,6 +923,93 @@ mod tests {
             plan(KeyMode::Device, None, MarkdownEncryption::None)
         );
         assert!(none.contains("new_passphrase: None"));
+    }
+
+    #[test]
+    fn a_new_passphrase_is_keyed_to_the_exact_bytes_the_user_typed() {
+        // The lockout #298 was meant to close and didn't: this site trimmed before deriving
+        // while every read path (unlock, adopt, restore) hashes raw, so a vault created or
+        // re-keyed with a padded passphrase was keyed to a string its owner could never
+        // retype. Nothing on disk records which form built a key, and the creator's cached
+        // key hides it until someone actually types the passphrase — a second account
+        // joining, or an unlock after "forget passphrase here". kdf.rs's Rule-1 test guards
+        // `derive_master` itself and so cannot see a trim in a CALLER; this one can.
+        //
+        // Deliberately expensive (~6s measured): it drives the REAL create path, so it pays a
+        // full `kdf::calibrate` — a dozen-odd Argon2 derivations each targeting 350ms — plus two
+        // more to check the result. `new_passphrase_for` locks the same rule in microseconds; this
+        // one exists to prove the wiring underneath it (that prepare_shareable really keys the meta
+        // and verifier to those bytes), which is worth the seconds for the vault's master key.
+        let padded = "  correct horse battery staple  ";
+        let dir = tempfile::tempdir().unwrap();
+        let old = super::super::ensure_device_meta(dir.path()).unwrap();
+        let (key, meta) = plan_new_key_and_meta(
+            &old,
+            &plan(
+                KeyMode::Passphrase,
+                Some(padded),
+                MarkdownEncryption::XChaCha20Poly1305,
+            ),
+        )
+        .unwrap();
+
+        // What unlock does, verbatim: derive from the exact bytes, check the verifier.
+        let typed = crate::vault::derive_master_from_passphrase(&meta, padded).unwrap();
+        assert!(
+            crate::vault::verifier::check(meta.verifier.as_ref().unwrap(), &typed).unwrap(),
+            "the passphrase the user typed must open the vault it just created"
+        );
+        assert_eq!(key.expose(), crate::vault::db_key_hex(&typed).expose());
+
+        // ...and the trimmed form — what the bug keyed it to — must NOT be the key.
+        let trimmed = crate::vault::derive_master_from_passphrase(&meta, padded.trim()).unwrap();
+        assert_ne!(key.expose(), crate::vault::db_key_hex(&trimmed).expose());
+
+        // The re-key keeps the vault's identity (prepare_shareable's contract).
+        assert_eq!(meta.vault_id, old.vault_id);
+    }
+
+    #[test]
+    fn new_passphrase_for_hands_over_the_exact_bytes_and_blank_means_no_re_key() {
+        // kdf.rs Rule 1 at the one site that broke it, locked without deriving a key. The first
+        // assertion is the whole regression: padding must reach the KDF, not a trimmed copy.
+        let md = MarkdownEncryption::XChaCha20Poly1305;
+        let padded = plan(KeyMode::Passphrase, Some("  correct horse  "), md);
+        assert_eq!(new_passphrase_for(&padded), Some("  correct horse  "));
+
+        // The trim that survives: it classifies, it never edits. Blank in any form means "no new
+        // passphrase" (a move with no re-key), exactly as before the fix.
+        assert_eq!(
+            new_passphrase_for(&plan(KeyMode::Passphrase, Some("   "), md)),
+            None
+        );
+        assert_eq!(
+            new_passphrase_for(&plan(KeyMode::Passphrase, Some(""), md)),
+            None
+        );
+        assert_eq!(
+            new_passphrase_for(&plan(KeyMode::Passphrase, None, md)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_device_vault_with_a_blank_passphrase_is_told_to_supply_one() {
+        // Not the "no re-key" branch (that one needs a Passphrase old_meta and a keychain): this
+        // pins the OTHER half of the None arm — a device vault asked to go shareable with nothing
+        // to derive from must refuse, never silently key itself to "   " or to the device key.
+        let dir = tempfile::tempdir().unwrap();
+        let device = super::super::ensure_device_meta(dir.path()).unwrap();
+        let err = plan_new_key_and_meta(
+            &device,
+            &plan(
+                KeyMode::Passphrase,
+                Some("   "),
+                MarkdownEncryption::XChaCha20Poly1305,
+            ),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("passphrase is required"));
     }
 
     #[test]

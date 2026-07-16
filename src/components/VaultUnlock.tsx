@@ -10,6 +10,7 @@
 import { useState } from "react";
 import { detachFromSharedVault, unlockVault, vaultFaultOf } from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
+import { paddedPassphraseHint } from "../lib/vaultPassphrase";
 import { Button, Input } from "./ui";
 import { DetachConfirm, RepairAccessButton } from "./VaultRecovery";
 
@@ -46,7 +47,8 @@ export function VaultUnlock({
         );
       } else if (fault?.code === "wrong-passphrase") {
         setError(
-          "That passphrase doesn't match this vault. If it was changed, check with whoever set it.",
+          "That passphrase doesn't match this vault. If it was changed, check with whoever set it." +
+            paddedPassphraseHint(pass),
         );
       } else {
         setError(String(e));
