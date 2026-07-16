@@ -19,6 +19,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.19.5-alpha",
+    date: "2026-07-16",
+    highlights: [
+      "Files from your connected accounts are no longer buried in search results. PM doesn't keep the contents of Drive or OneDrive files on your machine, so it stored a short summary and left a placeholder — \"(body available at the source)\" — where the text would go. Several parts of PM read that placeholder as if it were the file: the step that ranks results by relevance judged every connected file on that one sentence and pushed them all to the bottom, chat answers cited files it couldn't actually read, and the assistant that suggests a project's details saw the same line for every file. They all now read the summary PM does have.",
+      "Renaming a note now renames it everywhere. Changing a note's title on the Pinboard and saving it left the old title on the document itself — in search, in citations, and in the file in your vault — because PM decided nothing had changed by looking only at the body. The title counts as a change now, and the note is re-indexed under its new name.",
+      "A file that fails to import no longer comes back on its own. When importing a document, photo or spreadsheet failed at the last step, PM had already written the file into your vault and left it there — so the next time you rebuilt the index, the failed import reappeared as a document, unsorted and with no sign anything had gone wrong. The leftover file is now cleaned up.",
+      "Under-the-hood tidying: projects created from your connected files now stick properly instead of being forgotten and recreated on every launch, and a connected file that can't be restored during a rebuild is named on screen instead of leaving the progress bar stuck just short of the end.",
+    ],
+  },
+  {
     version: "3.19.4-alpha",
     date: "2026-07-16",
     highlights: [

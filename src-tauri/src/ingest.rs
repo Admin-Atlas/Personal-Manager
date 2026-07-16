@@ -411,10 +411,8 @@ fn ingest_one(
         source_id: None,
         external_ref: None,
     };
-    cipher.write_to(
-        &vault.join(&vault_name),
-        &render_markdown(&front, &markdown),
-    )?;
+    let vault_file = vault.join(&vault_name);
+    cipher.write_to(&vault_file, &render_markdown(&front, &markdown))?;
 
     let meta = DocMeta {
         source_path: Some(path.to_string_lossy().into()),
@@ -432,7 +430,8 @@ fn ingest_one(
         reviewed: false,
         source: SourceMeta::default(),
     };
-    let document = index_document(state, &meta, &chunks, &embeddings, None, None)?;
+    let document =
+        index_fresh_document(state, &vault_file, &meta, &chunks, &embeddings, None, None)?;
     Ok(Outcome::Indexed(document))
 }
 
@@ -560,7 +559,8 @@ fn ingest_photo(
         source_id: None,
         external_ref: None,
     };
-    cipher.write_to(&vault.join(&vault_name), &render_markdown(&front, &body))?;
+    let vault_file = vault.join(&vault_name);
+    cipher.write_to(&vault_file, &render_markdown(&front, &body))?;
 
     let meta = DocMeta {
         source_path: Some(path.to_string_lossy().into()),
@@ -578,7 +578,15 @@ fn ingest_photo(
         reviewed: false,
         source: SourceMeta::photo(),
     };
-    let document = index_document(state, &meta, &chunks, &embeddings, Some(&photo), None)?;
+    let document = index_fresh_document(
+        state,
+        &vault_file,
+        &meta,
+        &chunks,
+        &embeddings,
+        Some(&photo),
+        None,
+    )?;
     Ok(Outcome::Indexed(document))
 }
 
@@ -649,7 +657,8 @@ fn ingest_spreadsheet(
         source_id: None,
         external_ref: None,
     };
-    cipher.write_to(&vault.join(&vault_name), &render_markdown(&front, &body))?;
+    let vault_file = vault.join(&vault_name);
+    cipher.write_to(&vault_file, &render_markdown(&front, &body))?;
 
     let meta = DocMeta {
         source_path: Some(path.to_string_lossy().into()),
@@ -667,7 +676,15 @@ fn ingest_spreadsheet(
         reviewed: false,
         source: SourceMeta::spreadsheet(),
     };
-    let document = index_document(state, &meta, &chunks, &embeddings, None, Some(&record))?;
+    let document = index_fresh_document(
+        state,
+        &vault_file,
+        &meta,
+        &chunks,
+        &embeddings,
+        None,
+        Some(&record),
+    )?;
     Ok(Outcome::Indexed(document))
 }
 
@@ -912,6 +929,9 @@ struct ExistingNote {
     doc_id: i64,
     source_type: String,
     content_hash: String,
+    /// Compared against the incoming title by the idempotency guard. `content_hash` covers the
+    /// BODY only (`pointer_content_hash(source_id, body)`), so without this a rename was a Noop.
+    title: String,
     project: String,
     tags: Vec<String>,
     importance: Option<String>,
@@ -940,22 +960,23 @@ pub fn ingest_note_document(
     let existing: Option<ExistingNote> = {
         let conn = state.conn()?;
         match conn.query_row(
-            "SELECT id, source_type, content_hash, project, tags, importance, reviewed, created_at, \
-                    vault_path \
+            "SELECT id, source_type, content_hash, title, project, tags, importance, reviewed, \
+                    created_at, vault_path \
              FROM documents WHERE source_id = ?1",
             params![source_id],
             |r| {
-                let tags_json: String = r.get(4)?;
+                let tags_json: String = r.get(5)?;
                 Ok(ExistingNote {
                     doc_id: r.get(0)?,
                     source_type: r.get(1)?,
                     content_hash: r.get(2)?,
-                    project: r.get(3)?,
+                    title: r.get(3)?,
+                    project: r.get(4)?,
                     tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    importance: r.get(5)?,
-                    reviewed: r.get::<_, i64>(6)? != 0,
-                    created_at: r.get(7)?,
-                    vault_path: r.get(8)?,
+                    importance: r.get(6)?,
+                    reviewed: r.get::<_, i64>(7)? != 0,
+                    created_at: r.get(8)?,
+                    vault_path: r.get(9)?,
                 })
             },
         ) {
@@ -966,8 +987,20 @@ pub fn ingest_note_document(
     };
 
     // Unchanged and already a full vault note → nothing to do (the idempotency guarantee).
+    //
+    // The TITLE is part of "unchanged": `content_hash` is `pointer_content_hash(source_id, body)`,
+    // which never sees the title, so renaming a pinboard note (editable titles shipped in #349) and
+    // re-ingesting an untouched body took this early return — leaving the old title in the DB, in
+    // the vault file's front-matter, and everywhere the note is cited.
+    //
+    // A title change re-chunks and re-embeds by falling through, which is deliberate and not
+    // wasteful: the title is the breadcrumb prepended to every leaf's `embed_content` (never its
+    // display text), so it is genuinely part of what was embedded. A cheaper title-only UPDATE
+    // would leave every chunk's vector keyed to the OLD title — the rename would show in the UI
+    // while search kept answering to the name the user just changed away from.
     if let Some(e) = &existing {
-        if e.source_type == SOURCE_TYPE_VAULT && e.content_hash == content_hash {
+        if e.source_type == SOURCE_TYPE_VAULT && e.content_hash == content_hash && e.title == title
+        {
             let conn = state.conn()?;
             return load_document(&conn, e.doc_id);
         }
@@ -1535,6 +1568,7 @@ pub fn rebuild(
                 &gateway,
                 &vault_root,
                 &manifest_cipher,
+                on_event,
             )
         });
     match manifest_rebuild {
@@ -1805,6 +1839,33 @@ fn rebuild_chat(
 /// leaf embeddings in leaf order (parents are structural-only and carry none); the loop pairs
 /// them with leaves as it walks the chunk list. The splitter emits parents before their
 /// children, so a single ordered pass resolves `parent_uid` → row id from a uid map.
+/// Index a document whose vault file THIS ingest just wrote, removing that file if indexing fails.
+///
+/// The vault is the source of truth a Rebuild reads back, so a vault file with no DB row is not an
+/// inert orphan — it is a document that RESURRECTS on the next Rebuild, carrying whatever made us
+/// reject it, filed as Unsorted with no trace of the failure. The note-ingest and spreadsheet-promote
+/// paths always rolled back; the three FRESH ingest paths (document, photo, spreadsheet) wrote the
+/// file and then propagated the index error over it. Rolling back at each call site is what let them
+/// drift apart, so the rollback lives with the write instead.
+///
+/// Only for a file this ingest CREATED: it deletes unconditionally on failure, with no prior bytes
+/// to restore. Never call it for a re-ingest over an existing vault file.
+fn index_fresh_document(
+    state: &AppState,
+    vault_file: &Path,
+    meta: &DocMeta,
+    chunks: &[splitter::Chunk],
+    embeddings: &[Vec<f32>],
+    photo: Option<&PhotoRecord>,
+    spreadsheet: Option<&SpreadsheetRecord>,
+) -> Result<Document> {
+    index_document(state, meta, chunks, embeddings, photo, spreadsheet).inspect_err(|_| {
+        // Best-effort: if the file is locked we surface the INDEX error, which is the one the user
+        // can act on. A stranded file costs a spurious doc at the next Rebuild, not data.
+        let _ = std::fs::remove_file(vault_file);
+    })
+}
+
 pub(crate) fn index_document(
     state: &AppState,
     meta: &DocMeta,

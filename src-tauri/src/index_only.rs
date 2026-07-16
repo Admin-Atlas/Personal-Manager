@@ -281,7 +281,9 @@ pub fn forget_source(vault_root: &Path, cipher: &ManifestCipher, source_id: &str
 /// they await a Rebuild, which re-embeds them from their summary (we can't embed here). Runs on every
 /// boot/unlock, so the common already-in-sync row is detected up front and skipped: the existence
 /// probe reads the row's current values and the UPDATE only fires when something actually differs.
-fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<()> {
+/// Returns whether any item MINTED a project entity — see the F-04 note on the probe below. The
+/// caller must push the rules file when it did, or the next boot rolls the mint back.
+fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<bool> {
     /// The row's current values for every column the UPDATE below writes (minus `entity_id`, which
     /// is re-resolved fresh each pass and compared alongside).
     struct CurrentRow {
@@ -298,6 +300,28 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<()> {
         title: Option<String>,
         entity_id: Option<i64>,
     }
+    // F-04 ("mirror ⊆ rules after any mint"). The loop's `resolve_project(.., true)` below MINTS a
+    // project entity when the manifest names one the mirror lacks — but nothing here pushed it to
+    // the portable rules file, and this runs at boot right AFTER `entities::reconcile_on_open`,
+    // which treats that file as truth. So the next boot rolled the entity back, this pass minted it
+    // again, and round it went: a permanent every-boot churn loop, with any project-scoped
+    // preference attached to that entity left dormant (`entity_id = NULL`) for good.
+    //
+    // Probed BEFORE the loop, since the loop is what creates them, and once per DISTINCT name — the
+    // items overwhelmingly share one project, and one mint is enough to owe the sync.
+    let minted = {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut found = false;
+        for it in &manifest.items {
+            if seen.insert(it.project.as_str())
+                && crate::entities::resolve_project(conn, &it.project, false)?.is_none()
+            {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
     for it in &manifest.items {
         let current = conn
             .query_row(
@@ -373,7 +397,7 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<()> {
             ],
         )?;
     }
-    Ok(())
+    Ok(minted)
 }
 
 /// Reconcile the encrypted manifest with the DB mirror at session open. The file is the portable
@@ -382,15 +406,17 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<()> {
 /// its classification onto existing rows (a Rebuild restores any rows it still lacks); when ABSENT or
 /// UNDECRYPTABLE, (re)write it from the mirror if there is anything to persist. Runs AFTER the entity
 /// rules reconcile at boot, so each item's project resolves through the rebuilt aliases.
+/// Returns whether a project entity was MINTED, so the caller can push the portable rules file
+/// (this can't do it itself — it holds the connection, and `sync_entity_rules` takes its own).
 pub fn reconcile_on_open(
     conn: &Connection,
     vault_root: &Path,
     cipher: &ManifestCipher,
-) -> Result<()> {
+) -> Result<bool> {
     match read_manifest(vault_root, cipher) {
         Ok(Some(manifest)) => {
             let tx = conn.unchecked_transaction()?;
-            apply_classification(&tx, &manifest)?;
+            let minted = apply_classification(&tx, &manifest)?;
             tx.commit()?;
             // F-20 self-heal (mirror→file). `register_pointer` commits the DB row before it writes the
             // manifest, so a crash in that window leaves an index-only row in the mirror but absent from
@@ -401,20 +427,21 @@ pub fn reconcile_on_open(
             if mirror_has_unfiled(conn, &manifest)? {
                 write_synced(conn, vault_root, cipher)?;
             }
-            Ok(())
+            Ok(minted)
         }
+        // No manifest, or an unreadable one: nothing was read, so nothing was minted from a file.
         Ok(None) => {
             if has_index_only(conn)? {
                 write_synced(conn, vault_root, cipher)?;
             }
-            Ok(())
+            Ok(false)
         }
         Err(e) => {
             eprintln!("index_only: manifest unreadable ({e}); rewriting it from the DB mirror");
             if has_index_only(conn)? {
                 write_synced(conn, vault_root, cipher)?;
             }
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -585,6 +612,7 @@ pub fn rebuild_from_manifest(
     gateway: &ModelGateway<'_>,
     vault_root: &Path,
     cipher: &ManifestCipher,
+    on_event: &crate::ingest::ProgressSink,
 ) -> Result<(usize, usize)> {
     let manifest = match read_manifest(vault_root, cipher)? {
         Some(m) => m,
@@ -600,11 +628,47 @@ pub fn rebuild_from_manifest(
             Err(e) => {
                 failed += 1;
                 eprintln!("index_only: could not rebuild '{}': {e}", item.source_id);
+                // Name the failure in the UI, and — just as importantly — CLOSE this item's slot on
+                // the progress bar.
+                //
+                // The accounting, because it is not obvious and a plausible-looking "emit progress
+                // per restored item" would break it: the bar's total is `files.len() + extra_total`,
+                // where `extra_total` budgets exactly ONE slot per reachable index-only row, counted
+                // up front for PHASE 2 (the full-body re-index). This restore has no budget of its
+                // own, so emitting a terminal event per item would overshoot every slot phase 2 is
+                // about to fill and leave the bar reading "150 of 100".
+                //
+                // A FAILED restore is the one case that doesn't self-balance: no row is inserted, so
+                // phase 2 — which walks `documents`, not the manifest — never sees the item and never
+                // fills its slot. The bar then stops one short of 100% for a reason the user was
+                // never told. Emitting here fills exactly that orphaned slot. `Started` is only for
+                // the label (`processed` advances on terminal events alone), and the `ok` gate
+                // matches `extra_total`'s own `source_state = 'ok'` filter — an unreachable item was
+                // never budgeted, so naming it here would overshoot instead.
+                if item.source_state == SourceState::Ok.as_str() {
+                    on_event.send(crate::ingest::IngestEvent::Started {
+                        path: item.source_id.clone(),
+                        name: item.title.clone(),
+                    });
+                    on_event.send(crate::ingest::IngestEvent::Failed {
+                        path: item.source_id.clone(),
+                        error: e.to_string(),
+                    });
+                }
             }
         }
     }
     // The mirror has the restored rows again; resync (merge preserves any item that had no summary).
     state.sync_index_only();
+    // F-04, same rule as the boot reconcile: a restored item resolves its project with
+    // `create_if_new`, so restoring into a mirror that was cleared (the vector-width arm wipes the
+    // store) MINTS every project entity afresh. Without this the rules file — the portable truth —
+    // still described the pre-rebuild world, and the next boot rolled the whole lot back. Gated on
+    // actual work, and best-effort like every other sync: a rebuild that restored nothing writes
+    // nothing.
+    if restored > 0 {
+        state.sync_entity_rules();
+    }
     Ok((restored, failed))
 }
 
@@ -2147,6 +2211,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(other, "ok", "a different source is untouched");
+    }
+
+    /// A manifest item with only the fields these tests care about.
+    fn manifest_item(source_id: &str, project: &str) -> ManifestItem {
+        ManifestItem {
+            source_id: source_id.into(),
+            title: "T".into(),
+            project: project.into(),
+            tags: Vec::new(),
+            importance: None,
+            reviewed: false,
+            last_activity: None,
+            external_ref: None,
+            source_modified_at: None,
+            source_content_hash: None,
+            source_state: "ok".into(),
+            stored_summary: Some("s".into()),
+        }
+    }
+
+    #[test]
+    fn a_manifest_naming_an_unknown_project_reports_the_mint() {
+        // F-04. The reconcile resolves each item's project with create_if_new, so a manifest naming
+        // a project the mirror lacks MINTS an entity right here — but this pass runs at boot AFTER
+        // the entity-rules reconcile, which treats the rules FILE as truth. Unless the caller is
+        // told to push the file, next boot rolls the mint back, this pass mints it again, and the
+        // loop never ends — leaving any project-scoped preference on that entity dormant forever.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        insert_index_only(&conn, "s1", "Unsorted");
+
+        let manifest = Manifest {
+            items: vec![manifest_item("s1", "Taxes")],
+            ..Default::default()
+        };
+        assert!(
+            apply_classification(&conn, &manifest).unwrap(),
+            "a project the mirror has never seen is a mint the rules file must learn about"
+        );
+        // And the mint really happened — the report isn't just a flag.
+        assert!(crate::entities::resolve_project(&conn, "Taxes", false)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_manifest_of_known_projects_reports_no_mint() {
+        // The overwhelmingly common case: items land as the seeded 'Unsorted'. Reporting a mint
+        // here would rewrite the encrypted rules file on every single boot for nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        insert_index_only(&conn, "s1", "Unsorted");
+        crate::entities::resolve_project(&conn, "Taxes", true).unwrap();
+
+        let manifest = Manifest {
+            items: vec![manifest_item("s1", "Taxes")],
+            ..Default::default()
+        };
+        assert!(
+            !apply_classification(&conn, &manifest).unwrap(),
+            "an already-known project is not a mint"
+        );
     }
 
     #[test]
