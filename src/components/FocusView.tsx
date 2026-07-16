@@ -27,7 +27,7 @@ import type {
   ProjectSize,
   ProjectStatus,
 } from "../lib/types";
-import { formatDate, formatDateOnly } from "../lib/format";
+import { formatClock, formatDate, formatDateOnly } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
 import { rankImportance } from "../lib/importance";
 import { Button, Card, Input, Skeleton, StatusBadge, Select } from "./ui";
@@ -937,5 +937,8 @@ function formatEventWhen(start: string, allDay?: boolean): string {
   // All-day events carry a bare date — format from its own calendar day so it can't shift a day in a
   // UTC-negative zone (F-14). A timed event keeps the timezone-aware local date + clock.
   if (allDay || !start.includes("T")) return formatDateOnly(start);
-  return `${formatDate(start)} ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+  // The clock goes through `format.ts` like every other surface. Hand-rolling it here meant this tab
+  // used `hour: "numeric"` while the shared helper uses `"2-digit"` — so the same 9am event read
+  // "9:05" on Focus and "09:05" everywhere else, for no reason anyone chose.
+  return `${formatDate(start)} ${formatClock(d)}`;
 }
