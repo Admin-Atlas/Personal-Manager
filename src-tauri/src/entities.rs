@@ -288,6 +288,14 @@ pub fn merge_entities(conn: &Connection, from_id: i64, into_id: i64) -> Result<(
         "UPDATE preferences SET entity_id = ?2 WHERE entity_id = ?1",
         params![from_id, into_id],
     )?;
+    // Same banked Stage-4 seam as the mirror rebuild's NULL-out: nothing writes
+    // `calendar_events.entity_id` yet, so this is a no-op today — and the moment the carded
+    // correspondence work writes it, a merge that skipped this line would strand those rows
+    // pointing at an entity the DELETE below is about to remove.
+    conn.execute(
+        "UPDATE calendar_events SET entity_id = ?2 WHERE entity_id = ?1",
+        params![from_id, into_id],
+    )?;
     conn.execute("DELETE FROM entities WHERE id = ?1", params![from_id])?;
     // Merging variants into a survivor is a deliberate vouch for it — confirm the survivor.
     set_confirmed(conn, into_id)?;
@@ -513,6 +521,13 @@ pub fn rebuild_mirror_from_rules(conn: &Connection, rules: &Rules) -> Result<()>
     conn.execute("UPDATE documents SET entity_id = NULL", [])?;
     conn.execute("UPDATE projects SET entity_id = NULL", [])?;
     conn.execute("UPDATE preferences SET entity_id = NULL", [])?;
+    // `calendar_events.entity_id` is a banked Stage-4 seam that NOTHING writes yet — and that is
+    // exactly why it belongs here now. It has no ON DELETE action, so the first writer (the carded
+    // correspondence work) would make this rebuild die on an FK violation AT BOOT, on the very next
+    // launch, with the rules file as truth and no way in. Nulling a column no one writes is free
+    // today and un-shippable to forget later. Correct as a NULL-out for the same reason as its three
+    // siblings: the mirror is derived, and every pointer is re-resolved below.
+    conn.execute("UPDATE calendar_events SET entity_id = NULL", [])?;
     conn.execute("DELETE FROM entity_aliases", [])?;
     conn.execute("DELETE FROM entities", [])?;
 

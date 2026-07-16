@@ -153,7 +153,7 @@ fn expand_vevent(
         .or_else(|| dur.and_then(|d| start_anchor.checked_add_signed(d)))
         .unwrap_or(start_anchor);
 
-    let mut starts: Vec<DateTime<Utc>> = if block.iter().any(|l| l.starts_with("RRULE")) {
+    let mut starts: Vec<DateTime<Utc>> = if block.iter().any(|l| is_prop(l, "RRULE")) {
         expand_rrule(block, win_start, win_end, tz)
     } else if start_anchor <= win_end && effective_end >= win_start {
         vec![start_anchor]
@@ -249,13 +249,14 @@ fn rrule_freq_is_expandable(block: &[String]) -> bool {
 fn build_rrule_spec(block: &[String], tz: ChronoTz) -> String {
     block
         .iter()
+        .map(|l| canonical_prop_line(l))
         .filter(|l| {
-            l.starts_with("DTSTART")
-                || l.starts_with("RRULE")
-                || l.starts_with("EXDATE")
-                || l.starts_with("RDATE")
+            is_prop(l, "DTSTART")
+                || is_prop(l, "RRULE")
+                || is_prop(l, "EXDATE")
+                || is_prop(l, "RDATE")
         })
-        .map(|l| pin_floating_dtstart(l, tz))
+        .map(|l| pin_floating_dtstart(&l, tz))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -263,7 +264,7 @@ fn build_rrule_spec(block: &[String], tz: ChronoTz) -> String {
 /// If `line` is a floating (timed, no `Z`, no `TZID`) DTSTART, add `;TZID=<user zone>`;
 /// otherwise return it unchanged.
 fn pin_floating_dtstart(line: &str, tz: ChronoTz) -> String {
-    if !line.starts_with("DTSTART") {
+    if !is_prop(line, "DTSTART") {
         return line.to_string();
     }
     let Some(colon) = line.find(':') else {
@@ -298,8 +299,8 @@ fn rrule_spec_utc_fallback(block: &[String], tz: ChronoTz) -> Option<String> {
     };
     let rest = block
         .iter()
-        .filter(|l| l.starts_with("RRULE") || l.starts_with("EXDATE") || l.starts_with("RDATE"))
-        .cloned();
+        .map(|l| canonical_prop_line(l))
+        .filter(|l| is_prop(l, "RRULE") || is_prop(l, "EXDATE") || is_prop(l, "RDATE"));
     Some(
         std::iter::once(dtstart)
             .chain(rest)
@@ -488,8 +489,37 @@ fn find_prop<'a>(block: &'a [String], name: &str) -> Option<(&'a str, &'a str)> 
             Some(i) => (&head[..i], &head[i + 1..]),
             None => (head, ""),
         };
-        (prop == name).then_some((params, value))
+        // RFC 5545 property names are case-INSENSITIVE (3.1: "property names ... are case
+        // insensitive"). Matching them exactly meant a feed emitting `dtstart:` had no DTSTART at
+        // all as far as this parser was concerned, so every one of its events was silently
+        // skipped — the feed simply appeared empty. `param` already compares this way.
+        prop.eq_ignore_ascii_case(name).then_some((params, value))
     })
+}
+
+/// Does `line` carry the named property? Case-insensitive per RFC 5545, and the name must end at a
+/// `;` (parameters) or `:` (value), so `RDATE` can never match an unrelated `RDATEX`.
+fn is_prop(line: &str, name: &str) -> bool {
+    match line.as_bytes().get(name.len()) {
+        Some(b';') | Some(b':') => line
+            .get(..name.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(name)),
+        _ => false,
+    }
+}
+
+/// `line` with its property NAME upper-cased; parameters and value untouched (a `TZID=Europe/London`
+/// value IS case-sensitive, so only the name may be folded).
+///
+/// Load-bearing, not cosmetic: the `rrule` crate parses the spec string we hand it and does NOT
+/// share RFC 5545's case-insensitivity. Finding a lowercase feed's `rrule:` without canonicalising
+/// it would only trade a silently-dropped event for a rejected spec — so recognition and
+/// normalisation have to travel together.
+fn canonical_prop_line(line: &str) -> String {
+    match line.find([';', ':']) {
+        Some(i) => format!("{}{}", line[..i].to_ascii_uppercase(), &line[i..]),
+        None => line.to_string(),
+    }
 }
 
 /// A named parameter from a property's parameter string (`TZID=Europe/London`).
@@ -527,6 +557,60 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
             Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
         )
+    }
+
+    #[test]
+    fn property_names_are_case_insensitive() {
+        // RFC 5545 §3.1: property names are case-insensitive. Matching them exactly meant a feed
+        // emitting lowercase names had no DTSTART as far as this parser was concerned, so every
+        // event was skipped and the feed simply looked EMPTY — no error, no clue.
+        let feed = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nuid:a\r\nsummary:Standup\r\n\
+                    dtstart:20260615T090000Z\r\ndtend:20260615T093000Z\r\nEND:VEVENT\r\n\
+                    END:VCALENDAR";
+        let (s, e) = window();
+        let events = parse_feed_within(feed, "feed1", s, e, ChronoTz::UTC);
+        assert_eq!(events.len(), 1, "a lowercase feed must not read as empty");
+        assert_eq!(events[0].summary, "Standup");
+        assert_eq!(events[0].start, "2026-06-15T09:00:00Z");
+        assert_eq!(events[0].end.as_deref(), Some("2026-06-15T09:30:00Z"));
+    }
+
+    #[test]
+    fn a_lowercase_rrule_still_expands() {
+        // Recognising a lowercase `rrule:` is only half of it: the `rrule` crate parses the spec we
+        // hand it and does NOT share RFC 5545's case-insensitivity, so finding the property without
+        // canonicalising its name would just trade a dropped event for a rejected spec — one
+        // instance instead of the series, which is the quieter of the two failures.
+        let feed = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nuid:r\r\nsummary:Weekly\r\n\
+                    dtstart:20260601T090000Z\r\nrrule:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\n\
+                    END:VCALENDAR";
+        let (s, e) = window();
+        let events = parse_feed_within(feed, "feed1", s, e, ChronoTz::UTC);
+        assert_eq!(
+            events.len(),
+            3,
+            "the series must expand, not collapse to one"
+        );
+        assert_eq!(events[0].start, "2026-06-01T09:00:00Z");
+        assert_eq!(events[2].start, "2026-06-15T09:00:00Z");
+    }
+
+    #[test]
+    fn a_property_name_is_matched_whole() {
+        // `is_prop` must not treat a longer name as its prefix, or an unrelated X-DTSTARTISH
+        // property could be parsed as the event's start.
+        assert!(is_prop("DTSTART:20260601", "DTSTART"));
+        assert!(is_prop(
+            "dtstart;TZID=Europe/London:20260601T090000",
+            "DTSTART"
+        ));
+        assert!(!is_prop("DTSTARTX:20260601", "DTSTART"));
+        assert!(!is_prop("DTSTART", "DTSTART"), "a bare name has no value");
+        // The name folds; a TZID VALUE must not (Europe/London is case-sensitive).
+        assert_eq!(
+            canonical_prop_line("dtstart;TZID=Europe/London:20260601T090000"),
+            "DTSTART;TZID=Europe/London:20260601T090000"
+        );
     }
 
     #[test]

@@ -367,7 +367,20 @@ pub fn set_state(conn: &Connection, id: i64, met: bool) -> Result<()> {
 
 /// Delete a milestone by id.
 pub fn remove(conn: &Connection, id: i64) -> Result<()> {
-    conn.execute("DELETE FROM project_milestones WHERE id = ?1", params![id])?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM project_milestones WHERE id = ?1", params![id])?;
+    // The milestone id IS the flag anchor, and `flags` has no FK to `project_milestones` (the anchor
+    // is a text column spanning two identity spaces — iCal UIDs and milestone ids — so no single FK
+    // could express it). So deleting the milestone left its flags pointing at a row that no longer
+    // exists: an ACTIVE flag lingered until the next detection pass happened to prune it, and a
+    // RESOLVED one — a user-asserted tombstone — was removed by nothing, ever. Both states go: the
+    // anchor is gone, so there is nothing left for any flag on it to mean. Same transaction, because
+    // a half-done delete is what leaves the orphan this fixes.
+    tx.execute(
+        "DELETE FROM flags WHERE anchor_kind = ?1 AND anchor = ?2",
+        params![crate::flags::ANCHOR_MILESTONE, id.to_string()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
