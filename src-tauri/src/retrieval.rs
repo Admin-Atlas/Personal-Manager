@@ -258,8 +258,15 @@ fn hybrid_core(
         fts_hits.truncate(branch_limit);
     }
     let fused = fuse_scored(&[vec_hits, fts_hits]);
-    let ranked = apply_recency(conn, fused, k)?;
-    load_chunks(conn, &ranked)
+    // Over-fetch a wider ranked pool, then apply the per-section diversity cap so one long section
+    // (or a cluster of near-duplicate chunks that all carry the same breadcrumb) can't monopolise
+    // the top-k and starve other sections/documents. `branch_limit` (>= 20) gives the cap
+    // alternatives to promote; `diversify`'s backfill keeps the count identical to the old top-k when
+    // there's no diversity to be had. Query-time only, so it's not part of the retrieval-config stamp
+    // and triggers no Rebuild.
+    let pool = apply_recency(conn, fused, branch_limit)?;
+    let chunks = load_chunks(conn, &pool)?;
+    Ok(diversify(chunks, k, max_per_section(k)))
 }
 
 /// The chunk ids belonging to a project's documents — the allow-set for a scoped
@@ -492,6 +499,52 @@ fn decay_factor(age_days: f64, half_life_days: f64) -> f64 {
     MIN_DECAY + (1.0 - MIN_DECAY) * 0.5_f64.powf(age_days / half_life_days)
 }
 
+/// The most chunks from one `(document, section-heading)` allowed into the final top-k. A long
+/// heading splits into many leaves that all carry the same breadcrumb, so an uncapped section is a
+/// natural cluster of near-duplicate chunks that can monopolise the small pool and starve other
+/// sections/documents — and the reranker only reorders what it's handed, so a starved pool can't be
+/// rescued downstream. Half the pool (floor 2) stops any one section taking more than its share while
+/// still giving a genuinely multi-chunk section solid coverage.
+fn max_per_section(k: usize) -> usize {
+    (k / 2).max(2)
+}
+
+/// Cap how many chunks sharing one `(document_id, heading)` reach the final top-k, promoting chunks
+/// from other sections/documents that ranked just below the cut. Walks the pre-ranked pool
+/// best-first, keeping a chunk unless its section is already full; then **backfills** from the
+/// demoted remainder if diversity alone can't fill `k`, so it NEVER returns fewer chunks than the
+/// plain top-k would — a genuinely single-section answer comes back unchanged. Pure and
+/// order-preserving (the reranker reorders afterwards when enabled), so it's unit-tested without a DB.
+fn diversify(ranked: Vec<RetrievedChunk>, k: usize, max_per_section: usize) -> Vec<RetrievedChunk> {
+    use std::collections::HashMap;
+    let mut per_section: HashMap<(i64, Option<String>), usize> = HashMap::new();
+    let mut kept: Vec<RetrievedChunk> = Vec::with_capacity(k.min(ranked.len()));
+    let mut demoted: Vec<RetrievedChunk> = Vec::new();
+    for chunk in ranked {
+        if kept.len() >= k {
+            break;
+        }
+        let count = per_section
+            .entry((chunk.document_id, chunk.heading.clone()))
+            .or_insert(0);
+        if *count < max_per_section {
+            *count += 1;
+            kept.push(chunk);
+        } else {
+            demoted.push(chunk);
+        }
+    }
+    // Backfill: if diversity left us short of k (few distinct sections in the pool), top up from the
+    // demoted overflow in rank order, so the cap can never shrink the result below the plain top-k.
+    for chunk in demoted {
+        if kept.len() >= k {
+            break;
+        }
+        kept.push(chunk);
+    }
+    kept
+}
+
 /// Load full chunk + document provenance for the fused ids, preserving order.
 fn load_chunks(conn: &Connection, ids: &[i64]) -> Result<Vec<RetrievedChunk>> {
     // `AND c.kind = 'leaf'` is belt-and-suspenders: parents are never in chunk_vec/chunks_fts,
@@ -642,22 +695,35 @@ pub fn explain(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
-    decayed.truncate(k);
+    // Over-fetch the pool, then apply the SAME per-section diversity cap production uses, so the
+    // panel reflects what the model actually receives rather than the raw fused ranking.
+    decayed.truncate(branch_limit);
 
-    // Load full chunk provenance for the survivors, preserving the ranked order.
-    let ids: Vec<i64> = decayed.iter().map(|(id, ..)| *id).collect();
-    let by_id: HashMap<i64, RetrievedChunk> = load_chunks(conn, &ids)?
-        .into_iter()
-        .map(|c| (c.chunk_id, c))
+    // Load full provenance for the pool, keyed by id so per-stage scores reattach after the cap
+    // selects and reorders the survivors.
+    let by_id: HashMap<i64, RetrievedChunk> = {
+        let ids: Vec<i64> = decayed.iter().map(|(id, ..)| *id).collect();
+        load_chunks(conn, &ids)?
+            .into_iter()
+            .map(|c| (c.chunk_id, c))
+            .collect()
+    };
+    let recency: HashMap<i64, (Option<f64>, f64, f64)> = decayed
+        .iter()
+        .map(|(id, age, factor, score)| (*id, (*age, *factor, *score)))
         .collect();
+    let pool_chunks: Vec<RetrievedChunk> = decayed
+        .iter()
+        .filter_map(|(id, ..)| by_id.get(id).cloned())
+        .collect();
+    let survivors = diversify(pool_chunks, k, max_per_section(k));
 
-    let mut out = Vec::with_capacity(decayed.len());
-    for (id, age, factor, decayed_score) in decayed {
-        let Some(chunk) = by_id.get(&id) else {
-            continue;
-        };
+    let mut out = Vec::with_capacity(survivors.len());
+    for chunk in survivors {
+        let id = chunk.chunk_id;
+        let (age, factor, decayed_score) = recency.get(&id).copied().unwrap_or((None, 1.0, 0.0));
         out.push(ExplainCandidate {
-            chunk: chunk.clone(),
+            chunk,
             vector_rank: vector_rank.get(&id).copied(),
             vector_distance: vector_distance.get(&id).copied(),
             keyword_rank: keyword_rank.get(&id).copied(),
@@ -872,6 +938,83 @@ mod tests {
         assert!(instr.contains("untrusted DATA"));
         assert!(!instr.contains(SOURCE_FENCE));
         assert!(!instr.contains("Sources:"));
+    }
+
+    /// A minimal chunk for the pure-`diversify` tests — only `chunk_id`, `document_id`, and
+    /// `heading` drive the section cap; the rest is filler.
+    fn rc(chunk_id: i64, document_id: i64, heading: &str) -> RetrievedChunk {
+        RetrievedChunk {
+            chunk_id,
+            document_id,
+            title: "Doc".into(),
+            source_path: None,
+            vault_path: "d.md".into(),
+            heading: Some(heading.into()),
+            content: String::new(),
+            ordinal: 0,
+            source_type: None,
+            chat_turn_id: None,
+            chunk_at: None,
+            conversation_id: None,
+        }
+    }
+
+    #[test]
+    fn max_per_section_is_half_the_pool_with_a_floor_of_two() {
+        assert_eq!(max_per_section(6), 3);
+        assert_eq!(max_per_section(10), 5);
+        assert_eq!(max_per_section(2), 2);
+        assert_eq!(max_per_section(1), 2); // floor holds; a k=1 result is one chunk regardless
+    }
+
+    #[test]
+    fn diversify_caps_a_dominant_section_and_promotes_others() {
+        // Six chunks from one long section (same doc+heading) plus two other sections that ranked
+        // just below the cut — the "one section fills the pool" shape the explain panel showed.
+        let pool = vec![
+            rc(1, 1, "A"),
+            rc(2, 1, "A"),
+            rc(3, 1, "A"),
+            rc(4, 1, "A"),
+            rc(5, 1, "A"),
+            rc(6, 1, "A"),
+            rc(7, 1, "B"),
+            rc(8, 2, "C"),
+        ];
+        // k=6, cap=3: section A holds at most 3 slots up front, leaving room for B and C that would
+        // otherwise never reach the reranker; the 6th slot backfills from A's overflow.
+        let ids: Vec<i64> = diversify(pool, 6, max_per_section(6))
+            .iter()
+            .map(|c| c.chunk_id)
+            .collect();
+        assert_eq!(ids.len(), 6);
+        assert!(ids.contains(&7), "section B promoted into the top-k");
+        assert!(ids.contains(&8), "section C promoted into the top-k");
+        assert_eq!(
+            ids.iter().filter(|&&id| id <= 6).count(),
+            4,
+            "section A: 3 under the cap + 1 backfilled to fill k"
+        );
+    }
+
+    #[test]
+    fn diversify_never_returns_fewer_than_the_plain_top_k() {
+        // A genuinely single-section answer: every pool chunk shares one doc+heading. The cap would
+        // hold only `max_per_section`, but the backfill must still return the full top-k in rank
+        // order, so the cap can never shrink the result below the old behaviour.
+        let pool: Vec<RetrievedChunk> = (1..=8).map(|i| rc(i, 1, "A")).collect();
+        let ids: Vec<i64> = diversify(pool, 6, max_per_section(6))
+            .iter()
+            .map(|c| c.chunk_id)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn diversify_returns_the_whole_pool_when_smaller_than_k() {
+        // Never invents chunks: a pool shorter than k comes back whole.
+        let pool = vec![rc(1, 1, "A"), rc(2, 1, "A"), rc(3, 1, "A")];
+        assert_eq!(diversify(pool, 6, max_per_section(6)).len(), 3);
     }
 
     #[test]

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.22.4-alpha",
+    date: "2026-07-17",
+    highlights: [
+      "A behind-the-scenes tweak to how PM chooses which of your notes to read when answering. When one long document — or a run of very similar passages — dominates the results, PM now makes room for other relevant sources instead of letting a single section crowd everything else out, so answers can draw on a wider slice of what you've saved. Nothing looks different in everyday use.",
+    ],
+  },
+  {
     version: "3.22.3-alpha",
     date: "2026-07-17",
     highlights: [
