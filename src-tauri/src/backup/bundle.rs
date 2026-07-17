@@ -155,7 +155,7 @@ pub fn validate_path(path: &str) -> Result<()> {
 /// Whether a path component is a Windows reserved device name (CON/PRN/AUX/NUL,
 /// COM1–COM9, LPT1–LPT9). The reservation applies to the stem before the first dot,
 /// case-insensitively (`NUL.txt` is still the null device).
-fn is_windows_reserved(comp: &str) -> bool {
+pub(crate) fn is_windows_reserved(comp: &str) -> bool {
     let stem = comp.split('.').next().unwrap_or(comp);
     let upper = stem.to_ascii_uppercase();
     if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {

@@ -47,6 +47,7 @@ mod oauth_loopback;
 mod onedrive;
 mod openrouter;
 mod outlook_calendar;
+mod pathguard;
 mod paths;
 mod photos;
 mod preferences;

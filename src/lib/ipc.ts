@@ -59,6 +59,7 @@ import type {
   OneDriveSyncState,
   Preference,
   Milestone,
+  PlaintextExportOutcome,
   ProjectOverview,
   ProjectProposalEvent,
   ProjectSize,
@@ -316,10 +317,11 @@ export const suggestSharedVaultLocation = () =>
  *  off-Windows (the UI falls back to the manual name/SID field). */
 export const listLocalAccounts = () => invoke<LocalAccount[]>("list_local_accounts");
 
-/** Export the Markdown vault as plaintext `.md` into `destDir` — the "never locked in"
- *  escape hatch (decrypts with the in-session key). Returns the number of files written. */
-export const exportPlaintextMarkdown = (destDir: string) =>
-  invoke<number>("export_plaintext_markdown", { destDir });
+/** Export the Markdown vault as plaintext `.md` — the "never locked in" escape hatch (decrypts with
+ *  the in-session key). The backend opens the folder picker itself (L-5: the export writes decrypted
+ *  content, so its destination is never a webview-supplied path). Resolves to `null` if cancelled. */
+export const exportPlaintextMarkdown = () =>
+  invoke<PlaintextExportOutcome | null>("export_plaintext_markdown");
 
 // Single-writer lock for a shared vault (spec §5).
 
@@ -1101,7 +1103,10 @@ export const protonCliStatus = () => invoke<ProtonCliStatus>("proton_cli_status"
 
 /** Remember (or clear, with "") a manual path to the `proton-drive` binary, for when it lives
  *  somewhere auto-detection doesn't look. Rejects a non-empty path that isn't an existing file. */
-export const setProtonCliPath = (path: string) => invoke<void>("set_proton_cli_path", { path });
+/** Locate the proton-drive binary. The backend opens the file picker itself (L-5: the stored path is
+ *  later spawned as a subprocess, so it must never be a webview-supplied string). Cancelling is a
+ *  no-op that leaves the current setting untouched. */
+export const setProtonCliPath = () => invoke<void>("set_proton_cli_path");
 
 /** Whether the CLI has an active Proton session (+ the account email if available). */
 export const protonStatus = () => invoke<ProtonConnStatus>("proton_status");

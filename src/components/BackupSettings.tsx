@@ -177,13 +177,9 @@ export function BackupSettings() {
     setLocating(true);
     setLocateError(null);
     try {
-      const picked = await openFileDialog({
-        multiple: false,
-        directory: false,
-        title: "Locate the proton-drive program",
-      });
-      if (typeof picked !== "string") return; // cancelled
-      await setProtonCliPath(picked);
+      // The backend opens the file picker itself (L-5: the stored path is spawned as a subprocess,
+      // so it must never be a webview-supplied string). Cancelling is a no-op there.
+      await setProtonCliPath();
       await refreshProton();
     } catch (e) {
       setLocateError(String(e));

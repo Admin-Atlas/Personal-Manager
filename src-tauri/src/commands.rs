@@ -29,8 +29,8 @@ use crate::sidecar::SidecarStatus;
 use crate::{
     applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, cloud_sync,
     context_budget, cost, db, drive, entities, flags, index_only, localfolder, lock_session,
-    microsoft, onedrive, openrouter, outlook_calendar, paths, preferences, secrets, vault,
-    AppState, BusyGuard, VaultRuntime,
+    microsoft, onedrive, openrouter, outlook_calendar, pathguard, paths, preferences, secrets,
+    vault, AppState, BusyGuard, VaultRuntime,
 };
 
 /// Fallback model when the user hasn't chosen one, for BOTH roles. Swappable in
@@ -702,6 +702,11 @@ pub async fn create_shareable_vault(
     // M-4: enforce the strength floor here in the command layer — a shareable vault's Markdown is
     // reachable by other accounts, so a weak passphrase is a real exposure. Create/change only.
     vault::kdf::validate_passphrase_strength(&passphrase)?;
+    // L-5: if the caller chose a destination, validate it (webview-supplied) before we move the
+    // encrypted store there. `None` keeps the vault in place.
+    if let Some(loc) = &target_location {
+        pathguard::sanitize_destination(loc)?;
+    }
     {
         let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
             .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
@@ -866,6 +871,9 @@ pub async fn make_vault_private(app: AppHandle) -> Result<VaultOpOutcome> {
 /// holds a DIFFERENT vault (the collision guard in the migration) — join that one instead.
 #[tauri::command]
 pub async fn move_vault(app: AppHandle, folder: String) -> Result<VaultOpOutcome> {
+    // L-5: `folder` is a webview-supplied destination — validate its shape and that its containing
+    // folder exists before we relocate the whole encrypted store into it.
+    pathguard::sanitize_destination(&folder)?;
     let target = std::path::PathBuf::from(folder);
     let plan = {
         let meta = vault::load_meta(&vault::resolve(&app)?.vault_root)?
@@ -1153,6 +1161,9 @@ pub fn adopt_shared_vault(
 ) -> Result<AdoptOutcome> {
     // I-03: wipe the passphrase plaintext from memory on return.
     let passphrase = zeroize::Zeroizing::new(passphrase);
+    // L-5: `folder` is a webview string pointing at an existing shared-vault folder — require a
+    // real, absolute, well-formed location before we read vault metadata from it.
+    pathguard::sanitize_source(&folder)?;
     let root = std::path::PathBuf::from(&folder);
     let meta = match vault::load_meta(&root) {
         Ok(Some(m)) => m,
@@ -2549,6 +2560,14 @@ pub async fn ingest_paths(
     on_event: Channel<IngestEvent>,
 ) -> Result<()> {
     refuse_if_rebuilding(&app, "it can't take new documents")?;
+    // L-5: `paths` arrives straight from the webview — the file picker AND the OS drag-drop both
+    // funnel here — so validate every entry server-side before we read a byte. A path that is
+    // relative, malformed, or doesn't exist is rejected fail-closed (a compromised webview can't
+    // point ingest at a fabricated location). The originals are then walked unchanged so stored
+    // source paths keep their on-disk form.
+    for p in &paths {
+        pathguard::sanitize_source(p)?;
+    }
     let opts = ingest::IngestOpts {
         copy_photos_to_vault: copy_photos_to_vault.unwrap_or(false),
     };
@@ -4853,6 +4872,10 @@ pub fn resume_drive_sync(app: AppHandle) -> Result<bool> {
 /// the folder's stable key; the UI then triggers a sync. Idempotent — re-adding reactivates the row.
 #[tauri::command]
 pub fn add_local_folder(app: AppHandle, path: String) -> Result<String> {
+    // L-5: the path is a webview string (from the native picker, but a compromised webview could
+    // supply any path). Require a real, absolute, well-formed location before we register a root
+    // whose whole subtree we then walk and read.
+    pathguard::sanitize_source(&path)?;
     let root = std::path::PathBuf::from(&path);
     if !root.is_dir() {
         return Err(Error::Other("That path isn't a folder we can read.".into()));
@@ -5501,7 +5524,7 @@ fn reveal_in_file_manager(path: &str) -> Result<()> {
 /// manager. Web links never reach the file-manager reveal and local paths never reach `open::that`.
 /// Supersedes the old `open_external_ref` (which was http(s)-only).
 #[tauri::command]
-pub fn open_source(state: State<'_, AppState>, doc_id: i64) -> Result<()> {
+pub fn open_source(app: AppHandle, state: State<'_, AppState>, doc_id: i64) -> Result<()> {
     let external_ref: Option<String> = {
         let conn = state.conn()?;
         conn.query_row(
@@ -5513,7 +5536,16 @@ pub fn open_source(state: State<'_, AppState>, doc_id: i64) -> Result<()> {
     let refr = external_ref.ok_or_else(|| Error::Other("This item has no source link.".into()))?;
     match classify_source_ref(&refr) {
         SourceRefKind::Web => open_external_url(&refr),
-        SourceRefKind::LocalPath => reveal_in_file_manager(&refr),
+        SourceRefKind::LocalPath => {
+            // L-5 defense-in-depth: this path comes from the document row (populated by the
+            // now-guarded ingest / local-folder pipeline), but keep the reveal inside the folders
+            // PM tracks (or its own data dir) so it can never hand the OS shell an out-of-bounds
+            // location. Fails closed if the source has moved out of every tracked root.
+            let conn = state.conn()?;
+            pathguard::is_allowed(&app, &conn, &refr)?;
+            drop(conn);
+            reveal_in_file_manager(&refr)
+        }
     }
 }
 
@@ -6528,6 +6560,9 @@ pub async fn export_all_data(
     _state: State<'_, AppState>,
     dest_path: String,
 ) -> Result<()> {
+    // L-5: `dest_path` is a webview-supplied write destination — validate its shape and that its
+    // containing folder exists before we write the export archive there.
+    pathguard::sanitize_destination(&dest_path)?;
     // A temp *directory* (not file) so `VACUUM INTO` writes a fresh file into an empty
     // dir — it refuses a pre-existing target. The dir (and snapshot) is removed on drop.
     let tmp = tempfile::Builder::new().prefix("pm-export-").tempdir()?;
@@ -6552,23 +6587,56 @@ pub async fn export_all_data(
     .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
 }
 
-/// Export the Markdown vault as plaintext `.md` files to `dest_dir` — the spec's "you
-/// are never locked in" escape hatch (§3). Reads every vault file, decrypting any
-/// encrypted ones with the in-session key, and writes a clean tree with no `.pmenc`
-/// files, so the user can walk away with their notes in the open at any time. The vault
-/// must be unlocked (the Markdown key has to be loaded). Returns the number of files
-/// written. Unlike `export_all_data`, this is a *plaintext* escape hatch, not an
-/// encrypted backup — it deliberately strips the at-rest protection.
+/// The result of a plaintext export: how many files were written and where.
+#[derive(Serialize)]
+pub struct PlaintextExportOutcome {
+    pub count: usize,
+    pub dest: String,
+}
+
+/// Export the Markdown vault as plaintext `.md` files — the spec's "you are never locked in" escape
+/// hatch (§3). Reads every vault file, decrypting any encrypted ones with the in-session key, and
+/// writes a clean tree with no `.pmenc` files, so the user can walk away with their notes in the
+/// open at any time. The vault must be unlocked (the Markdown key has to be loaded). Unlike
+/// `export_all_data`, this is a *plaintext* escape hatch, not an encrypted backup — it deliberately
+/// strips the at-rest protection.
+///
+/// L-5: because this writes DECRYPTED vault content, the destination must not be a path a compromised
+/// webview could fabricate. We therefore pick the folder in the BACKEND (off the main thread) rather
+/// than trusting a webview-supplied string. Returns `None` if the user cancels; otherwise the count
+/// and the chosen destination for the confirmation message.
 #[tauri::command]
 pub async fn export_plaintext_markdown(
+    app: AppHandle,
     state: State<'_, AppState>,
-    dest_dir: String,
-) -> Result<usize> {
+) -> Result<Option<PlaintextExportOutcome>> {
+    use tauri_plugin_dialog::DialogExt;
+    let app2 = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app2.dialog()
+            .file()
+            .set_title("Choose a folder for the plaintext export")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| Error::Other(format!("folder dialog task failed: {e}")))?;
+    let Some(picked) = picked else {
+        return Ok(None); // cancelled
+    };
+    let dest = picked
+        .into_path()
+        .map_err(|e| Error::Other(format!("couldn't read the chosen folder path: {e}")))?;
     let (vault, cipher) = state.markdown_io()?;
-    let dest = std::path::PathBuf::from(dest_dir);
-    tokio::task::spawn_blocking(move || ingest::export_plaintext(&vault, &cipher, &dest))
-        .await
-        .map_err(|e| Error::Other(format!("export task panicked: {e}")))?
+    let dest_for_task = dest.clone();
+    let count = tokio::task::spawn_blocking(move || {
+        ingest::export_plaintext(&vault, &cipher, &dest_for_task)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("export task panicked: {e}")))??;
+    Ok(Some(PlaintextExportOutcome {
+        count,
+        dest: dest.to_string_lossy().into_owned(),
+    }))
 }
 
 /// Write the export archive: the DB snapshot as `pm.sqlite`, then the vault tree.
@@ -6682,6 +6750,9 @@ pub async fn create_local_backup(
     if passphrase.is_empty() {
         return Err(Error::Other("a backup passphrase is required".into()));
     }
+    // L-5: `dest_path` is a webview-supplied write destination — validate its shape and that its
+    // containing folder exists before we write the archive there.
+    pathguard::sanitize_destination(&dest_path)?;
     // M-4: strength floor before packing — the archive embeds the raw DB key and is portable.
     vault::kdf::validate_passphrase_strength(&passphrase)?;
     let _busy = BusyGuard::acquire(&state.backup_busy)
@@ -6814,6 +6885,9 @@ pub async fn restore_local_backup(
         },
     );
 
+    // L-5: `src_path` is a webview string pointing at an existing `.pmbackup` — require a real,
+    // absolute, well-formed location before we open and validate the archive.
+    pathguard::sanitize_source(&src_path)?;
     let src = std::path::PathBuf::from(src_path);
     let data_dir = paths::data_dir(&app)?;
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -6844,6 +6918,9 @@ pub async fn restore_local_backup(
 /// recovered the key.
 #[tauri::command]
 pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: String) -> Result<()> {
+    // L-5: `folder` is a webview string pointing at an existing vault folder — require a real,
+    // absolute, well-formed location before we open `folder/pm.sqlite` and promote its key.
+    pathguard::sanitize_source(&folder)?;
     let root = std::path::PathBuf::from(&folder);
     let meta = vault::load_meta(&root)?
         .ok_or_else(|| Error::Other("no PM vault found in that folder".into()))?;
@@ -6936,19 +7013,45 @@ pub fn proton_cli_status(state: State<'_, AppState>) -> ProtonCliStatus {
     }
 }
 
-/// Remember (or clear) a manual path to the `proton-drive` binary — the escape hatch for when the
-/// portable CLI lives somewhere auto-detection doesn't look. An empty string clears it; a non-empty
-/// path must point at an existing file, so the UI can flag a wrong pick immediately.
+/// Remember a manual path to the `proton-drive` binary — the escape hatch for when the portable CLI
+/// lives somewhere auto-detection doesn't look.
+///
+/// L-5: the stored path is later handed to `Command::new(...)` and SPAWNED, so a webview-supplied
+/// string here is a code-execution sink that no amount of after-the-fact string validation can
+/// close (a compromised webview could name any real executable). We therefore open the native file
+/// picker in the BACKEND and use its result directly — the chosen path never round-trips through the
+/// webview. Cancelling leaves the current setting untouched. The dialog is run on the blocking pool,
+/// not the main thread (a blocking pick on the main thread would deadlock the event loop).
 #[tauri::command]
-pub fn set_proton_cli_path(state: State<'_, AppState>, path: String) -> Result<()> {
-    let conn = state.conn()?;
-    let trimmed = path.trim();
-    if !trimmed.is_empty() && !std::path::Path::new(trimmed).is_file() {
+pub async fn set_proton_cli_path(app: AppHandle) -> Result<()> {
+    use tauri_plugin_dialog::DialogExt;
+    let app2 = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app2.dialog()
+            .file()
+            .set_title("Locate the proton-drive program")
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|e| Error::Other(format!("file dialog task failed: {e}")))?;
+    let Some(picked) = picked else {
+        return Ok(()); // cancelled — keep the current setting
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| Error::Other(format!("couldn't read the chosen file path: {e}")))?;
+    if !path.is_file() {
         return Err(Error::Other(
-            "That path isn't a file — pick the proton-drive program itself.".into(),
+            "That isn't a file — pick the proton-drive program itself.".into(),
         ));
     }
-    crate::db::set_setting(&conn, crate::backup::proton::CLI_PATH_SETTING, trimmed)
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    crate::db::set_setting(
+        &conn,
+        crate::backup::proton::CLI_PATH_SETTING,
+        &path.to_string_lossy(),
+    )
 }
 
 /// Resolve the CLI (honouring a manual override) or return a friendly "not installed" error (shared

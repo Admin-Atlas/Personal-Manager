@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.22.2-alpha",
+    date: "2026-07-17",
+    highlights: [
+      "Under-the-hood hardening of how PM handles file locations. When you import files, add a folder, save a backup or export, or move your vault, PM now double-checks the location is a real, sensible path before it touches your disk — an extra safety net you won't notice in everyday use. Choosing where to put a plaintext export, and pointing PM at the Proton Drive program, now open their picker from PM itself for the same reason. Nothing changes in how you use any of these.",
+    ],
+  },
+  {
     version: "3.22.1-alpha",
     date: "2026-07-16",
     highlights: [

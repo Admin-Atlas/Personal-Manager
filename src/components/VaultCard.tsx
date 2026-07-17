@@ -97,14 +97,14 @@ export function VaultCard() {
   }
 
   async function exportPlaintext() {
-    const dir = await pickFolder();
-    if (!dir) return;
+    // The backend opens the folder picker itself (L-5), so we don't pass a path.
     setBusy(true);
     setError(null);
     setMsg(null);
     try {
-      const count = await exportPlaintextMarkdown(dir);
-      setMsg(`Exported ${count} Markdown file${count === 1 ? "" : "s"} to ${dir}`);
+      const res = await exportPlaintextMarkdown();
+      if (!res) return; // cancelled
+      setMsg(`Exported ${res.count} Markdown file${res.count === 1 ? "" : "s"} to ${res.dest}`);
     } catch (e) {
       setError(String(e));
     } finally {

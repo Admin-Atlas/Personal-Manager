@@ -1122,6 +1122,12 @@ export interface IngestReport {
   failed: number;
 }
 
+/** Result of a plaintext vault export; `null` from the command means the user cancelled the picker. */
+export interface PlaintextExportOutcome {
+  count: number;
+  dest: string;
+}
+
 export type IngestEvent =
   | { type: "preparing"; message: string }
   | { type: "counted"; total: number }
