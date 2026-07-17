@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.22.3-alpha",
+    date: "2026-07-17",
+    highlights: [
+      "More under-the-hood hardening, this time around chat. When you ask PM something, it draws on your relevant notes, calendar and reminders as background material — which PM now keeps cleanly separated from its own instructions, so text living inside your own documents can never be read as a command to the assistant. It's a safety boundary behind the scenes and doesn't change how you chat.",
+    ],
+  },
+  {
     version: "3.22.2-alpha",
     date: "2026-07-17",
     highlights: [
