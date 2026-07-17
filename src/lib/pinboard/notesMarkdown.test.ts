@@ -38,9 +38,18 @@ describe("toRenderMarkdown — shorthand dialect → GFM (F-52)", () => {
     expect(toRenderMarkdown("  [] task")).toBe("  - [ ] task");
   });
 
-  it("leaves native markers and non-marker prose byte-for-byte", () => {
-    const native = "- bullet\n1. one\n> quote\njust prose, not a list";
+  it("leaves native list/quote markers byte-for-byte", () => {
+    const native = "- bullet\n1. one\n> quote";
     expect(toRenderMarkdown(native)).toBe(native);
+  });
+
+  it("gives plain prose lines a hard break so manual line breaks survive rendering (#394)", () => {
+    // GFM folds a single newline into a space, so a note typed across several lines would render
+    // as one line. Two trailing spaces make each newline a hard break, keeping the note's shape.
+    expect(toRenderMarkdown("line one\nline two")).toBe("line one  \nline two  ");
+    // Blank lines stay as paragraph breaks; an already-broken line isn't doubled (idempotent).
+    expect(toRenderMarkdown("para one\n\npara two")).toBe("para one  \n\npara two  ");
+    expect(toRenderMarkdown("already broken  ")).toBe("already broken  ");
   });
 
   it("actually changes a dialect note (the ingest wiring is not a no-op)", () => {

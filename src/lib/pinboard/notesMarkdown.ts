@@ -141,14 +141,24 @@ export function continueList(value: string, caret: number): ListEdit | null {
  *  - roman items keep their label but gain a hard line break so a run stays multi-line and
  *    isn't collapsed into one paragraph (GFM merges single newlines);
  *  - "-", "1.", ">" already render natively (bullet, ordered list, blockquote) — untouched.
- * Every non-marker line passes through byte-for-byte.
+ *  - a plain prose line gains that same two-space hard break, so a note's manual line breaks
+ *    survive rendering (GFM otherwise folds a single newline into a space, merging the lines).
+ *    Blank lines stay blank (paragraph breaks) and an already-broken line isn't doubled, so the
+ *    pass stays idempotent.
  */
 export function toRenderMarkdown(raw: string): string {
   return raw
     .split("\n")
     .map((line) => {
       const m = matchMarker(line);
-      if (!m) return line;
+      if (!m) {
+        // Plain prose: keep the author's own line breaks. A bare single newline is a GFM soft
+        // break (renders as a space), so a note typed across several lines would collapse into
+        // one. Two trailing spaces make it a hard break — the same rule the roman branch uses.
+        // Leave blank lines and already-broken lines alone so re-running is a no-op.
+        if (line.trim() === "" || line.endsWith("  ")) return line;
+        return `${line}  `;
+      }
       const { indent, token, content } = m;
 
       const cb = /^\[([ xX]?)\]$/.exec(token);

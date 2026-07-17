@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.22.5-alpha",
+    date: "2026-07-17",
+    highlights: [
+      "Fixed pinboard notes running your lines together. When you write a note across several lines and then click away to read it back, PM now keeps the line breaks exactly where you put them instead of merging everything into one paragraph.",
+    ],
+  },
+  {
     version: "3.22.4-alpha",
     date: "2026-07-17",
     highlights: [
