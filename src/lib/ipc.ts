@@ -420,10 +420,13 @@ export function sendMessage(
   conversationId: number,
   content: string,
   onEvent: (event: ChatEvent) => void,
+  /** Developer mode only: ask the backend to emit a `prompt` event with the exact assembled request
+   *  before streaming, so the UI can show what was sent. Defaults off — a normal chat sends no prompt. */
+  capturePrompt = false,
 ): Promise<void> {
   const channel = new Channel<ChatEvent>();
   channel.onmessage = onEvent;
-  return invoke<void>("send_message", { conversationId, content, onEvent: channel });
+  return invoke<void>("send_message", { conversationId, content, capturePrompt, onEvent: channel });
 }
 
 /** How full the selected model's context window is for a conversation, plus the meter/alert state

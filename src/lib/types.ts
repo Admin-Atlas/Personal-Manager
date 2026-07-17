@@ -285,8 +285,17 @@ export interface Citation {
   dated?: string | null;
 }
 
+/** One assembled request message shown in the Developer-mode "prompt sent to the API" dropdown —
+ *  the exact `{role, content}` pairs PM handed to the model for a turn (card #395). */
+export interface PromptMessage {
+  role: string;
+  content: string;
+}
+
 export type ChatEvent =
   | { type: "token"; text: string }
+  // Developer mode only: the exact assembled request, emitted once before the reply streams.
+  | { type: "prompt"; messages: PromptMessage[] }
   | { type: "done"; message_id: number; content: string; citations: Citation[] }
   | { type: "error"; message: string };
 
