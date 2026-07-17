@@ -1,22 +1,21 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// In-chat "Retrieval explain" (card 7H): the transparency panel from Developer mode, surfaced to
-// graduated users right under the chat composer. It shows which chunks a query retrieves and how
-// they scored, and exposes the one lever that matters — the retrieval depth `k`, the size of the
-// candidate POOL the reranker sees (not a display count). Dragging the slider PREVIEWS a pool live;
-// a distinct "Use this depth" button is the only thing that commits it (no silent, one-drag change).
-// A plain-language diagnostic reads the user's own explain state and RECOMMENDS what to change — it
-// never actuates; the user makes the change themselves.
+// In-chat "Retrieval explain" (card 7H): the transparency panel from Developer mode, shown right under
+// the chat composer. It shows which chunks a query retrieves and how they scored, and exposes the one
+// lever that matters — the retrieval depth `k`, the size of the candidate POOL the reranker sees (not a
+// display count). Dragging the slider PREVIEWS a pool live; a distinct "Use this depth" button is the
+// only thing that commits it (no silent, one-drag change). A plain-language diagnostic reads the user's
+// own explain state and RECOMMENDS what to change — it never actuates; the user makes the change themselves.
 //
-// Gated by `teachVisible` — the same graduation toggle that governs the Review/Teach tabs — so it's
-// hidden on the calm/minimal surface and recoverable from Appearance settings. The component owns
+// Gated by `devMode` (card #395): a retrieval inspector belongs with the other Developer-mode surfaces,
+// so it appears only when the Developer-mode toggle is on and is invisible otherwise. The component owns
 // that gate, so both chat surfaces (global + project) mount it unconditionally.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DevRetrievalExplain, Message } from "../lib/types";
 import { getSettings, retrievalDiagnose, retrievalExplain, setRetrievalK } from "../lib/ipc";
-import { useTheme } from "../theme";
+import { useDevMode } from "../lib/capabilities";
 import { RetrievalScoreTable } from "./RetrievalScoreTable";
 import { Popover } from "./calendar/Popover";
 import { Button } from "./ui";
@@ -33,7 +32,7 @@ interface Props {
 }
 
 export function RetrievalExplainPanel({ messages, project }: Props) {
-  const { teachVisible } = useTheme();
+  const { devMode } = useDevMode();
 
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -143,7 +142,7 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
       .finally(() => setDiagnosing(false));
   }, [symptom, explain, explainedQuery]);
 
-  if (!teachVisible) return null;
+  if (!devMode) return null;
 
   const dirty = savedK != null && k !== savedK;
 

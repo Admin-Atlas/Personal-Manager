@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.23.0-alpha",
+    date: "2026-07-17",
+    highlights: [
+      'For anyone who likes to look under the hood: turn on Developer mode and each chat answer now carries a collapsed "Prompt sent to the API" panel — open it to see exactly what PM sent the model for that reply, its own instructions and the notes, calendar and reminders it drew on. The in-chat retrieval "Explain" tool moved into Developer mode alongside it. Leave Developer mode off and nothing about chat changes.',
+    ],
+  },
+  {
     version: "3.22.5-alpha",
     date: "2026-07-17",
     highlights: [

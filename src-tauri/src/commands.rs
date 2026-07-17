@@ -131,12 +131,27 @@ pub struct Settings {
     pub retrieval_k: usize,
 }
 
+/// One assembled request message, surfaced verbatim to the Developer-mode "prompt sent to the API"
+/// inspector (card #395): the exact `{role, content}` pairs handed to OpenRouter for a turn.
+#[derive(Clone, Serialize)]
+pub struct PromptMessage {
+    pub role: String,
+    pub content: String,
+}
+
 /// Streamed back to the UI over a Tauri channel as the assistant replies.
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEvent {
     Token {
         text: String,
+    },
+    /// Developer mode only: the exact assembled request (system instructions + the bundled user
+    /// context + the recency window), emitted once BEFORE the first token so the UI can show what was
+    /// actually sent. Never persisted; only emitted when the caller opts in (Developer mode on), so a
+    /// normal chat never ships the full prompt (profile + retrieved excerpts) to the webview.
+    Prompt {
+        messages: Vec<PromptMessage>,
     },
     Done {
         message_id: i64,
@@ -1897,6 +1912,10 @@ pub async fn send_message(
     state: State<'_, AppState>,
     conversation_id: i64,
     content: String,
+    // Developer mode only (card #395): when true, emit the assembled request as a `Prompt` event
+    // before streaming so the UI can show exactly what was sent. The frontend sets this from the
+    // Developer-mode toggle, so a normal chat leaves it false and ships no prompt to the webview.
+    capture_prompt: bool,
     on_event: Channel<ChatEvent>,
 ) -> Result<()> {
     let content = content.trim().to_string();
@@ -2130,6 +2149,22 @@ pub async fn send_message(
         &retrieved,
         history,
     );
+
+    // Developer mode only (card #395): surface the exact assembled request — system instructions and
+    // the single bundled user/context message — so the user can see verbatim what PM sent to the API.
+    // Emitted once, before the first token; never persisted. `stream_chat` borrows `&messages` next, so
+    // this only clones the strings when the inspector is actually on.
+    if capture_prompt {
+        let _ = on_event.send(ChatEvent::Prompt {
+            messages: messages
+                .iter()
+                .map(|m| PromptMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect(),
+        });
+    }
 
     // Stream the reply, forwarding each token to the UI.
     let result = openrouter::stream_chat(

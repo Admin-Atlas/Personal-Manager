@@ -3,7 +3,8 @@
 
 import { useCallback, useRef, useState } from "react";
 import { sendMessage } from "./ipc";
-import type { Message } from "./types";
+import { useDevMode } from "./capabilities";
+import type { Message, PromptMessage } from "./types";
 
 /**
  * Chat send + streaming state, shared by the global chat (App) and the
@@ -23,10 +24,20 @@ export function useChatStream(currentConvId: () => number | null) {
   const [streaming, setStreaming] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Developer mode only: the exact assembled request PM sent for a turn, keyed by the assistant
+  // message id (from the `done` event). Ephemeral — captured live this session, never persisted, and
+  // dropped on a conversation switch — so the "prompt sent to the API" dropdown shows for turns sent
+  // here, not ones reloaded from history.
+  const [prompts, setPrompts] = useState<Record<number, PromptMessage[]>>({});
 
   // Keep the getter in a ref so `send` can stay stable across renders.
   const currentRef = useRef(currentConvId);
   currentRef.current = currentConvId;
+  // Read the dev toggle through a ref for the same reason — `send` asks the backend to emit the prompt
+  // only when Developer mode is on, without taking `devMode` as a dep and re-creating `send`.
+  const { devMode } = useDevMode();
+  const devModeRef = useRef(devMode);
+  devModeRef.current = devMode;
 
   /** Drop a finished/abandoned stream's transient UI. Call when the displayed
    *  conversation changes (switch, new chat, project change) so a previous
@@ -35,6 +46,7 @@ export function useChatStream(currentConvId: () => number | null) {
     setStreaming(null);
     setSending(false);
     setError(null);
+    setPrompts({});
   }, []);
 
   /** Append the user's message optimistically and stream the assistant reply
@@ -56,17 +68,30 @@ export function useChatStream(currentConvId: () => number | null) {
     setSending(true);
 
     let acc = "";
+    // Held from the `prompt` event (which fires before the first token) and committed to `prompts`
+    // under the assistant message id once `done` delivers it, so the dropdown attaches to its turn.
+    let captured: PromptMessage[] | null = null;
     try {
-      await sendMessage(convId, text, (event) => {
-        // Always accumulate so a resumed view shows the full reply; only write to
-        // shared UI state while this is still the conversation on screen.
-        if (event.type === "token") {
-          acc += event.text;
-          if (isCurrent()) setStreaming(acc);
-        } else if (event.type === "error" && isCurrent()) {
-          setError(event.message);
-        }
-      });
+      await sendMessage(
+        convId,
+        text,
+        (event) => {
+          // Always accumulate so a resumed view shows the full reply; only write to
+          // shared UI state while this is still the conversation on screen.
+          if (event.type === "token") {
+            acc += event.text;
+            if (isCurrent()) setStreaming(acc);
+          } else if (event.type === "prompt") {
+            captured = event.messages;
+          } else if (event.type === "done") {
+            const p = captured;
+            if (p && isCurrent()) setPrompts((prev) => ({ ...prev, [event.message_id]: p }));
+          } else if (event.type === "error" && isCurrent()) {
+            setError(event.message);
+          }
+        },
+        devModeRef.current,
+      );
     } catch (e) {
       if (isCurrent()) setError(String(e));
     } finally {
@@ -77,5 +102,15 @@ export function useChatStream(currentConvId: () => number | null) {
     }
   }, []);
 
-  return { messages, setMessages, streaming, sending, error, setError, clearTransient, send };
+  return {
+    messages,
+    setMessages,
+    streaming,
+    sending,
+    error,
+    setError,
+    clearTransient,
+    send,
+    prompts,
+  };
 }
