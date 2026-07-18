@@ -18,8 +18,9 @@ use crate::error::{Error, Result};
 pub const DEFAULT_TOP_K: usize = 6;
 
 /// How deep each branch (vector / keyword) searches before fusion — a little
-/// wider than top-k so fusion has material to reorder.
-const BRANCH_LIMIT: usize = 20;
+/// wider than top-k so fusion has material to reorder, and the width of the
+/// candidate pool the reranker judges before the final top-k grounding cut.
+pub const BRANCH_LIMIT: usize = 20;
 
 /// Reciprocal Rank Fusion constant (the value from the original RRF paper). It
 /// damps low-ranked hits without needing to normalize the two branches' scores,
@@ -144,9 +145,11 @@ pub struct RetrieveQuery<'a> {
 }
 
 /// The fused (pre-rerank) half of retrieval: run the requested strategy's hybrid core and return
-/// the ranked passages. This is the part that needs the DB, so the caller holds the connection
-/// guard only across this; it then drops the guard before [`rerank`], keeping the cross-encoder
-/// **off the DB lock** (AGENTS rule #4 — a sidecar call can block on a model download).
+/// the ranked candidate **pool** (up to `branch_limit`, ~20 at the default k) — NOT the final top-k.
+/// This is the part that needs the DB, so the caller holds the connection guard only across this; it
+/// then drops the guard before [`rerank_and_select`], which reranks the whole pool **off the DB
+/// lock** (AGENTS rule #4 — a sidecar call can block on a model download) and only then truncates to
+/// the top-k grounding set.
 pub fn retrieve_fused(conn: &Connection, q: &RetrieveQuery) -> Result<Vec<RetrievedChunk>> {
     match q.strategy {
         Strategy::HybridRrf => hybrid_core(
@@ -161,9 +164,13 @@ pub fn retrieve_fused(conn: &Connection, q: &RetrieveQuery) -> Result<Vec<Retrie
     }
 }
 
-/// The rerank half of retrieval — conn-free, so it runs after the caller drops the DB guard.
+/// The rerank-only half of retrieval — conn-free, so it runs after the caller drops the DB guard.
 /// `None` (reranking disabled by the Settings toggle, or a reranker that returns `None`/fails)
-/// leaves the fused order untouched, so search degrades gracefully and never mis-orders.
+/// leaves the fused order untouched, so search degrades gracefully and never mis-orders. The
+/// production path uses [`rerank_and_select`] (rerank the pool, *then* truncate to top-k); this
+/// score-dropping variant is a reserved primitive for in-process/agent callers, exercised by the
+/// tests.
+#[allow(dead_code)]
 pub fn rerank(
     reranker: Option<&dyn Reranker>,
     query: &str,
@@ -188,17 +195,44 @@ pub fn rerank_scored(
     }
 }
 
-/// Tool-shaped retrieval (spec §21.4): fuse, then rerank — the one contract chat, the Documents
-/// search, and (later) agents share. The production chat/search paths call [`retrieve_fused`] then
-/// [`rerank`] separately so the cross-encoder runs off the DB lock; this combined form is the
-/// stable seam reserved for in-process/agent callers and is exercised by the tests.
+/// Tool-shaped retrieval (spec §21.4): fuse, then rerank-and-select — the one contract chat, the
+/// Documents search, and (later) agents share. The production chat/search paths call
+/// [`retrieve_fused`] then [`rerank_and_select`] separately so the cross-encoder runs off the DB
+/// lock; this combined form is the stable seam reserved for in-process/agent callers and is
+/// exercised by the tests.
 #[allow(dead_code)]
 pub fn retrieve(
     conn: &Connection,
     q: &RetrieveQuery,
     reranker: Option<&dyn Reranker>,
 ) -> Result<Vec<RetrievedChunk>> {
-    rerank(reranker, q.text, retrieve_fused(conn, q)?)
+    Ok(rerank_and_select(reranker, q.text, retrieve_fused(conn, q)?, q.k)?.0)
+}
+
+/// Select the final top-k grounding chunks from an already-ordered candidate pool (reranked when
+/// enabled, else fused + recency order): apply the per-section diversity cap and truncate to `k`.
+/// The single home of "final grounding selection", shared by the production chat path
+/// ([`rerank_and_select`]) and the Developer-mode retrieval-explain panel, so the two can never
+/// drift. Pure and order-preserving, so it's unit-tested without a DB.
+pub fn select_top_k(ranked: Vec<RetrievedChunk>, k: usize) -> Vec<RetrievedChunk> {
+    diversify(ranked, k, max_per_section(k))
+}
+
+/// Rerank the whole candidate pool, then select the final top-k for the prompt. Reranking now judges
+/// every pooled candidate (~`branch_limit`) instead of a pre-truncated top-k, so the cross-encoder
+/// can promote a strongly on-topic chunk that RRF ranked below the cut — it *selects*, not merely
+/// reorders. Returns the top-k grounding chunks plus the **top** rerank score (the confidence-gate
+/// signal), taken over the whole pool before truncation. Conn-free, so it runs after the caller
+/// drops the DB guard; reranking off (toggle / opt-out / malformed scores) falls back to the
+/// fused + recency order, still selected down to top-k.
+pub fn rerank_and_select(
+    reranker: Option<&dyn Reranker>,
+    query: &str,
+    pool: Vec<RetrievedChunk>,
+    k: usize,
+) -> Result<(Vec<RetrievedChunk>, Option<f32>)> {
+    let (reranked, top) = rerank_scored(reranker, query, pool)?;
+    Ok((select_top_k(reranked, k), top))
 }
 
 /// The passage text handed to the cross-encoder reranker for a candidate: the `Title > Heading`
@@ -306,15 +340,14 @@ fn hybrid_core(
         fts_hits.truncate(branch_limit);
     }
     let fused = fuse_scored(&[vec_hits, fts_hits]);
-    // Over-fetch a wider ranked pool, then apply the per-section diversity cap so one long section
-    // (or a cluster of near-duplicate chunks that all carry the same breadcrumb) can't monopolise
-    // the top-k and starve other sections/documents. `branch_limit` (>= 20) gives the cap
-    // alternatives to promote; `diversify`'s backfill keeps the count identical to the old top-k when
-    // there's no diversity to be had. Query-time only, so it's not part of the retrieval-config stamp
-    // and triggers no Rebuild.
+    // Return the recency-decayed candidate POOL (up to `branch_limit`, ~20 at the default k), not a
+    // pre-truncated top-k: the caller reranks this whole pool and only then selects the final top-k
+    // (`rerank_and_select` → `select_top_k`), so the cross-encoder judges every candidate and can
+    // promote a strongly on-topic chunk that RRF ranked below the cut. The per-section diversity cap
+    // and the top-k truncation live in `select_top_k`, downstream of the rerank. Query-time only, so
+    // none of this is part of the retrieval-config stamp and it triggers no Rebuild.
     let pool = apply_recency(conn, fused, branch_limit)?;
-    let chunks = load_chunks(conn, &pool)?;
-    Ok(diversify(chunks, k, max_per_section(k)))
+    load_chunks(conn, &pool)
 }
 
 /// The chunk ids belonging to a project's documents — the allow-set for a scoped
@@ -673,11 +706,12 @@ pub struct ExplainCandidate {
     pub decayed_score: f64,
 }
 
-/// Run the hybrid retriever for `query` and return the top-k candidates **with** their per-stage
-/// scores, in fused + recency order (reranking, if enabled, is applied off the DB lock by the
-/// caller). The production [`retrieve_fused`] path is left untouched; this is a parallel,
-/// instrumented read used only by the Developer-mode panel. Pure SQL + a supplied embedding, like
-/// [`hybrid_core`], so it is unit-testable without Python.
+/// Run the hybrid retriever for `query` and return the candidate **pool** (up to `branch_limit`)
+/// **with** their per-stage scores, in fused + recency order. Reranking and the final top-k
+/// selection are applied off the DB lock by the caller (mirroring production's [`rerank_and_select`]
+/// → [`select_top_k`]), so the panel reflects exactly what the chat path grounds on. This is a
+/// parallel, instrumented read used only by the Developer-mode panel. Pure SQL + a supplied
+/// embedding, like [`hybrid_core`], so it is unit-testable without Python.
 pub fn explain(
     conn: &Connection,
     query_text: &str,
@@ -743,12 +777,11 @@ pub fn explain(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
-    // Over-fetch the pool, then apply the SAME per-section diversity cap production uses, so the
-    // panel reflects what the model actually receives rather than the raw fused ranking.
+    // Keep the whole recency-decayed pool (up to `branch_limit`); the reranker judges all of it and
+    // the caller selects the final top-k, mirroring production's `rerank_and_select` → `select_top_k`.
     decayed.truncate(branch_limit);
 
-    // Load full provenance for the pool, keyed by id so per-stage scores reattach after the cap
-    // selects and reorders the survivors.
+    // Load full provenance for the pool, keyed by id so per-stage scores reattach in pool order.
     let by_id: HashMap<i64, RetrievedChunk> = {
         let ids: Vec<i64> = decayed.iter().map(|(id, ..)| *id).collect();
         load_chunks(conn, &ids)?
@@ -764,10 +797,9 @@ pub fn explain(
         .iter()
         .filter_map(|(id, ..)| by_id.get(id).cloned())
         .collect();
-    let survivors = diversify(pool_chunks, k, max_per_section(k));
 
-    let mut out = Vec::with_capacity(survivors.len());
-    for chunk in survivors {
+    let mut out = Vec::with_capacity(pool_chunks.len());
+    for chunk in pool_chunks {
         let id = chunk.chunk_id;
         let (age, factor, decayed_score) = recency.get(&id).copied().unwrap_or((None, 1.0, 0.0));
         out.push(ExplainCandidate {
@@ -1170,6 +1202,53 @@ mod tests {
         // Never invents chunks: a pool shorter than k comes back whole.
         let pool = vec![rc(1, 1, "A"), rc(2, 1, "A"), rc(3, 1, "A")];
         assert_eq!(diversify(pool, 6, max_per_section(6)).len(), 3);
+    }
+
+    #[test]
+    fn rerank_and_select_promotes_a_pool_chunk_the_fused_order_would_have_cut() {
+        // The reranker now judges the WHOLE pool, not a pre-truncated top-k: a chunk the fused order
+        // ranked last is promoted into the final top-k when the cross-encoder loves it — the reranker
+        // *selects*, it doesn't just reorder within an already-committed set.
+        struct GemReranker;
+        impl Reranker for GemReranker {
+            fn scores(&self, _query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+                Ok(Some(
+                    passages
+                        .iter()
+                        .map(|p| p.matches("GEM").count() as f32)
+                        .collect(),
+                ))
+            }
+        }
+        // Eight distinct sections (rc_full keys each by its own document_id) so the per-section cap
+        // never interferes — only pool position matters. Only chunk 8, LAST in the fused pool, carries
+        // the term the reranker rewards.
+        let pool: Vec<RetrievedChunk> = (1..=8)
+            .map(|i| rc_full(i, "Doc", Some("S"), if i == 8 { "GEM" } else { "plain" }))
+            .collect();
+
+        let (out, top) =
+            rerank_and_select(Some(&GemReranker), "find the gem", pool.clone(), 3).unwrap();
+        let ids: Vec<i64> = out.iter().map(|c| c.chunk_id).collect();
+        assert_eq!(out.len(), 3, "still selects exactly k");
+        assert_eq!(
+            ids[0], 8,
+            "the reranker's best, though last in the fused pool, leads the final top-k"
+        );
+        assert_eq!(
+            top,
+            Some(1.0),
+            "the gate signal is the top rerank score over the WHOLE pool, taken before truncation"
+        );
+
+        // Without reranking, selection is the fused pool order → the first k, and chunk 8 (last) is
+        // cut — exactly what the old truncate-then-rerank pipeline did to a fused-low chunk.
+        let (plain, plain_top) = rerank_and_select(None, "find the gem", pool, 3).unwrap();
+        assert_eq!(
+            plain.iter().map(|c| c.chunk_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(plain_top, None);
     }
 
     #[test]
@@ -1781,17 +1860,19 @@ mod tests {
         };
         let ids = |v: &[RetrievedChunk]| v.iter().map(|c| c.chunk_id).collect::<Vec<_>>();
 
-        // The production split (fuse under the lock, then rerank off it) reproduces the combined
-        // tool-shaped contract exactly.
-        let fused = retrieve_fused(&conn, &q).unwrap();
-        let split = rerank(Some(&ReverseReranker as &dyn Reranker), q.text, fused).unwrap();
+        // The production split (fuse under the lock, then rerank-and-select off it) reproduces the
+        // combined tool-shaped contract exactly.
+        let pool = retrieve_fused(&conn, &q).unwrap();
+        let split = rerank_and_select(Some(&ReverseReranker as &dyn Reranker), q.text, pool, q.k)
+            .unwrap()
+            .0;
         let combined = retrieve(&conn, &q, Some(&ReverseReranker as &dyn Reranker)).unwrap();
         assert_eq!(ids(&split), ids(&combined));
 
-        // rerank(None) — reranking disabled — is the identity on the fused order.
-        let fused2 = retrieve_fused(&conn, &q).unwrap();
-        let passthrough = rerank(None, q.text, fused2.clone()).unwrap();
-        assert_eq!(ids(&passthrough), ids(&fused2));
+        // rerank(None) — reranking disabled — is the identity on the fused pool order.
+        let pool2 = retrieve_fused(&conn, &q).unwrap();
+        let passthrough = rerank(None, q.text, pool2.clone()).unwrap();
+        assert_eq!(ids(&passthrough), ids(&pool2));
     }
 
     #[test]
