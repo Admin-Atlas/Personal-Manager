@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.24.0-alpha",
+    date: "2026-07-18",
+    highlights: [
+      "PM no longer treats its own past answers as source material when it's answering you. It still keeps every conversation in full — nothing is deleted, and you can reread any chat — but when it looks for relevant background it now draws only on your own notes, files and messages, not on things it said earlier. That closes a subtle loop where an older, imperfect answer could quietly shape a new one. And since a reply is often worth keeping, there's now a \"Save as note\" button under each answer: one click files it as a real, searchable note in your vault, tagged with a small reminder that it came from a chat. (If you chatted before this update, press Rebuild once in Documents to clear the old answers out of search.)",
+    ],
+  },
+  {
     version: "3.23.1-alpha",
     date: "2026-07-18",
     highlights: [

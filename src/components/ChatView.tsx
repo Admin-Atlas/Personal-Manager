@@ -14,7 +14,8 @@ import type { Citation, Message, PromptMessage } from "../lib/types";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
-import { formatDate } from "../lib/format";
+import { formatDate, formatDateLocal } from "../lib/format";
+import { ingestNote } from "../lib/ipc";
 
 interface Props {
   messages: Message[];
@@ -197,6 +198,47 @@ function PromptPanel({ messages }: { messages: PromptMessage[] }) {
   );
 }
 
+/** A "Save as note" affordance under an assistant answer (standard + power depth). PM's own answers
+ *  are no longer indexed as retrievable grounding (they'd otherwise let the model re-ground on its own
+ *  earlier output), so a genuinely useful one is kept by promoting it to a real, searchable vault note.
+ *  Reuses the pinboard note-ingest path, keyed on the message id so it is idempotent (saving twice
+ *  re-embeds in place, never duplicates), with a soft "saved from a chat" date breadcrumb for
+ *  provenance. The note is standalone — deleting the chat never removes it. */
+function SaveAsNoteButton({ message }: { message: Message }) {
+  const [state, setState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const save = async () => {
+    if (state === "saving" || state === "saved") return;
+    setState("saving");
+    try {
+      const stamp = `_Saved from a chat, ${formatDateLocal(new Date())}_`;
+      await ingestNote(`chat:${message.id}`, "", `${message.content}\n\n${stamp}`);
+      setState("saved");
+    } catch {
+      setState("error");
+    }
+  };
+  const label =
+    state === "saving"
+      ? "Saving…"
+      : state === "saved"
+        ? "Saved to notes ✓"
+        : state === "error"
+          ? "Couldn't save — retry"
+          : "Save as note";
+  return (
+    <div className="flex justify-end">
+      <button
+        type="button"
+        onClick={save}
+        disabled={state === "saving" || state === "saved"}
+        className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 transition-colors hover:text-ink2 disabled:cursor-default disabled:hover:text-ink4 motion-reduce:transition-none"
+      >
+        {label}
+      </button>
+    </div>
+  );
+}
+
 /** One message and, for a grounded assistant turn, its sources — wired so an inline
  *  `[n]` marker scrolls to and flashes source n. `highlight` flashes the whole turn when a chat
  *  citation navigated here to it (card 7E PR3); `registerBlock` lets the parent scroll it into view. */
@@ -259,6 +301,9 @@ const MessageBlock = memo(function MessageBlock({
       )}
       {showPrompt && message.role === "assistant" && prompt && prompt.length > 0 && (
         <PromptPanel messages={prompt} />
+      )}
+      {message.role === "assistant" && atLeast("standard") && message.content.trim() !== "" && (
+        <SaveAsNoteButton message={message} />
       )}
     </div>
   );
