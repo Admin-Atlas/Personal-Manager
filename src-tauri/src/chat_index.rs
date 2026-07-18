@@ -14,10 +14,13 @@
 //!     old chunks are never re-split or re-embedded. Document ingest re-splits the whole file on every
 //!     change; chat can't afford that (it grows forever), and append-only is what makes per-chunk
 //!     timestamps natural.
-//!   * **Authored content only.** We embed exactly what the user wrote and what the model wrote, read
-//!     straight from the `messages` table — never the RAG context that was assembled into the prompt.
-//!     Indexing the assembled prompt would re-embed copies of other documents' chunks as chat sources
-//!     (near-duplicate retrieval poisoning + unbounded bloat). See [`render_authored_segment`].
+//!   * **The user's authored turn only.** We embed what the *user* wrote, read straight from the
+//!     `messages` table — never what PM wrote, and never the RAG context assembled into the prompt.
+//!     PM's own answers stay in the vault transcript but are never retrievable grounding, so a re-asked
+//!     question can't retrieve PM's earlier reply and make the model re-ground on its own output
+//!     (Bobby's 2026-07-18 decision); indexing the assembled prompt would likewise re-embed other
+//!     documents' chunks as chat sources (near-duplicate retrieval poisoning + unbounded bloat). See
+//!     [`render_authored_segment`].
 //!   * **Cursor-driven idempotency.** The cursor advances only inside the same transaction that lands
 //!     the chunks ([`commit_session_index`]). A crash mid-sweep leaves the cursor where it was, so the
 //!     next run simply re-reads the same turn-pairs — never a double-insert. The trigger is always "is
@@ -620,17 +623,18 @@ fn reevaluate_on_append(tx: &Connection, doc_id: i64, scope: &str) -> Result<boo
     }
 }
 
-/// One turn-pair as the text we embed: **authored content only** — exactly what the user wrote and what
-/// the model wrote, taken from the `messages` rows (the [`chat::TurnPair`]). The RAG context that was
-/// assembled into the live prompt is structurally absent here because we never read the prompt — only
-/// the authored messages. This is card B's one-line "index the authored content, never the retrieved
-/// context" rule, enforced by construction.
+/// One turn-pair as the text we embed: **the user's authored turn only**. Card B's rule was "index
+/// the authored content, never the retrieved context"; Bobby's 2026-07-18 decision narrows it further
+/// — index what the *user* wrote, never what *PM* wrote. PM's own answers stay in the vault transcript
+/// (`chat::append_turn_pair` writes both sides), so conversations still read back and reopen in full,
+/// but they are never retrievable grounding. Otherwise a re-asked question retrieves PM's earlier
+/// answer and the model re-grounds on its own (possibly wrong) output — a compounding-hallucination
+/// loop (the "what is stage 4 of pm" retrieval-explain panels: PM's prior answers reranked at the very
+/// top and were parroted back). A Rebuild clears + re-indexes each chat through this same seam, so
+/// already-indexed PM-answer chunks are purged then; the RAG context is structurally absent here
+/// either way because we only ever read the authored messages, never the assembled prompt.
 fn render_authored_segment(pair: &chat::TurnPair) -> String {
-    format!(
-        "**You:** {}\n\n**PM:** {}",
-        pair.user.trim(),
-        pair.assistant.trim()
-    )
+    format!("**You:** {}", pair.user.trim())
 }
 
 /// Index every chat session that has completed turn-pairs past its cursor. The launch/idle sweep. A
@@ -1404,7 +1408,9 @@ mod tests {
     }
 
     #[test]
-    fn authored_segment_holds_only_the_two_messages() {
+    fn authored_segment_indexes_the_user_turn_only() {
+        // Bobby's 2026-07-18 decision: the user's turn is indexed; PM's answer never is (it stays in
+        // the transcript only), so the model can't re-ground on its own prior output.
         let pair = chat::TurnPair {
             user: "  what should I name the org?  ".into(),
             assistant: "Atlas.".into(),
@@ -1412,10 +1418,9 @@ mod tests {
             at: "2026-06-28T10:00:01.000Z".into(),
         };
         let seg = render_authored_segment(&pair);
-        assert_eq!(
-            seg,
-            "**You:** what should I name the org?\n\n**PM:** Atlas."
-        );
+        assert_eq!(seg, "**You:** what should I name the org?");
+        assert!(!seg.contains("**PM:**"));
+        assert!(!seg.contains("Atlas."));
     }
 
     /// Create the vault file at exactly the path `delete_conversation_inner` will compute
