@@ -665,12 +665,15 @@ pub(crate) fn run_retrieval_explain(
         candidates.into_iter().map(|c| (c, None)).collect();
     let mut reranked = false;
     if rerank_on {
-        let texts: Vec<&str> = scored
+        // Same rerank input as production (title + heading breadcrumb, not bare body) so the panel
+        // reflects the real reranked order — see `retrieval::rerank_text`.
+        let texts: Vec<String> = scored
             .iter()
-            .map(|(c, _)| c.chunk.content.as_str())
+            .map(|(c, _)| retrieval::rerank_text(&c.chunk))
             .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let reranker = &gateway as &dyn retrieval::Reranker;
-        if let Some(scores) = reranker.scores(query, &texts)? {
+        if let Some(scores) = reranker.scores(query, &refs)? {
             if scores.len() == scored.len() {
                 for ((_, slot), s) in scored.iter_mut().zip(scores.iter()) {
                     *slot = Some(*s);
