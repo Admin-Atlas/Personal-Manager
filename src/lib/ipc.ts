@@ -553,9 +553,9 @@ export const retrievalExplain = (query: string, project?: string, k?: number) =>
  *  every future chat turn retrieves at (card 7H). Clamped 1–50 in the backend; stateless. */
 export const setRetrievalK = (k: number) => invoke<void>("set_retrieval_k", { k });
 
-/** Set the confidence-gate threshold — the minimum top rerank score for PM to trust its grounding —
- *  or `null` to disable the gate (the default). Below it, PM hedges instead of grounding on a weak
- *  match. Stateless; calibrated in Developer mode (card #402). */
+/** Set the confidence-gate threshold — the minimum top rerank score for PM to trust its grounding. A
+ *  number turns the gate ON at that score; `null` turns it OFF. On by default. Below the threshold PM
+ *  hedges instead of grounding on a weak match. Stateless; calibrated in Developer mode (card #402). */
 export const setRetrievalConfidenceThreshold = (threshold: number | null) =>
   invoke<void>("set_retrieval_confidence_threshold", { threshold });
 

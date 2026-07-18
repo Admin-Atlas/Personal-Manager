@@ -43,8 +43,8 @@ export interface Settings {
   /** Retrieval depth `k` — how many fused candidates reach the reranker (card 7H). The lever the
    *  in-chat Retrieval-explain panel tunes; default 6, stateless. */
   retrieval_k: number;
-  /** The confidence-gate threshold — the minimum top rerank score for PM to trust its grounding, or
-   *  null when the gate is disabled (the default). Calibrated in Developer mode (card #402). */
+  /** The effective confidence-gate threshold — the minimum top rerank score for PM to trust its
+   *  grounding — or null when a dev has disabled the gate. On by default; tuned in Developer mode (#402). */
   retrieval_confidence_threshold: number | null;
 }
 

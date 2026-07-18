@@ -256,43 +256,77 @@ function ConfidenceReadout({ confidence }: { confidence: GroundingConfidence }) 
   );
 }
 
-/** Developer-mode control (card #402) to set the confidence-gate threshold live for calibration: the
- *  minimum top rerank score for PM to trust its grounding. Empty = the gate is off (the default), so
- *  PM always trusts its sources. Reads the current value once; writes on change (stateless backend). */
+/** The gate's default threshold, mirrored from the backend (`db::DEFAULT_CONFIDENCE_THRESHOLD`) only to
+ *  seed the control when a dev flips the gate back on. The backend is authoritative for the value
+ *  actually applied — it uses this default whenever the setting is absent, so the gate is on for
+ *  everyone without the frontend writing anything. */
+const DEFAULT_CONFIDENCE_THRESHOLD = -8.5;
+
+/** Developer-mode control (card #402) to tune the confidence gate live for calibration: the minimum top
+ *  rerank score for PM to trust its grounding. ON by default at the calibrated threshold; a dev can
+ *  change the number or switch the gate off. Off is an EXPLICIT toggle and the number box is disabled
+ *  when off, so a stray click/blank can't silently arm a "gate everything" 0 (the old footgun). Reads
+ *  the current value once; writes on change (stateless backend). */
 function ConfidenceThresholdControl() {
+  // `threshold`: null = gate off; a number = gate on at that score. `draft` mirrors the number box so a
+  // dev can clear and retype without the committed value snapping around mid-edit.
   const [threshold, setThreshold] = useState<number | null>(null);
+  const [draft, setDraft] = useState(String(DEFAULT_CONFIDENCE_THRESHOLD));
   const [loaded, setLoaded] = useState(false);
   useEffect(() => {
     getSettings()
-      .then((s) => setThreshold(s.retrieval_confidence_threshold))
+      .then((s) => {
+        setThreshold(s.retrieval_confidence_threshold);
+        if (s.retrieval_confidence_threshold !== null)
+          setDraft(String(s.retrieval_confidence_threshold));
+      })
       .catch(() => {})
       .finally(() => setLoaded(true));
   }, []);
   if (!loaded) return null;
+  const on = threshold !== null;
   const commit = (v: number | null) => {
     setThreshold(v);
     setRetrievalConfidenceThreshold(v).catch(() => {});
   };
+  const toggle = () => {
+    if (on) {
+      commit(null); // switch the gate off
+    } else {
+      const n = Number(draft);
+      commit(draft.trim() !== "" && Number.isFinite(n) ? n : DEFAULT_CONFIDENCE_THRESHOLD);
+    }
+  };
   return (
     <div className="flex items-center gap-2 font-mono text-[10px] text-ink4">
       <span className="uppercase tracking-wide">confidence gate</span>
+      <button
+        type="button"
+        onClick={toggle}
+        aria-pressed={on}
+        className="rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 text-ink2 transition-colors hover:text-ink motion-reduce:transition-none"
+      >
+        {on ? "on" : "off"}
+      </button>
       <input
         type="number"
         step="0.5"
-        value={threshold ?? ""}
-        placeholder="off"
+        value={on ? draft : ""}
+        disabled={!on}
+        placeholder={String(DEFAULT_CONFIDENCE_THRESHOLD)}
         aria-label="Confidence-gate threshold"
         onChange={(e) => {
-          const raw = e.target.value.trim();
-          const n = Number(raw);
-          commit(raw === "" || !Number.isFinite(n) ? null : n);
+          const raw = e.target.value;
+          setDraft(raw);
+          const n = Number(raw.trim());
+          if (raw.trim() !== "" && Number.isFinite(n)) commit(n);
         }}
-        className="w-14 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 text-ink2"
+        className="w-14 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 text-ink2 disabled:opacity-40"
       />
       <span className="normal-case">
-        {threshold === null
-          ? "off — sources always trusted"
-          : `below ${threshold}, PM treats sources as weak and hedges`}
+        {on
+          ? `below ${threshold}, PM treats sources as weak and hedges`
+          : "off — sources always trusted"}
       </span>
     </div>
   );

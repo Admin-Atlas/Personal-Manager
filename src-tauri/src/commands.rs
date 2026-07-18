@@ -129,8 +129,9 @@ pub struct Settings {
     /// Retrieval depth `k` — how many fused candidates reach the reranker (card 7H). The lever the
     /// in-chat Retrieval-explain panel tunes; default [`retrieval::DEFAULT_TOP_K`], stateless.
     pub retrieval_k: usize,
-    /// The confidence-gate threshold — the minimum top rerank score for PM to trust its grounding, or
-    /// `None` when the gate is disabled (the default). Calibrated in Developer mode (card #402).
+    /// The EFFECTIVE confidence-gate threshold — the minimum top rerank score for PM to trust its
+    /// grounding — or `None` when a dev has disabled the gate. ON by default (card #402); the value and
+    /// on/off are tuned by the Developer-mode control. See [`db::retrieval_confidence_threshold`].
     pub retrieval_confidence_threshold: Option<f32>,
 }
 
@@ -230,9 +231,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
     })
 }
 
-/// Set the confidence-gate threshold (card #402), or clear it (`None`) to disable the gate. Below the
-/// threshold, PM is told the sources are weak and hedges instead of fabricating. Stateless — lands on
-/// the next query, no Rebuild. Calibrated in Developer mode.
+/// Set the confidence-gate threshold (card #402): `Some(n)` turns the gate ON at `n`, `None` turns it
+/// OFF. Below the threshold, PM is told the sources are weak and hedges instead of fabricating. ON by
+/// default when unset. Stateless — lands on the next query, no Rebuild. Calibrated in Developer mode.
 #[tauri::command]
 pub fn set_retrieval_confidence_threshold(
     state: State<'_, AppState>,
@@ -2175,11 +2176,12 @@ pub async fn send_message(
         retrieve_grounding(&app, content.clone(), scope, exclude_chat).await;
     let citations = retrieval::citations_from(&retrieved);
 
-    // Confidence gate (card #402): when the best retrieved source scored below the user's threshold —
-    // calibrated in Developer mode; ABSENT = gate off, so behaviour is unchanged by default — swap in
-    // the low-confidence grounding instruction so PM hedges ("I don't have that in your files") instead
-    // of grounding on a weak/irrelevant match. Only fires when reranking actually produced a top score
-    // AND a threshold is set. One short lock, dropped before the stream await below (AGENTS rule #4).
+    // Confidence gate (card #402): when the best retrieved source scored below the active threshold —
+    // ON by default at db::DEFAULT_CONFIDENCE_THRESHOLD, tunable/disable-able in Developer mode — swap
+    // in the low-confidence grounding instruction so PM hedges ("I don't have that in your files")
+    // instead of grounding on a weak/irrelevant match. Only fires when reranking actually produced a top
+    // score (the gate can't judge an ungrounded turn). One short lock, dropped before the stream await
+    // below (AGENTS rule #4).
     let confidence_threshold = {
         let conn = state.conn()?;
         db::retrieval_confidence_threshold(&conn)
