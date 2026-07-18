@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.26.0-alpha",
+    date: "2026-07-18",
+    highlights: [
+      "The safety check from the last update is now switched on. When you ask PM about something your files don't really cover, it now notices that the closest match is weak, says so plainly, and answers from general knowledge instead of dressing up a shaky guess as a fact from your notes. Ask about something your files do cover and nothing changes — it answers and cites its sources exactly as before. (For the curious: turn on Developer mode and each answer shows the confidence score behind it, with a dial to adjust or switch off the check.)",
+    ],
+  },
+  {
     version: "3.25.0-alpha",
     date: "2026-07-18",
     highlights: [

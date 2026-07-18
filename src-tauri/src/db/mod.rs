@@ -183,30 +183,59 @@ pub fn set_retrieval_k(conn: &Connection, k: usize) -> Result<()> {
     set_setting(conn, RETRIEVAL_K_KEY, &k.to_string())
 }
 
-/// The `settings` key for the confidence-gate threshold — the minimum top-rerank score for PM to
-/// treat retrieved sources as authoritative. ABSENT = the gate is disabled (the default): sources
-/// are always trusted, exactly as before, so an un-calibrated vault behaves unchanged.
+/// The confidence-gate DEFAULT threshold — the minimum top-rerank score for PM to treat retrieved
+/// sources as authoritative. Calibrated on a full vault (2026-07-18): a clean gap separates genuinely-
+/// grounded answers (top rerank score ~ -6 and up) from no-source junk (~ -11), and this sits in it.
+/// Applied when the setting is ABSENT, so the gate is ON by default for every vault; a below-threshold
+/// top score makes PM hedge instead of fabricating around a weak match. A dev can override the value or
+/// disable the gate entirely (see the control in Developer mode); nothing else exposes it.
+pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = -8.5;
+
+/// The stored sentinel that DISABLES the gate — deliberately distinct from an absent row, which means
+/// "use the default". Written by the Developer-mode control when the gate is toggled off.
+const CONFIDENCE_GATE_OFF: &str = "off";
+
+/// The `settings` key for the confidence-gate threshold.
 const RETRIEVAL_CONFIDENCE_THRESHOLD_KEY: &str = "retrieval_confidence_threshold";
 
-/// The confidence-gate threshold, or `None` when the gate is disabled (absent/invalid/non-finite
-/// setting — the default). When set, a retrieval whose TOP rerank score falls below it swaps in the
+/// The EFFECTIVE confidence-gate threshold, or `None` when the gate is disabled. Resolution:
+/// - absent -> `Some(DEFAULT_CONFIDENCE_THRESHOLD)` — the gate is ON by default;
+/// - the `"off"` sentinel -> `None` — a dev has explicitly disabled it;
+/// - a finite number -> `Some(n)` — a dev override;
+/// - anything else (garbage / non-finite) -> `Some(DEFAULT_CONFIDENCE_THRESHOLD)` — never silently drop
+///   the safety gate.
+///
+/// When it returns a value, a retrieval whose TOP rerank score falls below it swaps in the
 /// low-confidence grounding instruction so PM hedges instead of grounding on a weak match. Query-time
 /// and stateless (like `retrieval_k` / reranking): changing it never re-indexes. Only meaningful when
 /// reranking is on, since that is where the score comes from.
 pub fn retrieval_confidence_threshold(conn: &Connection) -> Option<f32> {
-    get_setting(conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY)
+    match get_setting(conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY)
         .ok()
         .flatten()
-        .and_then(|v| v.parse::<f32>().ok())
-        .filter(|t| t.is_finite())
+    {
+        None => Some(DEFAULT_CONFIDENCE_THRESHOLD),
+        Some(v) if v.as_str() == CONFIDENCE_GATE_OFF => None,
+        Some(v) => Some(
+            v.parse::<f32>()
+                .ok()
+                .filter(|t| t.is_finite())
+                .unwrap_or(DEFAULT_CONFIDENCE_THRESHOLD),
+        ),
+    }
 }
 
-/// Set the confidence-gate threshold, or clear it (`None`) to disable the gate. Non-finite values are
-/// treated as "clear". Stateless — the effect lands on the next query, no Rebuild.
+/// Set the confidence gate. `Some(finite n)` -> the gate is ON at `n`; `None` (or a non-finite value)
+/// -> the gate is OFF (writes the [`CONFIDENCE_GATE_OFF`] sentinel, NOT a delete — an absent row means
+/// "use the default", a different state). Stateless — the effect lands on the next query, no Rebuild.
 pub fn set_retrieval_confidence_threshold(conn: &Connection, threshold: Option<f32>) -> Result<()> {
     match threshold.filter(|t| t.is_finite()) {
         Some(t) => set_setting(conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY, &t.to_string()),
-        None => delete_setting(conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY),
+        None => set_setting(
+            conn,
+            RETRIEVAL_CONFIDENCE_THRESHOLD_KEY,
+            CONFIDENCE_GATE_OFF,
+        ),
     }
 }
 
@@ -593,6 +622,46 @@ mod tests {
         // A garbage stored value (hand-edited) also falls back to the default rather than panicking.
         set_setting(&conn, RETRIEVAL_K_KEY, "not-a-number").unwrap();
         assert_eq!(retrieval_k(&conn), crate::retrieval::DEFAULT_TOP_K);
+    }
+
+    #[test]
+    fn confidence_gate_defaults_on_with_off_sentinel_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gate.sqlite");
+        let conn = open(&path, KEY).unwrap();
+
+        // Unset ⇒ the gate is ON at the calibrated default, so every vault is protected out of the box.
+        assert_eq!(
+            retrieval_confidence_threshold(&conn),
+            Some(DEFAULT_CONFIDENCE_THRESHOLD)
+        );
+
+        // A dev override round-trips.
+        set_retrieval_confidence_threshold(&conn, Some(-6.0)).unwrap();
+        assert_eq!(retrieval_confidence_threshold(&conn), Some(-6.0));
+
+        // Disabling writes the "off" sentinel (NOT a delete), which resolves to None — a state distinct
+        // from "absent", so it survives and does NOT fall back to the default.
+        set_retrieval_confidence_threshold(&conn, None).unwrap();
+        assert_eq!(retrieval_confidence_threshold(&conn), None);
+        assert_eq!(
+            get_setting(&conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(CONFIDENCE_GATE_OFF)
+        );
+
+        // A non-finite request is treated as "off".
+        set_retrieval_confidence_threshold(&conn, Some(f32::NAN)).unwrap();
+        assert_eq!(retrieval_confidence_threshold(&conn), None);
+
+        // A garbage stored value (hand-edited) falls back to the default rather than silently disabling
+        // the safety gate.
+        set_setting(&conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY, "not-a-number").unwrap();
+        assert_eq!(
+            retrieval_confidence_threshold(&conn),
+            Some(DEFAULT_CONFIDENCE_THRESHOLD)
+        );
     }
 
     #[test]

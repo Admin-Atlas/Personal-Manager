@@ -25,12 +25,13 @@ export function useChatStream(currentConvId: () => number | null) {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Developer mode only: the exact assembled request PM sent for a turn, keyed by the assistant
-  // message id (from the `done` event). Ephemeral — captured live this session, never persisted, and
-  // dropped on a conversation switch — so the "prompt sent to the API" dropdown shows for turns sent
-  // here, not ones reloaded from history.
+  // message id (from the `done` event). Ephemeral — captured live this session, never persisted — but
+  // kept across conversation/tab switches: keyed by id, it only ever renders under its own turn (never a
+  // reloaded-from-history one that was never captured), so it survives leaving and re-opening the chat.
   const [prompts, setPrompts] = useState<Record<number, PromptMessage[]>>({});
-  // Sibling of `prompts` (card #402): the per-turn grounding-confidence readout, keyed the same way
-  // (by the assistant message id from `done`), ephemeral and dev-only, for calibrating the gate.
+  // Sibling of `prompts` (card #402): the per-turn grounding-confidence readout, keyed the same way and
+  // with the same lifecycle (kept across switches so a captured readout doesn't vanish on a tab switch),
+  // for calibrating the gate.
   const [confidences, setConfidences] = useState<Record<number, GroundingConfidence>>({});
 
   // Keep the getter in a ref so `send` can stay stable across renders.
@@ -44,13 +45,14 @@ export function useChatStream(currentConvId: () => number | null) {
 
   /** Drop a finished/abandoned stream's transient UI. Call when the displayed
    *  conversation changes (switch, new chat, project change) so a previous
-   *  send's streaming bubble and disabled composer don't linger. */
+   *  send's streaming bubble and disabled composer don't linger. The dev-only
+   *  `prompts`/`confidences` maps are deliberately NOT cleared here — they're keyed
+   *  by assistant message id, so they only attach to their own turn, and keeping
+   *  them lets a captured readout survive a tab switch or conversation revisit. */
   const clearTransient = useCallback(() => {
     setStreaming(null);
     setSending(false);
     setError(null);
-    setPrompts({});
-    setConfidences({});
   }, []);
 
   /** Append the user's message optimistically and stream the assistant reply
