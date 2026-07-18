@@ -4,7 +4,7 @@
 import { useCallback, useRef, useState } from "react";
 import { sendMessage } from "./ipc";
 import { useDevMode } from "./capabilities";
-import type { Message, PromptMessage } from "./types";
+import type { GroundingConfidence, Message, PromptMessage } from "./types";
 
 /**
  * Chat send + streaming state, shared by the global chat (App) and the
@@ -29,6 +29,9 @@ export function useChatStream(currentConvId: () => number | null) {
   // dropped on a conversation switch — so the "prompt sent to the API" dropdown shows for turns sent
   // here, not ones reloaded from history.
   const [prompts, setPrompts] = useState<Record<number, PromptMessage[]>>({});
+  // Sibling of `prompts` (card #402): the per-turn grounding-confidence readout, keyed the same way
+  // (by the assistant message id from `done`), ephemeral and dev-only, for calibrating the gate.
+  const [confidences, setConfidences] = useState<Record<number, GroundingConfidence>>({});
 
   // Keep the getter in a ref so `send` can stay stable across renders.
   const currentRef = useRef(currentConvId);
@@ -47,6 +50,7 @@ export function useChatStream(currentConvId: () => number | null) {
     setSending(false);
     setError(null);
     setPrompts({});
+    setConfidences({});
   }, []);
 
   /** Append the user's message optimistically and stream the assistant reply
@@ -71,6 +75,7 @@ export function useChatStream(currentConvId: () => number | null) {
     // Held from the `prompt` event (which fires before the first token) and committed to `prompts`
     // under the assistant message id once `done` delivers it, so the dropdown attaches to its turn.
     let captured: PromptMessage[] | null = null;
+    let capturedConfidence: GroundingConfidence | null = null;
     try {
       await sendMessage(
         convId,
@@ -83,9 +88,12 @@ export function useChatStream(currentConvId: () => number | null) {
             if (isCurrent()) setStreaming(acc);
           } else if (event.type === "prompt") {
             captured = event.messages;
+            capturedConfidence = event.confidence;
           } else if (event.type === "done") {
             const p = captured;
             if (p && isCurrent()) setPrompts((prev) => ({ ...prev, [event.message_id]: p }));
+            const c = capturedConfidence;
+            if (c && isCurrent()) setConfidences((prev) => ({ ...prev, [event.message_id]: c }));
           } else if (event.type === "error" && isCurrent()) {
             setError(event.message);
           }
@@ -112,5 +120,6 @@ export function useChatStream(currentConvId: () => number | null) {
     clearTransient,
     send,
     prompts,
+    confidences,
   };
 }

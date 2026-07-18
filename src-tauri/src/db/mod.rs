@@ -183,6 +183,33 @@ pub fn set_retrieval_k(conn: &Connection, k: usize) -> Result<()> {
     set_setting(conn, RETRIEVAL_K_KEY, &k.to_string())
 }
 
+/// The `settings` key for the confidence-gate threshold — the minimum top-rerank score for PM to
+/// treat retrieved sources as authoritative. ABSENT = the gate is disabled (the default): sources
+/// are always trusted, exactly as before, so an un-calibrated vault behaves unchanged.
+const RETRIEVAL_CONFIDENCE_THRESHOLD_KEY: &str = "retrieval_confidence_threshold";
+
+/// The confidence-gate threshold, or `None` when the gate is disabled (absent/invalid/non-finite
+/// setting — the default). When set, a retrieval whose TOP rerank score falls below it swaps in the
+/// low-confidence grounding instruction so PM hedges instead of grounding on a weak match. Query-time
+/// and stateless (like `retrieval_k` / reranking): changing it never re-indexes. Only meaningful when
+/// reranking is on, since that is where the score comes from.
+pub fn retrieval_confidence_threshold(conn: &Connection) -> Option<f32> {
+    get_setting(conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|t| t.is_finite())
+}
+
+/// Set the confidence-gate threshold, or clear it (`None`) to disable the gate. Non-finite values are
+/// treated as "clear". Stateless — the effect lands on the next query, no Rebuild.
+pub fn set_retrieval_confidence_threshold(conn: &Connection, threshold: Option<f32>) -> Result<()> {
+    match threshold.filter(|t| t.is_finite()) {
+        Some(t) => set_setting(conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY, &t.to_string()),
+        None => delete_setting(conn, RETRIEVAL_CONFIDENCE_THRESHOLD_KEY),
+    }
+}
+
 /// The **live** vector width of this vault's `chunk_vec`, read from the table's own DDL. Migration
 /// v2 creates it at `float[384]`; a multilingual vault is drop+recreated to a wider column by
 /// [`ensure_vec_dim`] at re-index time, so this reflects the *current physical* width — the source

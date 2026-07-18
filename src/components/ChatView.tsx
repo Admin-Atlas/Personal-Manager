@@ -10,12 +10,12 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
-import type { Citation, Message, PromptMessage } from "../lib/types";
+import type { Citation, GroundingConfidence, Message, PromptMessage } from "../lib/types";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
 import { formatDate, formatDateLocal } from "../lib/format";
-import { ingestNote } from "../lib/ipc";
+import { getSettings, ingestNote, setRetrievalConfidenceThreshold } from "../lib/ipc";
 
 interface Props {
   messages: Message[];
@@ -25,6 +25,9 @@ interface Props {
    *  in a collapsed "prompt sent to the API" dropdown under that turn (card #395). Only turns sent this
    *  session carry one; reloaded history turns don't. */
   prompts?: Record<number, PromptMessage[]>;
+  /** Developer mode only: the grounding-confidence readout for a turn (top rerank score / threshold /
+   *  gated), keyed by assistant message id, shown under the answer for calibrating the gate (card #402). */
+  confidences?: Record<number, GroundingConfidence>;
   /** Open a past chat a citation points to, at its cited turn (board card 7E PR3). Absent in surfaces
    *  where chat citations don't navigate. */
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
@@ -239,6 +242,62 @@ function SaveAsNoteButton({ message }: { message: Message }) {
   );
 }
 
+/** Developer-mode grounding-confidence readout under an assistant answer (card #402): a compact,
+ *  selectable/copy-pastable line showing the top rerank score, the active gate threshold, and whether
+ *  the gate fired. The score is the calibration signal — read a few good vs. junk answers to find the
+ *  threshold where they separate. */
+function ConfidenceReadout({ confidence }: { confidence: GroundingConfidence }) {
+  const top = confidence.top_score === null ? "— (ungrounded)" : confidence.top_score.toFixed(2);
+  const thr = confidence.threshold === null ? "off" : confidence.threshold.toFixed(2);
+  return (
+    <div className="select-text font-mono text-[10px] leading-snug text-ink4">
+      confidence · top {top} · threshold {thr} · gated {confidence.gated ? "yes" : "no"}
+    </div>
+  );
+}
+
+/** Developer-mode control (card #402) to set the confidence-gate threshold live for calibration: the
+ *  minimum top rerank score for PM to trust its grounding. Empty = the gate is off (the default), so
+ *  PM always trusts its sources. Reads the current value once; writes on change (stateless backend). */
+function ConfidenceThresholdControl() {
+  const [threshold, setThreshold] = useState<number | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    getSettings()
+      .then((s) => setThreshold(s.retrieval_confidence_threshold))
+      .catch(() => {})
+      .finally(() => setLoaded(true));
+  }, []);
+  if (!loaded) return null;
+  const commit = (v: number | null) => {
+    setThreshold(v);
+    setRetrievalConfidenceThreshold(v).catch(() => {});
+  };
+  return (
+    <div className="flex items-center gap-2 font-mono text-[10px] text-ink4">
+      <span className="uppercase tracking-wide">confidence gate</span>
+      <input
+        type="number"
+        step="0.5"
+        value={threshold ?? ""}
+        placeholder="off"
+        aria-label="Confidence-gate threshold"
+        onChange={(e) => {
+          const raw = e.target.value.trim();
+          const n = Number(raw);
+          commit(raw === "" || !Number.isFinite(n) ? null : n);
+        }}
+        className="w-14 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 text-ink2"
+      />
+      <span className="normal-case">
+        {threshold === null
+          ? "off — sources always trusted"
+          : `below ${threshold}, PM treats sources as weak and hedges`}
+      </span>
+    </div>
+  );
+}
+
 /** One message and, for a grounded assistant turn, its sources — wired so an inline
  *  `[n]` marker scrolls to and flashes source n. `highlight` flashes the whole turn when a chat
  *  citation navigated here to it (card 7E PR3); `registerBlock` lets the parent scroll it into view. */
@@ -251,6 +310,7 @@ function SaveAsNoteButton({ message }: { message: Message }) {
 const MessageBlock = memo(function MessageBlock({
   message,
   prompt,
+  confidence,
   showPrompt,
   onOpenChatCitation,
   highlight,
@@ -258,6 +318,7 @@ const MessageBlock = memo(function MessageBlock({
 }: {
   message: Message;
   prompt?: PromptMessage[];
+  confidence?: GroundingConfidence;
   showPrompt?: boolean;
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
   highlight?: boolean;
@@ -302,6 +363,9 @@ const MessageBlock = memo(function MessageBlock({
       {showPrompt && message.role === "assistant" && prompt && prompt.length > 0 && (
         <PromptPanel messages={prompt} />
       )}
+      {showPrompt && message.role === "assistant" && confidence && (
+        <ConfidenceReadout confidence={confidence} />
+      )}
       {message.role === "assistant" && atLeast("standard") && message.content.trim() !== "" && (
         <SaveAsNoteButton message={message} />
       )}
@@ -309,7 +373,14 @@ const MessageBlock = memo(function MessageBlock({
   );
 });
 
-export function ChatView({ messages, streaming, prompts, onOpenChatCitation, focusTurn }: Props) {
+export function ChatView({
+  messages,
+  streaming,
+  prompts,
+  confidences,
+  onOpenChatCitation,
+  focusTurn,
+}: Props) {
   const endRef = useRef<HTMLDivElement>(null);
   const { atLeast } = useDepth();
   const { devMode } = useDevMode();
@@ -375,6 +446,7 @@ export function ChatView({ messages, streaming, prompts, onOpenChatCitation, foc
   return (
     <div ref={scrollRef} className="flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-6">
+        {devMode && <ConfidenceThresholdControl />}
         {empty && (
           <div className="mt-24 text-center text-ink3">
             <p className="text-sm">Start a conversation.</p>
@@ -392,6 +464,7 @@ export function ChatView({ messages, streaming, prompts, onOpenChatCitation, foc
             key={m.id}
             message={m}
             prompt={prompts?.[m.id]}
+            confidence={confidences?.[m.id]}
             showPrompt={devMode}
             onOpenChatCitation={openCitation}
             highlight={flashMsg === m.id}

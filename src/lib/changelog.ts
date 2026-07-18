@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.25.0-alpha",
+    date: "2026-07-18",
+    highlights: [
+      "Groundwork for a new safety check on how PM grounds its answers. When PM searches your files for an answer, it now measures how strong the best match actually is — so that, once tuned, it can tell the difference between “your notes really cover this” and “nothing here fits,” and stop confidently answering from a weak match. The check is switched off by default while it's being calibrated, so nothing changes in how you chat today.",
+    ],
+  },
+  {
     version: "3.24.0-alpha",
     date: "2026-07-18",
     highlights: [

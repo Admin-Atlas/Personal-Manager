@@ -385,6 +385,7 @@ export function ProjectView({
           <ChatView
             messages={chat.messages}
             prompts={chat.prompts}
+            confidences={chat.confidences}
             streaming={chat.streaming}
             onOpenChatCitation={onOpenChatCitation}
           />

@@ -166,6 +166,7 @@ export function useProjectChat(project: string | null) {
     convId,
     messages: chat.messages,
     prompts: chat.prompts,
+    confidences: chat.confidences,
     streaming: chat.streaming,
     sending: chat.sending,
     error: chat.error,

@@ -1078,6 +1078,7 @@ pub fn run() {
             commands::set_help_mode,
             commands::set_reranking,
             commands::set_retrieval_k,
+            commands::set_retrieval_confidence_threshold,
             commands::retrieval_explain,
             commands::retrieval_diagnose,
             commands::language_options,

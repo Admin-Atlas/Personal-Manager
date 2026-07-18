@@ -129,6 +129,9 @@ pub struct Settings {
     /// Retrieval depth `k` — how many fused candidates reach the reranker (card 7H). The lever the
     /// in-chat Retrieval-explain panel tunes; default [`retrieval::DEFAULT_TOP_K`], stateless.
     pub retrieval_k: usize,
+    /// The confidence-gate threshold — the minimum top rerank score for PM to trust its grounding, or
+    /// `None` when the gate is disabled (the default). Calibrated in Developer mode (card #402).
+    pub retrieval_confidence_threshold: Option<f32>,
 }
 
 /// One assembled request message, surfaced verbatim to the Developer-mode "prompt sent to the API"
@@ -137,6 +140,18 @@ pub struct Settings {
 pub struct PromptMessage {
     pub role: String,
     pub content: String,
+}
+
+/// Developer-mode grounding-confidence readout for a turn (card #402): the top rerank score of the
+/// retrieved grounding, the active gate threshold (if any), and whether the gate fired (i.e. swapped
+/// in the low-confidence instruction). A `None` top score means the turn was ungrounded or reranking
+/// was off, so there is no signal to gate on. Emitted with the Prompt event so the dev UI can show a
+/// copy-pastable line for calibrating the threshold against real answers.
+#[derive(Clone, Serialize)]
+pub struct GroundingConfidence {
+    pub top_score: Option<f32>,
+    pub threshold: Option<f32>,
+    pub gated: bool,
 }
 
 /// Streamed back to the UI over a Tauri channel as the assistant replies.
@@ -152,6 +167,7 @@ pub enum ChatEvent {
     /// normal chat never ships the full prompt (profile + retrieved excerpts) to the webview.
     Prompt {
         messages: Vec<PromptMessage>,
+        confidence: GroundingConfidence,
     },
     Done {
         message_id: i64,
@@ -210,7 +226,20 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
         indexing_speed: db::get_setting(&conn, db::INDEXING_SPEED_KEY)?
             .unwrap_or_else(|| "fast".into()),
         retrieval_k: db::retrieval_k(&conn),
+        retrieval_confidence_threshold: db::retrieval_confidence_threshold(&conn),
     })
+}
+
+/// Set the confidence-gate threshold (card #402), or clear it (`None`) to disable the gate. Below the
+/// threshold, PM is told the sources are weak and hedges instead of fabricating. Stateless — lands on
+/// the next query, no Rebuild. Calibrated in Developer mode.
+#[tauri::command]
+pub fn set_retrieval_confidence_threshold(
+    state: State<'_, AppState>,
+    threshold: Option<f64>,
+) -> Result<()> {
+    let conn = state.conn()?;
+    db::set_retrieval_confidence_threshold(&conn, threshold.map(|t| t as f32))
 }
 
 /// Set the indexing-speed preference. "gentle" paces indexing (Drive sync + file import) so a low-end
@@ -1844,6 +1873,7 @@ fn assemble_chat_messages(
     agenda: Option<&str>,
     flag_ctx: Option<&str>,
     retrieved: &[retrieval::RetrievedChunk],
+    low_confidence: bool,
     history: Vec<openrouter::ChatMessage>,
 ) -> (Vec<openrouter::ChatMessage>, Option<usize>) {
     let mut messages = Vec::with_capacity(history.len() + 3);
@@ -1865,9 +1895,18 @@ fn assemble_chat_messages(
     //    instruction it didn't have before, so those answers don't drift. It sits AFTER the breakpoint
     //    (it varies per turn with source presence), matching where the old grounding block sat.
     if !retrieved.is_empty() {
+        // Confidence gate (card #402): below the user's threshold the hardened low-confidence
+        // instruction tells PM to treat the sources as weak candidates and hedge rather than
+        // fabricate. Same source-gating + system placement; only the instruction TEXT differs (it
+        // still carries no source bytes, so it stays M-7-safe in the system role).
+        let instruction = if low_confidence {
+            retrieval::grounding_instruction_low_confidence()
+        } else {
+            retrieval::grounding_instruction()
+        };
         messages.push(openrouter::ChatMessage {
             role: "system".into(),
-            content: retrieval::grounding_instruction().to_string(),
+            content: instruction.to_string(),
         });
     }
 
@@ -2132,8 +2171,23 @@ pub async fn send_message(
     // relevant chunks and prepend them as a system message the model must cite.
     // If retrieval yields nothing (no docs / engine not ready), chat proceeds
     // exactly as before. A scoped chat draws only from its project.
-    let retrieved = retrieve_grounding(&app, content.clone(), scope, exclude_chat).await;
+    let (retrieved, top_score) =
+        retrieve_grounding(&app, content.clone(), scope, exclude_chat).await;
     let citations = retrieval::citations_from(&retrieved);
+
+    // Confidence gate (card #402): when the best retrieved source scored below the user's threshold —
+    // calibrated in Developer mode; ABSENT = gate off, so behaviour is unchanged by default — swap in
+    // the low-confidence grounding instruction so PM hedges ("I don't have that in your files") instead
+    // of grounding on a weak/irrelevant match. Only fires when reranking actually produced a top score
+    // AND a threshold is set. One short lock, dropped before the stream await below (AGENTS rule #4).
+    let confidence_threshold = {
+        let conn = state.conn()?;
+        db::retrieval_confidence_threshold(&conn)
+    };
+    let low_confidence = match (confidence_threshold, top_score) {
+        (Some(t), Some(s)) => s < t,
+        _ => false,
+    };
 
     // Assemble the request via the pure helper (M-7). Only genuine instructions stay in the `system`
     // role (the learned profile — the cache-marked stable prefix, card 7C — and, when sources are
@@ -2147,6 +2201,7 @@ pub async fn send_message(
         agenda.as_deref(),
         flag_ctx.as_deref(),
         &retrieved,
+        low_confidence,
         history,
     );
 
@@ -2163,6 +2218,11 @@ pub async fn send_message(
                     content: m.content.clone(),
                 })
                 .collect(),
+            confidence: GroundingConfidence {
+                top_score,
+                threshold: confidence_threshold,
+                gated: low_confidence,
+            },
         });
     }
 
@@ -2401,6 +2461,10 @@ pub async fn revert_compress(
     chat_summary::revert_to(&conn, conversation_id, &snapshot)
 }
 
+/// The chunks retrieved for grounding, paired with the top rerank score — the confidence-gate signal
+/// (`None` when reranking is off or nothing was retrieved).
+type GroundedChunks = (Vec<RetrievedChunk>, Option<f32>);
+
 /// Retrieve grounding chunks for a chat query — best-effort. Returns an empty
 /// list (so chat falls back to ungrounded answering) if there are no documents
 /// or the document engine isn't ready yet; never errors out the chat. Runs the
@@ -2411,9 +2475,9 @@ async fn retrieve_grounding(
     query: String,
     project: Option<String>,
     exclude_chat: Option<(i64, i64)>,
-) -> Vec<RetrievedChunk> {
+) -> GroundedChunks {
     let app = app.clone();
-    let task = tokio::task::spawn_blocking(move || -> Result<Vec<RetrievedChunk>> {
+    let task = tokio::task::spawn_blocking(move || -> Result<GroundedChunks> {
         let state = app.state::<AppState>();
 
         // Nothing to ground on?
@@ -2422,11 +2486,11 @@ async fn retrieve_grounding(
             conn.query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))?
         };
         if !has_docs {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         // Don't trigger a slow first-run install mid-chat — only embed if ready.
         if !matches!(state.sidecar.status(), SidecarStatus::Ready) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         // Resolve the vault's models + the reranking toggle + the user's retrieval depth in one
@@ -2444,7 +2508,7 @@ async fn retrieve_grounding(
 
         let embeddings = gateway.embed_query(std::slice::from_ref(&query))?;
         let Some(query_vec) = embeddings.into_iter().next() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
 
         let q = retrieval::RetrieveQuery {
@@ -2468,18 +2532,19 @@ async fn retrieve_grounding(
             retrieval::retrieve_fused(&conn, &q)?
         };
         let reranker = rerank_on.then_some(&gateway as &dyn retrieval::Reranker);
-        retrieval::rerank(reranker, &query, fused)
+        // Keep the TOP rerank score alongside the reordered chunks — the confidence-gate signal.
+        retrieval::rerank_scored(reranker, &query, fused)
     })
     .await;
 
-    let (chunks, failure) = interpret_grounding(task);
+    let (chunks, top_score, failure) = interpret_grounding(task);
     if let Some(note) = failure {
         // A broken retrieval stack (or a panic in the blocking task) must not silently make EVERY chat
         // ungrounded with no trace (F-37). We keep the best-effort contract — still return an empty list so
         // the turn answers ungrounded rather than erroring — but the failure is now observable.
         eprintln!("retrieve_grounding: {note}");
     }
-    chunks
+    (chunks, top_score)
 }
 
 /// Interpret the outcome of the off-runtime grounding task, keeping distinct the three cases the caller
@@ -2490,16 +2555,18 @@ async fn retrieve_grounding(
 /// erroring the turn — paired with a note the caller logs. Pure, so the split is unit-tested without a live
 /// retrieval stack.
 fn interpret_grounding(
-    task: std::result::Result<Result<Vec<RetrievedChunk>>, tokio::task::JoinError>,
-) -> (Vec<RetrievedChunk>, Option<String>) {
+    task: std::result::Result<Result<GroundedChunks>, tokio::task::JoinError>,
+) -> (Vec<RetrievedChunk>, Option<f32>, Option<String>) {
     match task {
-        Ok(Ok(chunks)) => (chunks, None),
+        Ok(Ok((chunks, top))) => (chunks, top, None),
         Ok(Err(e)) => (
             Vec::new(),
+            None,
             Some(format!("retrieval failed; answering ungrounded: {e}")),
         ),
         Err(e) => (
             Vec::new(),
+            None,
             Some(format!(
                 "grounding task panicked; answering ungrounded: {e}"
             )),
@@ -7999,6 +8066,7 @@ mod tests {
             Some("AGENDA-3pm"),
             Some("FLAGS-deadline"),
             &[mk_chunk("Statement", "CHUNK-BODY balance 42")],
+            false,
             history,
         );
 
@@ -8057,6 +8125,7 @@ mod tests {
             Some("AGENDA-3pm"),
             None,
             &[],
+            false,
             vec![mk_turn("user", "hi")],
         );
         assert!(!msgs
@@ -8078,6 +8147,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
             vec![mk_turn("user", "hi")],
         );
         assert_eq!(msgs.len(), 2); // the profile system message + the one history turn
@@ -8096,6 +8166,7 @@ mod tests {
             None,
             None,
             &[mk_chunk("Doc", "body")],
+            false,
             vec![mk_turn("user", "hi")],
         );
         assert_eq!(cache_through, None);
@@ -8113,6 +8184,7 @@ mod tests {
             None,
             Some("FLAGS-milestone"),
             &[mk_chunk("Doc", "scoped body")],
+            false,
             vec![mk_turn("user", "q")],
         );
         let ctx = msgs
@@ -8121,6 +8193,35 @@ mod tests {
             .unwrap();
         assert!(ctx.content.contains("Sources:"));
         assert!(!ctx.content.contains("AGENDA"));
+    }
+
+    #[test]
+    fn chat_messages_low_confidence_swaps_in_the_hedging_instruction() {
+        // Confidence gate fired (card #402): with sources but a below-threshold top score, the system
+        // instruction is the hardened low-confidence variant that tells PM to hedge — and the sources
+        // are STILL passed (we never throw away a genuine weak match; the fix is to FLAG it).
+        let (msgs, _) = assemble_chat_messages(
+            None,
+            None,
+            None,
+            None,
+            &[mk_chunk("Doc", "weakly-related body")],
+            true, // low_confidence
+            vec![mk_turn("user", "tell me about bananas")],
+        );
+        let sys = msgs
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("a grounding instruction");
+        assert_eq!(
+            sys.content,
+            retrieval::grounding_instruction_low_confidence()
+        );
+        assert_ne!(sys.content, retrieval::grounding_instruction());
+        // The sources still ride in the user context message.
+        assert!(msgs
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("Sources:")));
     }
 
     #[test]
@@ -8186,18 +8287,24 @@ mod tests {
             chunk_at: None,
             conversation_id: None,
         };
-        // Clean success: the chunks flow through and nothing is logged.
-        let (chunks, note) = interpret_grounding(Ok(Ok(vec![chunk])));
+        // Clean success: the chunks + top score flow through and nothing is logged.
+        let (chunks, top, note) = interpret_grounding(Ok(Ok((vec![chunk], Some(7.5)))));
         assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            top,
+            Some(7.5),
+            "the top rerank score flows through a clean success"
+        );
         assert!(note.is_none(), "a clean result logs nothing");
 
         // Inner error (the broken-stack case): still empty so chat answers ungrounded, but NOT silent.
-        let (chunks, note) =
+        let (chunks, top, note) =
             interpret_grounding(Ok(Err(Error::Other("vec0 dimension mismatch".into()))));
         assert!(
             chunks.is_empty(),
             "a retrieval error still falls back to ungrounded (contract preserved)"
         );
+        assert!(top.is_none(), "a failure yields no confidence score");
         let note = note.expect("an inner error must surface a note, not vanish");
         assert!(
             note.contains("vec0 dimension mismatch"),
