@@ -181,7 +181,7 @@ jobs:
       - name: Rust — cargo-deny (advisories + licences + bans + sources)
         # Runs `cargo deny check` against src-tauri/ (finds src-tauri/deny.toml next
         # to the manifest) — identical to local `just deny`.
-        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: ./src-tauri/Cargo.toml
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
