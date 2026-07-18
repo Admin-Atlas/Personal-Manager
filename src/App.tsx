@@ -909,6 +909,7 @@ export default function App() {
                 <ChatView
                   messages={chat.messages}
                   prompts={chat.prompts}
+                  confidences={chat.confidences}
                   streaming={chat.streaming}
                   onOpenChatCitation={openChatCitation}
                   focusTurn={focusTurn}

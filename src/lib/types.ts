@@ -43,6 +43,9 @@ export interface Settings {
   /** Retrieval depth `k` — how many fused candidates reach the reranker (card 7H). The lever the
    *  in-chat Retrieval-explain panel tunes; default 6, stateless. */
   retrieval_k: number;
+  /** The confidence-gate threshold — the minimum top rerank score for PM to trust its grounding, or
+   *  null when the gate is disabled (the default). Calibrated in Developer mode (card #402). */
+  retrieval_confidence_threshold: number | null;
 }
 
 /** One search-language / embedder choice offered at vault creation. */
@@ -292,10 +295,19 @@ export interface PromptMessage {
   content: string;
 }
 
+/** Developer-mode grounding-confidence readout for a turn (card #402): the top rerank score of the
+ *  retrieved grounding, the active gate threshold, and whether the gate fired (swapping in the
+ *  low-confidence instruction). A null top score means the turn was ungrounded or reranking was off. */
+export interface GroundingConfidence {
+  top_score: number | null;
+  threshold: number | null;
+  gated: boolean;
+}
+
 export type ChatEvent =
   | { type: "token"; text: string }
-  // Developer mode only: the exact assembled request, emitted once before the reply streams.
-  | { type: "prompt"; messages: PromptMessage[] }
+  // Developer mode only: the exact assembled request + the confidence readout, once before streaming.
+  | { type: "prompt"; messages: PromptMessage[]; confidence: GroundingConfidence }
   | { type: "done"; message_id: number; content: string; citations: Citation[] }
   | { type: "error"; message: string };
 
