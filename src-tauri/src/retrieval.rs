@@ -188,6 +188,36 @@ pub fn retrieve(
     rerank(reranker, q.text, retrieve_fused(conn, q)?)
 }
 
+/// The passage text handed to the cross-encoder reranker for a candidate: the `Title > Heading`
+/// breadcrumb prepended to the chunk body, mirroring the `title > heading\n\nbody` shape the
+/// embedder indexed (`splitter::breadcrumb`). The reranker scored bare `content` before, so a
+/// chunk whose only topical signal lived in its heading — e.g. a "Stage 4 — Up next" section over a
+/// body that opens with a boilerplate/comment header — was invisible to it and got buried beneath
+/// verbatim lexical echoes, even though the embedder (which does see the breadcrumb) ranked it
+/// high. Only the immediate heading is stored on a leaf row (not the full ancestor path), so this
+/// reconstructs the leaf-level breadcrumb — the level that carries the section topic. `content`
+/// itself is never modified: display, snippets, and citations stay clean; this is rerank *input*
+/// only. Both the production reranker ([`apply_reranker`]) and the dev retrieval-explain panel
+/// build their reranker input through this one function, so the panel stays faithful to production.
+pub fn rerank_text(chunk: &RetrievedChunk) -> String {
+    let mut crumbs: Vec<&str> = Vec::new();
+    let title = chunk.title.trim();
+    if !title.is_empty() {
+        crumbs.push(title);
+    }
+    if let Some(h) = chunk.heading.as_deref() {
+        let h = h.trim();
+        if !h.is_empty() {
+            crumbs.push(h);
+        }
+    }
+    if crumbs.is_empty() {
+        chunk.content.clone()
+    } else {
+        format!("{}\n\n{}", crumbs.join(" > "), chunk.content)
+    }
+}
+
 /// Reorder the fused passages by a reranker's scores. A `None` result (PR 1's inert path) or a
 /// malformed score list leaves the order untouched — never mis-orders on bad input.
 fn apply_reranker(
@@ -195,8 +225,10 @@ fn apply_reranker(
     query: &str,
     chunks: Vec<RetrievedChunk>,
 ) -> Result<Vec<RetrievedChunk>> {
-    let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
-    let Some(scores) = reranker.scores(query, &texts)? else {
+    // Feed the cross-encoder the title + heading breadcrumb, not the bare body — see `rerank_text`.
+    let texts: Vec<String> = chunks.iter().map(rerank_text).collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let Some(scores) = reranker.scores(query, &refs)? else {
         return Ok(chunks);
     };
     if scores.len() != chunks.len() {
@@ -957,6 +989,70 @@ mod tests {
             chunk_at: None,
             conversation_id: None,
         }
+    }
+
+    /// A fuller chunk builder for the rerank-input tests — controls title, heading, and body.
+    fn rc_full(chunk_id: i64, title: &str, heading: Option<&str>, content: &str) -> RetrievedChunk {
+        RetrievedChunk {
+            chunk_id,
+            document_id: chunk_id,
+            title: title.into(),
+            source_path: None,
+            vault_path: "d.md".into(),
+            heading: heading.map(Into::into),
+            content: content.into(),
+            ordinal: 0,
+            source_type: None,
+            chat_turn_id: None,
+            chunk_at: None,
+            conversation_id: None,
+        }
+    }
+
+    #[test]
+    fn rerank_text_prepends_the_title_and_heading_breadcrumb() {
+        // The cross-encoder must see the same `Title > Heading` breadcrumb the embedder indexed.
+        let c = rc_full(1, "Spec", Some("Stage 4 - Up next"), "boilerplate body");
+        assert_eq!(
+            rerank_text(&c),
+            "Spec > Stage 4 - Up next\n\nboilerplate body"
+        );
+        // No heading -> title only.
+        let c = rc_full(2, "Spec", None, "body");
+        assert_eq!(rerank_text(&c), "Spec\n\nbody");
+        // Empty title + whitespace heading -> the bare body, with no stray separators.
+        let c = rc_full(3, "", Some("   "), "body");
+        assert_eq!(rerank_text(&c), "body");
+    }
+
+    #[test]
+    fn reranker_sees_the_heading_breadcrumb() {
+        // The regression this card fixes: when the only differentiator between two chunks is the
+        // HEADING, a reranker that keys on that phrase must be able to act on it. Scoring bare
+        // `content` (the old behaviour) left both bodies identical -> a tie the heading chunk lost.
+        struct KeywordReranker;
+        impl Reranker for KeywordReranker {
+            fn scores(&self, _query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+                Ok(Some(
+                    passages
+                        .iter()
+                        .map(|p| p.matches("Stage 4").count() as f32)
+                        .collect(),
+                ))
+            }
+        }
+        // Identical bodies; only chunk 1's HEADING names the topic. Chunk 2 sits first in the pool,
+        // so under the old bare-body scoring the tie broke to chunk 2 — proving the flip is the
+        // heading becoming visible, not a body match.
+        let chunks = vec![
+            rc_full(2, "Doc", Some("Overview"), "identical body text"),
+            rc_full(1, "Doc", Some("Stage 4 - Up next"), "identical body text"),
+        ];
+        let out = apply_reranker(&KeywordReranker, "what is in stage 4", chunks).unwrap();
+        assert_eq!(
+            out[0].chunk_id, 1,
+            "the heading-signaled chunk must win once the reranker can see the breadcrumb"
+        );
     }
 
     #[test]

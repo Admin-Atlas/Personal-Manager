@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.23.1-alpha",
+    date: "2026-07-18",
+    highlights: [
+      "Another improvement to how PM picks which of your notes to read when answering. To rank the passages it finds, PM takes a second, closer look at each one — but that closer read was only seeing the passage text, not the section heading above it. So a section whose heading named exactly what you asked about could be passed over when its text happened to open with routine boilerplate. PM now shows that closer read the heading too, so the right section is more likely to rise to the top. Nothing looks different in everyday use.",
+    ],
+  },
+  {
     version: "3.23.0-alpha",
     date: "2026-07-17",
     highlights: [
