@@ -20,7 +20,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -436,16 +436,38 @@ pub enum SidecarErrorKind {
     Unknown,
 }
 
-/// A running sidecar child plus its stdio handles.
+/// The kill/wait half of a running sidecar child, abstracted so the confined Windows worker (a raw
+/// AppContainer process — see [`crate::sidecar_sandbox`]) and a plain `std::process::Child` (every
+/// other platform, and the `--fetch` helper) share one [`Process`]. `kill` closes the child's stdout,
+/// which is what unblocks the read watchdog at EOF.
+trait ChildControl: Send {
+    fn kill(&mut self);
+    fn wait(&mut self);
+}
+
+/// The ordinary, unconfined backend: a `std::process::Child` whose stdio has been taken out into the
+/// [`Process`]. Retained so the child can still be killed/reaped after its pipes are owned elsewhere.
+struct StdChild(Child);
+impl ChildControl for StdChild {
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+    }
+    fn wait(&mut self) {
+        let _ = self.0.wait();
+    }
+}
+
+/// A running sidecar child plus its stdio handles, over any backend. Boxed trait objects so the same
+/// request/read/kill machinery drives both the std child and the confined worker.
 struct Process {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdin: Box<dyn Write + Send>,
+    stdout: Box<dyn BufRead + Send>,
+    control: Box<dyn ChildControl>,
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        self.control.kill();
     }
 }
 
@@ -460,6 +482,11 @@ pub struct SidecarManager {
     /// climbing across respawns — a stale line from a dead child can never match
     /// a fresh request's id.
     req_seq: AtomicU64,
+    /// The Windows AppContainer that confines the worker, set on first successful confined spawn and
+    /// reused for per-request input staging (issue #286). `None` = unconfined (setup failed, or a
+    /// non-Windows platform). Held here so `request` can stage the file a path-bearing call parses.
+    #[cfg(windows)]
+    sandbox: Mutex<Option<crate::sidecar_sandbox::Sandbox>>,
 }
 
 impl SidecarManager {
@@ -470,6 +497,8 @@ impl SidecarManager {
             status: Mutex::new(SidecarStatus::NotInstalled),
             install: Mutex::new(()),
             req_seq: AtomicU64::new(0),
+            #[cfg(windows)]
+            sandbox: Mutex::new(None),
         };
         // Boot status asks the SAME question every other readiness check asks — is the marker
         // CURRENT — rather than merely whether the file exists. The marker stamps the
@@ -1263,10 +1292,23 @@ impl SidecarManager {
         let mut req = json!({ "id": 0u64, "method": method, "params": params });
         let timeout = request_timeout(method);
         let mut fetched = false;
+        // Kept alive for the WHOLE request (including the fetch-and-retry) so the staged copy isn't
+        // deleted mid-flight. Staged exactly once, and only AFTER the worker is spawned below — because
+        // the request that triggers the first confined spawn only sets `self.sandbox` inside `spawn`,
+        // so staging before it would hand the confined worker the un-granted original path (issue #286).
+        #[cfg(windows)]
+        let mut staged: Option<crate::sidecar_sandbox::StagedInput> = None;
 
         loop {
             if guard.is_none() {
                 *guard = Some(self.spawn()?);
+            }
+            // Stage the file this call parses into the container-readable dir and point the request at
+            // the staged copy (no-op for non-path methods and the unconfined worker). After the spawn
+            // above so `self.sandbox` reflects confinement; once, so a retry reuses the same copy.
+            #[cfg(windows)]
+            if staged.is_none() {
+                staged = self.maybe_stage_input(&mut req);
             }
             let id = self.req_seq.fetch_add(1, Ordering::Relaxed) + 1;
             req["id"] = json!(id);
@@ -1332,29 +1374,33 @@ impl SidecarManager {
             ));
         }
 
+        let script = self.paths.script();
+        let envs = self.worker_env();
+
+        // Windows: confine the worker in a no-network AppContainer (issue #286). Best-effort — if the
+        // sandbox can't be set up we fall through to the unconfined child rather than break ingest
+        // (this is defence in depth ON TOP OF the offline worker + at-rest encryption; the failure is
+        // logged). The `--fetch` helper is never confined — it needs the network.
+        #[cfg(windows)]
+        if let Some(proc) = self.try_spawn_confined(&py, &script, &envs)? {
+            return Ok(proc);
+        }
+
+        // The ordinary, unconfined child (every non-Windows platform, and the Windows fallback). The
+        // offline posture comes from the SAME `worker_env` list the confined path uses, so the two can
+        // never drift — a stray offline flag missing from one would be a silent hole.
         let mut command = Command::new(&py);
         command
-            .arg(self.paths.script())
-            // The long-lived worker runs OFFLINE (issue #286): it parses untrusted files and
-            // must never open a socket. PM_SIDECAR_OFFLINE makes it load models from the local
-            // cache only — a miss comes back as `model_not_cached`, which `request` satisfies by
-            // running the network-allowed `--fetch` helper and retrying. We ALSO set the Hugging
-            // Face offline flags explicitly here — rather than let the child inherit them — so a
-            // stale HF_HUB_OFFLINE=0 in the launching environment can't quietly re-enable fastembed's
-            // network path (it keys its offline gate off this var). Symmetric to `fetch_model`, which
-            // env_removes these so the fetcher CAN reach the network. The HF_HUB_DISABLE_* flags keep
-            // any hub access quiet and private (no telemetry — PM's "nothing leaves the device" rule)
-            // and silence the cosmetic Windows symlink warning without Developer Mode.
-            .env("PM_SIDECAR_OFFLINE", "1")
-            .env("HF_HUB_OFFLINE", "1")
-            .env("TRANSFORMERS_OFFLINE", "1")
-            .env("HF_HUB_DISABLE_TELEMETRY", "1")
-            .env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+            .arg(&script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        clean_python_env(&mut command);
-        set_models_dir(&mut command, &self.paths);
+        for (k, v) in &envs {
+            command.env(k, v);
+        }
+        for k in PYTHON_ENV_REMOVES {
+            command.env_remove(k);
+        }
         no_window(&mut command);
 
         let mut child = command
@@ -1363,10 +1409,112 @@ impl SidecarManager {
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Ok(Process {
-            child,
-            stdin,
-            stdout,
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            control: Box::new(StdChild(child)),
         })
+    }
+
+    /// The environment the WORKER runs with, as a single list so the confined and unconfined spawn
+    /// paths can never disagree (issue #286). Carries the authoritative offline posture
+    /// (`PM_SIDECAR_OFFLINE` + the HF offline flags — see the long note history), the quiet-hub flags,
+    /// the shared model-cache root, and `PYTHONUTF8`. Keys in [`PYTHON_ENV_REMOVES`] are dropped from
+    /// the inherited environment on top of this.
+    fn worker_env(&self) -> Vec<(String, String)> {
+        let mut envs = vec![
+            ("PM_SIDECAR_OFFLINE".to_string(), "1".to_string()),
+            ("HF_HUB_OFFLINE".to_string(), "1".to_string()),
+            ("TRANSFORMERS_OFFLINE".to_string(), "1".to_string()),
+            ("HF_HUB_DISABLE_TELEMETRY".to_string(), "1".to_string()),
+            (
+                "HF_HUB_DISABLE_SYMLINKS_WARNING".to_string(),
+                "1".to_string(),
+            ),
+            ("PYTHONUTF8".to_string(), "1".to_string()),
+        ];
+        if let Some(dir) = self.paths.models_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            envs.push((
+                "PM_MODELS_DIR".to_string(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        }
+        envs
+    }
+
+    /// Try to launch the worker confined in the no-network AppContainer (issue #286). Returns
+    /// `Ok(None)` — the caller then runs it unconfined — if the sandbox can't be set up or the confined
+    /// launch fails. On success the [`Sandbox`] is stashed on the manager so `request` can stage the
+    /// files path-bearing calls parse.
+    #[cfg(windows)]
+    fn try_spawn_confined(
+        &self,
+        py: &Path,
+        script: &Path,
+        envs: &[(String, String)],
+    ) -> Result<Option<Process>> {
+        use crate::sidecar_sandbox::Sandbox;
+        let venv_dir = &self.paths.venv_dir;
+        let Some(runtime) = venv_dir.parent().map(|p| p.to_path_buf()) else {
+            return Ok(None);
+        };
+        let Some(models) = self.paths.models_dir() else {
+            return Ok(None);
+        };
+        let Some(base) = base_python_dir(venv_dir) else {
+            eprintln!(
+                "sidecar sandbox: base python unresolved from pyvenv.cfg — running unconfined"
+            );
+            return Ok(None);
+        };
+        let Some(sandbox) =
+            Sandbox::ensure(venv_dir, &base, &models, &self.paths.source_dir, &runtime)
+        else {
+            return Ok(None);
+        };
+
+        let env_refs: Vec<(&str, &str)> =
+            envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let cwd = sandbox.staging_dir().to_path_buf();
+        let mut confined =
+            match sandbox.spawn_confined(py, &[script], &env_refs, PYTHON_ENV_REMOVES, &cwd) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("sidecar sandbox: confined spawn failed, running unconfined: {e}");
+                    return Ok(None);
+                }
+            };
+        let stdin = confined.stdin.take().unwrap();
+        let stdout = BufReader::new(confined.stdout.take().unwrap());
+        *self.sandbox.lock().unwrap() = Some(sandbox);
+        Ok(Some(Process {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            control: Box::new(confined),
+        }))
+    }
+
+    /// When the worker is confined, copy the file a path-bearing request parses into the
+    /// container-readable staging dir and rewrite `params.path` to it — so the confined worker sees ONLY
+    /// that one file, never the user's real tree or the vault. The returned guard deletes the staged
+    /// copy when the request finishes. No-op (returns `None`) when unconfined or the request has no path.
+    #[cfg(windows)]
+    fn maybe_stage_input(&self, req: &mut Value) -> Option<crate::sidecar_sandbox::StagedInput> {
+        let guard = self.sandbox.lock().unwrap();
+        let sandbox = guard.as_ref()?;
+        let path = req["params"]["path"].as_str()?.to_string();
+        match sandbox.stage_input(Path::new(&path)) {
+            Ok(staged) => {
+                req["params"]["path"] = json!(staged.path().to_string_lossy());
+                Some(staged)
+            }
+            Err(e) => {
+                eprintln!(
+                    "sidecar sandbox: could not stage {path}: {e} — passing the original path"
+                );
+                None
+            }
+        }
     }
 
     /// Download the model that `method`/`params` needs by running the short-lived, network-ALLOWED
@@ -1532,8 +1680,10 @@ fn read_reply_with_timeout(
     id: u64,
     timeout: std::time::Duration,
 ) -> std::io::Result<Value> {
-    // Disjoint borrows: the reader thread owns `stdout`, the watchdog owns `child`.
-    let Process { child, stdout, .. } = &mut *proc;
+    // Disjoint borrows: the reader thread owns `stdout`, the watchdog owns `control`.
+    let Process {
+        control, stdout, ..
+    } = &mut *proc;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(move || {
@@ -1546,8 +1696,8 @@ fn read_reply_with_timeout(
                 // Deadline hit (or the reader panicked and dropped its sender): kill the child
                 // so its stdout closes and the scoped reader unblocks at EOF, then reap it. The
                 // scope waits for that reader to finish before returning.
-                let _ = child.kill();
-                let _ = child.wait();
+                control.kill();
+                control.wait();
                 Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "sidecar did not reply within its deadline",
@@ -1816,12 +1966,46 @@ fn too_old_message() -> String {
 /// environment can't break the bundled interpreter or the venv), and forces UTF-8
 /// mode so a non-UTF-8 OEM codepage can't fail interpreter init. Applied to every
 /// Python process PM launches.
+/// Environment keys stripped from any Python child PM launches: the `PYTHON*` overrides that could
+/// point the interpreter at the wrong stdlib (so a poisoned environment can't break the bundled
+/// interpreter or the venv). Shared by [`clean_python_env`] and the worker spawn so the confined and
+/// unconfined paths strip exactly the same set.
+const PYTHON_ENV_REMOVES: &[&str] = &["PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"];
+
 fn clean_python_env(command: &mut Command) {
-    command
-        .env_remove("PYTHONHOME")
-        .env_remove("PYTHONPATH")
-        .env_remove("PYTHONSTARTUP")
-        .env("PYTHONUTF8", "1");
+    for k in PYTHON_ENV_REMOVES {
+        command.env_remove(k);
+    }
+    command.env("PYTHONUTF8", "1");
+}
+
+/// Bridge the confined worker's process control to the generic [`ChildControl`] the request loop drives.
+#[cfg(windows)]
+impl ChildControl for crate::sidecar_sandbox::ConfinedChild {
+    fn kill(&mut self) {
+        crate::sidecar_sandbox::ConfinedChild::kill(self);
+    }
+    fn wait(&mut self) {
+        crate::sidecar_sandbox::ConfinedChild::wait(self);
+    }
+}
+
+/// The base interpreter a venv was built from, read from its `pyvenv.cfg` `home =` line (stripping the
+/// `\\?\` long-path prefix). The confined worker needs read/execute on this tree as well as the venv,
+/// because the venv's `python.exe` is only a thin launcher that defers to it.
+#[cfg(windows)]
+fn base_python_dir(venv_dir: &Path) -> Option<PathBuf> {
+    let cfg = std::fs::read_to_string(venv_dir.join("pyvenv.cfg")).ok()?;
+    for line in cfg.lines() {
+        if let Some(rest) = line.strip_prefix("home") {
+            let val = rest.trim_start_matches([' ', '=']).trim();
+            let val = val.strip_prefix(r"\\?\").unwrap_or(val);
+            if !val.is_empty() {
+                return Some(PathBuf::from(val));
+            }
+        }
+    }
+    None
 }
 
 /// Point the sidecar's model caches at PM's data dir (`runtime/models`) via `PM_MODELS_DIR`, shared by
@@ -2006,6 +2190,55 @@ fn no_window(_command: &mut Command) {}
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// End-to-end smoke test of the Windows AppContainer confinement (issue #286 PR2b): spawn the REAL
+    /// worker confined, `ping` it over the raw pipes, then convert a text file through the staging path,
+    /// and confirm it actually ran confined. `#[ignore]` + hardcoded dev paths because it needs the live
+    /// venv and runs the slow one-time ACL grant. Run manually:
+    ///   cargo test --manifest-path src-tauri/Cargo.toml --ignored confined_worker_smoke -- --nocapture
+    #[test]
+    #[ignore = "windows-only, needs the live venv; validates the confined stdio protocol"]
+    #[cfg(windows)]
+    fn confined_worker_smoke() {
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("sidecar");
+        // No hardcoded path in a public repo: point PM_SANDBOX_SMOKE_VENV at your installed venv dir
+        // (…/runtime/venv). Unset → skip.
+        let venv_dir = match std::env::var("PM_SANDBOX_SMOKE_VENV") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("skipping: set PM_SANDBOX_SMOKE_VENV to the venv dir to run this");
+                return;
+            }
+        };
+        assert!(venv_dir.join("Scripts\\python.exe").exists(), "no venv");
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir,
+            venv_dir,
+        });
+
+        // The FIRST sidecar call is a convert (path-bearing), with NO prior ping — the regression case
+        // for the staging-ordering bug: the SAME request triggers the first confined spawn, so the
+        // input must be staged AFTER that spawn or the confined worker gets the un-granted original path.
+        let tmp = std::env::temp_dir().join("pm_confined_smoke.txt");
+        std::fs::write(&tmp, "hello from a confined worker").unwrap();
+        let (markdown, _title) = mgr.convert(&tmp).expect("confined convert (first request)");
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            markdown.contains("hello from a confined worker"),
+            "convert output: {markdown:?}"
+        );
+        assert!(
+            mgr.sandbox.lock().unwrap().is_some(),
+            "worker should be CONFINED — the sandbox was not set up"
+        );
+
+        // ping confirms the worker is still alive over its pipes after the convert.
+        let pong = mgr.request("ping", json!({})).expect("ping");
+        assert_eq!(pong["ok"], serde_json::Value::Bool(true), "ping");
+    }
 
     /// The OCR marker string must be exactly the pins joined by ';' — the installer writes the marker
     /// and `optional_ocr_ready` compares it, so a drift here would silently re-install on every check

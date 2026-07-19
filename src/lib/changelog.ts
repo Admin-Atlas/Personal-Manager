@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.31.0-alpha",
+    date: "2026-07-19",
+    highlights: [
+      "On Windows, the helper that opens and reads your files now runs inside a locked-down sandbox: it has no way to reach the internet, and it can only see the one file it's working on — not your notes, not the rest of your computer. So even a booby-trapped document can't use PM's file reader to phone home or snoop around. Everything works exactly as before; this is simply an extra wall, quietly added around the riskiest part of PM. (The AI models still download normally through a separate, sandbox-free step, and macOS and Linux get the same treatment next.)",
+    ],
+  },
+  {
     version: "3.30.0-alpha",
     date: "2026-07-19",
     highlights: [
