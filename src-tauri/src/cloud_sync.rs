@@ -19,7 +19,7 @@
 //! the whole generic pass future must be `Send`, and the explicit bound makes that provable through the
 //! generic `C`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -28,7 +28,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{Error, Result};
-use crate::{connector_sync, db, drive, index_only, ingest, onedrive, AppState};
+use crate::{connector_sync, db, drive, index_only, onedrive, AppState};
 
 // --- unified report / progress types (shared by both cloud connectors) ---------------------------
 
@@ -287,20 +287,33 @@ pub(crate) fn non_empty(s: &str) -> Option<String> {
     }
 }
 
-/// Stage downloaded bytes to a temp file named with the source's extension, so the sidecar
-/// (MarkItDown) picks the right converter. Content-addressed so a re-fetch reuses the name; removed
-/// by the caller after conversion. `prefix` keeps each connector's temp files recognisable
-/// (`pm-drive-` / `pm-onedrive-`).
+/// Stage downloaded bytes to a uniquely-named temp file tagged with the source's extension, so the
+/// sidecar (MarkItDown) picks the right converter; removed by the caller after use. `prefix` keeps
+/// each connector's temp files recognisable (`pm-drive-` / `pm-onedrive-`).
+///
+/// The name is **random per call** (it used to be content-addressed): a deterministic name let a
+/// temp left behind by a crashed pass — or one Windows Defender was still scanning right after the
+/// write — collide with the sidecar's `open(path, "rb")`, surfacing as `PermissionError [Errno 13]`
+/// and failing that one document (#403). A fresh name can't collide, and the write handle is closed
+/// before the path is handed on, so our own handle never blocks the reader either.
 pub(crate) fn stage_temp(prefix: &str, name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let ext = std::path::Path::new(name)
+    let ext = Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
         .filter(|e| e.len() <= 8)
         .unwrap_or("bin");
-    let digest = ingest::hex_digest(bytes);
-    let path = std::env::temp_dir().join(format!("{prefix}{}.{ext}", &digest[..16]));
-    std::fs::write(&path, bytes)?;
-    Ok(path)
+    let mut file = tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(&format!(".{ext}"))
+        .tempfile()
+        .map_err(|e| Error::Other(format!("staging temp file: {e}")))?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    std::io::Write::flush(&mut file)?;
+    // Close our writer handle but keep the file on disk (the caller removes it after conversion);
+    // on Windows an open writer would deny the sidecar's read `open`.
+    file.into_temp_path()
+        .keep()
+        .map_err(|e| Error::Other(format!("staging temp file: {e}")))
 }
 
 /// The shared tail of both connectors' `FetchPlan::DownloadBinary` arms: take the download's
@@ -319,10 +332,44 @@ pub(crate) fn convert_downloaded_binary(
         Err(e) => return Err(e),
     };
     let tmp = stage_temp(temp_prefix, name, &bytes)?;
-    let converted = state.sidecar.convert(&tmp);
+    let converted = convert_staged(state, &tmp);
     let _ = std::fs::remove_file(&tmp);
     let (markdown, _title) = converted?;
     Ok(non_empty(&markdown))
+}
+
+/// Convert a staged temp file via the sidecar, retrying briefly on a transient Windows file lock.
+/// Once the file is written, antivirus (Defender) opens it to scan, and during that window the
+/// sidecar's `open(path, "rb")` is denied with `PermissionError [Errno 13]` (#403) — a lock that
+/// clears in well under a second. A genuine conversion failure (unsupported/corrupt input) doesn't
+/// match the lock signature and surfaces on the first try. Runs off the DB lock, like its caller.
+fn convert_staged(state: &AppState, path: &Path) -> Result<(String, String)> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut attempt = 1u32;
+    loop {
+        match state.sidecar.convert(path) {
+            Ok(out) => return Ok(out),
+            Err(e) if attempt < MAX_ATTEMPTS && is_file_lock_error(&e) => {
+                // 160 / 320 / 640 ms — bounded (~1.1s total) so a genuinely stuck lock still fails fast.
+                std::thread::sleep(std::time::Duration::from_millis(80 * (1u64 << attempt)));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether an error looks like a transient file lock worth retrying (the #403 Windows failure:
+/// antivirus or another handle briefly holding the just-written temp). Matched on the sidecar's
+/// surfaced Python/OS text — `PermissionError`/`Errno 13` (Python) and `os error 32`/"being used by
+/// another process" (the Win32 sharing violation).
+fn is_file_lock_error(e: &Error) -> bool {
+    let s = e.to_string();
+    s.contains("PermissionError")
+        || s.contains("[Errno 13]")
+        || s.contains("Permission denied")
+        || s.contains("os error 32")
+        || s.contains("being used by another process")
 }
 
 /// Drive both cloud sync engines: the detached, single-flight, crash-resumable lifecycle around one
@@ -1482,4 +1529,56 @@ pub(crate) async fn drive_sync_core(app: &AppHandle, account: Option<String>) ->
 /// The sync engine behind [`crate::commands::sync_onedrive`] / [`crate::commands::resume_onedrive_sync`].
 pub(crate) async fn onedrive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
     run_cloud_sync(app, OneDriveDriver, account).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_temp_writes_unique_openable_files() {
+        let bytes = b"<html><body>hi</body></html>";
+        // Identical bytes used to map to one content-addressed name — the collision behind #403.
+        let a = stage_temp("pm-test-", "page.html", bytes).unwrap();
+        let b = stage_temp("pm-test-", "page.html", bytes).unwrap();
+        assert_ne!(a, b, "each staged file must get a fresh name");
+        for p in [&a, &b] {
+            // Readable back means the writer handle was closed before the path was returned.
+            assert_eq!(std::fs::read(p).unwrap(), bytes);
+            assert_eq!(p.extension().and_then(|e| e.to_str()), Some("html"));
+            assert!(p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pm-test-"));
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn stage_temp_defaults_and_caps_extension() {
+        // No extension → `.bin`; an over-long "extension" is not treated as one → `.bin`.
+        let noext = stage_temp("pm-test-", "noext", b"x").unwrap();
+        assert_eq!(noext.extension().and_then(|e| e.to_str()), Some("bin"));
+        let longext = stage_temp("pm-test-", "file.superlongext", b"x").unwrap();
+        assert_eq!(longext.extension().and_then(|e| e.to_str()), Some("bin"));
+        let _ = std::fs::remove_file(&noext);
+        let _ = std::fs::remove_file(&longext);
+    }
+
+    #[test]
+    fn is_file_lock_error_matches_lock_signatures_only() {
+        let py = Error::Other(
+            "sidecar convert failed: PermissionError: [Errno 13] Permission denied: 'C:\\Temp\\pm-drive-ab.html'"
+                .into(),
+        );
+        let win = Error::Other(
+            "The process cannot access the file because it is being used by another process. (os error 32)"
+                .into(),
+        );
+        let genuine = Error::Other("sidecar convert failed: unsupported file type .xyz".into());
+        assert!(is_file_lock_error(&py));
+        assert!(is_file_lock_error(&win));
+        assert!(!is_file_lock_error(&genuine));
+    }
 }

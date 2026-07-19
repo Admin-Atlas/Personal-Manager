@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.27.1-alpha",
+    date: "2026-07-19",
+    highlights: [
+      "Fixed a Windows-only hiccup where the occasional web page saved in your Google Drive or OneDrive could fail to import. PM briefly collided with antivirus over the temporary copy it was reading, so that one page was skipped. It now gives each file its own name and waits out that momentary lock, so these pages index reliably. Everything else about how your cloud files sync is unchanged.",
+    ],
+  },
+  {
     version: "3.27.0-alpha",
     date: "2026-07-18",
     highlights: [
