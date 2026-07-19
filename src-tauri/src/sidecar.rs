@@ -436,6 +436,29 @@ pub enum SidecarErrorKind {
     Unknown,
 }
 
+/// Whether the untrusted-file worker is OS-confined, for the Developer-mode readout (issue #286). The
+/// worker spawns lazily, so this reflects the LAST spawn this session — `NotSpawned` until the first
+/// convert/embed/transcribe. Sandboxing fails OPEN by design, so `Unconfined` is a normal state, not an
+/// error: it names why setup fell back so a hardened-machine surprise is visible without the log.
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SandboxReport {
+    /// This build has no worker confinement (every non-Windows platform, for now).
+    Unsupported,
+    /// The worker hasn't been launched yet this session — nothing to report.
+    NotSpawned,
+    /// The worker is running inside the no-network AppContainer. Carries the container name, the
+    /// staging dir, and the exact dirs its SID can read — the confined filesystem view.
+    Confined {
+        container: String,
+        staging_dir: String,
+        granted_dirs: Vec<String>,
+    },
+    /// Sandbox setup or the confined launch failed, so the worker is running UNCONFINED (fail-open).
+    /// `reason` is the short cause (e.g. "venv grant: access denied").
+    Unconfined { reason: String },
+}
+
 /// The kill/wait half of a running sidecar child, abstracted so the confined Windows worker (a raw
 /// AppContainer process — see [`crate::sidecar_sandbox`]) and a plain `std::process::Child` (every
 /// other platform, and the `--fetch` helper) share one [`Process`]. `kill` closes the child's stdout,
@@ -487,6 +510,11 @@ pub struct SidecarManager {
     /// non-Windows platform). Held here so `request` can stage the file a path-bearing call parses.
     #[cfg(windows)]
     sandbox: Mutex<Option<crate::sidecar_sandbox::Sandbox>>,
+    /// The last worker-spawn confinement outcome, for the Developer-mode readout (issue #286). Distinct
+    /// from `sandbox` (which holds the live handle only while confined): this also records WHY a spawn
+    /// fell open, and survives as `NotSpawned` before the first spawn.
+    #[cfg(windows)]
+    sandbox_report: Mutex<SandboxReport>,
 }
 
 impl SidecarManager {
@@ -499,6 +527,8 @@ impl SidecarManager {
             req_seq: AtomicU64::new(0),
             #[cfg(windows)]
             sandbox: Mutex::new(None),
+            #[cfg(windows)]
+            sandbox_report: Mutex::new(SandboxReport::NotSpawned),
         };
         // Boot status asks the SAME question every other readiness check asks — is the marker
         // CURRENT — rather than merely whether the file exists. The marker stamps the
@@ -515,6 +545,28 @@ impl SidecarManager {
 
     pub fn status(&self) -> SidecarStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    /// The worker's confinement state, for the Developer-mode readout (issue #286). Reflects the LAST
+    /// spawn this session (`NotSpawned` before the first). Always `Unsupported` off Windows, which has
+    /// no worker confinement yet — the readout tells the maintainer that plainly instead of implying a
+    /// hole.
+    #[cfg(windows)]
+    pub fn sandbox_report(&self) -> SandboxReport {
+        self.sandbox_report.lock().unwrap().clone()
+    }
+    #[cfg(not(windows))]
+    pub fn sandbox_report(&self) -> SandboxReport {
+        SandboxReport::Unsupported
+    }
+
+    /// Ask the running worker to attempt one outbound socket and report whether the OS refused it — the
+    /// Developer-mode network-block probe (issue #286). Spawns the worker lazily like any request, so on
+    /// Windows it exercises the confined worker; the handler is unlocked only by `PM_SIDECAR_DEV`, which
+    /// a debug build alone sets (see [`Self::worker_env`]), so a release worker refuses the method.
+    /// Returns the worker's raw `{ blocked, detail, errno }` result.
+    pub fn net_selftest(&self) -> Result<Value> {
+        self.request("net_selftest", json!({}))
     }
 
     /// Whether the engine is already provisioned and current — a cheap, non-building probe (no install
@@ -1432,6 +1484,12 @@ impl SidecarManager {
             ),
             ("PYTHONUTF8".to_string(), "1".to_string()),
         ];
+        // Debug builds only: unlock the worker's dev-only `net_selftest` handler (the Developer-mode
+        // network-block probe, issue #286). A release worker never sets this, so it refuses the method
+        // — the untrusted worker attempts a socket only under a dev build's explicit dev-tab click.
+        if cfg!(debug_assertions) {
+            envs.push(("PM_SIDECAR_DEV".to_string(), "1".to_string()));
+        }
         if let Some(dir) = self.paths.models_dir() {
             let _ = std::fs::create_dir_all(&dir);
             envs.push((
@@ -1456,22 +1514,19 @@ impl SidecarManager {
         use crate::sidecar_sandbox::Sandbox;
         let venv_dir = &self.paths.venv_dir;
         let Some(runtime) = venv_dir.parent().map(|p| p.to_path_buf()) else {
-            return Ok(None);
+            return self.fall_open("the venv has no parent runtime dir".into());
         };
         let Some(models) = self.paths.models_dir() else {
-            return Ok(None);
+            return self.fall_open("the models dir could not be resolved".into());
         };
         let Some(base) = base_python_dir(venv_dir) else {
-            eprintln!(
-                "sidecar sandbox: base python unresolved from pyvenv.cfg — running unconfined"
-            );
-            return Ok(None);
+            return self.fall_open("base python unresolved from pyvenv.cfg".into());
         };
-        let Some(sandbox) =
-            Sandbox::ensure(venv_dir, &base, &models, &self.paths.source_dir, &runtime)
-        else {
-            return Ok(None);
-        };
+        let sandbox =
+            match Sandbox::ensure(venv_dir, &base, &models, &self.paths.source_dir, &runtime) {
+                Ok(s) => s,
+                Err(reason) => return self.fall_open(reason),
+            };
 
         let env_refs: Vec<(&str, &str)> =
             envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -1479,19 +1534,33 @@ impl SidecarManager {
         let mut confined =
             match sandbox.spawn_confined(py, &[script], &env_refs, PYTHON_ENV_REMOVES, &cwd) {
                 Ok(c) => c,
-                Err(e) => {
-                    eprintln!("sidecar sandbox: confined spawn failed, running unconfined: {e}");
-                    return Ok(None);
-                }
+                Err(e) => return self.fall_open(format!("confined spawn: {e}")),
             };
         let stdin = confined.stdin.take().unwrap();
         let stdout = BufReader::new(confined.stdout.take().unwrap());
+        // Record the confined view for the Developer-mode readout BEFORE the sandbox moves into the
+        // staging slot below.
+        *self.sandbox_report.lock().unwrap() = SandboxReport::Confined {
+            container: sandbox.container_name().to_string(),
+            staging_dir: sandbox.staging_dir().display().to_string(),
+            granted_dirs: sandbox.granted_dirs(),
+        };
         *self.sandbox.lock().unwrap() = Some(sandbox);
         Ok(Some(Process {
             stdin: Box::new(stdin),
             stdout: Box::new(stdout),
             control: Box::new(confined),
         }))
+    }
+
+    /// Record a fall-open: log why, stamp the Developer-mode readout, and return `Ok(None)` so the
+    /// caller runs the worker unconfined (issue #286). "running unconfined" stays in the log line as
+    /// the stable grep tell.
+    #[cfg(windows)]
+    fn fall_open(&self, reason: String) -> Result<Option<Process>> {
+        eprintln!("sidecar sandbox: running unconfined — {reason}");
+        *self.sandbox_report.lock().unwrap() = SandboxReport::Unconfined { reason };
+        Ok(None)
     }
 
     /// When the worker is confined, copy the file a path-bearing request parses into the

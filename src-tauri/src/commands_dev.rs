@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::{Error, Result};
-use crate::sidecar::SidecarStatus;
+use crate::sidecar::{SandboxReport, SidecarStatus};
 use crate::{db, retrieval, AppState};
 
 /// How a column's value is rendered into the read-only browser. Applied to TEXT values
@@ -590,6 +590,48 @@ pub fn dev_table_rows(
 pub fn dev_document_chunks(state: State<'_, AppState>, document_id: i64) -> Result<DevTablePage> {
     let conn = state.conn()?;
     document_chunks(&conn, document_id)
+}
+
+/// The untrusted-file worker's OS-confinement state for the Dev tab's Sandbox panel (issue #286). A
+/// plain read of the last spawn's outcome — no store access, no mutation. Always registered (a harmless
+/// read); the UI is gated by the runtime `devMode`. Off Windows it reports `Unsupported`.
+#[tauri::command]
+pub fn dev_sidecar_sandbox_report(state: State<'_, AppState>) -> SandboxReport {
+    state.sidecar.sandbox_report()
+}
+
+/// The worker's answer to the network-block self-test (issue #286): whether the OS refused an outbound
+/// socket, a human detail, and the raw errno. Mirrors the sidecar's `net_selftest` result.
+#[cfg(debug_assertions)]
+#[derive(Serialize, Deserialize)]
+pub struct NetSelftest {
+    pub blocked: bool,
+    pub detail: String,
+    pub errno: Option<i64>,
+}
+
+/// Dev-only (debug builds): ask the running worker to attempt ONE outbound socket and report whether it
+/// was refused — the live proof the confinement denies network (issue #286). Compiled OUT of release
+/// (like `dev_apply_change_event`), so the worker never attempts a socket in a shipped build; the UI
+/// calls it only behind `isDevBuild`. Requires the engine ready (it spawns the worker to ask it), and
+/// never touches the store. The socket targets a reserved TEST-NET address, so an unconfined attempt is
+/// egress-safe.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub async fn dev_sidecar_net_selftest(app: AppHandle) -> Result<NetSelftest> {
+    tokio::task::spawn_blocking(move || -> Result<NetSelftest> {
+        let state = app.state::<AppState>();
+        if !matches!(state.sidecar.status(), SidecarStatus::Ready) {
+            return Err(Error::Other(
+                "the document engine isn't ready yet — finish setup first".into(),
+            ));
+        }
+        let raw = state.sidecar.net_selftest()?;
+        serde_json::from_value(raw)
+            .map_err(|e| Error::Other(format!("could not parse net_selftest result: {e}")))
+    })
+    .await
+    .map_err(|e| Error::Other(format!("net self-test task panicked: {e}")))?
 }
 
 /// Read-only "Retrieval explain" (issue #81): run `query` through the live hybrid retriever and

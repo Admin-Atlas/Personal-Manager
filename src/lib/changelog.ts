@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.32.0-alpha",
+    date: "2026-07-19",
+    highlights: [
+      "Developer mode now shows, at a glance, whether the file-reading helper's Windows sandbox is actually switched on — and, in development builds, a one-click check that confirms it really can't reach the internet. This is purely a window onto the protection added last update; if you don't use Developer mode, nothing here changes for you.",
+    ],
+  },
+  {
     version: "3.31.0-alpha",
     date: "2026-07-19",
     highlights: [
