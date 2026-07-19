@@ -54,9 +54,11 @@ function sandboxLabel(s: SandboxReport | null): string {
   if (!s) return "—";
   switch (s.state) {
     case "confined":
-      return "confined (AppContainer)";
+      return `confined · ${s.layers.join(" + ")}`;
+    case "degraded":
+      return `degraded (${s.layers.join(" + ")} only) — [${s.code}] ${s.detail}`;
     case "unconfined":
-      return `unconfined — ${s.reason}`;
+      return `unconfined — [${s.code}] ${s.detail}`;
     case "not_spawned":
       return "worker not started yet";
     case "unsupported":
@@ -204,12 +206,13 @@ export function DevView() {
           <DevPanel
             title="Sidecar sandbox"
             helpId="dev-sandbox"
-            subtitle="Whether the untrusted-file worker is confined in a no-network OS sandbox. Windows only, for now — it fails open, so a fall-back to unconfined shows here with its reason."
+            subtitle="Whether the untrusted-file worker is confined in a no-network OS sandbox. Windows only, for now — it fails open, and any fall-back or degraded state shows here with an SBX-#### code you can quote when reporting a problem."
           >
             <div className="flex flex-col">
               <Row label="Confinement" value={sandboxLabel(sandbox)} />
               {sandbox?.state === "confined" && (
                 <>
+                  <Row label="Enforces" value={sandbox.layers.join(" + ")} />
                   <Row label="Container" value={sandbox.container} />
                   <Row label="Staging dir" value={sandbox.staging_dir} />
                 </>

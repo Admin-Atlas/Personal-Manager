@@ -436,27 +436,106 @@ pub enum SidecarErrorKind {
     Unknown,
 }
 
+/// Stable DIAGNOSTIC CODES for the sidecar worker confinement (issue #286). A tester or an ordinary
+/// user who hits a fall-back can quote the code and it maps to the EXACT failure site here — a precise,
+/// greppable id beats a generic message, and flagging the error loudly beats burying it. Ranges:
+/// `1xxx` cross-platform/setup, `2xxx` Windows AppContainer, `3xxx` macOS sandbox-exec, `4xxx` Linux
+/// Landlock+seccomp. **Never renumber or reuse a shipped code** — they travel in logs and bug reports.
+///
+/// Only the Windows arm references these in this PR, so the whole set is `allow(dead_code)` off Windows
+/// until the macOS/Linux arms (PR2c/PR2d) add + use their 3xxx/4xxx codes.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod sbx {
+    // --- 1xxx cross-platform setup (sidecar.rs) ---
+    /// The venv directory has no parent `runtime/` dir, so the staging/allow-set can't be anchored.
+    pub const NO_RUNTIME_DIR: &str = "SBX-1101";
+    /// The model-cache dir could not be resolved.
+    pub const NO_MODELS_DIR: &str = "SBX-1102";
+    /// The base interpreter dir could not be read from the venv's `pyvenv.cfg` `home=`.
+    pub const NO_BASE_PYTHON: &str = "SBX-1103";
+    /// The staging dir (`runtime/sandbox-in`) could not be created.
+    pub const STAGING_DIR: &str = "SBX-1104";
+    /// Copying an input file into the staging dir failed (the request runs on the original path).
+    pub const STAGE_COPY: &str = "SBX-1105";
+    /// The confined child process failed to spawn/launch.
+    pub const CONFINED_SPAWN: &str = "SBX-1106";
+
+    // --- 2xxx Windows AppContainer (sidecar_sandbox.rs) ---
+    /// AppContainer profile creation or SID derivation failed.
+    pub const WIN_PROFILE: &str = "SBX-2101";
+    /// Granting the container SID full control of the staging dir failed.
+    pub const WIN_STAGING_GRANT: &str = "SBX-2102";
+    /// Granting the container SID read/execute on the sidecar script dir failed.
+    pub const WIN_SCRIPT_GRANT: &str = "SBX-2103";
+    /// Granting the container SID read/execute on the model-cache dir failed.
+    pub const WIN_MODELS_GRANT: &str = "SBX-2104";
+    /// Granting the container SID read/execute on the venv / base-python tree failed.
+    pub const WIN_TREE_GRANT: &str = "SBX-2105";
+
+    // 3xxx macOS (PR2c) and 4xxx Linux (PR2d) codes are added with their platform arms.
+}
+
+/// A confinement setup/launch failure: a stable [`sbx`] code plus human detail. Formats as
+/// `"[SBX-####] detail"`, and that exact string surfaces in the log line, the Developer-mode readout
+/// ([`SandboxReport::Unconfined`]/[`SandboxReport::Degraded`]), and any user-facing error — so one code
+/// pins the failure across all three. Cheap to construct at every failure site (issue #286). Only the
+/// Windows arm constructs it in this PR, so `allow(dead_code)` off Windows until PR2c/PR2d.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub struct SbxError {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl SbxError {
+    pub fn new(code: &'static str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            code,
+            detail: detail.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for SbxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code, self.detail)
+    }
+}
+
 /// Whether the untrusted-file worker is OS-confined, for the Developer-mode readout (issue #286). The
 /// worker spawns lazily, so this reflects the LAST spawn this session — `NotSpawned` until the first
 /// convert/embed/transcribe. Sandboxing fails OPEN by design, so `Unconfined` is a normal state, not an
-/// error: it names why setup fell back so a hardened-machine surprise is visible without the log.
+/// error: it names (with a code) why setup fell back so a hardened-machine surprise is visible without
+/// the log. `Degraded` is the middle ground — some axes enforced, some not (e.g. Linux with no Landlock:
+/// network blocked but filesystem open) — surfaced honestly rather than mislabeled `Confined`.
 #[derive(Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SandboxReport {
-    /// This build has no worker confinement (every non-Windows platform, for now).
+    /// This build has no worker confinement for this OS (yet).
     Unsupported,
     /// The worker hasn't been launched yet this session — nothing to report.
     NotSpawned,
-    /// The worker is running inside the no-network AppContainer. Carries the container name, the
-    /// staging dir, and the exact dirs its SID can read — the confined filesystem view.
+    /// The worker is fully confined. Carries the mechanism name, the staging dir, the exact dirs it can
+    /// read (the confined filesystem view), and which axes are enforced (`layers`, e.g.
+    /// `["network","filesystem"]`).
     Confined {
         container: String,
         staging_dir: String,
         granted_dirs: Vec<String>,
+        layers: Vec<String>,
+    },
+    /// PARTIAL confinement: `layers` names the axes that ARE enforced; `code`/`detail` say what's
+    /// missing and why (e.g. Landlock unavailable on an old kernel, so filesystem isn't restricted even
+    /// though the network is blocked). Never mislabel this `Confined`.
+    Degraded {
+        layers: Vec<String>,
+        code: String,
+        detail: String,
     },
     /// Sandbox setup or the confined launch failed, so the worker is running UNCONFINED (fail-open).
-    /// `reason` is the short cause (e.g. "venv grant: access denied").
-    Unconfined { reason: String },
+    /// `code` is the [`sbx`] id of the failing site; `detail` is the cause.
+    Unconfined { code: String, detail: String },
 }
 
 /// The kill/wait half of a running sidecar child, abstracted so the confined Windows worker (a raw
@@ -1349,7 +1428,7 @@ impl SidecarManager {
         // the request that triggers the first confined spawn only sets `self.sandbox` inside `spawn`,
         // so staging before it would hand the confined worker the un-granted original path (issue #286).
         #[cfg(windows)]
-        let mut staged: Option<crate::sidecar_sandbox::StagedInput> = None;
+        let mut staged: Option<crate::sidecar_stage::StagedInput> = None;
 
         loop {
             if guard.is_none() {
@@ -1514,18 +1593,27 @@ impl SidecarManager {
         use crate::sidecar_sandbox::Sandbox;
         let venv_dir = &self.paths.venv_dir;
         let Some(runtime) = venv_dir.parent().map(|p| p.to_path_buf()) else {
-            return self.fall_open("the venv has no parent runtime dir".into());
+            return self.fall_open(SbxError::new(
+                sbx::NO_RUNTIME_DIR,
+                "the venv has no parent runtime dir",
+            ));
         };
         let Some(models) = self.paths.models_dir() else {
-            return self.fall_open("the models dir could not be resolved".into());
+            return self.fall_open(SbxError::new(
+                sbx::NO_MODELS_DIR,
+                "the models dir could not be resolved",
+            ));
         };
         let Some(base) = base_python_dir(venv_dir) else {
-            return self.fall_open("base python unresolved from pyvenv.cfg".into());
+            return self.fall_open(SbxError::new(
+                sbx::NO_BASE_PYTHON,
+                "base python unresolved from pyvenv.cfg",
+            ));
         };
         let sandbox =
             match Sandbox::ensure(venv_dir, &base, &models, &self.paths.source_dir, &runtime) {
                 Ok(s) => s,
-                Err(reason) => return self.fall_open(reason),
+                Err(e) => return self.fall_open(e),
             };
 
         let env_refs: Vec<(&str, &str)> =
@@ -1534,16 +1622,17 @@ impl SidecarManager {
         let mut confined =
             match sandbox.spawn_confined(py, &[script], &env_refs, PYTHON_ENV_REMOVES, &cwd) {
                 Ok(c) => c,
-                Err(e) => return self.fall_open(format!("confined spawn: {e}")),
+                Err(e) => return self.fall_open(SbxError::new(sbx::CONFINED_SPAWN, e)),
             };
         let stdin = confined.stdin.take().unwrap();
         let stdout = BufReader::new(confined.stdout.take().unwrap());
         // Record the confined view for the Developer-mode readout BEFORE the sandbox moves into the
-        // staging slot below.
+        // staging slot below. The AppContainer enforces both axes (no sockets + ACL read-set).
         *self.sandbox_report.lock().unwrap() = SandboxReport::Confined {
             container: sandbox.container_name().to_string(),
             staging_dir: sandbox.staging_dir().display().to_string(),
             granted_dirs: sandbox.granted_dirs(),
+            layers: vec!["network".to_string(), "filesystem".to_string()],
         };
         *self.sandbox.lock().unwrap() = Some(sandbox);
         Ok(Some(Process {
@@ -1553,13 +1642,16 @@ impl SidecarManager {
         }))
     }
 
-    /// Record a fall-open: log why, stamp the Developer-mode readout, and return `Ok(None)` so the
-    /// caller runs the worker unconfined (issue #286). "running unconfined" stays in the log line as
-    /// the stable grep tell.
+    /// Record a fall-open: log the coded reason, stamp the Developer-mode readout, and return `Ok(None)`
+    /// so the caller runs the worker unconfined (issue #286). The log line keeps "running unconfined" as
+    /// the stable grep tell AND carries the `[SBX-####]` code so a tester/user can quote it.
     #[cfg(windows)]
-    fn fall_open(&self, reason: String) -> Result<Option<Process>> {
-        eprintln!("sidecar sandbox: running unconfined — {reason}");
-        *self.sandbox_report.lock().unwrap() = SandboxReport::Unconfined { reason };
+    fn fall_open(&self, err: SbxError) -> Result<Option<Process>> {
+        eprintln!("sidecar sandbox: running unconfined — {err}");
+        *self.sandbox_report.lock().unwrap() = SandboxReport::Unconfined {
+            code: err.code.to_string(),
+            detail: err.detail,
+        };
         Ok(None)
     }
 
@@ -1568,18 +1660,21 @@ impl SidecarManager {
     /// that one file, never the user's real tree or the vault. The returned guard deletes the staged
     /// copy when the request finishes. No-op (returns `None`) when unconfined or the request has no path.
     #[cfg(windows)]
-    fn maybe_stage_input(&self, req: &mut Value) -> Option<crate::sidecar_sandbox::StagedInput> {
+    fn maybe_stage_input(&self, req: &mut Value) -> Option<crate::sidecar_stage::StagedInput> {
         let guard = self.sandbox.lock().unwrap();
         let sandbox = guard.as_ref()?;
         let path = req["params"]["path"].as_str()?.to_string();
-        match sandbox.stage_input(Path::new(&path)) {
+        match crate::sidecar_stage::stage_into(sandbox.staging_dir(), Path::new(&path)) {
             Ok(staged) => {
                 req["params"]["path"] = json!(staged.path().to_string_lossy());
                 Some(staged)
             }
             Err(e) => {
+                // Flag with a code rather than bury it: the request then runs on the ORIGINAL path,
+                // which the confined worker can't read, so it will fail — the code points at why.
                 eprintln!(
-                    "sidecar sandbox: could not stage {path}: {e} — passing the original path"
+                    "sidecar sandbox: running unconfined-for-this-request — [{}] could not stage {path}: {e}",
+                    sbx::STAGE_COPY
                 );
                 None
             }

@@ -1129,8 +1129,15 @@ export type SidecarStatus =
 export type SandboxReport =
   | { state: "unsupported" }
   | { state: "not_spawned" }
-  | { state: "confined"; container: string; staging_dir: string; granted_dirs: string[] }
-  | { state: "unconfined"; reason: string };
+  | {
+      state: "confined";
+      container: string;
+      staging_dir: string;
+      granted_dirs: string[];
+      layers: string[];
+    }
+  | { state: "degraded"; layers: string[]; code: string; detail: string }
+  | { state: "unconfined"; code: string; detail: string };
 
 /** The worker's answer to the dev-only network-block self-test (issue #286): whether the OS refused an
  *  outbound socket, a human detail, and the raw errno. Mirrors `NetSelftest` in commands_dev.rs. */

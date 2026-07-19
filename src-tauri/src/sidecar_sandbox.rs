@@ -14,9 +14,9 @@
 //! faster-whisper all run inside such a container, and an outbound socket is refused.
 //!
 //! Everything here is a best-effort HARDENING layer on top of the offline worker + at-rest encryption:
-//! if setup fails (`ensure` returns `Err(reason)`) the caller runs the worker unconfined rather than
-//! break ingest — failing open is the right trade for defence in depth on an alpha, and is logged (the
-//! reason also surfaces in the Developer-mode sandbox readout).
+//! if setup fails (`ensure` returns `Err(SbxError)`) the caller runs the worker unconfined rather than
+//! break ingest — failing open is the right trade for defence in depth on an alpha, and is logged with
+//! its `SBX-####` code (which also surfaces in the Developer-mode sandbox readout).
 
 #![cfg(windows)]
 
@@ -47,6 +47,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::error::{Error, Result};
+use crate::sidecar::{sbx, SbxError};
 
 /// Stable AppContainer name. Derived deterministically to the same SID on every run, so the profile is
 /// created once and the (slow) filesystem grants are cached against it. Never rename — see the bundle-id
@@ -79,9 +80,9 @@ impl Sandbox {
     /// The tree grants walk thousands of files, so they run once and are cached behind a marker keyed on
     /// the SID (a SID change re-grants).
     ///
-    /// Returns `Err(reason)` — caller runs unconfined — if any step fails; the `reason` is a short human
-    /// string the caller both logs and surfaces in the Developer-mode readout, so a fall-open is visible
-    /// without digging the log.
+    /// Returns `Err(SbxError)` — caller runs unconfined — if any step fails; the error carries a stable
+    /// `SBX-2xxx` code + detail the caller both logs and surfaces in the Developer-mode readout, so a
+    /// fall-open is visible (and quotable) without digging the log.
     ///
     /// `runtime_dir` is the parent of the venv (`…/runtime`); the staging dir lives under it. The grant
     /// marker lives INSIDE the venv, so a venv rebuild deletes it and re-triggers the grant.
@@ -91,20 +92,22 @@ impl Sandbox {
         models_dir: &Path,
         script_dir: &Path,
         runtime_dir: &Path,
-    ) -> std::result::Result<Sandbox, String> {
-        let sid_string = ensure_profile_sid().map_err(|e| format!("profile: {e}"))?;
+    ) -> std::result::Result<Sandbox, SbxError> {
+        let sid_string = ensure_profile_sid()
+            .map_err(|e| SbxError::new(sbx::WIN_PROFILE, format!("profile: {e}")))?;
 
         let staging_dir = runtime_dir.join("sandbox-in");
-        std::fs::create_dir_all(&staging_dir).map_err(|e| format!("staging dir: {e}"))?;
+        std::fs::create_dir_all(&staging_dir)
+            .map_err(|e| SbxError::new(sbx::STAGING_DIR, format!("staging dir: {e}")))?;
 
         // Grant the small, always-needed dirs every time (cheap, few files): the staging dir (writable)
         // and the script dir that holds `pm_sidecar.py` (readable). The script dir is NOT marker-cached
         // because its location differs between the dev repo and the bundled release resource dir. The
         // big interpreter/model trees ARE grant-once, marker-cached on the SID.
         icacls_grant(&staging_dir, &sid_string, "(OI)(CI)F")
-            .map_err(|e| format!("staging grant: {e}"))?;
+            .map_err(|e| SbxError::new(sbx::WIN_STAGING_GRANT, format!("staging grant: {e}")))?;
         icacls_grant(script_dir, &sid_string, "(OI)(CI)RX")
-            .map_err(|e| format!("script grant: {e}"))?;
+            .map_err(|e| SbxError::new(sbx::WIN_SCRIPT_GRANT, format!("script grant: {e}")))?;
 
         // The models dir is granted EVERY spawn, NOT marker-cached: it is cheap (a handful of model
         // files, not the venv's ~17k) and, unlike the venv, it is routinely deleted and re-created out
@@ -116,7 +119,7 @@ impl Sandbox {
         // writes the cache; downloads are the unconfined fetcher's job.
         let _ = std::fs::create_dir_all(models_dir);
         icacls_grant(models_dir, &sid_string, "(OI)(CI)RX")
-            .map_err(|e| format!("models grant: {e}"))?;
+            .map_err(|e| SbxError::new(sbx::WIN_MODELS_GRANT, format!("models grant: {e}")))?;
 
         // The venv + base interpreter ARE grant-once, marker-cached on the SID (the venv walk is the
         // expensive one, ~17k files). The marker lives INSIDE the venv (not runtime_dir) on purpose: a
@@ -128,8 +131,9 @@ impl Sandbox {
         let granted_for = std::fs::read_to_string(&marker).unwrap_or_default();
         if granted_for.trim() != sid_string {
             for (path, label) in [(venv_dir, "venv"), (base_python_dir, "base python")] {
-                icacls_grant(path, &sid_string, "(OI)(CI)RX")
-                    .map_err(|e| format!("{label} grant: {e}"))?;
+                icacls_grant(path, &sid_string, "(OI)(CI)RX").map_err(|e| {
+                    SbxError::new(sbx::WIN_TREE_GRANT, format!("{label} grant: {e}"))
+                })?;
             }
             let _ = std::fs::write(&marker, &sid_string);
         }
@@ -164,25 +168,6 @@ impl Sandbox {
             .iter()
             .map(|p| p.display().to_string())
             .collect()
-    }
-
-    /// Copy `src` into the granted staging dir under a unique name, returning a handle whose path the
-    /// confined worker CAN read and which is deleted on drop. The worker's filesystem view is thus the
-    /// venv + models + exactly the one file being parsed — never the user's real tree or the vault.
-    pub fn stage_input(&self, src: &Path) -> Result<StagedInput> {
-        let ext = src
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{e}"))
-            .unwrap_or_default();
-        // Unique name without pulling in a uuid dep here: a monotonic counter is enough (single
-        // process, serialized sidecar), and the file is deleted right after the request.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dst = self.staging_dir.join(format!("in-{n}{ext}"));
-        std::fs::copy(src, &dst).map_err(|e| other("stage input", e))?;
-        Ok(StagedInput { path: dst })
     }
 
     /// Launch `exe` with `args` inside the no-network AppContainer, with `envs` overriding and `removes`
@@ -315,23 +300,6 @@ impl Sandbox {
             stdin: Some(stdin),
             stdout: Some(stdout),
         })
-    }
-}
-
-/// A staged copy of an untrusted input file, deleted when dropped.
-pub struct StagedInput {
-    path: PathBuf,
-}
-
-impl StagedInput {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for StagedInput {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
