@@ -432,9 +432,9 @@ mod tests {
     #[test]
     fn rehearse_lockdown_leaves_no_residue() {
         let dir = tempfile::tempdir().unwrap();
-        // On platforms with a real lockdown this exercises icacls/setfacl; on macOS the
-        // restrict_to_owner stub errors, which is a legitimate rehearsal failure — either
-        // way, no rehearsal folder may survive.
+        // On platforms with a real lockdown this exercises icacls / setfacl / chmod; on a
+        // platform with no ACL primitive the restrict_to_owner stub errors, a legitimate
+        // rehearsal failure — either way, no rehearsal folder may survive.
         let _ = rehearse_lockdown(dir.path());
         assert!(!dir.path().join(REHEARSAL_DIR).exists());
     }

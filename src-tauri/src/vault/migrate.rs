@@ -735,7 +735,8 @@ fn relocate(
     // The lockdown closure applies the owner + linked-account ACL to the destination.
     // Linked principals are read from the SOURCE sidecar (it hasn't been copied yet); the
     // inheritable ACEs then propagate to every file the copy lands there. `lockdown == false`
-    // (a device move, an in-profile target, or macOS) makes it a no-op.
+    // (a device move, an in-profile target, or a platform with no ACL primitive) makes it a
+    // no-op.
     let linked = if lockdown {
         access::principals(from_root, &new_meta.vault_id)
     } else {
