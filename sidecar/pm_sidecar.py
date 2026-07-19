@@ -25,8 +25,11 @@ One response per line:
 
 Heavy objects (the MarkItDown instance, the embedding/reranking models, the
 Whisper model) are created lazily on first use so `ping` stays instant and
-startup is cheap. A model downloads its weights the first time it is used, then
-runs fully on-device.
+startup is cheap. The long-lived worker runs OFFLINE (PM_SIDECAR_OFFLINE=1): a
+model missing from the local cache raises `ModelNotCached`, which the Rust side
+turns into a run of this same script with `--fetch` (network allowed) to download
+it, then a retry. So the worker that parses untrusted files never needs a socket;
+only the short-lived fetcher does (issue #286).
 
 Security: ingested content — including transcribed audio and passages scored by
 the reranker — is untrusted data, never instructions. This process only
@@ -39,6 +42,24 @@ import math
 import os
 import sys
 import traceback
+
+# Network posture (issue #286: sidecar OS sandbox). The long-lived WORKER parses untrusted
+# file bytes and must run with no outbound sockets; downloading a model is instead the job
+# of the short-lived `--fetch` helper, which Rust runs with the network allowed. Rust sets
+# PM_SIDECAR_OFFLINE=1 on the worker only. Translate it to Hugging Face's offline flags HERE,
+# at import time, before any loader pulls in huggingface_hub (fastembed and faster-whisper
+# both fetch through it) — so a cold-cache load fails fast with a catchable error the worker
+# can turn into "please fetch this", instead of silently reaching out to the network.
+_OFFLINE = os.environ.get("PM_SIDECAR_OFFLINE") == "1"
+if _OFFLINE:
+    # Hard-assign, NOT setdefault: Rust (via PM_SIDECAR_OFFLINE) is the authority on offline, so an
+    # inherited falsy value like HF_HUB_OFFLINE=0 must NOT win. huggingface_hub reads "0" as online
+    # and fastembed keys its offline gate off this var, so a stale "0" would let a cold-cache
+    # embed/rerank download from inside the untrusted-file worker (the exact socket #286 forbids),
+    # with _OFFLINE still True so nothing notices. faster-whisper and (below) fastembed also pass
+    # local_files_only=_OFFLINE as belt-and-suspenders, but this env var must be authoritative too.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 # pdfminer (which MarkItDown uses to extract text from PDFs) logs a warning for every glyph
 # whose font descriptor has no FontBBox ("None cannot be parsed as 4 floats") — cosmetic noise
@@ -84,6 +105,33 @@ _ocr_engine = None
 _heif_registered = False
 
 
+class ModelNotCached(Exception):
+    """OFFLINE worker reached a model that isn't downloaded yet (issue #286). The main loop
+    turns this into a `model_not_cached` reply so Rust runs the network-allowed `--fetch`
+    helper and retries the call. Never raised outside offline mode."""
+
+
+def _load_model(build):
+    """Construct a model, converting ANY failure in OFFLINE mode into ModelNotCached so Rust runs
+    the network-allowed `--fetch` helper and retries. Treating every offline construction failure as
+    "not downloaded yet" is deliberate: the exception differs by library and version. faster-whisper
+    surfaces huggingface_hub's `LocalEntryNotFoundError`, but fastembed 0.8.0 swallows the offline
+    error and raises a bare `ValueError("Could not load model ... from any source")` (verified
+    against the pinned venv), so matching specific types/messages would silently break first-use
+    ingest on a wording change. In offline mode the only recovery for ANY load failure is for the
+    fetcher (with the network) to obtain the model and retry, which also self-heals a corrupt cache;
+    if it still fails, `request()` fetches once then surfaces the real error. In the FETCHER itself
+    (`_OFFLINE` False) this is a passthrough: a genuine download error must surface as-is."""
+    if not _OFFLINE:
+        return build()
+    try:
+        return build()
+    except ModelNotCached:
+        raise
+    except Exception as exc:
+        raise ModelNotCached(str(exc)) from exc
+
+
 def get_markitdown():
     global _markitdown
     if _markitdown is None:
@@ -126,7 +174,11 @@ def get_embedder(model=None, spec=None):
                 model_file=spec.get("model_file", "onnx/model.onnx"),
             )
             _registered.add(spec["model"])
-        _embedders[model] = TextEmbedding(model_name=model)
+        # local_files_only=_OFFLINE makes the offline posture hold even if the env var were somehow
+        # not authoritative; fastembed passes it through **kwargs to its huggingface_hub download.
+        _embedders[model] = _load_model(
+            lambda: TextEmbedding(model_name=model, local_files_only=_OFFLINE)
+        )
     return _embedders[model]
 
 
@@ -196,7 +248,9 @@ def get_reranker(model, spec=None):
                 model_file=spec.get("model_file", "onnx/model.onnx"),
             )
             _registered.add(spec["model"])
-        _rerankers[model] = TextCrossEncoder(model_name=model)
+        _rerankers[model] = _load_model(
+            lambda: TextCrossEncoder(model_name=model, local_files_only=_OFFLINE)
+        )
     return _rerankers[model]
 
 
@@ -207,11 +261,17 @@ def get_whisper(model_dir):
 
         # `model_dir` (passed by Rust) keeps the weights inside PM's data dir so
         # they uninstall cleanly with it; None falls back to the default cache.
-        _whisper = WhisperModel(
-            WHISPER_MODEL,
-            device="cpu",
-            compute_type="int8",
-            download_root=model_dir or None,
+        # `local_files_only` mirrors the worker's offline posture: the OFFLINE worker
+        # loads from cache only (a miss raises → ModelNotCached), while the `--fetch`
+        # helper runs with it False so it can download (issue #286).
+        _whisper = _load_model(
+            lambda: WhisperModel(
+                WHISPER_MODEL,
+                device="cpu",
+                compute_type="int8",
+                download_root=model_dir or None,
+                local_files_only=_OFFLINE,
+            )
         )
     return _whisper
 
@@ -950,6 +1010,17 @@ def main():
                 raise ValueError(f"unknown method: {method!r}")
             result = handler(req.get("params") or {})
             response = {"id": req_id, "ok": True, "result": result}
+        except ModelNotCached as miss:
+            # Not a failure to report: the offline worker just needs Rust to download this
+            # model (via --fetch) and retry. `error_kind` lets request() tell this apart from
+            # a genuine error (issue #286). Must precede the broad `except` below — ModelNotCached
+            # is an Exception too.
+            response = {
+                "id": req_id,
+                "ok": False,
+                "error": str(miss),
+                "error_kind": "model_not_cached",
+            }
         except Exception as exc:  # report, never crash the loop
             traceback.print_exc(file=sys.stderr)
             response = {"id": req_id, "ok": False, "error": str(exc)}
@@ -983,5 +1054,47 @@ def main():
         out.flush()
 
 
+def _ensure_model(method, params):
+    """Load — and thus download, with the network allowed — the model `method` needs, so a later
+    OFFLINE worker call finds it in the shared cache. Reuses the worker's own lazy loaders; the
+    cache location is identical (same OS user, same fastembed/whisper defaults, and whisper's
+    `model_dir` rides along in `params`), so what this process fetches is exactly what the worker
+    then reads."""
+    model = params.get("model") or EMBED_MODEL
+    custom = params.get("custom")
+    if method in ("embed", "count_tokens"):
+        get_embedder(model, custom)
+        get_tokenizer(model, custom)
+    elif method == "rerank":
+        get_reranker(params.get("model"), custom)
+    elif method == "transcribe":
+        get_whisper(params.get("model_dir"))
+    else:
+        raise ValueError(f"nothing to fetch for method {method!r}")
+
+
+def fetch_main():
+    """The network-allowed model DOWNLOADER (issue #286). Rust spawns this SHORT-LIVED process —
+    deliberately WITHOUT PM_SIDECAR_OFFLINE — when the offline worker reports a model isn't cached.
+    It reads one request line ({"method","params"}, the shape the worker gets), downloads that
+    method's model into the shared cache, writes one reply line, and exits. It never parses
+    untrusted file bytes: its only input is a trusted model id from Rust, so it is the one component
+    that legitimately keeps network access once the worker is sandboxed."""
+    line = sys.stdin.readline()
+    try:
+        req = json.loads(line)
+        _ensure_model(req.get("method"), req.get("params") or {})
+        reply = {"ok": True}
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        reply = {"ok": False, "error": str(exc)}
+    sys.stdout.write(json.dumps(reply) + "\n")
+    sys.stdout.flush()
+    sys.exit(0 if reply.get("ok") else 1)
+
+
 if __name__ == "__main__":
-    main()
+    if "--fetch" in sys.argv[1:]:
+        fetch_main()
+    else:
+        main()
