@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.30.0-alpha",
+    date: "2026-07-19",
+    highlights: [
+      "Under-the-hood tidying that also helps at uninstall time: PM now keeps its downloaded on-device AI models inside its own data folder, so removing PM cleans them up too — previously some were left behind in a temporary system folder. The first time you search or add something after this update, the main model may download once more into its new home; after that, everything runs on your device exactly as before.",
+    ],
+  },
+  {
     version: "3.29.0-alpha",
     date: "2026-07-19",
     highlights: [

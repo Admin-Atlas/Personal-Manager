@@ -61,6 +61,23 @@ if _OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+# Model-cache root (issue #286). Rust points every model cache at PM's data dir (runtime/models) via
+# PM_MODELS_DIR, so the weights uninstall with the app AND the Windows sidecar sandbox's filesystem
+# allow-set is one tidy subtree instead of scattered %TEMP% / ~/.cache paths. The worker and the
+# --fetch helper both receive it, so they share one location. Unset (a raw dev run) falls back
+# to each library's own default.
+_MODELS_DIR = os.environ.get("PM_MODELS_DIR") or None
+if _MODELS_DIR:
+    # Covers the huggingface_hub / tokenizers cache (the `from_pretrained` fallback path).
+    os.environ["HF_HOME"] = os.path.join(_MODELS_DIR, "hf")
+
+
+def _fastembed_cache_dir():
+    """fastembed's cache dir under the shared model root (embed + rerank ONNX weights), or None
+    (fastembed's own default) when PM_MODELS_DIR is unset."""
+    return os.path.join(_MODELS_DIR, "fastembed") if _MODELS_DIR else None
+
+
 # pdfminer (which MarkItDown uses to extract text from PDFs) logs a warning for every glyph
 # whose font descriptor has no FontBBox ("None cannot be parsed as 4 floats") — cosmetic noise
 # that can flood the console on a single PDF and tells us nothing actionable. Quiet that logger
@@ -176,8 +193,11 @@ def get_embedder(model=None, spec=None):
             _registered.add(spec["model"])
         # local_files_only=_OFFLINE makes the offline posture hold even if the env var were somehow
         # not authoritative; fastembed passes it through **kwargs to its huggingface_hub download.
+        # cache_dir keeps the weights under the shared model root (issue #286).
         _embedders[model] = _load_model(
-            lambda: TextEmbedding(model_name=model, local_files_only=_OFFLINE)
+            lambda: TextEmbedding(
+                model_name=model, cache_dir=_fastembed_cache_dir(), local_files_only=_OFFLINE
+            )
         )
     return _embedders[model]
 
@@ -249,7 +269,9 @@ def get_reranker(model, spec=None):
             )
             _registered.add(spec["model"])
         _rerankers[model] = _load_model(
-            lambda: TextCrossEncoder(model_name=model, local_files_only=_OFFLINE)
+            lambda: TextCrossEncoder(
+                model_name=model, cache_dir=_fastembed_cache_dir(), local_files_only=_OFFLINE
+            )
         )
     return _rerankers[model]
 
