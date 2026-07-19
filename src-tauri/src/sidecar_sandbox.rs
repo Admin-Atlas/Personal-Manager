@@ -108,21 +108,30 @@ impl Sandbox {
             return None;
         }
 
-        // The marker lives INSIDE the venv (not runtime_dir) on purpose: a venv rebuild
-        // (`remove_dir_all(venv_dir)` on a torn/too-old install) deletes it, forcing a re-grant — the
-        // recreated venv_dir would otherwise inherit runtime_dir's DACL (no container ACE) while a
-        // runtime_dir marker still claimed "granted", leaving the confined worker unable to read the
-        // fresh venv.
+        // The models dir is granted EVERY spawn, NOT marker-cached: it is cheap (a handful of model
+        // files, not the venv's ~17k) and, unlike the venv, it is routinely deleted and re-created out
+        // from under us — the fetcher re-downloads into it, and a cache reset / cold refresh wipes it.
+        // A recreated models dir inherits `runtime`'s DACL (no container ACE), so a cached "granted"
+        // marker would leave the confined worker denied on freshly downloaded models (WinError 5 on
+        // `models\fastembed`). Granting the (possibly empty) dir here with inheritance means the models
+        // the fetcher writes right afterwards inherit the ACE. Read/execute only — the worker never
+        // writes the cache; downloads are the unconfined fetcher's job.
+        let _ = std::fs::create_dir_all(models_dir);
+        if let Err(e) = icacls_grant(models_dir, &sid_string, "(OI)(CI)RX") {
+            eprintln!("sidecar sandbox disabled (models grant): {e}");
+            return None;
+        }
+
+        // The venv + base interpreter ARE grant-once, marker-cached on the SID (the venv walk is the
+        // expensive one, ~17k files). The marker lives INSIDE the venv (not runtime_dir) on purpose: a
+        // venv rebuild (`remove_dir_all(venv_dir)` on a torn/too-old install) deletes it, forcing a
+        // re-grant — the recreated venv_dir would otherwise inherit runtime_dir's DACL (no container
+        // ACE) while a runtime_dir marker still claimed "granted", leaving the confined worker unable to
+        // read the fresh venv.
         let marker = venv_dir.join(".pm-sandbox-granted");
         let granted_for = std::fs::read_to_string(&marker).unwrap_or_default();
         if granted_for.trim() != sid_string {
-            let _ = std::fs::create_dir_all(models_dir);
-            let grants = [
-                (venv_dir, "venv"),
-                (base_python_dir, "base python"),
-                (models_dir, "models"),
-            ];
-            for (path, label) in grants {
+            for (path, label) in [(venv_dir, "venv"), (base_python_dir, "base python")] {
                 if let Err(e) = icacls_grant(path, &sid_string, "(OI)(CI)RX") {
                     eprintln!("sidecar sandbox disabled ({label} grant): {e}");
                     return None;
