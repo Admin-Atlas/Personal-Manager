@@ -73,6 +73,8 @@ import type {
   Settings,
   SharedDrive,
   SidecarStatus,
+  SandboxReport,
+  NetSelftest,
   StorageReport,
   SyncEvent,
   TsneStatus,
@@ -541,6 +543,16 @@ export const devDocumentChunks = (documentId: number) =>
  *  clamped 1–50. Embeds via the sidecar, so it needs the document engine ready. */
 export const devRetrievalExplain = (query: string, project?: string, k?: number) =>
   invoke<DevRetrievalExplain>("dev_retrieval_explain", { query, project, k });
+
+/** The untrusted-file worker's OS-confinement state, for the Dev tab's Sandbox panel (issue #286).
+ *  A harmless read; off Windows it reports `unsupported`. */
+export const devSidecarSandboxReport = () => invoke<SandboxReport>("dev_sidecar_sandbox_report");
+
+/** Dev-only (debug builds): ask the running worker to attempt one outbound socket and report whether
+ *  the OS refused it — live proof the Windows confinement denies network (issue #286). The backend
+ *  command is compiled out of release builds, so only call this behind `isDevBuild`
+ *  (the central build-time signal in `lib/capabilities`). Needs the document engine ready. */
+export const devSidecarNetSelftest = () => invoke<NetSelftest>("dev_sidecar_net_selftest");
 
 /** In-chat "Retrieval explain" (card 7H): the same instrumented read as the dev panel, for
  *  graduated users. When `k` is omitted it defaults to the user's saved retrieval depth (what a

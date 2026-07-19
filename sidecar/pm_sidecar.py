@@ -989,6 +989,34 @@ def do_reduce(params):
     return {"coords": _fit_unit(coords).tolist(), "method": used}
 
 
+def do_net_selftest(_params):
+    """Dev-only network-block probe (issue #286): attempt ONE outbound TCP socket and report
+    whether the OS refused it. Confined (Windows AppContainer), the connect is denied with
+    WSAEACCES before a packet leaves; unconfined it is allowed out and times out against the
+    unrouted target. That target is TEST-NET-1 (192.0.2.1, RFC 5737 — reserved, routes nowhere),
+    so an unconfined attempt is egress-safe. Registered ONLY when PM_SIDECAR_DEV=1, which only a
+    debug build sets, so a release worker has no reachable socket path here at all."""
+    import errno as _errno
+    import socket
+
+    wsaeacces = 10013  # Windows: a no-network AppContainer refuses the socket with this.
+    try:
+        with socket.create_connection(("192.0.2.1", 443), timeout=2):
+            return {"blocked": False, "detail": "connected — network is NOT blocked", "errno": None}
+    except OSError as exc:
+        blocked = (
+            isinstance(exc, PermissionError)
+            or exc.errno == _errno.EACCES
+            or getattr(exc, "winerror", None) == wsaeacces
+        )
+        detail = (
+            "outbound socket refused (network blocked)"
+            if blocked
+            else f"reached the network layer, NOT blocked ({type(exc).__name__}: {exc})"
+        )
+        return {"blocked": blocked, "detail": detail, "errno": exc.errno}
+
+
 HANDLERS = {
     "ping": lambda params: {"ok": True},
     "convert": do_convert,
@@ -1000,6 +1028,12 @@ HANDLERS = {
     "analyze_image": do_analyze_image,
     "analyze_spreadsheet": do_analyze_spreadsheet,
 }
+
+# The self-test is unlocked only for debug builds (Rust sets PM_SIDECAR_DEV=1 there, never in
+# release), so a shipped worker carries no reachable socket path — the method is simply unknown and
+# refused. See `SidecarManager::net_selftest` (issue #286).
+if os.environ.get("PM_SIDECAR_DEV") == "1":
+    HANDLERS["net_selftest"] = do_net_selftest
 
 
 # Mirror the Rust reader's per-line cap. Rust is the trusted sender and never

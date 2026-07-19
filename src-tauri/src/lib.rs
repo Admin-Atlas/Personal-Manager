@@ -1280,6 +1280,9 @@ pub fn run() {
             commands_dev::dev_table_rows,
             commands_dev::dev_document_chunks,
             commands_dev::dev_retrieval_explain,
+            commands_dev::dev_sidecar_sandbox_report,
+            #[cfg(debug_assertions)]
+            commands_dev::dev_sidecar_net_selftest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

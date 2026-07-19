@@ -388,6 +388,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Retrieval explain",
     body: "Type a query and PM runs it through the same hybrid retriever that grounds chat, then shows why each chunk ranked: its vector distance, keyword rank, fused score, recency decay, and reranker score. Read-only — chunk text is a short truncated preview and nothing is changed. Use it to confirm the index returns the right passages and to see what reranking does.",
   },
+  "dev-sandbox": {
+    title: "Sidecar sandbox",
+    body: "The document engine parses your files in a background helper. On Windows that helper runs inside a locked-down OS sandbox with no network access, able to read only a handful of folders (the engine's own files and one file at a time as it's processed) — so a malicious file can't reach the internet or your vault. This panel shows whether that confinement is active; if it couldn't be set up the engine still runs (just unconfined) and the reason is shown here. In a development build, the network self-test button asks the helper to try one outbound connection and confirms the block is real.",
+  },
   "dev-calendar": {
     title: "Calendar sync state",
     body: "Developer-mode read-out of the calendar connector's state: how many feeds/calendars are connected, whether Google OAuth is configured and connected, the sync window, and when it last synced. Tokens and feed URLs live in your keychain and are never shown here.",

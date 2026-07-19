@@ -14,8 +14,9 @@
 //! faster-whisper all run inside such a container, and an outbound socket is refused.
 //!
 //! Everything here is a best-effort HARDENING layer on top of the offline worker + at-rest encryption:
-//! if setup fails (`ensure` returns `None`) the caller runs the worker unconfined rather than break
-//! ingest — failing open is the right trade for defence in depth on an alpha, and is logged.
+//! if setup fails (`ensure` returns `Err(reason)`) the caller runs the worker unconfined rather than
+//! break ingest — failing open is the right trade for defence in depth on an alpha, and is logged (the
+//! reason also surfaces in the Developer-mode sandbox readout).
 
 #![cfg(windows)]
 
@@ -64,13 +65,23 @@ fn wide(s: &str) -> Vec<u16> {
 pub struct Sandbox {
     /// Where untrusted input files are copied before the confined worker reads them.
     staging_dir: PathBuf,
+    /// The dirs whose ACL grants the container SID access (staging F, everything else RX). Retained
+    /// only so the Developer-mode readout can show the confined worker's exact filesystem view; it is
+    /// never consulted at runtime. Includes the marker-cached trees even on a run that reused the
+    /// cache (they stay granted from the run that set them), so it reflects what the container CAN
+    /// read, not just what was granted this launch.
+    granted: Vec<PathBuf>,
 }
 
 impl Sandbox {
     /// Idempotent setup: create the AppContainer profile (or derive its SID if it already exists), then
     /// grant that SID read/execute on the interpreter + model trees and full control on a staging dir.
     /// The tree grants walk thousands of files, so they run once and are cached behind a marker keyed on
-    /// the SID (a SID change re-grants). Returns `None` — caller runs unconfined — if any step fails.
+    /// the SID (a SID change re-grants).
+    ///
+    /// Returns `Err(reason)` — caller runs unconfined — if any step fails; the `reason` is a short human
+    /// string the caller both logs and surfaces in the Developer-mode readout, so a fall-open is visible
+    /// without digging the log.
     ///
     /// `runtime_dir` is the parent of the venv (`…/runtime`); the staging dir lives under it. The grant
     /// marker lives INSIDE the venv, so a venv rebuild deletes it and re-triggers the grant.
@@ -80,33 +91,20 @@ impl Sandbox {
         models_dir: &Path,
         script_dir: &Path,
         runtime_dir: &Path,
-    ) -> Option<Sandbox> {
-        let sid_string = match ensure_profile_sid() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("sidecar sandbox disabled (profile): {e}");
-                return None;
-            }
-        };
+    ) -> std::result::Result<Sandbox, String> {
+        let sid_string = ensure_profile_sid().map_err(|e| format!("profile: {e}"))?;
 
         let staging_dir = runtime_dir.join("sandbox-in");
-        if let Err(e) = std::fs::create_dir_all(&staging_dir) {
-            eprintln!("sidecar sandbox disabled (staging dir): {e}");
-            return None;
-        }
+        std::fs::create_dir_all(&staging_dir).map_err(|e| format!("staging dir: {e}"))?;
 
         // Grant the small, always-needed dirs every time (cheap, few files): the staging dir (writable)
         // and the script dir that holds `pm_sidecar.py` (readable). The script dir is NOT marker-cached
         // because its location differs between the dev repo and the bundled release resource dir. The
         // big interpreter/model trees ARE grant-once, marker-cached on the SID.
-        if let Err(e) = icacls_grant(&staging_dir, &sid_string, "(OI)(CI)F") {
-            eprintln!("sidecar sandbox disabled (staging grant): {e}");
-            return None;
-        }
-        if let Err(e) = icacls_grant(script_dir, &sid_string, "(OI)(CI)RX") {
-            eprintln!("sidecar sandbox disabled (script grant): {e}");
-            return None;
-        }
+        icacls_grant(&staging_dir, &sid_string, "(OI)(CI)F")
+            .map_err(|e| format!("staging grant: {e}"))?;
+        icacls_grant(script_dir, &sid_string, "(OI)(CI)RX")
+            .map_err(|e| format!("script grant: {e}"))?;
 
         // The models dir is granted EVERY spawn, NOT marker-cached: it is cheap (a handful of model
         // files, not the venv's ~17k) and, unlike the venv, it is routinely deleted and re-created out
@@ -117,10 +115,8 @@ impl Sandbox {
         // the fetcher writes right afterwards inherit the ACE. Read/execute only — the worker never
         // writes the cache; downloads are the unconfined fetcher's job.
         let _ = std::fs::create_dir_all(models_dir);
-        if let Err(e) = icacls_grant(models_dir, &sid_string, "(OI)(CI)RX") {
-            eprintln!("sidecar sandbox disabled (models grant): {e}");
-            return None;
-        }
+        icacls_grant(models_dir, &sid_string, "(OI)(CI)RX")
+            .map_err(|e| format!("models grant: {e}"))?;
 
         // The venv + base interpreter ARE grant-once, marker-cached on the SID (the venv walk is the
         // expensive one, ~17k files). The marker lives INSIDE the venv (not runtime_dir) on purpose: a
@@ -132,20 +128,42 @@ impl Sandbox {
         let granted_for = std::fs::read_to_string(&marker).unwrap_or_default();
         if granted_for.trim() != sid_string {
             for (path, label) in [(venv_dir, "venv"), (base_python_dir, "base python")] {
-                if let Err(e) = icacls_grant(path, &sid_string, "(OI)(CI)RX") {
-                    eprintln!("sidecar sandbox disabled ({label} grant): {e}");
-                    return None;
-                }
+                icacls_grant(path, &sid_string, "(OI)(CI)RX")
+                    .map_err(|e| format!("{label} grant: {e}"))?;
             }
             let _ = std::fs::write(&marker, &sid_string);
         }
 
-        Some(Sandbox { staging_dir })
+        // The container's readable set, kept only for the readout. Order = broadest first.
+        let granted = vec![
+            venv_dir.to_path_buf(),
+            base_python_dir.to_path_buf(),
+            models_dir.to_path_buf(),
+            script_dir.to_path_buf(),
+            staging_dir.clone(),
+        ];
+        Ok(Sandbox {
+            staging_dir,
+            granted,
+        })
     }
 
     /// The container-writable dir input files are staged into (also a sane cwd for the confined child).
     pub fn staging_dir(&self) -> &Path {
         &self.staging_dir
+    }
+
+    /// The stable AppContainer name, for the Developer-mode readout.
+    pub fn container_name(&self) -> &'static str {
+        CONTAINER_NAME
+    }
+
+    /// The dirs the container SID is granted (for the Developer-mode readout only — see [`Sandbox`]).
+    pub fn granted_dirs(&self) -> Vec<String> {
+        self.granted
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect()
     }
 
     /// Copy `src` into the granted staging dir under a unique name, returning a handle whose path the

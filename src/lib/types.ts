@@ -1123,6 +1123,23 @@ export type SidecarStatus =
   | { state: "ready" }
   | { state: "error"; message: string; kind: SidecarErrorKind };
 
+/** Whether the untrusted-file worker is OS-confined (issue #286), for the Dev tab's Sandbox panel.
+ *  Reflects the last spawn this session; sandboxing fails open, so `unconfined` is a normal (logged)
+ *  state, not an error. Mirrors `SandboxReport` in src-tauri/src/sidecar.rs. */
+export type SandboxReport =
+  | { state: "unsupported" }
+  | { state: "not_spawned" }
+  | { state: "confined"; container: string; staging_dir: string; granted_dirs: string[] }
+  | { state: "unconfined"; reason: string };
+
+/** The worker's answer to the dev-only network-block self-test (issue #286): whether the OS refused an
+ *  outbound socket, a human detail, and the raw errno. Mirrors `NetSelftest` in commands_dev.rs. */
+export interface NetSelftest {
+  blocked: boolean;
+  detail: string;
+  errno: number | null;
+}
+
 /** A snapshot of the rebuild currently running (if any) — mirrors `IngestJobState`. The rebuild
  *  runs detached from whichever view started it, so a view mounting later reads this to restore
  *  progress it never saw, then follows `ingest://progress` live. */

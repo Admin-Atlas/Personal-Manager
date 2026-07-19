@@ -11,6 +11,8 @@ import { useCallback, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import {
   devRetrievalExplain,
+  devSidecarNetSelftest,
+  devSidecarSandboxReport,
   devSystemInfo,
   devTableCounts,
   devTableList,
@@ -22,8 +24,11 @@ import type {
   DevSystemInfo,
   DevTableCount,
   DevTablePage,
+  NetSelftest,
+  SandboxReport,
   SidecarStatus,
 } from "../lib/types";
+import { isDevBuild } from "../lib/capabilities";
 import { Button, Select } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
 import { DevTableGrid } from "./dev/DevTableGrid";
@@ -45,6 +50,20 @@ function sidecarLabel(s: SidecarStatus | null): string {
   }
 }
 
+function sandboxLabel(s: SandboxReport | null): string {
+  if (!s) return "—";
+  switch (s.state) {
+    case "confined":
+      return "confined (AppContainer)";
+    case "unconfined":
+      return `unconfined — ${s.reason}`;
+    case "not_spawned":
+      return "worker not started yet";
+    case "unsupported":
+      return "not supported on this OS";
+  }
+}
+
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-baseline justify-between gap-4 border-b border-rule py-1 last:border-0">
@@ -58,6 +77,7 @@ export function DevView() {
   const [info, setInfo] = useState<DevSystemInfo | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [sidecar, setSidecar] = useState<SidecarStatus | null>(null);
+  const [sandbox, setSandbox] = useState<SandboxReport | null>(null);
   const [counts, setCounts] = useState<DevTableCount[]>([]);
   const [tables, setTables] = useState<string[]>([]);
   const [table, setTable] = useState("documents");
@@ -65,6 +85,24 @@ export function DevView() {
   const [page, setPage] = useState<DevTablePage | null>(null);
   const [corrections, setCorrections] = useState<DevTablePage | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Network-block self-test (issue #286): button-triggered — the ONLY thing here that makes the worker
+  // attempt a socket, and the command is compiled out of release builds (so `isDevBuild` gates it).
+  const [netTest, setNetTest] = useState<NetSelftest | null>(null);
+  const [netTesting, setNetTesting] = useState(false);
+  const [netErr, setNetErr] = useState<string | null>(null);
+
+  const runNetTest = useCallback(() => {
+    setNetTesting(true);
+    setNetErr(null);
+    devSidecarNetSelftest()
+      .then(setNetTest)
+      .catch((e) => {
+        setNetTest(null);
+        setNetErr(String(e));
+      })
+      .finally(() => setNetTesting(false));
+  }, []);
 
   // Retrieval explain (issue #81): button-triggered so the sidecar embed never fires on its own.
   const [query, setQuery] = useState("");
@@ -94,6 +132,9 @@ export function DevView() {
       .catch((e) => setError(String(e)));
     sidecarStatus()
       .then(setSidecar)
+      .catch(() => {});
+    devSidecarSandboxReport()
+      .then(setSandbox)
       .catch(() => {});
     devTableCounts()
       .then(setCounts)
@@ -158,6 +199,61 @@ export function DevView() {
               />
               <Row label="Document engine" value={sidecarLabel(sidecar)} />
             </div>
+          </DevPanel>
+
+          <DevPanel
+            title="Sidecar sandbox"
+            helpId="dev-sandbox"
+            subtitle="Whether the untrusted-file worker is confined in a no-network OS sandbox. Windows only, for now — it fails open, so a fall-back to unconfined shows here with its reason."
+          >
+            <div className="flex flex-col">
+              <Row label="Confinement" value={sandboxLabel(sandbox)} />
+              {sandbox?.state === "confined" && (
+                <>
+                  <Row label="Container" value={sandbox.container} />
+                  <Row label="Staging dir" value={sandbox.staging_dir} />
+                </>
+              )}
+            </div>
+
+            {sandbox?.state === "confined" && sandbox.granted_dirs.length > 0 && (
+              <div className="mt-3">
+                <p className="text-xs text-ink3">Readable dirs (everything else is denied):</p>
+                <ul className="mt-1 flex flex-col gap-0.5">
+                  {sandbox.granted_dirs.map((d) => (
+                    <li key={d} className="break-all font-mono text-[11px] text-ink4">
+                      {d}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {isDevBuild && (
+              <div className="mt-4 border-t border-rule pt-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button onClick={runNetTest} disabled={netTesting}>
+                    {netTesting ? "Testing…" : "Run network self-test"}
+                  </Button>
+                  <span className="text-xs text-ink4">
+                    Asks the worker to attempt one outbound socket — live proof the network block
+                    holds.
+                  </span>
+                </div>
+                {netErr && <p className="mt-2 text-xs text-[var(--st-due)]">{netErr}</p>}
+                {netTest && (
+                  <p className="mt-2 text-xs">
+                    <span className={netTest.blocked ? "text-st-quick" : "text-st-due"}>
+                      {netTest.blocked ? "✓ blocked" : "✗ not blocked"}
+                    </span>
+                    <span className="text-ink3"> — {netTest.detail}</span>
+                    {netTest.errno != null && (
+                      <span className="font-mono text-ink4"> (errno {netTest.errno})</span>
+                    )}
+                  </p>
+                )}
+              </div>
+            )}
           </DevPanel>
 
           <DevPanel
