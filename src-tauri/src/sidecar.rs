@@ -1256,52 +1256,70 @@ impl SidecarManager {
     /// Serialized by the process mutex, so the next stdout line is our reply.
     fn request(&self, method: &str, params: Value) -> Result<Value> {
         let mut guard = self.proc.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(self.spawn()?);
-        }
-        let id = self.req_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let proc = guard.as_mut().unwrap();
 
-        let line = serde_json::to_string(&json!({
-            "id": id, "method": method, "params": params,
-        }))
-        .map_err(|e| Error::Other(format!("encode sidecar request: {e}")))?;
-
-        // Refuse to send a line the child would silently drop (see MAX_SIDECAR_REQUEST_LINE):
-        // that drop yields no reply and would wedge this call — and every queued call behind
-        // the process mutex — forever. Nothing has been written yet, so the child stays healthy
-        // and only this one call fails. (Normal callers stay far under this; the gateway
-        // batches embed/count-token requests so a large document never reaches it.)
-        if line.len() > MAX_SIDECAR_REQUEST_LINE {
-            return Err(Error::Other(format!(
-                "sidecar {method} request line is {} bytes, over the {MAX_SIDECAR_REQUEST_LINE}-byte \
-                 cap — refusing to send it (the child would drop it silently and wedge)",
-                line.len()
-            )));
-        }
-
-        // On any IO failure — or a deadline with no reply — drop the (possibly dead) child so
-        // the next call respawns it.
+        // Built once so `params` (which can be a large embed batch) is never cloned per attempt;
+        // only the id is stamped fresh on each send. There are at most two attempts: the second
+        // happens only after a `model_not_cached` miss has been satisfied by `fetch_model`.
+        let mut req = json!({ "id": 0u64, "method": method, "params": params });
         let timeout = request_timeout(method);
-        let send = (|| -> std::io::Result<Value> {
-            proc.stdin.write_all(line.as_bytes())?;
-            proc.stdin.write_all(b"\n")?;
-            proc.stdin.flush()?;
-            read_reply_with_timeout(proc, id, timeout)
-        })();
+        let mut fetched = false;
 
-        match send {
-            Ok(value) => {
-                if value["ok"].as_bool() == Some(true) {
-                    Ok(value["result"].clone())
-                } else {
-                    let msg = value["error"].as_str().unwrap_or("unknown sidecar error");
-                    Err(Error::Other(format!("sidecar {method} failed: {msg}")))
-                }
+        loop {
+            if guard.is_none() {
+                *guard = Some(self.spawn()?);
             }
-            Err(e) => {
-                *guard = None; // force a respawn next time
-                Err(Error::Other(format!("sidecar {method} IO error: {e}")))
+            let id = self.req_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            req["id"] = json!(id);
+            let proc = guard.as_mut().unwrap();
+
+            let line = serde_json::to_string(&req)
+                .map_err(|e| Error::Other(format!("encode sidecar request: {e}")))?;
+
+            // Refuse to send a line the child would silently drop (see MAX_SIDECAR_REQUEST_LINE):
+            // that drop yields no reply and would wedge this call — and every queued call behind
+            // the process mutex — forever. Nothing has been written yet, so the child stays healthy
+            // and only this one call fails. (Normal callers stay far under this; the gateway
+            // batches embed/count-token requests so a large document never reaches it.)
+            if line.len() > MAX_SIDECAR_REQUEST_LINE {
+                return Err(Error::Other(format!(
+                    "sidecar {method} request line is {} bytes, over the {MAX_SIDECAR_REQUEST_LINE}-byte \
+                     cap — refusing to send it (the child would drop it silently and wedge)",
+                    line.len()
+                )));
+            }
+
+            // On any IO failure — or a deadline with no reply — drop the (possibly dead) child so
+            // the next call respawns it.
+            let send = (|| -> std::io::Result<Value> {
+                proc.stdin.write_all(line.as_bytes())?;
+                proc.stdin.write_all(b"\n")?;
+                proc.stdin.flush()?;
+                read_reply_with_timeout(proc, id, timeout)
+            })();
+
+            match send {
+                Ok(value) => {
+                    if value["ok"].as_bool() == Some(true) {
+                        return Ok(value["result"].clone());
+                    }
+                    // The offline worker doesn't have this model cached yet (issue #286). Download
+                    // it with the network-allowed fetcher and retry ONCE against the SAME live
+                    // worker (the reply was well-formed, so the child is healthy — do NOT respawn).
+                    // Holding the proc lock across the download matches the pre-existing behaviour
+                    // of a first-use inline download, which blocked the serialized sidecar for
+                    // exactly as long.
+                    if !fetched && is_model_not_cached(&value) {
+                        fetched = true;
+                        self.fetch_model(method, &req["params"])?;
+                        continue;
+                    }
+                    let msg = value["error"].as_str().unwrap_or("unknown sidecar error");
+                    return Err(Error::Other(format!("sidecar {method} failed: {msg}")));
+                }
+                Err(e) => {
+                    *guard = None; // force a respawn next time
+                    return Err(Error::Other(format!("sidecar {method} IO error: {e}")));
+                }
             }
         }
     }
@@ -1317,10 +1335,19 @@ impl SidecarManager {
         let mut command = Command::new(&py);
         command
             .arg(self.paths.script())
-            // Keep the model downloads quiet and private: no Hugging Face
-            // telemetry (PM's "nothing leaves the device" rule), and silence the
-            // cosmetic symlink warning on Windows without Developer Mode — the
-            // copy-based cache fallback is fine for our single pinned model.
+            // The long-lived worker runs OFFLINE (issue #286): it parses untrusted files and
+            // must never open a socket. PM_SIDECAR_OFFLINE makes it load models from the local
+            // cache only — a miss comes back as `model_not_cached`, which `request` satisfies by
+            // running the network-allowed `--fetch` helper and retrying. We ALSO set the Hugging
+            // Face offline flags explicitly here — rather than let the child inherit them — so a
+            // stale HF_HUB_OFFLINE=0 in the launching environment can't quietly re-enable fastembed's
+            // network path (it keys its offline gate off this var). Symmetric to `fetch_model`, which
+            // env_removes these so the fetcher CAN reach the network. The HF_HUB_DISABLE_* flags keep
+            // any hub access quiet and private (no telemetry — PM's "nothing leaves the device" rule)
+            // and silence the cosmetic Windows symlink warning without Developer Mode.
+            .env("PM_SIDECAR_OFFLINE", "1")
+            .env("HF_HUB_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1")
             .env("HF_HUB_DISABLE_TELEMETRY", "1")
             .env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
             .stdin(Stdio::piped())
@@ -1339,6 +1366,84 @@ impl SidecarManager {
             stdin,
             stdout,
         })
+    }
+
+    /// Download the model that `method`/`params` needs by running the short-lived, network-ALLOWED
+    /// `--fetch` helper (issue #286). The offline worker reports a cold-cache model as
+    /// `model_not_cached`; this turns that miss into a real download WITHOUT ever giving the worker —
+    /// the process that parses untrusted files — a socket. It reuses the worker's own loaders, so the
+    /// cache it fills is exactly the one the worker then reads (same OS user, same fastembed/whisper
+    /// defaults; whisper's `model_dir` rides along in `params`). Blocks — a first download can take
+    /// minutes — bounded by a generous deadline so a stalled download can't wedge the caller forever.
+    fn fetch_model(&self, method: &str, params: &Value) -> Result<()> {
+        let py = self.paths.venv_python();
+        let request = serde_json::to_string(&json!({ "method": method, "params": params }))
+            .map_err(|e| Error::Other(format!("encode fetch request: {e}")))?;
+
+        let mut command = Command::new(&py);
+        command
+            .arg(self.paths.script())
+            .arg("--fetch")
+            // The one child that MAY reach the network: it only ever downloads a model named by
+            // Rust and never touches untrusted file bytes. Force offline OFF (drop any inherited
+            // flag) so it can always fetch; keep the download quiet/private like the worker.
+            .env_remove("PM_SIDECAR_OFFLINE")
+            .env_remove("HF_HUB_OFFLINE")
+            .env_remove("TRANSFORMERS_OFFLINE")
+            .env("HF_HUB_DISABLE_TELEMETRY", "1")
+            .env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        clean_python_env(&mut command);
+        no_window(&mut command);
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| Error::Other(format!("could not start the model fetcher: {e}")))?;
+
+        // Hand it the one-line request and close stdin so it reads EOF and proceeds.
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            let write = stdin
+                .write_all(request.as_bytes())
+                .and_then(|()| stdin.write_all(b"\n"));
+            if let Err(e) = write {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Other(format!("model fetcher stdin: {e}")));
+            }
+        }
+
+        // Read the single reply line on a worker thread so this thread can enforce a deadline:
+        // on timeout we kill the child, which closes its stdout and unblocks the reader at EOF.
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = tx.send(line);
+        });
+
+        let outcome = match rx.recv_timeout(FETCH_TIMEOUT) {
+            Ok(line) => {
+                let reply: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                if reply["ok"].as_bool() == Some(true) {
+                    Ok(())
+                } else {
+                    let msg = reply["error"].as_str().unwrap_or("unknown fetcher error");
+                    Err(Error::Other(format!("could not download the model: {msg}")))
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                Err(Error::Other("downloading the model timed out".to_string()))
+            }
+        };
+        let _ = child.wait();
+        let _ = reader.join();
+        outcome
     }
 }
 
@@ -1458,6 +1563,18 @@ fn read_reply_with_timeout(
 /// ~1 GB) runs *inside* the request with no stdout output, and killing a slow-but-real download
 /// would break local ML — far worse than waiting. Values are intentionally round; tune on the
 /// live rig if a legitimate operation is ever cut short.
+/// Deadline for the `--fetch` helper (issue #286). A first model download is slow; this matches the
+/// worker's own download-bearing grace (`request_timeout` for embed/rerank/transcribe) so the fetch
+/// path is no more likely to time out than the inline first-use download it replaces.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Whether a sidecar reply is the offline worker signalling a model isn't downloaded yet (as opposed
+/// to a genuine failure) — the trigger for a fetch-and-retry (issue #286). Pure, so it unit-tests the
+/// classification without a live child.
+fn is_model_not_cached(reply: &Value) -> bool {
+    reply["ok"].as_bool() != Some(true) && reply["error_kind"].as_str() == Some("model_not_cached")
+}
+
 fn request_timeout(method: &str) -> std::time::Duration {
     use std::time::Duration;
     match method {
@@ -2031,6 +2148,25 @@ mod tests {
             secs("something_new") > 0,
             "unknown methods get a safe default"
         );
+    }
+
+    #[test]
+    fn model_not_cached_is_told_apart_from_a_real_failure() {
+        // The offline worker's "please fetch this model" signal — the only reply that triggers a
+        // fetch-and-retry (issue #286).
+        assert!(is_model_not_cached(&json!({
+            "ok": false, "error_kind": "model_not_cached", "error": "not in cache"
+        })));
+        // A genuine error is NOT a fetch trigger, even though it also has ok:false.
+        assert!(!is_model_not_cached(&json!({
+            "ok": false, "error": "onnx blew up"
+        })));
+        // A success is never a fetch trigger, whatever else it carries.
+        assert!(!is_model_not_cached(&json!({ "ok": true, "result": {} })));
+        // A stray error_kind on a successful reply must not trigger a pointless refetch.
+        assert!(!is_model_not_cached(&json!({
+            "ok": true, "error_kind": "model_not_cached"
+        })));
     }
 
     fn paths_with_source(source_dir: PathBuf) -> SidecarPaths {

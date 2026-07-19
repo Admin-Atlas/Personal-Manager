@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.29.0-alpha",
+    date: "2026-07-19",
+    highlights: [
+      "Under-the-hood security groundwork: the helper that opens and converts your files is being prepared to run completely sealed off from the internet, so that even a malicious file could never use it to reach out. As a first step, downloading PM's on-device AI models is now handled by a separate, short-lived step — leaving the file reader with no reason to touch the network. Day to day nothing changes: the models still download once on first use, then everything runs on your device as before.",
+    ],
+  },
+  {
     version: "3.28.0-alpha",
     date: "2026-07-19",
     highlights: [
