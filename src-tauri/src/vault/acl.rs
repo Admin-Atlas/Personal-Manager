@@ -12,8 +12,11 @@
 //! the current user, the Administrators group, and any explicitly linked accounts.
 //! Linux uses plain POSIX permissions plus ACLs: `chmod 700` on the vault root denies
 //! traversal to every other account (children are unreachable regardless of their own
-//! modes), and `setfacl` re-admits explicitly linked accounts. macOS is a flagged stub
-//! (shared vaults are weaker there; the UI says so).
+//! modes), and `setfacl` re-admits explicitly linked accounts. macOS mirrors Linux with
+//! `chmod 700` on the root, but manages named-account grants through its extended ACLs
+//! (`chmod +a` / `-a` / `-N`): a macOS ACL is honoured *on top of* the POSIX mode rather
+//! than masked off by it, so the owner lockdown must strip the extended ACLs explicitly
+//! instead of relying on the mode the way Linux's mask trick does.
 //!
 //! As of the verify-then-commit change (the ACL-lockout fix), the share migration runs
 //! the owner lockdown BEFORE it commits the move and probes effective access afterwards
@@ -36,12 +39,46 @@ pub enum GrantCheck {
 }
 
 /// Whether this platform actually applies a shared-folder lockdown — true on Windows
-/// (icacls) and Linux (chmod 700 + setfacl), false on macOS (a flagged stub that always
-/// errors). The migration gates FATAL lockdown-before-commit on this: on macOS the
-/// lockdown stays best-effort (there's nothing to enforce), so a share never fails there
-/// for want of an ACL primitive that doesn't exist.
+/// (icacls), Linux (chmod 700 + setfacl) and macOS (chmod 700 + `chmod +a`), false only on
+/// other platforms with no ACL primitive wired. The migration gates its FATAL
+/// lockdown-before-commit on this, so where it's false the lockdown stays best-effort and a
+/// share never fails for want of an enforcement primitive that doesn't exist.
 pub const fn lockdown_supported() -> bool {
-    cfg!(any(windows, target_os = "linux"))
+    cfg!(any(windows, target_os = "linux", target_os = "macos"))
+}
+
+/// The permission list on a macOS vault-folder ACE: rwX plus attribute/xattr/security reads,
+/// delete, and the two inherit flags so a linked account can fully use the folder and every
+/// child created later inherits the grant. Shared by [`macos_ace`] and its callers.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MACOS_ACE_PERMS: &str = "read,write,execute,delete,append,delete_child,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
+
+/// Build one macOS `chmod +a` / `-a` ACL entry — `"<principal> allow <perms>"` — granting an
+/// account inheritable read/write access to a vault folder and everything created under it
+/// later. Pure, so its shape is unit-tested on every platform: PR CI never builds the
+/// `#[cfg(target_os = "macos")]` arm below (only `release.yml` does), so testing the string
+/// here keeps it honest without a Mac. The same entry is used to grant (`+a`) and to remove
+/// (`-a`), so it lives in one place.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_ace(principal: &str) -> String {
+    format!("{} allow {MACOS_ACE_PERMS}", principal.trim())
+}
+
+#[cfg(test)]
+mod acl_arg_tests {
+    use super::{macos_ace, MACOS_ACE_PERMS};
+
+    #[test]
+    fn macos_ace_trims_and_grants_inheritable_rwx() {
+        let ace = macos_ace("  alice  ");
+        // A padded principal is trimmed — no leading/trailing junk in the ACE.
+        assert_eq!(ace, format!("alice allow {MACOS_ACE_PERMS}"));
+        assert!(ace.starts_with("alice allow read,write,execute"));
+        // Inheritance flags are last, so a copy landing in the folder later gets the grant.
+        assert!(ace.ends_with("file_inherit,directory_inherit"));
+        // A uid principal passes through verbatim (chmod resolves it).
+        assert!(macos_ace("501").starts_with("501 allow "));
+    }
 }
 
 // --- Windows: icacls --------------------------------------------------------------
@@ -472,50 +509,206 @@ mod platform {
     }
 }
 
-// --- macOS: flagged stub ------------------------------------------------------------
+// --- macOS: chmod 700 + extended ACLs via `chmod +a` -------------------------------
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::path::Path;
+    use std::process::Command;
+
+    use crate::error::{Error, Result};
+
+    /// Run `/bin/chmod` with `acl_args` applied to `dir`, mapping a non-zero exit to a
+    /// friendly error carrying chmod's own last stderr line. `/bin/chmod` is always present on
+    /// macOS, so a spawn failure is genuinely exceptional.
+    fn run_chmod(acl_args: &[&str], dir: &Path) -> Result<()> {
+        let out = Command::new("/bin/chmod")
+            .args(acl_args)
+            .arg(dir)
+            .output()
+            .map_err(|e| Error::Other(format!("could not run chmod: {e}")))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(Error::Other(format!(
+                "chmod failed: {}",
+                err.trim().lines().last().unwrap_or("(no output)")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set the vault root to owner-only mode (`0o700`) — the piece that makes new vault files
+    /// owner-only, since a 700 root denies every other account traversal into it.
+    fn chmod_700(dir: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| Error::Other(format!("could not chmod the vault folder: {e}")))
+    }
+
+    /// Lock a shared vault folder down to its owner: strip every extended ACL in the tree
+    /// (`chmod -R -N`), set the root to `0o700`, then re-admit exactly the `extra_principals`
+    /// with an inheritable `chmod +a` grant. The `-N` is load-bearing and the reason this
+    /// isn't a copy of the Linux arm: a macOS `allow` ACE is honoured on top of the POSIX
+    /// mode, so a previously-linked account's ACE would survive a bare `chmod 700` — clearing
+    /// the ACLs first gives the same replace-to-named-principals result the Windows
+    /// `/inheritance:r` + `/grant:r` does.
+    pub fn restrict_to_owner(dir: &Path, extra_principals: &[String]) -> Result<()> {
+        run_chmod(&["-R", "-N"], dir)?;
+        chmod_700(dir)?;
+        for p in extra_principals {
+            if !p.trim().is_empty() {
+                run_chmod(&["-R", "+a", &super::macos_ace(p)], dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Additively grant one more account (the Settings "link a second account" field) an
+    /// inheritable read/write ACE, without disturbing the owner lockdown or other grants —
+    /// the macOS counterpart of the Windows additive `/grant:r`.
+    pub fn grant_access(dir: &Path, principal: &str) -> Result<()> {
+        if principal.trim().is_empty() {
+            return Err(Error::Other("an account name or uid is required".into()));
+        }
+        run_chmod(&["-R", "+a", &super::macos_ace(principal)], dir)
+    }
+
+    /// The macOS counterpart of the Windows DACL reset: strip every extended ACL in the tree
+    /// (`chmod -R -N`) and normalise the root to `0o700`. The folder's Unix owner keeps rwx by
+    /// virtue of ownership, so this reopens owner access while clearing any lockdown ACEs — the
+    /// migration's abort/repair path and the rehearsal cleanup call it uniformly across
+    /// platforms. The ACL strip is best-effort (a folder with no ACL, or a missing rehearsal
+    /// folder, isn't an error the `let _ =` callers care about); the mode normalise is the
+    /// reported result.
+    pub fn reset_inheritance(dir: &Path) -> Result<()> {
+        let _ = run_chmod(&["-R", "-N"], dir);
+        chmod_700(dir)
+    }
+
+    /// Additively-removed: strip a previously linked account's ACE (the "unlink" / make-private
+    /// path). Idempotent — if the principal holds no ACE (already removed, or cleared wholesale
+    /// by [`restrict_to_owner`]'s `-N`), this is a no-op rather than a chmod error, mirroring
+    /// the Linux `setfacl -x` contract. The 700 root is the real denial; this strips the
+    /// now-defunct grant so `ls -le` reads clean.
+    pub fn revoke_access(dir: &Path, principal: &str) -> Result<()> {
+        if principal.trim().is_empty() {
+            return Err(Error::Other("an account name or uid is required".into()));
+        }
+        // Presence-check first so a double-revoke (or a revoke after restrict_to_owner already
+        // cleared the ACL) doesn't fail on `chmod -a`'s "no matching entry".
+        if verify_grant(dir, principal) == super::GrantCheck::NotFound {
+            return Ok(());
+        }
+        run_chmod(&["-R", "-a", &super::macos_ace(principal)], dir)
+    }
+
+    /// Read back whether a principal holds an `allow` ACE on `dir` via `ls -led` (the dir's
+    /// own ACL, long form). NOT an effective-access proof (that's impossible to run AS the
+    /// other user); `Inconclusive` on any spawn/shape surprise so a readback quirk never blocks
+    /// a link that actually worked, mirroring the Windows/Linux contract. Lenient: a uid that
+    /// resolved to a display name reads as `NotFound` rather than erroring.
+    pub fn verify_grant(dir: &Path, principal: &str) -> super::GrantCheck {
+        let p = principal.trim().to_ascii_lowercase();
+        let out = match Command::new("/bin/ls").args(["-led"]).arg(dir).output() {
+            Ok(o) => o,
+            Err(e) => return super::GrantCheck::Inconclusive(format!("could not run ls: {e}")),
+        };
+        if !out.status.success() {
+            return super::GrantCheck::Inconclusive(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            );
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        // ACL rows print as ` <n>: user:<name> allow <perms>`; a granting row for this
+        // principal is one that names it and says `allow`.
+        let granted = stdout
+            .lines()
+            .any(|l| l.contains("allow") && l.contains(p.as_str()));
+        if granted {
+            super::GrantCheck::Granted
+        } else {
+            super::GrantCheck::NotFound
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// `restrict_to_owner` on a fresh folder sets it to 0o700 (owner-only) — and, because
+        /// it runs `chmod -R -N` first, this also exercises the real `/bin/chmod` spawn path on
+        /// a Mac (a folder with no ACL is a clean no-op for the strip).
+        #[test]
+        fn restrict_to_owner_chmods_the_root_to_700() {
+            let dir = tempfile::tempdir().unwrap();
+            super::restrict_to_owner(dir.path(), &[]).unwrap();
+            let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+
+        /// The reset path strips ACLs and re-normalises the mode to 0o700 without error.
+        #[test]
+        fn reset_inheritance_reopens_to_owner_only() {
+            let dir = tempfile::tempdir().unwrap();
+            super::restrict_to_owner(dir.path(), &[]).unwrap();
+            super::reset_inheritance(dir.path()).unwrap();
+            let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+
+        /// A grant with no ACE present reads back as `NotFound`, and revoke is then a no-op.
+        #[test]
+        fn verify_and_revoke_are_idempotent_when_absent() {
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                super::verify_grant(dir.path(), "nobody-here"),
+                super::super::GrantCheck::NotFound
+            );
+            super::revoke_access(dir.path(), "nobody-here").unwrap();
+        }
+    }
+}
+
+// --- Other platforms: flagged stub -------------------------------------------------
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod platform {
     use std::path::Path;
 
     use crate::error::{Error, Result};
 
-    /// Folder ACLs aren't wired on macOS in this release. Encryption is still the
-    /// real protection, so callers treat this as a warning. TODO(mac, deferred):
-    /// `chmod 700` + a `chmod +a` ACE for the linked account.
+    /// Folder ACLs aren't wired on this platform. Encryption is still the real protection, so
+    /// callers treat this as a warning, and [`super::lockdown_supported`] is false here so the
+    /// migration never gates a share on it.
     pub fn restrict_to_owner(_dir: &Path, _extra_principals: &[String]) -> Result<()> {
         Err(Error::Other(
-            "shared-folder ACLs aren't applied on macOS in this release".into(),
+            "shared-folder ACLs aren't applied on this platform".into(),
         ))
     }
 
-    /// See [`restrict_to_owner`]: not implemented on macOS.
+    /// See [`restrict_to_owner`]: not implemented on this platform.
     pub fn grant_access(_dir: &Path, _principal: &str) -> Result<()> {
         Err(Error::Other(
-            "shared-folder ACLs aren't applied on macOS in this release".into(),
+            "shared-folder ACLs aren't applied on this platform".into(),
         ))
     }
 
-    /// See [`restrict_to_owner`]: not implemented on macOS.
+    /// See [`restrict_to_owner`]: not implemented on this platform.
     pub fn revoke_access(_dir: &Path, _principal: &str) -> Result<()> {
         Err(Error::Other(
-            "shared-folder ACLs aren't applied on macOS in this release".into(),
+            "shared-folder ACLs aren't applied on this platform".into(),
         ))
     }
 
-    /// No-op on macOS: nothing was locked down, so there's nothing to reset. Returns Ok so
-    /// the migration's abort path and the repair command stay branch-free across platforms
-    /// (the fatal-lockdown gate is off here via `lockdown_supported()`, so a self-lockout
-    /// this would need to undo can't arise).
+    /// No-op: nothing was locked down, so there's nothing to reset. Returns Ok so the
+    /// migration's abort path and the repair command stay branch-free across platforms.
     pub fn reset_inheritance(_dir: &Path) -> Result<()> {
         Ok(())
     }
 
-    /// See [`restrict_to_owner`]: ACLs aren't wired on macOS, so a grant can't be read back.
+    /// See [`restrict_to_owner`]: ACLs aren't wired here, so a grant can't be read back.
     pub fn verify_grant(_dir: &Path, _principal: &str) -> super::GrantCheck {
-        super::GrantCheck::Inconclusive(
-            "shared-folder ACLs aren't applied on macOS in this release".into(),
-        )
+        super::GrantCheck::Inconclusive("shared-folder ACLs aren't applied on this platform".into())
     }
 }
 

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.28.0-alpha",
+    date: "2026-07-19",
+    highlights: [
+      "On a Mac, sharing a vault with other accounts on the same computer now locks the folder down to just the people you choose — the same extra protection PM already gave shared vaults on Windows and Linux. Other accounts signed in to that Mac can no longer reach the raw files; your notes were always encrypted, and this simply adds a lock on the folder on top. If you never share a vault, nothing changes for you.",
+    ],
+  },
+  {
     version: "3.27.1-alpha",
     date: "2026-07-19",
     highlights: [
