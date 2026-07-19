@@ -1354,6 +1354,7 @@ impl SidecarManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         clean_python_env(&mut command);
+        set_models_dir(&mut command, &self.paths);
         no_window(&mut command);
 
         let mut child = command
@@ -1396,6 +1397,7 @@ impl SidecarManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         clean_python_env(&mut command);
+        set_models_dir(&mut command, &self.paths);
         no_window(&mut command);
 
         let mut child = command
@@ -1820,6 +1822,18 @@ fn clean_python_env(command: &mut Command) {
         .env_remove("PYTHONPATH")
         .env_remove("PYTHONSTARTUP")
         .env("PYTHONUTF8", "1");
+}
+
+/// Point the sidecar's model caches at PM's data dir (`runtime/models`) via `PM_MODELS_DIR`, shared by
+/// the long-lived worker and the short-lived `--fetch` helper so they read/write one location (issue
+/// #286). The weights then uninstall with the app, and the Windows sidecar sandbox gets a single tidy
+/// filesystem allow-set instead of scattered `%TEMP%` / `~/.cache` paths. No-op when the models dir
+/// can't be derived (a raw dev layout), where each library falls back to its own default.
+fn set_models_dir(command: &mut Command, paths: &SidecarPaths) {
+    if let Some(dir) = paths.models_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        command.env("PM_MODELS_DIR", &dir);
+    }
 }
 
 /// Whether a failure message is the signature of an interpreter that can't boot
