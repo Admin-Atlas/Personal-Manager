@@ -2497,8 +2497,9 @@ async fn retrieve_grounding(
 
         // Resolve the vault's models + the reranking toggle + the user's retrieval depth in one
         // short lock, then drop it so neither the query embed nor the rerank holds the DB lock
-        // across a sidecar call (#4). `k` is the user-tunable candidate pool (card 7H) — it gates
-        // what the reranker ever sees, so it's read here, not fixed at the DEFAULT_TOP_K constant.
+        // across a sidecar call (#4). `k` is the user-tunable GROUNDING depth (card 7H) — how many
+        // chunks reach the answer — read here rather than fixed at the DEFAULT_TOP_K constant. The
+        // reranker judges the whole ~BRANCH_LIMIT pool regardless of `k` (see `rerank_and_select`).
         let (gateway, rerank_on, k) = {
             let conn = state.conn()?;
             (
@@ -2528,14 +2529,16 @@ async fn retrieve_grounding(
             multilingual: gateway.embedder().multilingual,
         };
         // Fuse under the lock, then drop it before reranking — the cross-encoder is a sidecar
-        // call that can block on a model download. Reranking off (toggle) skips it entirely.
-        let fused = {
+        // call that can block on a model download. `rerank_and_select` reranks the whole pool then
+        // truncates to the top-k grounding set; reranking off (toggle) falls back to fused order.
+        let pool = {
             let conn = state.conn()?;
             retrieval::retrieve_fused(&conn, &q)?
         };
         let reranker = rerank_on.then_some(&gateway as &dyn retrieval::Reranker);
-        // Keep the TOP rerank score alongside the reordered chunks — the confidence-gate signal.
-        retrieval::rerank_scored(reranker, &query, fused)
+        // Keep the TOP rerank score (over the whole pool) alongside the selected chunks — the
+        // confidence-gate signal.
+        retrieval::rerank_and_select(reranker, &query, pool, k)
     })
     .await;
 

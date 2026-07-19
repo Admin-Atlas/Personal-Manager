@@ -689,23 +689,38 @@ pub(crate) fn run_retrieval_explain(
         }
     }
 
-    let rows = scored
+    // Mirror production's final selection: from the reranked (or fused, if reranking is off) pool,
+    // apply the SAME per-section cap + top-k truncation the chat path grounds on, so the panel shows
+    // exactly the chunks the model receives, in the same order (`retrieval::select_top_k`). The wider
+    // pool's rejected candidates stay inspectable by raising the depth slider.
+    use std::collections::HashMap;
+    let selected =
+        retrieval::select_top_k(scored.iter().map(|(c, _)| c.chunk.clone()).collect(), k);
+    let mut by_id: HashMap<i64, (retrieval::ExplainCandidate, Option<f32>)> = scored
+        .into_iter()
+        .map(|(c, s)| (c.chunk.chunk_id, (c, s)))
+        .collect();
+    let rows = selected
         .into_iter()
         .enumerate()
-        .map(|(i, (c, reranker_score))| DevRetrievalRow {
-            final_rank: i,
-            chunk_id: c.chunk.chunk_id,
-            document_id: c.chunk.document_id,
-            title: c.chunk.title,
-            heading: c.chunk.heading,
-            preview: truncate(&c.chunk.content, PREVIEW_CHARS),
-            vector_rank: c.vector_rank,
-            vector_distance: c.vector_distance,
-            keyword_rank: c.keyword_rank,
-            fused_score: c.fused_score,
-            decay_factor: c.decay_factor,
-            decayed_score: c.decayed_score,
-            reranker_score,
+        .filter_map(|(i, chunk)| {
+            by_id
+                .remove(&chunk.chunk_id)
+                .map(|(c, reranker_score)| DevRetrievalRow {
+                    final_rank: i,
+                    chunk_id: c.chunk.chunk_id,
+                    document_id: c.chunk.document_id,
+                    title: c.chunk.title,
+                    heading: c.chunk.heading,
+                    preview: truncate(&c.chunk.content, PREVIEW_CHARS),
+                    vector_rank: c.vector_rank,
+                    vector_distance: c.vector_distance,
+                    keyword_rank: c.keyword_rank,
+                    fused_score: c.fused_score,
+                    decay_factor: c.decay_factor,
+                    decayed_score: c.decayed_score,
+                    reranker_score,
+                })
         })
         .collect();
 

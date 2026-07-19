@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.27.0-alpha",
+    date: "2026-07-18",
+    highlights: [
+      "PM now chooses the passages behind an answer more carefully. Until now its smart re-ranker only re-ordered a short list of notes that a first, rougher pass had already picked — so a strongly relevant note that the rough pass ranked just out of reach could never make it in. The re-ranker now weighs the whole shortlist, so those near-misses can surface. You should notice fewer “but I know I wrote that” moments on questions your files genuinely cover.",
+    ],
+  },
+  {
     version: "3.26.1-alpha",
     date: "2026-07-18",
     highlights: [
