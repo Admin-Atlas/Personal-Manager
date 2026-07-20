@@ -64,6 +64,7 @@ mod secrets;
 mod sidecar;
 #[cfg(windows)]
 mod sidecar_sandbox;
+mod sidecar_stage;
 mod smart_app_control;
 mod splitter;
 mod spreadsheets;

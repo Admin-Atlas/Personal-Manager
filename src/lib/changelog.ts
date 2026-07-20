@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.33.0-alpha",
+    date: "2026-07-20",
+    highlights: [
+      "Under-the-hood groundwork for bringing the file-reader's protective sandbox to Mac and Linux next: the shared machinery now lives in one place, and if the sandbox ever can't start it reports a precise code (like SBX-2104) instead of a vague message — so a one-line note is enough for us to pinpoint and fix it. Nothing changes in day-to-day use.",
+    ],
+  },
+  {
     version: "3.32.0-alpha",
     date: "2026-07-19",
     highlights: [
