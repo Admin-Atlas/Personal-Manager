@@ -2276,9 +2276,12 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 6
 /// `import onnxruntime` (its native `.so` load + CPU-feature probing) can take several seconds on a
 /// slow disk; if it hasn't answered by now the confinement has almost certainly broken the worker, so
 /// we fall open.
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 const SELFTEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
