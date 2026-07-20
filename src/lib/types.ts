@@ -1131,7 +1131,7 @@ export type SandboxReport =
   | { state: "not_spawned" }
   | {
       state: "confined";
-      container: string;
+      mechanism: string;
       staging_dir: string;
       granted_dirs: string[];
       layers: string[];

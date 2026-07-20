@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.33.1-alpha"
+version = "3.34.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -153,4 +153,10 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
+# Sidecar OS sandbox (#286, PR2d): confine the untrusted-file worker on Linux. `landlock` builds the
+# filesystem ruleset (its value is the ABI-compat matrix across kernels); `libc` supplies the raw
+# prctl/seccomp/landlock/close_range syscalls we impose in the child's pre_exec. Both are also pulled
+# transitively already, so this adds no new licences (MIT/Apache-2.0, already allow-listed).
+landlock = "0.4"
+libc = "0.2"
 

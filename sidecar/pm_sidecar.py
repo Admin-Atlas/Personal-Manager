@@ -1017,8 +1017,49 @@ def do_net_selftest(_params):
         return {"blocked": blocked, "detail": detail, "errno": exc.errno}
 
 
+def do_fs_probe(params):
+    """Dev-only filesystem-confinement probe (issue #286 PR2d): try to READ the given path and
+    report whether the OS denied it. Confined by Landlock, a path outside the worker's allow-set is
+    refused with EACCES before any bytes are read; unconfined the read succeeds. Dev-gated
+    (PM_SIDECAR_DEV=1) exactly like do_net_selftest, so a shipped worker exposes no
+    arbitrary-path-read primitive here at all. Used by the Linux confinement smoke test to prove the
+    filesystem restriction is real. The path rides in `probe_path`, NOT `params.path`: the latter is
+    the field Rust stages into the granted staging dir, which would defeat the probe."""
+    import errno as _errno
+
+    path = params.get("probe_path") or ""
+    try:
+        with open(path, "rb") as handle:
+            handle.read(1)
+        return {"denied": False, "detail": "read succeeded — NOT restricted", "errno": None}
+    except PermissionError as exc:
+        return {"denied": True, "detail": "read refused (restricted)", "errno": exc.errno}
+    except OSError as exc:
+        denied = exc.errno == _errno.EACCES
+        detail = (
+            "read refused (filesystem restricted)"
+            if denied
+            else f"reached the filesystem, NOT restricted ({type(exc).__name__}: {exc})"
+        )
+        return {"denied": denied, "detail": detail, "errno": exc.errno}
+
+
+def do_worker_selftest(_params):
+    """Confinement preflight (issue #286 PR2d): load the native library the worker relies on, so
+    Rust can verify the OS sandbox didn't deny it a path it needs BEFORE serving real work. Imports
+    onnxruntime — a compiled extension that dlopen()s system libraries and probes CPU features via
+    /sys and /proc, so it exercises the sandbox's filesystem allow-set the way a plain `ping` (no
+    heavy import) would not. Offline and input-free: it touches no untrusted bytes and no network. A
+    too-tight sandbox makes the import raise, main() reports {ok: False}, and the Linux caller falls
+    open (runs the worker unconfined) instead of every later embed failing."""
+    import onnxruntime  # noqa: F401 — the import IS the test: a native .so load under the sandbox.
+
+    return {"ok": True, "checked": ["onnxruntime"], "onnxruntime": onnxruntime.__version__}
+
+
 HANDLERS = {
     "ping": lambda params: {"ok": True},
+    "worker_selftest": do_worker_selftest,
     "convert": do_convert,
     "embed": do_embed,
     "count_tokens": do_count_tokens,
@@ -1029,11 +1070,13 @@ HANDLERS = {
     "analyze_spreadsheet": do_analyze_spreadsheet,
 }
 
-# The self-test is unlocked only for debug builds (Rust sets PM_SIDECAR_DEV=1 there, never in
-# release), so a shipped worker carries no reachable socket path — the method is simply unknown and
-# refused. See `SidecarManager::net_selftest` (issue #286).
+# The probes are unlocked only for debug builds (Rust sets PM_SIDECAR_DEV=1 there, never in
+# release), so a shipped worker carries no reachable outbound-socket or arbitrary-path-read
+# primitive — the methods are simply unknown and refused. See `SidecarManager::net_selftest`
+# (issue #286) and the Linux confinement smoke test.
 if os.environ.get("PM_SIDECAR_DEV") == "1":
     HANDLERS["net_selftest"] = do_net_selftest
+    HANDLERS["fs_probe"] = do_fs_probe
 
 
 # Mirror the Rust reader's per-line cap. Rust is the trusted sender and never

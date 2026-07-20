@@ -64,6 +64,14 @@ mod secrets;
 mod sidecar;
 #[cfg(windows)]
 mod sidecar_sandbox;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod sidecar_sandbox_linux;
+// The seccomp filter builder is pure and platform-agnostic (its cBPF-interpreter tests run on every
+// platform); only the Linux sandbox installs what it produces, so it's dead code off Linux.
+mod sidecar_seccomp;
 mod sidecar_stage;
 mod smart_app_control;
 mod splitter;

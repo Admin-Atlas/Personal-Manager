@@ -2271,6 +2271,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "landlock"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "635839550ae8b90d9fd2571460a6645dc0aec070225956ca7a2831ed31d2795d"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3035,7 +3046,7 @@ dependencies = [
 
 [[package]]
 name = "pm"
-version = "3.33.1-alpha"
+version = "3.34.0-alpha"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3048,6 +3059,8 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "keyring",
+ "landlock",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "open",
@@ -4667,7 +4680,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
