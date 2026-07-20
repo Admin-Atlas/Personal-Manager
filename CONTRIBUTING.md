@@ -231,10 +231,16 @@ version per merged change).
 
 ---
 
-## 8. Reporting security issues
+## 8. Reporting a problem
 
-Don't open a public issue for a vulnerability. The private reporting process, the
-supported versions, and what's in and out of scope are in [`SECURITY.md`](SECURITY.md).
+**Security vulnerabilities:** don't open a public issue. The private reporting process,
+the supported versions, and what's in and out of scope are in [`SECURITY.md`](SECURITY.md).
+
+**Bugs and crashes:** open a GitHub issue. If PM showed a **diagnostic code** — a short
+stable id like `SBX-2104` — include it *verbatim*, with the message next to it and your OS.
+These codes map to an exact spot in the code; [`ERROR_CODES.md`](ERROR_CODES.md) lists what
+each one means. The sidecar-sandbox ones also show live in **Developer mode → Sidecar
+sandbox**. A code turns "it didn't work" into a one-line, pinpointable report.
 
 ---
 

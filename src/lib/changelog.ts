@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.33.1-alpha",
+    date: "2026-07-20",
+    highlights: [
+      "If PM ever can't start the file-reader's sandbox, it now shows a short code (like SBX-2104) — and there's a plain-English list of what each code means (ERROR_CODES.md in the project, and Developer mode → Sidecar sandbox in the app). Popping that code into a bug report lets us pinpoint the problem fast. Nothing changes in normal use.",
+    ],
+  },
+  {
     version: "3.33.0-alpha",
     date: "2026-07-20",
     highlights: [

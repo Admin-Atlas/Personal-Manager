@@ -87,6 +87,7 @@ const ALLOWED_ROOT = new Set([
   "AGENTS.md",
   "CLAUDE.md",
   "CONTRIBUTING.md",
+  "ERROR_CODES.md",
   "LICENCE.txt",
   "README.md",
   "RELEASING.md",
