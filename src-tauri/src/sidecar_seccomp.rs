@@ -74,6 +74,13 @@ const AF_PACKET: u32 = 17;
 /// The two 64-bit Linux arches PM ships a desktop build for. Each carries the arch's `AUDIT_ARCH`
 /// value, its `socket` syscall number, and whether it has an x32 compat ABI to guard against — so the
 /// one [`build_block_inet_filter`] emits the correct filter for either, and the tests can drive both.
+///
+/// A cross-ARCHITECTURE registry: both variants are always defined so the pure builder and the cBPF
+/// tests can target x86-64 AND aarch64 regardless of the host, but any single build only ever
+/// constructs its own arch's variant (via [`SeccompArch::current`]). So on each host the other
+/// variant is unused by design — `allow(dead_code)` on the enum, deliberately narrower than a
+/// module-wide allow, so a genuinely-unused method still trips `-D dead_code` on the ubuntu CI job.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SeccompArch {
     X86_64,
