@@ -33,8 +33,15 @@ Ranges: `1xxx` cross-platform · `2xxx` Windows · `3xxx` macOS · `4xxx` Linux.
 | `SBX-2103` | Windows: couldn't grant the worker access to the sidecar-script folder. |
 | `SBX-2104` | Windows: couldn't grant the worker access to the model-cache folder. |
 | `SBX-2105` | Windows: couldn't grant the worker access to the Python / virtual-environment folders. |
+| `SBX-4101` | Linux: couldn't build the Landlock filesystem ruleset on a kernel that supports it. |
+| `SBX-4102` | Linux: no network-blocking filter is available for this CPU architecture. |
+| `SBX-4105` | Linux: **degraded, not failed** — Landlock isn't available (kernel older than 5.13, or its security module is off), so the worker's network is still blocked but its filesystem is *not* restricted. |
+| `SBX-4106` | Linux: the sandboxed worker couldn't load its libraries under the sandbox, so it was re-run unconfined. |
 
-`3xxx` (macOS) and `4xxx` (Linux) codes are added as sandboxing lands on those systems.
+`3xxx` (macOS) codes are added as sandboxing lands on that system.
+
+> On Linux, "confined" means both **Landlock** (filesystem) and **seccomp** (network) are active;
+> `SBX-4105` is the honest middle state where only the network half applies.
 
 ---
 

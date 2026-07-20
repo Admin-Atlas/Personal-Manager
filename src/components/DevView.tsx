@@ -206,14 +206,14 @@ export function DevView() {
           <DevPanel
             title="Sidecar sandbox"
             helpId="dev-sandbox"
-            subtitle="Whether the untrusted-file worker is confined in a no-network OS sandbox. Windows only, for now — it fails open, and any fall-back or degraded state shows here with an SBX-#### code you can quote when reporting a problem."
+            subtitle="Whether the untrusted-file worker is confined in a no-network OS sandbox (Windows AppContainer; Linux Landlock + seccomp) — it fails open, and any fall-back or degraded state shows here with an SBX-#### code you can quote when reporting a problem."
           >
             <div className="flex flex-col">
               <Row label="Confinement" value={sandboxLabel(sandbox)} />
               {sandbox?.state === "confined" && (
                 <>
                   <Row label="Enforces" value={sandbox.layers.join(" + ")} />
-                  <Row label="Container" value={sandbox.container} />
+                  <Row label="Mechanism" value={sandbox.mechanism} />
                   <Row label="Staging dir" value={sandbox.staging_dir} />
                 </>
               )}

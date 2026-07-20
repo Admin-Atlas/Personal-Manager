@@ -442,9 +442,12 @@ pub enum SidecarErrorKind {
 /// `1xxx` cross-platform/setup, `2xxx` Windows AppContainer, `3xxx` macOS sandbox-exec, `4xxx` Linux
 /// Landlock+seccomp. **Never renumber or reuse a shipped code** — they travel in logs and bug reports.
 ///
-/// Only the Windows arm references these in this PR, so the whole set is `allow(dead_code)` off Windows
-/// until the macOS/Linux arms (PR2c/PR2d) add + use their 3xxx/4xxx codes.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// This is the canonical cross-platform registry, so on any single target some codes are inevitably
+/// unused (a Windows build never references the `4xxx` Linux codes, and vice-versa) — `allow(dead_code)`
+/// on the whole module rather than a cfg maze per code. A typo'd code still fails to compile at its
+/// reference site, so this hides only a genuinely-orphaned entry (which stays valid documentation in
+/// ERROR_CODES.md regardless).
+#[allow(dead_code)]
 pub mod sbx {
     // --- 1xxx cross-platform setup (sidecar.rs) ---
     /// The venv directory has no parent `runtime/` dir, so the staging/allow-set can't be anchored.
@@ -472,22 +475,53 @@ pub mod sbx {
     /// Granting the container SID read/execute on the venv / base-python tree failed.
     pub const WIN_TREE_GRANT: &str = "SBX-2105";
 
-    // 3xxx macOS (PR2c) and 4xxx Linux (PR2d) codes are added with their platform arms.
+    // --- 4xxx Linux Landlock + seccomp (sidecar_sandbox_linux.rs) ---
+    /// Building the Landlock filesystem ruleset failed on a kernel that HAS Landlock (a genuine error,
+    /// not merely an old kernel — that path degrades instead).
+    pub const LINUX_LANDLOCK: &str = "SBX-4101";
+    /// The seccomp network filter could not be built (a Linux CPU architecture PM has no filter for).
+    pub const LINUX_SECCOMP: &str = "SBX-4102";
+    /// NOT an error — the readout code for a `Degraded` run: Landlock is unavailable (kernel < 5.13 or
+    /// its LSM is not active), so the worker's network is blocked but its filesystem is not restricted.
+    pub const LINUX_DEGRADED: &str = "SBX-4105";
+    /// The confined worker failed its post-spawn self-test (it could not load its libraries under the
+    /// sandbox), so it was killed and re-run unconfined rather than break ingest.
+    pub const LINUX_PREFLIGHT: &str = "SBX-4106";
+
+    // 3xxx macOS (PR2c) codes are added with that platform arm.
 }
 
 /// A confinement setup/launch failure: a stable [`sbx`] code plus human detail. Formats as
 /// `"[SBX-####] detail"`, and that exact string surfaces in the log line, the Developer-mode readout
 /// ([`SandboxReport::Unconfined`]/[`SandboxReport::Degraded`]), and any user-facing error — so one code
-/// pins the failure across all three. Cheap to construct at every failure site (issue #286). Only the
-/// Windows arm constructs it in this PR, so `allow(dead_code)` off Windows until PR2c/PR2d.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// pins the failure across all three. Cheap to construct at every failure site (issue #286). The
+/// Windows + Linux arms construct it; `allow(dead_code)` only on a build with no worker sandbox.
+#[cfg_attr(
+    not(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )),
+    allow(dead_code)
+)]
 #[derive(Clone, Debug)]
 pub struct SbxError {
     pub code: &'static str,
     pub detail: String,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )),
+    allow(dead_code)
+)]
 impl SbxError {
     pub fn new(code: &'static str, detail: impl std::fmt::Display) -> Self {
         Self {
@@ -516,11 +550,11 @@ pub enum SandboxReport {
     Unsupported,
     /// The worker hasn't been launched yet this session — nothing to report.
     NotSpawned,
-    /// The worker is fully confined. Carries the mechanism name, the staging dir, the exact dirs it can
-    /// read (the confined filesystem view), and which axes are enforced (`layers`, e.g.
-    /// `["network","filesystem"]`).
+    /// The worker is fully confined. Carries the mechanism label (e.g. "Windows AppContainer",
+    /// "Landlock (files) + seccomp (network)"), the staging dir, the exact dirs it can read (the
+    /// confined filesystem view), and which axes are enforced (`layers`, e.g. `["network","filesystem"]`).
     Confined {
-        container: String,
+        mechanism: String,
         staging_dir: String,
         granted_dirs: Vec<String>,
         layers: Vec<String>,
@@ -573,6 +607,17 @@ impl Drop for Process {
     }
 }
 
+// The confining `Sandbox` is a different type per OS (Windows AppContainer vs Linux Landlock+seccomp)
+// but exposes the same `staging_dir()` the shared input-staging path needs; alias it so the manager
+// field and `maybe_stage_input` are written once. macOS (PR2c) will add its own arm.
+#[cfg(windows)]
+use crate::sidecar_sandbox::Sandbox;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use crate::sidecar_sandbox_linux::Sandbox;
+
 pub struct SidecarManager {
     paths: SidecarPaths,
     proc: Mutex<Option<Process>>,
@@ -584,15 +629,28 @@ pub struct SidecarManager {
     /// climbing across respawns — a stale line from a dead child can never match
     /// a fresh request's id.
     req_seq: AtomicU64,
-    /// The Windows AppContainer that confines the worker, set on first successful confined spawn and
-    /// reused for per-request input staging (issue #286). `None` = unconfined (setup failed, or a
-    /// non-Windows platform). Held here so `request` can stage the file a path-bearing call parses.
-    #[cfg(windows)]
-    sandbox: Mutex<Option<crate::sidecar_sandbox::Sandbox>>,
+    /// The OS sandbox that confines the worker (Windows AppContainer / Linux Landlock+seccomp), set on
+    /// first successful confined spawn and reused for per-request input staging (issue #286). `None` =
+    /// unconfined (setup failed, or a platform with no worker sandbox). Held here so `request` can stage
+    /// the file a path-bearing call parses.
+    #[cfg(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    sandbox: Mutex<Option<Sandbox>>,
     /// The last worker-spawn confinement outcome, for the Developer-mode readout (issue #286). Distinct
     /// from `sandbox` (which holds the live handle only while confined): this also records WHY a spawn
     /// fell open, and survives as `NotSpawned` before the first spawn.
-    #[cfg(windows)]
+    #[cfg(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     sandbox_report: Mutex<SandboxReport>,
 }
 
@@ -604,9 +662,21 @@ impl SidecarManager {
             status: Mutex::new(SidecarStatus::NotInstalled),
             install: Mutex::new(()),
             req_seq: AtomicU64::new(0),
-            #[cfg(windows)]
+            #[cfg(any(
+                windows,
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            ))]
             sandbox: Mutex::new(None),
-            #[cfg(windows)]
+            #[cfg(any(
+                windows,
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            ))]
             sandbox_report: Mutex::new(SandboxReport::NotSpawned),
         };
         // Boot status asks the SAME question every other readiness check asks — is the marker
@@ -627,14 +697,26 @@ impl SidecarManager {
     }
 
     /// The worker's confinement state, for the Developer-mode readout (issue #286). Reflects the LAST
-    /// spawn this session (`NotSpawned` before the first). Always `Unsupported` off Windows, which has
-    /// no worker confinement yet — the readout tells the maintainer that plainly instead of implying a
-    /// hole.
-    #[cfg(windows)]
+    /// spawn this session (`NotSpawned` before the first). `Unsupported` on a platform (or Linux CPU
+    /// arch) with no worker confinement yet — the readout tells the maintainer that plainly instead of
+    /// implying a hole.
+    #[cfg(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     pub fn sandbox_report(&self) -> SandboxReport {
         self.sandbox_report.lock().unwrap().clone()
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
     pub fn sandbox_report(&self) -> SandboxReport {
         SandboxReport::Unsupported
     }
@@ -1427,17 +1509,29 @@ impl SidecarManager {
         // deleted mid-flight. Staged exactly once, and only AFTER the worker is spawned below — because
         // the request that triggers the first confined spawn only sets `self.sandbox` inside `spawn`,
         // so staging before it would hand the confined worker the un-granted original path (issue #286).
-        #[cfg(windows)]
+        #[cfg(any(
+            windows,
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        ))]
         let mut staged: Option<crate::sidecar_stage::StagedInput> = None;
 
         loop {
             if guard.is_none() {
                 *guard = Some(self.spawn()?);
             }
-            // Stage the file this call parses into the container-readable dir and point the request at
+            // Stage the file this call parses into the sandbox-readable dir and point the request at
             // the staged copy (no-op for non-path methods and the unconfined worker). After the spawn
             // above so `self.sandbox` reflects confinement; once, so a retry reuses the same copy.
-            #[cfg(windows)]
+            #[cfg(any(
+                windows,
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            ))]
             if staged.is_none() {
                 staged = self.maybe_stage_input(&mut req);
             }
@@ -1517,7 +1611,18 @@ impl SidecarManager {
             return Ok(proc);
         }
 
-        // The ordinary, unconfined child (every non-Windows platform, and the Windows fallback). The
+        // Linux: the same fall-open contract, via Landlock (filesystem) + seccomp (network) self-imposed
+        // in the child's pre_exec. The confined worker is an ordinary child, and it must survive a
+        // post-spawn self-test (it can load its libraries under the sandbox) or we fall open here too.
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if let Some(proc) = self.try_spawn_confined_linux(&py, &script, &envs)? {
+            return Ok(proc);
+        }
+
+        // The ordinary, unconfined child (every non-confined platform, and the confined fall-open). The
         // offline posture comes from the SAME `worker_env` list the confined path uses, so the two can
         // never drift — a stray offline flag missing from one would be a silent hole.
         let mut command = Command::new(&py);
@@ -1590,7 +1695,6 @@ impl SidecarManager {
         script: &Path,
         envs: &[(String, String)],
     ) -> Result<Option<Process>> {
-        use crate::sidecar_sandbox::Sandbox;
         let venv_dir = &self.paths.venv_dir;
         let Some(runtime) = venv_dir.parent().map(|p| p.to_path_buf()) else {
             return self.fall_open(SbxError::new(
@@ -1629,7 +1733,7 @@ impl SidecarManager {
         // Record the confined view for the Developer-mode readout BEFORE the sandbox moves into the
         // staging slot below. The AppContainer enforces both axes (no sockets + ACL read-set).
         *self.sandbox_report.lock().unwrap() = SandboxReport::Confined {
-            container: sandbox.container_name().to_string(),
+            mechanism: sandbox.mechanism().to_string(),
             staging_dir: sandbox.staging_dir().display().to_string(),
             granted_dirs: sandbox.granted_dirs(),
             layers: vec!["network".to_string(), "filesystem".to_string()],
@@ -1644,10 +1748,21 @@ impl SidecarManager {
 
     /// Record a fall-open: log the coded reason, stamp the Developer-mode readout, and return `Ok(None)`
     /// so the caller runs the worker unconfined (issue #286). The log line keeps "running unconfined" as
-    /// the stable grep tell AND carries the `[SBX-####]` code so a tester/user can quote it.
-    #[cfg(windows)]
+    /// the stable grep tell AND carries the `[SBX-####]` code so a tester/user can quote it. Shared by
+    /// the Windows and Linux confinement paths.
+    #[cfg(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn fall_open(&self, err: SbxError) -> Result<Option<Process>> {
         eprintln!("sidecar sandbox: running unconfined — {err}");
+        // Clear any Sandbox from an earlier confined spawn: after a fall-open the next worker runs
+        // unconfined, so `maybe_stage_input` must NOT keep staging inputs (which would rewrite the path
+        // to a copy and leave the readout — now Unconfined — disagreeing with a still-present handle).
+        *self.sandbox.lock().unwrap() = None;
         *self.sandbox_report.lock().unwrap() = SandboxReport::Unconfined {
             code: err.code.to_string(),
             detail: err.detail,
@@ -1656,10 +1771,17 @@ impl SidecarManager {
     }
 
     /// When the worker is confined, copy the file a path-bearing request parses into the
-    /// container-readable staging dir and rewrite `params.path` to it — so the confined worker sees ONLY
+    /// sandbox-readable staging dir and rewrite `params.path` to it — so the confined worker sees ONLY
     /// that one file, never the user's real tree or the vault. The returned guard deletes the staged
     /// copy when the request finishes. No-op (returns `None`) when unconfined or the request has no path.
-    #[cfg(windows)]
+    /// Shared by the Windows and Linux confinement paths (both stage into a granted dir).
+    #[cfg(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn maybe_stage_input(&self, req: &mut Value) -> Option<crate::sidecar_stage::StagedInput> {
         let guard = self.sandbox.lock().unwrap();
         let sandbox = guard.as_ref()?;
@@ -1678,6 +1800,139 @@ impl SidecarManager {
                 );
                 None
             }
+        }
+    }
+
+    /// Try to launch the worker confined with Landlock (filesystem) + seccomp (network), self-imposed in
+    /// the child's `pre_exec` (issue #286 PR2d). Returns `Ok(None)` — caller runs it unconfined — if the
+    /// sandbox can't be set up, the confined launch fails, OR the confined worker fails its self-test
+    /// (it couldn't load its libraries under the sandbox). On success the [`Sandbox`] is stashed on the
+    /// manager for per-request input staging, exactly like the Windows path.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn try_spawn_confined_linux(
+        &self,
+        py: &Path,
+        script: &Path,
+        envs: &[(String, String)],
+    ) -> Result<Option<Process>> {
+        let venv_dir = &self.paths.venv_dir;
+        let Some(runtime) = venv_dir.parent().map(|p| p.to_path_buf()) else {
+            return self.fall_open(SbxError::new(
+                sbx::NO_RUNTIME_DIR,
+                "the venv has no parent runtime dir",
+            ));
+        };
+        let Some(models) = self.paths.models_dir() else {
+            return self.fall_open(SbxError::new(
+                sbx::NO_MODELS_DIR,
+                "the models dir could not be resolved",
+            ));
+        };
+        let Some(base) = base_python_dir(venv_dir) else {
+            return self.fall_open(SbxError::new(
+                sbx::NO_BASE_PYTHON,
+                "base python unresolved from pyvenv.cfg",
+            ));
+        };
+        let sandbox =
+            match Sandbox::ensure(venv_dir, &base, &models, &self.paths.source_dir, &runtime) {
+                Ok(s) => s,
+                Err(e) => return self.fall_open(e),
+            };
+
+        // Build the confined worker command: same stdio/env/offline posture as the unconfined child,
+        // plus TMPDIR pointed at the (Landlock-granted) staging dir so `tempfile` doesn't hit the
+        // ungranted system /tmp, and no .pyc writes into the read-only interpreter trees. `install_into`
+        // sets the cwd to staging and installs the pre_exec confinement hook.
+        let mut command = Command::new(py);
+        command
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        for (k, v) in envs {
+            command.env(k, v);
+        }
+        command.env("TMPDIR", sandbox.staging_dir());
+        command.env("PYTHONDONTWRITEBYTECODE", "1");
+        for k in PYTHON_ENV_REMOVES {
+            command.env_remove(k);
+        }
+        no_window(&mut command);
+        sandbox.install_into(&mut command);
+
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            // A pre_exec confinement syscall failing surfaces here as a spawn error — fall open rather
+            // than break ingest (the preflight below would also have caught a booted-but-broken worker).
+            Err(e) => return self.fall_open(SbxError::new(sbx::CONFINED_SPAWN, e)),
+        };
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut proc = Process {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            control: Box::new(StdChild(child)),
+        };
+
+        // Preflight: prove the confined worker can boot AND load its native libraries before we commit
+        // to it. If the Landlock allow-set is missing something the interpreter/onnxruntime needs, this
+        // is where it surfaces as a clean, coded fall-open instead of every later request failing.
+        if let Err(e) = self.linux_preflight(&mut proc) {
+            drop(proc); // kills the confined worker
+            return self.fall_open(SbxError::new(sbx::LINUX_PREFLIGHT, e));
+        }
+
+        // Kept it. Stamp the readout (honestly Degraded when Landlock was unavailable) and stash the
+        // sandbox for per-request staging.
+        let report = match sandbox.degraded() {
+            Some((code, detail)) => SandboxReport::Degraded {
+                layers: sandbox.layers(),
+                code: code.to_string(),
+                detail,
+            },
+            None => SandboxReport::Confined {
+                mechanism: sandbox.mechanism().to_string(),
+                staging_dir: sandbox.staging_dir().display().to_string(),
+                granted_dirs: sandbox.granted_dirs(),
+                layers: sandbox.layers(),
+            },
+        };
+        *self.sandbox_report.lock().unwrap() = report;
+        *self.sandbox.lock().unwrap() = Some(sandbox);
+        Ok(Some(proc))
+    }
+
+    /// One `worker_selftest` round-trip against the freshly-spawned confined worker (issue #286). Proves
+    /// it can boot AND load its native libraries (onnxruntime's `.so`, which the lazy imports a plain
+    /// `ping` wouldn't touch) under the sandbox. Any failure — a dead worker, a timeout, or a non-ok
+    /// reply — means the confinement broke the worker, so the caller falls open.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn linux_preflight(&self, proc: &mut Process) -> Result<()> {
+        let id = self.req_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let line =
+            serde_json::to_string(&json!({ "id": id, "method": "worker_selftest", "params": {} }))
+                .map_err(|e| Error::Other(format!("encode selftest: {e}")))?;
+        proc.stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| proc.stdin.write_all(b"\n"))
+            .and_then(|()| proc.stdin.flush())
+            .map_err(|e| Error::Other(format!("selftest write: {e}")))?;
+        let reply = read_reply_with_timeout(proc, id, SELFTEST_TIMEOUT)
+            .map_err(|e| Error::Other(format!("no selftest reply: {e}")))?;
+        if reply["ok"].as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(Error::Other(format!(
+                "worker_selftest failed under confinement: {}",
+                reply["error"].as_str().unwrap_or("unknown")
+            )))
         }
     }
 
@@ -1883,6 +2138,16 @@ fn read_reply_with_timeout(
 /// worker's own download-bearing grace (`request_timeout` for embed/rerank/transcribe) so the fetch
 /// path is no more likely to time out than the inline first-use download it replaces.
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Deadline for the confined Linux worker's one-shot self-test (issue #286 PR2d). Generous: a cold
+/// `import onnxruntime` (its native `.so` load + CPU-feature probing) can take several seconds on a
+/// slow disk; if it hasn't answered by now the confinement has almost certainly broken the worker, so
+/// we fall open.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SELFTEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether a sidecar reply is the offline worker signalling a model isn't downloaded yet (as opposed
 /// to a genuine failure) — the trigger for a fetch-and-retry (issue #286). Pure, so it unit-tests the
@@ -2155,9 +2420,17 @@ impl ChildControl for crate::sidecar_sandbox::ConfinedChild {
 }
 
 /// The base interpreter a venv was built from, read from its `pyvenv.cfg` `home =` line (stripping the
-/// `\\?\` long-path prefix). The confined worker needs read/execute on this tree as well as the venv,
-/// because the venv's `python.exe` is only a thin launcher that defers to it.
-#[cfg(windows)]
+/// `\\?\` long-path prefix, a Windows-only nicety that's a harmless no-op elsewhere). The confined
+/// worker needs read/execute on this tree as well as the venv, because the venv's python is only a thin
+/// launcher that defers to it. On Windows `home` is the interpreter dir; on Linux it's the `bin` dir,
+/// and the Linux sandbox grants its parent (the install root) so `lib/pythonX.Y` is reachable.
+#[cfg(any(
+    windows,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn base_python_dir(venv_dir: &Path) -> Option<PathBuf> {
     let cfg = std::fs::read_to_string(venv_dir.join("pyvenv.cfg")).ok()?;
     for line in cfg.lines() {
@@ -2402,6 +2675,113 @@ mod tests {
         // ping confirms the worker is still alive over its pipes after the convert.
         let pong = mgr.request("ping", json!({})).expect("ping");
         assert_eq!(pong["ok"], serde_json::Value::Bool(true), "ping");
+    }
+
+    /// End-to-end smoke test of the Linux Landlock + seccomp confinement (issue #286 PR2d): spawn the
+    /// REAL worker confined, convert a text file through the staging path, then PROVE both enforcement
+    /// axes on the live worker — seccomp refuses an outbound socket, and Landlock refuses reading a path
+    /// outside the allow-set. `#[ignore]` + a `PM_SANDBOX_SMOKE_VENV` env because it needs the live venv
+    /// and a Landlock-capable kernel (≥ 5.13). This is the enforcement check the Windows dev box cannot
+    /// run and CI (compile/lint/unit only) does not — run it on a real Linux box:
+    ///   PM_SANDBOX_SMOKE_VENV=~/.local/share/pm/runtime/venv \
+    ///     cargo test --manifest-path src-tauri/Cargo.toml --ignored confined_worker_smoke_linux -- --nocapture
+    #[test]
+    #[ignore = "linux-only, needs the live venv + a Landlock kernel; validates real enforcement"]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn confined_worker_smoke_linux() {
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("sidecar");
+        // No hardcoded path in a public repo: point PM_SANDBOX_SMOKE_VENV at your installed venv dir
+        // (…/runtime/venv). Unset → skip.
+        let venv_dir = match std::env::var("PM_SANDBOX_SMOKE_VENV") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("skipping: set PM_SANDBOX_SMOKE_VENV to the venv dir to run this");
+                return;
+            }
+        };
+        assert!(
+            venv_dir.join("bin/python").exists(),
+            "no venv at {venv_dir:?}"
+        );
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir,
+            venv_dir,
+        });
+
+        // First call is a convert (path-bearing) with NO prior ping — the SAME request triggers the
+        // first confined spawn, so the input must be staged AFTER that spawn (the staging-order
+        // regression the Windows test also guards).
+        let tmp = std::env::temp_dir().join("pm_confined_smoke_linux.txt");
+        std::fs::write(&tmp, "hello from a confined linux worker").unwrap();
+        let (markdown, _title) = mgr.convert(&tmp).expect("confined convert (first request)");
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            markdown.contains("hello from a confined linux worker"),
+            "convert output: {markdown:?}"
+        );
+
+        // The sandbox handle is set, and (on a Landlock kernel) the readout enforces both axes.
+        assert!(
+            mgr.sandbox.lock().unwrap().is_some(),
+            "worker should be confined — the sandbox was not set up"
+        );
+        let landlocked = match mgr.sandbox_report() {
+            SandboxReport::Confined { ref layers, .. } => {
+                assert!(layers.iter().any(|l| l == "network"), "network: {layers:?}");
+                assert!(
+                    layers.iter().any(|l| l == "filesystem"),
+                    "filesystem layer should be enforced on a Landlock kernel: {layers:?}"
+                );
+                true
+            }
+            SandboxReport::Degraded { ref code, .. } => {
+                eprintln!(
+                    "NOTE: running Degraded ({code}) — Landlock unavailable on this kernel; the \
+                     seccomp/network assertion still applies, the filesystem one is skipped"
+                );
+                false
+            }
+            other => panic!(
+                "expected confined/degraded, got a fall-open: {}",
+                serde_json::to_value(&other).unwrap()
+            ),
+        };
+
+        // Network: a debug test build sets PM_SIDECAR_DEV=1, so net_selftest is unlocked. The confined
+        // worker's outbound socket must be refused by seccomp.
+        let net = mgr.net_selftest().expect("net_selftest");
+        assert_eq!(
+            net["blocked"],
+            serde_json::Value::Bool(true),
+            "seccomp should refuse the socket: {net:?}"
+        );
+
+        // Filesystem (only meaningful when Landlock is active): a path OUTSIDE the allow-set — a file in
+        // the system temp dir, which is not granted — must be refused with EACCES. The path rides in
+        // `probe_path`, not `path`, so it bypasses the staging that would otherwise copy it into the
+        // granted dir and defeat the probe.
+        if landlocked {
+            let outside = std::env::temp_dir().join("pm_fs_probe_target.txt");
+            std::fs::write(&outside, b"not for the worker").unwrap();
+            let probe = mgr
+                .request(
+                    "fs_probe",
+                    json!({ "probe_path": outside.to_string_lossy() }),
+                )
+                .expect("fs_probe");
+            std::fs::remove_file(&outside).ok();
+            assert_eq!(
+                probe["denied"],
+                serde_json::Value::Bool(true),
+                "Landlock should deny reading an ungranted path: {probe:?}"
+            );
+        }
     }
 
     /// The OCR marker string must be exactly the pins joined by ';' — the installer writes the marker

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.34.0-alpha",
+    date: "2026-07-20",
+    highlights: [
+      "The file-reader's protective sandbox now covers Linux too: the helper that opens your files runs with no way to reach the internet and can only see the handful of folders it actually needs — not your vault, not the rest of your home directory — the same wall Windows already had. On older Linux kernels that lack the newer 'Landlock' feature, the network is still blocked and PM says so honestly rather than pretending. As always it's an extra layer, not a gate: if the sandbox can't fully start, PM keeps working and reports a short code (like SBX-4105) you can quote in a bug report. Nothing changes in day-to-day use — macOS gets the same treatment next.",
+    ],
+  },
+  {
     version: "3.33.1-alpha",
     date: "2026-07-20",
     highlights: [

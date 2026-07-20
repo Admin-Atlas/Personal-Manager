@@ -157,9 +157,11 @@ impl Sandbox {
         &self.staging_dir
     }
 
-    /// The stable AppContainer name, for the Developer-mode readout.
-    pub fn container_name(&self) -> &'static str {
-        CONTAINER_NAME
+    /// The confinement mechanism label, for the Developer-mode readout (parallels the Linux arm's
+    /// `mechanism()`). The specific AppContainer identity is [`CONTAINER_NAME`]; the readout shows the
+    /// human label plus the granted dirs.
+    pub fn mechanism(&self) -> &'static str {
+        "Windows AppContainer (no network)"
     }
 
     /// The dirs the container SID is granted (for the Developer-mode readout only — see [`Sandbox`]).
