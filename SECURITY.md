@@ -60,6 +60,9 @@ Please include:
 - **Steps to reproduce** (a proof of concept if you have one).
 - The **affected version** (see Settings → What's New, or the title bar).
 - The **impact** as you understand it — what an attacker could do.
+- Any **diagnostic code** PM showed (e.g. `SBX-2104`) and, for a sidecar-sandbox
+  concern, the **Developer mode → Sidecar sandbox** readout. See
+  [`ERROR_CODES.md`](ERROR_CODES.md) for what the codes mean.
 
 What to expect:
 
