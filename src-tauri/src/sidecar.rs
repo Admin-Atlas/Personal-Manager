@@ -488,7 +488,13 @@ pub mod sbx {
     /// sandbox), so it was killed and re-run unconfined rather than break ingest.
     pub const LINUX_PREFLIGHT: &str = "SBX-4106";
 
-    // 3xxx macOS (PR2c) codes are added with that platform arm.
+    // --- 3xxx macOS sandbox-exec (sidecar_sandbox_macos.rs) ---
+    /// `/usr/bin/sandbox-exec` is not present, so the worker can't be confined (it runs unconfined).
+    /// Essentially unreachable on a shipping macOS — the binary is deprecated but always installed.
+    pub const MAC_SANDBOX_EXEC: &str = "SBX-3101";
+    /// The confined worker failed its post-spawn self-test (it could not load its libraries or read its
+    /// model cache under the profile), so it was killed and re-run unconfined rather than break ingest.
+    pub const MAC_PREFLIGHT: &str = "SBX-3106";
 }
 
 /// A confinement setup/launch failure: a stable [`sbx`] code plus human detail. Formats as
@@ -499,6 +505,7 @@ pub mod sbx {
 #[cfg_attr(
     not(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -515,6 +522,7 @@ pub struct SbxError {
 #[cfg_attr(
     not(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -607,9 +615,9 @@ impl Drop for Process {
     }
 }
 
-// The confining `Sandbox` is a different type per OS (Windows AppContainer vs Linux Landlock+seccomp)
-// but exposes the same `staging_dir()` the shared input-staging path needs; alias it so the manager
-// field and `maybe_stage_input` are written once. macOS (PR2c) will add its own arm.
+// The confining `Sandbox` is a different type per OS (Windows AppContainer / Linux Landlock+seccomp /
+// macOS sandbox-exec) but each exposes the same `staging_dir()` the shared input-staging path needs;
+// alias it so the manager field and `maybe_stage_input` are written once.
 #[cfg(windows)]
 use crate::sidecar_sandbox::Sandbox;
 #[cfg(all(
@@ -617,6 +625,8 @@ use crate::sidecar_sandbox::Sandbox;
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 use crate::sidecar_sandbox_linux::Sandbox;
+#[cfg(target_os = "macos")]
+use crate::sidecar_sandbox_macos::Sandbox;
 
 pub struct SidecarManager {
     paths: SidecarPaths,
@@ -635,6 +645,7 @@ pub struct SidecarManager {
     /// the file a path-bearing call parses.
     #[cfg(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -646,6 +657,7 @@ pub struct SidecarManager {
     /// fell open, and survives as `NotSpawned` before the first spawn.
     #[cfg(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -664,6 +676,7 @@ impl SidecarManager {
             req_seq: AtomicU64::new(0),
             #[cfg(any(
                 windows,
+                target_os = "macos",
                 all(
                     target_os = "linux",
                     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -672,6 +685,7 @@ impl SidecarManager {
             sandbox: Mutex::new(None),
             #[cfg(any(
                 windows,
+                target_os = "macos",
                 all(
                     target_os = "linux",
                     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -702,6 +716,7 @@ impl SidecarManager {
     /// implying a hole.
     #[cfg(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -712,6 +727,7 @@ impl SidecarManager {
     }
     #[cfg(not(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -1511,6 +1527,7 @@ impl SidecarManager {
         // so staging before it would hand the confined worker the un-granted original path (issue #286).
         #[cfg(any(
             windows,
+            target_os = "macos",
             all(
                 target_os = "linux",
                 any(target_arch = "x86_64", target_arch = "aarch64")
@@ -1527,6 +1544,7 @@ impl SidecarManager {
             // above so `self.sandbox` reflects confinement; once, so a retry reuses the same copy.
             #[cfg(any(
                 windows,
+                target_os = "macos",
                 all(
                     target_os = "linux",
                     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -1619,6 +1637,14 @@ impl SidecarManager {
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         if let Some(proc) = self.try_spawn_confined_linux(&py, &script, &envs)? {
+            return Ok(proc);
+        }
+
+        // macOS: the same fall-open contract, via `sandbox-exec` applying a `(deny default)` Seatbelt
+        // profile (no network, restricted filesystem). Like Linux, the confined worker is an ordinary
+        // child and must survive a post-spawn self-test or we fall open here too.
+        #[cfg(target_os = "macos")]
+        if let Some(proc) = self.try_spawn_confined_macos(&py, &script, &envs)? {
             return Ok(proc);
         }
 
@@ -1749,9 +1775,10 @@ impl SidecarManager {
     /// Record a fall-open: log the coded reason, stamp the Developer-mode readout, and return `Ok(None)`
     /// so the caller runs the worker unconfined (issue #286). The log line keeps "running unconfined" as
     /// the stable grep tell AND carries the `[SBX-####]` code so a tester/user can quote it. Shared by
-    /// the Windows and Linux confinement paths.
+    /// the Windows, Linux, and macOS confinement paths.
     #[cfg(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -1774,9 +1801,10 @@ impl SidecarManager {
     /// sandbox-readable staging dir and rewrite `params.path` to it — so the confined worker sees ONLY
     /// that one file, never the user's real tree or the vault. The returned guard deletes the staged
     /// copy when the request finishes. No-op (returns `None`) when unconfined or the request has no path.
-    /// Shared by the Windows and Linux confinement paths (both stage into a granted dir).
+    /// Shared by the Windows, Linux, and macOS confinement paths (all stage into a granted dir).
     #[cfg(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -1881,7 +1909,7 @@ impl SidecarManager {
         // Preflight: prove the confined worker can boot AND load its native libraries before we commit
         // to it. If the Landlock allow-set is missing something the interpreter/onnxruntime needs, this
         // is where it surfaces as a clean, coded fall-open instead of every later request failing.
-        if let Err(e) = self.linux_preflight(&mut proc) {
+        if let Err(e) = self.confined_preflight(&mut proc) {
             drop(proc); // kills the confined worker
             return self.fall_open(SbxError::new(sbx::LINUX_PREFLIGHT, e));
         }
@@ -1906,15 +1934,120 @@ impl SidecarManager {
         Ok(Some(proc))
     }
 
+    /// Try to launch the worker confined by `sandbox-exec` applying a `(deny default)` Seatbelt profile
+    /// — no network, restricted filesystem (issue #286 PR2c). Returns `Ok(None)` — caller runs it
+    /// unconfined — if the sandbox can't be set up, the confined launch fails, OR the confined worker
+    /// fails its self-test. On success the [`Sandbox`] is stashed on the manager for per-request input
+    /// staging, exactly like the Windows and Linux paths.
+    #[cfg(target_os = "macos")]
+    fn try_spawn_confined_macos(
+        &self,
+        py: &Path,
+        script: &Path,
+        envs: &[(String, String)],
+    ) -> Result<Option<Process>> {
+        let venv_dir = &self.paths.venv_dir;
+        let Some(runtime) = venv_dir.parent().map(|p| p.to_path_buf()) else {
+            return self.fall_open(SbxError::new(
+                sbx::NO_RUNTIME_DIR,
+                "the venv has no parent runtime dir",
+            ));
+        };
+        let Some(models) = self.paths.models_dir() else {
+            return self.fall_open(SbxError::new(
+                sbx::NO_MODELS_DIR,
+                "the models dir could not be resolved",
+            ));
+        };
+        let Some(base) = base_python_dir(venv_dir) else {
+            return self.fall_open(SbxError::new(
+                sbx::NO_BASE_PYTHON,
+                "base python unresolved from pyvenv.cfg",
+            ));
+        };
+        let sandbox =
+            match Sandbox::ensure(venv_dir, &base, &models, &self.paths.source_dir, &runtime) {
+                Ok(s) => s,
+                Err(e) => return self.fall_open(e),
+            };
+
+        // Build the confined worker command: `sandbox-exec -p <profile> -D… -- <py> <script>` (the
+        // Sandbox owns the wrapping) with the same stdio/env/offline posture as the unconfined child,
+        // plus TMPDIR pointed at the (profile-granted) staging dir, no .pyc writes into the read-only
+        // interpreter trees, and HOME set to staging so getpwuid() never fires (keeping the
+        // opendirectoryd mach-lookup off the boot path).
+        let mut command = sandbox.wrap_command(py, script);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        for (k, v) in envs {
+            command.env(k, v);
+        }
+        command.env("TMPDIR", sandbox.staging_dir());
+        command.env("PYTHONDONTWRITEBYTECODE", "1");
+        command.env("HOME", sandbox.staging_dir());
+        for k in PYTHON_ENV_REMOVES {
+            command.env_remove(k);
+        }
+        no_window(&mut command);
+
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            // sandbox-exec rejecting the profile, or the pre_exec fd-sweep failing, surfaces here — fall
+            // open rather than break ingest (the preflight below would also catch a broken worker).
+            Err(e) => return self.fall_open(SbxError::new(sbx::CONFINED_SPAWN, e)),
+        };
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut proc = Process {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            control: Box::new(StdChild(child)),
+        };
+
+        // Preflight: prove the confined worker can boot, load its native libraries, AND read its model
+        // cache before committing to it. A profile missing something surfaces here as a clean, coded
+        // fall-open instead of every later request failing.
+        if let Err(e) = self.confined_preflight(&mut proc) {
+            drop(proc); // kills the confined worker
+            return self.fall_open(SbxError::new(sbx::MAC_PREFLIGHT, e));
+        }
+
+        // Kept it. macOS confinement is all-or-nothing, so `degraded()` is always `None` here (this
+        // stays a full Confined stamp); the match mirrors the Linux arm for one shared shape and so the
+        // Degraded path is already wired if macOS ever gains a partial mode.
+        let report = match sandbox.degraded() {
+            Some((code, detail)) => SandboxReport::Degraded {
+                layers: sandbox.layers(),
+                code: code.to_string(),
+                detail,
+            },
+            None => SandboxReport::Confined {
+                mechanism: sandbox.mechanism().to_string(),
+                staging_dir: sandbox.staging_dir().display().to_string(),
+                granted_dirs: sandbox.granted_dirs(),
+                layers: sandbox.layers(),
+            },
+        };
+        *self.sandbox_report.lock().unwrap() = report;
+        *self.sandbox.lock().unwrap() = Some(sandbox);
+        Ok(Some(proc))
+    }
+
     /// One `worker_selftest` round-trip against the freshly-spawned confined worker (issue #286). Proves
-    /// it can boot AND load its native libraries (onnxruntime's `.so`, which the lazy imports a plain
-    /// `ping` wouldn't touch) under the sandbox. Any failure — a dead worker, a timeout, or a non-ok
-    /// reply — means the confinement broke the worker, so the caller falls open.
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    /// it can boot, load its native libraries (onnxruntime's `.so`/`.dylib`, which the lazy imports a
+    /// plain `ping` wouldn't touch), and read its model cache under the sandbox. Any failure — a dead
+    /// worker, a timeout, or a non-ok reply — means the confinement broke the worker, so the caller
+    /// falls open. Shared by the Linux and macOS arms (Windows proves confinement a different way).
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
-    fn linux_preflight(&self, proc: &mut Process) -> Result<()> {
+    fn confined_preflight(&self, proc: &mut Process) -> Result<()> {
         let id = self.req_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let line =
             serde_json::to_string(&json!({ "id": id, "method": "worker_selftest", "params": {} }))
@@ -2422,10 +2555,11 @@ impl ChildControl for crate::sidecar_sandbox::ConfinedChild {
 /// The base interpreter a venv was built from, read from its `pyvenv.cfg` `home =` line (stripping the
 /// `\\?\` long-path prefix, a Windows-only nicety that's a harmless no-op elsewhere). The confined
 /// worker needs read/execute on this tree as well as the venv, because the venv's python is only a thin
-/// launcher that defers to it. On Windows `home` is the interpreter dir; on Linux it's the `bin` dir,
-/// and the Linux sandbox grants its parent (the install root) so `lib/pythonX.Y` is reachable.
+/// launcher that defers to it. On Windows `home` is the interpreter dir; on Linux and macOS it's the
+/// `bin` dir, and those sandboxes grant its parent (the install root) so `lib/pythonX.Y` is reachable.
 #[cfg(any(
     windows,
+    target_os = "macos",
     all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -2782,6 +2916,106 @@ mod tests {
                 "Landlock should deny reading an ungranted path: {probe:?}"
             );
         }
+    }
+
+    /// End-to-end smoke test of the macOS `sandbox-exec` confinement (issue #286 PR2c): spawn the REAL
+    /// worker confined, convert a text file through the staging path, then PROVE enforcement on the live
+    /// worker — the Seatbelt profile refuses BOTH a direct outbound socket AND out-of-process DNS
+    /// resolution (the mach-lookup-to-mDNSResponder exfil path, finding #1), and refuses reading a file
+    /// outside the allow-set. `#[ignore]` + a `PM_SANDBOX_SMOKE_VENV` env because it needs the live venv
+    /// on a real Mac. This is the enforcement check neither the Windows dev box nor any CI job can run
+    /// (the macOS arm only compiles on `macos-latest` CI and only ENFORCES on a real Mac):
+    ///   PM_SANDBOX_SMOKE_VENV=~/Library/Application\ Support/pm/runtime/venv \
+    ///     cargo test --manifest-path src-tauri/Cargo.toml --ignored confined_worker_smoke_macos -- --nocapture
+    #[test]
+    #[ignore = "macOS-only, needs the live venv; validates real sandbox-exec enforcement"]
+    #[cfg(target_os = "macos")]
+    fn confined_worker_smoke_macos() {
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("sidecar");
+        // No hardcoded path in a public repo: point PM_SANDBOX_SMOKE_VENV at your installed venv dir
+        // (…/runtime/venv). Unset → skip.
+        let venv_dir = match std::env::var("PM_SANDBOX_SMOKE_VENV") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!("skipping: set PM_SANDBOX_SMOKE_VENV to the venv dir to run this");
+                return;
+            }
+        };
+        assert!(
+            venv_dir.join("bin/python").exists(),
+            "no venv at {venv_dir:?}"
+        );
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir,
+            venv_dir,
+        });
+
+        // First call is a convert (path-bearing) with NO prior ping — the SAME request triggers the
+        // first confined spawn, so the input must be staged AFTER that spawn (the staging-order
+        // regression the Windows/Linux tests also guard).
+        let tmp = std::env::temp_dir().join("pm_confined_smoke_macos.txt");
+        std::fs::write(&tmp, "hello from a confined macos worker").unwrap();
+        let (markdown, _title) = mgr.convert(&tmp).expect("confined convert (first request)");
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            markdown.contains("hello from a confined macos worker"),
+            "convert output: {markdown:?}"
+        );
+
+        // The sandbox handle is set and the readout enforces both axes (macOS is never Degraded).
+        assert!(
+            mgr.sandbox.lock().unwrap().is_some(),
+            "worker should be confined — the sandbox was not set up"
+        );
+        match mgr.sandbox_report() {
+            SandboxReport::Confined { ref layers, .. } => {
+                assert!(layers.iter().any(|l| l == "network"), "network: {layers:?}");
+                assert!(
+                    layers.iter().any(|l| l == "filesystem"),
+                    "filesystem: {layers:?}"
+                );
+            }
+            other => panic!(
+                "expected fully Confined on macOS, got: {}",
+                serde_json::to_value(&other).unwrap()
+            ),
+        }
+
+        // Network: a debug test build sets PM_SIDECAR_DEV=1, so net_selftest is unlocked. The confined
+        // worker's DIRECT outbound socket must be refused, AND out-of-process DNS resolution must be
+        // refused too (no mach-lookup to mDNSResponder) — the macOS-specific exfil path, finding #1.
+        let net = mgr.net_selftest().expect("net_selftest");
+        assert_eq!(
+            net["blocked"],
+            serde_json::Value::Bool(true),
+            "the profile should refuse the socket: {net:?}"
+        );
+        assert_eq!(
+            net["dns_blocked"],
+            serde_json::Value::Bool(true),
+            "the profile should refuse out-of-process DNS resolution: {net:?}"
+        );
+
+        // Filesystem: a path OUTSIDE the allow-set — a file in the system temp dir, which is not granted
+        // — must be refused. The path rides in `probe_path`, not `path`, so it bypasses the staging that
+        // would otherwise copy it into the granted dir and defeat the probe.
+        let outside = std::env::temp_dir().join("pm_fs_probe_target_macos.txt");
+        std::fs::write(&outside, b"not for the worker").unwrap();
+        let probe = mgr
+            .request(
+                "fs_probe",
+                json!({ "probe_path": outside.to_string_lossy() }),
+            )
+            .expect("fs_probe");
+        std::fs::remove_file(&outside).ok();
+        assert_eq!(
+            probe["denied"],
+            serde_json::Value::Bool(true),
+            "the profile should deny reading an ungranted path: {probe:?}"
+        );
     }
 
     /// The OCR marker string must be exactly the pins joined by ';' — the installer writes the marker

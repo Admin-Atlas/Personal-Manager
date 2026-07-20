@@ -990,19 +990,27 @@ def do_reduce(params):
 
 
 def do_net_selftest(_params):
-    """Dev-only network-block probe (issue #286): attempt ONE outbound TCP socket and report
-    whether the OS refused it. Confined (Windows AppContainer), the connect is denied with
-    WSAEACCES before a packet leaves; unconfined it is allowed out and times out against the
-    unrouted target. That target is TEST-NET-1 (192.0.2.1, RFC 5737 — reserved, routes nowhere),
-    so an unconfined attempt is egress-safe. Registered ONLY when PM_SIDECAR_DEV=1, which only a
-    debug build sets, so a release worker has no reachable socket path here at all."""
+    """Dev-only network-block probe (issue #286): report whether the OS refused (1) a direct
+    outbound TCP socket and (2) out-of-process DNS resolution.
+
+    The socket probe targets TEST-NET-1 (192.0.2.1, RFC 5737 — reserved, routes nowhere), so an
+    unconfined attempt is egress-safe; confined it is refused (Windows AppContainer → WSAEACCES;
+    Linux seccomp → EACCES; macOS `(deny default)` → the socket is denied) before a packet leaves.
+
+    The DNS probe is the macOS-specific gate (finding #1): hostname resolution on macOS goes to the
+    mDNSResponder daemon over a mach service a `(deny network*)` rule never sees, so blocking direct
+    sockets is not enough — we also attempt `getaddrinfo` and report whether it was refused. A
+    confined worker can't reach the resolver (no mach-lookup to mDNSResponder on macOS; no socket at
+    all on the other arms), so this must fail; if resolution SUCCEEDS the confinement has an
+    out-of-process egress hole. Registered ONLY when PM_SIDECAR_DEV=1, so a release worker has no
+    reachable path here."""
     import errno as _errno
     import socket
 
     wsaeacces = 10013  # Windows: a no-network AppContainer refuses the socket with this.
     try:
         with socket.create_connection(("192.0.2.1", 443), timeout=2):
-            return {"blocked": False, "detail": "connected — network is NOT blocked", "errno": None}
+            blocked, detail, err = False, "connected — network is NOT blocked", None
     except OSError as exc:
         blocked = (
             isinstance(exc, PermissionError)
@@ -1014,7 +1022,23 @@ def do_net_selftest(_params):
             if blocked
             else f"reached the network layer, NOT blocked ({type(exc).__name__}: {exc})"
         )
-        return {"blocked": blocked, "detail": detail, "errno": exc.errno}
+        err = exc.errno
+
+    try:
+        socket.getaddrinfo("example.com", 443, type=socket.SOCK_STREAM)
+        dns_blocked = False
+        dns_detail = "DNS resolved — out-of-process resolution is NOT blocked"
+    except OSError as exc:
+        dns_blocked = True
+        dns_detail = f"DNS resolution refused ({type(exc).__name__}: {exc})"
+
+    return {
+        "blocked": blocked,
+        "detail": detail,
+        "errno": err,
+        "dns_blocked": dns_blocked,
+        "dns_detail": dns_detail,
+    }
 
 
 def do_fs_probe(params):
@@ -1045,16 +1069,39 @@ def do_fs_probe(params):
 
 
 def do_worker_selftest(_params):
-    """Confinement preflight (issue #286 PR2d): load the native library the worker relies on, so
-    Rust can verify the OS sandbox didn't deny it a path it needs BEFORE serving real work. Imports
-    onnxruntime — a compiled extension that dlopen()s system libraries and probes CPU features via
-    /sys and /proc, so it exercises the sandbox's filesystem allow-set the way a plain `ping` (no
-    heavy import) would not. Offline and input-free: it touches no untrusted bytes and no network. A
-    too-tight sandbox makes the import raise, main() reports {ok: False}, and the Linux caller falls
-    open (runs the worker unconfined) instead of every later embed failing."""
-    import onnxruntime  # noqa: F401 — the import IS the test: a native .so load under the sandbox.
+    """Confinement preflight (issue #286): exercise the operations the OS sandbox must permit BEFORE
+    serving real work, so Rust can fall open (run the worker unconfined) instead of every later
+    request failing under a too-tight profile. Three checks, all offline and input-free (no
+    untrusted bytes, no network):
 
-    return {"ok": True, "checked": ["onnxruntime"], "onnxruntime": onnxruntime.__version__}
+      1. `import onnxruntime` — a native `.so`/`.dylib` load that dlopen()s system libraries and
+         probes CPU features, exercising the sandbox's executable-map + system-library allow-set
+         the way a plain `ping` never would.
+      2. list the model-cache dir — a DIRECT read, deliberately NOT routed through the
+         offline-masking `_load_model` (which would swallow a sandbox denial into a `ModelNotCached`
+         that looks like a cold cache). So a profile that forgot the model-cache grant raises
+         `PermissionError` HERE and fails the preflight; an empty dir (a cold cache) lists fine and
+         still passes.
+      3. when the default model is already cached, embed one string — the ONNX `InferenceSession`
+         and the CPU-feature sysctls a bare import never reaches (and it pre-warms the embedder the
+         first real request would load anyway). A cold cache raises `ModelNotCached`, which the
+         fetch flow handles, so it still passes; only a real sandbox denial makes it raise instead.
+
+    A too-tight sandbox makes one of these raise, main() reports {ok: False}, and the caller falls
+    open."""
+    import onnxruntime  # noqa: F401 — the import IS a test: a native lib load under the sandbox.
+
+    checked = ["onnxruntime"]
+    models_dir = os.environ.get("PM_MODELS_DIR")
+    if models_dir and os.path.isdir(models_dir):
+        os.listdir(models_dir)  # un-masked: a sandbox denial raises PermissionError here.
+        checked.append("models_dir")
+    try:
+        list(get_embedder().embed(["ok"]))  # consuming the generator is what runs the model.
+        checked.append("embed")
+    except ModelNotCached:
+        checked.append("embed:cold-cache")
+    return {"ok": True, "checked": checked, "onnxruntime": onnxruntime.__version__}
 
 
 HANDLERS = {

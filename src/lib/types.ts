@@ -1139,12 +1139,15 @@ export type SandboxReport =
   | { state: "degraded"; layers: string[]; code: string; detail: string }
   | { state: "unconfined"; code: string; detail: string };
 
-/** The worker's answer to the dev-only network-block self-test (issue #286): whether the OS refused an
- *  outbound socket, a human detail, and the raw errno. Mirrors `NetSelftest` in commands_dev.rs. */
+/** The worker's answer to the dev-only network-block self-test (issue #286): whether the OS refused a
+ *  direct outbound socket AND out-of-process DNS resolution (the macOS mDNSResponder exfil path), each
+ *  with a human detail, plus the socket errno. Mirrors `NetSelftest` in commands_dev.rs. */
 export interface NetSelftest {
   blocked: boolean;
   detail: string;
   errno: number | null;
+  dnsBlocked: boolean;
+  dnsDetail: string;
 }
 
 /** A snapshot of the rebuild currently running (if any) — mirrors `IngestJobState`. The rebuild

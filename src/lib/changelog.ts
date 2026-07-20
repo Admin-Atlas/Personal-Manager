@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.35.0-alpha",
+    date: "2026-07-20",
+    highlights: [
+      "The file-reader's protective sandbox now covers macOS too — completing the set alongside Windows and Linux. The helper that opens your files runs with no way to reach the internet (not even to look up a web address) and can only see the handful of folders it actually needs, never your vault or the rest of your home folder. As always it's an extra layer, not a gate: if the sandbox can't fully start, PM keeps working and reports a short code (like SBX-3101) you can quote in a bug report. Nothing changes in day-to-day use.",
+    ],
+  },
+  {
     version: "3.34.0-alpha",
     date: "2026-07-20",
     highlights: [

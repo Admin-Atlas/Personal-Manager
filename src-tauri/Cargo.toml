@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.34.0-alpha"
+version = "3.35.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -150,6 +150,11 @@ windows-future = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+# Sidecar OS sandbox (#286, PR2c): `libc` supplies the raw fcntl calls the confined worker's pre_exec
+# uses to mark inherited fds close-on-exec (macOS has no close_range). The Seatbelt profile itself needs
+# no crate — it rides on the OS `sandbox-exec`. libc is already pulled transitively (MIT/Apache-2.0,
+# already allow-listed), so this adds no new licence.
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }

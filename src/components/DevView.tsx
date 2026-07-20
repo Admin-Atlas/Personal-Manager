@@ -245,15 +245,25 @@ export function DevView() {
                 </div>
                 {netErr && <p className="mt-2 text-xs text-[var(--st-due)]">{netErr}</p>}
                 {netTest && (
-                  <p className="mt-2 text-xs">
-                    <span className={netTest.blocked ? "text-st-quick" : "text-st-due"}>
-                      {netTest.blocked ? "✓ blocked" : "✗ not blocked"}
-                    </span>
-                    <span className="text-ink3"> — {netTest.detail}</span>
-                    {netTest.errno != null && (
-                      <span className="font-mono text-ink4"> (errno {netTest.errno})</span>
-                    )}
-                  </p>
+                  <>
+                    <p className="mt-2 text-xs">
+                      <span className="text-ink4">socket: </span>
+                      <span className={netTest.blocked ? "text-st-quick" : "text-st-due"}>
+                        {netTest.blocked ? "✓ blocked" : "✗ not blocked"}
+                      </span>
+                      <span className="text-ink3"> — {netTest.detail}</span>
+                      {netTest.errno != null && (
+                        <span className="font-mono text-ink4"> (errno {netTest.errno})</span>
+                      )}
+                    </p>
+                    <p className="mt-1 text-xs">
+                      <span className="text-ink4">DNS: </span>
+                      <span className={netTest.dnsBlocked ? "text-st-quick" : "text-st-due"}>
+                        {netTest.dnsBlocked ? "✓ blocked" : "✗ not blocked"}
+                      </span>
+                      <span className="text-ink3"> — {netTest.dnsDetail}</span>
+                    </p>
+                  </>
                 )}
               </div>
             )}
