@@ -11,7 +11,7 @@ import { deviceTimeZone } from "../../theme";
 import { MAX_EXTRA_ZONES } from "../../lib/calendarPrefs";
 import { allZoneOptions } from "../../lib/zoneLabel";
 import { cn } from "../ui";
-import { Popover } from "./Popover";
+import { Popover } from "../ui";
 
 /** Short, friendly display for a zone: last path segment with underscores as spaces (e.g. "New York"). */
 function zoneShort(tz: string): string {

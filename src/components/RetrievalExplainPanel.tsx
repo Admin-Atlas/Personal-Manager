@@ -17,7 +17,7 @@ import type { DevRetrievalExplain, Message } from "../lib/types";
 import { getSettings, retrievalDiagnose, retrievalExplain, setRetrievalK } from "../lib/ipc";
 import { useDevMode } from "../lib/capabilities";
 import { RetrievalScoreTable } from "./RetrievalScoreTable";
-import { Popover } from "./calendar/Popover";
+import { Popover } from "./ui";
 import { Button } from "./ui";
 
 /** The depth bounds mirror the backend clamp (`db::RETRIEVAL_K_{MIN,MAX}`). */
