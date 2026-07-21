@@ -461,6 +461,14 @@ const MIGRATIONS: &[&str] = &[
     // the stored CREATE TABLE text only, moves no data, and touches nothing else. We surgically
     // replace the value list, which appears exactly once (in this CHECK) and only on `documents`.
     // The schema cookie is then bumped (see `run`) so this connection reparses the new constraint.
+    //
+    // GOTCHA (canonical note — the later writable_schema patches reference this one): the patch leaves
+    // THIS connection's cached schema stale, and `run()` only reparses once, at the end of the batch.
+    // A same-run LATER migration that `ALTER … ADD COLUMN`s a writable_schema-patched table then fails
+    // with a baffling `near "…": syntax error` (a DEFAULT-expression DDL re-parse fault, not a bad
+    // ALTER). Fix: emit `PRAGMA writable_schema=RESET;` at the top of that migration first — verified
+    // clean on SQLCipher (reloads the schema in-memory, no page-1 write → no HMAC corruption). See
+    // AGENTS.md rule 3; v37 instead used a satellite table (justified only when the data is sparse).
     r#"
     PRAGMA writable_schema = ON;
     UPDATE sqlite_master
@@ -639,7 +647,8 @@ const MIGRATIONS: &[&str] = &[
     //     in place, so we reuse v17's `writable_schema` text-patch (it edits the stored CREATE TABLE
     //     text only; `run` then bumps the schema cookie so this connection reparses the new
     //     constraint). The value list `'vault','index_only'` appears exactly once — in this CHECK,
-    //     added by v11 — and only on `documents`.
+    //     added by v11 — and only on `documents`. (A later same-run ALTER on this patched table needs
+    //     `writable_schema=RESET` first — see v17's gotcha note + AGENTS.md rule 3.)
     //   * `photos` (NEW). `file_hash` is the SHA-256 of the image BYTES — the dedupe/identity anchor
     //     that survives a moved/renamed source (UNIQUE, so re-dropping the same image is a no-op).
     //     `source_type` is the capture provenance (screenshot/camera_roll/dragged_file/vault_copy),
@@ -686,7 +695,9 @@ const MIGRATIONS: &[&str] = &[
     // Two additive parts (rule #3 — no data moved, no column dropped):
     //   * Relax the `documents.source_type` CHECK to admit 'chat'. SQLite can't ALTER a column CHECK in
     //     place, so we reuse the v17/v22 `writable_schema` text-patch (it edits the stored CREATE TABLE
-    //     text only; `run` then bumps the schema cookie so this connection reparses the new constraint).
+    //     text only; `run` then bumps the schema cookie so this connection reparses the new constraint;
+    //     a later same-run ALTER on this patched table needs `writable_schema=RESET` first — see v17's
+    //     gotcha note + AGENTS.md rule 3).
     //     The value list `'vault','index_only','photo'` appears exactly once — in this CHECK — and only on
     //     `documents`. A chat session, when card B indexes it, becomes a `documents` row with
     //     `source_type='chat'` backed by a real Markdown vault file, so split/embed/FTS/vector/retrieval/
@@ -802,7 +813,8 @@ const MIGRATIONS: &[&str] = &[
     //     column CHECK in place, so we reuse the v17/v22/v23 `writable_schema` text-patch: it edits the
     //     stored CREATE TABLE text only, moves no data, and touches nothing else. The value list
     //     `'user','inferred'` appears exactly once (this CHECK) and only on `preferences`; the schema
-    //     cookie bump in `run` reparses the relaxed constraint on this connection.
+    //     cookie bump in `run` reparses the relaxed constraint on this connection. (A later same-run
+    //     ALTER on this patched table needs `writable_schema=RESET` first — see v17's gotcha note.)
     //   * `prefs_covers_up_to_turn_id` — the extraction cursor on `chat_sessions`, mirroring
     //     `summary_covers_up_to_turn_id`. Additive, NULL until the first extraction pass advances it.
     r#"
@@ -843,7 +855,8 @@ const MIGRATIONS: &[&str] = &[
     //     CHECK in place, so we reuse the v22/v23 `writable_schema` text-patch (it edits the stored
     //     CREATE TABLE text only; `run` then bumps the schema cookie so this connection reparses the new
     //     constraint). The value list `'vault','index_only','photo','chat'` appears exactly once — in
-    //     this CHECK — and only on `documents`.
+    //     this CHECK — and only on `documents`. (A later same-run ALTER on this patched table needs
+    //     `writable_schema=RESET` first — see v17's gotcha note + AGENTS.md rule 3.)
     //   * `spreadsheets` (NEW) is the thin satellite holding the spreadsheet-specific truth a document
     //     doesn't have: `sheet_count`/`total_rows` and `chunked_rows` (rows actually indexed after the
     //     sidecar's per-sheet row cap — `chunked_rows < total_rows` records a truncation). These
@@ -1014,6 +1027,8 @@ const MIGRATIONS: &[&str] = &[
     // text-patch: it edits the stored CREATE TABLE text only, moves no data, and touches nothing else. The
     // value list `'chat','background'` appears exactly once — in this CHECK — and only on `usage_log`; the
     // schema cookie is then bumped (see `run`) so this connection reparses the relaxed constraint.
+    // (This left THIS connection's cached usage_log schema stale — which is exactly why v37 could not
+    // `ALTER usage_log` in the same run; see v37's note + AGENTS.md rule 3 for the `writable_schema=RESET` fix.)
     r#"
     PRAGMA writable_schema = ON;
     UPDATE sqlite_master
@@ -1026,12 +1041,19 @@ const MIGRATIONS: &[&str] = &[
     //
     // A SATELLITE table (1:1 with usage_log, cascading on delete), NOT new columns on usage_log. Why:
     // v36 relaxed usage_log's CHECK via a `writable_schema` text-patch that leaves this connection's
-    // cached definition of usage_log stale, so an `ALTER usage_log ADD COLUMN` would regenerate the
-    // table from that stale definition and fail ("near ',': syntax error"). A rebuild would need a
-    // `DROP TABLE` (the additive-migrations guard forbids it). The satellite sidesteps both — it is a
-    // plain additive CREATE that never touches usage_log's schema, matching PM's existing satellite
-    // pattern (v30 spreadsheets). A row is absent for pre-v37 spend and for any write that fails
-    // best-effort — read it with a LEFT JOIN, treating absent as "provider unknown".
+    // cached definition of usage_log stale, so an `ALTER usage_log ADD COLUMN` regenerates the table
+    // from that stale definition and fails (`near "…": syntax error`, from re-parsing usage_log's
+    // `created_at DEFAULT (strftime(…,'now'))` — reproduced in the test below). A rebuild would need a
+    // `DROP TABLE` (the additive-migrations guard forbids it). The satellite sidesteps both — a plain
+    // additive CREATE that never touches usage_log's schema, matching PM's existing satellite pattern
+    // (v30 spreadsheets). A row is absent for pre-v37 spend and for any write that fails best-effort —
+    // read it with a LEFT JOIN, treating absent as "provider unknown".
+    //
+    // NOTE (evidence-based, 2026-07-21): the ALTER failure has a cleaner general fix —
+    // `PRAGMA writable_schema=RESET;` at the top of this migration (verified clean on SQLCipher; no
+    // page-1 write, so no HMAC corruption). Since usage_meta's fields populate on EVERY usage row
+    // (dense, not sparse), columns + RESET would be the shape a fresh design should pick; the satellite
+    // shipped and works, and converting it now is not worth a follow-up migration. See AGENTS.md rule 3.
     r#"
     CREATE TABLE usage_meta (
         usage_id        INTEGER PRIMARY KEY REFERENCES usage_log(id) ON DELETE CASCADE,
@@ -1060,9 +1082,11 @@ pub fn run(conn: &Connection) -> Result<()> {
     // stored schema without bumping the schema cookie, so this connection would keep compiling the OLD
     // constraint into prepared statements. If any migration ran, bump the cookie once to force a
     // reparse so the relaxed CHECK takes effect immediately (harmless when no writable_schema edit was
-    // involved). NOTE: a migration that must ALTER a just-writable_schema-patched table forces its own
-    // reparse inline (see v37) — mid-loop reparsing here disturbs the still-settling schema on a
-    // teardown-then-remigrate path (the db-ladder tests), so this stays a single end-of-run bump.
+    // involved). NOTE: a migration that must ALTER a just-writable_schema-patched table in the same run
+    // can't wait for this end-of-run bump — it must emit `PRAGMA writable_schema=RESET;` at its own top
+    // (v37 instead sidestepped the ALTER with a satellite table). Mid-loop reparsing HERE is wrong: it
+    // disturbs the still-settling schema on a teardown-then-remigrate path (the db-ladder tests), so
+    // this stays a single end-of-run bump.
     if version as i64 != current {
         let cookie: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
         conn.execute_batch(&format!(
@@ -1106,7 +1130,7 @@ mod tests {
              structured flag layer is v32; per-flag instance timestamp (F-18) is v33; \
              per-calendar quiet flag is v34; rebuild pass stamp (#371) is v35; \
              usage_log kind CHECK relaxed for chat housekeeping is v36; \
-             usage_log provider/latency/fallback columns for the local provider is v37)"
+             usage_meta provider/latency/fallback satellite for the local provider is v37)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1994,6 +2018,77 @@ mod tests {
             .query_row("SELECT count(*) FROM usage_meta", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 0, "the satellite cascades on usage_log delete");
+    }
+
+    /// Pins the writable_schema→ALTER gotcha that shaped v37 (AGENTS.md rule 3): a table whose CHECK
+    /// was relaxed by a v36-style `writable_schema` text-patch, and whose DDL carries a
+    /// `DEFAULT (strftime(…))`, CANNOT take a later same-connection `ALTER … ADD COLUMN` (the stored-DDL
+    /// re-parse faults) — but `PRAGMA writable_schema=RESET` first makes it succeed cleanly, with the
+    /// relaxed CHECK live and the encrypted store intact across a reopen (no page-1 HMAC damage, unlike
+    /// a mid-run schema-cookie bump). This is the evidence behind "columns + RESET" being the general fix.
+    #[test]
+    fn writable_schema_patch_then_alter_needs_a_reset() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pm.sqlite");
+
+        // usage_log's exact shape — the strftime DEFAULT's internal commas are the re-parse trigger —
+        // with v36's exact CHECK-relax, leaving THIS connection's cached schema stale (no reparse).
+        fn make_patched(conn: &rusqlite::Connection, name: &str) {
+            conn.execute_batch(&format!(
+                "CREATE TABLE {name} (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model             TEXT NOT NULL,
+                    kind              TEXT NOT NULL CHECK (kind IN ('chat','background')),
+                    prompt_tokens     INTEGER,
+                    completion_tokens INTEGER,
+                    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                );"
+            ))
+            .unwrap();
+            // v36's EXACT replacement (four chat-housekeeping kinds): the precise text that shipped and
+            // faulted the original column-based v37. The exact patched text matters — a shorter
+            // replacement does not always trip the re-parse — so this reproduces the real condition.
+            conn.execute_batch(&format!(
+                "PRAGMA writable_schema = ON;\n\
+                 UPDATE sqlite_master SET sql = replace(sql, '''chat'',''background''', \
+                   '''chat'',''background'',''chat_summary'',''chat_compress'',''chat_title'',''chat_prefs''') \
+                   WHERE type='table' AND name='{name}';\n\
+                 PRAGMA writable_schema = OFF;"
+            ))
+            .unwrap();
+        }
+
+        let conn = crate::db::open(&path, DB_KEY).unwrap();
+
+        // Without a remedy, the same-connection ALTER faults on the stored-DDL re-parse — the trap
+        // v37 hit (verified on the bundled SQLCipher; if a future toolchain stops faulting here, that
+        // is a real behaviour change worth a look, not a test to silence).
+        make_patched(&conn, "gotcha_control");
+        assert!(
+            conn.execute_batch("ALTER TABLE gotcha_control ADD COLUMN provider TEXT;")
+                .is_err(),
+            "a writable_schema-patched table with a DEFAULT expr faults a later ALTER — the gotcha"
+        );
+
+        // `writable_schema=RESET` reloads the schema in-memory, so the ALTER then succeeds.
+        make_patched(&conn, "gotcha_reset");
+        conn.execute_batch("PRAGMA writable_schema = RESET;")
+            .unwrap();
+        conn.execute_batch("ALTER TABLE gotcha_reset ADD COLUMN provider TEXT;")
+            .expect("writable_schema=RESET clears the stale cache so the ALTER succeeds");
+        // The relaxed CHECK is genuinely in effect and the new column is usable.
+        conn.execute(
+            "INSERT INTO gotcha_reset(model, kind, provider) VALUES ('m','chat_title','local')",
+            [],
+        )
+        .expect("the relaxed CHECK admits the new value after RESET");
+        // The encrypted store is undamaged (RESET does no page-1 write, unlike a schema-cookie bump).
+        conn.query_row("SELECT count(*) FROM usage_log", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        drop(conn);
+        crate::db::open(&path, DB_KEY)
+            .expect("the encrypted store reopens cleanly after a RESET+ALTER");
     }
 
     // --- T-05: the full migration ladder over real user data ----------------

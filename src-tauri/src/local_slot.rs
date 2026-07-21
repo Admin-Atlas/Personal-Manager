@@ -31,16 +31,15 @@ use crate::openai_compat::{LocalFailKind, WindowInfo};
 // here — never a hunt through the gateway. Where a value departs from the epic's baseline, the
 // reason is in the doc comment on the constant.
 //
-// NOT constants here, deliberately — evaluated and left UNWIRED so the block holds no config that
-// nothing reads:
-//   * retry_base_backoff (exponential + full jitter): PR3 has no in-process retry loop to back
-//     off — a failed local call falls back to cloud once (foreground) or is retried on the next
-//     scheduler tick (background), the app's existing, proven discipline. Full-jitter backoff
-//     (AWS) would only earn its place if a future in-process multi-retry loop lands.
-//   * preemption_retry_delay: a preempted background call returns to its scheduler for a next-tick
-//     retry rather than looping in-process. The research warning is explicit — hammering a server
-//     that a preemption pushed into a cold reload (Ollama swap / LM Studio auto-evict / a 503
-//     "loading model") is worse than waiting a tick — so there is no in-process retry to delay.
+// The BACKGROUND retry policy lives here too (MAX_LOCAL_BACKGROUND_RETRIES / PREEMPTION_RETRY_DELAY /
+// RETRY_BASE_BACKOFF): a preempted or warming-up background call retries in-process a bounded number
+// of times, jittered, before it defers to its scheduler — the shape is in preemption_retry_delay() /
+// loading_retry_backoff() and the gateway's run_local_complete. Foreground chat is never retried (it
+// is interactive: it falls back to cloud pre-first-token, or surfaces the error). The retry is
+// deliberately NARROW so it can never become the hot loop against a reloading server the research
+// warns against: only a PREEMPTION (not a fault) or a host that ANSWERED "model loading" (alive,
+// warming up) is retried — every hard failure (refused / timeout / 5xx) skips the loop and falls back
+// to cloud, or defers to the circuit breaker + the next scheduler tick.
 pub mod tunables {
     use std::time::Duration;
 
@@ -111,6 +110,72 @@ pub mod tunables {
     // adopted: 3 repeats false-positive on tables, code, and enumerations (the research pass and the
     // existing `loop_guard_leaves_legitimate_repetition_alone` test both confirm this), so the
     // period detector's 6-cycle / 768-byte requirement is the researched, false-positive-safe form.
+
+    // --- Background retry policy — "background waits and retries" (#297) made bounded + jittered. ---
+
+    /// Bound on in-process BACKGROUND retries (preemption + warming-up combined, across one call).
+    /// Small on purpose: past this the job returns cleanly to its (idle-gated) scheduler for a
+    /// next-tick retry with its cursor unadvanced, rather than spinning while a user is mid-chat. Chat
+    /// always wins the single GPU slot, so a busy GPU must never trap a background job in a retry loop.
+    pub const MAX_LOCAL_BACKGROUND_RETRIES: u32 = 3;
+
+    /// Delay before retrying a background call a foreground chat PREEMPTED (took the single GPU slot).
+    /// "Background waits and retries" made literal: a short jittered beat for the chat turn to finish,
+    /// instead of deferring the whole job to the next scheduler tick. Flat, not escalating — a
+    /// preemption is not a fault, so there is nothing to back off from; [`super::preemption_retry_delay`]
+    /// jitters it to `[base/2, 3·base/2]` so a retry never fires instantly back into a still-active chat.
+    pub const PREEMPTION_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+    /// Base for the exponential + full-jitter backoff (AWS "backoff and jitter") between in-process
+    /// retries of a host that ANSWERED "model loading" — alive and warming up, so a bounded, backed-off
+    /// recheck is polite, not a hammer. Attempt N waits a uniform-random `[0, BASE · 2^(N-1)]`
+    /// ([`super::loading_retry_backoff`]); with the bound above the worst single wait is ~4×base. A host
+    /// that never finishes loading hands off to cloud (local-then-cloud) or surfaces a clear "still
+    /// loading" error (local-only) after the bound — it is never hammered.
+    pub const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(2);
+}
+
+// =================================================================================================
+// Background retry timing — the jittered delays the gateway sleeps between in-process retries of a
+// preempted or warming-up BACKGROUND local call. Pure but for the RNG; the bounds are unit-tested.
+// =================================================================================================
+
+/// A uniformly-random `Duration` in `[0, span]` for backoff jitter, from the app's `getrandom`
+/// source (same as everywhere else). On the astronomically-unlikely RNG error it returns the full
+/// `span` — jitter is advisory, so a deterministic fall-back is fine and never zero-waits a retry.
+fn jitter_up_to(span: Duration) -> Duration {
+    let nanos = span.as_nanos();
+    if nanos == 0 {
+        return Duration::ZERO;
+    }
+    let mut buf = [0u8; 8];
+    let r = match getrandom::fill(&mut buf) {
+        Ok(()) => u128::from(u64::from_le_bytes(buf)),
+        Err(_) => return span,
+    };
+    // `nanos` fits u64 for the small spans used here (well under a minute), so the cast is lossless.
+    Duration::from_nanos((r % (nanos + 1)) as u64)
+}
+
+/// The jittered wait before retrying a PREEMPTED background call: at least half
+/// [`tunables::PREEMPTION_RETRY_DELAY`] (so a retry can't fire instantly back into a still-active
+/// chat and immediately re-preempt) plus up to a further full delay of jitter — i.e. `[base/2, 3·base/2]`.
+pub fn preemption_retry_delay() -> Duration {
+    let base = tunables::PREEMPTION_RETRY_DELAY;
+    base / 2 + jitter_up_to(base)
+}
+
+/// AWS full-jitter exponential backoff for retrying a warming-up ("model loading") host on 1-based
+/// `attempt`: a uniform-random wait in `[0, BASE · 2^(attempt-1)]`, saturating so a large attempt
+/// can never overflow the shift or the multiply.
+pub fn loading_retry_backoff(attempt: u32) -> Duration {
+    let factor = 1u32
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    let ceil = tunables::RETRY_BASE_BACKOFF
+        .checked_mul(factor)
+        .unwrap_or(tunables::RETRY_BASE_BACKOFF);
+    jitter_up_to(ceil)
 }
 
 // =================================================================================================
@@ -650,6 +715,42 @@ mod tests {
             CallOutcome::Alive,
             "a 4xx means the host answered — config problem, not a dead host"
         );
+    }
+
+    // ---- background retry timing (bounds over many RNG draws) ----
+
+    #[test]
+    fn preemption_delay_is_bounded_and_never_instant() {
+        let base = tunables::PREEMPTION_RETRY_DELAY;
+        for _ in 0..2000 {
+            let d = preemption_retry_delay();
+            assert!(
+                d >= base / 2,
+                "a preemption retry must never fire instantly back into an active chat"
+            );
+            assert!(d <= base / 2 + base, "bounded above at 3·base/2");
+        }
+    }
+
+    #[test]
+    fn loading_backoff_stays_within_the_exponential_ceiling() {
+        for attempt in 1..=tunables::MAX_LOCAL_BACKGROUND_RETRIES {
+            let ceil = tunables::RETRY_BASE_BACKOFF * (1u32 << (attempt - 1));
+            for _ in 0..2000 {
+                let d = loading_retry_backoff(attempt);
+                assert!(
+                    d <= ceil,
+                    "attempt {attempt}: full-jitter backoff must stay within [0, base·2^(n-1)]"
+                );
+            }
+        }
+        // Saturates rather than panicking on an absurd attempt count.
+        let _ = loading_retry_backoff(u32::MAX);
+    }
+
+    #[test]
+    fn jitter_up_to_zero_span_is_zero() {
+        assert_eq!(jitter_up_to(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

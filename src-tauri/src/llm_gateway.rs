@@ -22,7 +22,9 @@ use crate::commands::{
     CHAT_MODELS_KEY,
 };
 use crate::error::{Error, Result};
-use crate::local_slot::{CallOutcome, SlotOutcome};
+use crate::local_slot::{
+    loading_retry_backoff, preemption_retry_delay, tunables, CallOutcome, SlotOutcome,
+};
 use crate::openai_compat::{self, LocalFailKind, LocalFailure};
 use crate::openrouter::{self, ChatMessage, Completion};
 use crate::secret::Secret;
@@ -421,6 +423,14 @@ pub async fn complete(
 /// the outcome for the circuit breaker, and — for `LocalThenCloud` — fall back to cloud on any hard
 /// failure. Background consumption is atomic (nothing is shown mid-stream), so a cloud retry after a
 /// failed local leg is always safe.
+///
+/// "Background waits and retries" (#297): rather than deferring a whole idle-gated scheduler cycle,
+/// this retries IN-PROCESS a bounded, jittered number of times ([`tunables::MAX_LOCAL_BACKGROUND_RETRIES`])
+/// for the two transient cases only — a chat PREEMPTION (the GPU was briefly busy; not a fault) and a
+/// host that ANSWERED "model loading" (alive, warming up). Every other failure is a strike: it is NOT
+/// retried here (that would be the hot loop against a reloading server the research warns against) —
+/// it falls back to cloud, or surfaces. Past the bound the job returns to its scheduler for a
+/// next-tick retry with its cursor unadvanced, so a user mid-conversation never traps it spinning.
 async fn run_local_complete(
     app: &AppHandle,
     local: &LocalArm,
@@ -446,38 +456,59 @@ async fn run_local_complete(
         };
     }
 
-    let start = Instant::now();
-    let token = local.token.as_ref().map(Secret::expose);
-    let attempt = openai_compat::complete(&local.base_url, &local.model, token, messages);
-    match rt.slot.run_background(attempt).await {
-        SlotOutcome::Preempted => {
-            // A chat request took the GPU; not the host's fault. Retry on the next scheduler tick.
-            rt.record(CallOutcome::Neutral);
-            Err(Error::Other(
-                "the local model was busy with a chat request; it will retry shortly".into(),
-            ))
-        }
-        SlotOutcome::Ran(Ok(completion)) => {
-            rt.record(CallOutcome::Ok);
-            ensure_local_window_cached(app, local);
-            Ok(LlmOutcome {
-                completion,
-                meta: CallMeta::local(start.elapsed()),
-            })
-        }
-        SlotOutcome::Ran(Err(failure)) => {
-            rt.record(CallOutcome::for_failure(&failure.kind));
-            match cloud {
-                Some(cloud) => {
-                    cloud_complete(
-                        cloud,
-                        messages,
-                        FallbackReason::HardFailure(failure.kind),
-                        local.model.clone(),
-                    )
-                    .await
+    let mut retries: u32 = 0;
+    loop {
+        let start = Instant::now();
+        let token = local.token.as_ref().map(Secret::expose);
+        let attempt = openai_compat::complete(&local.base_url, &local.model, token, messages);
+        match rt.slot.run_background(attempt).await {
+            SlotOutcome::Ran(Ok(completion)) => {
+                rt.record(CallOutcome::Ok);
+                ensure_local_window_cached(app, local);
+                return Ok(LlmOutcome {
+                    completion,
+                    meta: CallMeta::local(start.elapsed()),
+                });
+            }
+            SlotOutcome::Preempted => {
+                // A chat turn took the single GPU slot — not the host's fault (never a strike). Wait a
+                // short jittered beat for chat to finish and retry in-process; the lane is free during
+                // the sleep, so chat proceeds. Bounded: if the user is in a rapid back-and-forth, hand
+                // back to the scheduler for a next-tick retry rather than spinning.
+                rt.record(CallOutcome::Neutral);
+                if retries < tunables::MAX_LOCAL_BACKGROUND_RETRIES {
+                    retries += 1;
+                    tokio::time::sleep(preemption_retry_delay()).await;
+                    continue;
                 }
-                None => Err(local_failure_to_error(&failure)),
+                return Err(Error::Other(
+                    "the local model was busy with a chat request; it will retry shortly".into(),
+                ));
+            }
+            SlotOutcome::Ran(Err(failure)) => {
+                rt.record(CallOutcome::for_failure(&failure.kind));
+                // A host that ANSWERED "model loading" is alive and warming up — a bounded, backed-off
+                // recheck honours a local-then-cloud user's local preference (and spares needless cloud
+                // spend) without hammering. Every other failure is a strike and is NOT retried here.
+                if matches!(failure.kind, LocalFailKind::ModelLoading)
+                    && retries < tunables::MAX_LOCAL_BACKGROUND_RETRIES
+                {
+                    retries += 1;
+                    tokio::time::sleep(loading_retry_backoff(retries)).await;
+                    continue;
+                }
+                return match cloud {
+                    Some(cloud) => {
+                        cloud_complete(
+                            cloud,
+                            messages,
+                            FallbackReason::HardFailure(failure.kind),
+                            local.model.clone(),
+                        )
+                        .await
+                    }
+                    None => Err(local_failure_to_error(&failure)),
+                };
             }
         }
     }

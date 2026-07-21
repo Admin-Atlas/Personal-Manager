@@ -173,6 +173,22 @@ otherwise). Implemented in `src/lib/format.ts`.
    user data — app updates must never wipe the store. A re-key of index-only rows
    (e.g. connector row IDs) must ship an old→new mapping so user classifications
    survive.
+   - **`writable_schema` + a later `ALTER` gotcha.** Several migrations relax a
+     column CHECK by text-patching `sqlite_master` under `PRAGMA writable_schema`
+     (v17/v22/v23/v28/v30/v36 — SQLite can't `ALTER` a CHECK in place). That patch
+     leaves the connection's cached schema **stale**. A subsequent `ALTER TABLE …
+     ADD COLUMN` on such a table re-parses the stored CREATE text and, if that DDL
+     has a `DEFAULT (…)` expression (e.g. `strftime('%Y…','now')`), fails with a
+     baffling `near "…": syntax error` — it is NOT your ALTER that's wrong. The
+     `run()` reparse fires only once, at the **end** of the batch, so a same-run
+     later migration ALTERing that table hits the stale schema. **Fix: emit
+     `PRAGMA writable_schema=RESET;` at the top of that later migration** (verified
+     clean on the bundled SQLCipher — it reloads the schema in-memory without a
+     page-1 write, so no HMAC corruption, unlike a mid-run schema-cookie bump).
+     Reopening the connection works too. A satellite table also sidesteps it, but
+     only prefer that when the data is genuinely sparse (see the satellite vs
+     columns note in `db/migrations.rs`); for dense per-row fields, columns +
+     `RESET` is the right shape.
 4. **Don't hold the DB lock across `.await`.** Lock, do quick sync work, drop the
    guard, then do network/async work.
 5. **The API key stays in Rust.** OpenRouter is called from the backend; the key
