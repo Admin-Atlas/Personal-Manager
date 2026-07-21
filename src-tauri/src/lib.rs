@@ -35,6 +35,7 @@ mod ics;
 mod index_only;
 mod ingest;
 mod layout;
+mod llm_gateway;
 // Local-folder indexing (board card 6): a third index-only source on the shared foundation, reading
 // from the filesystem. This first PR reconciles a tracked folder on demand (a filtered walk +
 // mtime→hash diff); the live `notify` watcher is the next card.

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.36.1-alpha",
+    date: "2026-07-21",
+    highlights: [
+      "Under-the-hood tidying, no visible change: every AI request now flows through a single internal routing point. It behaves exactly as before today, and it's the groundwork that lets a local, on-device model slot in cleanly next.",
+    ],
+  },
+  {
     version: "3.36.0-alpha",
     date: "2026-07-21",
     highlights: [

@@ -323,13 +323,13 @@ fn push_group(out: &mut String, label: &str, items: &[String]) {
 /// served model + token usage (for the cost logger). The caller decides what to do on error
 /// (best-effort — a hiccup just leaves the prior briefing in place).
 pub async fn generate(
-    api_key: &str,
-    models: &[String],
+    app: &tauri::AppHandle,
+    plan: &crate::llm_gateway::RoutePlan,
     snapshot: &str,
     profile: Option<&str>,
 ) -> Result<(String, openrouter::Usage, Option<String>)> {
     let messages = build_messages(snapshot, profile);
-    let c = openrouter::complete(api_key, models, &messages, false).await?;
+    let c = crate::llm_gateway::complete(app, plan, &messages, false).await?;
     Ok((clean(&c.text), c.usage, c.model))
 }
 

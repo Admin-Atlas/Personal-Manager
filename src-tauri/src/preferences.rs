@@ -29,7 +29,7 @@ use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::openrouter::{self, ChatMessage};
+use crate::openrouter::ChatMessage;
 
 /// The three preference scopes (the `scope` CHECK domain).
 pub const SCOPE_GLOBAL: &str = "global";
@@ -414,12 +414,12 @@ fn clean_opt(s: Option<&str>, max: usize) -> Option<String> {
 /// stores each as `source='inferred'`, unconfirmed, at [`INFERRED_SEED_CONFIDENCE`] — surfaced in
 /// Teach for the user to confirm, edit, re-scope, or delete.
 pub async fn distill_blob(
-    api_key: &str,
-    models: &[String],
+    app: &tauri::AppHandle,
+    plan: &crate::llm_gateway::RoutePlan,
     blob: &str,
 ) -> Result<Vec<DraftPreference>> {
     let messages = distill_messages(blob);
-    let c = openrouter::complete(api_key, models, &messages, false).await?;
+    let c = crate::llm_gateway::complete(app, plan, &messages, false).await?;
     Ok(parse_pref_array(&c.text))
 }
 
@@ -463,13 +463,13 @@ pub fn inferred_seed_confidence() -> f64 {
 /// DATA: extracted + validated defensively. The user reviews the prefilled form before it is stored
 /// (`source='user'`, confidence 1.0, confirmed), so a mis-parse is corrected, never silently saved.
 pub async fn parse_statement(
-    api_key: &str,
-    models: &[String],
+    app: &tauri::AppHandle,
+    plan: &crate::llm_gateway::RoutePlan,
     text: &str,
     project_names: &[String],
 ) -> Result<DraftPreference> {
     let messages = parse_messages(text, project_names);
-    let c = openrouter::complete(api_key, models, &messages, false).await?;
+    let c = crate::llm_gateway::complete(app, plan, &messages, false).await?;
     parse_pref_object(&c.text)
         .ok_or_else(|| Error::Other("couldn't read a preference from that — try rephrasing".into()))
 }
