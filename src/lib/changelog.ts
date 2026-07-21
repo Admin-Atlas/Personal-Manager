@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.37.1-alpha",
+    date: "2026-07-21",
+    highlights: [
+      "Under-the-hood tidying, no visible change: when a live chat borrows your local model for a moment, the background jobs it interrupted (like chat summaries and titles) now wait a beat and retry on their own, instead of sitting out until much later. Also added internal notes so a fiddly database-upgrade footgun can't quietly bite us again.",
+    ],
+  },
+  {
     version: "3.37.0-alpha",
     date: "2026-07-21",
     highlights: [

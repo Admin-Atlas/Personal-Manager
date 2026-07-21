@@ -31,16 +31,31 @@ use crate::openai_compat::{LocalFailKind, WindowInfo};
 // here — never a hunt through the gateway. Where a value departs from the epic's baseline, the
 // reason is in the doc comment on the constant.
 //
-// NOT constants here, deliberately — evaluated and left UNWIRED so the block holds no config that
-// nothing reads:
-//   * retry_base_backoff (exponential + full jitter): PR3 has no in-process retry loop to back
-//     off — a failed local call falls back to cloud once (foreground) or is retried on the next
-//     scheduler tick (background), the app's existing, proven discipline. Full-jitter backoff
-//     (AWS) would only earn its place if a future in-process multi-retry loop lands.
-//   * preemption_retry_delay: a preempted background call returns to its scheduler for a next-tick
-//     retry rather than looping in-process. The research warning is explicit — hammering a server
-//     that a preemption pushed into a cold reload (Ollama swap / LM Studio auto-evict / a 503
-//     "loading model") is worse than waiting a tick — so there is no in-process retry to delay.
+// The BACKGROUND retry policy lives here too: a preempted or warming-up background call retries
+// in-process, jittered, until a **total-elapsed budget** is spent, before it defers to its scheduler
+// — the shape is in preemption_retry_delay() / loading_retry_backoff() and the gateway's
+// run_local_complete. The budget is a total-elapsed cap (not an attempt count) because the case this
+// exists for — a host that ANSWERED "model loading" — must be able to span a real cold model load
+// (30-60s+), which an attempt count with a short backoff cannot honestly express. The two reasons get
+// DIFFERENT budgets: a warming model is worth waiting out (LOADING_RETRY_BUDGET ≈ the cold-load window
+// the TTFT timeout also covers), a busy GPU is not (PREEMPTION_RETRY_BUDGET is short — defer to the
+// idle-gated scheduler, which is the right backstop for "chat is using the GPU"). Foreground chat is
+// never retried (interactive: cloud-fallback pre-first-token, or surface the error). The retry stays
+// NARROW so it can never become the hot loop against a reloading server the research warns against:
+// only a PREEMPTION (not a fault) or a "model loading" 503 (alive, warming) is retried — every hard
+// failure (refused / timeout / 5xx) skips the loop and falls back to cloud, or defers to the circuit
+// breaker + the next scheduler tick.
+//
+// COMPOUND WORST CASE for one background job on the local path: LOADING_RETRY_BUDGET (~120s of fast
+// "503 loading" rechecks) PLUS — only if a final recheck then accepts the request and hangs — one
+// BACKGROUND_TOTAL_TIMEOUT (180s) before that Timeout strikes and exits: ~5 min absolute maximum, but
+// ~120s in the realistic cold-load case (the model loads and a request succeeds, or we fall to cloud
+// at the budget). It does NOT compound with the streaming TTFT timeout — that is the FOREGROUND
+// (stream_chat) path, which has no loading-retry (it falls back to cloud pre-first-token instead). And
+// it never LOCKS the slot for that long: chat preempts any in-flight attempt and walks into the free
+// lane during the backoff sleeps, which are OUTSIDE `run_background` so the lane is not held (pinned by
+// `a_returned_background_call_frees_the_slot_for_foreground` +
+// `foreground_preempts_an_in_flight_background_call`).
 pub mod tunables {
     use std::time::Duration;
 
@@ -111,6 +126,81 @@ pub mod tunables {
     // adopted: 3 repeats false-positive on tables, code, and enumerations (the research pass and the
     // existing `loop_guard_leaves_legitimate_repetition_alone` test both confirm this), so the
     // period detector's 6-cycle / 768-byte requirement is the researched, false-positive-safe form.
+
+    // --- Background retry policy — "background waits and retries" (#297), total-elapsed-bounded. ---
+
+    /// Total in-process wait for a foreground chat to free the single GPU slot before a PREEMPTED
+    /// background job defers to its (idle-gated) scheduler for a next-tick retry (cursor unadvanced).
+    /// Short on purpose: a busy GPU is exactly what the idle scheduler backstop is for, so there is no
+    /// point waiting out a long chat session in-process — a user in a rapid back-and-forth must not
+    /// trap the job. (Preemption retries are cheap: they mostly block on the slot's lane until chat
+    /// yields, they do not hit the server.)
+    pub const PREEMPTION_RETRY_BUDGET: Duration = Duration::from_secs(20);
+
+    /// Per-retry pause after a preemption. Flat, not escalating — a preemption is not a fault, so there
+    /// is nothing to back off from; [`super::preemption_retry_delay`] jitters it to `[base/2, 3·base/2]`
+    /// so a retry never fires instantly back into a still-active chat.
+    pub const PREEMPTION_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+    /// Total in-process wait for a host that keeps answering "model loading" before we give up on the
+    /// warm-up (local-then-cloud → cloud; local-only → a clear "still loading" error + a next-tick
+    /// retry). Sized to the cold-load window the TTFT timeout also covers (Ollama/LM Studio JIT-loading
+    /// a model can take 30-60s+), so a warming model completes locally instead of being abandoned after
+    /// a few seconds. A hard failure is NEVER retried, so this only ever spans a genuinely-warming host.
+    pub const LOADING_RETRY_BUDGET: Duration = Duration::from_secs(120);
+
+    /// Base for the exponential + full-jitter backoff (AWS "backoff and jitter") between "model
+    /// loading" rechecks: recheck N waits a uniform-random `[0, min(CAP, BASE · 2^(N-1))]`
+    /// ([`super::loading_retry_backoff`]).
+    pub const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(2);
+
+    /// Cap on a single "model loading" backoff step, so rechecks stay frequent late in
+    /// [`LOADING_RETRY_BUDGET`] — a loaded model is then noticed within ~this long, not a full doubling.
+    pub const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(15);
+}
+
+// =================================================================================================
+// Background retry timing — the jittered delays the gateway sleeps between in-process retries of a
+// preempted or warming-up BACKGROUND local call. Pure but for the RNG; the bounds are unit-tested.
+// =================================================================================================
+
+/// A uniformly-random `Duration` in `[0, span]` for backoff jitter, from the app's `getrandom`
+/// source (same as everywhere else). On the astronomically-unlikely RNG error it returns the full
+/// `span` — jitter is advisory, so a deterministic fall-back is fine and never zero-waits a retry.
+fn jitter_up_to(span: Duration) -> Duration {
+    let nanos = span.as_nanos();
+    if nanos == 0 {
+        return Duration::ZERO;
+    }
+    let mut buf = [0u8; 8];
+    let r = match getrandom::fill(&mut buf) {
+        Ok(()) => u128::from(u64::from_le_bytes(buf)),
+        Err(_) => return span,
+    };
+    // `nanos` fits u64 for the small spans used here (well under a minute), so the cast is lossless.
+    Duration::from_nanos((r % (nanos + 1)) as u64)
+}
+
+/// The jittered wait before retrying a PREEMPTED background call: at least half
+/// [`tunables::PREEMPTION_RETRY_DELAY`] (so a retry can't fire instantly back into a still-active
+/// chat and immediately re-preempt) plus up to a further full delay of jitter — i.e. `[base/2, 3·base/2]`.
+pub fn preemption_retry_delay() -> Duration {
+    let base = tunables::PREEMPTION_RETRY_DELAY;
+    base / 2 + jitter_up_to(base)
+}
+
+/// AWS full-jitter exponential backoff for retrying a warming-up ("model loading") host on 1-based
+/// `attempt`: a uniform-random wait in `[0, min(RETRY_BACKOFF_CAP, BASE · 2^(attempt-1))]`. The cap
+/// keeps rechecks frequent late in [`tunables::LOADING_RETRY_BUDGET`]; the saturating shift/multiply
+/// mean a large attempt can never overflow (it just pins to the cap).
+pub fn loading_retry_backoff(attempt: u32) -> Duration {
+    let factor = 1u32
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    let uncapped = tunables::RETRY_BASE_BACKOFF
+        .checked_mul(factor)
+        .unwrap_or(tunables::RETRY_BACKOFF_CAP);
+    jitter_up_to(uncapped.min(tunables::RETRY_BACKOFF_CAP))
 }
 
 // =================================================================================================
@@ -652,6 +742,46 @@ mod tests {
         );
     }
 
+    // ---- background retry timing (bounds over many RNG draws) ----
+
+    #[test]
+    fn preemption_delay_is_bounded_and_never_instant() {
+        let base = tunables::PREEMPTION_RETRY_DELAY;
+        for _ in 0..2000 {
+            let d = preemption_retry_delay();
+            assert!(
+                d >= base / 2,
+                "a preemption retry must never fire instantly back into an active chat"
+            );
+            assert!(d <= base / 2 + base, "bounded above at 3·base/2");
+        }
+    }
+
+    #[test]
+    fn loading_backoff_stays_within_the_capped_exponential_ceiling() {
+        for attempt in 1..=10u32 {
+            let uncapped = tunables::RETRY_BASE_BACKOFF
+                .checked_mul(1u32 << (attempt - 1))
+                .unwrap_or(tunables::RETRY_BACKOFF_CAP);
+            let ceil = uncapped.min(tunables::RETRY_BACKOFF_CAP);
+            for _ in 0..2000 {
+                let d = loading_retry_backoff(attempt);
+                assert!(
+                    d <= ceil,
+                    "attempt {attempt}: full-jitter backoff must stay within [0, min(cap, base·2^(n-1))]"
+                );
+            }
+        }
+        // Late attempts pin to the cap, and an absurd attempt count saturates rather than panicking.
+        assert!(loading_retry_backoff(20) <= tunables::RETRY_BACKOFF_CAP);
+        assert!(loading_retry_backoff(u32::MAX) <= tunables::RETRY_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn jitter_up_to_zero_span_is_zero() {
+        assert_eq!(jitter_up_to(Duration::ZERO), Duration::ZERO);
+    }
+
     #[test]
     fn window_cache_round_trips_per_endpoint_and_model() {
         use crate::openai_compat::{WindowInfo, WindowSource};
@@ -667,5 +797,64 @@ mod tests {
         );
         // A different model on the same endpoint is a separate entry.
         assert_eq!(rt.cached_window("http://localhost:11434", "qwen2.5"), None);
+    }
+
+    // ---- the single-inference slot: the "chat always wins" invariant (async) ----
+
+    /// A returned background call FREES the lane. [`LocalSlot::run_background`] holds the lane only for
+    /// its own duration; once it returns, the lane is free. This is why the gateway's retry backoffs —
+    /// which sleep OUTSIDE `run_background`, between calls — do NOT hold the slot: a background job that
+    /// is merely waiting out its LOADING/PREEMPTION budget cannot block foreground chat. If the lane
+    /// leaked past `run_background`, the foreground call below would deadlock and the timeout would fire.
+    #[tokio::test]
+    async fn a_returned_background_call_frees_the_slot_for_foreground() {
+        let slot = LocalSlot::default();
+        let out = slot.run_background(async { 7u8 }).await;
+        assert!(
+            matches!(out, SlotOutcome::Ran(7)),
+            "the background call ran"
+        );
+        // The lane is free now — foreground must acquire it without blocking.
+        let fg = tokio::time::timeout(Duration::from_secs(5), slot.run_foreground(async { 9u8 }))
+            .await
+            .expect("foreground must not block once the background call has returned");
+        assert_eq!(fg, 9);
+    }
+
+    /// Foreground chat PREEMPTS an in-flight background call. While a background call is actively parked
+    /// inside the slot (holding the lane, awaiting its request), a foreground call signals it, takes the
+    /// lane, and runs — the background call returns [`SlotOutcome::Preempted`], its future dropped. This
+    /// is the "chat always wins" invariant for the case the lane IS held (an active request), the
+    /// complement of the freed-lane test above. Together they cover both ways chat wins: it preempts an
+    /// active request, and it walks straight into a free lane while a background job is between retries.
+    #[tokio::test]
+    async fn foreground_preempts_an_in_flight_background_call() {
+        use std::sync::Arc;
+        let slot = Arc::new(LocalSlot::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let bg = {
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                slot.run_background(async move {
+                    // Signal that we are now running inside the slot (lane held), then never finish on
+                    // our own — only a preemption can end this call.
+                    let _ = started_tx.send(());
+                    std::future::pending::<u8>().await
+                })
+                .await
+            })
+        };
+        started_rx
+            .await
+            .expect("the background call started inside the slot");
+
+        let fg = tokio::time::timeout(Duration::from_secs(5), slot.run_foreground(async { 42u8 }))
+            .await
+            .expect("foreground must preempt the in-flight background call, not block behind it");
+        assert_eq!(fg, 42);
+        assert!(
+            matches!(bg.await.unwrap(), SlotOutcome::Preempted),
+            "the in-flight background call was preempted, its future dropped"
+        );
     }
 }
