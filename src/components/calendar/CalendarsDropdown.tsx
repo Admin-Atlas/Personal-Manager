@@ -10,7 +10,7 @@ import { useMemo } from "react";
 import type { Calendar, CalendarAccount } from "../../lib/types";
 import { MILESTONE_CALENDAR_ID, PINBOARD_CALENDAR_ID } from "../../lib/calendar-layout";
 import { Button, cn } from "../ui";
-import { Popover } from "./Popover";
+import { Popover } from "../ui";
 import { SourceDot } from "./parts/SourceDot";
 
 interface Props {

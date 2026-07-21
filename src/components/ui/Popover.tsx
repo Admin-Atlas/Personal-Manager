@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// A small anchored popover — the calendar chrome needs a dropdown that opens *under its trigger* and
-// stays put for multi-select, which the centered/blocking Modal primitive can't do. Click-outside +
-// Esc close it. Token-driven (bg-panel / border-border2); no colours of its own.
+// A small anchored popover — opens *under its trigger* and stays put for multi-select, which the
+// centered/blocking Modal primitive can't do. Click-outside + Esc close it. Token-driven
+// (bg-panel / border-border2); no colours of its own. Used by the calendar chrome, the context
+// meter, and the retrieval-explain panel — a generic primitive, hence its home in ui/.
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { cn } from "../ui";
+import { cn } from "./cn";
 
 interface Props {
   /** Renders the trigger; `open` reflects state and `toggle` opens/closes. */

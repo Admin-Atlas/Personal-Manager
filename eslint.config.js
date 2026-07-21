@@ -76,6 +76,32 @@ export default tseslint.config(
         "error",
         { checksVoidReturn: { attributes: false } },
       ],
+      // The backend boundary (AGENTS.md "src/lib/ipc.ts — the only place that calls Rust").
+      // Ban `invoke`/`Channel` (the `@tauri-apps/api/core` entrypoint) everywhere so every
+      // backend command goes through the typed wrappers in ipc.ts, which normalise errors and
+      // keep the surface auditable. Scoped to the exact path, NOT `@tauri-apps/api/*` — the
+      // builtin plugin APIs (api/event, api/app, api/window, api/webview, plugin-*) legitimately
+      // cross from ~15 components and must not be caught. ipc.ts itself is exempted below.
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "@tauri-apps/api/core",
+              message:
+                "Call backend commands only through src/lib/ipc.ts (the typed IPC boundary).",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  // The one sanctioned caller of @tauri-apps/api/core: ipc.ts wraps invoke/Channel for the
+  // whole app, so the boundary rule above is turned back off for this single file.
+  {
+    files: ["src/lib/ipc.ts"],
+    rules: {
+      "no-restricted-imports": "off",
     },
   },
   // Node tooling (build/check scripts, config files).

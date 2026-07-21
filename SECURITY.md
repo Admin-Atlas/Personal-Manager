@@ -36,9 +36,9 @@ release. There are no long-term support branches.
 | Latest release       | :white_check_mark: |
 | Any earlier build    | :x:                |
 
-(Versioning note: pre-release builds are tagged `1.x` now and sort below the
-first public `2.0.0-alpha`. Whatever the number, only the newest release is
-supported.)
+(Versioning note: the earliest pre-release builds were tagged `1.x`, sorting
+below the first public `2.0.0-alpha`; alpha releases have continued from there.
+Whatever the number, only the newest release is supported.)
 
 ## Reporting a vulnerability
 

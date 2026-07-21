@@ -1004,6 +1004,23 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE documents ADD COLUMN rebuild_pass TEXT;   -- id of the rebuild pass that last built these chunks; NULL = pre-v35 or never rebuilt
     "#,
+    // v36: relax the `usage_log.kind` CHECK. The v7 CHECK admits only 'chat'|'background', but four
+    // background jobs write their own kinds by direct INSERT — 'chat_summary'/'chat_compress' (rolling
+    // summary + Compress, chat_summary.rs), 'chat_title' (chat_title.rs), 'chat_prefs' (chat_prefs.rs).
+    // Every one of those inserts is wrapped in best-effort `let _ = conn.execute(...)`, so SQLite's CHECK
+    // silently REJECTED the row and the error was swallowed: that whole class of housekeeping spend never
+    // reached `usage_log` and never showed up in the Usage & cost table. This admits the four kinds so the
+    // rows land. SQLite can't ALTER a column CHECK in place, so we reuse the v17/v22/v23/v28 `writable_schema`
+    // text-patch: it edits the stored CREATE TABLE text only, moves no data, and touches nothing else. The
+    // value list `'chat','background'` appears exactly once — in this CHECK — and only on `usage_log`; the
+    // schema cookie is then bumped (see `run`) so this connection reparses the relaxed constraint.
+    r#"
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master
+       SET sql = replace(sql, '''chat'',''background''', '''chat'',''background'',''chat_summary'',''chat_compress'',''chat_title'',''chat_prefs''')
+     WHERE type = 'table' AND name = 'usage_log';
+    PRAGMA writable_schema = OFF;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1053,7 +1070,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 35,
+            version, 36,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1065,7 +1082,8 @@ mod tests {
              Drive parent-folder tag + normalized source_account is v29; \
              spreadsheet ingestion table is v30; project activity log is v31; \
              structured flag layer is v32; per-flag instance timestamp (F-18) is v33; \
-             per-calendar quiet flag is v34; rebuild pass stamp (#371) is v35)"
+             per-calendar quiet flag is v34; rebuild pass stamp (#371) is v35; \
+             usage_log kind CHECK relaxed for chat housekeeping is v36)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1852,6 +1870,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor, None, "extraction cursor defaults NULL");
+    }
+
+    /// v36 relaxes the `usage_log.kind` CHECK to admit the four background housekeeping kinds
+    /// (proving the writable_schema patch + cookie reparse took effect on this connection). Before
+    /// this migration those direct inserts were silently rejected by the v7 CHECK and swallowed by
+    /// their best-effort `let _ =`, so summary/compress/title/prefs spend never reached `usage_log`.
+    #[test]
+    fn usage_log_admits_chat_housekeeping_kinds() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        // The two original kinds and the four housekeeping kinds all insert now.
+        for kind in [
+            "chat",
+            "background",
+            "chat_summary",
+            "chat_compress",
+            "chat_title",
+            "chat_prefs",
+        ] {
+            conn.execute(
+                "INSERT INTO usage_log(model, kind) VALUES ('m', ?1)",
+                rusqlite::params![kind],
+            )
+            .unwrap_or_else(|e| panic!("kind='{kind}' should insert after v36: {e}"));
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 6, "all six kinds persisted");
+
+        // An unknown kind must still violate the relaxed CHECK — the constraint is narrowed, not dropped.
+        assert!(
+            conn.execute(
+                "INSERT INTO usage_log(model, kind) VALUES ('m', 'nonsense')",
+                [],
+            )
+            .is_err(),
+            "an unknown kind must still violate the relaxed CHECK"
+        );
     }
 
     // --- T-05: the full migration ladder over real user data ----------------

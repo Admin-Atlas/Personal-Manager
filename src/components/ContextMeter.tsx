@@ -16,7 +16,7 @@ import { chatContextStatus, compressChat, revertCompress } from "../lib/ipc";
 import type { CompressResult, ContextStatus } from "../lib/types";
 import { useDepth } from "../theme/depth";
 import { Button, Modal } from "./ui";
-import { Popover } from "./calendar/Popover";
+import { Popover } from "./ui";
 
 interface Props {
   conversationId: number | null;

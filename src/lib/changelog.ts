@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.35.1-alpha",
+    date: "2026-07-21",
+    highlights: [
+      "Under-the-hood tidying. Your Usage & cost view now counts a slice of background AI work — chat summaries, titles, and a couple of others — that a stray database rule had been quietly dropping, so your totals read a little more complete. We also firmed up an internal code boundary and moved a shared building block to its proper home. Nothing changes in day-to-day use.",
+    ],
+  },
+  {
     version: "3.35.0-alpha",
     date: "2026-07-20",
     highlights: [

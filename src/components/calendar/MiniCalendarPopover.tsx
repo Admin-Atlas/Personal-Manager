@@ -7,7 +7,7 @@
 // shared MiniMonth; no colour of its own.
 
 import { useState } from "react";
-import { Popover } from "./Popover";
+import { Popover } from "../ui";
 import { MiniMonth } from "./parts/MiniMonth";
 
 interface Props {

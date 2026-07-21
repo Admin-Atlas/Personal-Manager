@@ -57,8 +57,12 @@ release remain the open post-v1 work.
 ## Architecture
 
 - **Frontend** — `src/` (React 19 + TypeScript + Tailwind v4, Vite).
-  - `src/lib/ipc.ts` — the only place that calls Rust. Typed wrappers over Tauri
-    commands; streaming/progress use a `Channel`.
+  - `src/lib/ipc.ts` — the only caller of PM's own backend command surface
+    (`invoke` / `Channel` from `@tauri-apps/api/core`); other files may still use the
+    builtin plugin APIs (window / webview / app / updater / process). Typed wrappers
+    over Tauri commands; streaming/progress use a `Channel`. Enforced, not just
+    convention: `no-restricted-imports` in `eslint.config.js` bans `@tauri-apps/api/core`
+    everywhere but this file, and the `frontend` CI job (pr.yml) runs it.
   - `src/lib/types.ts` — shared types mirroring the Rust structs.
   - `src/components/` — the nav surfaces (`Sidebar` → Focus / Chat / Documents / Review /
     Map / Calendar / Pinboard, plus the capability-gated Teach + Dev): `FocusView` (status
@@ -82,7 +86,8 @@ release remain the open post-v1 work.
     `commands.rs` + `commands_dev.rs` (the `#[tauri::command]` surface), `error.rs`,
     `paths.rs`, `clock.rs`.
   - **Store** — `db/` (`open()` = SQLCipher key + sqlite-vec + FTS5 + migrations;
-    `migrations.rs` additive + `user_version`-based, past v30); `vault/` (the Markdown vault
+    `migrations.rs` additive + `user_version`-based, the version pinned to the migration
+    count by a test in that file); `vault/` (the Markdown vault
     + its crypto / KDF / ACL / pointer / migration).
   - **Ingestion & retrieval** — `ingest.rs` (convert → hash → chunk → embed → vault + index;
     the `write_document_truth` truth-writer seam; `rebuild`), `splitter.rs` (structure-aware

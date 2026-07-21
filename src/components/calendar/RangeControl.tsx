@@ -11,7 +11,7 @@ import { sanitizeBounds, type CalendarRange, type RangeBounds } from "../../lib/
 import { resolveRangeBounds } from "../../lib/calendarGeom";
 import type { Coords } from "../../theme";
 import { cn } from "../ui";
-import { Popover } from "./Popover";
+import { Popover } from "../ui";
 
 const ITEMS: ReadonlyArray<{ value: CalendarRange; label: string; editable: boolean }> = [
   { value: "work", label: "Work", editable: true },
