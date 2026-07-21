@@ -6404,7 +6404,12 @@ pub(crate) fn log_usage(
 ) {
     // One row, tagged with how it was served (provider / latency / fallback, the v37 columns).
     let fallback = meta.fallback.as_ref().map(|f| f.as_log_str());
-    let _ = conn.execute(
+    // Best-effort: accounting must NEVER fail a model call, so we don't propagate the error. But we do
+    // NOT swallow it silently — a rejected insert here almost always means a schema mismatch (a store
+    // missing the v37 columns), the exact class of bug v36 hid for months by pairing a rejecting CHECK
+    // with a silent `let _ =`. Surface it at once so a mismatch shows up in seconds, not as months of
+    // missing cost data.
+    if let Err(e) = conn.execute(
         "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd, \
          provider, latency_ms, fallback_reason) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -6418,7 +6423,12 @@ pub(crate) fn log_usage(
             meta.latency_ms as i64,
             fallback
         ],
-    );
+    ) {
+        eprintln!(
+            "usage_log: could not record a '{kind}' usage row — cost/usage accounting will be \
+             incomplete ({e})"
+        );
+    }
 }
 
 /// Write collected background usage rows under one short lock (best-effort), each attributed to its

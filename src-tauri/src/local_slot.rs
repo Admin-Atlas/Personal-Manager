@@ -45,6 +45,17 @@ use crate::openai_compat::{LocalFailKind, WindowInfo};
 // only a PREEMPTION (not a fault) or a "model loading" 503 (alive, warming) is retried — every hard
 // failure (refused / timeout / 5xx) skips the loop and falls back to cloud, or defers to the circuit
 // breaker + the next scheduler tick.
+//
+// COMPOUND WORST CASE for one background job on the local path: LOADING_RETRY_BUDGET (~120s of fast
+// "503 loading" rechecks) PLUS — only if a final recheck then accepts the request and hangs — one
+// BACKGROUND_TOTAL_TIMEOUT (180s) before that Timeout strikes and exits: ~5 min absolute maximum, but
+// ~120s in the realistic cold-load case (the model loads and a request succeeds, or we fall to cloud
+// at the budget). It does NOT compound with the streaming TTFT timeout — that is the FOREGROUND
+// (stream_chat) path, which has no loading-retry (it falls back to cloud pre-first-token instead). And
+// it never LOCKS the slot for that long: chat preempts any in-flight attempt and walks into the free
+// lane during the backoff sleeps, which are OUTSIDE `run_background` so the lane is not held (pinned by
+// `a_returned_background_call_frees_the_slot_for_foreground` +
+// `foreground_preempts_an_in_flight_background_call`).
 pub mod tunables {
     use std::time::Duration;
 
@@ -786,5 +797,64 @@ mod tests {
         );
         // A different model on the same endpoint is a separate entry.
         assert_eq!(rt.cached_window("http://localhost:11434", "qwen2.5"), None);
+    }
+
+    // ---- the single-inference slot: the "chat always wins" invariant (async) ----
+
+    /// A returned background call FREES the lane. [`LocalSlot::run_background`] holds the lane only for
+    /// its own duration; once it returns, the lane is free. This is why the gateway's retry backoffs —
+    /// which sleep OUTSIDE `run_background`, between calls — do NOT hold the slot: a background job that
+    /// is merely waiting out its LOADING/PREEMPTION budget cannot block foreground chat. If the lane
+    /// leaked past `run_background`, the foreground call below would deadlock and the timeout would fire.
+    #[tokio::test]
+    async fn a_returned_background_call_frees_the_slot_for_foreground() {
+        let slot = LocalSlot::default();
+        let out = slot.run_background(async { 7u8 }).await;
+        assert!(
+            matches!(out, SlotOutcome::Ran(7)),
+            "the background call ran"
+        );
+        // The lane is free now — foreground must acquire it without blocking.
+        let fg = tokio::time::timeout(Duration::from_secs(5), slot.run_foreground(async { 9u8 }))
+            .await
+            .expect("foreground must not block once the background call has returned");
+        assert_eq!(fg, 9);
+    }
+
+    /// Foreground chat PREEMPTS an in-flight background call. While a background call is actively parked
+    /// inside the slot (holding the lane, awaiting its request), a foreground call signals it, takes the
+    /// lane, and runs — the background call returns [`SlotOutcome::Preempted`], its future dropped. This
+    /// is the "chat always wins" invariant for the case the lane IS held (an active request), the
+    /// complement of the freed-lane test above. Together they cover both ways chat wins: it preempts an
+    /// active request, and it walks straight into a free lane while a background job is between retries.
+    #[tokio::test]
+    async fn foreground_preempts_an_in_flight_background_call() {
+        use std::sync::Arc;
+        let slot = Arc::new(LocalSlot::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let bg = {
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                slot.run_background(async move {
+                    // Signal that we are now running inside the slot (lane held), then never finish on
+                    // our own — only a preemption can end this call.
+                    let _ = started_tx.send(());
+                    std::future::pending::<u8>().await
+                })
+                .await
+            })
+        };
+        started_rx
+            .await
+            .expect("the background call started inside the slot");
+
+        let fg = tokio::time::timeout(Duration::from_secs(5), slot.run_foreground(async { 42u8 }))
+            .await
+            .expect("foreground must preempt the in-flight background call, not block behind it");
+        assert_eq!(fg, 42);
+        assert!(
+            matches!(bg.await.unwrap(), SlotOutcome::Preempted),
+            "the in-flight background call was preempted, its future dropped"
+        );
     }
 }
