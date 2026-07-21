@@ -425,12 +425,15 @@ pub async fn complete(
 /// failed local leg is always safe.
 ///
 /// "Background waits and retries" (#297): rather than deferring a whole idle-gated scheduler cycle,
-/// this retries IN-PROCESS a bounded, jittered number of times ([`tunables::MAX_LOCAL_BACKGROUND_RETRIES`])
-/// for the two transient cases only — a chat PREEMPTION (the GPU was briefly busy; not a fault) and a
-/// host that ANSWERED "model loading" (alive, warming up). Every other failure is a strike: it is NOT
-/// retried here (that would be the hot loop against a reloading server the research warns against) —
-/// it falls back to cloud, or surfaces. Past the bound the job returns to its scheduler for a
-/// next-tick retry with its cursor unadvanced, so a user mid-conversation never traps it spinning.
+/// this retries IN-PROCESS — bounded by a TOTAL-ELAPSED budget, not an attempt count — for the two
+/// transient cases only: a chat PREEMPTION (the GPU was briefly busy; not a fault) and a host that
+/// ANSWERED "model loading" (alive, warming up). The two get different budgets: a warming model is
+/// worth waiting out for the whole cold-load window ([`tunables::LOADING_RETRY_BUDGET`]), a busy GPU
+/// is not ([`tunables::PREEMPTION_RETRY_BUDGET`] is short — defer to the idle scheduler, the right
+/// backstop for "chat is using the GPU"). Every OTHER failure is a strike: NOT retried here (that
+/// would be the hot loop against a reloading server the research warns against) — it falls back to
+/// cloud, or surfaces. Past the budget the job returns to its scheduler for a next-tick retry with its
+/// cursor unadvanced, so a user mid-conversation never traps it spinning.
 async fn run_local_complete(
     app: &AppHandle,
     local: &LocalArm,
@@ -456,7 +459,8 @@ async fn run_local_complete(
         };
     }
 
-    let mut retries: u32 = 0;
+    let loop_start = Instant::now();
+    let mut loading_recheck: u32 = 0;
     loop {
         let start = Instant::now();
         let token = local.token.as_ref().map(Secret::expose);
@@ -472,12 +476,11 @@ async fn run_local_complete(
             }
             SlotOutcome::Preempted => {
                 // A chat turn took the single GPU slot — not the host's fault (never a strike). Wait a
-                // short jittered beat for chat to finish and retry in-process; the lane is free during
-                // the sleep, so chat proceeds. Bounded: if the user is in a rapid back-and-forth, hand
-                // back to the scheduler for a next-tick retry rather than spinning.
+                // short jittered beat and retry: the retry mostly BLOCKS on the slot's lane until chat
+                // yields (it does not hit the server), so it is cheap. Bounded by a short total-elapsed
+                // budget — a persistently-busy GPU hands back to the idle scheduler rather than spinning.
                 rt.record(CallOutcome::Neutral);
-                if retries < tunables::MAX_LOCAL_BACKGROUND_RETRIES {
-                    retries += 1;
+                if loop_start.elapsed() < tunables::PREEMPTION_RETRY_BUDGET {
                     tokio::time::sleep(preemption_retry_delay()).await;
                     continue;
                 }
@@ -487,14 +490,16 @@ async fn run_local_complete(
             }
             SlotOutcome::Ran(Err(failure)) => {
                 rt.record(CallOutcome::for_failure(&failure.kind));
-                // A host that ANSWERED "model loading" is alive and warming up — a bounded, backed-off
-                // recheck honours a local-then-cloud user's local preference (and spares needless cloud
-                // spend) without hammering. Every other failure is a strike and is NOT retried here.
+                // A host that ANSWERED "model loading" is alive and warming up — recheck with a capped
+                // full-jitter backoff across the whole cold-load window, so the model completes locally
+                // (honouring a local-then-cloud user's local preference, sparing needless cloud spend)
+                // instead of being abandoned after a few seconds. Every other failure is a strike and is
+                // NOT retried here — no hot loop against a reloading server.
                 if matches!(failure.kind, LocalFailKind::ModelLoading)
-                    && retries < tunables::MAX_LOCAL_BACKGROUND_RETRIES
+                    && loop_start.elapsed() < tunables::LOADING_RETRY_BUDGET
                 {
-                    retries += 1;
-                    tokio::time::sleep(loading_retry_backoff(retries)).await;
+                    loading_recheck += 1;
+                    tokio::time::sleep(loading_retry_backoff(loading_recheck)).await;
                     continue;
                 }
                 return match cloud {

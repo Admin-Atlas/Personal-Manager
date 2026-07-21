@@ -185,10 +185,11 @@ otherwise). Implemented in `src/lib/format.ts`.
      `PRAGMA writable_schema=RESET;` at the top of that later migration** (verified
      clean on the bundled SQLCipher — it reloads the schema in-memory without a
      page-1 write, so no HMAC corruption, unlike a mid-run schema-cookie bump).
-     Reopening the connection works too. A satellite table also sidesteps it, but
-     only prefer that when the data is genuinely sparse (see the satellite vs
-     columns note in `db/migrations.rs`); for dense per-row fields, columns +
-     `RESET` is the right shape.
+     Reopening the connection works too. **v37 does exactly this** — a `RESET`
+     followed by `ALTER usage_log ADD COLUMN …` on the v36-patched table. (A
+     satellite table also sidesteps the ALTER, but only reach for one when the data
+     is genuinely SPARSE; for dense per-row fields, columns + `RESET` is the right
+     shape.)
 4. **Don't hold the DB lock across `.await`.** Lock, do quick sync work, drop the
    guard, then do network/async work.
 5. **The API key stays in Rust.** OpenRouter is called from the backend; the key

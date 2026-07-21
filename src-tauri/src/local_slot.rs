@@ -31,15 +31,20 @@ use crate::openai_compat::{LocalFailKind, WindowInfo};
 // here — never a hunt through the gateway. Where a value departs from the epic's baseline, the
 // reason is in the doc comment on the constant.
 //
-// The BACKGROUND retry policy lives here too (MAX_LOCAL_BACKGROUND_RETRIES / PREEMPTION_RETRY_DELAY /
-// RETRY_BASE_BACKOFF): a preempted or warming-up background call retries in-process a bounded number
-// of times, jittered, before it defers to its scheduler — the shape is in preemption_retry_delay() /
-// loading_retry_backoff() and the gateway's run_local_complete. Foreground chat is never retried (it
-// is interactive: it falls back to cloud pre-first-token, or surfaces the error). The retry is
-// deliberately NARROW so it can never become the hot loop against a reloading server the research
-// warns against: only a PREEMPTION (not a fault) or a host that ANSWERED "model loading" (alive,
-// warming up) is retried — every hard failure (refused / timeout / 5xx) skips the loop and falls back
-// to cloud, or defers to the circuit breaker + the next scheduler tick.
+// The BACKGROUND retry policy lives here too: a preempted or warming-up background call retries
+// in-process, jittered, until a **total-elapsed budget** is spent, before it defers to its scheduler
+// — the shape is in preemption_retry_delay() / loading_retry_backoff() and the gateway's
+// run_local_complete. The budget is a total-elapsed cap (not an attempt count) because the case this
+// exists for — a host that ANSWERED "model loading" — must be able to span a real cold model load
+// (30-60s+), which an attempt count with a short backoff cannot honestly express. The two reasons get
+// DIFFERENT budgets: a warming model is worth waiting out (LOADING_RETRY_BUDGET ≈ the cold-load window
+// the TTFT timeout also covers), a busy GPU is not (PREEMPTION_RETRY_BUDGET is short — defer to the
+// idle-gated scheduler, which is the right backstop for "chat is using the GPU"). Foreground chat is
+// never retried (interactive: cloud-fallback pre-first-token, or surface the error). The retry stays
+// NARROW so it can never become the hot loop against a reloading server the research warns against:
+// only a PREEMPTION (not a fault) or a "model loading" 503 (alive, warming) is retried — every hard
+// failure (refused / timeout / 5xx) skips the loop and falls back to cloud, or defers to the circuit
+// breaker + the next scheduler tick.
 pub mod tunables {
     use std::time::Duration;
 
@@ -111,28 +116,36 @@ pub mod tunables {
     // existing `loop_guard_leaves_legitimate_repetition_alone` test both confirm this), so the
     // period detector's 6-cycle / 768-byte requirement is the researched, false-positive-safe form.
 
-    // --- Background retry policy — "background waits and retries" (#297) made bounded + jittered. ---
+    // --- Background retry policy — "background waits and retries" (#297), total-elapsed-bounded. ---
 
-    /// Bound on in-process BACKGROUND retries (preemption + warming-up combined, across one call).
-    /// Small on purpose: past this the job returns cleanly to its (idle-gated) scheduler for a
-    /// next-tick retry with its cursor unadvanced, rather than spinning while a user is mid-chat. Chat
-    /// always wins the single GPU slot, so a busy GPU must never trap a background job in a retry loop.
-    pub const MAX_LOCAL_BACKGROUND_RETRIES: u32 = 3;
+    /// Total in-process wait for a foreground chat to free the single GPU slot before a PREEMPTED
+    /// background job defers to its (idle-gated) scheduler for a next-tick retry (cursor unadvanced).
+    /// Short on purpose: a busy GPU is exactly what the idle scheduler backstop is for, so there is no
+    /// point waiting out a long chat session in-process — a user in a rapid back-and-forth must not
+    /// trap the job. (Preemption retries are cheap: they mostly block on the slot's lane until chat
+    /// yields, they do not hit the server.)
+    pub const PREEMPTION_RETRY_BUDGET: Duration = Duration::from_secs(20);
 
-    /// Delay before retrying a background call a foreground chat PREEMPTED (took the single GPU slot).
-    /// "Background waits and retries" made literal: a short jittered beat for the chat turn to finish,
-    /// instead of deferring the whole job to the next scheduler tick. Flat, not escalating — a
-    /// preemption is not a fault, so there is nothing to back off from; [`super::preemption_retry_delay`]
-    /// jitters it to `[base/2, 3·base/2]` so a retry never fires instantly back into a still-active chat.
+    /// Per-retry pause after a preemption. Flat, not escalating — a preemption is not a fault, so there
+    /// is nothing to back off from; [`super::preemption_retry_delay`] jitters it to `[base/2, 3·base/2]`
+    /// so a retry never fires instantly back into a still-active chat.
     pub const PREEMPTION_RETRY_DELAY: Duration = Duration::from_secs(3);
 
-    /// Base for the exponential + full-jitter backoff (AWS "backoff and jitter") between in-process
-    /// retries of a host that ANSWERED "model loading" — alive and warming up, so a bounded, backed-off
-    /// recheck is polite, not a hammer. Attempt N waits a uniform-random `[0, BASE · 2^(N-1)]`
-    /// ([`super::loading_retry_backoff`]); with the bound above the worst single wait is ~4×base. A host
-    /// that never finishes loading hands off to cloud (local-then-cloud) or surfaces a clear "still
-    /// loading" error (local-only) after the bound — it is never hammered.
+    /// Total in-process wait for a host that keeps answering "model loading" before we give up on the
+    /// warm-up (local-then-cloud → cloud; local-only → a clear "still loading" error + a next-tick
+    /// retry). Sized to the cold-load window the TTFT timeout also covers (Ollama/LM Studio JIT-loading
+    /// a model can take 30-60s+), so a warming model completes locally instead of being abandoned after
+    /// a few seconds. A hard failure is NEVER retried, so this only ever spans a genuinely-warming host.
+    pub const LOADING_RETRY_BUDGET: Duration = Duration::from_secs(120);
+
+    /// Base for the exponential + full-jitter backoff (AWS "backoff and jitter") between "model
+    /// loading" rechecks: recheck N waits a uniform-random `[0, min(CAP, BASE · 2^(N-1))]`
+    /// ([`super::loading_retry_backoff`]).
     pub const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(2);
+
+    /// Cap on a single "model loading" backoff step, so rechecks stay frequent late in
+    /// [`LOADING_RETRY_BUDGET`] — a loaded model is then noticed within ~this long, not a full doubling.
+    pub const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(15);
 }
 
 // =================================================================================================
@@ -166,16 +179,17 @@ pub fn preemption_retry_delay() -> Duration {
 }
 
 /// AWS full-jitter exponential backoff for retrying a warming-up ("model loading") host on 1-based
-/// `attempt`: a uniform-random wait in `[0, BASE · 2^(attempt-1)]`, saturating so a large attempt
-/// can never overflow the shift or the multiply.
+/// `attempt`: a uniform-random wait in `[0, min(RETRY_BACKOFF_CAP, BASE · 2^(attempt-1))]`. The cap
+/// keeps rechecks frequent late in [`tunables::LOADING_RETRY_BUDGET`]; the saturating shift/multiply
+/// mean a large attempt can never overflow (it just pins to the cap).
 pub fn loading_retry_backoff(attempt: u32) -> Duration {
     let factor = 1u32
         .checked_shl(attempt.saturating_sub(1))
         .unwrap_or(u32::MAX);
-    let ceil = tunables::RETRY_BASE_BACKOFF
+    let uncapped = tunables::RETRY_BASE_BACKOFF
         .checked_mul(factor)
-        .unwrap_or(tunables::RETRY_BASE_BACKOFF);
-    jitter_up_to(ceil)
+        .unwrap_or(tunables::RETRY_BACKOFF_CAP);
+    jitter_up_to(uncapped.min(tunables::RETRY_BACKOFF_CAP))
 }
 
 // =================================================================================================
@@ -733,19 +747,23 @@ mod tests {
     }
 
     #[test]
-    fn loading_backoff_stays_within_the_exponential_ceiling() {
-        for attempt in 1..=tunables::MAX_LOCAL_BACKGROUND_RETRIES {
-            let ceil = tunables::RETRY_BASE_BACKOFF * (1u32 << (attempt - 1));
+    fn loading_backoff_stays_within_the_capped_exponential_ceiling() {
+        for attempt in 1..=10u32 {
+            let uncapped = tunables::RETRY_BASE_BACKOFF
+                .checked_mul(1u32 << (attempt - 1))
+                .unwrap_or(tunables::RETRY_BACKOFF_CAP);
+            let ceil = uncapped.min(tunables::RETRY_BACKOFF_CAP);
             for _ in 0..2000 {
                 let d = loading_retry_backoff(attempt);
                 assert!(
                     d <= ceil,
-                    "attempt {attempt}: full-jitter backoff must stay within [0, base·2^(n-1)]"
+                    "attempt {attempt}: full-jitter backoff must stay within [0, min(cap, base·2^(n-1))]"
                 );
             }
         }
-        // Saturates rather than panicking on an absurd attempt count.
-        let _ = loading_retry_backoff(u32::MAX);
+        // Late attempts pin to the cap, and an absurd attempt count saturates rather than panicking.
+        assert!(loading_retry_backoff(20) <= tunables::RETRY_BACKOFF_CAP);
+        assert!(loading_retry_backoff(u32::MAX) <= tunables::RETRY_BACKOFF_CAP);
     }
 
     #[test]

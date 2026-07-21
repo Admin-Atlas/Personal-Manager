@@ -6402,33 +6402,23 @@ pub(crate) fn log_usage(
     usage: &openrouter::Usage,
     meta: &llm_gateway::CallMeta,
 ) {
-    let inserted = conn.execute(
-        "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+    // One row, tagged with how it was served (provider / latency / fallback, the v37 columns).
+    let fallback = meta.fallback.as_ref().map(|f| f.as_log_str());
+    let _ = conn.execute(
+        "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd, \
+         provider, latency_ms, fallback_reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             model,
             kind,
             usage.prompt_tokens,
             usage.completion_tokens,
-            usage.cost
+            usage.cost,
+            meta.provider.as_str(),
+            meta.latency_ms as i64,
+            fallback
         ],
     );
-    // Tag the row's provider/latency/fallback in the satellite (migration v37). Best-effort like the
-    // row itself, and only when the row landed so `last_insert_rowid` is this row's.
-    if inserted.is_ok() {
-        let usage_id = conn.last_insert_rowid();
-        let fallback = meta.fallback.as_ref().map(|f| f.as_log_str());
-        let _ = conn.execute(
-            "INSERT INTO usage_meta(usage_id, provider, latency_ms, fallback_reason) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                usage_id,
-                meta.provider.as_str(),
-                meta.latency_ms as i64,
-                fallback
-            ],
-        );
-    }
 }
 
 /// Write collected background usage rows under one short lock (best-effort), each attributed to its

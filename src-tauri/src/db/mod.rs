@@ -922,7 +922,9 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE usage_meta; \
+            "ALTER TABLE usage_log DROP COLUMN provider; \
+             ALTER TABLE usage_log DROP COLUMN latency_ms; \
+             ALTER TABLE usage_log DROP COLUMN fallback_reason; \
              ALTER TABLE documents DROP COLUMN rebuild_pass; \
              DROP TABLE flags; \
              ALTER TABLE chunks DROP COLUMN chat_turn_id; \
@@ -1073,7 +1075,9 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "DROP TABLE usage_meta; \
+            "ALTER TABLE usage_log DROP COLUMN provider; \
+             ALTER TABLE usage_log DROP COLUMN latency_ms; \
+             ALTER TABLE usage_log DROP COLUMN fallback_reason; \
              ALTER TABLE documents DROP COLUMN rebuild_pass; \
              DROP TABLE flags; \
              ALTER TABLE chunks DROP COLUMN chat_turn_id; \
