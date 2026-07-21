@@ -179,7 +179,8 @@ pub(crate) async fn generate_title(app: &AppHandle, conversation_id: i64) -> Res
 
     // 3. Name the conversation (async, no lock held).
     let messages = render_title_request(&segment);
-    let completion = crate::llm_gateway::complete(app, &route, &messages, false).await?;
+    let crate::llm_gateway::LlmOutcome { completion, meta } =
+        crate::llm_gateway::complete(app, &route, &messages, false).await?;
     let Some(title) = clamp_title(&completion.text) else {
         return Ok(false);
     };
@@ -194,16 +195,7 @@ pub(crate) async fn generate_title(app: &AppHandle, conversation_id: i64) -> Res
                 .model
                 .as_deref()
                 .or(Some(route.primary_model_id()));
-            let _ = conn.execute(
-                "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
-                 VALUES (?1, 'chat_title', ?2, ?3, ?4)",
-                params![
-                    model,
-                    completion.usage.prompt_tokens,
-                    completion.usage.completion_tokens,
-                    completion.usage.cost
-                ],
-            );
+            crate::commands::log_usage(&conn, "chat_title", model, &completion.usage, &meta);
         }
         applied
     };

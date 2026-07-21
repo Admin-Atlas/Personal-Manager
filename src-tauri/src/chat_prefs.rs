@@ -197,7 +197,8 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
     // 3. Extract (async, no lock held). A model/parse failure propagates so the cursor is NOT advanced
     //    and the turns are retried next time.
     let messages = preferences::render_chat_extract_request(&user_turns, &project_names);
-    let completion = crate::llm_gateway::complete(app, &route, &messages, false).await?;
+    let crate::llm_gateway::LlmOutcome { completion, meta } =
+        crate::llm_gateway::complete(app, &route, &messages, false).await?;
     let drafts = preferences::parse_chat_preferences(&completion.text);
 
     // 4. Short write lock: land the records (resolve + dedup) and advance the cursor together; log spend.
@@ -209,16 +210,7 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
             .model
             .as_deref()
             .or(Some(route.primary_model_id()));
-        let _ = conn.execute(
-            "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
-             VALUES (?1, 'chat_prefs', ?2, ?3, ?4)",
-            params![
-                model,
-                completion.usage.prompt_tokens,
-                completion.usage.completion_tokens,
-                completion.usage.cost
-            ],
-        );
+        crate::commands::log_usage(&conn, "chat_prefs", model, &completion.usage, &meta);
         inserted
     };
     Ok(inserted)

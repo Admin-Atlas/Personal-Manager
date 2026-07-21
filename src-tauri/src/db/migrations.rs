@@ -1021,6 +1021,25 @@ const MIGRATIONS: &[&str] = &[
      WHERE type = 'table' AND name = 'usage_log';
     PRAGMA writable_schema = OFF;
     "#,
+    // v37 (#297 live local provider): tag each usage row with how it was served, so the Usage & cost
+    // table and the Local AI tab can tell local from cloud spend and show local latency/throughput.
+    //
+    // A SATELLITE table (1:1 with usage_log, cascading on delete), NOT new columns on usage_log. Why:
+    // v36 relaxed usage_log's CHECK via a `writable_schema` text-patch that leaves this connection's
+    // cached definition of usage_log stale, so an `ALTER usage_log ADD COLUMN` would regenerate the
+    // table from that stale definition and fail ("near ',': syntax error"). A rebuild would need a
+    // `DROP TABLE` (the additive-migrations guard forbids it). The satellite sidesteps both — it is a
+    // plain additive CREATE that never touches usage_log's schema, matching PM's existing satellite
+    // pattern (v30 spreadsheets). A row is absent for pre-v37 spend and for any write that fails
+    // best-effort — read it with a LEFT JOIN, treating absent as "provider unknown".
+    r#"
+    CREATE TABLE usage_meta (
+        usage_id        INTEGER PRIMARY KEY REFERENCES usage_log(id) ON DELETE CASCADE,
+        provider        TEXT,     -- 'local' | 'cloud'
+        latency_ms      INTEGER,  -- wall-clock of the serving leg, milliseconds
+        fallback_reason TEXT      -- why cloud served instead of the preferred local; NULL = none
+    );
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1037,10 +1056,13 @@ pub fn run(conn: &Connection) -> Result<()> {
         tx.commit()?;
         version += 1;
     }
-    // A `writable_schema` text-patch (v17's importance-CHECK relaxation) edits the stored schema
-    // without bumping the schema cookie, so this connection would keep compiling the OLD constraint
-    // into prepared statements. If any migration ran, bump the cookie once to force a reparse so the
-    // relaxed CHECK takes effect immediately (harmless when no writable_schema edit was involved).
+    // A `writable_schema` text-patch (v17's importance-CHECK relaxation and its siblings) edits the
+    // stored schema without bumping the schema cookie, so this connection would keep compiling the OLD
+    // constraint into prepared statements. If any migration ran, bump the cookie once to force a
+    // reparse so the relaxed CHECK takes effect immediately (harmless when no writable_schema edit was
+    // involved). NOTE: a migration that must ALTER a just-writable_schema-patched table forces its own
+    // reparse inline (see v37) — mid-loop reparsing here disturbs the still-settling schema on a
+    // teardown-then-remigrate path (the db-ladder tests), so this stays a single end-of-run bump.
     if version as i64 != current {
         let cookie: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
         conn.execute_batch(&format!(
@@ -1070,7 +1092,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 36,
+            version, 37,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1083,7 +1105,8 @@ mod tests {
              spreadsheet ingestion table is v30; project activity log is v31; \
              structured flag layer is v32; per-flag instance timestamp (F-18) is v33; \
              per-calendar quiet flag is v34; rebuild pass stamp (#371) is v35; \
-             usage_log kind CHECK relaxed for chat housekeeping is v36)"
+             usage_log kind CHECK relaxed for chat housekeeping is v36; \
+             usage_log provider/latency/fallback columns for the local provider is v37)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1911,6 +1934,66 @@ mod tests {
             .is_err(),
             "an unknown kind must still violate the relaxed CHECK"
         );
+    }
+
+    /// v37 adds the `usage_meta` satellite (provider / latency_ms / fallback_reason, 1:1 with
+    /// usage_log, cascading). A tagged row round-trips; a usage_log row with no satellite reads as
+    /// "provider unknown" via LEFT JOIN; deleting the usage row cascades the satellite away.
+    #[test]
+    fn usage_meta_satellite_lands_and_cascades() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute(
+            "INSERT INTO usage_log(id, model, kind, prompt_tokens, completion_tokens) \
+             VALUES (1, 'local-model', 'chat', 10, 20)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_meta(usage_id, provider, latency_ms, fallback_reason) \
+             VALUES (1, 'local', 1234, NULL)",
+            [],
+        )
+        .expect("a provider-tagged satellite row inserts after v37");
+        // A cloud fallback row: no satellite for it yet, so the LEFT JOIN reads provider NULL.
+        conn.execute(
+            "INSERT INTO usage_log(id, model, kind) VALUES (2, 'gpt', 'background')",
+            [],
+        )
+        .unwrap();
+
+        let (provider, latency): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT m.provider, m.latency_ms FROM usage_log u \
+                 LEFT JOIN usage_meta m ON m.usage_id = u.id WHERE u.id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(provider.as_deref(), Some("local"));
+        assert_eq!(latency, Some(1234));
+
+        let untagged: Option<String> = conn
+            .query_row(
+                "SELECT m.provider FROM usage_log u LEFT JOIN usage_meta m ON m.usage_id = u.id WHERE u.id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            untagged, None,
+            "a row with no satellite reads as provider-unknown"
+        );
+
+        // Deleting the usage row cascades its satellite away (foreign_keys is ON in db::open).
+        conn.execute("DELETE FROM usage_log WHERE id = 1", [])
+            .unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM usage_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "the satellite cascades on usage_log delete");
     }
 
     // --- T-05: the full migration ladder over real user data ----------------

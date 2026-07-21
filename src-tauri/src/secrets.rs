@@ -21,6 +21,10 @@ const OPENROUTER_KEY: &str = "openrouter_api_key";
 /// the Learning-You profile distillation), so the user can see at a glance which
 /// OpenRouter spend is interactive chat vs background processing (Step 4).
 const OPENROUTER_BACKGROUND_KEY: &str = "openrouter_background_key";
+/// Optional bearer token for a user-configured local OpenAI-compatible endpoint (#297). Most
+/// loopback servers need none; a remote (LAN / Tailscale) one may. Kept in the keychain like every
+/// other credential — never handed to the webview, never in settings.
+const LOCAL_LLM_ENDPOINT_TOKEN: &str = "local_llm_endpoint_token";
 const DB_KEY: &str = "db_encryption_key";
 /// The backup passphrase, stored ONLY when the user opts in to automatic (scheduled) backups —
 /// unattended runs can't prompt for it. Same keychain trust as [`DB_KEY`]: it is the sole secret
@@ -125,6 +129,27 @@ pub fn get_background_or_primary_key() -> Result<Option<Secret>> {
         Some(key) => Ok(Some(key)),
         None => get_openrouter_key(),
     }
+}
+
+/// The bearer token for a user-configured local endpoint, if one was set. A blank stored value reads
+/// as absent (matching the OpenRouter keys), so a saved-then-cleared token doesn't send `Bearer `.
+pub fn get_local_llm_endpoint_token() -> Result<Option<Secret>> {
+    Ok(get(LOCAL_LLM_ENDPOINT_TOKEN)?
+        .filter(|v| !v.trim().is_empty())
+        .map(Secret::from))
+}
+
+pub fn set_local_llm_endpoint_token(value: &str) -> Result<()> {
+    set(LOCAL_LLM_ENDPOINT_TOKEN, value)
+}
+
+pub fn clear_local_llm_endpoint_token() -> Result<()> {
+    delete(LOCAL_LLM_ENDPOINT_TOKEN)
+}
+
+/// Whether a local-endpoint bearer token is stored (presence only — the value never leaves Rust).
+pub fn has_local_llm_endpoint_token() -> Result<bool> {
+    Ok(get_local_llm_endpoint_token()?.is_some())
 }
 
 // --- Google OAuth (Step 6) ---
@@ -424,6 +449,7 @@ pub fn known_cached_vault_ids() -> Vec<String> {
 const FIXED_KEYS: &[&str] = &[
     OPENROUTER_KEY,
     OPENROUTER_BACKGROUND_KEY,
+    LOCAL_LLM_ENDPOINT_TOKEN,
     DB_KEY,
     BACKUP_PASSPHRASE,
     GOOGLE_CLIENT_ID,

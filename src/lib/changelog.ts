@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.37.0-alpha",
+    date: "2026-07-21",
+    highlights: [
+      "Under-the-hood: the local-AI engine is now live inside PM. It can talk to a local model server, hand a request to the cloud honestly when the local one is slow or unreachable (and tell you when it did), and count local and cloud usage separately. There's still no switch to flip — the Local AI setup screen that turns it on comes next.",
+    ],
+  },
+  {
     version: "3.36.1-alpha",
     date: "2026-07-21",
     highlights: [

@@ -547,10 +547,23 @@ pub async fn propose(
     project: &str,
     samples: &[String],
     other_projects: &[String],
-) -> (ProjectProposal, Option<(openrouter::Usage, Option<String>)>) {
+) -> (
+    ProjectProposal,
+    Option<(
+        openrouter::Usage,
+        Option<String>,
+        crate::llm_gateway::CallMeta,
+    )>,
+) {
     let messages = build_messages(project, samples, other_projects);
     match crate::llm_gateway::complete(app, plan, &messages, false).await {
-        Ok(c) => (parse_proposal(&c.text, project), Some((c.usage, c.model))),
+        Ok(crate::llm_gateway::LlmOutcome {
+            completion: c,
+            meta,
+        }) => (
+            parse_proposal(&c.text, project),
+            Some((c.usage, c.model, meta)),
+        ),
         Err(e) => (
             ProjectProposal::fallback(format!("Proposal request failed: {e}")),
             None,

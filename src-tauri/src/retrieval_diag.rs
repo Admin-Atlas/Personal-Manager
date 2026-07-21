@@ -40,7 +40,8 @@ pub async fn diagnose(
     let messages = build_messages(symptom, query, explain);
     // No cache_prefix: each diagnostic carries a different explain state, so there's no stable
     // prefix to reuse across calls.
-    let completion = crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    let crate::llm_gateway::LlmOutcome { completion, .. } =
+        crate::llm_gateway::complete(app, plan, &messages, false).await?;
     Ok(completion.text.trim().to_string())
 }
 

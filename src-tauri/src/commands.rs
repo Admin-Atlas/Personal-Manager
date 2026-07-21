@@ -179,6 +179,16 @@ pub enum ChatEvent {
     Error {
         message: String,
     },
+    /// The reply was served by cloud despite a local-endpoint preference (#297): the user asked for
+    /// local, but it failed or was resting, so cloud answered. NOT an error (the reply is real) and
+    /// NOT a power-policy switch. `reason` is the normalized slug (`hard_failure:<kind>` / `cooldown`);
+    /// the honesty strip (#297 PR6) maps it to friendly text. Today's if/else consumer safely ignores
+    /// this unknown variant until PR6 mirrors it in TS.
+    Fallback {
+        from_model: String,
+        to_model: String,
+        reason: String,
+    },
 }
 
 // --- secrets ---
@@ -1972,9 +1982,7 @@ pub async fn send_message(
     state.mark_user_activity();
 
     let Some(plan) = llm_gateway::resolve(&app, Role::Chat)? else {
-        return Err(Error::Other(
-            "No OpenRouter API key set. Add one in Settings.".into(),
-        ));
+        return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
     // Save the user turn and gather history + the learned profile + the
@@ -2237,8 +2245,8 @@ pub async fn send_message(
     })
     .await;
 
-    let completion = match result {
-        Ok(c) => c,
+    let llm_gateway::LlmOutcome { completion, meta } = match result {
+        Ok(o) => o,
         Err(e) => {
             let _ = on_event.send(ChatEvent::Error {
                 message: e.to_string(),
@@ -2246,6 +2254,19 @@ pub async fn send_message(
             return Err(e);
         }
     };
+    // If the local endpoint the user preferred didn't serve this turn (it failed or was resting), tell
+    // the UI so it can render the honesty strip (#297 PR6) — a fell-back reply is real, so this is
+    // NOT an Error. Today's chat consumer safely ignores the unknown variant until PR6 mirrors it.
+    if let Some(reason) = &meta.fallback {
+        let _ = on_event.send(ChatEvent::Fallback {
+            from_model: meta.displaced_local_model.clone().unwrap_or_default(),
+            to_model: completion
+                .model
+                .clone()
+                .unwrap_or_else(|| plan.primary_model_id().to_string()),
+            reason: reason.as_log_str(),
+        });
+    }
     // A reply that hit the model's token ceiling is real text, but it is not a finished answer — it
     // stops mid-thought. It is persisted to `messages`, to the vault file and to the index, so
     // storing it unmarked means PM later retrieves and quotes a trailing-off sentence as though the
@@ -2281,7 +2302,7 @@ pub async fn send_message(
             params![conversation_id, reply, used_model, citations_json],
         )?;
         let id = conn.last_insert_rowid();
-        log_usage(&conn, "chat", Some(&used_model), &usage);
+        log_usage(&conn, "chat", Some(&used_model), &usage, &meta);
         // Record the exact prompt size OpenRouter just measured as the context-meter's numerator (card 7D).
         // Because it counted the real assembled prompt, this already reflects everything that rode along —
         // profile, agenda, rolling summary, recency window, retrieved grounding. Best-effort: a session row
@@ -2349,6 +2370,30 @@ pub struct ContextStatus {
     pub upgrade: Vec<context_budget::ModelOption>,
 }
 
+/// The usable context budget for a configured LOCAL model: 85% of its proven window (leaving
+/// headroom), from the in-memory cache the gateway fills after a local reply. `None` when the model
+/// isn't the configured local chat/background model, or its window hasn't been probed yet. Cache-only
+/// (no network, no await) — the meter must never block on the endpoint.
+fn local_budget_window(app: &AppHandle, conn: &Connection, model: &str) -> Option<i64> {
+    let base_url = db::get_setting(conn, llm_gateway::LOCAL_BASE_URL_KEY)
+        .ok()
+        .flatten()?;
+    let is_local_model = [
+        llm_gateway::LOCAL_CHAT_MODEL_KEY,
+        llm_gateway::LOCAL_BACKGROUND_MODEL_KEY,
+    ]
+    .iter()
+    .any(|k| db::get_setting(conn, k).ok().flatten().as_deref() == Some(model));
+    if !is_local_model {
+        return None;
+    }
+    let info = app
+        .state::<AppState>()
+        .local_ai
+        .cached_window(&base_url, model)?;
+    Some(((info.tokens as f64 * 0.85).floor() as i64).max(1))
+}
+
 /// How full the SELECTED model's context window is for a conversation, plus what the user can do about it
 /// (board card 7D, #143). Cheap read the chat UI calls after each reply: it joins the measured last-turn
 /// prompt size, the model's window from the daily `model_pricing` catalogue, and the un-summarised tail into
@@ -2384,7 +2429,11 @@ pub async fn chat_context_status(app: AppHandle, conversation_id: i64) -> Result
         .iter()
         .find(|m| m.id == model)
         .and_then(|m| m.context_length)
-        .map(|v| v as i64);
+        .map(|v| v as i64)
+        // A local model is uncatalogued — read its proven window from the in-memory cache the gateway
+        // fills after the first local reply. `None` (never chatted locally yet) → the meter stays
+        // honestly "unknown" rather than guessing.
+        .or_else(|| local_budget_window(&app, &conn, &model));
 
     // Per-conversation state: the measured last prompt size, the summary, and its cursor.
     let session: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
@@ -2614,9 +2663,7 @@ pub async fn retrieval_diagnose(
     explain: crate::commands_dev::DevRetrievalExplain,
 ) -> Result<String> {
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(
-            "No OpenRouter API key set. Add one in Settings.".into(),
-        ));
+        return Err(Error::Other(llm_gateway::no_provider_message()));
     };
     retrieval_diag::diagnose(&app, &plan, &symptom, &query, &explain).await
 }
@@ -3352,9 +3399,7 @@ pub async fn propose_metadata(
     on_event: Channel<ReviewEvent>,
 ) -> Result<()> {
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(
-            "No OpenRouter API key set. Add one in Settings.".into(),
-        ));
+        return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
     // Bound the (untrusted webview) id list: it expands to one SQL placeholder
@@ -3444,7 +3489,8 @@ pub async fn propose_metadata(
     };
 
     let mut proposed = 0;
-    let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
+    let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
+        Vec::new();
     for p in pending {
         // Fold this document's Drive folder into its own copy of the profile preamble — the same
         // plain-text seam that carries the Learning-You preferences. `propose` is called once per
@@ -3460,8 +3506,8 @@ pub async fn propose_metadata(
             doc_profile.as_deref(),
         )
         .await;
-        if let Some((usage, served)) = usage_info {
-            usage_rows.push((served, usage));
+        if let Some((usage, served, meta)) = usage_info {
+            usage_rows.push((served, usage, meta));
         }
         // Resolve the model's project string to its canonical form for display, so a known variant
         // is shown (and later committed) as the canonical name — the variant never surfaces. A
@@ -3956,9 +4002,7 @@ pub async fn propose_project_metadata(
     on_event: Channel<ProjectProposalEvent>,
 ) -> Result<()> {
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(
-            "No OpenRouter API key set. Add one in Settings.".into(),
-        ));
+        return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
     // Bound the (untrusted webview) name list — one model call per name, so this
@@ -3992,7 +4036,8 @@ pub async fn propose_project_metadata(
     };
 
     let mut proposed = 0;
-    let mut usage_rows: Vec<(Option<String>, openrouter::Usage)> = Vec::new();
+    let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
+        Vec::new();
     for t in targets {
         let others: Vec<String> = all_projects
             .iter()
@@ -4001,8 +4046,8 @@ pub async fn propose_project_metadata(
             .collect();
         let (proposal, usage_info) =
             projects::propose(&app, &plan, &t.name, &t.samples, &others).await;
-        if let Some((usage, served)) = usage_info {
-            usage_rows.push((served, usage));
+        if let Some((usage, served, meta)) = usage_info {
+            usage_rows.push((served, usage, meta));
         }
         let _ = on_event.send(ProjectProposalEvent::Proposed {
             project: t.name,
@@ -6035,9 +6080,7 @@ pub async fn parse_preference_statement(
         entities::canonical_project_names(&conn)?
     };
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(
-            "No OpenRouter API key set. Add one in Settings.".into(),
-        ));
+        return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
     let mut draft = preferences::parse_statement(&app, &plan, &text, &projects).await?;
@@ -6084,9 +6127,7 @@ pub fn get_daily_briefing(state: State<'_, AppState>) -> Result<briefing::DailyB
 #[tauri::command]
 pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBriefing> {
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(
-            "No OpenRouter API key set. Add one in Settings.".into(),
-        ));
+        return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
     let (snapshot, profile) = {
@@ -6122,7 +6163,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         return briefing::get_briefing(&conn);
     };
 
-    let (text, usage, served) =
+    let (text, usage, served, meta) =
         briefing::generate(&app, &plan, &snapshot, profile.as_deref()).await?;
 
     let state = app.state::<AppState>();
@@ -6133,6 +6174,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
         "background",
         served.as_deref().or(Some(plan.primary_model_id())),
         &usage,
+        &meta,
     );
     briefing::save_briefing(&conn, &text, &now)?;
     briefing::get_briefing(&conn)
@@ -6204,13 +6246,12 @@ pub async fn route_focus_input(app: AppHandle, text: String) -> Result<flags::Fo
         (candidates, project_names)
     };
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(
-            "No OpenRouter API key set. Add one in Settings.".into(),
-        ));
+        return Err(Error::Other(llm_gateway::no_provider_message()));
     };
 
     let messages = flags::render_route_request(&text, &candidates, &project_names);
-    let completion = llm_gateway::complete(&app, &plan, &messages, false).await?;
+    let llm_gateway::LlmOutcome { completion, meta } =
+        llm_gateway::complete(&app, &plan, &messages, false).await?;
     {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -6222,6 +6263,7 @@ pub async fn route_focus_input(app: AppHandle, text: String) -> Result<flags::Fo
                 .as_deref()
                 .or(Some(plan.primary_model_id())),
             &completion.usage,
+            &meta,
         );
     }
     let route = flags::parse_route(&completion.text, &candidates, &text);
@@ -6349,9 +6391,18 @@ fn cached_catalogue(conn: &Connection) -> Result<Vec<openrouter::ModelDetail>> {
 }
 
 /// Append a `usage_log` row — best-effort: cost logging must never fail a model call,
-/// so errors are swallowed. `model = None` is allowed (an unreported served model).
-fn log_usage(conn: &Connection, kind: &str, model: Option<&str>, usage: &openrouter::Usage) {
-    let _ = conn.execute(
+/// so errors are swallowed. `model = None` is allowed (an unreported served model). `meta` tags the
+/// row with how it was served (provider / latency / fallback reason, migration v37) so the Usage &
+/// cost table and the Local AI tab can tell local from cloud spend. `pub(crate)` so the chat
+/// housekeeping modules (summary / title / prefs) route their rows through it too.
+pub(crate) fn log_usage(
+    conn: &Connection,
+    kind: &str,
+    model: Option<&str>,
+    usage: &openrouter::Usage,
+    meta: &llm_gateway::CallMeta,
+) {
+    let inserted = conn.execute(
         "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
@@ -6362,25 +6413,41 @@ fn log_usage(conn: &Connection, kind: &str, model: Option<&str>, usage: &openrou
             usage.cost
         ],
     );
+    // Tag the row's provider/latency/fallback in the satellite (migration v37). Best-effort like the
+    // row itself, and only when the row landed so `last_insert_rowid` is this row's.
+    if inserted.is_ok() {
+        let usage_id = conn.last_insert_rowid();
+        let fallback = meta.fallback.as_ref().map(|f| f.as_log_str());
+        let _ = conn.execute(
+            "INSERT INTO usage_meta(usage_id, provider, latency_ms, fallback_reason) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                usage_id,
+                meta.provider.as_str(),
+                meta.latency_ms as i64,
+                fallback
+            ],
+        );
+    }
 }
 
-/// Write collected background usage rows under one short lock (best-effort), each
-/// attributed to its served model, or the requested primary when none was reported.
+/// Write collected background usage rows under one short lock (best-effort), each attributed to its
+/// served model (or the requested primary when none was reported) and tagged with how it was served.
 fn log_background_usage(
     app: &AppHandle,
     models: &[String],
-    rows: &[(Option<String>, openrouter::Usage)],
+    rows: &[(Option<String>, openrouter::Usage, llm_gateway::CallMeta)],
 ) {
     if rows.is_empty() {
         return;
     }
     let state = app.state::<AppState>();
     let Ok(conn) = state.conn() else { return };
-    for (served, usage) in rows {
+    for (served, usage, meta) in rows {
         let model = served
             .as_deref()
             .or_else(|| models.first().map(String::as_str));
-        log_usage(&conn, "background", model, usage);
+        log_usage(&conn, "background", model, usage, meta);
     }
 }
 

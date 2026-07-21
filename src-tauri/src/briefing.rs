@@ -320,17 +320,25 @@ fn push_group(out: &mut String, label: &str, items: &[String]) {
 }
 
 /// Generate the briefing text via the background model. Returns the cleaned briefing text plus the
-/// served model + token usage (for the cost logger). The caller decides what to do on error
-/// (best-effort — a hiccup just leaves the prior briefing in place).
+/// served model + token usage + how it was served (for the cost logger). The caller decides what to
+/// do on error (best-effort — a hiccup just leaves the prior briefing in place).
 pub async fn generate(
     app: &tauri::AppHandle,
     plan: &crate::llm_gateway::RoutePlan,
     snapshot: &str,
     profile: Option<&str>,
-) -> Result<(String, openrouter::Usage, Option<String>)> {
+) -> Result<(
+    String,
+    openrouter::Usage,
+    Option<String>,
+    crate::llm_gateway::CallMeta,
+)> {
     let messages = build_messages(snapshot, profile);
-    let c = crate::llm_gateway::complete(app, plan, &messages, false).await?;
-    Ok((clean(&c.text), c.usage, c.model))
+    let crate::llm_gateway::LlmOutcome {
+        completion: c,
+        meta,
+    } = crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    Ok((clean(&c.text), c.usage, c.model, meta))
 }
 
 /// Build the briefing prompt: the snapshot in, a short plain-text briefing out. The
