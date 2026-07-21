@@ -33,9 +33,8 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::{AppHandle, Manager};
 
-use crate::commands::{effective_models, BACKGROUND_AUTO_SWITCH_KEY, BACKGROUND_MODELS_KEY};
 use crate::error::Result;
-use crate::openrouter::{self, ChatMessage};
+use crate::openrouter::ChatMessage;
 use crate::{chat, secrets, AppState};
 
 /// How many completed turn-pairs a conversation needs before we title it. The card asks for "roughly 3–4
@@ -173,18 +172,14 @@ pub(crate) async fn generate_title(app: &AppHandle, conversation_id: i64) -> Res
 
     // 2. Resolve the background model + key off the lock; no key ⇒ we cannot title (a later launch retries
     //    once a key exists, since the state is still `pending`).
-    let Some(api_key) = secrets::get_background_or_primary_key()? else {
+    let Some(route) = crate::llm_gateway::resolve(app, crate::llm_gateway::Role::Background)?
+    else {
         return Ok(false);
-    };
-    let models = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?
     };
 
     // 3. Name the conversation (async, no lock held).
     let messages = render_title_request(&segment);
-    let completion = openrouter::complete(api_key.expose(), &models, &messages, false).await?;
+    let completion = crate::llm_gateway::complete(app, &route, &messages, false).await?;
     let Some(title) = clamp_title(&completion.text) else {
         return Ok(false);
     };
@@ -198,7 +193,7 @@ pub(crate) async fn generate_title(app: &AppHandle, conversation_id: i64) -> Res
             let model = completion
                 .model
                 .as_deref()
-                .or_else(|| models.first().map(String::as_str));
+                .or(Some(route.primary_model_id()));
             let _ = conn.execute(
                 "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
                  VALUES (?1, 'chat_title', ?2, ?3, ?4)",

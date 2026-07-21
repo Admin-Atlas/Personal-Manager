@@ -34,10 +34,9 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::{AppHandle, Manager};
 
-use crate::commands::{effective_models, BACKGROUND_AUTO_SWITCH_KEY, BACKGROUND_MODELS_KEY};
 use crate::error::Result;
 use crate::preferences::{self, DraftPreference};
-use crate::{chat, entities, openrouter, secrets, AppState};
+use crate::{chat, entities, secrets, AppState};
 
 /// Seed confidence for a chat-extracted record: an explicit statement, but auto-captured and not yet
 /// vouched for by the user — so it lands below 1.0 and unconfirmed, awaiting a "Keep" in Teach.
@@ -185,21 +184,20 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
 
     // 2. Resolve the background key + models + known projects off the lock; no key ⇒ we cannot extract
     //    (the cursor stays put, so a later launch retries once a key exists).
-    let Some(api_key) = secrets::get_background_or_primary_key()? else {
+    let Some(route) = crate::llm_gateway::resolve(app, crate::llm_gateway::Role::Background)?
+    else {
         return Ok(0);
     };
-    let (models, project_names) = {
+    let project_names = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
-        let projects = entities::canonical_project_names(&conn)?;
-        (models, projects)
+        entities::canonical_project_names(&conn)?
     };
 
     // 3. Extract (async, no lock held). A model/parse failure propagates so the cursor is NOT advanced
     //    and the turns are retried next time.
     let messages = preferences::render_chat_extract_request(&user_turns, &project_names);
-    let completion = openrouter::complete(api_key.expose(), &models, &messages, false).await?;
+    let completion = crate::llm_gateway::complete(app, &route, &messages, false).await?;
     let drafts = preferences::parse_chat_preferences(&completion.text);
 
     // 4. Short write lock: land the records (resolve + dedup) and advance the cursor together; log spend.
@@ -210,7 +208,7 @@ pub(crate) async fn extract_for_session(app: &AppHandle, conversation_id: i64) -
         let model = completion
             .model
             .as_deref()
-            .or_else(|| models.first().map(String::as_str));
+            .or(Some(route.primary_model_id()));
         let _ = conn.execute(
             "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
              VALUES (?1, 'chat_prefs', ?2, ?3, ?4)",

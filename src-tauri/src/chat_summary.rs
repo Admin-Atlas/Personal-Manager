@@ -39,10 +39,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-use crate::commands::{effective_models, BACKGROUND_AUTO_SWITCH_KEY, BACKGROUND_MODELS_KEY};
 use crate::context_budget::{self, COMPRESS_FLOOR_PAIRS};
 use crate::error::Result;
-use crate::openrouter::{self, ChatMessage};
+use crate::openrouter::ChatMessage;
 use crate::{chat, secrets, AppState};
 
 /// The recency window context assembly (PR2) sends verbatim, in turn-pairs. The summary covers everything
@@ -231,18 +230,14 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
 
         // 2. Resolve the background model + key (off the model call's lock). No key set ⇒ we cannot
         //    summarise; leave the cursor where it is so the next launch retries once a key exists.
-        let Some(api_key) = secrets::get_background_or_primary_key()? else {
+        let Some(route) = crate::llm_gateway::resolve(app, crate::llm_gateway::Role::Background)?
+        else {
             break;
-        };
-        let models = {
-            let state = app.state::<AppState>();
-            let conn = state.conn()?;
-            effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?
         };
 
         // 3. Summarise the new span (async, no lock held).
         let messages = render_summary_request(plan.existing_summary.as_deref(), &plan.segment);
-        let completion = openrouter::complete(api_key.expose(), &models, &messages, false).await?;
+        let completion = crate::llm_gateway::complete(app, &route, &messages, false).await?;
 
         // 4. Short write lock: append + advance the cursor together (compare-and-swap on the cursor so a
         //    racing compress can't double-fold the same span — F-36), and log the spend.
@@ -261,7 +256,7 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
             let model = completion
                 .model
                 .as_deref()
-                .or_else(|| models.first().map(String::as_str));
+                .or(Some(route.primary_model_id()));
             let _ = conn.execute(
                 "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
                  VALUES (?1, 'chat_summary', ?2, ?3, ?4)",
@@ -366,18 +361,14 @@ pub(crate) async fn compress_now(
     };
 
     // 2. Resolve the background model + key off the lock; no key ⇒ we cannot compress.
-    let Some(api_key) = secrets::get_background_or_primary_key()? else {
+    let Some(route) = crate::llm_gateway::resolve(app, crate::llm_gateway::Role::Background)?
+    else {
         return Ok(None);
-    };
-    let models = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?
     };
 
     // 3. Summarise the folded span (async, no lock held).
     let messages = render_summary_request(snapshot.prev_summary.as_deref(), &segment);
-    let completion = openrouter::complete(api_key.expose(), &models, &messages, false).await?;
+    let completion = crate::llm_gateway::complete(app, &route, &messages, false).await?;
     let bullets = completion.text.trim().to_string();
 
     // Estimated reclaim: the raw tokens leaving the verbatim window, minus the bullets we add back.
@@ -414,7 +405,7 @@ pub(crate) async fn compress_now(
             let model = completion
                 .model
                 .as_deref()
-                .or_else(|| models.first().map(String::as_str));
+                .or(Some(route.primary_model_id()));
             let _ = conn.execute(
                 "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
                  VALUES (?1, 'chat_compress', ?2, ?3, ?4)",

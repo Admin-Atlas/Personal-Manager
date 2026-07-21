@@ -79,8 +79,8 @@ pub struct ReviewDecision {
 /// for the cost logger. The usage is `None` on the best-effort fallback path, so a
 /// failed call logs nothing (not even a phantom zero-token request).
 pub async fn propose(
-    api_key: &str,
-    models: &[String],
+    app: &tauri::AppHandle,
+    plan: &crate::llm_gateway::RoutePlan,
     title: &str,
     body: &str,
     existing_projects: &[String],
@@ -89,7 +89,7 @@ pub async fn propose(
     let messages = build_messages(title, body, existing_projects, profile);
     // cache_prefix: the system message is the same across every document in a review run, so cache it
     // once and reuse it cheaply for the rest of the batch.
-    match openrouter::complete(api_key, models, &messages, true).await {
+    match crate::llm_gateway::complete(app, plan, &messages, true).await {
         Ok(c) => (parse_proposal(&c.text), Some((c.usage, c.model))),
         Err(e) => (
             Proposal::fallback(format!("Proposal request failed: {e}")),

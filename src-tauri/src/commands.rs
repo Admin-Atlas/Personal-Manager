@@ -18,6 +18,7 @@ use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
 use crate::error::{Error, Result, VaultFault, VaultFaultCode};
 use crate::google;
 use crate::ingest::{self, Document, IngestEvent};
+use crate::llm_gateway::{self, Role};
 use crate::milestones::{self, Milestone};
 use crate::project_activity;
 use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
@@ -49,9 +50,9 @@ const DEFAULT_MODEL: &str = "inclusionai/ling-2.6-flash";
 
 /// Settings keys for the two model roles. Each holds a JSON array of model ids
 /// (ordered, first = primary); the `*_AUTO_SWITCH` keys hold "true"/"false".
-const CHAT_MODELS_KEY: &str = "chat_models";
+pub(crate) const CHAT_MODELS_KEY: &str = "chat_models";
 pub(crate) const BACKGROUND_MODELS_KEY: &str = "background_models";
-const CHAT_AUTO_SWITCH_KEY: &str = "chat_auto_switch";
+pub(crate) const CHAT_AUTO_SWITCH_KEY: &str = "chat_auto_switch";
 pub(crate) const BACKGROUND_AUTO_SWITCH_KEY: &str = "background_auto_switch";
 
 /// The user's IANA time-zone name (e.g. "America/New_York"), supplied by the
@@ -1970,13 +1971,16 @@ pub async fn send_message(
     // settles, so background indexing never competes with a live exchange.
     state.mark_user_activity();
 
-    let api_key = secrets::get_openrouter_key()?
-        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+    let Some(plan) = llm_gateway::resolve(&app, Role::Chat)? else {
+        return Err(Error::Other(
+            "No OpenRouter API key set. Add one in Settings.".into(),
+        ));
+    };
 
-    // Save the user turn and gather history + models + the learned profile + the
+    // Save the user turn and gather history + the learned profile + the
     // conversation's project scope. Scope the lock so the guard is dropped before
     // the network await below.
-    let (history, models, profile, scope, agenda, flag_ctx, summary, exclude_chat) = {
+    let (history, profile, scope, agenda, flag_ctx, summary, exclude_chat) = {
         let conn = state.conn()?;
 
         let prior: i64 = conn.query_row(
@@ -2035,8 +2039,6 @@ pub async fn send_message(
                 Some(conversation_id),
             );
         }
-
-        let models = effective_models(&conn, CHAT_MODELS_KEY, CHAT_AUTO_SWITCH_KEY)?;
 
         // Context assembly (board card 7C): once a chat is indexed (card B) and long enough to have a
         // rolling summary (card C, PR1), it carries a `summary` plus the `summary_covers_up_to_turn_id`
@@ -2158,7 +2160,6 @@ pub async fn send_message(
                 .unwrap_or(None);
         (
             history,
-            models,
             profile,
             scope,
             agenda,
@@ -2229,17 +2230,11 @@ pub async fn send_message(
     }
 
     // Stream the reply, forwarding each token to the UI.
-    let result = openrouter::stream_chat(
-        api_key.expose(),
-        &models,
-        &messages,
-        cache_through,
-        |token| {
-            let _ = on_event.send(ChatEvent::Token {
-                text: token.to_string(),
-            });
-        },
-    )
+    let result = llm_gateway::stream_chat(&app, &plan, &messages, cache_through, |token| {
+        let _ = on_event.send(ChatEvent::Token {
+            text: token.to_string(),
+        });
+    })
     .await;
 
     let completion = match result {
@@ -2270,7 +2265,7 @@ pub async fn send_message(
     // reflected), falling back to the requested primary if it wasn't reported.
     let used_model = completion
         .model
-        .unwrap_or_else(|| models.first().cloned().unwrap_or_default());
+        .unwrap_or_else(|| plan.primary_model_id().to_string());
 
     // Persist the assistant turn with the documents it cited (JSON, or NULL).
     let citations_json = if citations.is_empty() {
@@ -2618,14 +2613,12 @@ pub async fn retrieval_diagnose(
     query: String,
     explain: crate::commands_dev::DevRetrievalExplain,
 ) -> Result<String> {
-    let api_key = secrets::get_background_or_primary_key()?
-        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
-    let models = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+        return Err(Error::Other(
+            "No OpenRouter API key set. Add one in Settings.".into(),
+        ));
     };
-    retrieval_diag::diagnose(api_key.expose(), &models, &symptom, &query, &explain).await
+    retrieval_diag::diagnose(&app, &plan, &symptom, &query, &explain).await
 }
 
 // --- archivist: documents ---
@@ -3358,8 +3351,11 @@ pub async fn propose_metadata(
     document_ids: Option<Vec<i64>>,
     on_event: Channel<ReviewEvent>,
 ) -> Result<()> {
-    let api_key = secrets::get_background_or_primary_key()?
-        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+        return Err(Error::Other(
+            "No OpenRouter API key set. Add one in Settings.".into(),
+        ));
+    };
 
     // Bound the (untrusted webview) id list: it expands to one SQL placeholder
     // each, so an unbounded list would blow SQLITE_MAX_VARIABLE_NUMBER. Far above
@@ -3383,10 +3379,9 @@ pub async fn propose_metadata(
 
     // Gather the documents + existing projects + learned profile under a short
     // lock, then drop it before any network call (rule #4).
-    let (pending, projects, models, profile) = {
+    let (pending, projects, profile) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         // Global + context filing preferences only: the target project isn't chosen until the model
         // proposes it, so per-project preferences have nothing to key on yet (a deferred refinement).
         // Still a strict improvement on dumping the whole blob (§4.5).
@@ -3445,7 +3440,7 @@ pub async fn propose_metadata(
                 .collect::<std::result::Result<Vec<_>, _>>()?
             }
         };
-        (pending, projects, models, profile)
+        (pending, projects, profile)
     };
 
     let mut proposed = 0;
@@ -3457,8 +3452,8 @@ pub async fn propose_metadata(
         // the proposal but never pre-assigns a project (the LLM proposal stays the review checkpoint).
         let doc_profile = profile_with_folder(profile.as_deref(), p.folder.as_deref());
         let (mut proposal, usage_info) = review::propose(
-            api_key.expose(),
-            &models,
+            &app,
+            &plan,
             &p.title,
             &p.body,
             &projects,
@@ -3482,7 +3477,7 @@ pub async fn propose_metadata(
         });
         proposed += 1;
     }
-    log_background_usage(&app, &models, &usage_rows);
+    log_background_usage(&app, plan.models(), &usage_rows);
     let _ = on_event.send(ReviewEvent::Finished { proposed });
     Ok(())
 }
@@ -3960,8 +3955,11 @@ pub async fn propose_project_metadata(
     names: Option<Vec<String>>,
     on_event: Channel<ProjectProposalEvent>,
 ) -> Result<()> {
-    let api_key = secrets::get_background_or_primary_key()?
-        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+        return Err(Error::Other(
+            "No OpenRouter API key set. Add one in Settings.".into(),
+        ));
+    };
 
     // Bound the (untrusted webview) name list — one model call per name, so this
     // also caps runaway spend. Far above any real project count.
@@ -3977,10 +3975,9 @@ pub async fn propose_project_metadata(
 
     // Gather targets + their document samples + the full project list (for picking
     // a real parent/blocker) + models under a short lock, then drop it (rule #4).
-    let (targets, all_projects, models) = {
+    let (targets, all_projects) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let all_projects: Vec<String> = db::distinct_projects(&conn)?;
         let target_names = match names {
             Some(n) if !n.is_empty() => n,
@@ -3991,7 +3988,7 @@ pub async fn propose_project_metadata(
             let samples = projects::document_samples(&conn, &name)?;
             targets.push(Target { name, samples });
         }
-        (targets, all_projects, models)
+        (targets, all_projects)
     };
 
     let mut proposed = 0;
@@ -4003,7 +4000,7 @@ pub async fn propose_project_metadata(
             .cloned()
             .collect();
         let (proposal, usage_info) =
-            projects::propose(api_key.expose(), &models, &t.name, &t.samples, &others).await;
+            projects::propose(&app, &plan, &t.name, &t.samples, &others).await;
         if let Some((usage, served)) = usage_info {
             usage_rows.push((served, usage));
         }
@@ -4013,7 +4010,7 @@ pub async fn propose_project_metadata(
         });
         proposed += 1;
     }
-    log_background_usage(&app, &models, &usage_rows);
+    log_background_usage(&app, plan.models(), &usage_rows);
     let _ = on_event.send(ProjectProposalEvent::Finished { proposed });
     Ok(())
 }
@@ -5905,7 +5902,7 @@ pub fn resume_onedrive_sync(app: AppHandle) -> Result<bool> {
 /// best-effort. The legacy blob is kept ARCHIVED (never deleted). Records land `inferred` +
 /// unconfirmed, awaiting the user's vouch in the Teach tab.
 async fn migrate_preferences_once(app: AppHandle) -> Result<()> {
-    let (blob, models) = {
+    let blob = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         if db::get_setting(&conn, preferences::MIGRATED_FLAG_KEY)?.is_some() {
@@ -5920,16 +5917,15 @@ async fn migrate_preferences_once(app: AppHandle) -> Result<()> {
             db::set_setting(&conn, preferences::MIGRATED_FLAG_KEY, &now)?;
             return Ok(());
         }
-        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
-        (blob, models)
+        blob
     };
 
-    // No key yet → leave the blob untouched and unstamped; a later trigger retries.
-    let Some(api_key) = secrets::get_background_or_primary_key()? else {
+    // No provider yet → leave the blob untouched and unstamped; a later trigger retries.
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
         return Ok(());
     };
 
-    let drafts = preferences::distill_blob(api_key.expose(), &models, &blob).await?;
+    let drafts = preferences::distill_blob(&app, &plan, &blob).await?;
 
     let state = app.state::<AppState>();
     let conn = state.conn()?;
@@ -6033,18 +6029,18 @@ pub async fn parse_preference_statement(
     app: AppHandle,
     text: String,
 ) -> Result<preferences::DraftPreference> {
-    let (models, projects) = {
+    let projects = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
-        let projects = entities::canonical_project_names(&conn)?;
-        (models, projects)
+        entities::canonical_project_names(&conn)?
     };
-    let api_key = secrets::get_background_or_primary_key()?
-        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+        return Err(Error::Other(
+            "No OpenRouter API key set. Add one in Settings.".into(),
+        ));
+    };
 
-    let mut draft =
-        preferences::parse_statement(api_key.expose(), &models, &text, &projects).await?;
+    let mut draft = preferences::parse_statement(&app, &plan, &text, &projects).await?;
 
     if draft.scope == preferences::SCOPE_PROJECT {
         let state = app.state::<AppState>();
@@ -6087,13 +6083,15 @@ pub fn get_daily_briefing(state: State<'_, AppState>) -> Result<briefing::DailyB
 /// there's nothing to summarise.
 #[tauri::command]
 pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBriefing> {
-    let api_key = secrets::get_background_or_primary_key()?
-        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+        return Err(Error::Other(
+            "No OpenRouter API key set. Add one in Settings.".into(),
+        ));
+    };
 
-    let (snapshot, profile, models) = {
+    let (snapshot, profile) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let zone = resolve_zone(&conn);
         let now = clock::now_local_iso(zone);
         let today = clock::today_sql_in(zone);
@@ -6114,7 +6112,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
             briefing::build_flag_snapshot(&active, &resolved_prep, &projects, &events, &now, zone);
         // The briefing is the whole-picture view, so global + context preferences shape its voice.
         let profile = preferences::preferences_preamble(&conn, preferences::PrefContext::global())?;
-        (snapshot, profile, models)
+        (snapshot, profile)
     };
 
     // Nothing to brief on yet — leave any prior briefing in place.
@@ -6125,7 +6123,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
     };
 
     let (text, usage, served) =
-        briefing::generate(api_key.expose(), &models, &snapshot, profile.as_deref()).await?;
+        briefing::generate(&app, &plan, &snapshot, profile.as_deref()).await?;
 
     let state = app.state::<AppState>();
     let conn = state.conn()?;
@@ -6133,9 +6131,7 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
     log_usage(
         &conn,
         "background",
-        served
-            .as_deref()
-            .or_else(|| models.first().map(String::as_str)),
+        served.as_deref().or(Some(plan.primary_model_id())),
         &usage,
     );
     briefing::save_briefing(&conn, &text, &now)?;
@@ -6198,21 +6194,23 @@ pub async fn route_focus_input(app: AppHandle, text: String) -> Result<flags::Fo
     if text.is_empty() {
         return Ok(flags::FocusRoute::Unclear);
     }
-    let (models, candidates, project_names) = {
+    let (candidates, project_names) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        let models = effective_models(&conn, BACKGROUND_MODELS_KEY, BACKGROUND_AUTO_SWITCH_KEY)?;
         let zone = resolve_zone(&conn);
         let today = clock::today_sql_in(zone);
         let candidates = flags::describe_active(&conn, &today, zone)?;
         let project_names = entities::canonical_project_names(&conn)?;
-        (models, candidates, project_names)
+        (candidates, project_names)
     };
-    let api_key = secrets::get_background_or_primary_key()?
-        .ok_or_else(|| Error::Other("No OpenRouter API key set. Add one in Settings.".into()))?;
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+        return Err(Error::Other(
+            "No OpenRouter API key set. Add one in Settings.".into(),
+        ));
+    };
 
     let messages = flags::render_route_request(&text, &candidates, &project_names);
-    let completion = openrouter::complete(api_key.expose(), &models, &messages, false).await?;
+    let completion = llm_gateway::complete(&app, &plan, &messages, false).await?;
     {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -6222,7 +6220,7 @@ pub async fn route_focus_input(app: AppHandle, text: String) -> Result<flags::Fo
             completion
                 .model
                 .as_deref()
-                .or_else(|| models.first().map(String::as_str)),
+                .or(Some(plan.primary_model_id())),
             &completion.usage,
         );
     }

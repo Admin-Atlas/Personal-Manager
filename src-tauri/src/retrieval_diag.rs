@@ -21,7 +21,7 @@
 
 use crate::commands_dev::DevRetrievalExplain;
 use crate::error::Result;
-use crate::openrouter::{self, ChatMessage};
+use crate::openrouter::ChatMessage;
 
 /// How many scored rows to hand the model. The top of the ranking is what explains a symptom;
 /// bounding it caps token cost on a large-k run.
@@ -31,8 +31,8 @@ const MAX_ROWS: usize = 20;
 /// Returns the model's plain-text advice. Not best-effort: a model/key failure surfaces as an error
 /// so the interactive panel can show it, rather than pretending it "diagnosed" nothing.
 pub async fn diagnose(
-    api_key: &str,
-    models: &[String],
+    app: &tauri::AppHandle,
+    plan: &crate::llm_gateway::RoutePlan,
     symptom: &str,
     query: &str,
     explain: &DevRetrievalExplain,
@@ -40,7 +40,7 @@ pub async fn diagnose(
     let messages = build_messages(symptom, query, explain);
     // No cache_prefix: each diagnostic carries a different explain state, so there's no stable
     // prefix to reuse across calls.
-    let completion = openrouter::complete(api_key, models, &messages, false).await?;
+    let completion = crate::llm_gateway::complete(app, plan, &messages, false).await?;
     Ok(completion.text.trim().to_string())
 }
 
