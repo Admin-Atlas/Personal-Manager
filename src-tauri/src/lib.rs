@@ -45,6 +45,7 @@ mod milestones;
 mod model_gateway;
 mod oauth_loopback;
 mod onedrive;
+mod openai_compat;
 mod openrouter;
 mod outlook_calendar;
 mod pathguard;

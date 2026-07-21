@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.36.0-alpha",
+    date: "2026-07-21",
+    highlights: [
+      "Under-the-hood groundwork for an upcoming option: running AI models locally, on your own machine, so your chats can stay entirely on your device. This release lays the plumbing only — there's nothing to switch on yet. The setup screens follow.",
+    ],
+  },
+  {
     version: "3.35.1-alpha",
     date: "2026-07-21",
     highlights: [
