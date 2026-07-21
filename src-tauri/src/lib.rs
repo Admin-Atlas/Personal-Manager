@@ -36,6 +36,8 @@ mod index_only;
 mod ingest;
 mod layout;
 mod llm_gateway;
+mod local_ai;
+mod local_slot;
 // Local-folder indexing (board card 6): a third index-only source on the shared foundation, reading
 // from the filesystem. This first PR reconciles a tracked folder on demand (a filtered walk +
 // mtime→hash diff); the live `notify` watcher is the next card.
@@ -374,6 +376,10 @@ pub struct AppState {
     /// [`session_unavailable_message`] — "access denied" must never masquerade as
     /// "the vault is locked" (the ACL-lockout incident).
     pub vault_fault: Mutex<Option<error::VaultFault>>,
+    /// Local-endpoint runtime (#297): the single-inference slot (chat preempts background), the
+    /// dead-host circuit breaker, and the per-endpoint context-window cache. In-memory — a restart
+    /// re-probes, since the loaded model / window can change across relaunches.
+    pub local_ai: local_slot::LocalRuntime,
 }
 
 /// The sentence a command gets when it needs the store but the session is closed. Pure
@@ -1000,6 +1006,7 @@ pub fn run() {
                 backup_busy: AtomicBool::new(false),
                 pending_restore_keys: Mutex::new(std::collections::HashMap::new()),
                 vault_fault: Mutex::new(boot_fault),
+                local_ai: local_slot::LocalRuntime::default(),
             });
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
@@ -1084,6 +1091,19 @@ pub fn run() {
             commands::set_openrouter_key,
             commands::has_openrouter_background_key,
             commands::set_openrouter_background_key,
+            // Local AI endpoint (#297): detection, the posture-checked endpoint check, config
+            // get/set, model listing, and the live status snapshot.
+            local_ai::probe_local_llm_ports,
+            local_ai::check_local_llm_endpoint,
+            local_ai::get_local_llm_config,
+            local_ai::set_local_llm_endpoint,
+            local_ai::clear_local_llm_endpoint,
+            local_ai::set_local_llm_role_model,
+            local_ai::set_local_llm_routing,
+            local_ai::set_local_llm_token,
+            local_ai::clear_local_llm_token,
+            local_ai::list_local_llm_models,
+            local_ai::local_llm_status,
             commands::get_settings,
             commands::set_indexing_speed,
             commands::set_chat_models,

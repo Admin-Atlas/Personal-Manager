@@ -237,7 +237,8 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
 
         // 3. Summarise the new span (async, no lock held).
         let messages = render_summary_request(plan.existing_summary.as_deref(), &plan.segment);
-        let completion = crate::llm_gateway::complete(app, &route, &messages, false).await?;
+        let crate::llm_gateway::LlmOutcome { completion, meta } =
+            crate::llm_gateway::complete(app, &route, &messages, false).await?;
 
         // 4. Short write lock: append + advance the cursor together (compare-and-swap on the cursor so a
         //    racing compress can't double-fold the same span — F-36), and log the spend.
@@ -257,16 +258,7 @@ pub(crate) async fn extend_summary(app: &AppHandle, conversation_id: i64) -> Res
                 .model
                 .as_deref()
                 .or(Some(route.primary_model_id()));
-            let _ = conn.execute(
-                "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
-                 VALUES (?1, 'chat_summary', ?2, ?3, ?4)",
-                params![
-                    model,
-                    completion.usage.prompt_tokens,
-                    completion.usage.completion_tokens,
-                    completion.usage.cost
-                ],
-            );
+            crate::commands::log_usage(&conn, "chat_summary", model, &completion.usage, &meta);
             applied
         };
         if applied {
@@ -368,7 +360,8 @@ pub(crate) async fn compress_now(
 
     // 3. Summarise the folded span (async, no lock held).
     let messages = render_summary_request(snapshot.prev_summary.as_deref(), &segment);
-    let completion = crate::llm_gateway::complete(app, &route, &messages, false).await?;
+    let crate::llm_gateway::LlmOutcome { completion, meta } =
+        crate::llm_gateway::complete(app, &route, &messages, false).await?;
     let bullets = completion.text.trim().to_string();
 
     // Estimated reclaim: the raw tokens leaving the verbatim window, minus the bullets we add back.
@@ -406,16 +399,7 @@ pub(crate) async fn compress_now(
                 .model
                 .as_deref()
                 .or(Some(route.primary_model_id()));
-            let _ = conn.execute(
-                "INSERT INTO usage_log(model, kind, prompt_tokens, completion_tokens, cost_usd) \
-                 VALUES (?1, 'chat_compress', ?2, ?3, ?4)",
-                params![
-                    model,
-                    completion.usage.prompt_tokens,
-                    completion.usage.completion_tokens,
-                    completion.usage.cost
-                ],
-            );
+            crate::commands::log_usage(&conn, "chat_compress", model, &completion.usage, &meta);
         }
         applied
     };

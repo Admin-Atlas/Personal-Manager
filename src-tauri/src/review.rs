@@ -85,12 +85,22 @@ pub async fn propose(
     body: &str,
     existing_projects: &[String],
     profile: Option<&str>,
-) -> (Proposal, Option<(openrouter::Usage, Option<String>)>) {
+) -> (
+    Proposal,
+    Option<(
+        openrouter::Usage,
+        Option<String>,
+        crate::llm_gateway::CallMeta,
+    )>,
+) {
     let messages = build_messages(title, body, existing_projects, profile);
     // cache_prefix: the system message is the same across every document in a review run, so cache it
     // once and reuse it cheaply for the rest of the batch.
     match crate::llm_gateway::complete(app, plan, &messages, true).await {
-        Ok(c) => (parse_proposal(&c.text), Some((c.usage, c.model))),
+        Ok(crate::llm_gateway::LlmOutcome {
+            completion: c,
+            meta,
+        }) => (parse_proposal(&c.text), Some((c.usage, c.model, meta))),
         Err(e) => (
             Proposal::fallback(format!("Proposal request failed: {e}")),
             None,

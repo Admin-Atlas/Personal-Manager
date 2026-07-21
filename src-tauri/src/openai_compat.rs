@@ -17,28 +17,70 @@
 //! checklist). "OpenAI-compatible" is a spectrum in practice, so the parser tolerates all three
 //! named servers plus buffered/keepalive variants and never crashes on an unknown field.
 //!
-//! Inert on landing: nothing calls the network entrypoints yet — the gateway seam (#297, next PR)
-//! wires them in and removes the module-level `allow(dead_code)` below.
-#![allow(dead_code)]
+//! Live as of #297 PR3: the gateway ([`crate::llm_gateway`]) drives these entrypoints for a
+//! configured local endpoint. Timeouts and the loop-guard fast path read the central tunables in
+//! [`crate::local_slot::tunables`], so tuning after live testing is a one-file edit there.
 
 use futures_util::StreamExt;
 
 use crate::error::{Error, Result};
+use crate::local_slot::tunables;
 use crate::openrouter::{drain_lines, ChatMessage, Completion, Usage};
 
-/// One shared HTTP client for local-endpoint calls. Separate from `openrouter::HTTP` on purpose:
-/// the cloud client's 30 s connect timeout is wrong for a localhost probe (a dead local server
-/// should be declared dead in seconds, not wait half a minute), and keeping the clients separate
-/// means the local arm can never perturb the cloud path (strict additivity). `read_timeout` bounds
-/// silence *between* chunks — it resets on every byte — so a healthy slow local reply never trips
-/// it while a wedged connection still aborts.
-static LOCAL_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+/// HTTP clients for local-endpoint calls. Two of them, differing ONLY in connect timeout: a
+/// loopback server that isn't listening RSTs instantly (2 s is ample), while a remote (LAN /
+/// Tailscale) endpoint may take longer to connect. Separate from `openrouter::HTTP` so the cloud
+/// path can never be perturbed (strict additivity), and — crucially — NEITHER sets a `read_timeout`:
+/// streaming manages a two-phase (first-token vs inter-token) deadline itself, and the non-streaming
+/// calls set a per-request total `timeout`. A single flat read timeout cannot tell a legitimate 60 s
+/// cold model load from a dead stream.
+static LOCAL_HTTP_LOOPBACK: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| build_local_client(tunables::CONNECT_TIMEOUT_LOOPBACK));
+static LOCAL_HTTP_REMOTE: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| build_local_client(tunables::CONNECT_TIMEOUT_REMOTE));
+
+fn build_local_client(connect_timeout: std::time::Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .read_timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(connect_timeout)
         .build()
-        .expect("reqwest client with static timeouts should build")
-});
+        .expect("reqwest client with a static connect timeout should build")
+}
+
+/// Pick the client (and thus the connect timeout) by whether the endpoint host is a loopback
+/// literal / `localhost`. A cheap SYNTACTIC check only — the security posture decision (resolving
+/// the address and refusing public cleartext) is a separate, stricter check the caller makes before
+/// any call is attempted.
+fn client_for(base_url: &str) -> &'static reqwest::Client {
+    if host_is_loopback_literal(base_url) {
+        &LOCAL_HTTP_LOOPBACK
+    } else {
+        &LOCAL_HTTP_REMOTE
+    }
+}
+
+/// Whether the URL's host is `localhost` or a loopback IP literal — a cheap string check (no DNS).
+fn host_is_loopback_literal(base_url: &str) -> bool {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // Host = authority minus a trailing :port. IPv6 literals are bracketed, e.g. `[::1]:11434`.
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|v4| v4.is_loopback())
+            .unwrap_or(false)
+}
 
 // Untrusted model output (rule #6): bound both the assembled reply and any single unterminated SSE
 // line so a malicious/runaway local endpoint can't grow memory without limit. Same caps as the
@@ -263,11 +305,29 @@ const GUARD_SCAN_EVERY: usize = 64;
 pub struct LoopGuard {
     tail: Vec<u8>,
     since_scan: usize,
+    /// The previous streamed token and its consecutive-repeat count — the cheap fast path that kills
+    /// a single-token loop (`LOOP_GUARD_SAME_TOKEN_RUN` identical deltas in a row) well before the
+    /// byte-period detector below accumulates its cover.
+    last_token: String,
+    same_run: usize,
 }
 
 impl LoopGuard {
     /// Observe a new content chunk. Returns `true` once an obvious loop is detected.
     pub fn observe(&mut self, chunk: &str) -> bool {
+        // Fast path: N identical consecutive tokens is almost certainly degenerate, and legitimate
+        // output effectively never repeats one exact token 50 times in a row.
+        if chunk == self.last_token {
+            self.same_run += 1;
+        } else {
+            self.last_token.clear();
+            self.last_token.push_str(chunk);
+            self.same_run = 1;
+        }
+        if self.same_run >= tunables::LOOP_GUARD_SAME_TOKEN_RUN {
+            return true;
+        }
+
         self.tail.extend_from_slice(chunk.as_bytes());
         if self.tail.len() > GUARD_TAIL_BYTES {
             let cut = self.tail.len() - GUARD_TAIL_BYTES;
@@ -448,9 +508,9 @@ pub fn pick_window(
 /// than treating an unreachable server as a user-facing exception.
 pub async fn probe(base_url: &str, token: Option<&str>) -> LocalResult<Vec<String>> {
     let url = format!("{base_url}/v1/models");
-    let mut req = LOCAL_HTTP
+    let mut req = client_for(base_url)
         .get(&url)
-        .timeout(std::time::Duration::from_secs(5));
+        .timeout(tunables::PROBE_TIMEOUT);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -493,7 +553,7 @@ where
 {
     let body = chat_body(model, messages, true);
     let url = format!("{base_url}/v1/chat/completions");
-    let mut req = LOCAL_HTTP
+    let mut req = client_for(base_url)
         .post(&url)
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .json(&body);
@@ -522,12 +582,38 @@ where
     let mut assembler = SseAssembler::default();
     let mut guard = LoopGuard::default();
     let mut stream = response.bytes_stream();
+    let mut got_first_token = false;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        // Two-phase timeout: a generous deadline for the FIRST token — absorbing a silent cold model
+        // load (Ollama / LM Studio JIT-load and stream nothing until the first token) — then a short
+        // inter-token deadline once streaming has started. Any received bytes, including an SSE
+        // keepalive ping, arrive as a chunk and reset the timer; the inter-token window is set above
+        // llama-server's 30 s ping cadence so a ping always resets it before it can fire.
+        let deadline = if got_first_token {
+            tunables::INTER_TOKEN_TIMEOUT
+        } else {
+            tunables::TIME_TO_FIRST_TOKEN_TIMEOUT
+        };
+        let next = match tokio::time::timeout(deadline, stream.next()).await {
+            Ok(next) => next,
+            Err(_elapsed) => {
+                let detail = if got_first_token {
+                    "the model stream stalled between tokens"
+                } else {
+                    "the model produced no first token before the deadline"
+                };
+                return Err(LocalFailure::new(LocalFailKind::Timeout, detail));
+            }
+        };
+        let Some(chunk) = next else {
+            break; // the byte stream ended
+        };
         let bytes = chunk.map_err(|e| LocalFailure::new(classify_send_error(&e), e.to_string()))?;
         for event in assembler.feed(&bytes) {
             match event {
                 SseEvent::Token(tok) => {
+                    got_first_token = true;
                     full.push_str(&tok);
                     if full.len() > MAX_REPLY_BYTES {
                         return Err(LocalFailure::new(
@@ -605,9 +691,9 @@ pub async fn complete(
 ) -> LocalResult<Completion> {
     let body = chat_body(model, messages, false);
     let url = format!("{base_url}/v1/chat/completions");
-    let mut req = LOCAL_HTTP
+    let mut req = client_for(base_url)
         .post(&url)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(tunables::BACKGROUND_TOTAL_TIMEOUT)
         .json(&body);
     if let Some(t) = token {
         req = req.bearer_auth(t);
@@ -664,9 +750,9 @@ pub async fn probe_window(base_url: &str, model: &str, token: Option<&str>) -> W
 /// a llama-server, or slots disabled) — the ladder falls through, by design.
 async fn probe_slots_ctx(base_url: &str, token: Option<&str>) -> Option<u32> {
     let url = format!("{base_url}/slots");
-    let mut req = LOCAL_HTTP
+    let mut req = client_for(base_url)
         .get(&url)
-        .timeout(std::time::Duration::from_secs(3));
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -687,9 +773,9 @@ async fn probe_slots_ctx(base_url: &str, token: Option<&str>) -> Option<u32> {
 /// A `/v1/models` entry may carry the training/max context under a couple of server-specific keys.
 async fn probe_models_ctx(base_url: &str, model: &str, token: Option<&str>) -> Option<u32> {
     let url = format!("{base_url}/v1/models");
-    let mut req = LOCAL_HTTP
+    let mut req = client_for(base_url)
         .get(&url)
-        .timeout(std::time::Duration::from_secs(3));
+        .timeout(tunables::WINDOW_PROBE_TIMEOUT);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -902,6 +988,21 @@ mod tests {
             !tripped,
             "structurally-repeated but varying rows are not a token loop"
         );
+    }
+
+    #[test]
+    fn loop_guard_fast_path_trips_on_a_short_repeated_token() {
+        // 50 identical multi-char tokens = 300 bytes, below the period detector's 768-byte cover —
+        // the same-token-run fast path must still trip, and exactly at the threshold.
+        let mut g = LoopGuard::default();
+        let mut tripped_at = None;
+        for i in 0..(tunables::LOOP_GUARD_SAME_TOKEN_RUN + 5) {
+            if g.observe(" hello") {
+                tripped_at = Some(i + 1);
+                break;
+            }
+        }
+        assert_eq!(tripped_at, Some(tunables::LOOP_GUARD_SAME_TOKEN_RUN));
     }
 
     #[test]

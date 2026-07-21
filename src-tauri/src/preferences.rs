@@ -419,7 +419,9 @@ pub async fn distill_blob(
     blob: &str,
 ) -> Result<Vec<DraftPreference>> {
     let messages = distill_messages(blob);
-    let c = crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    // Distillation doesn't record usage, so the serving metadata is discarded.
+    let crate::llm_gateway::LlmOutcome { completion: c, .. } =
+        crate::llm_gateway::complete(app, plan, &messages, false).await?;
     Ok(parse_pref_array(&c.text))
 }
 
@@ -469,7 +471,8 @@ pub async fn parse_statement(
     project_names: &[String],
 ) -> Result<DraftPreference> {
     let messages = parse_messages(text, project_names);
-    let c = crate::llm_gateway::complete(app, plan, &messages, false).await?;
+    let crate::llm_gateway::LlmOutcome { completion: c, .. } =
+        crate::llm_gateway::complete(app, plan, &messages, false).await?;
     parse_pref_object(&c.text)
         .ok_or_else(|| Error::Other("couldn't read a preference from that — try rephrasing".into()))
 }
