@@ -597,7 +597,7 @@ where
 /// each whole line as UTF-8 (lossy) and trimming it. Incomplete trailing bytes
 /// stay in `buffer` for the next chunk, so a multi-byte char straddling a chunk
 /// boundary is decoded once, intact, rather than as two replacement characters.
-fn drain_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+pub(crate) fn drain_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut lines = Vec::new();
     while let Some(newline) = buffer.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = buffer.drain(..=newline).collect();
