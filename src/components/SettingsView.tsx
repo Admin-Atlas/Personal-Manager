@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef, useState } from "react";
-import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
-  appLockStatus,
   costSummary,
-  exportAllData,
   getPref,
   getSettings,
   hasOpenRouterBackgroundKey,
@@ -14,12 +11,10 @@ import {
   installOptionalTsne,
   languageOptions,
   onTsneInstall,
-  openDataFolder,
   optionalTsneStatus,
   refreshPricing,
   setPref,
   startSemanticLayout,
-  setAppLock,
   setBackgroundAutoSwitch,
   setBackgroundModels,
   setChatAutoSwitch,
@@ -35,16 +30,14 @@ import {
 import { useHelp } from "../lib/help";
 import { BackupSettings } from "./BackupSettings";
 import { ConnectorsSettings } from "./ConnectorsSettings";
+import { DataSecuritySettings } from "./settings/DataSecuritySettings";
 import { DeveloperSettings } from "./settings/DeveloperSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { IngestProgress } from "./IngestProgress";
 import { RebuildProgress } from "./RebuildProgress";
-import { RemovePmData } from "./RemovePmData";
 import { StorageSettings } from "./StorageSettings";
-import { VaultCard } from "./VaultCard";
-import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
+import type { CostSummary, LanguageOptions } from "../lib/types";
 import { formatWhen } from "../lib/format";
-import { IS_LINUX } from "../lib/setupGuide";
 import {
   MAP_COHESION_KEY,
   MAP_MODE_KEY,
@@ -141,9 +134,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [tzAuto, setTzAuto] = useState(true);
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [refreshingPrices, setRefreshingPrices] = useState(false);
-  const [appLock, setAppLockState] = useState<AppLockStatus | null>(null);
-  const [exporting, setExporting] = useState(false);
-  const [exportMsg, setExportMsg] = useState<string | null>(null);
   // Onboarding on a JOINED shared vault (issue #337): the vault already exists and its search
   // language travels with it, so the language chooser is replaced by a short "what's yours alone"
   // checklist and `set_vault_embedder` is suppressed. (First-run always creates a device vault;
@@ -252,14 +242,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       .catch(() => {});
   }, [onboarding]);
 
-  // App-lock status (enabled + whether the OS can verify) loads independently.
-  useEffect(() => {
-    if (onboarding) return;
-    appLockStatus()
-      .then(setAppLockState)
-      .catch(() => {});
-  }, [onboarding]);
-
   // Memory-map prefs + optional-t-SNE install state (non-onboarding only — there's no Map yet at setup).
   useEffect(() => {
     if (onboarding) return;
@@ -341,16 +323,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       .finally(() => setInstallingTsne(false));
   }
 
-  async function toggleAppLock(next: boolean) {
-    setError(null);
-    try {
-      await setAppLock(next);
-      setAppLockState((s) => (s ? { ...s, enabled: next } : s));
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
   async function toggleReranking(next: boolean) {
     setError(null);
     setRerankingState(next); // optimistic — revert if the write fails
@@ -426,40 +398,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       setError(String(e));
     } finally {
       setRefreshingPrices(false);
-    }
-  }
-
-  async function revealDataFolder() {
-    setError(null);
-    try {
-      await openDataFolder();
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function exportData() {
-    setError(null);
-    setExportMsg(null);
-    let dest: string | null;
-    try {
-      dest = await saveFileDialog({
-        defaultPath: "personal-manager-export.zip",
-        filters: [{ name: "Zip archive", extensions: ["zip"] }],
-      });
-    } catch (e) {
-      setError(String(e));
-      return;
-    }
-    if (!dest) return; // the user cancelled the dialog
-    setExporting(true);
-    try {
-      await exportAllData(dest);
-      setExportMsg(`Exported to ${dest}`);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setExporting(false);
     }
   }
 
@@ -1335,127 +1273,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
               </>
             )}
 
-            {tab === "data" && (
-              <>
-                <div className="mt-4 border-t border-border pt-4" data-help="settings-app-lock">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <label className="block text-sm font-medium text-ink2">App lock</label>
-                      {/* Only the *available* branch of this line was explanation. The other
-                          two say why the toggle beside them is dead, so they stay inline — as
-                          does the "can't verify here" notice, which is state, not commentary. */}
-                      {!appLock?.available && (
-                        <p className="mt-1 text-xs text-ink4">
-                          {IS_LINUX
-                            ? "Not available on Linux yet. Your store is always encrypted at rest."
-                            : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
-                        </p>
-                      )}
-                      {appLock?.enabled && !appLock.available && (
-                        <p className="mt-1 text-xs text-ink4">
-                          App lock is on, but this device can't verify — PM opens without it here.
-                          The setting stays saved and re-arms on a device that can verify.
-                        </p>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={appLock?.enabled ?? false}
-                      aria-label="App lock"
-                      disabled={!appLock?.available}
-                      title={
-                        appLock?.available
-                          ? undefined
-                          : IS_LINUX
-                            ? "Feature not available on Linux yet"
-                            : "Not available on this device"
-                      }
-                      onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
-                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                        appLock?.enabled ? "bg-accent" : "bg-surface"
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                          appLock?.enabled ? "translate-x-4" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                  {appLock?.available && (
-                    <SectionInfo title="What does app lock do?">
-                      <p>
-                        Require Windows Hello (face, fingerprint, or PIN) to open PM. A convenience
-                        lock for the window — your store is always encrypted at rest. Takes effect
-                        next time you open PM.
-                      </p>
-                    </SectionInfo>
-                  )}
-                </div>
-
-                <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
-                  <label className="block text-sm font-medium text-ink2">Data</label>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <Button variant="tertiary" onClick={revealDataFolder}>
-                      Open data folder
-                    </Button>
-                    <Button variant="tertiary" onClick={exportData} disabled={exporting}>
-                      {exporting ? "Exporting…" : "Export all data…"}
-                    </Button>
-                  </div>
-                  {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
-                  <SectionInfo title="About your data & export">
-                    <p>
-                      Your documents and the encrypted store live in one folder (
-                      <span className="font-medium">Personal Manager</span>). Open it to back it up
-                      by hand, or export everything to a single{" "}
-                      <span className="font-medium">.zip</span> — the Markdown vault plus the
-                      encrypted store (the regenerable runtime is left out). The store stays
-                      encrypted in the archive.
-                    </p>
-                    <p>
-                      Your documents in the Markdown vault are stored unencrypted so any tool can
-                      read them. To protect them when your machine is off or logged out, turn on
-                      full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on
-                      Linux).
-                    </p>
-                  </SectionInfo>
-                </div>
-
-                <VaultCard />
-
-                <RemovePmData biometricAvailable={appLock?.available ?? false} />
-
-                <div className="mt-5 border-t border-border pt-4" data-help="settings-license">
-                  <SectionInfo title="License">
-                    <p>
-                      PM is free software, licensed under the{" "}
-                      <a
-                        href="https://www.gnu.org/licenses/agpl-3.0.html"
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-ink3 underline hover:text-ink"
-                      >
-                        GNU Affero General Public License v3
-                      </a>
-                      . © 2026 Bobby Yu.
-                    </p>
-                    <p>
-                      Source code:{" "}
-                      <a
-                        href="https://github.com/Admin-Atlas/Personal-Manager"
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-ink3 underline hover:text-ink"
-                      >
-                        github.com/Admin-Atlas/Personal-Manager
-                      </a>
-                    </p>
-                  </SectionInfo>
-                </div>
-              </>
-            )}
+            {tab === "data" && <DataSecuritySettings />}
 
             {tab === "backup" && <BackupSettings />}
 
