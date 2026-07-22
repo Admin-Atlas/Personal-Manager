@@ -3,16 +3,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-  costSummary,
   getPref,
   getSettings,
-  hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
   installOptionalTsne,
   languageOptions,
   onTsneInstall,
   optionalTsneStatus,
-  refreshPricing,
   setPref,
   startSemanticLayout,
   setBackgroundAutoSwitch,
@@ -20,7 +17,6 @@ import {
   setChatAutoSwitch,
   setChatModels,
   setIndexingSpeed,
-  setOpenRouterBackgroundKey,
   setOpenRouterKey,
   setTimeZone,
   setVaultEmbedder,
@@ -29,14 +25,14 @@ import {
 import { useHelp } from "../lib/help";
 import { BackupSettings } from "./BackupSettings";
 import { ConnectorsSettings } from "./ConnectorsSettings";
+import { AiModelsSettings } from "./settings/AiModelsSettings";
 import { DataSecuritySettings } from "./settings/DataSecuritySettings";
 import { DeveloperSettings } from "./settings/DeveloperSettings";
 import { SearchSettings } from "./settings/SearchSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { IngestProgress } from "./IngestProgress";
 import { StorageSettings } from "./StorageSettings";
-import type { CostSummary, LanguageOptions } from "../lib/types";
-import { formatWhen } from "../lib/format";
+import type { LanguageOptions } from "../lib/types";
 import {
   MAP_COHESION_KEY,
   MAP_MODE_KEY,
@@ -115,7 +111,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   // Pinboard reads the pref fresh at the moment you click delete (see pinboard/prefs.ts).
   const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
   const [key, setKey] = useState("");
-  const [bgKey, setBgKey] = useState("");
   const [chatModels, setChatModelsState] = useState<string[]>([]);
   const [backgroundModels, setBackgroundModelsState] = useState<string[]>([]);
   // True once getSettings() has populated the model lists. Save gates on this (not a non-empty
@@ -125,13 +120,10 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [chatAuto, setChatAuto] = useState(false);
   const [backgroundAuto, setBackgroundAuto] = useState(false);
   const [keyAlreadySet, setKeyAlreadySet] = useState(false);
-  const [bgKeyAlreadySet, setBgKeyAlreadySet] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [timeZone, setTimeZoneState] = useState("");
   const [tzAuto, setTzAuto] = useState(true);
-  const [cost, setCost] = useState<CostSummary | null>(null);
-  const [refreshingPrices, setRefreshingPrices] = useState(false);
   // Onboarding on a JOINED shared vault (issue #337): the vault already exists and its search
   // language travels with it, so the language chooser is replaced by a short "what's yours alone"
   // checklist and `set_vault_embedder` is suppressed. (First-run always creates a device vault;
@@ -171,7 +163,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     void (async () => {
       try {
         setKeyAlreadySet(await hasOpenRouterKey());
-        setBgKeyAlreadySet(await hasOpenRouterBackgroundKey());
         const settings = await getSettings();
         setChatModelsState(settings.chat_models);
         setBackgroundModelsState(settings.background_models);
@@ -220,15 +211,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
         }
       }
     })();
-  }, [onboarding]);
-
-  // Cost summary loads on its own (its first read may trigger a daily pricing fetch),
-  // so it never blocks the rest of Settings from showing.
-  useEffect(() => {
-    if (onboarding) return;
-    costSummary()
-      .then(setCost)
-      .catch(() => {});
   }, [onboarding]);
 
   // Memory-map prefs + optional-t-SNE install state (non-onboarding only — there's no Map yet at setup).
@@ -312,6 +294,16 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       .finally(() => setInstallingTsne(false));
   }
 
+  // Time zone saves immediately, like everything else in Settings. Auto persists the device zone;
+  // Manual persists the selected zone. The shared time/location context re-reads on the event.
+  function changeTz(auto: boolean, zone: string) {
+    setTzAuto(auto);
+    setTimeZoneState(zone);
+    void setTimeZone(auto ? deviceTimeZone() : zone)
+      .then(() => window.dispatchEvent(new Event("pm:settings-changed")))
+      .catch((e) => setError(String(e)));
+  }
+
   async function changeIndexingSpeed(next: "fast" | "gentle") {
     setError(null);
     const prev = indexingSpeed;
@@ -321,18 +313,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     } catch (e) {
       setIndexingSpeedState(prev);
       setError(String(e));
-    }
-  }
-
-  async function refreshPrices() {
-    setRefreshingPrices(true);
-    setError(null);
-    try {
-      setCost(await refreshPricing());
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setRefreshingPrices(false);
     }
   }
 
@@ -346,11 +326,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
         await setOpenRouterKey(key.trim());
         setKey("");
         setKeyAlreadySet(true);
-      }
-      if (bgKey.trim()) {
-        await setOpenRouterBackgroundKey(bgKey.trim());
-        setBgKey("");
-        setBgKeyAlreadySet(true);
       }
       // Persist the model lists only once they've loaded from the backend — gating on the load
       // flag (not a non-empty list) lets the user clear a role back to "use the default" and have
@@ -895,7 +870,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                     <span className="text-sm text-ink2">Detection</span>
                     <SegmentedControl
                       value={tzAuto ? "auto" : "manual"}
-                      onChange={(v) => setTzAuto(v === "auto")}
+                      onChange={(v) => changeTz(v === "auto", timeZone)}
                       options={[
                         { value: "auto", label: "Auto" },
                         { value: "manual", label: "Manual" },
@@ -907,7 +882,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
                       <span className="text-sm text-ink2">Zone</span>
                       <Select
                         value={timeZone}
-                        onChange={(e) => setTimeZoneState(e.target.value)}
+                        onChange={(e) => changeTz(false, e.target.value)}
                         className="max-w-[14rem]"
                       >
                         {allTimeZones().map((z) => (
@@ -960,165 +935,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
               </>
             )}
 
-            {tab === "ai" && (
-              <>
-                <label className="mt-5 block text-sm font-medium text-ink2">
-                  OpenRouter API key
-                </label>
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  data-help="settings-api-key"
-                  value={key}
-                  onChange={(e) => setKey(e.target.value)}
-                  placeholder={keyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-                  className="mt-1"
-                />
-                <a
-                  href="https://openrouter.ai/keys"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-1 inline-block text-xs text-ink4 hover:text-ink2"
-                >
-                  Get a key at openrouter.ai/keys →
-                </a>
-
-                <label className="mt-4 block text-sm font-medium text-ink2">
-                  Background API key
-                </label>
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  data-help="settings-background-key"
-                  value={bgKey}
-                  onChange={(e) => setBgKey(e.target.value)}
-                  placeholder={bgKeyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-                  className="mt-1"
-                />
-                {/* Both key fields' explanation in one disclosure at the foot of the pair —
-                    including the keychain sentence that used to head every tab. */}
-                <SectionInfo title="About your API keys">
-                  <p>Your API key lives in the OS keychain. The model is swappable anytime.</p>
-                  <p>
-                    The background key is used for background work (sorting proposals, learning).
-                    Lets you track that spend separately. Falls back to your main key if blank.
-                  </p>
-                </SectionInfo>
-
-                <div className="mt-5 space-y-5 border-t border-border pt-4">
-                  <ModelListEditor
-                    label="Chat model"
-                    description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
-                    helpId="settings-chat-models"
-                    models={chatModels}
-                    onChange={setChatModelsState}
-                    autoSwitch={chatAuto}
-                    onAutoSwitchChange={setChatAuto}
-                  />
-                  <ModelListEditor
-                    label="Background model"
-                    description="Runs sorting proposals and Learning You. Free models work well here; chain a few for daily limits."
-                    helpId="settings-background-models"
-                    models={backgroundModels}
-                    onChange={setBackgroundModelsState}
-                    autoSwitch={backgroundAuto}
-                    onAutoSwitchChange={setBackgroundAuto}
-                  />
-                </div>
-
-                {cost && (
-                  <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
-                    <div className="flex items-center justify-between">
-                      <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                        Usage &amp; cost
-                      </label>
-                      <Button
-                        variant="tertiary"
-                        onClick={refreshPrices}
-                        disabled={refreshingPrices}
-                        className="px-2 py-0.5 text-xs"
-                      >
-                        {refreshingPrices ? "Refreshing…" : "Refresh prices"}
-                      </Button>
-                    </div>
-                    {/* The "Spend & breakdown" Collapsible is gone: it hid your own numbers
-                        behind a caret (and unfolded them only for Power), while its `meta` slot
-                        leaked the 30d total back out to prove the point. The totals and the
-                        per-model table are readouts — the thing you opened this section for — so
-                        they stay visible; only the pricing methodology folds away below. */}
-                    <div className="mt-3 flex gap-6 text-sm">
-                      <div>
-                        <div className="text-xs text-ink4">Last 30 days</div>
-                        <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
-                      </div>
-                      <div>
-                        <div className="text-xs text-ink4">All time</div>
-                        <div className="font-mono text-ink2">{fmtUsd(cost.total_all_time_usd)}</div>
-                      </div>
-                    </div>
-                    {cost.all_time.length > 0 ? (
-                      <div className="mt-3">
-                        <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
-                          By model · most expensive first (all time)
-                        </p>
-                        <table className="w-full text-left text-xs">
-                          <thead className="font-mono uppercase tracking-wide text-ink4">
-                            <tr className="border-b border-rule">
-                              <th className="py-1 font-medium">Model</th>
-                              <th className="py-1 text-right font-medium">Reqs</th>
-                              <th className="py-1 text-right font-medium">Tokens in/out</th>
-                              <th className="py-1 text-right font-medium">Cost</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {cost.all_time.map((s) => (
-                              <tr key={s.model} className="border-b border-rule">
-                                <td className="py-1 pr-2 text-ink2">{s.model}</td>
-                                <td className="py-1 text-right text-ink3">{s.request_count}</td>
-                                <td className="py-1 text-right font-mono text-ink4">
-                                  {s.prompt_tokens.toLocaleString()} /{" "}
-                                  {s.completion_tokens.toLocaleString()}
-                                </td>
-                                <td className="py-1 text-right font-mono text-ink3">
-                                  {fmtUsd(s.cost_usd)}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
-                    )}
-                    <SectionInfo title="How this is calculated">
-                      <p>
-                        Your real per-call cost as reported by OpenRouter where available, otherwise
-                        estimated from the tokens each call used × OpenRouter&apos;s per-token price
-                        {cost.pricing_updated_at
-                          ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
-                          : ""}
-                        .
-                      </p>
-                      <p>
-                        Each model reply reports the tokens it used (your prompt + its reply). PM
-                        logs those per call. It fetches OpenRouter&apos;s public price list about
-                        once a day and caches it — no extra model call, and your API key is never
-                        used for it.
-                      </p>
-                      <p>
-                        Where OpenRouter reports a call&apos;s actual cost (reflecting any
-                        prompt-cache discount) PM shows that; for older calls without it, cost =
-                        prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
-                        reply&nbsp;price. It&apos;s computed when you open this page, so a later
-                        price change re-prices your history. A model with no reported cost and not
-                        yet in the price cache shows <span className="font-mono text-ink4">—</span>,
-                        never an understated&nbsp;$0.
-                      </p>
-                    </SectionInfo>
-                  </div>
-                )}
-              </>
-            )}
+            {tab === "ai" && <AiModelsSettings />}
 
             {tab === "search" && <SearchSettings />}
 
@@ -1153,11 +970,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
             </p>
           )}
           <div className="flex justify-end gap-2">
-            <Button variant="tertiary" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button variant="primary" onClick={save} disabled={!canSave}>
-              {saving ? "Saving…" : "Save"}
+            <Button variant="primary" onClick={onClose}>
+              Done
             </Button>
           </div>
         </div>
@@ -1198,11 +1012,4 @@ function LanguageCompareTable() {
       </tbody>
     </table>
   );
-}
-
-/** Format a USD cost, or "—" when unknown (the model isn't in the price cache yet). */
-function fmtUsd(v: number | null): string {
-  if (v == null) return "—";
-  if (v === 0) return "$0.00";
-  return v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
 }
