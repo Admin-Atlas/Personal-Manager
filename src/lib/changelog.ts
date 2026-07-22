@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.40.0-alpha",
+    date: "2026-07-22",
+    highlights: [
+      "Settings is easier to get around: the tabs are now grouped and icon-labelled down the side, and the tab you're on lists its sub-sections right there — click one to jump straight to it, or just scroll and watch it keep pace. Everything's where it was, only quicker to find.",
+    ],
+  },
+  {
     version: "3.39.0-alpha",
     date: "2026-07-22",
     highlights: [

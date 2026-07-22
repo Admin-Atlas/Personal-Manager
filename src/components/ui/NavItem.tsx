@@ -13,12 +13,22 @@ export interface NavItemProps {
   active?: boolean;
   onClick?: () => void;
   children: ReactNode;
+  /** Optional leading slot — e.g. a tab icon. Inherits the item's text colour (active/inactive). */
+  leading?: ReactNode;
   trailing?: ReactNode;
   helpId?: string;
   className?: string;
 }
 
-export function NavItem({ active, onClick, children, trailing, helpId, className }: NavItemProps) {
+export function NavItem({
+  active,
+  onClick,
+  children,
+  leading,
+  trailing,
+  helpId,
+  className,
+}: NavItemProps) {
   const { system } = useTheme();
   const leftBorder = system === "editorial" || system === "terminal";
   return (
@@ -36,7 +46,8 @@ export function NavItem({ active, onClick, children, trailing, helpId, className
         className,
       )}
     >
-      <span className="truncate">{children}</span>
+      {leading != null && <span className="shrink-0">{leading}</span>}
+      <span className="min-w-0 flex-1 truncate">{children}</span>
       {trailing != null && <span className="shrink-0">{trailing}</span>}
     </button>
   );

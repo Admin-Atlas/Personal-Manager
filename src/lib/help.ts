@@ -223,10 +223,6 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Indexing speed",
     body: "How hard PM works your machine when it indexes documents — a Drive sync, or files you add (email later). Fast indexes at full speed, using as much CPU and memory as it needs. Gentle paces the work — it pauses briefly between files and embeds in smaller batches — so it uses less CPU and less memory and your computer stays usable while a big index runs in the background. Calendars aren't affected: they're tiny and only fetch events (no indexing), so they always sync at full speed. The setting only changes how fast indexing goes, never what gets indexed, and a change applies right away — even partway through a sync.",
   },
-  "settings-learning": {
-    title: "Learning You",
-    body: "A short, readable profile of how you organise — distilled from the corrections you make in Review. PM injects it into its suggestions and chat so it gets more like you over time. 'Refresh now' rebuilds it from your latest corrections.",
-  },
   "settings-appearance": {
     title: "Appearance",
     body: "Switch the visual System (Editorial / Slate / Terminal), Light or Dark mode, the accent colour, and Depth (how much detail is shown). Changes apply instantly and are remembered on this device.",

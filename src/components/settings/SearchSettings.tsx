@@ -173,19 +173,6 @@ export function SearchSettings() {
         </SectionInfo>
       </div>
 
-      {/* A section with no controls at all — purely a signpost to the Teach tab — so the
-          whole thing is the disclosure, its old heading now the caret's label. */}
-      <div className="mt-5 border-t border-border pt-4">
-        <SectionInfo title="Preferences" helpId="settings-learning">
-          <p>
-            What PM has learned about how you work — what belongs where, how things are named, how
-            answers should read — now lives in the <span className="text-ink2">Teach</span> tab as
-            editable preferences. Your earlier “Learning&nbsp;You” profile was carried over into
-            them automatically.
-          </p>
-        </SectionInfo>
-      </div>
-
       <ConfirmDialog
         open={switchTarget !== null}
         title="Switch search language?"
