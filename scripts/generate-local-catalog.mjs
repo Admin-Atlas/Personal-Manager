@@ -19,6 +19,11 @@
 // Idempotent: it re-hashes the entries and rewrites `local_models.json` ONLY when the content changed
 // (so a scheduled run opens a PR only on a real diff). `generated_at`/`catalog_version` advance only
 // on a real change. Never reads HF_TOKEN — an accidental CI secret must not authenticate the catalog.
+//
+// All-or-nothing on fetch failure: a transient Hugging Face outage (network drop / HTTP 5xx) is
+// retried, and if it persists the run ABORTS without writing — it never emits a shorter catalog. A
+// dropped seed would delete a model AND bump `catalog_version`, so a blip must not masquerade as a
+// real update. Only a model that fetched fine but doesn't qualify (embedding, no curated quant) drops.
 
 import { gguf } from "@huggingface/gguf";
 import { createHash } from "node:crypto";
@@ -30,6 +35,14 @@ const HF = "https://huggingface.co";
 const UA = "pm-local-catalog-generator (Personal-Manager)";
 const DEFAULT_QUANTS = ["Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"];
 const SCHEMA_VERSION = 1;
+// Bounded retries for transient Hugging Face failures (network drop / HTTP 5xx) before we give up.
+const MAX_ATTEMPTS = 4;
+
+// Thrown when a curated seed can't be fetched/verified (transient outage or a permanent 4xx). It
+// ABORTS the whole run rather than emit a smaller catalog — a dropped seed would delete a model AND
+// bump `catalog_version`, nudging every user to rescan over a Hugging Face blip. Distinct from a
+// model that fetched fine but doesn't qualify (embedding, no curated quant), which is a clean drop.
+class AbortRun extends Error {}
 
 // The curated SEED: verified-real GGUF repos spanning small→large, dense + MoE + multimodal, from
 // reputable quantizers (bartowski / unsloth / ggml-org). `sort=downloads` discovery is a maintainer
@@ -62,17 +75,52 @@ const outPath = join(repoRoot, "src-tauri", "local_models.json");
 
 // --- HTTP with the mandatory rate-limit clear-error --------------------------------------------
 
+// Fetch with bounded retries on transient failures. A network drop or an HTTP 5xx is retried a few
+// times with backoff, then — if it still fails — throws `AbortRun` so the run stops WITHOUT writing a
+// degraded catalog. A 429 is never retried (never spin a rate limit): one clear error, exit. A 2xx/3xx
+// or a 4xx is returned for the caller to judge (a 4xx on a curated seed is fatal there).
 async function hfFetch(url, extraHeaders = {}) {
-  const res = await fetch(url, { headers: { "User-Agent": UA, ...extraHeaders } });
-  if (res.status === 429) {
-    const retry = parseRateLimit(res.headers);
-    console.error(
-      `generate-local-catalog: Hugging Face rate-limited this IP (HTTP 429).\n` +
-        `Retry in ${retry}s. This is a dev/CI tool — do NOT set HF_TOKEN to work around it.`,
-    );
-    process.exit(2);
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, { headers: { "User-Agent": UA, ...extraHeaders } });
+    } catch (e) {
+      const reason = e?.message || String(e);
+      if (attempt < MAX_ATTEMPTS) {
+        console.warn(`    ${url} → ${reason}, retry ${attempt}/${MAX_ATTEMPTS - 1} …`);
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw new AbortRun(`${url} failed after ${MAX_ATTEMPTS} attempts (${reason})`);
+    }
+    if (res.status === 429) {
+      const retry = parseRateLimit(res.headers);
+      console.error(
+        `generate-local-catalog: Hugging Face rate-limited this IP (HTTP 429).\n` +
+          `Retry in ${retry}s. This is a dev/CI tool — do NOT set HF_TOKEN to work around it.`,
+      );
+      process.exit(2);
+    }
+    if (res.status >= 500) {
+      if (attempt < MAX_ATTEMPTS) {
+        console.warn(`    ${url} → HTTP ${res.status}, retry ${attempt}/${MAX_ATTEMPTS - 1} …`);
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw new AbortRun(`${url}: HTTP ${res.status} after ${MAX_ATTEMPTS} attempts`);
+    }
+    return res;
   }
-  return res;
+  // Unreachable — the loop either returns a response or throws — but keeps the type checker honest.
+  throw new AbortRun(`${url}: exhausted retries`);
+}
+
+// Exponential backoff: 500ms, 1s, 2s. A dev tool, so a few seconds of waiting out a blip is fine.
+function backoffMs(attempt) {
+  return 500 * 2 ** (attempt - 1);
+}
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // The `RateLimit` header carries `t=<seconds>`; fall back to `Retry-After`, then a plain default.
@@ -93,8 +141,11 @@ async function buildEntry(seed) {
   // 1. Inline GGUF metadata: total params, architecture, context window.
   const infoRes = await hfFetch(`${HF}/api/models/${repo}?expand[]=gguf`);
   if (!infoRes.ok) {
-    console.warn(`  skip ${repo}: model info HTTP ${infoRes.status}`);
-    return null;
+    // 5xx already retried+threw in hfFetch; a 4xx here means a curated seed is gone/renamed — a
+    // maintenance signal, not a silent drop. Abort so the SEED gets fixed rather than shipped short.
+    throw new AbortRun(
+      `curated seed ${repo}: model info HTTP ${infoRes.status} — fix SEED or retry`,
+    );
   }
   const info = await infoRes.json();
   const g = info.gguf || {};
@@ -118,8 +169,8 @@ async function buildEntry(seed) {
   // 2. File tree: per-quant sizes (shards summed) + the mmproj (projector) if any.
   const treeRes = await hfFetch(`${HF}/api/models/${repo}/tree/main?recursive=true`);
   if (!treeRes.ok) {
-    console.warn(`  skip ${repo}: tree HTTP ${treeRes.status}`);
-    return null;
+    // This is the exact case that dropped Meta-Llama-3.1-8B on a 503: abort, never silently shrink.
+    throw new AbortRun(`curated seed ${repo}: tree HTTP ${treeRes.status} — fix SEED or retry`);
   }
   const tree = await treeRes.json();
   const ggufFiles = tree.filter((f) => f.type === "file" && /\.gguf$/i.test(f.path));
@@ -187,11 +238,22 @@ async function moeActiveParams(repo, shardPath, totalParams) {
   if (!shardPath) return null;
   const url = `${HF}/${repo}/resolve/main/${shardPath}`;
   let metadata;
-  try {
-    ({ metadata } = await gguf(url));
-  } catch (e) {
-    console.warn(`    gguf parse failed for ${repo}: ${e?.message || e}`);
-    return null;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      ({ metadata } = await gguf(url));
+      break;
+    } catch (e) {
+      // Retry a transient header-range read; only after it persists is this a real decision-E
+      // exclusion (an unparseable MoE header → drop). A network blip must not masquerade as one.
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      console.warn(
+        `    gguf parse failed for ${repo} after ${MAX_ATTEMPTS} attempts: ${e?.message || e}`,
+      );
+      return null;
+    }
   }
   const arch = String(metadata["general.architecture"] || "");
   const key = (k) => Number(metadata[`${arch}.${k}`] ?? metadata[k]);
@@ -314,7 +376,20 @@ async function main() {
   const entries = [];
   for (const seed of SEED) {
     process.stdout.write(`- ${seed.repo}\n`);
-    const entry = await buildEntry(seed);
+    let entry;
+    try {
+      entry = await buildEntry(seed);
+    } catch (e) {
+      if (e instanceof AbortRun) {
+        console.error(
+          `\ngenerate-local-catalog: ABORTING without writing — ${e.message}\n` +
+            `A transient Hugging Face failure must not silently drop a curated model or bump ` +
+            `catalog_version. Re-run when Hugging Face is healthy.`,
+        );
+        process.exit(1);
+      }
+      throw e;
+    }
     if (entry) entries.push(entry);
   }
   entries.sort((a, b) => a.parameters_b - b.parameters_b);
