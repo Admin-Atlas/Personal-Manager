@@ -60,6 +60,15 @@ if _OFFLINE:
     # local_files_only=_OFFLINE as belt-and-suspenders, but this env var must be authoritative too.
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    # fastembed logs its download attempts through loguru; offline, those are just noise about a
+    # cold-cache miss the worker already turns into a clean "please fetch". Quiet them. Best-effort:
+    # loguru is only a fastembed transitive dep, so a partial venv without it must not break import.
+    try:
+        from loguru import logger
+
+        logger.disable("fastembed")
+    except Exception:
+        pass
 
 # Model-cache root (issue #286). Rust points every model cache at PM's data dir (runtime/models) via
 # PM_MODELS_DIR, so the weights uninstall with the app AND the Windows sidecar sandbox's filesystem

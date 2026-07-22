@@ -484,6 +484,9 @@ pub struct LocalRuntime {
     health: Mutex<HealthState>,
     windows: Mutex<std::collections::HashMap<String, WindowInfo>>,
     last_probe: Mutex<Option<Instant>>,
+    /// The last hardware scan (#296), cached until a `force` re-scan. Reset on restart with the rest
+    /// of this runtime — hardware rarely changes mid-session, and a stale figure is one click away.
+    hardware: Mutex<Option<crate::hardware::Hardware>>,
 }
 
 impl LocalRuntime {
@@ -533,6 +536,18 @@ impl LocalRuntime {
             due
         } else {
             true
+        }
+    }
+
+    /// The last cached hardware scan, if any (poison-tolerant).
+    pub fn cached_hardware(&self) -> Option<crate::hardware::Hardware> {
+        self.hardware.lock().ok()?.clone()
+    }
+
+    /// Store a fresh hardware scan (poison-tolerant).
+    pub fn cache_hardware(&self, hw: crate::hardware::Hardware) {
+        if let Ok(mut h) = self.hardware.lock() {
+            *h = Some(hw);
         }
     }
 }

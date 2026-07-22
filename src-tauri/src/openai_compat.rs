@@ -735,15 +735,21 @@ pub async fn complete(
 /// `/slots` (llama-server) is tried first for the proven window; `/v1/models` metadata second; the
 /// catalog hook is filled in by #296 (PR4). A conservative default is never an error — it is the
 /// bottom rung by design.
-pub async fn probe_window(base_url: &str, model: &str, token: Option<&str>) -> WindowInfo {
+pub async fn probe_window(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+    catalog: Option<u32>,
+) -> WindowInfo {
     let slots = probe_slots_ctx(base_url, token).await;
     let models_meta = if slots.is_none() {
         probe_models_ctx(base_url, model, token).await
     } else {
         None
     };
-    // Catalog rung (None here) is supplied by the gateway once #296's catalog lands.
-    pick_window(slots, models_meta, None)
+    // The catalog rung — a matched curated model's advertised window (#296) — is supplied by the
+    // gateway, which owns the catalog lookup so this protocol module stays catalog-free.
+    pick_window(slots, models_meta, catalog)
 }
 
 /// llama-server `/slots` returns per-slot `n_ctx` for the loaded model. 404/501/timeout → None (not

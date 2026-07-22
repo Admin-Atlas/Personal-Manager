@@ -23,7 +23,7 @@ use crate::llm_gateway::{
     LOCAL_CHAT_MODEL_KEY,
 };
 use crate::local_slot::{classify_ip, posture_for, EndpointClass, PostureVerdict};
-use crate::{db, openai_compat, secrets, AppState};
+use crate::{db, fit, hardware, local_catalog, openai_compat, paths, secrets, AppState};
 
 /// The three servers PM knows how to auto-detect, by their default loopback port.
 const KNOWN_PORTS: &[(u16, &str)] = &[
@@ -501,6 +501,209 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         cooldown_remaining_s,
         probed_now: probe_now,
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hardware scan + model recommendations (#296) — the Workbench data layer. Backend-only in PR4
+// (no ipc.ts wrapper yet); the Local AI tab consumes these in PR5.
+// ---------------------------------------------------------------------------------------------
+
+/// Scan the machine (RAM/CPU/disk/GPU). Cached on the runtime; `force` re-scans. Kept separate from
+/// [`local_model_recommendations`] so the (slower) scan caches independently of a recommendations
+/// refresh. The probes are blocking, so they run off the async runtime.
+#[tauri::command]
+pub async fn local_hardware_scan(app: AppHandle, force: bool) -> Result<hardware::Hardware> {
+    if !force {
+        if let Some(hw) = app.state::<AppState>().local_ai.cached_hardware() {
+            return Ok(hw);
+        }
+    }
+    let hw = scan_hardware(&app).await?;
+    Ok(hw)
+}
+
+/// Score every curated catalog model — and any model the configured endpoint already serves — against
+/// this machine's memory, so the Workbench can recommend what to run. Uses the cached hardware scan
+/// (or runs one), never forcing a re-scan.
+#[tauri::command]
+pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendations> {
+    let hardware = match app.state::<AppState>().local_ai.cached_hardware() {
+        Some(hw) => hw,
+        None => scan_hardware(&app).await?,
+    };
+    let fit_hw = fit::FitHardware {
+        available_ram_gb: hardware.available_ram_gb,
+        vram_gb: hardware.vram_gb,
+    };
+
+    // Score the curated catalog.
+    let cat = local_catalog::catalog();
+    let mut curated: Vec<Recommendation> = cat
+        .entries
+        .iter()
+        .map(|e| Recommendation {
+            repo: e.repo.clone(),
+            display_name: e.display_name.clone(),
+            architecture: e.architecture.clone(),
+            role_hint: e.role_hint.clone(),
+            parameters_b: e.parameters_b,
+            active_parameters_b: e.active_parameters_b,
+            context_length: e.context_length,
+            multimodal: e.multimodal,
+            reasoning: e.reasoning,
+            install: e.install.clone(),
+            // Honour the generator's judgment: an entry it marked fit-unknown is never silently scored.
+            fit: match e.fit {
+                local_catalog::FitClass::Unknown => {
+                    fit::unknown("PM can't estimate this model's fit.".to_string())
+                }
+                local_catalog::FitClass::Computed => {
+                    fit::fit(&local_catalog::entry_to_spec(e), &fit_hw)
+                }
+            },
+        })
+        .collect();
+    curated.sort_by(|a, b| {
+        verdict_rank(a.fit.verdict)
+            .cmp(&verdict_rank(b.fit.verdict))
+            .then(
+                b.parameters_b
+                    .partial_cmp(&a.parameters_b)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    // Models the configured endpoint already serves (best-effort — no endpoint is fine).
+    let base_url = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?
+    };
+    let endpoint_configured = base_url.is_some();
+    let mut installed = Vec::new();
+    if let Some(base_url) = base_url {
+        let token = secrets::get_local_llm_endpoint_token()?;
+        if let Ok(models) =
+            openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose())).await
+        {
+            for id in models {
+                let (matched_repo, fit_result) = match local_catalog::match_installed(&id) {
+                    Some(entry) => (
+                        Some(entry.repo.clone()),
+                        fit::fit(&local_catalog::entry_to_spec(entry), &fit_hw),
+                    ),
+                    None => (
+                        None,
+                        fit::unknown(
+                            "This model isn't in PM's catalog, so its fit can't be estimated."
+                                .to_string(),
+                        ),
+                    ),
+                };
+                installed.push(InstalledModel {
+                    id,
+                    matched_repo,
+                    fit: fit_result,
+                });
+            }
+        }
+    }
+
+    // Rescan cadence — read-only in PR4 (the Local AI tab sets it and stamps the seen version in PR5).
+    let (cadence, rescan_due) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let cadence = local_catalog::RescanCadence::from_setting(
+            db::get_setting(&conn, local_catalog::RESCAN_CADENCE_KEY)?.as_deref(),
+        );
+        let seen = db::get_setting(&conn, local_catalog::CATALOG_VERSION_SEEN_KEY)?
+            .and_then(|s| s.parse::<u32>().ok());
+        let last =
+            db::get_setting_time(&conn, local_catalog::LAST_RESCAN_KEY).map(|t| t.timestamp());
+        let due = local_catalog::rescan_due(
+            cadence,
+            seen,
+            cat.catalog_version,
+            last,
+            chrono::Utc::now().timestamp(),
+        );
+        (cadence.as_setting().to_string(), due)
+    };
+
+    Ok(Recommendations {
+        hardware,
+        reserve_gb: fit::reserve_gb(),
+        catalog_version: cat.catalog_version,
+        catalog_generated_at: cat.generated_at.clone(),
+        endpoint_configured,
+        cadence,
+        rescan_due,
+        curated,
+        installed,
+    })
+}
+
+/// Run a fresh hardware scan off the async runtime and cache it. Shared by both commands.
+async fn scan_hardware(app: &AppHandle) -> Result<hardware::Hardware> {
+    let data_dir = paths::data_dir(app).ok();
+    let hw = tauri::async_runtime::spawn_blocking(move || hardware::scan(data_dir.as_deref()))
+        .await
+        .map_err(|e| Error::Other(format!("hardware scan task failed: {e}")))?;
+    app.state::<AppState>().local_ai.cache_hardware(hw.clone());
+    Ok(hw)
+}
+
+/// Sort key so the best-fitting, most-capable models rise to the top of the list.
+fn verdict_rank(v: fit::Verdict) -> u8 {
+    match v {
+        fit::Verdict::Comfortable => 0,
+        fit::Verdict::Tight => 1,
+        fit::Verdict::HalvedContext => 2,
+        fit::Verdict::StayOnCloud => 3,
+        fit::Verdict::Unknown => 4,
+    }
+}
+
+/// One curated model, scored against this machine.
+#[derive(Serialize)]
+pub struct Recommendation {
+    pub repo: String,
+    pub display_name: String,
+    pub architecture: String,
+    pub role_hint: Option<String>,
+    pub parameters_b: f64,
+    pub active_parameters_b: f64,
+    pub context_length: u32,
+    pub multimodal: bool,
+    pub reasoning: Option<bool>,
+    pub install: local_catalog::InstallHints,
+    pub fit: fit::FitResult,
+}
+
+/// A model the configured endpoint already serves, matched to the catalog when possible.
+#[derive(Serialize)]
+pub struct InstalledModel {
+    pub id: String,
+    pub matched_repo: Option<String>,
+    pub fit: fit::FitResult,
+}
+
+/// The Workbench recommendations payload.
+#[derive(Serialize)]
+pub struct Recommendations {
+    pub hardware: hardware::Hardware,
+    /// System RAM kept free when scoring (surfaced so the UI can state it).
+    pub reserve_gb: f64,
+    pub catalog_version: u32,
+    /// The UTC date the catalog content last changed — for a "catalog from <date>" line.
+    pub catalog_generated_at: String,
+    pub endpoint_configured: bool,
+    /// The rescan cadence as stored (`on-catalog-update` default).
+    pub cadence: String,
+    /// A read-only signal for PR5's passive "a better-fitting model is available" nudge.
+    pub rescan_due: bool,
+    pub curated: Vec<Recommendation>,
+    pub installed: Vec<InstalledModel>,
 }
 
 #[cfg(test)]
