@@ -24,7 +24,9 @@ use serde::Serialize;
 const GIB: f64 = 1_073_741_824.0;
 
 /// The GPU's `AdapterRAM` (a WMI `uint32`) saturates around 4 GiB, so any value at/above this ceiling
-/// is a lie for a modern card — we fall back to a RAM-only score rather than trust it.
+/// is a lie for a modern card — we fall back to a RAM-only score rather than trust it. (Only the
+/// Windows probe reads `AdapterRAM`, so it's gated with its helper — see the pure-parse section note.)
+#[cfg(any(windows, test))]
 const ADAPTER_RAM_CEILING: u64 = 4_000_000_000;
 
 /// The fraction of unified memory Apple Silicon lets the GPU use (`recommendedMaxWorkingSetSize` is
@@ -242,10 +244,14 @@ fn probe_gpu() -> GpuProbe {
     GpuProbe::default()
 }
 
+// nvidia-smi is queried by the Windows and Linux probes; macOS never shells out to it.
+#[cfg(any(windows, target_os = "linux"))]
 const NVIDIA_SMI_ARGS: [&str; 2] = ["--query-gpu=memory.total", "--format=csv,noheader,nounits"];
 
 /// Run a command and capture stdout as a string, or `None` if it can't be run or fails. On Windows a
-/// no-op-elsewhere `no_window` flag keeps a console from flashing.
+/// no-op-elsewhere `no_window` flag keeps a console from flashing. Only the Windows/Linux probes shell
+/// out (macOS reads memory directly), so this is gated to them.
+#[cfg(any(windows, target_os = "linux"))]
 fn run_capture(program: &str, args: &[&str]) -> Option<String> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
@@ -265,7 +271,8 @@ fn no_window(cmd: &mut std::process::Command) {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
-#[cfg(not(windows))]
+// The no-op arm only needs to exist where `run_capture` is compiled but isn't Windows — i.e. Linux.
+#[cfg(target_os = "linux")]
 fn no_window(_cmd: &mut std::process::Command) {}
 
 #[cfg(target_os = "linux")]
@@ -291,8 +298,13 @@ fn is_wsl_now() -> bool {
         .unwrap_or(false)
 }
 
-// --- pure parse helpers (unit-tested; the live probes above are not) ----------------------------
+// --- pure parse helpers (unit-tested; the live probes above are not) -----------------------------
+//
+// Each is `#[cfg]`-gated to the OS whose probe calls it, plus `test` so every platform's test run
+// still exercises the parser. Without the gate, clippy's `-D warnings` dead-code lint fails the build
+// on the platforms that don't use a given helper — a Windows `AdapterRAM` parser is dead on Linux.
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone)]
 struct GpuLine {
     name: String,
@@ -301,6 +313,7 @@ struct GpuLine {
 
 /// Parse `Get-CimInstance Win32_VideoController | ConvertTo-Json` — which is a single object for one
 /// GPU and an array for several. Missing/zero `AdapterRAM` becomes `None`.
+#[cfg(any(windows, test))]
 fn parse_video_controller_json(json: &str) -> Vec<GpuLine> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
         return Vec::new();
@@ -330,6 +343,7 @@ fn parse_video_controller_json(json: &str) -> Vec<GpuLine> {
 
 /// Choose the most relevant controller: skip Microsoft's basic/remote display shims, then take the
 /// one reporting the most memory (usually the discrete card), else the first real one.
+#[cfg(any(windows, test))]
 fn pick_gpu(lines: &[GpuLine]) -> Option<GpuLine> {
     let real: Vec<&GpuLine> = lines
         .iter()
@@ -349,11 +363,13 @@ fn pick_gpu(lines: &[GpuLine]) -> Option<GpuLine> {
 }
 
 /// `AdapterRAM` is a `uint32` that saturates near 4 GiB, so only sub-ceiling values are trustworthy.
+#[cfg(any(windows, test))]
 fn adapter_ram_reliable(bytes: u64) -> bool {
     bytes > 0 && bytes < ADAPTER_RAM_CEILING
 }
 
 /// The largest `memory.total` (MiB) across `nvidia-smi --query-gpu` lines, or `None`.
+#[cfg(any(windows, target_os = "linux", test))]
 fn parse_nvidia_smi_csv(csv: &str) -> Option<f64> {
     csv.lines()
         .filter_map(|l| l.trim().parse::<f64>().ok())
@@ -364,6 +380,7 @@ fn parse_nvidia_smi_csv(csv: &str) -> Option<f64> {
 }
 
 /// A GPU vendor guessed from the controller name, or `None` if unrecognized.
+#[cfg(any(windows, test))]
 fn vendor_from_name(name: &str) -> Option<String> {
     let n = name.to_ascii_lowercase();
     if n.contains("nvidia")
