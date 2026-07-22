@@ -22,7 +22,6 @@ import {
   setIndexingSpeed,
   setOpenRouterBackgroundKey,
   setOpenRouterKey,
-  setReranking,
   setTimeZone,
   setVaultEmbedder,
   vaultStatus,
@@ -32,9 +31,9 @@ import { BackupSettings } from "./BackupSettings";
 import { ConnectorsSettings } from "./ConnectorsSettings";
 import { DataSecuritySettings } from "./settings/DataSecuritySettings";
 import { DeveloperSettings } from "./settings/DeveloperSettings";
+import { SearchSettings } from "./settings/SearchSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { IngestProgress } from "./IngestProgress";
-import { RebuildProgress } from "./RebuildProgress";
 import { StorageSettings } from "./StorageSettings";
 import type { CostSummary, LanguageOptions } from "../lib/types";
 import { formatWhen } from "../lib/format";
@@ -61,7 +60,6 @@ import {
 import {
   Button,
   Collapsible,
-  ConfirmDialog,
   Input,
   NavItem,
   SectionInfo,
@@ -139,8 +137,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   // checklist and `set_vault_embedder` is suppressed. (First-run always creates a device vault;
   // sharing happens later through the guided wizard.)
   const [joinedVault, setJoinedVault] = useState(false);
-  // Query-time reranking toggle (default on; stateless — never triggers a Rebuild).
-  const [reranking, setRerankingState] = useState(true);
   // Indexing speed: "fast" (default) or "gentle" (paced for low-end machines).
   const [indexingSpeed, setIndexingSpeedState] = useState<"fast" | "gentle">("fast");
   // Memory map (the Map tab): the default grouping (per-device, shared with the Map header toggle via
@@ -161,12 +157,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
   const [embedderId, setEmbedderId] = useState("");
-  // Settings language switcher (non-onboarding): the pending confirm target, the in-flight switch
-  // (drives the guided re-index modal: { to, from }), and any error from the switch itself.
-  const [switchTarget, setSwitchTarget] = useState<string | null>(null);
-  const [switching, setSwitching] = useState<{ to: string; from: string } | null>(null);
-  const [rebuildOpen, setRebuildOpen] = useState(false);
-  const [switchError, setSwitchError] = useState<string | null>(null);
   // Active tab (non-onboarding only). The scrolling content pane is reset to the top on a
   // tab change so each tab opens from its first section.
   const [tab, setTab] = useState<SettingsTab>("general");
@@ -206,7 +196,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
             /* ignore — UTC fallback in the backend */
           }
         }
-        setRerankingState(settings.reranking);
         setIndexingSpeedState(settings.indexing_speed === "gentle" ? "gentle" : "fast");
       } catch (e) {
         setError(String(e));
@@ -323,17 +312,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       .finally(() => setInstallingTsne(false));
   }
 
-  async function toggleReranking(next: boolean) {
-    setError(null);
-    setRerankingState(next); // optimistic — revert if the write fails
-    try {
-      await setReranking(next);
-    } catch (e) {
-      setRerankingState(!next);
-      setError(String(e));
-    }
-  }
-
   async function changeIndexingSpeed(next: "fast" | "gentle") {
     setError(null);
     const prev = indexingSpeed;
@@ -343,49 +321,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     } catch (e) {
       setIndexingSpeedState(prev);
       setError(String(e));
-    }
-  }
-
-  // Re-sync the language picker with the backend's truth (after a switch lands, or reverts).
-  async function reloadLang() {
-    try {
-      const lo = await languageOptions();
-      setLangOpts(lo);
-      setEmbedderId(lo.selected);
-    } catch {
-      /* ignore — the picker simply keeps its last state */
-    }
-  }
-
-  // A click on the *other* segment in Settings: stage the target and open the confirm. The picker's
-  // value stays on the current selection until the switch actually lands, so a cancel snaps back.
-  function requestLanguageSwitch(newId: string) {
-    if (!langOpts || newId === embedderId) return;
-    setSwitchError(null);
-    setSwitchTarget(newId);
-  }
-
-  // Confirmed: record the new embedder. An empty vault is done immediately (the backend resized its
-  // empty vector table); a populated vault launches the guided re-index, remembering the old id so
-  // a download/offline failure can revert the selection (search keeps working on the old index).
-  async function confirmLanguageSwitch() {
-    if (!langOpts || !switchTarget) return;
-    const to = switchTarget;
-    const from = embedderId;
-    setSwitchTarget(null);
-    setSwitchError(null);
-    try {
-      await setVaultEmbedder(to);
-    } catch (e) {
-      setSwitchError(String(e));
-      return;
-    }
-    if (langOpts.has_documents) {
-      setSwitching({ to, from });
-      setRebuildOpen(true);
-    } else {
-      setEmbedderId(to);
-      await reloadLang();
     }
   }
 
@@ -1185,84 +1120,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
               </>
             )}
 
-            {tab === "search" && (
-              <>
-                <div className="mt-4 border-t border-border pt-4">
-                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                    Search
-                  </label>
-                  {langOpts && langOpts.options.length > 1 && (
-                    <div className="mt-2">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="text-xs text-ink4">
-                          Language:{" "}
-                          <span className="text-ink2">
-                            {langOpts.options.find((o) => o.id === embedderId)?.label ?? "English"}
-                          </span>
-                        </p>
-                        <SegmentedControl
-                          value={embedderId}
-                          onChange={requestLanguageSwitch}
-                          options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
-                        />
-                      </div>
-                      {switchError && <p className="mt-1 text-xs text-st-due">{switchError}</p>}
-                    </div>
-                  )}
-                  <div className="mt-3 flex items-start justify-between gap-3">
-                    <label className="block text-sm font-medium text-ink2">
-                      Re-rank search results
-                    </label>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={reranking}
-                      aria-label="Re-rank search results"
-                      onClick={() => void toggleReranking(!reranking)}
-                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                        reranking ? "bg-accent" : "bg-surface"
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                          reranking ? "translate-x-4" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                  {/* Both of the section's paragraphs in one disclosure at the foot. Folding the
-                      "switching re-indexes your library" note is safe *because* the confirm dialog
-                      restates it at the moment it bites — and nothing here is lost either way
-                      (your Markdown files are the source it re-indexes from). */}
-                  <SectionInfo title="About search language & re-ranking">
-                    {langOpts && langOpts.options.length > 1 && (
-                      <p>
-                        Switching language re-indexes your whole library from your Markdown files —
-                        Multilingual downloads a larger model the first time (about 1 GB, once).
-                        Your original files are never touched.
-                      </p>
-                    )}
-                    <p>
-                      Re-ranking runs a second pass that re-scores search hits for sharper
-                      relevance. First use downloads a small model; turn it off for fastest results.
-                    </p>
-                  </SectionInfo>
-                </div>
-
-                {/* A section with no controls at all — purely a signpost to the Teach tab — so the
-                    whole thing is the disclosure, its old heading now the caret's label. */}
-                <div className="mt-5 border-t border-border pt-4">
-                  <SectionInfo title="Preferences" helpId="settings-learning">
-                    <p>
-                      What PM has learned about how you work — what belongs where, how things are
-                      named, how answers should read — now lives in the{" "}
-                      <span className="text-ink2">Teach</span> tab as editable preferences. Your
-                      earlier “Learning&nbsp;You” profile was carried over into them automatically.
-                    </p>
-                  </SectionInfo>
-                </div>
-              </>
-            )}
+            {tab === "search" && <SearchSettings />}
 
             {tab === "connectors" && (
               <>
@@ -1304,40 +1162,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
           </div>
         </div>
       </div>
-
-      <ConfirmDialog
-        open={switchTarget !== null}
-        title="Switch search language?"
-        confirmLabel="Switch & re-index"
-        onConfirm={() => void confirmLanguageSwitch()}
-        onClose={() => setSwitchTarget(null)}
-      >
-        This re-indexes your whole library from your Markdown files
-        {langOpts?.options.find((o) => o.id === switchTarget)?.multilingual
-          ? ", and downloads a larger language model the first time (about 1 GB, once)"
-          : ""}
-        . Your original files aren&apos;t changed, and it can take a while on a large library.
-      </ConfirmDialog>
-
-      {switching && (
-        <RebuildProgress
-          open={rebuildOpen}
-          title="Switching search language"
-          subtitle={`Re-indexing your library for ${
-            langOpts?.options.find((o) => o.id === switching.to)?.label ?? "the new language"
-          }.`}
-          onError={() => {
-            // The re-index failed (e.g. offline): revert the selection so search keeps working on
-            // the existing index.
-            void setVaultEmbedder(switching.from).catch(() => {});
-          }}
-          onClose={() => {
-            setRebuildOpen(false);
-            setSwitching(null);
-            void reloadLang();
-          }}
-        />
-      )}
     </div>
   );
 }
