@@ -702,12 +702,14 @@ fn ensure_local_window_cached(app: &AppHandle, local: &LocalArm) {
     {
         return;
     }
+    // The catalog rung is a cheap in-memory lookup — resolve it here (sync) and hand it to the probe.
+    let catalog = crate::local_catalog::context_window_for(&local.model);
     let app = app.clone();
     let base_url = local.base_url.clone();
     let model = local.model.clone();
     let token = local.token.as_ref().map(|s| s.expose().to_string());
     tauri::async_runtime::spawn(async move {
-        let info = openai_compat::probe_window(&base_url, &model, token.as_deref()).await;
+        let info = openai_compat::probe_window(&base_url, &model, token.as_deref(), catalog).await;
         app.state::<AppState>()
             .local_ai
             .cache_window(&base_url, &model, info);

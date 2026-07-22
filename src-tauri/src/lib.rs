@@ -25,18 +25,27 @@ mod db;
 mod drive;
 mod entities;
 mod error;
+// Pure model-fit scoring (#296): sizes a model against a machine's memory and picks the best
+// (quant, context) that fits. No I/O — a pure projection of hardware + catalog inputs.
+mod fit;
 // The structured flag layer (board card 9): detection (a pure reducer over milestones + calendar)
 // populates first-class flag records, the briefing renders the active set, and a backstop
 // scheduler keeps them current. Assertion/resolution and chat grounding arrive in the following PRs.
 mod flags;
 mod fts_segment;
 mod google;
+// Best-effort hardware scan (#296): RAM/CPU/disk via sysinfo, GPU/VRAM hand-rolled per-OS. Every
+// probe nulls its field on failure rather than erroring.
+mod hardware;
 mod ics;
 mod index_only;
 mod ingest;
 mod layout;
 mod llm_gateway;
 mod local_ai;
+// The curated local-model catalog (#296): in-repo GGUF table (include_str!), bridged into fit-scoring
+// and the endpoint window ladder's catalog rung.
+mod local_catalog;
 mod local_slot;
 // Local-folder indexing (board card 6): a third index-only source on the shared foundation, reading
 // from the filesystem. This first PR reconciles a tracked folder on demand (a filtered walk +
@@ -1104,6 +1113,9 @@ pub fn run() {
             local_ai::clear_local_llm_token,
             local_ai::list_local_llm_models,
             local_ai::local_llm_status,
+            // Workbench (#296): hardware scan + per-machine model recommendations.
+            local_ai::local_hardware_scan,
+            local_ai::local_model_recommendations,
             commands::get_settings,
             commands::set_indexing_speed,
             commands::set_chat_models,

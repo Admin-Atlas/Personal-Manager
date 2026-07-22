@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.37.1-alpha"
+version = "3.38.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -110,6 +110,11 @@ rrule = "0.14"
 file-id = "0.2"
 notify = "8"
 notify-debouncer-full = "0.7"
+
+# Hardware scan for the local-AI Workbench (#296): RAM / CPU / disk only. sysinfo 0.39 has no
+# GPU/VRAM/battery, so those are hand-rolled per-OS in hardware.rs. default-features off drops the
+# network/component/user probes we don't use — leaner binary and licence surface.
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 
 # OpenRouter streaming chat client. rustls keeps TLS independent of SQLCipher's crypto.
 # `blocking` is used by python_fetch (macOS interpreter download) from inside spawn_blocking.

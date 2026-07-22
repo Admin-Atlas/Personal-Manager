@@ -1,0 +1,675 @@
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "content_hash": "sha256:1501993e96a5b15385013964f53fa46f5fc9e2b2ff2170dfc44c70e9d3531fc1",
+  "generated_at": "2026-07-22",
+  "source": "huggingface-gguf",
+  "entries": [
+    {
+      "repo": "ggml-org/SmolVLM-500M-Instruct-GGUF",
+      "display_name": "SmolVLM 500M Instruct",
+      "architecture": "llama",
+      "role_hint": "background",
+      "parameters_b": 0.41,
+      "active_parameters_b": 0.41,
+      "context_length": 8192,
+      "multimodal": true,
+      "reasoning": null,
+      "projector_gb": 0.1,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q8_0",
+          "file_gb": 0.41,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "ggml-org/gemma-3-1b-it-GGUF",
+      "display_name": "gemma 3 1b it",
+      "architecture": "gemma3",
+      "role_hint": "background",
+      "parameters_b": 1,
+      "active_parameters_b": 1,
+      "context_length": 32768,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 0.75,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 1,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "bartowski/Llama-3.2-1B-Instruct-GGUF",
+      "display_name": "Llama 3.2 1B Instruct",
+      "architecture": "llama",
+      "role_hint": "background",
+      "parameters_b": 1.24,
+      "active_parameters_b": 1.24,
+      "context_length": 131072,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 0.75,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 0.85,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 0.95,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 1.23,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "bartowski/gemma-2-2b-it-GGUF",
+      "display_name": "gemma 2 2b it",
+      "architecture": "gemma2",
+      "role_hint": "background",
+      "parameters_b": 2.61,
+      "active_parameters_b": 2.61,
+      "context_length": 8192,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 1.59,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 1.79,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 2,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 2.59,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "bartowski/Llama-3.2-3B-Instruct-GGUF",
+      "display_name": "Llama 3.2 3B Instruct",
+      "architecture": "llama",
+      "role_hint": "background",
+      "parameters_b": 3.21,
+      "active_parameters_b": 3.21,
+      "context_length": 131072,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 1.88,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 2.16,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 2.46,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 3.19,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "bartowski/Phi-3.5-mini-instruct-GGUF",
+      "display_name": "Phi 3.5 mini instruct",
+      "architecture": "phi3",
+      "role_hint": "background",
+      "parameters_b": 3.82,
+      "active_parameters_b": 3.82,
+      "context_length": 131072,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 1.82,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 2.23,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 2.62,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 2.92,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 3.78,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "ggml-org/gemma-3-4b-it-GGUF",
+      "display_name": "gemma 3 4b it",
+      "architecture": "gemma3",
+      "role_hint": "chat",
+      "parameters_b": 3.88,
+      "active_parameters_b": 3.88,
+      "context_length": 131072,
+      "multimodal": true,
+      "reasoning": null,
+      "projector_gb": 0.79,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 2.32,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 3.85,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3.5-4B-GGUF",
+      "display_name": "Qwen3.5 4B",
+      "architecture": "qwen35",
+      "role_hint": "background",
+      "parameters_b": 4.21,
+      "active_parameters_b": 4.21,
+      "context_length": 262144,
+      "multimodal": true,
+      "reasoning": null,
+      "projector_gb": 0.63,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 2.14,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 2.55,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 2.93,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 3.28,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 4.17,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+      "display_name": "Qwen2.5 7B Instruct",
+      "architecture": "qwen2",
+      "role_hint": "chat",
+      "parameters_b": 7.62,
+      "active_parameters_b": 7.62,
+      "context_length": 32768,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 3.55,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 4.36,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 5.07,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 5.82,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 7.54,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+      "display_name": "Meta Llama 3.1 8B Instruct",
+      "architecture": "llama",
+      "role_hint": "chat",
+      "parameters_b": 8.03,
+      "active_parameters_b": 8.03,
+      "context_length": 131072,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 3.74,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 4.58,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 5.34,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 6.14,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 7.95,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3.5-9B-GGUF",
+      "display_name": "Qwen3.5 9B",
+      "architecture": "qwen35",
+      "role_hint": "chat",
+      "parameters_b": 8.95,
+      "active_parameters_b": 8.95,
+      "context_length": 262144,
+      "multimodal": true,
+      "reasoning": null,
+      "projector_gb": 0.86,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 4.35,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 5.29,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 6.13,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 6.95,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 8.87,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "unsloth/gemma-4-12b-it-GGUF",
+      "display_name": "gemma 4 12b it",
+      "architecture": "gemma4",
+      "role_hint": "chat",
+      "parameters_b": 11.91,
+      "active_parameters_b": 11.91,
+      "context_length": 262144,
+      "multimodal": true,
+      "reasoning": null,
+      "projector_gb": 0.16,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 5.3,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 6.63,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 7.84,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 9.11,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 12.23,
+          "sharded": true
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "bartowski/Qwen2.5-14B-Instruct-GGUF",
+      "display_name": "Qwen2.5 14B Instruct",
+      "architecture": "qwen2",
+      "role_hint": "chat",
+      "parameters_b": 14.77,
+      "active_parameters_b": 14.77,
+      "context_length": 32768,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 6.84,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 8.37,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 9.79,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 11.29,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 14.62,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "unsloth/gemma-4-26B-A4B-it-GGUF",
+      "display_name": "gemma 4 26B A4B it",
+      "architecture": "gemma4",
+      "role_hint": "chat",
+      "parameters_b": 25.23,
+      "active_parameters_b": 3.82,
+      "context_length": 262144,
+      "multimodal": true,
+      "reasoning": null,
+      "projector_gb": 1.11,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 11.85,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 15.78,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 19.7,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 21.58,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 25.45,
+          "sharded": true
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3.6-27B-GGUF",
+      "display_name": "Qwen3.6 27B",
+      "architecture": "qwen35",
+      "role_hint": "chat",
+      "parameters_b": 26.9,
+      "active_parameters_b": 26.9,
+      "context_length": 262144,
+      "multimodal": true,
+      "reasoning": null,
+      "projector_gb": 0.86,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 12.65,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 15.66,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 18.17,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 20.98,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 26.63,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "display_name": "Qwen3.6 35B A3B",
+      "architecture": "qwen35moe",
+      "role_hint": "chat",
+      "parameters_b": 34.66,
+      "active_parameters_b": 3.45,
+      "context_length": 262144,
+      "multimodal": true,
+      "reasoning": null,
+      "projector_gb": 0.84,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 15.46,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 20.61,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 24.64,
+          "sharded": false
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 27.3,
+          "sharded": false
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 34.37,
+          "sharded": false
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    },
+    {
+      "repo": "bartowski/Qwen2.5-72B-Instruct-GGUF",
+      "display_name": "Qwen2.5 72B Instruct",
+      "architecture": "qwen2",
+      "role_hint": "chat",
+      "parameters_b": 72.71,
+      "active_parameters_b": 72.71,
+      "context_length": 32768,
+      "multimodal": false,
+      "reasoning": null,
+      "projector_gb": null,
+      "fit": "computed",
+      "quants": [
+        {
+          "quant": "Q3_K_M",
+          "file_gb": 35.11,
+          "sharded": false
+        },
+        {
+          "quant": "Q4_K_M",
+          "file_gb": 44.16,
+          "sharded": false
+        },
+        {
+          "quant": "Q5_K_M",
+          "file_gb": 50.71,
+          "sharded": true
+        },
+        {
+          "quant": "Q6_K",
+          "file_gb": 59.93,
+          "sharded": true
+        },
+        {
+          "quant": "Q8_0",
+          "file_gb": 71.96,
+          "sharded": true
+        }
+      ],
+      "install": {
+        "ollama": null
+      }
+    }
+  ]
+}

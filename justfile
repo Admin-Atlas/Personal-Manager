@@ -66,6 +66,14 @@ frontend-test:
 fetch-python:
     node scripts/fetch-python.mjs
 
+# Refresh the curated local-model catalog (#296) from Hugging Face into
+# src-tauri/local_models.json. Dev-only + network-bound, so deliberately NOT part of
+# `check` (it must never make the PR gate flaky). Uses the @huggingface/gguf
+# devDependency; `--discover` prints the top GGUF repos as a curation aid. Idempotent —
+# rewrites only on a real content change.
+generate-local-catalog:
+    node scripts/generate-local-catalog.mjs
+
 cargo-fmt:
     cargo fmt --check --manifest-path {{manifest}}
 

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.38.0-alpha",
+    date: "2026-07-22",
+    highlights: [
+      "Under-the-hood groundwork for on-device AI: PM can now read your computer's memory, processor, and graphics card, and size a curated list of local models against it — working out the highest quality each one could run, and roughly how fast. Nothing to switch on yet; the setup screen that shows these recommendations comes next.",
+    ],
+  },
+  {
     version: "3.37.1-alpha",
     date: "2026-07-21",
     highlights: [
