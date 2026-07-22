@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.39.0-alpha",
+    date: "2026-07-22",
+    highlights: [
+      "Settings now save the moment you change them — the Save button is gone, so there's nothing to remember to click. Your API key shows a green 'Saved' the instant it's stored. (Groundwork, too, for adding new settings cleanly — like the on-device AI setup coming soon.)",
+    ],
+  },
+  {
     version: "3.38.0-alpha",
     date: "2026-07-22",
     highlights: [

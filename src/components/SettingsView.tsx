@@ -2,80 +2,32 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef, useState } from "react";
-import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
-  appLockStatus,
-  costSummary,
-  exportAllData,
-  getPref,
   getSettings,
-  hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
-  installOptionalTsne,
   languageOptions,
-  onTsneInstall,
-  openDataFolder,
-  optionalTsneStatus,
-  refreshPricing,
-  setPref,
-  startSemanticLayout,
-  setAppLock,
   setBackgroundAutoSwitch,
   setBackgroundModels,
   setChatAutoSwitch,
   setChatModels,
   setIndexingSpeed,
-  setOpenRouterBackgroundKey,
   setOpenRouterKey,
-  setReranking,
   setTimeZone,
   setVaultEmbedder,
   vaultStatus,
 } from "../lib/ipc";
-import { useHelp } from "../lib/help";
 import { BackupSettings } from "./BackupSettings";
 import { ConnectorsSettings } from "./ConnectorsSettings";
+import { AiModelsSettings } from "./settings/AiModelsSettings";
+import { DataSecuritySettings } from "./settings/DataSecuritySettings";
+import { DeveloperSettings } from "./settings/DeveloperSettings";
+import { GeneralSettings } from "./settings/GeneralSettings";
+import { SearchSettings } from "./settings/SearchSettings";
 import { ModelListEditor } from "./ModelListEditor";
-import { IngestProgress } from "./IngestProgress";
-import { RebuildProgress } from "./RebuildProgress";
-import { RemovePmData } from "./RemovePmData";
 import { StorageSettings } from "./StorageSettings";
-import { VaultCard } from "./VaultCard";
-import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
-import { isDevBuild, useDevMode } from "../lib/capabilities";
-import { formatWhen } from "../lib/format";
-import { IS_LINUX } from "../lib/setupGuide";
-import {
-  MAP_COHESION_KEY,
-  MAP_MODE_KEY,
-  readMapCohesion,
-  readMapMode,
-  type MapLayoutMode,
-} from "../lib/mapPrefs";
-import { readConfirmDelete, writeConfirmDelete } from "../lib/pinboard/prefs";
-import {
-  useTheme,
-  ACCENTS,
-  accentName,
-  MONO_ACCENT,
-  EIGENGRAU,
-  deviceCoords,
-  coordsForTimezone,
-  formatCoords,
-  deviceTimeZone,
-  allTimeZones,
-} from "../theme";
-import {
-  Button,
-  Collapsible,
-  ConfirmDialog,
-  Input,
-  NavItem,
-  SectionInfo,
-  SegmentedControl,
-  Select,
-  Toggle,
-} from "./ui";
+import type { LanguageOptions } from "../lib/types";
+import { deviceTimeZone } from "../theme";
+import { Button, Collapsible, Input, NavItem, SegmentedControl } from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -101,31 +53,7 @@ const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
 ];
 
 export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
-  const help = useHelp();
-  const {
-    system,
-    setSystem,
-    mode,
-    modePref,
-    setModePref,
-    modeSource,
-    modeCoords,
-    modeNextChange,
-    autoLocation,
-    setAutoLocation,
-    depth,
-    setDepth,
-    accent,
-    setAccent,
-    teachVisible,
-    setTeachVisible,
-  } = useTheme();
-  const { devMode, setDevMode } = useDevMode();
-  // Seeded from localStorage rather than watched: the toggle is the only writer here, and the
-  // Pinboard reads the pref fresh at the moment you click delete (see pinboard/prefs.ts).
-  const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
   const [key, setKey] = useState("");
-  const [bgKey, setBgKey] = useState("");
   const [chatModels, setChatModelsState] = useState<string[]>([]);
   const [backgroundModels, setBackgroundModelsState] = useState<string[]>([]);
   // True once getSettings() has populated the model lists. Save gates on this (not a non-empty
@@ -135,49 +63,21 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [chatAuto, setChatAuto] = useState(false);
   const [backgroundAuto, setBackgroundAuto] = useState(false);
   const [keyAlreadySet, setKeyAlreadySet] = useState(false);
-  const [bgKeyAlreadySet, setBgKeyAlreadySet] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [timeZone, setTimeZoneState] = useState("");
   const [tzAuto, setTzAuto] = useState(true);
-  const [cost, setCost] = useState<CostSummary | null>(null);
-  const [refreshingPrices, setRefreshingPrices] = useState(false);
-  const [appLock, setAppLockState] = useState<AppLockStatus | null>(null);
-  const [exporting, setExporting] = useState(false);
-  const [exportMsg, setExportMsg] = useState<string | null>(null);
   // Onboarding on a JOINED shared vault (issue #337): the vault already exists and its search
   // language travels with it, so the language chooser is replaced by a short "what's yours alone"
   // checklist and `set_vault_embedder` is suppressed. (First-run always creates a device vault;
   // sharing happens later through the guided wizard.)
   const [joinedVault, setJoinedVault] = useState(false);
-  // Query-time reranking toggle (default on; stateless — never triggers a Rebuild).
-  const [reranking, setRerankingState] = useState(true);
   // Indexing speed: "fast" (default) or "gentle" (paced for low-end machines).
   const [indexingSpeed, setIndexingSpeedState] = useState<"fast" | "gentle">("fast");
-  // Memory map (the Map tab): the default grouping (per-device, shared with the Map header toggle via
-  // localStorage), the node cap (a vault-travelling pref the backend reads), and the optional t-SNE
-  // component's install state.
-  const [mapGrouping, setMapGrouping] = useState<MapLayoutMode>(readMapMode);
-  const [mapNodeCap, setMapNodeCap] = useState(1000);
-  // Project cohesion (0 = pure meaning, the default; ≤0.5) — a render-time blend, so it lives in
-  // localStorage like the grouping pref, not in the backend layout fingerprint.
-  const [mapCohesion, setMapCohesion] = useState<number>(readMapCohesion);
-  const [tsneInstalled, setTsneInstalled] = useState<boolean | null>(null);
-  // Whether to *use* t-SNE when it's installed (vs falling back to PCA). Default true; lives in the
-  // `map` pref alongside nodeCap, so the backend reads it for the layout fingerprint.
-  const [mapTsneEnabled, setMapTsneEnabled] = useState(true);
-  const [installingTsne, setInstallingTsne] = useState(false);
-  const [tsneInstallFrac, setTsneInstallFrac] = useState(0);
   // Search-language choices: the selectable embedders + the chosen id (onboarding picks one;
   // non-onboarding switches it, re-indexing the vault). Loaded best-effort.
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
   const [embedderId, setEmbedderId] = useState("");
-  // Settings language switcher (non-onboarding): the pending confirm target, the in-flight switch
-  // (drives the guided re-index modal: { to, from }), and any error from the switch itself.
-  const [switchTarget, setSwitchTarget] = useState<string | null>(null);
-  const [switching, setSwitching] = useState<{ to: string; from: string } | null>(null);
-  const [rebuildOpen, setRebuildOpen] = useState(false);
-  const [switchError, setSwitchError] = useState<string | null>(null);
   // Active tab (non-onboarding only). The scrolling content pane is reset to the top on a
   // tab change so each tab opens from its first section.
   const [tab, setTab] = useState<SettingsTab>("general");
@@ -192,7 +92,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     void (async () => {
       try {
         setKeyAlreadySet(await hasOpenRouterKey());
-        setBgKeyAlreadySet(await hasOpenRouterBackgroundKey());
         const settings = await getSettings();
         setChatModelsState(settings.chat_models);
         setBackgroundModelsState(settings.background_models);
@@ -217,7 +116,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
             /* ignore — UTC fallback in the backend */
           }
         }
-        setRerankingState(settings.reranking);
         setIndexingSpeedState(settings.indexing_speed === "gentle" ? "gentle" : "fast");
       } catch (e) {
         setError(String(e));
@@ -244,125 +142,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     })();
   }, [onboarding]);
 
-  // Cost summary loads on its own (its first read may trigger a daily pricing fetch),
-  // so it never blocks the rest of Settings from showing.
-  useEffect(() => {
-    if (onboarding) return;
-    costSummary()
-      .then(setCost)
-      .catch(() => {});
-  }, [onboarding]);
-
-  // App-lock status (enabled + whether the OS can verify) loads independently.
-  useEffect(() => {
-    if (onboarding) return;
-    appLockStatus()
-      .then(setAppLockState)
-      .catch(() => {});
-  }, [onboarding]);
-
-  // Memory-map prefs + optional-t-SNE install state (non-onboarding only — there's no Map yet at setup).
-  useEffect(() => {
-    if (onboarding) return;
-    getPref("map")
-      .then((v) => {
-        if (!v) return;
-        try {
-          const pref = JSON.parse(v);
-          if (typeof pref?.nodeCap === "number") setMapNodeCap(pref.nodeCap);
-          if (typeof pref?.tsneEnabled === "boolean") setMapTsneEnabled(pref.tsneEnabled);
-        } catch {
-          /* ignore a malformed pref */
-        }
-      })
-      .catch(() => {});
-    optionalTsneStatus()
-      .then((s) => setTsneInstalled(s.installed))
-      .catch(() => setTsneInstalled(false));
-  }, [onboarding]);
-
-  // Follow the optional-t-SNE download's progress so the row shows a real percentage bar.
-  useEffect(() => {
-    if (onboarding) return;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    void onTsneInstall((e) => {
-      if (!cancelled) setTsneInstallFrac(e.fraction);
-    }).then((u) => {
-      unlisten = u;
-      if (cancelled) u();
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [onboarding]);
-
-  function changeMapGrouping(next: MapLayoutMode) {
-    setMapGrouping(next);
-    localStorage.setItem(MAP_MODE_KEY, next); // shared with the Map header toggle
-  }
-
-  function changeMapCohesion(next: number) {
-    setMapCohesion(next);
-    localStorage.setItem(MAP_COHESION_KEY, String(next)); // shared with the Map's cohesion control
-  }
-
-  // The `map` pref is one blob (`{ nodeCap, tsneEnabled }`), both part of the layout fingerprint —
-  // write it whole (so neither key is lost) and recompute in the background so the change takes hold.
-  function persistMapPref(nodeCap: number, tsneEnabled: boolean) {
-    return setPref("map", JSON.stringify({ nodeCap, tsneEnabled }))
-      .then(() => startSemanticLayout())
-      .catch(() => {});
-  }
-
-  function changeMapNodeCap(next: number) {
-    setMapNodeCap(next);
-    void persistMapPref(next, mapTsneEnabled);
-  }
-
-  function changeTsneEnabled(next: boolean) {
-    setMapTsneEnabled(next);
-    void persistMapPref(mapNodeCap, next);
-  }
-
-  function downloadTsne() {
-    setInstallingTsne(true);
-    setTsneInstallFrac(0);
-    installOptionalTsne()
-      .then(() => optionalTsneStatus())
-      .then((s) => {
-        setTsneInstalled(s.installed);
-        if (s.installed) {
-          setMapTsneEnabled(true); // a fresh install starts enabled
-          void persistMapPref(mapNodeCap, true);
-        }
-      })
-      .catch((e) => setError(String(e)))
-      .finally(() => setInstallingTsne(false));
-  }
-
-  async function toggleAppLock(next: boolean) {
-    setError(null);
-    try {
-      await setAppLock(next);
-      setAppLockState((s) => (s ? { ...s, enabled: next } : s));
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function toggleReranking(next: boolean) {
-    setError(null);
-    setRerankingState(next); // optimistic — revert if the write fails
-    try {
-      await setReranking(next);
-    } catch (e) {
-      setRerankingState(!next);
-      setError(String(e));
-    }
-  }
-
   async function changeIndexingSpeed(next: "fast" | "gentle") {
     setError(null);
     const prev = indexingSpeed;
@@ -372,95 +151,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     } catch (e) {
       setIndexingSpeedState(prev);
       setError(String(e));
-    }
-  }
-
-  // Re-sync the language picker with the backend's truth (after a switch lands, or reverts).
-  async function reloadLang() {
-    try {
-      const lo = await languageOptions();
-      setLangOpts(lo);
-      setEmbedderId(lo.selected);
-    } catch {
-      /* ignore — the picker simply keeps its last state */
-    }
-  }
-
-  // A click on the *other* segment in Settings: stage the target and open the confirm. The picker's
-  // value stays on the current selection until the switch actually lands, so a cancel snaps back.
-  function requestLanguageSwitch(newId: string) {
-    if (!langOpts || newId === embedderId) return;
-    setSwitchError(null);
-    setSwitchTarget(newId);
-  }
-
-  // Confirmed: record the new embedder. An empty vault is done immediately (the backend resized its
-  // empty vector table); a populated vault launches the guided re-index, remembering the old id so
-  // a download/offline failure can revert the selection (search keeps working on the old index).
-  async function confirmLanguageSwitch() {
-    if (!langOpts || !switchTarget) return;
-    const to = switchTarget;
-    const from = embedderId;
-    setSwitchTarget(null);
-    setSwitchError(null);
-    try {
-      await setVaultEmbedder(to);
-    } catch (e) {
-      setSwitchError(String(e));
-      return;
-    }
-    if (langOpts.has_documents) {
-      setSwitching({ to, from });
-      setRebuildOpen(true);
-    } else {
-      setEmbedderId(to);
-      await reloadLang();
-    }
-  }
-
-  async function refreshPrices() {
-    setRefreshingPrices(true);
-    setError(null);
-    try {
-      setCost(await refreshPricing());
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setRefreshingPrices(false);
-    }
-  }
-
-  async function revealDataFolder() {
-    setError(null);
-    try {
-      await openDataFolder();
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function exportData() {
-    setError(null);
-    setExportMsg(null);
-    let dest: string | null;
-    try {
-      dest = await saveFileDialog({
-        defaultPath: "personal-manager-export.zip",
-        filters: [{ name: "Zip archive", extensions: ["zip"] }],
-      });
-    } catch (e) {
-      setError(String(e));
-      return;
-    }
-    if (!dest) return; // the user cancelled the dialog
-    setExporting(true);
-    try {
-      await exportAllData(dest);
-      setExportMsg(`Exported to ${dest}`);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setExporting(false);
     }
   }
 
@@ -474,11 +164,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
         await setOpenRouterKey(key.trim());
         setKey("");
         setKeyAlreadySet(true);
-      }
-      if (bgKey.trim()) {
-        await setOpenRouterBackgroundKey(bgKey.trim());
-        setBgKey("");
-        setBgKeyAlreadySet(true);
       }
       // Persist the model lists only once they've loaded from the backend — gating on the load
       // flag (not a non-empty list) lets the user clear a role back to "use the default" and have
@@ -713,619 +398,11 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
             ref={contentRef}
             className="min-w-0 flex-1 overflow-y-auto px-6 py-4 [&>*:first-child]:mt-0 [&>*:first-child]:border-t-0 [&>*:first-child]:pt-0"
           >
-            {tab === "general" && (
-              <>
-                <div className="mt-5 border-t border-border pt-4" data-help="settings-appearance">
-                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                    Appearance
-                  </label>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">System</span>
-                    <SegmentedControl
-                      value={system}
-                      onChange={setSystem}
-                      options={[
-                        {
-                          value: "editorial",
-                          label: "Editorial",
-                          title: "Editorial — serif headings, warm paper tones",
-                        },
-                        {
-                          value: "slate",
-                          label: "Slate",
-                          title: "Slate — clean sans, cool neutrals (default)",
-                        },
-                        {
-                          value: "terminal",
-                          label: "Terminal",
-                          title: "Terminal — monospace, high contrast",
-                        },
-                      ]}
-                    />
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">Mode</span>
-                    <SegmentedControl
-                      value={modePref}
-                      onChange={setModePref}
-                      options={[
-                        { value: "light", label: "Light" },
-                        { value: "dark", label: "Dark" },
-                        {
-                          value: "system",
-                          label: "System",
-                          title: "Follow your device's light/dark setting",
-                        },
-                        {
-                          value: "auto",
-                          label: "Auto",
-                          title: "Follow sunrise and sunset at your location",
-                        },
-                      ]}
-                    />
-                  </div>
-                  {modePref === "system" && (
-                    <p className="mt-1.5 text-xs text-ink4">
-                      Following your device's light/dark setting — currently{" "}
-                      {mode === "dark" ? "dark" : "light"}.
-                    </p>
-                  )}
-                  {modePref === "auto" && (
-                    <>
-                      <p className="mt-1.5 text-xs text-ink4">
-                        {modeSource === "auto" ? (
-                          <>
-                            Follows sunrise &amp; sunset — currently{" "}
-                            {mode === "dark" ? "dark" : "light"}
-                            {modeCoords ? ` · ${formatCoords(modeCoords)}` : ""}
-                            {modeNextChange
-                              ? ` · switches to ${mode === "dark" ? "light" : "dark"} at ${modeNextChange.toLocaleTimeString(
-                                  [],
-                                  { hour: "2-digit", minute: "2-digit" },
-                                )}`
-                              : ""}
-                            .
-                          </>
-                        ) : (
-                          <>
-                            Couldn't determine your location, so it's following your device's
-                            light/dark setting for now. Enter a location below for sunrise &amp;
-                            sunset.
-                          </>
-                        )}
-                      </p>
-                      <div className="mt-2 flex items-center justify-between gap-3">
-                        <span className="text-sm text-ink2">Location</span>
-                        <div className="flex items-center gap-2">
-                          <Input
-                            value={autoLocation}
-                            onChange={(e) => setAutoLocation(e.target.value)}
-                            placeholder={
-                              deviceCoords()
-                                ? `${formatCoords(deviceCoords()!)} (detected)`
-                                : "e.g. 51.51, -0.13"
-                            }
-                            aria-label="Location for sunrise and sunset, as latitude, longitude"
-                            className="w-44"
-                          />
-                          {autoLocation && (
-                            <button
-                              type="button"
-                              className="text-xs text-ink4 transition hover:text-ink"
-                              onClick={() => setAutoLocation("")}
-                            >
-                              Reset
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    </>
-                  )}
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">Depth</span>
-                    <SegmentedControl
-                      value={depth}
-                      onChange={setDepth}
-                      options={[
-                        { value: "min", label: "Min" },
-                        { value: "standard", label: "Standard" },
-                        { value: "power", label: "Power" },
-                      ]}
-                    />
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">Accent</span>
-                    <div className="flex items-center gap-1.5">
-                      {ACCENTS[system].map((hex) => {
-                        const isMono = hex === MONO_ACCENT;
-                        const name = accentName(hex);
-                        return (
-                          <button
-                            key={hex}
-                            type="button"
-                            aria-label={isMono ? "Monochrome (Eigengrau)" : `Accent: ${name}`}
-                            title={
-                              isMono ? "Monochrome — Eigengrau base, white text & accents" : name
-                            }
-                            onClick={() => setAccent(hex)}
-                            style={{
-                              background: isMono ? EIGENGRAU : hex,
-                              // The Eigengrau swatch is near-black; a white rim makes it legible and
-                              // signals the "white accents" treatment.
-                              border: isMono ? "1px solid rgba(255,255,255,0.55)" : undefined,
-                            }}
-                            className={`h-5 w-5 rounded-full transition ${
-                              accent === hex
-                                ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
-                                : ""
-                            }`}
-                          />
-                        );
-                      })}
-                    </div>
-                  </div>
-                  <div
-                    className="mt-3 flex items-center justify-between gap-3"
-                    data-help="settings-pinboard-confirm-delete"
-                  >
-                    <span className="text-sm text-ink2">
-                      Confirm before deleting a pinboard card
-                    </span>
-                    <Toggle
-                      checked={confirmDelete}
-                      onChange={(on) => {
-                        setConfirmDelete(on);
-                        writeConfirmDelete(on);
-                      }}
-                      ariaLabel="Ask before deleting a note or timeline"
-                    />
-                  </div>
-                  <div
-                    className="mt-3 flex items-center justify-between gap-3"
-                    data-help="settings-teach-tab"
-                  >
-                    <span className="text-sm text-ink2">Review &amp; Teach tabs</span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={teachVisible}
-                      aria-label="Show the Review and Teach tabs"
-                      onClick={() => setTeachVisible(!teachVisible)}
-                      className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                        teachVisible ? "bg-accent" : "bg-surface"
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                          teachVisible ? "translate-x-4" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                  {/* Both of Appearance's paragraphs — the "it saves itself" reassurance and the
-                      Location field's format + privacy note — fold into this one disclosure at the
-                      foot. The auto-mode status line and its "couldn't find your location" fallback
-                      stay inline above: they're a readout and a gating hint, not explanation. */}
-                  <SectionInfo title="What these settings do">
-                    <p>Applies instantly and is remembered on this device.</p>
-                    {modePref === "auto" && (
-                      <p>
-                        Location is a latitude, longitude pair. Blank uses your device's timezone
-                        {(() => {
-                          try {
-                            const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                            return tz && coordsForTimezone(tz) ? ` (${tz})` : "";
-                          } catch {
-                            return "";
-                          }
-                        })()}
-                        . Nothing about your location leaves this device.
-                      </p>
-                    )}
-                  </SectionInfo>
-                </div>
+            {tab === "general" && <GeneralSettings />}
 
-                <div className="mt-5 border-t border-border pt-4" data-help="settings-memory-map">
-                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                    Memory map
-                  </label>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">Default grouping</span>
-                    <SegmentedControl
-                      value={mapGrouping}
-                      onChange={changeMapGrouping}
-                      options={[
-                        { value: "project", label: "By project" },
-                        { value: "semantic", label: "Semantic" },
-                      ]}
-                    />
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">Project cohesion</span>
-                    <Select
-                      value={String(mapCohesion)}
-                      onChange={(e) => changeMapCohesion(Number(e.target.value))}
-                    >
-                      <option value="0">Off</option>
-                      <option value="0.15">Low</option>
-                      <option value="0.3">Medium</option>
-                      <option value="0.5">High</option>
-                    </Select>
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">Maximum nodes</span>
-                    <Select
-                      value={String(mapNodeCap)}
-                      onChange={(e) => changeMapNodeCap(Number(e.target.value))}
-                    >
-                      {[200, 500, 1000, 2000, 3500, 5000].map((n) => (
-                        <option key={n} value={n}>
-                          {n.toLocaleString()}
-                        </option>
-                      ))}
-                    </Select>
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">Enhanced layout (t-SNE)</span>
-                    {tsneInstalled === null ? (
-                      <span className="text-xs text-ink4">…</span>
-                    ) : tsneInstalled ? (
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={mapTsneEnabled}
-                        aria-label="Use the enhanced t-SNE layout"
-                        onClick={() => changeTsneEnabled(!mapTsneEnabled)}
-                        className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                          mapTsneEnabled ? "bg-accent" : "bg-surface"
-                        }`}
-                      >
-                        <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                            mapTsneEnabled ? "translate-x-4" : "translate-x-0.5"
-                          }`}
-                        />
-                      </button>
-                    ) : (
-                      <Button variant="secondary" onClick={downloadTsne} disabled={installingTsne}>
-                        {installingTsne ? "Downloading…" : "Download"}
-                      </Button>
-                    )}
-                  </div>
-                  {installingTsne && (
-                    <IngestProgress
-                      mode="percent"
-                      processed={Math.round(tsneInstallFrac * 100)}
-                      total={100}
-                      label="Downloading the enhanced (t-SNE) layout"
-                      className="mt-2"
-                    />
-                  )}
-                  {/* The section's opening blurb and its trailing rationale said one thing between
-                      them — how the map is laid out — so they're one disclosure now. */}
-                  <SectionInfo title="How the map is arranged">
-                    <p>The Map tab — how documents are arranged and how many are plotted.</p>
-                    <p>
-                      Semantic proximity uses a basic on-device layout by default. Project cohesion
-                      gently pulls same-project documents together (Off keeps the layout purely by
-                      meaning). The optional t-SNE component (a one-time download) produces tighter
-                      clusters of related documents — turn it on or off here, or remove it to free
-                      space under Settings → Storage.
-                    </p>
-                  </SectionInfo>
-                </div>
+            {tab === "ai" && <AiModelsSettings />}
 
-                <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">
-                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                    Time zone
-                  </label>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink2">Detection</span>
-                    <SegmentedControl
-                      value={tzAuto ? "auto" : "manual"}
-                      onChange={(v) => setTzAuto(v === "auto")}
-                      options={[
-                        { value: "auto", label: "Auto" },
-                        { value: "manual", label: "Manual" },
-                      ]}
-                    />
-                  </div>
-                  {!tzAuto && (
-                    <div className="mt-3 flex items-center justify-between gap-3">
-                      <span className="text-sm text-ink2">Zone</span>
-                      <Select
-                        value={timeZone}
-                        onChange={(e) => setTimeZoneState(e.target.value)}
-                        className="max-w-[14rem]"
-                      >
-                        {allTimeZones().map((z) => (
-                          <option key={z} value={z}>
-                            {z}
-                          </option>
-                        ))}
-                      </Select>
-                    </div>
-                  )}
-                  {/* The zone in force is a readout — it stays visible; only what the zone *means*
-                      folds away. */}
-                  <p className="mt-2 text-xs text-faint">
-                    {tzAuto
-                      ? `Following this device: ${deviceTimeZone()}`
-                      : `Selected: ${timeZone || "—"}`}
-                  </p>
-                  <SectionInfo title="What the time zone affects">
-                    <p>
-                      Sets “today”, “due soon”, and your calendar agenda. Auto follows this device.
-                    </p>
-                  </SectionInfo>
-                </div>
-
-                <div className="mt-4 border-t border-border pt-4" data-help="settings-help-mode">
-                  <div className="flex items-start justify-between gap-3">
-                    <label className="block text-sm font-medium text-ink2">Help mode</label>
-                    <button
-                      role="switch"
-                      aria-checked={help.enabled}
-                      onClick={() => help.setEnabled(!help.enabled)}
-                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                        help.enabled ? "bg-accent" : "bg-surface"
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                          help.enabled ? "translate-x-4" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                  <SectionInfo title="What is help mode?">
-                    <p>
-                      When on, hovering any highlighted section shows a short explanation of what it
-                      does.
-                    </p>
-                  </SectionInfo>
-                </div>
-              </>
-            )}
-
-            {tab === "ai" && (
-              <>
-                <label className="mt-5 block text-sm font-medium text-ink2">
-                  OpenRouter API key
-                </label>
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  data-help="settings-api-key"
-                  value={key}
-                  onChange={(e) => setKey(e.target.value)}
-                  placeholder={keyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-                  className="mt-1"
-                />
-                <a
-                  href="https://openrouter.ai/keys"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-1 inline-block text-xs text-ink4 hover:text-ink2"
-                >
-                  Get a key at openrouter.ai/keys →
-                </a>
-
-                <label className="mt-4 block text-sm font-medium text-ink2">
-                  Background API key
-                </label>
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  data-help="settings-background-key"
-                  value={bgKey}
-                  onChange={(e) => setBgKey(e.target.value)}
-                  placeholder={bgKeyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-                  className="mt-1"
-                />
-                {/* Both key fields' explanation in one disclosure at the foot of the pair —
-                    including the keychain sentence that used to head every tab. */}
-                <SectionInfo title="About your API keys">
-                  <p>Your API key lives in the OS keychain. The model is swappable anytime.</p>
-                  <p>
-                    The background key is used for background work (sorting proposals, learning).
-                    Lets you track that spend separately. Falls back to your main key if blank.
-                  </p>
-                </SectionInfo>
-
-                <div className="mt-5 space-y-5 border-t border-border pt-4">
-                  <ModelListEditor
-                    label="Chat model"
-                    description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
-                    helpId="settings-chat-models"
-                    models={chatModels}
-                    onChange={setChatModelsState}
-                    autoSwitch={chatAuto}
-                    onAutoSwitchChange={setChatAuto}
-                  />
-                  <ModelListEditor
-                    label="Background model"
-                    description="Runs sorting proposals and Learning You. Free models work well here; chain a few for daily limits."
-                    helpId="settings-background-models"
-                    models={backgroundModels}
-                    onChange={setBackgroundModelsState}
-                    autoSwitch={backgroundAuto}
-                    onAutoSwitchChange={setBackgroundAuto}
-                  />
-                </div>
-
-                {cost && (
-                  <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
-                    <div className="flex items-center justify-between">
-                      <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                        Usage &amp; cost
-                      </label>
-                      <Button
-                        variant="tertiary"
-                        onClick={refreshPrices}
-                        disabled={refreshingPrices}
-                        className="px-2 py-0.5 text-xs"
-                      >
-                        {refreshingPrices ? "Refreshing…" : "Refresh prices"}
-                      </Button>
-                    </div>
-                    {/* The "Spend & breakdown" Collapsible is gone: it hid your own numbers
-                        behind a caret (and unfolded them only for Power), while its `meta` slot
-                        leaked the 30d total back out to prove the point. The totals and the
-                        per-model table are readouts — the thing you opened this section for — so
-                        they stay visible; only the pricing methodology folds away below. */}
-                    <div className="mt-3 flex gap-6 text-sm">
-                      <div>
-                        <div className="text-xs text-ink4">Last 30 days</div>
-                        <div className="font-mono text-ink2">{fmtUsd(cost.total_30d_usd)}</div>
-                      </div>
-                      <div>
-                        <div className="text-xs text-ink4">All time</div>
-                        <div className="font-mono text-ink2">{fmtUsd(cost.total_all_time_usd)}</div>
-                      </div>
-                    </div>
-                    {cost.all_time.length > 0 ? (
-                      <div className="mt-3">
-                        <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
-                          By model · most expensive first (all time)
-                        </p>
-                        <table className="w-full text-left text-xs">
-                          <thead className="font-mono uppercase tracking-wide text-ink4">
-                            <tr className="border-b border-rule">
-                              <th className="py-1 font-medium">Model</th>
-                              <th className="py-1 text-right font-medium">Reqs</th>
-                              <th className="py-1 text-right font-medium">Tokens in/out</th>
-                              <th className="py-1 text-right font-medium">Cost</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {cost.all_time.map((s) => (
-                              <tr key={s.model} className="border-b border-rule">
-                                <td className="py-1 pr-2 text-ink2">{s.model}</td>
-                                <td className="py-1 text-right text-ink3">{s.request_count}</td>
-                                <td className="py-1 text-right font-mono text-ink4">
-                                  {s.prompt_tokens.toLocaleString()} /{" "}
-                                  {s.completion_tokens.toLocaleString()}
-                                </td>
-                                <td className="py-1 text-right font-mono text-ink3">
-                                  {fmtUsd(s.cost_usd)}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
-                    )}
-                    <SectionInfo title="How this is calculated">
-                      <p>
-                        Your real per-call cost as reported by OpenRouter where available, otherwise
-                        estimated from the tokens each call used × OpenRouter&apos;s per-token price
-                        {cost.pricing_updated_at
-                          ? ` (prices updated ${formatWhen(cost.pricing_updated_at)})`
-                          : ""}
-                        .
-                      </p>
-                      <p>
-                        Each model reply reports the tokens it used (your prompt + its reply). PM
-                        logs those per call. It fetches OpenRouter&apos;s public price list about
-                        once a day and caches it — no extra model call, and your API key is never
-                        used for it.
-                      </p>
-                      <p>
-                        Where OpenRouter reports a call&apos;s actual cost (reflecting any
-                        prompt-cache discount) PM shows that; for older calls without it, cost =
-                        prompt&nbsp;tokens × prompt&nbsp;price + reply&nbsp;tokens ×
-                        reply&nbsp;price. It&apos;s computed when you open this page, so a later
-                        price change re-prices your history. A model with no reported cost and not
-                        yet in the price cache shows <span className="font-mono text-ink4">—</span>,
-                        never an understated&nbsp;$0.
-                      </p>
-                    </SectionInfo>
-                  </div>
-                )}
-              </>
-            )}
-
-            {tab === "search" && (
-              <>
-                <div className="mt-4 border-t border-border pt-4">
-                  <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                    Search
-                  </label>
-                  {langOpts && langOpts.options.length > 1 && (
-                    <div className="mt-2">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="text-xs text-ink4">
-                          Language:{" "}
-                          <span className="text-ink2">
-                            {langOpts.options.find((o) => o.id === embedderId)?.label ?? "English"}
-                          </span>
-                        </p>
-                        <SegmentedControl
-                          value={embedderId}
-                          onChange={requestLanguageSwitch}
-                          options={langOpts.options.map((o) => ({ value: o.id, label: o.label }))}
-                        />
-                      </div>
-                      {switchError && <p className="mt-1 text-xs text-st-due">{switchError}</p>}
-                    </div>
-                  )}
-                  <div className="mt-3 flex items-start justify-between gap-3">
-                    <label className="block text-sm font-medium text-ink2">
-                      Re-rank search results
-                    </label>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={reranking}
-                      aria-label="Re-rank search results"
-                      onClick={() => void toggleReranking(!reranking)}
-                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                        reranking ? "bg-accent" : "bg-surface"
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                          reranking ? "translate-x-4" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                  {/* Both of the section's paragraphs in one disclosure at the foot. Folding the
-                      "switching re-indexes your library" note is safe *because* the confirm dialog
-                      restates it at the moment it bites — and nothing here is lost either way
-                      (your Markdown files are the source it re-indexes from). */}
-                  <SectionInfo title="About search language & re-ranking">
-                    {langOpts && langOpts.options.length > 1 && (
-                      <p>
-                        Switching language re-indexes your whole library from your Markdown files —
-                        Multilingual downloads a larger model the first time (about 1 GB, once).
-                        Your original files are never touched.
-                      </p>
-                    )}
-                    <p>
-                      Re-ranking runs a second pass that re-scores search hits for sharper
-                      relevance. First use downloads a small model; turn it off for fastest results.
-                    </p>
-                  </SectionInfo>
-                </div>
-
-                {/* A section with no controls at all — purely a signpost to the Teach tab — so the
-                    whole thing is the disclosure, its old heading now the caret's label. */}
-                <div className="mt-5 border-t border-border pt-4">
-                  <SectionInfo title="Preferences" helpId="settings-learning">
-                    <p>
-                      What PM has learned about how you work — what belongs where, how things are
-                      named, how answers should read — now lives in the{" "}
-                      <span className="text-ink2">Teach</span> tab as editable preferences. Your
-                      earlier “Learning&nbsp;You” profile was carried over into them automatically.
-                    </p>
-                  </SectionInfo>
-                </div>
-              </>
-            )}
+            {tab === "search" && <SearchSettings />}
 
             {tab === "connectors" && (
               <>
@@ -1336,127 +413,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
               </>
             )}
 
-            {tab === "data" && (
-              <>
-                <div className="mt-4 border-t border-border pt-4" data-help="settings-app-lock">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <label className="block text-sm font-medium text-ink2">App lock</label>
-                      {/* Only the *available* branch of this line was explanation. The other
-                          two say why the toggle beside them is dead, so they stay inline — as
-                          does the "can't verify here" notice, which is state, not commentary. */}
-                      {!appLock?.available && (
-                        <p className="mt-1 text-xs text-ink4">
-                          {IS_LINUX
-                            ? "Not available on Linux yet. Your store is always encrypted at rest."
-                            : "Requires Windows Hello or a configured biometric. Not available on this device yet."}
-                        </p>
-                      )}
-                      {appLock?.enabled && !appLock.available && (
-                        <p className="mt-1 text-xs text-ink4">
-                          App lock is on, but this device can't verify — PM opens without it here.
-                          The setting stays saved and re-arms on a device that can verify.
-                        </p>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={appLock?.enabled ?? false}
-                      aria-label="App lock"
-                      disabled={!appLock?.available}
-                      title={
-                        appLock?.available
-                          ? undefined
-                          : IS_LINUX
-                            ? "Feature not available on Linux yet"
-                            : "Not available on this device"
-                      }
-                      onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
-                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                        appLock?.enabled ? "bg-accent" : "bg-surface"
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                          appLock?.enabled ? "translate-x-4" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                  {appLock?.available && (
-                    <SectionInfo title="What does app lock do?">
-                      <p>
-                        Require Windows Hello (face, fingerprint, or PIN) to open PM. A convenience
-                        lock for the window — your store is always encrypted at rest. Takes effect
-                        next time you open PM.
-                      </p>
-                    </SectionInfo>
-                  )}
-                </div>
-
-                <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
-                  <label className="block text-sm font-medium text-ink2">Data</label>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <Button variant="tertiary" onClick={revealDataFolder}>
-                      Open data folder
-                    </Button>
-                    <Button variant="tertiary" onClick={exportData} disabled={exporting}>
-                      {exporting ? "Exporting…" : "Export all data…"}
-                    </Button>
-                  </div>
-                  {exportMsg && <p className="mt-2 break-all text-xs text-faint">{exportMsg}</p>}
-                  <SectionInfo title="About your data & export">
-                    <p>
-                      Your documents and the encrypted store live in one folder (
-                      <span className="font-medium">Personal Manager</span>). Open it to back it up
-                      by hand, or export everything to a single{" "}
-                      <span className="font-medium">.zip</span> — the Markdown vault plus the
-                      encrypted store (the regenerable runtime is left out). The store stays
-                      encrypted in the archive.
-                    </p>
-                    <p>
-                      Your documents in the Markdown vault are stored unencrypted so any tool can
-                      read them. To protect them when your machine is off or logged out, turn on
-                      full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on
-                      Linux).
-                    </p>
-                  </SectionInfo>
-                </div>
-
-                <VaultCard />
-
-                <RemovePmData biometricAvailable={appLock?.available ?? false} />
-
-                <div className="mt-5 border-t border-border pt-4" data-help="settings-license">
-                  <SectionInfo title="License">
-                    <p>
-                      PM is free software, licensed under the{" "}
-                      <a
-                        href="https://www.gnu.org/licenses/agpl-3.0.html"
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-ink3 underline hover:text-ink"
-                      >
-                        GNU Affero General Public License v3
-                      </a>
-                      . © 2026 Bobby Yu.
-                    </p>
-                    <p>
-                      Source code:{" "}
-                      <a
-                        href="https://github.com/Admin-Atlas/Personal-Manager"
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-ink3 underline hover:text-ink"
-                      >
-                        github.com/Admin-Atlas/Personal-Manager
-                      </a>
-                    </p>
-                  </SectionInfo>
-                </div>
-              </>
-            )}
+            {tab === "data" && <DataSecuritySettings />}
 
             {tab === "backup" && <BackupSettings />}
 
@@ -1464,55 +421,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
               <StorageSettings onNavigate={(t) => selectTab(t as SettingsTab)} />
             )}
 
-            {tab === "developer" && (
-              <div className="mt-5 border-t border-border pt-4" data-help="settings-developer">
-                <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                  Developer mode
-                </label>
-                <div className="mt-3 flex items-center justify-between gap-3">
-                  <span className="text-sm text-ink2">Developer mode</span>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={devMode}
-                    aria-label="Developer mode"
-                    onClick={() => setDevMode(!devMode)}
-                    className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                      devMode ? "bg-accent" : "bg-surface"
-                    }`}
-                  >
-                    <span
-                      className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                        devMode ? "translate-x-4" : "translate-x-0.5"
-                      }`}
-                    />
-                  </button>
-                </div>
-                <div className="mt-3 flex items-center justify-between gap-3 text-xs">
-                  <span className="text-ink3">Signals</span>
-                  <span className="font-mono text-ink4">
-                    build: {isDevBuild ? "dev" : "release"} · runtime: {devMode ? "on" : "off"}
-                  </span>
-                </div>
-                {devMode && onOpenDev && (
-                  <div className="mt-3">
-                    <Button variant="tertiary" onClick={onOpenDev}>
-                      Open Dev tab →
-                    </Button>
-                  </div>
-                )}
-                {/* The build/runtime signals above stay put — a readout. Only the paragraph about
-                    what the switch reveals folds. */}
-                <SectionInfo title="What does developer mode reveal?">
-                  <p>
-                    Reveals read-only inspection surfaces — a dedicated Dev tab (raw tables, row
-                    counts, the corrections log, system &amp; build info) plus internals shown in
-                    place — for debugging and watching how PM works. Strictly read-only: it never
-                    changes your data. Independent of the density preset, and off by default.
-                  </p>
-                </SectionInfo>
-              </div>
-            )}
+            {tab === "developer" && <DeveloperSettings onOpenDev={onOpenDev} />}
           </div>
         </div>
 
@@ -1526,49 +435,12 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
             </p>
           )}
           <div className="flex justify-end gap-2">
-            <Button variant="tertiary" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button variant="primary" onClick={save} disabled={!canSave}>
-              {saving ? "Saving…" : "Save"}
+            <Button variant="primary" onClick={onClose}>
+              Done
             </Button>
           </div>
         </div>
       </div>
-
-      <ConfirmDialog
-        open={switchTarget !== null}
-        title="Switch search language?"
-        confirmLabel="Switch & re-index"
-        onConfirm={() => void confirmLanguageSwitch()}
-        onClose={() => setSwitchTarget(null)}
-      >
-        This re-indexes your whole library from your Markdown files
-        {langOpts?.options.find((o) => o.id === switchTarget)?.multilingual
-          ? ", and downloads a larger language model the first time (about 1 GB, once)"
-          : ""}
-        . Your original files aren&apos;t changed, and it can take a while on a large library.
-      </ConfirmDialog>
-
-      {switching && (
-        <RebuildProgress
-          open={rebuildOpen}
-          title="Switching search language"
-          subtitle={`Re-indexing your library for ${
-            langOpts?.options.find((o) => o.id === switching.to)?.label ?? "the new language"
-          }.`}
-          onError={() => {
-            // The re-index failed (e.g. offline): revert the selection so search keeps working on
-            // the existing index.
-            void setVaultEmbedder(switching.from).catch(() => {});
-          }}
-          onClose={() => {
-            setRebuildOpen(false);
-            setSwitching(null);
-            void reloadLang();
-          }}
-        />
-      )}
     </div>
   );
 }
@@ -1605,11 +477,4 @@ function LanguageCompareTable() {
       </tbody>
     </table>
   );
-}
-
-/** Format a USD cost, or "—" when unknown (the model isn't in the price cache yet). */
-function fmtUsd(v: number | null): string {
-  if (v == null) return "—";
-  if (v === 0) return "$0.00";
-  return v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
 }
