@@ -35,6 +35,7 @@ import {
 import { useHelp } from "../lib/help";
 import { BackupSettings } from "./BackupSettings";
 import { ConnectorsSettings } from "./ConnectorsSettings";
+import { DeveloperSettings } from "./settings/DeveloperSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { IngestProgress } from "./IngestProgress";
 import { RebuildProgress } from "./RebuildProgress";
@@ -42,7 +43,6 @@ import { RemovePmData } from "./RemovePmData";
 import { StorageSettings } from "./StorageSettings";
 import { VaultCard } from "./VaultCard";
 import type { AppLockStatus, CostSummary, LanguageOptions } from "../lib/types";
-import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { formatWhen } from "../lib/format";
 import { IS_LINUX } from "../lib/setupGuide";
 import {
@@ -120,7 +120,6 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     teachVisible,
     setTeachVisible,
   } = useTheme();
-  const { devMode, setDevMode } = useDevMode();
   // Seeded from localStorage rather than watched: the toggle is the only writer here, and the
   // Pinboard reads the pref fresh at the moment you click delete (see pinboard/prefs.ts).
   const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
@@ -1464,55 +1463,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
               <StorageSettings onNavigate={(t) => selectTab(t as SettingsTab)} />
             )}
 
-            {tab === "developer" && (
-              <div className="mt-5 border-t border-border pt-4" data-help="settings-developer">
-                <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-                  Developer mode
-                </label>
-                <div className="mt-3 flex items-center justify-between gap-3">
-                  <span className="text-sm text-ink2">Developer mode</span>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={devMode}
-                    aria-label="Developer mode"
-                    onClick={() => setDevMode(!devMode)}
-                    className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                      devMode ? "bg-accent" : "bg-surface"
-                    }`}
-                  >
-                    <span
-                      className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                        devMode ? "translate-x-4" : "translate-x-0.5"
-                      }`}
-                    />
-                  </button>
-                </div>
-                <div className="mt-3 flex items-center justify-between gap-3 text-xs">
-                  <span className="text-ink3">Signals</span>
-                  <span className="font-mono text-ink4">
-                    build: {isDevBuild ? "dev" : "release"} · runtime: {devMode ? "on" : "off"}
-                  </span>
-                </div>
-                {devMode && onOpenDev && (
-                  <div className="mt-3">
-                    <Button variant="tertiary" onClick={onOpenDev}>
-                      Open Dev tab →
-                    </Button>
-                  </div>
-                )}
-                {/* The build/runtime signals above stay put — a readout. Only the paragraph about
-                    what the switch reveals folds. */}
-                <SectionInfo title="What does developer mode reveal?">
-                  <p>
-                    Reveals read-only inspection surfaces — a dedicated Dev tab (raw tables, row
-                    counts, the corrections log, system &amp; build info) plus internals shown in
-                    place — for debugging and watching how PM works. Strictly read-only: it never
-                    changes your data. Independent of the density preset, and off by default.
-                  </p>
-                </SectionInfo>
-              </div>
-            )}
+            {tab === "developer" && <DeveloperSettings onOpenDev={onOpenDev} />}
           </div>
         </div>
 
