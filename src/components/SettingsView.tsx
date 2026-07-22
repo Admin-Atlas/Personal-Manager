@@ -26,8 +26,10 @@ import { SearchSettings } from "./settings/SearchSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { StorageSettings } from "./StorageSettings";
 import type { LanguageOptions } from "../lib/types";
+import { useScrollSpy } from "../lib/useScrollSpy";
 import { deviceTimeZone } from "../theme";
-import { Button, Collapsible, Input, NavItem, SegmentedControl } from "./ui";
+import { SETTINGS_GROUPS, sectionsFor, type SettingsTab } from "./settings/registry";
+import { Button, cn, Collapsible, Input, NavItem, SegmentedControl } from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -36,21 +38,6 @@ interface Props {
   /** Jump to the Dev tab (issue #78) — closes Settings and navigates. Non-onboarding only. */
   onOpenDev?: () => void;
 }
-
-/** The non-onboarding Settings tabs (left rail). Onboarding stays a single untabbed scroll. */
-type SettingsTab =
-  "general" | "ai" | "search" | "connectors" | "data" | "backup" | "storage" | "developer";
-
-const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = [
-  { id: "general", label: "General" },
-  { id: "ai", label: "AI & Models" },
-  { id: "search", label: "Search" },
-  { id: "connectors", label: "Connectors" },
-  { id: "data", label: "Data & Security" },
-  { id: "backup", label: "Backup" },
-  { id: "storage", label: "Storage" },
-  { id: "developer", label: "Developer" },
-];
 
 export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [key, setKey] = useState("");
@@ -86,6 +73,21 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   function selectTab(next: SettingsTab) {
     setTab(next);
     contentRef.current?.scrollTo({ top: 0 });
+  }
+
+  // The active tab's in-rail sub-nav: scroll-spy lights the section currently in view; clicking a
+  // sub-item scrolls its section to the top of the pane. Self-contained tabs have no sections, so the
+  // hook simply finds no anchors and stays inert.
+  const activeSectionId = useScrollSpy(
+    contentRef,
+    sectionsFor(tab).map((s) => s.id),
+  );
+
+  function scrollToSection(id: string) {
+    const el = contentRef.current?.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
+    if (!el) return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
   }
 
   useEffect(() => {
@@ -384,14 +386,81 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
         </div>
 
         <div className="flex min-h-0 flex-1">
-          <nav className="w-44 shrink-0 overflow-y-auto border-r border-border p-3">
-            <div className="flex flex-col gap-1">
-              {SETTINGS_TABS.map((t) => (
-                <NavItem key={t.id} active={tab === t.id} onClick={() => selectTab(t.id)}>
-                  {t.label}
-                </NavItem>
-              ))}
-            </div>
+          <nav className="w-52 shrink-0 overflow-y-auto border-r border-border p-3">
+            {SETTINGS_GROUPS.map((group, gi) => {
+              const headerId = group.header
+                ? `settings-group-${group.header.toLowerCase()}`
+                : undefined;
+              return (
+                <div
+                  key={group.header ?? "top"}
+                  className={gi > 0 ? "mt-4" : undefined}
+                  role={group.header ? "group" : undefined}
+                  aria-labelledby={headerId}
+                >
+                  {group.header && (
+                    <div
+                      id={headerId}
+                      className="px-3 pb-1 font-mono text-[10px] font-medium uppercase tracking-wider text-ink4"
+                    >
+                      {group.header}
+                    </div>
+                  )}
+                  <div className="flex flex-col gap-0.5">
+                    {group.tabs.map((t) => {
+                      const active = tab === t.id;
+                      return (
+                        <div key={t.id}>
+                          <NavItem
+                            active={active}
+                            onClick={() => selectTab(t.id)}
+                            leading={<t.Icon className="h-4 w-4" />}
+                          >
+                            {t.label}
+                          </NavItem>
+                          {/* The active tab's sub-nav: it animates open via the grid 0fr↔1fr trick and
+                            is kept mounted-but-collapsed (and non-interactive) for the others, so
+                            switching tabs slides smoothly. Tabs with no sections render nothing. */}
+                          {t.sections.length > 0 && (
+                            <div
+                              className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
+                              style={{ gridTemplateRows: active ? "1fr" : "0fr" }}
+                            >
+                              <div className="overflow-hidden">
+                                <div
+                                  className={cn(
+                                    "mt-0.5 flex flex-col gap-0.5 pb-1 pl-6",
+                                    !active && "pointer-events-none",
+                                  )}
+                                  aria-hidden={!active}
+                                >
+                                  {t.sections.map((s) => (
+                                    <button
+                                      key={s.id}
+                                      type="button"
+                                      tabIndex={active ? 0 : -1}
+                                      onClick={() => scrollToSection(s.id)}
+                                      className={cn(
+                                        "truncate border-l-2 py-1 pl-3 text-left text-xs transition-colors",
+                                        active && activeSectionId === s.id
+                                          ? "border-accent text-ink"
+                                          : "border-transparent text-ink4 hover:text-ink2",
+                                      )}
+                                    >
+                                      {s.label}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
           </nav>
 
           <div

@@ -85,7 +85,12 @@ export function DataSecuritySettings() {
         </div>
       )}
 
-      <div className="mt-4 border-t border-border pt-4" data-help="settings-app-lock">
+      <div
+        id="sec-data-applock"
+        data-settings-section
+        className="mt-4 border-t border-border pt-4"
+        data-help="settings-app-lock"
+      >
         <div className="flex items-start justify-between gap-3">
           <div>
             <label className="block text-sm font-medium text-ink2">App lock</label>
@@ -142,7 +147,12 @@ export function DataSecuritySettings() {
         )}
       </div>
 
-      <div className="mt-5 border-t border-border pt-4" data-help="settings-data">
+      <div
+        id="sec-data-data"
+        data-settings-section
+        className="mt-5 border-t border-border pt-4"
+        data-help="settings-data"
+      >
         <label className="block text-sm font-medium text-ink2">Data</label>
         <div className="mt-2 flex flex-wrap gap-2">
           <Button variant="tertiary" onClick={revealDataFolder}>
@@ -169,11 +179,20 @@ export function DataSecuritySettings() {
         </SectionInfo>
       </div>
 
-      <VaultCard />
+      <div id="sec-data-vault" data-settings-section>
+        <VaultCard />
+      </div>
 
-      <RemovePmData biometricAvailable={appLock?.available ?? false} />
+      <div id="sec-data-remove" data-settings-section>
+        <RemovePmData biometricAvailable={appLock?.available ?? false} />
+      </div>
 
-      <div className="mt-5 border-t border-border pt-4" data-help="settings-license">
+      <div
+        id="sec-data-license"
+        data-settings-section
+        className="mt-5 border-t border-border pt-4"
+        data-help="settings-license"
+      >
         <SectionInfo title="License">
           <p>
             PM is free software, licensed under the{" "}

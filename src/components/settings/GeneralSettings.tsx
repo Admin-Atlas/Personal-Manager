@@ -196,7 +196,12 @@ export function GeneralSettings() {
         </div>
       )}
 
-      <div className="mt-5 border-t border-border pt-4" data-help="settings-appearance">
+      <div
+        id="sec-general-appearance"
+        data-settings-section
+        className="mt-5 border-t border-border pt-4"
+        data-help="settings-appearance"
+      >
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
           Appearance
         </label>
@@ -400,7 +405,12 @@ export function GeneralSettings() {
         </SectionInfo>
       </div>
 
-      <div className="mt-5 border-t border-border pt-4" data-help="settings-memory-map">
+      <div
+        id="sec-general-map"
+        data-settings-section
+        className="mt-5 border-t border-border pt-4"
+        data-help="settings-memory-map"
+      >
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
           Memory map
         </label>
@@ -489,7 +499,12 @@ export function GeneralSettings() {
         </SectionInfo>
       </div>
 
-      <div className="mt-5 border-t border-border pt-4" data-help="settings-timezone">
+      <div
+        id="sec-general-timezone"
+        data-settings-section
+        className="mt-5 border-t border-border pt-4"
+        data-help="settings-timezone"
+      >
         <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
           Time zone
         </label>
@@ -529,7 +544,12 @@ export function GeneralSettings() {
         </SectionInfo>
       </div>
 
-      <div className="mt-4 border-t border-border pt-4" data-help="settings-help-mode">
+      <div
+        id="sec-general-help"
+        data-settings-section
+        className="mt-4 border-t border-border pt-4"
+        data-help="settings-help-mode"
+      >
         <div className="flex items-start justify-between gap-3">
           <label className="block text-sm font-medium text-ink2">Help mode</label>
           <button

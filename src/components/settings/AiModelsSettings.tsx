@@ -171,7 +171,13 @@ export function AiModelsSettings() {
         </div>
       )}
 
-      <label className="mt-5 block text-sm font-medium text-ink2">OpenRouter API key</label>
+      <label
+        id="sec-ai-keys"
+        data-settings-section
+        className="mt-5 block text-sm font-medium text-ink2"
+      >
+        OpenRouter API key
+      </label>
       <Input
         type="password"
         autoComplete="off"
@@ -222,7 +228,11 @@ export function AiModelsSettings() {
         </p>
       </SectionInfo>
 
-      <div className="mt-5 space-y-5 border-t border-border pt-4">
+      <div
+        id="sec-ai-models"
+        data-settings-section
+        className="mt-5 space-y-5 border-t border-border pt-4"
+      >
         <ModelListEditor
           label="Chat model"
           description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
@@ -244,7 +254,12 @@ export function AiModelsSettings() {
       </div>
 
       {cost && (
-        <div className="mt-5 border-t border-border pt-4" data-help="settings-usage-cost">
+        <div
+          id="sec-ai-usage"
+          data-settings-section
+          className="mt-5 border-t border-border pt-4"
+          data-help="settings-usage-cost"
+        >
           <div className="flex items-center justify-between">
             <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
               Usage &amp; cost
