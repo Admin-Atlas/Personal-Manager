@@ -1264,3 +1264,132 @@ export interface DevRetrievalExplain {
   k: number;
   rows: DevRetrievalRow[];
 }
+
+// --- Local AI: Workbench (#296) + the user-configured local endpoint (#297) -------------------
+// Return DTOs are snake_case (Tauri only camelCases invoke ARG names). Mirrors of the Rust structs
+// in hardware.rs / fit.rs / local_ai.rs / openai_compat.rs.
+
+/** How well a curated model fits this machine (fit.rs Verdict, snake_case wire form). */
+export type LocalFitVerdict =
+  "comfortable" | "tight" | "halved_context" | "stay_on_cloud" | "unknown";
+
+/** The sizing verdict for one model on this machine (fit.rs FitResult). `quant` is a GGUF label like
+ *  "Q4_K_M"; `notes` always includes the f16-KV honesty line. */
+export interface LocalFitResult {
+  verdict: LocalFitVerdict;
+  quant: string | null;
+  context: number | null;
+  est_memory_gb: number | null;
+  est_tokens_per_sec: number | null;
+  notes: string[];
+}
+
+/** This machine's hardware scan (hardware.rs Hardware). A null field = "couldn't read it", never 0. */
+export interface LocalHardware {
+  platform: string;
+  total_ram_gb: number;
+  available_ram_gb: number;
+  cpu_brand: string | null;
+  cpu_cores: number | null;
+  cpu_threads: number | null;
+  disk_free_gb: number | null;
+  gpu_name: string | null;
+  gpu_vendor: string | null;
+  vram_gb: number | null;
+  /** "nvidia-smi" | "adapter_ram" | "apple_unified" | "amd_sysfs" — how VRAM was read. */
+  vram_source: string | null;
+  unified_memory: boolean;
+  is_wsl: boolean;
+  notes: string[];
+}
+
+/** How to install a recommended model (only Ollama has a native pull today). */
+export interface LocalInstallHints {
+  ollama: string | null;
+}
+
+/** One curated model scored against this machine (local_ai.rs Recommendation). */
+export interface LocalRecommendation {
+  repo: string;
+  display_name: string;
+  architecture: string;
+  role_hint: string | null;
+  parameters_b: number;
+  active_parameters_b: number;
+  context_length: number;
+  multimodal: boolean;
+  reasoning: boolean | null;
+  install: LocalInstallHints;
+  fit: LocalFitResult;
+}
+
+/** A model the configured endpoint already serves (local_ai.rs InstalledModel). `matched_repo` links
+ *  it back to a curated entry when PM recognises it. */
+export interface LocalInstalledModel {
+  id: string;
+  matched_repo: string | null;
+  fit: LocalFitResult;
+}
+
+/** The Workbench payload: the hardware scan + the fit-scored catalog + installed models
+ *  (local_ai.rs Recommendations). */
+export interface LocalRecommendations {
+  hardware: LocalHardware;
+  reserve_gb: number;
+  catalog_version: number;
+  catalog_generated_at: string;
+  endpoint_configured: boolean;
+  cadence: string;
+  rescan_due: boolean;
+  curated: LocalRecommendation[];
+  installed: LocalInstalledModel[];
+}
+
+/** An auto-detected local server (local_ai.rs DetectedEndpoint). */
+export interface DetectedEndpoint {
+  url: string;
+  label: string;
+  models: string[];
+}
+
+/** The pre-save posture + reachability check for a candidate endpoint (local_ai.rs EndpointCheck).
+ *  `message` carries the warning/refusal copy to render. */
+export interface EndpointCheck {
+  reachable: boolean;
+  normalized_url: string;
+  models: string[];
+  /** "loopback" | "private" | "public". */
+  posture: string;
+  /** "ok" | "warn_unencrypted" | "refused_public_cleartext". */
+  scheme_verdict: string;
+  exposed_on_network: boolean;
+  message: string | null;
+}
+
+/** The saved local-endpoint config (local_ai.rs LocalLlmConfig). Routing is
+ *  "cloud" | "local" | "local-then-cloud"; the token value never leaves Rust (`has_token` only). */
+export interface LocalLlmConfig {
+  base_url: string | null;
+  chat_model: string | null;
+  background_model: string | null;
+  chat_routing: string;
+  background_routing: string;
+  has_token: boolean;
+}
+
+/** Live endpoint status for the tab's connection chip (local_ai.rs LocalLlmStatus). */
+export interface LocalLlmStatus {
+  configured: boolean;
+  reachable: boolean;
+  in_cooldown: boolean;
+  cooldown_remaining_s: number;
+  probed_now: boolean;
+}
+
+/** One progress tick from an Ollama model pull (openai_compat.rs PullProgress). */
+export interface PullProgress {
+  status: string;
+  completed_bytes: number | null;
+  total_bytes: number | null;
+  done: boolean;
+}

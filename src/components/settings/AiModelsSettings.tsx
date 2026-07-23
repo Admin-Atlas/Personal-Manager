@@ -319,6 +319,10 @@ export function AiModelsSettings() {
           ) : (
             <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
           )}
+          <p className="mt-2 text-xs text-faint">
+            Local models (Settings → Local AI) aren&apos;t counted here — this ledger tracks only
+            your paid cloud calls.
+          </p>
           <SectionInfo title="How this is calculated">
             <p>
               Your real per-call cost as reported by OpenRouter where available, otherwise estimated

@@ -43,6 +43,13 @@ import type {
   IndexOnlyFetch,
   IngestEvent,
   InstallProgressEvent,
+  DetectedEndpoint,
+  EndpointCheck,
+  LocalHardware,
+  LocalLlmConfig,
+  LocalLlmStatus,
+  LocalRecommendations,
+  PullProgress,
   LanguageOptions,
   LayoutProgressEvent,
   LocalFolder,
@@ -1197,3 +1204,70 @@ export const backupToGdrive = (passphrase: string) =>
  *  with a summary. The live vault is untouched until you {@link switchToVault} to it. */
 export const restoreFromGdrive = (name: string, passphrase: string) =>
   invoke<RestoreSummary>("restore_from_gdrive", { name, passphrase });
+
+// --- Local AI: Workbench (#296) + the user-configured local endpoint (#297) -------------------
+// Thin wrappers over commands that already exist in the backend (src-tauri/src/local_ai.rs). The
+// endpoint config/token stay in Rust — `has_token` on the config is presence-only.
+
+/** Scan this machine's hardware (RAM/VRAM/CPU/GPU). Cached on the runtime; `force` re-scans. */
+export const localHardwareScan = (force = false) =>
+  invoke<LocalHardware>("local_hardware_scan", { force });
+
+/** The Workbench payload: the hardware scan + the curated catalog scored against this machine +
+ *  any models the configured endpoint already serves, sorted best-fit first. */
+export const localModelRecommendations = () =>
+  invoke<LocalRecommendations>("local_model_recommendations");
+
+/** Auto-detect the three known local servers (Ollama / LM Studio / llama-server) on their ports. */
+export const probeLocalLlmPorts = () => invoke<DetectedEndpoint[]>("probe_local_llm_ports");
+
+/** Pre-save check of a candidate endpoint: normalises, resolves the posture (loopback/private/
+ *  public), probes reachability + LAN exposure. Does NOT persist anything. */
+export const checkLocalLlmEndpoint = (url: string, token?: string) =>
+  invoke<EndpointCheck>("check_local_llm_endpoint", { url, token: token ?? null });
+
+/** The saved local-endpoint config (base URL, per-role model + routing, token presence). */
+export const getLocalLlmConfig = () => invoke<LocalLlmConfig>("get_local_llm_config");
+
+/** Normalise + save the endpoint base URL; returns the normalised URL. Rejects a public cleartext
+ *  URL (a token + chats would travel in the clear). */
+export const setLocalLlmEndpoint = (url: string) =>
+  invoke<string>("set_local_llm_endpoint", { url });
+
+/** Forget the endpoint entirely: base URL, both role models, and the token (routing left as-is,
+ *  which falls through to cloud without a base URL). */
+export const clearLocalLlmEndpoint = () => invoke<void>("clear_local_llm_endpoint");
+
+/** Assign (or clear, with an empty string) the model for a role. */
+export const setLocalLlmRoleModel = (role: "chat" | "background", model: string) =>
+  invoke<void>("set_local_llm_role_model", { role, model });
+
+/** Set a role's routing preference. */
+export const setLocalLlmRouting = (
+  role: "chat" | "background",
+  pref: "cloud" | "local" | "local-then-cloud",
+) => invoke<void>("set_local_llm_routing", { role, pref });
+
+/** Store / clear the optional bearer token for a remote OpenAI-compatible endpoint (OS keychain). */
+export const setLocalLlmToken = (token: string) => invoke<void>("set_local_llm_token", { token });
+export const clearLocalLlmToken = () => invoke<void>("clear_local_llm_token");
+
+/** The models the configured endpoint currently serves (for the pickers). Rejects if none is
+ *  configured or it can't be reached. */
+export const listLocalLlmModels = () => invoke<string[]>("list_local_llm_models");
+
+/** A live endpoint status snapshot (configured / reachable / cooldown). Self-debounced to at most
+ *  one server probe per 30s, so a fast poll can't hammer the user's server. */
+export const localLlmStatus = () => invoke<LocalLlmStatus>("local_llm_status");
+
+/** Ask the configured (Ollama) endpoint to download `model` into itself, streaming progress. Only
+ *  Ollama has a native pull API — the tab shows a copy-paste command for other runners. PM downloads
+ *  nothing itself; this triggers the user's own server to fetch the weights. */
+export function pullLocalModel(
+  model: string,
+  onProgress: (event: PullProgress) => void,
+): Promise<void> {
+  const channel = new Channel<PullProgress>();
+  channel.onmessage = onProgress;
+  return invoke<void>("pull_local_model", { model, onEvent: channel });
+}

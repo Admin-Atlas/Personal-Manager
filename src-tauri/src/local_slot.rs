@@ -83,6 +83,12 @@ pub mod tunables {
     /// caught inside the window.
     pub const INTER_TOKEN_TIMEOUT: Duration = Duration::from_secs(45);
 
+    /// Silence allowed between progress ticks during an Ollama model pull. A pull streams frequent
+    /// byte/manifest updates, so a long quiet gap means a wedged download (or a dropped connection the
+    /// stream didn't surface as an error). Generous — a slow disk write, or a "verifying sha256" pause
+    /// on a multi-GB model, can be quiet for a while — but bounded so the tab never hangs on a dead pull.
+    pub const PULL_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
     /// Total wall-clock budget for a NON-streaming background completion (summaries, titles, prefs).
     /// With no token-level signal to lean on, this single deadline must cover a cold load plus the
     /// whole (short) generation. 180s = ~60s worst-case load + generation headroom. A dead host is

@@ -8,9 +8,13 @@ no bug bounty.
 ## Threat model (the short version)
 
 PM is **local-first**: your data lives on your own machine. Outbound traffic is limited and
-enumerable — the model API calls that power chat; a launch-time update check against the
+enumerable — the model API calls that power chat, sent to your cloud AI provider by default or,
+if you configure one, to a local model endpoint (a loopback server on this machine sends nothing
+off-box; a remote or LAN endpoint receives the requests you route to it, and PM refuses to send a
+token and chats in the clear to a public address); a launch-time update check against the
 signed release feed (and the download if you accept an update); a one-time first-run download
-of PM's on-device models and Python dependencies; and, only if you configure them, a read-only
+of PM's on-device models and Python dependencies (your local model runner, if you use one, fetches
+model weights itself — PM does not); and, only if you configure them, a read-only
 calendar fetch, a read-only sync of the cloud accounts you connect (Google Drive, Google
 Sheets, OneDrive), and encrypted backups to your own cloud. There is no telemetry, analytics,
 or crash reporting. At rest, the **SQLCipher store** (settings, search index) is encrypted with

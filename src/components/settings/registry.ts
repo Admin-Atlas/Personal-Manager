@@ -23,12 +23,21 @@ import {
   DataIcon,
   DeveloperIcon,
   GeneralIcon,
+  LocalAiIcon,
   SearchIcon,
   StorageIcon,
 } from "./tabIcons";
 
 export type SettingsTab =
-  "general" | "ai" | "search" | "connectors" | "data" | "backup" | "storage" | "developer";
+  | "general"
+  | "ai"
+  | "localai"
+  | "search"
+  | "connectors"
+  | "data"
+  | "backup"
+  | "storage"
+  | "developer";
 
 export interface SettingsSectionDef {
   /** Must equal an `id=` on a `[data-settings-section]` element inside the tab's component. */
@@ -78,6 +87,17 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
           { id: "sec-ai-keys", label: "API keys" },
           { id: "sec-ai-models", label: "Models" },
           { id: "sec-ai-usage", label: "Usage & cost" },
+        ],
+      },
+      {
+        id: "localai",
+        label: "Local AI",
+        Icon: LocalAiIcon,
+        sections: [
+          { id: "sec-localai-machine", label: "Your machine" },
+          { id: "sec-localai-models", label: "Recommended models" },
+          { id: "sec-localai-endpoint", label: "Connect endpoint" },
+          { id: "sec-localai-roles", label: "Assign roles" },
         ],
       },
       { id: "search", label: "Search", Icon: SearchIcon, sections: [] },

@@ -434,6 +434,38 @@ pub async fn list_local_llm_models(app: AppHandle) -> Result<Vec<String>> {
         })
 }
 
+/// Ask the user's own (loopback) Ollama to download `model` into itself, streaming progress on
+/// `on_event`. Ollama is the only local runner PM knows with a native pull API — for LM Studio /
+/// llama-server the tab shows a copy-paste command instead. PM downloads nothing itself and proxies
+/// nothing: this triggers the user's server to fetch the weights. Errors with a friendly message when
+/// no endpoint is configured or the pull fails (e.g. the endpoint isn't Ollama, so `/api/pull` 404s).
+#[tauri::command]
+pub async fn pull_local_model(
+    app: AppHandle,
+    model: String,
+    on_event: tauri::ipc::Channel<openai_compat::PullProgress>,
+) -> Result<()> {
+    let base_url = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        db::get_setting(&conn, LOCAL_BASE_URL_KEY)?
+    };
+    let Some(base_url) = base_url else {
+        return Err(Error::Other("no local endpoint is configured".into()));
+    };
+    let token = secrets::get_local_llm_endpoint_token()?;
+    openai_compat::pull_ollama_model(&base_url, &model, token.as_ref().map(|s| s.expose()), |p| {
+        let _ = on_event.send(p);
+    })
+    .await
+    .map_err(|f| {
+        Error::Other(format!(
+            "couldn't download the model ({})",
+            crate::error::truncate_detail(&f.detail)
+        ))
+    })
+}
+
 #[derive(Serialize)]
 pub struct LocalLlmStatus {
     /// A base URL is configured.

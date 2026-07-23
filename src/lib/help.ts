@@ -227,6 +227,22 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Appearance",
     body: "Switch the visual System (Editorial / Slate / Terminal), Light or Dark mode, the accent colour, and Depth (how much detail is shown). Changes apply instantly and are remembered on this device.",
   },
+  "settings-localai-machine": {
+    title: "Your machine",
+    body: "PM reads your memory, processor, and graphics card entirely on this device to work out which local models would run well, and how fast. Nothing about your hardware leaves the machine.",
+  },
+  "settings-localai-models": {
+    title: "Recommended models",
+    body: "A curated list of on-device models, each sized against your machine — the best quality it could run, the context it would fit, and a rough speed. The numbers are conservative estimates. Local models have no per-use cost, so they don't appear in AI & Models → Usage & cost.",
+  },
+  "settings-localai-endpoint": {
+    title: "Connect an endpoint",
+    body: "Point PM at a local model server (Ollama, LM Studio, or llama-server). A server on this machine keeps everything on your device — nothing leaves it. A remote or LAN server receives the chats you route to it; PM refuses to send a token and chats in the clear to a public address.",
+  },
+  "settings-localai-roles": {
+    title: "Assign roles",
+    body: "Choose which local model answers your chats and which runs background work, and how each falls back: Cloud, Local only, or Local with a fall-back to your cloud model on a hard failure (an unreachable or broken server).",
+  },
   "settings-storage": {
     title: "On-device components",
     body: "Everything PM has downloaded to this device, with sizes. The document engine and the active search model are always needed. The enhanced map layout (t-SNE) and the speech model can be removed to free space — they re-download when you need them again. The heavy shared libraries (scikit-learn, scipy) can only be removed once nothing still uses them: a greyed Remove button shows a pill pointing to what to remove first. numpy is never offered because the search model shares it.",
