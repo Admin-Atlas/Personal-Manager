@@ -400,6 +400,30 @@ pub(crate) fn new_passphrase_for(plan: &MigrationPlan) -> Option<&str> {
         .filter(|p| !p.trim().is_empty())
 }
 
+/// The Device-mode metadata for a make-private (or a device-vault move): the vault keeps its id but
+/// sheds every passphrase-vault attribute. Pure (no keychain), so the field resets are unit-testable.
+///
+/// Clearing `owner_sid` is the important one: a device vault has no sharing owner (matches
+/// [`VaultMeta::new_device`]), so a stale SID a formerly-shareable vault carried is dropped here. Left
+/// in place it lingers meaninglessly and — after a cross-machine restore — could gate connector setup
+/// against a foreign account's SID (`require_vault_owner`). There is no share left to own once Device.
+fn private_meta(old_meta: &VaultMeta, target_markdown: MarkdownEncryption) -> VaultMeta {
+    let mut meta = old_meta.clone();
+    meta.key_mode = KeyMode::Device;
+    meta.kdf = None;
+    meta.verifier = None;
+    meta.owner_sid = None;
+    // Drop the source vault's MAC so the next authenticated open stamps a fresh one (uniform with
+    // `build_passphrase_meta`, which also leaves it `None`). Cloning the old tag would leave a MAC
+    // that no longer covers the mutated fields — read on the next open as "altered outside PM".
+    meta.meta_mac = None;
+    meta.markdown = MarkdownPolicy {
+        encryption: target_markdown,
+        subkey: meta.markdown.subkey,
+    };
+    meta
+}
+
 /// Resolve a plan to the new SQLCipher key (64-hex) and the new metadata, preserving the
 /// vault id. Derives a fresh passphrase key (make-shareable / change-passphrase), reuses
 /// the device key (make-private), or keeps the current key (a move with no key change).
@@ -425,17 +449,18 @@ fn plan_new_key_and_meta(
             }
         }
         KeyMode::Device => {
-            // Make-private (or a move of a device vault): the random device keychain key.
-            let key = secrets::get_or_create_db_key()?;
-            let mut meta = old_meta.clone();
-            meta.key_mode = KeyMode::Device;
-            meta.kdf = None;
-            meta.verifier = None;
-            meta.markdown = MarkdownPolicy {
-                encryption: plan.target_markdown,
-                subkey: meta.markdown.subkey,
+            // A vault CONVERTING from passphrase (make-private) gets a fresh random device key. A vault
+            // ALREADY device (a device-vault move/adopt — e.g. re-homing a restored device backup) keeps
+            // the key its DB is actually encrypted under, so a relocation never needlessly re-keys the
+            // whole store. On the same machine `get_or_create_db_key` returns that same key anyway; the
+            // difference bites a RESTORED device vault, whose key is the embedded source key, not this
+            // machine's device key.
+            let key = if old_meta.key_mode == KeyMode::Device {
+                current_key_hex(old_meta)?
+            } else {
+                secrets::get_or_create_db_key()?
             };
-            Ok((key, meta))
+            Ok((key, private_meta(old_meta, plan.target_markdown)))
         }
     }
 }
@@ -1002,6 +1027,36 @@ mod tests {
 
         // The re-key keeps the vault's identity (prepare_shareable's contract).
         assert_eq!(meta.vault_id, old.vault_id);
+    }
+
+    #[test]
+    fn private_meta_sheds_shareable_attributes_including_owner_sid() {
+        // Making a vault private (make-private, or a cross-machine restore adopted as private) must
+        // drop every passphrase-vault attribute — crucially `owner_sid`, a machine/account-scoped SID
+        // that off its origin account would gate connector setup against a foreign owner. Pure, so it
+        // needs no keychain.
+        let mut shareable = VaultMeta::new_device();
+        shareable.key_mode = KeyMode::Passphrase;
+        shareable.owner_sid = Some("S-1-5-21-1111111111-2222222222-3333333333-1001".into());
+        shareable.markdown.encryption = MarkdownEncryption::XChaCha20Poly1305;
+
+        let priv_meta = private_meta(&shareable, MarkdownEncryption::None);
+        assert_eq!(priv_meta.key_mode, KeyMode::Device);
+        assert_eq!(
+            priv_meta.owner_sid, None,
+            "a device vault carries no owner SID"
+        );
+        assert!(priv_meta.kdf.is_none());
+        assert!(priv_meta.verifier.is_none());
+        assert!(
+            priv_meta.meta_mac.is_none(),
+            "the cloned MAC is dropped so the next open stamps a fresh one"
+        );
+        assert_eq!(priv_meta.markdown.encryption, MarkdownEncryption::None);
+        assert_eq!(
+            priv_meta.vault_id, shareable.vault_id,
+            "the vault identity is preserved"
+        );
     }
 
     #[test]
