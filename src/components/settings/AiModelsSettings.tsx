@@ -16,10 +16,18 @@ import {
   setChatModels,
   setOpenRouterBackgroundKey,
   setOpenRouterKey,
+  settingsDefaults,
 } from "../../lib/ipc";
-import type { CostSummary } from "../../lib/types";
+import type { CostSummary, Settings } from "../../lib/types";
 import { ModelListEditor } from "../ModelListEditor";
 import { Button, Input, SectionInfo } from "../ui";
+import { TabResetSection } from "./ResetControls";
+
+/** Order-sensitive equality for the two model-role lists — a reset is offered only when a role's
+ *  ordered list (or its auto-switch) differs from the default. */
+function sameList(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((m, i) => m === b[i]);
+}
 
 /** Format a USD cost, or "—" when unknown (the model isn't in the price cache yet). */
 function fmtUsd(v: number | null): string {
@@ -47,6 +55,8 @@ export function AiModelsSettings() {
   // list) so clearing a role back to "use the default" persists, while a write can never fire against
   // the empty pre-load state.
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  // The out-of-the-box defaults (one backend source), for the per-role + per-tab reset affordances.
+  const [defaults, setDefaults] = useState<Settings | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [refreshingPrices, setRefreshingPrices] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,10 +65,11 @@ export function AiModelsSettings() {
     let cancelled = false;
     void (async () => {
       try {
-        const [hasKey, hasBgKey, settings] = await Promise.all([
+        const [hasKey, hasBgKey, settings, defs] = await Promise.all([
           hasOpenRouterKey(),
           hasOpenRouterBackgroundKey(),
           getSettings(),
+          settingsDefaults(),
         ]);
         if (cancelled) return;
         setKeyAlreadySet(hasKey);
@@ -67,6 +78,7 @@ export function AiModelsSettings() {
         setBackgroundModelsState(settings.background_models);
         setChatAuto(settings.chat_auto_switch);
         setBackgroundAuto(settings.background_auto_switch);
+        setDefaults(defs);
         setSettingsLoaded(true);
       } catch (e) {
         if (!cancelled) setError(String(e));
@@ -156,6 +168,23 @@ export function AiModelsSettings() {
     }
   }
 
+  // A role is at its default when its ordered list AND auto-switch match the backend defaults. Until
+  // the defaults load, nothing is offered a reset. Reset restores both the list and the auto toggle
+  // (reusing the same change* handlers, so it persists exactly like a manual edit).
+  const chatRoleIsDefault = !defaults || (sameList(chatModels, defaults.chat_models) && !chatAuto);
+  const backgroundRoleIsDefault =
+    !defaults || (sameList(backgroundModels, defaults.background_models) && !backgroundAuto);
+  function resetChatRole() {
+    if (!defaults) return;
+    changeChatModels(defaults.chat_models);
+    changeChatAuto(false);
+  }
+  function resetBackgroundRole() {
+    if (!defaults) return;
+    changeBackgroundModels(defaults.background_models);
+    changeBackgroundAuto(false);
+  }
+
   return (
     <>
       {error && (
@@ -241,6 +270,7 @@ export function AiModelsSettings() {
           onChange={changeChatModels}
           autoSwitch={chatAuto}
           onAutoSwitchChange={changeChatAuto}
+          onReset={chatRoleIsDefault ? undefined : resetChatRole}
         />
         <ModelListEditor
           label="Background model"
@@ -250,6 +280,7 @@ export function AiModelsSettings() {
           onChange={changeBackgroundModels}
           autoSwitch={backgroundAuto}
           onAutoSwitchChange={changeBackgroundAuto}
+          onReset={backgroundRoleIsDefault ? undefined : resetBackgroundRole}
         />
       </div>
 
@@ -348,6 +379,21 @@ export function AiModelsSettings() {
           </SectionInfo>
         </div>
       )}
+
+      <TabResetSection
+        tabName="AI & Models"
+        isDefault={chatRoleIsDefault && backgroundRoleIsDefault}
+        onReset={() => {
+          resetChatRole();
+          resetBackgroundRole();
+        }}
+        confirmBody={
+          <>
+            Restores the chat and background models — and their auto-switch — to the defaults. Your
+            saved API keys aren&apos;t affected.
+          </>
+        }
+      />
     </>
   );
 }

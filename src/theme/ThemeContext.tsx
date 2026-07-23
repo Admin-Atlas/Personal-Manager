@@ -59,6 +59,11 @@ export interface ThemeState {
    *  the user can override, e.g. hide both once the assistant files things well on its own. */
   teachVisible: boolean;
   setTeachVisible: (v: boolean) => void;
+  /** True when every appearance axis (System, Mode, Accent, Depth, Location, Teach) is at its
+   *  out-of-the-box default — drives whether Settings offers an appearance "Reset". */
+  appearanceIsDefault: boolean;
+  /** Restore every appearance axis to its default and forget the per-System accent memory (#445). */
+  resetAppearance: () => void;
 }
 
 // App defaults. Slate + Dark + its default accent (the Eigengrau monochrome — ACCENTS.slate[0])
@@ -280,6 +285,31 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.teach, pref);
   }
 
+  // Whether the appearance is untouched from the defaults (the accent default is System-relative, so
+  // it's compared against the default System's default accent). Drives the Settings "Reset" affordance.
+  const appearanceIsDefault =
+    system === DEFAULT_SYSTEM &&
+    modePref === DEFAULT_MODE_PREF &&
+    depth === DEFAULT_DEPTH &&
+    accent === defaultAccentFor(DEFAULT_SYSTEM) &&
+    autoLocation === "" &&
+    teachPref === DEFAULT_TEACH;
+
+  // Restore every axis to its default in one go. The persist effect below mirrors the axis changes to
+  // localStorage + the stored `appearance` blob; teach and the per-System accent memory aren't in that
+  // effect, so they're written here directly. `setSystemState` (not the public `setSystem`) avoids
+  // re-recording a per-System accent while we're clearing that memory.
+  function resetAppearance(): void {
+    write(KEY.accentBySystem, "{}");
+    write(KEY.teach, DEFAULT_TEACH);
+    setSystemState(DEFAULT_SYSTEM);
+    setModePrefState(DEFAULT_MODE_PREF);
+    setDepthState(DEFAULT_DEPTH);
+    setAccentState(defaultAccentFor(DEFAULT_SYSTEM));
+    setAutoLocationState("");
+    setTeachPrefState(DEFAULT_TEACH);
+  }
+
   // Apply + persist whenever an axis (or the resolved Mode) changes (also runs on mount → themed
   // first paint). localStorage is the fast path; the store is mirrored once hydration has run so the
   // theme survives a folder backup/transfer. We persist the *preference*, not the resolved Mode.
@@ -322,6 +352,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setAutoLocation: setAutoLocationState,
     teachVisible,
     setTeachVisible,
+    appearanceIsDefault,
+    resetAppearance,
   };
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

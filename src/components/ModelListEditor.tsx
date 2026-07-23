@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { ModelPicker } from "./ModelPicker";
+import { ResetLink } from "./settings/ResetControls";
 import { Button, SectionInfo } from "./ui";
 
 interface Props {
@@ -13,6 +14,9 @@ interface Props {
   autoSwitch: boolean;
   onAutoSwitchChange: (enabled: boolean) => void;
   helpId?: string;
+  /** When set, a per-option "Reset" appears by the label (#445). The caller passes it only when this
+   *  role differs from its default (list + auto-switch), and the handler restores both. */
+  onReset?: () => void;
 }
 
 /**
@@ -29,6 +33,7 @@ export function ModelListEditor({
   autoSwitch,
   onAutoSwitchChange,
   helpId,
+  onReset,
 }: Props) {
   function add(id: string) {
     const trimmed = id.trim();
@@ -48,7 +53,10 @@ export function ModelListEditor({
 
   return (
     <div data-help={helpId}>
-      <label className="block text-sm font-medium text-ink2">{label}</label>
+      <div className="flex items-center justify-between gap-2">
+        <label className="block text-sm font-medium text-ink2">{label}</label>
+        {onReset && <ResetLink onReset={onReset} />}
+      </div>
 
       <div className="mt-2 space-y-1.5">
         {models.length === 0 && (

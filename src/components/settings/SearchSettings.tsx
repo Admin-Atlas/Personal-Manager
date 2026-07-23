@@ -3,10 +3,17 @@
 
 import { useEffect, useState } from "react";
 
-import { getSettings, languageOptions, setReranking, setVaultEmbedder } from "../../lib/ipc";
+import {
+  getSettings,
+  languageOptions,
+  setReranking,
+  settingsDefaults,
+  setVaultEmbedder,
+} from "../../lib/ipc";
 import type { LanguageOptions } from "../../lib/types";
 import { RebuildProgress } from "../RebuildProgress";
 import { ConfirmDialog, SectionInfo, SegmentedControl } from "../ui";
+import { ResetLink } from "./ResetControls";
 
 /** The Search Settings tab: the vault's search language (with the guided re-index on a populated
  *  vault) and the query-time reranking toggle. Self-contained: reranking persists immediately, and
@@ -14,6 +21,9 @@ import { ConfirmDialog, SectionInfo, SegmentedControl } from "../ui";
  *  shared footer. Onboarding has its own, simpler language picker — this is the non-onboarding one. */
 export function SearchSettings() {
   const [reranking, setRerankingState] = useState(true);
+  // The out-of-the-box default (from the backend's single defaults source) — drives the per-option
+  // "Reset". Re-ranking defaults on.
+  const [rerankingDefault, setRerankingDefault] = useState(true);
   const [langOpts, setLangOpts] = useState<LanguageOptions | null>(null);
   const [embedderId, setEmbedderId] = useState("");
   // The pending confirm target, the in-flight switch (drives the guided re-index modal: { to, from }),
@@ -29,6 +39,11 @@ export function SearchSettings() {
     getSettings()
       .then((s) => {
         if (!cancelled) setRerankingState(s.reranking);
+      })
+      .catch(() => {});
+    settingsDefaults()
+      .then((d) => {
+        if (!cancelled) setRerankingDefault(d.reranking);
       })
       .catch(() => {});
     languageOptions()
@@ -137,22 +152,27 @@ export function SearchSettings() {
         )}
         <div className="mt-3 flex items-start justify-between gap-3">
           <label className="block text-sm font-medium text-ink2">Re-rank search results</label>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={reranking}
-            aria-label="Re-rank search results"
-            onClick={() => void toggleReranking(!reranking)}
-            className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-              reranking ? "bg-accent" : "bg-surface"
-            }`}
-          >
-            <span
-              className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                reranking ? "translate-x-4" : "translate-x-0.5"
+          <div className="flex items-center gap-2">
+            {reranking !== rerankingDefault && (
+              <ResetLink onReset={() => void toggleReranking(rerankingDefault)} />
+            )}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={reranking}
+              aria-label="Re-rank search results"
+              onClick={() => void toggleReranking(!reranking)}
+              className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                reranking ? "bg-accent" : "bg-surface"
               }`}
-            />
-          </button>
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                  reranking ? "translate-x-4" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
         </div>
         {/* Both of the section's paragraphs in one disclosure at the foot. Folding the
             "switching re-indexes your library" note is safe *because* the confirm dialog
