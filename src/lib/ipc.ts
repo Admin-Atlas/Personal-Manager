@@ -5,6 +5,7 @@ import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { RepairOutcome, VaultFault } from "./types";
 import type {
+  AiProviderStatus,
   AppLockStatus,
   BackupEntry,
   BackupEvent,
@@ -136,6 +137,14 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 export const hasOpenRouterKey = () => invoke<boolean>("has_openrouter_key");
+
+/** Whether an AI provider is available — a cloud key, a configured local endpoint, or an explicit
+ *  "set up AI later". The keyless-onboarding gate reads this instead of {@link hasOpenRouterKey}
+ *  (#295); combine with `lib/aiGate.aiReady`. */
+export const aiProviderStatus = () => invoke<AiProviderStatus>("ai_provider_status");
+
+/** Mark first-run onboarding complete (finished the wizard, or chose "Set up AI later"). */
+export const setOnboardingDone = () => invoke<void>("set_onboarding_done");
 
 export const setOpenRouterKey = (key: string) => invoke<void>("set_openrouter_key", { key });
 

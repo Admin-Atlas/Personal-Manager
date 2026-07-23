@@ -1129,6 +1129,8 @@ pub fn run() {
             settings::set_reranking,
             settings::set_retrieval_k,
             settings::set_retrieval_confidence_threshold,
+            settings::ai_provider_status,
+            settings::set_onboarding_done,
             commands::retrieval_explain,
             commands::retrieval_diagnose,
             settings::language_options,

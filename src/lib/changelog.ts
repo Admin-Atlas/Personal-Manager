@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.44.0-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "You can now start PM without an API key. On first run, choose a cloud provider (OpenRouter), a model running on your own device, or “Set up AI later” — PM works either way, and it tells you plainly when a feature needs an AI provider you haven’t set up yet. Already using PM? Nothing changes.",
+    ],
+  },
+  {
     version: "3.43.0-alpha",
     date: "2026-07-23",
     highlights: [

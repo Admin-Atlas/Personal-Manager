@@ -15,6 +15,7 @@
 
 use std::time::Instant;
 
+use rusqlite::Connection;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{Error, Result};
@@ -405,6 +406,21 @@ fn local_arm(app: &AppHandle, role: Role) -> Result<Option<LocalArm>> {
         model,
         token,
     }))
+}
+
+/// Whether a local endpoint is usable as a CHAT provider from settings alone — a base URL and a chat
+/// model, both present and non-blank. This is the settings half of [`local_arm`] for [`Role::Chat`]
+/// minus the keychain token read, factored out as a pure `&Connection` predicate so the keyless-
+/// onboarding gate (#295) can ask "is this user AI-ready via a local model?" and so it is unit-
+/// testable. The routing preference is deliberately ignored: leniency errs toward the honest
+/// `no_provider_message()` guard rather than re-showing a local-only user the onboarding wizard.
+pub(crate) fn local_chat_configured(conn: &Connection) -> Result<bool> {
+    let base_url = db::get_setting(conn, LOCAL_BASE_URL_KEY)?;
+    let model = db::get_setting(conn, LOCAL_CHAT_MODEL_KEY)?;
+    Ok(match (base_url, model) {
+        (Some(b), Some(m)) => !b.trim().is_empty() && !m.trim().is_empty(),
+        _ => false,
+    })
 }
 
 /// Run a non-streaming completion through the resolved route, returning the completion plus how it
@@ -812,6 +828,28 @@ mod tests {
         };
         assert_eq!(prefs.for_role(Role::Chat), ProviderPref::Local);
         assert_eq!(prefs.for_role(Role::Background), ProviderPref::Cloud);
+    }
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn local_chat_configured_requires_a_nonblank_base_url_and_chat_model() {
+        let conn = mem_conn();
+        assert!(!local_chat_configured(&conn).unwrap()); // nothing set
+        db::set_setting(&conn, LOCAL_BASE_URL_KEY, "http://localhost:11434").unwrap();
+        assert!(!local_chat_configured(&conn).unwrap()); // base URL only
+        db::set_setting(&conn, LOCAL_CHAT_MODEL_KEY, "   ").unwrap();
+        assert!(!local_chat_configured(&conn).unwrap()); // model present but blank
+        db::set_setting(&conn, LOCAL_CHAT_MODEL_KEY, "llama3").unwrap();
+        assert!(local_chat_configured(&conn).unwrap()); // both present and non-blank
     }
 
     #[test]

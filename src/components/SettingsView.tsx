@@ -11,6 +11,7 @@ import {
   setChatAutoSwitch,
   setChatModels,
   setIndexingSpeed,
+  setOnboardingDone,
   setOpenRouterKey,
   setTimeZone,
   setVaultEmbedder,
@@ -25,6 +26,7 @@ import { DeveloperSettings } from "./settings/DeveloperSettings";
 import { GeneralSettings } from "./settings/GeneralSettings";
 import { SearchSettings } from "./settings/SearchSettings";
 import { ModelListEditor } from "./ModelListEditor";
+import { OnboardingLocalConnect } from "./onboarding/OnboardingLocalConnect";
 import { StorageSettings } from "./StorageSettings";
 import type { LanguageOptions } from "../lib/types";
 import { useScrollSpy } from "../lib/useScrollSpy";
@@ -42,6 +44,10 @@ interface Props {
 
 export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
   const [key, setKey] = useState("");
+  // First-run AI-provider choice (#295): a cloud key, or a local model on this device. The local
+  // pane reports readiness (an endpoint + a chat model configured) up through `localReady`.
+  const [aiMode, setAiMode] = useState<"cloud" | "local">("cloud");
+  const [localReady, setLocalReady] = useState(false);
   const [chatModels, setChatModelsState] = useState<string[]>([]);
   const [backgroundModels, setBackgroundModelsState] = useState<string[]>([]);
   // True once getSettings() has populated the model lists. Save gates on this (not a non-empty
@@ -157,13 +163,18 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
     }
   }
 
-  const canSave = !saving && (keyAlreadySet || key.trim().length > 0);
+  // A provider is ready when the active pane is satisfied: a cloud key (entered or already saved),
+  // or a configured local model. "Get started" gates on this; "Set up AI later" bypasses it.
+  const providerReady = aiMode === "cloud" ? keyAlreadySet || key.trim().length > 0 : localReady;
+  const canSave = !saving && providerReady;
 
   async function save() {
     setSaving(true);
     setError(null);
     try {
-      if (key.trim()) {
+      // Cloud pane persists a freshly-entered key; the local pane already persisted its endpoint as
+      // the user connected; "Set up AI later" persists no provider at all.
+      if (aiMode === "cloud" && key.trim()) {
         await setOpenRouterKey(key.trim());
         setKey("");
         setKeyAlreadySet(true);
@@ -197,6 +208,9 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
       // Windows accounts is set up afterwards via the guided wizard, which moves the vault to a
       // reachable folder — so onboarding can never strand a "shareable" vault inside this
       // profile's private folder, unreachable by every other account (the issue #337 trap).
+      // Record that onboarding is complete so a keyless finish (a local model, or "set up later")
+      // isn't re-prompted on the next launch — the keyless-onboarding gate (#295) reads this.
+      if (onboarding) await setOnboardingDone();
       onClose();
     } catch (e) {
       setError(String(e));
@@ -230,59 +244,81 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
               AI provider
             </label>
             <p className="mt-1 text-xs leading-relaxed text-ink4">
-              PM reaches AI models through{" "}
+              PM needs an AI model to power chat and the behind-the-scenes work. Use a cloud
+              provider through OpenRouter, or run a model on this device — you can also set this up
+              later.
+            </p>
+            <div className="mt-3">
+              <SegmentedControl
+                value={aiMode}
+                onChange={setAiMode}
+                options={[
+                  { value: "cloud", label: "Cloud (OpenRouter)" },
+                  { value: "local", label: "On this device" },
+                ]}
+              />
+            </div>
+          </div>
+
+          {aiMode === "cloud" ? (
+            <>
+              <p className="mt-3 text-xs leading-relaxed text-ink4">
+                PM reaches AI models through{" "}
+                <a
+                  href="https://openrouter.ai"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-accent-text underline hover:brightness-110"
+                >
+                  OpenRouter
+                </a>{" "}
+                — one account for OpenAI, Anthropic, Google, and free models. It's free to start,
+                and PM sends Zero-Data-Retention on every request.
+              </p>
+
+              <label className="mt-3 block text-sm font-medium text-ink2">OpenRouter API key</label>
+              <Input
+                type="password"
+                autoComplete="off"
+                data-help="settings-api-key"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                placeholder={keyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
+                className="mt-1"
+              />
               <a
-                href="https://openrouter.ai"
+                href="https://openrouter.ai/keys"
                 target="_blank"
                 rel="noreferrer"
-                className="text-accent-text underline hover:brightness-110"
+                className="mt-1 inline-block text-xs text-ink4 hover:text-ink2"
               >
-                OpenRouter
-              </a>{" "}
-              — one account for OpenAI, Anthropic, Google, and free models. It's free to start, and
-              PM sends Zero-Data-Retention on every request.
-            </p>
-          </div>
+                Get a key at openrouter.ai/keys →
+              </a>
 
-          <label className="mt-3 block text-sm font-medium text-ink2">OpenRouter API key</label>
-          <Input
-            type="password"
-            autoComplete="off"
-            data-help="settings-api-key"
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
-            placeholder={keyAlreadySet ? "•••••••• (saved — type to replace)" : "sk-or-..."}
-            className="mt-1"
-          />
-          <a
-            href="https://openrouter.ai/keys"
-            target="_blank"
-            rel="noreferrer"
-            className="mt-1 inline-block text-xs text-ink4 hover:text-ink2"
-          >
-            Get a key at openrouter.ai/keys →
-          </a>
-
-          <div className="mt-5 space-y-5 border-t border-border pt-4">
-            <ModelListEditor
-              label="Chat model"
-              description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
-              helpId="settings-chat-models"
-              models={chatModels}
-              onChange={setChatModelsState}
-              autoSwitch={chatAuto}
-              onAutoSwitchChange={setChatAuto}
-            />
-            <ModelListEditor
-              label="Background model"
-              description="Runs sorting proposals and Learning You. Free models work well here; chain a few for daily limits."
-              helpId="settings-background-models"
-              models={backgroundModels}
-              onChange={setBackgroundModelsState}
-              autoSwitch={backgroundAuto}
-              onAutoSwitchChange={setBackgroundAuto}
-            />
-          </div>
+              <div className="mt-5 space-y-5 border-t border-border pt-4">
+                <ModelListEditor
+                  label="Chat model"
+                  description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
+                  helpId="settings-chat-models"
+                  models={chatModels}
+                  onChange={setChatModelsState}
+                  autoSwitch={chatAuto}
+                  onAutoSwitchChange={setChatAuto}
+                />
+                <ModelListEditor
+                  label="Background model"
+                  description="Runs sorting proposals and Learning You. Free models work well here; chain a few for daily limits."
+                  helpId="settings-background-models"
+                  models={backgroundModels}
+                  onChange={setBackgroundModelsState}
+                  autoSwitch={backgroundAuto}
+                  onAutoSwitchChange={setBackgroundAuto}
+                />
+              </div>
+            </>
+          ) : (
+            <OnboardingLocalConnect onConfigured={setLocalReady} />
+          )}
 
           {joinedVault ? (
             <div className="mt-5 border-t border-border pt-4">
@@ -365,7 +401,18 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
             </p>
           )}
 
-          <div className="mt-6 flex justify-end gap-2">
+          <div className="mt-6 flex items-center justify-between gap-2">
+            {/* Keyless start (#295): finish onboarding with no provider. PM works — chat and the
+                behind-the-scenes AI stay off (with an honest prompt) until a key or local model is
+                added in Settings. */}
+            <Button
+              variant="tertiary"
+              onClick={save}
+              disabled={saving}
+              data-help="onboarding-later"
+            >
+              Set up AI later
+            </Button>
             <Button variant="primary" onClick={save} disabled={!canSave}>
               {saving ? "Saving…" : "Get started"}
             </Button>
