@@ -1328,6 +1328,13 @@ export interface LocalInstallHints {
   ollama: string | null;
 }
 
+/** The relationship between a model's highest-quality (system-RAM) config and a faster GPU-resident
+ *  config (fit.rs GpuFit, `#[serde(tag = "kind")]`). `single` = one config is the whole story;
+ *  `split` = a distinct faster config that fits VRAM (`fit`); `no_gpu_resident` = a GPU exists but
+ *  nothing fits it (still usable in system RAM). */
+export type LocalGpuFit =
+  { kind: "single" } | { kind: "split"; fit: LocalFitResult } | { kind: "no_gpu_resident" };
+
 /** One curated model scored against this machine (local_ai.rs Recommendation). */
 export interface LocalRecommendation {
   repo: string;
@@ -1340,7 +1347,10 @@ export interface LocalRecommendation {
   multimodal: boolean;
   reasoning: boolean | null;
   install: LocalInstallHints;
+  /** The highest-quality config that fits system RAM (unchanged from before the two-budget split). */
   fit: LocalFitResult;
+  /** Whether a faster GPU-resident config is worth showing beside `fit` (#457). */
+  gpu: LocalGpuFit;
 }
 
 /** A model the configured endpoint already serves (local_ai.rs InstalledModel). `matched_repo` links
@@ -1356,6 +1366,7 @@ export interface LocalInstalledModel {
 export interface LocalRecommendations {
   hardware: LocalHardware;
   reserve_gb: number;
+  gpu_reserve_gb: number;
   catalog_version: number;
   catalog_generated_at: string;
   endpoint_configured: boolean;
