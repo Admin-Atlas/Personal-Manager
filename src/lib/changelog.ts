@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.42.0-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "Changed a setting and want it back the way it was? A small “Reset” now appears next to anything you’ve moved off its default, and each of the General, AI & Models, and Search tabs has a “Reset to defaults” that puts everything on it back at once — appearance, model choices, the memory map, re-ranking, and more. Your API keys, search language, and time zone are deliberately left untouched.",
+    ],
+  },
+  {
     version: "3.41.1-alpha",
     date: "2026-07-23",
     highlights: [

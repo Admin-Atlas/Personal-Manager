@@ -1119,6 +1119,7 @@ pub fn run() {
             local_ai::local_hardware_scan,
             local_ai::local_model_recommendations,
             settings::get_settings,
+            settings::settings_defaults,
             settings::set_indexing_speed,
             settings::set_chat_models,
             settings::set_background_models,

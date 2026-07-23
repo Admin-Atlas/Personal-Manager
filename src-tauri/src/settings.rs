@@ -75,6 +75,28 @@ pub struct Settings {
     pub retrieval_confidence_threshold: Option<f32>,
 }
 
+impl Settings {
+    /// The canonical out-of-the-box defaults — the single source the reset-to-default flow (#445)
+    /// restores to. Deliberately mirrors what [`get_settings`] falls back to on a fresh vault: an
+    /// unset role resolves to `DEFAULT_MODEL`, auto-switch and help off, reranking on, "fast"
+    /// indexing, and the default retrieval depth / confidence gate. Keeping the values here (not
+    /// hardcoded again in the frontend) is what keeps "reset" honest as those defaults evolve.
+    pub fn defaults() -> Self {
+        Settings {
+            chat_models: vec![DEFAULT_MODEL.to_string()],
+            background_models: vec![DEFAULT_MODEL.to_string()],
+            chat_auto_switch: false,
+            background_auto_switch: false,
+            help_mode: false,
+            time_zone: String::new(),
+            reranking: true,
+            indexing_speed: "fast".to_string(),
+            retrieval_k: crate::retrieval::DEFAULT_TOP_K,
+            retrieval_confidence_threshold: Some(db::DEFAULT_CONFIDENCE_THRESHOLD),
+        }
+    }
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
     let conn = state.conn()?;
@@ -91,6 +113,14 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
         retrieval_k: db::retrieval_k(&conn),
         retrieval_confidence_threshold: db::retrieval_confidence_threshold(&conn),
     })
+}
+
+/// The out-of-the-box default for every setting — the values the reset-to-default flow (#445)
+/// restores to, and what the frontend diffs the live settings against to decide when to offer a
+/// per-control "Reset". Pure (no state): the defaults are constants, not stored rows.
+#[tauri::command]
+pub fn settings_defaults() -> Result<Settings> {
+    Ok(Settings::defaults())
 }
 
 /// Set the confidence-gate threshold (card #402): `Some(n)` turns the gate ON at `n`, `None` turns it
@@ -405,6 +435,50 @@ mod tests {
         let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let conn = db::open(&path, key).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn defaults_match_a_fresh_empty_vault() {
+        // The reset-to-default target (#445) must equal what a brand-new vault reports, or "reset"
+        // wouldn't restore the out-of-the-box state. Read a fresh empty store exactly as get_settings
+        // does and assert Settings::defaults() agrees — so a fallback can't drift out from under it.
+        let (_dir, conn) = temp_db();
+        let d = Settings::defaults();
+        assert_eq!(d.chat_models, models_for(&conn, CHAT_MODELS_KEY).unwrap());
+        assert_eq!(
+            d.background_models,
+            models_for(&conn, BACKGROUND_MODELS_KEY).unwrap()
+        );
+        assert_eq!(
+            d.chat_auto_switch,
+            db::get_bool(&conn, CHAT_AUTO_SWITCH_KEY, false).unwrap()
+        );
+        assert_eq!(
+            d.background_auto_switch,
+            db::get_bool(&conn, BACKGROUND_AUTO_SWITCH_KEY, false).unwrap()
+        );
+        assert_eq!(
+            d.help_mode,
+            db::get_bool(&conn, "help_mode", false).unwrap()
+        );
+        assert_eq!(
+            d.time_zone,
+            db::get_setting(&conn, TIME_ZONE_KEY)
+                .unwrap()
+                .unwrap_or_default()
+        );
+        assert_eq!(d.reranking, db::reranking_enabled(&conn).unwrap());
+        assert_eq!(
+            d.indexing_speed,
+            db::get_setting(&conn, db::INDEXING_SPEED_KEY)
+                .unwrap()
+                .unwrap_or_else(|| "fast".into())
+        );
+        assert_eq!(d.retrieval_k, db::retrieval_k(&conn));
+        assert_eq!(
+            d.retrieval_confidence_threshold,
+            db::retrieval_confidence_threshold(&conn)
+        );
     }
 
     #[test]

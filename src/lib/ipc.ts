@@ -146,6 +146,10 @@ export const setOpenRouterBackgroundKey = (key: string) =>
 
 export const getSettings = () => invoke<Settings>("get_settings");
 
+/** The out-of-the-box default for every setting — the reset-to-default targets, and what the
+ *  Settings tabs diff the live values against to show a per-control "Reset". */
+export const settingsDefaults = () => invoke<Settings>("settings_defaults");
+
 /** Current Windows Smart App Control state, so the updater can warn before a restart that SAC
  *  would silently block. Off-Windows / when SAC is absent this resolves to "unknown". */
 export const smartAppControlState = () => invoke<SmartAppControlState>("smart_app_control_state");

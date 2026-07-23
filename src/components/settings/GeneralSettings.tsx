@@ -36,6 +36,7 @@ import {
 } from "../../theme";
 import { IngestProgress } from "../IngestProgress";
 import { Button, Input, SectionInfo, SegmentedControl, Select, Toggle } from "../ui";
+import { ResetLink, TabResetSection } from "./ResetControls";
 
 /** The General Settings tab: appearance (system/mode/accent/depth/location), the memory-map defaults,
  *  time zone, and help mode. Everything here already persists immediately — theme axes through the
@@ -59,6 +60,8 @@ export function GeneralSettings() {
     setAccent,
     teachVisible,
     setTeachVisible,
+    appearanceIsDefault,
+    resetAppearance,
   } = useTheme();
   const help = useHelp();
   // Seeded from localStorage rather than watched: the toggle is the only writer here, and the
@@ -181,6 +184,35 @@ export function GeneralSettings() {
       .catch((e) => setError(String(e)));
   }
 
+  // --- Reset-to-default (#445) ---
+  // Map view defaults: by-project layout, no cohesion, the 1,000-node cap, enhanced (t-SNE) layout on.
+  const mapIsDefault =
+    mapGrouping === "project" && mapCohesion === 0 && mapNodeCap === 1000 && mapTsneEnabled;
+  const confirmDeleteIsDefault = confirmDelete;
+  const helpIsDefault = !help.enabled;
+  // The whole tab, minus the deliberately-excluded time zone (device-derived, not a preference).
+  const generalIsDefault =
+    appearanceIsDefault && mapIsDefault && confirmDeleteIsDefault && helpIsDefault;
+
+  function resetMap() {
+    changeMapGrouping("project"); // state + shared localStorage key
+    changeMapCohesion(0); // state + shared localStorage key
+    setMapNodeCap(1000);
+    setMapTsneEnabled(true);
+    void persistMapPref(1000, true); // the vault-travelling `map` blob (nodeCap + t-SNE) + relayout
+  }
+  function resetConfirmDelete() {
+    setConfirmDelete(true);
+    writeConfirmDelete(true);
+  }
+  function resetGeneral() {
+    resetAppearance();
+    resetMap();
+    resetConfirmDelete();
+    help.setEnabled(false);
+    // Time zone is intentionally left alone — it's derived from the device, not a taste preference.
+  }
+
   return (
     <>
       {error && (
@@ -202,9 +234,12 @@ export function GeneralSettings() {
         className="mt-5 border-t border-border pt-4"
         data-help="settings-appearance"
       >
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Appearance
-        </label>
+        <div className="flex items-center justify-between gap-2">
+          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+            Appearance
+          </label>
+          {!appearanceIsDefault && <ResetLink onReset={resetAppearance} label="Reset appearance" />}
+        </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           <span className="text-sm text-ink2">System</span>
           <SegmentedControl
@@ -351,14 +386,17 @@ export function GeneralSettings() {
           data-help="settings-pinboard-confirm-delete"
         >
           <span className="text-sm text-ink2">Confirm before deleting a pinboard card</span>
-          <Toggle
-            checked={confirmDelete}
-            onChange={(on) => {
-              setConfirmDelete(on);
-              writeConfirmDelete(on);
-            }}
-            ariaLabel="Ask before deleting a note or timeline"
-          />
+          <div className="flex items-center gap-2">
+            {!confirmDeleteIsDefault && <ResetLink onReset={resetConfirmDelete} />}
+            <Toggle
+              checked={confirmDelete}
+              onChange={(on) => {
+                setConfirmDelete(on);
+                writeConfirmDelete(on);
+              }}
+              ariaLabel="Ask before deleting a note or timeline"
+            />
+          </div>
         </div>
         <div
           className="mt-3 flex items-center justify-between gap-3"
@@ -411,9 +449,12 @@ export function GeneralSettings() {
         className="mt-5 border-t border-border pt-4"
         data-help="settings-memory-map"
       >
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Memory map
-        </label>
+        <div className="flex items-center justify-between gap-2">
+          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+            Memory map
+          </label>
+          {!mapIsDefault && <ResetLink onReset={resetMap} label="Reset map" />}
+        </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           <span className="text-sm text-ink2">Default grouping</span>
           <SegmentedControl
@@ -552,20 +593,23 @@ export function GeneralSettings() {
       >
         <div className="flex items-start justify-between gap-3">
           <label className="block text-sm font-medium text-ink2">Help mode</label>
-          <button
-            role="switch"
-            aria-checked={help.enabled}
-            onClick={() => help.setEnabled(!help.enabled)}
-            className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-              help.enabled ? "bg-accent" : "bg-surface"
-            }`}
-          >
-            <span
-              className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                help.enabled ? "translate-x-4" : "translate-x-0.5"
+          <div className="flex items-center gap-2">
+            {!helpIsDefault && <ResetLink onReset={() => help.setEnabled(false)} />}
+            <button
+              role="switch"
+              aria-checked={help.enabled}
+              onClick={() => help.setEnabled(!help.enabled)}
+              className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                help.enabled ? "bg-accent" : "bg-surface"
               }`}
-            />
-          </button>
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
+                  help.enabled ? "translate-x-4" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
         </div>
         <SectionInfo title="What is help mode?">
           <p>
@@ -573,6 +617,19 @@ export function GeneralSettings() {
           </p>
         </SectionInfo>
       </div>
+
+      <TabResetSection
+        tabName="General"
+        isDefault={generalIsDefault}
+        onReset={resetGeneral}
+        confirmBody={
+          <>
+            Restores appearance (System, Mode, Accent, Depth, Location), the memory-map view, the
+            pinboard delete confirmation, and help mode to their defaults. Your time zone is left
+            as-is.
+          </>
+        }
+      />
     </>
   );
 }
