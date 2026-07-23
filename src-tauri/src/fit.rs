@@ -150,8 +150,9 @@ pub struct FitHardware {
     /// against RAM (so we never over-promise a fit we can't run); VRAM refines the speed estimate and
     /// drives the separate GPU-resident config (`gpu_fit`).
     pub vram_gb: Option<f64>,
-    /// Apple-Silicon-style shared memory: VRAM is a slice of system RAM at the same bandwidth, so
-    /// there is no distinct faster "GPU" config to offer (`gpu_fit` returns `Single`).
+    /// Shared-memory GPU — Apple Silicon, OR a non-Apple integrated GPU / APU: VRAM is a slice of
+    /// system RAM at the same bandwidth, so there is no distinct faster "GPU" config to offer
+    /// (`gpu_fit` returns `Single`). Set by the hardware probe's integrated-GPU detection (#459).
     pub unified_memory: bool,
 }
 
@@ -397,11 +398,11 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
 /// gating on the reserve-shrunk budget here would let a config the same code labels "runs in system
 /// RAM" sit beside a "fastest on GPU" row in the reserve band, contradicting itself.
 pub fn gpu_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> GpuFit {
-    // VRAM is a slice of the same RAM pool → no distinct faster config. NOTE: today only the
-    // Apple-Silicon probe sets `unified_memory`; a non-Apple integrated GPU (AMD APU / Intel iGPU)
-    // with a large shared carve-out isn't flagged, so it could surface a Split whose "GPU speed" is
-    // really shared-RAM speed. Narrow (needs a big UMA carve-out AND a spilling model) and the speed
-    // mislabel predates this; a proper fix needs integrated-GPU detection — tracked as a #457 follow-up.
+    // VRAM is a slice of the same RAM pool → no distinct faster config. `unified_memory` covers Apple
+    // Silicon AND non-Apple integrated GPUs (AMD APU / Intel iGPU), flagged by the hardware probe
+    // (#459: Windows by controller name, Linux AMD by PCI bus). What it deliberately does NOT change
+    // is bandwidth realism for the *single* config that fits a shared carve-out (still scored at GPU
+    // bandwidth) — that stays the v2 per-GPU calibration item.
     if hw.unified_memory {
         return GpuFit::Single;
     }

@@ -179,6 +179,12 @@ fn probe_gpu() -> GpuProbe {
         probe.source = Some("nvidia-smi".to_string());
     }
 
+    // Shared-memory (integrated) GPU → no distinct faster pool, so no GPU Split. nvidia-smi VRAM is
+    // always a discrete NVIDIA card (even on a hybrid laptop), so it wins; otherwise classify by the
+    // controller name (Intel UHD/Iris, AMD "Radeon Graphics" / Vega APU).
+    probe.unified = probe.source.as_deref() != Some("nvidia-smi")
+        && probe.name.as_deref().is_some_and(integrated_gpu_from_name);
+
     // A named GPU we couldn't size reliably: say so plainly, don't invent a number.
     if probe.name.is_some() && probe.vram_gb.is_none() {
         probe
@@ -229,11 +235,13 @@ fn probe_gpu() -> GpuProbe {
         probe.vendor = Some("NVIDIA".to_string());
         probe.vram_gb = Some(round1(mib / 1024.0));
         probe.source = Some("nvidia-smi".to_string());
-    } else if let Some(bytes) = read_amd_sysfs_vram() {
+    } else if let Some((bytes, card)) = read_amd_sysfs_vram() {
         probe.name = Some("AMD GPU".to_string());
         probe.vendor = Some("AMD".to_string());
         probe.vram_gb = Some(round1(bytes as f64 / GIB));
         probe.source = Some("amd_sysfs".to_string());
+        // Integrated (APU) → the "VRAM" is a shared-RAM carve-out, not a distinct faster pool: no Split.
+        probe.unified = amd_is_integrated(card);
     }
     probe
 }
@@ -276,19 +284,32 @@ fn no_window(cmd: &mut std::process::Command) {
 fn no_window(_cmd: &mut std::process::Command) {}
 
 #[cfg(target_os = "linux")]
-fn read_amd_sysfs_vram() -> Option<u64> {
-    // The first card's total VRAM in bytes, if the amdgpu driver exposes it.
+fn read_amd_sysfs_vram() -> Option<(u64, u32)> {
+    // The first card's total VRAM in bytes AND its index, if the amdgpu driver exposes it. The index
+    // lets `amd_is_integrated` check the SAME card's PCI bus (APU-vs-discrete).
     for n in 0..8 {
         let path = format!("/sys/class/drm/card{n}/device/mem_info_vram_total");
         if let Ok(s) = std::fs::read_to_string(&path) {
             if let Ok(bytes) = s.trim().parse::<u64>() {
                 if bytes > 0 {
-                    return Some(bytes);
+                    return Some((bytes, n));
                 }
             }
         }
     }
     None
+}
+
+/// Whether amdgpu `card{n}` is integrated (an APU): its PCI device sits on bus 00 (the CPU root
+/// complex), whereas a discrete card is behind a PCIe port on a higher bus. Best-effort — if the
+/// `device` symlink can't be read it falls back to `false` (discrete), but since we only ask about a
+/// card whose `.../device/mem_info_vram_total` we just read, that link is present in practice.
+#[cfg(target_os = "linux")]
+fn amd_is_integrated(card: u32) -> bool {
+    std::fs::read_link(format!("/sys/class/drm/card{card}/device"))
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .is_some_and(|target| pci_bus_is_integrated(&target))
 }
 
 #[cfg(target_os = "linux")]
@@ -401,6 +422,51 @@ fn vendor_from_name(name: &str) -> Option<String> {
     }
 }
 
+/// Whether a video-controller name is an integrated GPU (shares system memory, so no faster "GPU"
+/// config to offer). Intel iGPUs are UHD / Iris / HD Graphics, and the integrated "Arc Graphics" on
+/// Core Ultra (Meteor/Arrow Lake) chips — only *discrete* Arc cards carry an A-/B-series model token
+/// (Arc A770, Arc B580). AMD APUs market as a bare "Radeon(TM) Graphics" or "Radeon Vega N Graphics",
+/// while discrete AMD carries an explicit tier (RX / Pro / FirePro / Instinct). NVIDIA has no
+/// integrated desktop/laptop part. Conservative: an unrecognized name → `false` (discrete), and AMD is
+/// positive-matched on APU markers so a discrete card is never wrongly flagged (a missed newer APU
+/// like a 780M usually reports no reliable VRAM on Windows anyway → no Split regardless).
+#[cfg(any(windows, test))]
+fn integrated_gpu_from_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    if n.contains("nvidia") || n.contains("geforce") || n.contains("rtx") || n.contains("gtx") {
+        return false; // NVIDIA is always discrete.
+    }
+    if n.contains("intel") || n.contains("uhd") || n.contains("iris") {
+        // "Arc Graphics" (no model token) is the Core-Ultra iGPU; "Arc A770"/"Arc B580" are discrete.
+        if n.contains("arc") {
+            return !has_arc_discrete_model(&n);
+        }
+        return true;
+    }
+    if n.contains("radeon") || n.contains("amd") {
+        let discrete = n.contains(" rx ")
+            || n.contains("radeon rx")
+            || n.contains("radeon pro")
+            || n.contains("firepro")
+            || n.contains("instinct");
+        return !discrete && (n.contains("graphics") || n.contains("vega"));
+    }
+    false
+}
+
+/// True if an already-lowercased Intel-Arc name carries a discrete A-/B-series model token — an `a`/`b`
+/// followed by 2+ digits (`a60`, `a770`, `b580`) — as opposed to the integrated "Arc Graphics" that
+/// carries none. Covers the desktop (A3xx–A7xx, B5xx) and workstation Arc Pro (A40/A50/A60) lines.
+#[cfg(any(windows, test))]
+fn has_arc_discrete_model(name_lower: &str) -> bool {
+    name_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| {
+            let b = tok.as_bytes();
+            b.len() >= 3 && (b[0] == b'a' || b[0] == b'b') && b[1..].iter().all(u8::is_ascii_digit)
+        })
+}
+
 /// VRAM available to an Apple-Silicon GPU: the working-set fraction of unified memory.
 #[cfg(any(target_os = "macos", test))]
 fn apple_vram_gb(total_gb: f64) -> f64 {
@@ -412,6 +478,19 @@ fn apple_vram_gb(total_gb: f64) -> f64 {
 fn detect_wsl(proc_version: &str) -> bool {
     let v = proc_version.to_ascii_lowercase();
     v.contains("microsoft") || v.contains("wsl")
+}
+
+/// Is a `/sys/class/drm/cardN/device` symlink target an integrated GPU? Integrated GPUs sit on PCI
+/// bus 00 (the CPU root complex); a discrete card is behind a PCIe port on a higher bus. The target
+/// looks like `../../../0000:03:00.0` — the bus is the field between the two colons of the last path
+/// segment. Pure; an unparseable target → `false` (treated as discrete).
+#[cfg(any(target_os = "linux", test))]
+fn pci_bus_is_integrated(link_target: &str) -> bool {
+    link_target
+        .rsplit('/')
+        .next()
+        .and_then(|addr| addr.split(':').nth(1)) // "0000:BB:DD.F" → "BB"
+        .is_some_and(|bus| bus == "00")
 }
 
 fn round1(x: f64) -> f64 {
@@ -523,5 +602,36 @@ mod tests {
         assert!(detect_wsl("Linux version 5.15.0-microsoft-standard-WSL2"));
         assert!(detect_wsl("... Microsoft ..."));
         assert!(!detect_wsl("Linux version 6.1.0-generic (gcc ...)"));
+    }
+
+    #[test]
+    fn integrated_gpu_is_classified_from_the_name() {
+        // Intel iGPUs are integrated, incl. the Core-Ultra "Arc Graphics"; discrete Arc has a model.
+        assert!(integrated_gpu_from_name("Intel(R) UHD Graphics 770"));
+        assert!(integrated_gpu_from_name("Intel(R) Iris(R) Xe Graphics"));
+        assert!(integrated_gpu_from_name("Intel(R) Arc(TM) Graphics")); // Core-Ultra iGPU
+        assert!(!integrated_gpu_from_name("Intel(R) Arc(TM) A770 Graphics")); // discrete
+        assert!(!integrated_gpu_from_name("Intel Arc B580")); // discrete
+        assert!(!integrated_gpu_from_name("Intel Arc Pro A60")); // discrete workstation (2-digit model)
+                                                                 // AMD APUs read as bare "... Graphics" / "Vega N"; discrete AMD carries a tier.
+        assert!(integrated_gpu_from_name("AMD Radeon(TM) Graphics"));
+        assert!(integrated_gpu_from_name("AMD Radeon(TM) Vega 8 Graphics"));
+        assert!(!integrated_gpu_from_name("AMD Radeon RX 7900 XT"));
+        assert!(!integrated_gpu_from_name("AMD Radeon Pro W6800"));
+        // NVIDIA has no integrated part; unknown names are conservatively discrete.
+        assert!(!integrated_gpu_from_name(
+            "NVIDIA GeForce RTX 5070 Laptop GPU"
+        ));
+        assert!(!integrated_gpu_from_name("Some Unknown Adapter"));
+    }
+
+    #[test]
+    fn pci_bus_00_is_integrated_higher_buses_are_discrete() {
+        assert!(pci_bus_is_integrated("../../../0000:00:02.0")); // iGPU on the root complex
+        assert!(pci_bus_is_integrated("0000:00:08.1")); // bare last-segment form
+        assert!(!pci_bus_is_integrated("../../../0000:03:00.0")); // discrete behind a PCIe port
+        assert!(!pci_bus_is_integrated("../../../0000:01:00.0"));
+        assert!(!pci_bus_is_integrated("")); // unparseable → discrete
+        assert!(!pci_bus_is_integrated("garbage"));
     }
 }
