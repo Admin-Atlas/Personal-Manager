@@ -12,9 +12,12 @@
 //!     which is more accurate than reconstructing size from `params × bytes_per_param` — especially
 //!     for K-quants, IQ-quants, and sharded/MoE files. `bytes_per_param` survives only for the
 //!     throughput term (active weight bytes read per token) and to order quants by quality.
-//!   * The **KV** term assumes an **f16** cache (2 bytes/element) — the conservative default. The UI
-//!     states this out loud rather than presenting a silently-pessimistic number (every result's
-//!     `notes` carries the f16 line).
+//!   * The **KV** term is sized at **f16** (2 bytes/element) by default — the conservative choice —
+//!     but the ladder will compress it to **q8_0** (~half the size, near-lossless) *before* halving
+//!     the context, so a KV-dominated model keeps its window and quant instead of degrading harder.
+//!     Each result records the precision it was sized at in its `kv` field, surfaced per-config in the
+//!     UI. f16 is always tried first, so this only ever *rescues* a config — never changes one that
+//!     already fit.
 //!
 //! No I/O, no DB, no tauri — every function here is a pure projection of its inputs, unit-tested
 //! below. The numeric constants are first-pass estimates that need calibration against a real
@@ -55,7 +58,8 @@ const GPU_BANDWIDTH_GBPS: f64 = 400.0;
 
 /// f16 KV-cache proxy: GB of cache per (billion active params × token). Deliberately a compact
 /// heuristic, not a per-architecture derivation — it can't see `n_kv_heads`/`head_dim`, so it
-/// trends conservative for wide models. CALIBRATE.
+/// trends conservative for wide models. The q8_0 rung scales this by [`KvCache::size_ratio`].
+/// CALIBRATE.
 const KV_GB_PER_BPARAM_TOKEN: f64 = 8e-6;
 
 // --- input / output model ----------------------------------------------------------------------
@@ -131,6 +135,35 @@ impl Quant {
     }
 }
 
+/// The KV-cache precision a fit was sized at. `F16` (2 bytes/element) is the conservative default;
+/// `Q8_0` is the gentler lever the ladder tries *before* halving the context — roughly half the cache
+/// size and near-lossless in practice (llama.cpp's `--cache-type-k q8_0`), so it can hold a larger
+/// context or a higher weight quant than f16 could afford.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum KvCache {
+    #[serde(rename = "f16")]
+    F16,
+    #[serde(rename = "q8_0")]
+    Q8_0,
+}
+
+impl KvCache {
+    /// Cache size relative to f16. q8_0 stores 8-bit values plus a per-block fp16 scale, so it lands a
+    /// little above half of f16 — mirroring the 1.06-vs-2.0 bytes-per-weight ratio of Q8_0 vs f16
+    /// weights. CALIBRATE.
+    fn size_ratio(self) -> f64 {
+        match self {
+            KvCache::F16 => 1.0,
+            KvCache::Q8_0 => 0.53,
+        }
+    }
+}
+
+/// KV precisions to try at each context rung, gentlest first. f16 is tried before q8_0 so any config
+/// that fits at the conservative default is chosen unchanged; q8_0 only rescues a config that would
+/// otherwise drop a weight quant, halve the context, or go to the cloud.
+const KV_LADDER: [KvCache; 2] = [KvCache::F16, KvCache::Q8_0];
+
 /// One downloadable quant of a model, paired with its measured on-disk size (all experts, all
 /// shards summed — exactly what the catalog stores).
 #[derive(Debug, Clone, Copy)]
@@ -195,9 +228,13 @@ pub struct FitResult {
     pub quant: Option<Quant>,
     /// The context it fits at (== target, or a halved value ≥ 4096), if any.
     pub context: Option<u32>,
+    /// The KV-cache precision this config was sized at: `f16` (the conservative default) or `q8_0`
+    /// when the cache was compressed to keep a larger context or quant. The UI shows it per-config.
+    pub kv: KvCache,
     pub est_memory_gb: Option<f64>,
     pub est_tokens_per_sec: Option<f64>,
-    /// Honest, user-facing caveats — always includes the f16-KV line.
+    /// Honest, user-facing caveats (GPU-vs-RAM speed, halved context, thin headroom). The KV precision
+    /// is carried structurally in `kv`, not here.
     pub notes: Vec<String>,
 }
 
@@ -218,8 +255,6 @@ pub enum GpuFit {
     NoGpuResident,
 }
 
-const F16_KV_NOTE: &str = "Estimate assumes an f16 KV cache (the conservative default).";
-
 // --- the pure functions ------------------------------------------------------------------------
 
 /// The system memory PM keeps free when scoring, so inference doesn't push the machine into swap.
@@ -233,16 +268,17 @@ pub fn gpu_reserve_gb() -> f64 {
     GPU_RESERVE_GB
 }
 
-/// f16 KV-cache footprint for `ctx` tokens at `active_params_b` billion active params.
-pub fn kv_cache_gb(active_params_b: f64, ctx: u32) -> f64 {
-    KV_GB_PER_BPARAM_TOKEN * active_params_b * f64::from(ctx)
+/// KV-cache footprint for `ctx` tokens at `active_params_b` billion active params, at the given cache
+/// precision (`f16` is the conservative default; `q8_0` is roughly half the size).
+pub fn kv_cache_gb(active_params_b: f64, ctx: u32, kv: KvCache) -> f64 {
+    KV_GB_PER_BPARAM_TOKEN * active_params_b * f64::from(ctx) * kv.size_ratio()
 }
 
-/// Total resident footprint for one (candidate, context) pair: measured weights + f16 KV + a flat
-/// overhead + the multimodal projector (0 when there is none).
-fn footprint_gb(spec: &ModelSpec, cand: &QuantCandidate, ctx: u32) -> f64 {
+/// Total resident footprint for one (candidate, context, KV-precision) triple: measured weights + KV
+/// + a flat overhead + the multimodal projector (0 when there is none).
+fn footprint_gb(spec: &ModelSpec, cand: &QuantCandidate, ctx: u32, kv: KvCache) -> f64 {
     cand.weight_gb
-        + kv_cache_gb(spec.active_params_b, ctx)
+        + kv_cache_gb(spec.active_params_b, ctx, kv)
         + OVERHEAD_GB
         + spec.projector_gb.unwrap_or(0.0)
 }
@@ -329,10 +365,17 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // At each context rung, take the best weight quant that fits; within a quant, try f16 first and
+    // only fall back to a q8_0 cache. This preserves the highest weight quant (compressing the
+    // near-lossless cache to afford it) before dropping a quant, and keeps context (compressing the
+    // cache before halving). f16-first at every step makes the whole thing non-regressing.
     for (rung, &ctx) in context_ladder(spec.target_context).iter().enumerate() {
         for cand in &candidates {
-            let mem = footprint_gb(spec, cand, ctx);
-            if mem <= budget_gb {
+            for &kv in &KV_LADDER {
+                let mem = footprint_gb(spec, cand, ctx, kv);
+                if mem > budget_gb {
+                    continue;
+                }
                 let halved = rung > 0;
                 let headroom = budget_gb - mem;
                 let verdict = if halved {
@@ -343,7 +386,7 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
                     Verdict::Tight
                 };
 
-                let mut notes = vec![F16_KV_NOTE.to_string()];
+                let mut notes: Vec<String> = Vec::new();
                 let on_gpu = hw.vram_gb.is_some_and(|v| v >= mem);
                 if on_gpu {
                     notes.push("Fits your GPU's memory — expect GPU-class speed.".to_string());
@@ -367,6 +410,7 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
                     verdict,
                     quant: Some(cand.quant),
                     context: Some(ctx),
+                    kv,
                     est_memory_gb: Some(round2(mem)),
                     est_tokens_per_sec: tokens_per_sec(spec, cand, mem, hw).map(round1),
                     notes,
@@ -375,17 +419,15 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
         }
     }
 
-    // Nothing fit, even the smallest quant at the floor context.
+    // Nothing fit, even the smallest quant with a q8_0 cache at the floor context.
     FitResult {
         verdict: Verdict::StayOnCloud,
         quant: None,
         context: None,
+        kv: KvCache::F16,
         est_memory_gb: None,
         est_tokens_per_sec: None,
-        notes: vec![
-            F16_KV_NOTE.to_string(),
-            "Too large for this machine's memory — better run in the cloud.".to_string(),
-        ],
+        notes: vec!["Too large for this machine's memory — better run in the cloud.".to_string()],
     }
 }
 
@@ -426,7 +468,7 @@ pub fn gpu_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> GpuFi
     if matches!(gpu.verdict, Verdict::Unknown | Verdict::StayOnCloud) {
         return GpuFit::NoGpuResident;
     }
-    if gpu.quant == ram_fit.quant && gpu.context == ram_fit.context {
+    if gpu.quant == ram_fit.quant && gpu.context == ram_fit.context && gpu.kv == ram_fit.kv {
         return GpuFit::Single; // Defensive: identical pick — nothing distinct to show.
     }
     GpuFit::Split { fit: gpu }
@@ -440,6 +482,7 @@ pub fn unknown(reason: String) -> FitResult {
         verdict: Verdict::Unknown,
         quant: None,
         context: None,
+        kv: KvCache::F16,
         est_memory_gb: None,
         est_tokens_per_sec: None,
         notes: vec![reason],
@@ -535,9 +578,17 @@ mod tests {
 
     #[test]
     fn kv_cache_scales_with_active_params_and_context() {
-        assert!((kv_cache_gb(7.0, 4096) - 8e-6 * 7.0 * 4096.0).abs() < EPS);
+        assert!((kv_cache_gb(7.0, 4096, KvCache::F16) - 8e-6 * 7.0 * 4096.0).abs() < EPS);
         // Doubling context doubles KV.
-        assert!((kv_cache_gb(7.0, 8192) - 2.0 * kv_cache_gb(7.0, 4096)).abs() < EPS);
+        assert!(
+            (kv_cache_gb(7.0, 8192, KvCache::F16) - 2.0 * kv_cache_gb(7.0, 4096, KvCache::F16))
+                .abs()
+                < EPS
+        );
+        // q8_0 is a little above half of f16 (near-lossless, roughly halved footprint).
+        let f16 = kv_cache_gb(7.0, 8192, KvCache::F16);
+        let q8 = kv_cache_gb(7.0, 8192, KvCache::Q8_0);
+        assert!(q8 < f16 && q8 > 0.4 * f16, "q8_0 KV should be ~half of f16");
     }
 
     #[test]
@@ -549,7 +600,8 @@ mod tests {
         // Best quant that fits at full context is chosen (Q8_0 fits comfortably here).
         assert_eq!(r.quant, Some(Quant::Q8_0));
         assert_eq!(r.context, Some(8192));
-        assert!(r.notes.iter().any(|n| n.contains("f16 KV")));
+        // Comfortable fit uses the conservative f16 cache (no compression needed).
+        assert_eq!(r.kv, KvCache::F16);
     }
 
     #[test]
@@ -568,7 +620,7 @@ mod tests {
         // Footprint just under budget → Tight (headroom < COMFORT_MARGIN).
         let spec = dense(1.0, 4096, vec![q(Quant::Q4_K_M, 4.0)]);
         // budget = 6 - 2 = 4 ... need mem just below 4 but above 4 - 1.5. mem = 4.0 + kv + 0.5.
-        let mem = footprint_gb(&spec, &q(Quant::Q4_K_M, 4.0), 4096);
+        let mem = footprint_gb(&spec, &q(Quant::Q4_K_M, 4.0), 4096, KvCache::F16);
         let avail = PM_RESERVE_GB + mem + 0.2; // headroom 0.2 < 1.5
         let r = fit(&spec, &ram(avail));
         assert_eq!(r.verdict, Verdict::Tight);
@@ -576,18 +628,47 @@ mod tests {
     }
 
     #[test]
-    fn halves_context_when_full_context_does_not_fit() {
-        // A big KV: only a halved context brings the footprint under budget.
+    fn halves_context_when_even_a_q8_0_cache_does_not_fit_full_context() {
+        // A big KV: even the compressed q8_0 cache at full context overflows, so the context halves.
         // active 40B → kv(8192) huge; kv(4096) half. Weight small so KV dominates.
         let spec = dense(40.0, 8192, vec![q(Quant::Q4_K_M, 1.0)]);
-        let full = footprint_gb(&spec, &q(Quant::Q4_K_M, 1.0), 8192);
-        let half = footprint_gb(&spec, &q(Quant::Q4_K_M, 1.0), 4096);
-        // Budget between half and full.
-        let avail = PM_RESERVE_GB + (full + half) / 2.0;
+        let q8_full = footprint_gb(&spec, &q(Quant::Q4_K_M, 1.0), 8192, KvCache::Q8_0);
+        let f16_half = footprint_gb(&spec, &q(Quant::Q4_K_M, 1.0), 4096, KvCache::F16);
+        assert!(q8_full > f16_half); // the halved f16 config really is the smaller of the two
+                                     // Budget below the gentlest full-context option (q8_0) but at/above the f16 half-context one.
+        let avail = PM_RESERVE_GB + (q8_full + f16_half) / 2.0;
         let r = fit(&spec, &ram(avail));
         assert_eq!(r.verdict, Verdict::HalvedContext);
         assert_eq!(r.context, Some(4096));
         assert!(r.notes.iter().any(|n| n.contains("Context reduced")));
+    }
+
+    #[test]
+    fn q8_0_kv_keeps_full_context_where_f16_alone_would_halve() {
+        // KV-dominated: f16 at full context spills, but a q8_0 cache fits — so the window is kept,
+        // sized on the compressed cache, instead of halved.
+        let spec = dense(40.0, 8192, vec![q(Quant::Q4_K_M, 1.0)]);
+        let f16_full = footprint_gb(&spec, &q(Quant::Q4_K_M, 1.0), 8192, KvCache::F16);
+        let q8_full = footprint_gb(&spec, &q(Quant::Q4_K_M, 1.0), 8192, KvCache::Q8_0);
+        assert!(q8_full < f16_full);
+        // Budget between the two full-context footprints: f16 spills, q8_0 fits.
+        let avail = PM_RESERVE_GB + (f16_full + q8_full) / 2.0;
+        let r = fit(&spec, &ram(avail));
+        assert_eq!(r.context, Some(8192)); // full context kept ...
+        assert_eq!(r.kv, KvCache::Q8_0); // ... by compressing the cache
+        assert_ne!(r.verdict, Verdict::HalvedContext);
+    }
+
+    #[test]
+    fn q8_0_kv_holds_a_higher_weight_quant_than_f16_would_allow() {
+        // A KV-heavy model with two quants. At this budget Q6_K only fits with a q8_0 cache; f16 would
+        // force the lower Q4_K_M. The ladder keeps the higher weight quant on a compressed cache.
+        let spec = dense(30.0, 8192, vec![q(Quant::Q6_K, 6.0), q(Quant::Q4_K_M, 4.0)]);
+        // f16 KV(8192) ≈ 1.97: Q6_K f16 ≈ 8.47 (spills 8.0), Q6_K q8_0 ≈ 7.54 (fits), Q4_K_M f16 ≈ 6.47.
+        let r = fit(&spec, &ram(PM_RESERVE_GB + 8.0));
+        assert_eq!(r.quant, Some(Quant::Q6_K));
+        assert_eq!(r.kv, KvCache::Q8_0);
+        assert_eq!(r.context, Some(8192));
     }
 
     #[test]
@@ -616,8 +697,8 @@ mod tests {
     fn reserve_is_applied() {
         // A model that fits `available` but not `available - reserve` must not be Comfortable.
         let spec = dense(1.0, 4096, vec![q(Quant::Q4_K_M, 5.0)]);
-        let mem = footprint_gb(&spec, &q(Quant::Q4_K_M, 5.0), 4096); // ~5.5
-                                                                     // available = mem + reserve - 0.1 → budget = mem - 0.1 → does NOT fit.
+        let mem = footprint_gb(&spec, &q(Quant::Q4_K_M, 5.0), 4096, KvCache::F16); // ~5.5
+                                                                                   // available = mem + reserve - 0.1 → budget = mem - 0.1 → does NOT fit.
         let r = fit(&spec, &ram(mem + PM_RESERVE_GB - 0.1));
         assert_eq!(r.verdict, Verdict::StayOnCloud);
     }
@@ -839,6 +920,30 @@ mod tests {
         let rfm = fit(&missing, &hw);
         assert_eq!(rfm.verdict, Verdict::Unknown);
         assert_eq!(gpu_fit(&missing, &hw, &rfm), GpuFit::Single);
+    }
+
+    #[test]
+    fn gpu_fit_uses_a_q8_0_cache_to_fit_a_config_into_vram() {
+        // KV-dominated with small VRAM: the quality pick spills to RAM at f16; the GPU-resident config
+        // fits VRAM only by compressing the cache to q8_0 (same quant + context) — so it Splits on the
+        // KV difference alone and streams at GPU speed.
+        let spec = dense(30.0, 16384, vec![q(Quant::Q5_K_M, 4.0)]);
+        let hw = gpu(32.0, 8.0);
+        let rf = fit(&spec, &hw);
+        assert_eq!(rf.kv, KvCache::F16);
+        assert!(rf.est_memory_gb.unwrap() > 8.0); // quality pick spilled past VRAM at f16
+        match gpu_fit(&spec, &hw, &rf) {
+            GpuFit::Split { fit } => {
+                assert_eq!(fit.kv, KvCache::Q8_0);
+                assert_eq!(fit.quant, rf.quant); // same quant + context ...
+                assert_eq!(fit.context, rf.context);
+                // ... it fits only because the cache is smaller
+                assert!(fit.est_memory_gb.unwrap() <= 8.0 - gpu_reserve_gb() + 1e-6);
+                assert!(fit.est_tokens_per_sec.unwrap() > rf.est_tokens_per_sec.unwrap());
+                assert!(fit.notes.iter().any(|n| n.contains("GPU-class speed")));
+            }
+            other => panic!("expected a q8_0-KV Split, got {other:?}"),
+        }
     }
 
     #[test]

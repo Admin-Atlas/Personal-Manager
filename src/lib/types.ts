@@ -1294,11 +1294,14 @@ export type LocalFitVerdict =
   "comfortable" | "tight" | "halved_context" | "stay_on_cloud" | "unknown";
 
 /** The sizing verdict for one model on this machine (fit.rs FitResult). `quant` is a GGUF label like
- *  "Q4_K_M"; `notes` always includes the f16-KV honesty line. */
+ *  "Q4_K_M". `kv` is the cache precision this config was sized at: "f16" (the conservative default) or
+ *  "q8_0" when the cache was compressed to keep a larger context or quant. `notes` carries the
+ *  situational caveats (GPU-vs-RAM speed, halved context, thin headroom). */
 export interface LocalFitResult {
   verdict: LocalFitVerdict;
   quant: string | null;
   context: number | null;
+  kv: "f16" | "q8_0";
   est_memory_gb: number | null;
   est_tokens_per_sec: number | null;
   notes: string[];
@@ -1316,7 +1319,7 @@ export interface LocalHardware {
   gpu_name: string | null;
   gpu_vendor: string | null;
   vram_gb: number | null;
-  /** "nvidia-smi" | "adapter_ram" | "apple_unified" | "amd_sysfs" — how VRAM was read. */
+  /** "nvidia-smi" | "dxgi" | "adapter_ram" | "apple_unified" | "amd_sysfs" — how VRAM was read. */
   vram_source: string | null;
   unified_memory: boolean;
   is_wsl: boolean;
