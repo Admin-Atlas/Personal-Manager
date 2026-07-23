@@ -308,8 +308,28 @@ export type ChatEvent =
   | { type: "token"; text: string }
   // Developer mode only: the exact assembled request + the confidence readout, once before streaming.
   | { type: "prompt"; messages: PromptMessage[]; confidence: GroundingConfidence }
-  | { type: "done"; message_id: number; content: string; citations: Citation[] }
-  | { type: "error"; message: string };
+  // `served_by` is which provider actually answered ("local"/"cloud"), for the per-message footer.
+  | {
+      type: "done";
+      message_id: number;
+      content: string;
+      citations: Citation[];
+      served_by: "local" | "cloud";
+    }
+  | { type: "error"; message: string }
+  // The reply was served by cloud despite a local-endpoint preference (#297): local failed or was
+  // resting, so cloud answered. NOT an error — the reply is real. `reason` is the backend slug
+  // (`hard_failure:<kind>` / `cooldown`); `FallbackStrip` maps it to friendly copy. Arrives after
+  // the tokens, before `done`.
+  | { type: "fallback"; from_model: string; to_model: string; reason: string };
+
+/** A cloud-served fallback the chat honesty strip renders (#297). Mirrors `ChatEvent`'s `fallback`
+ *  arm minus the discriminant. Shared by `useChatStream`'s transient state and `FallbackStrip`. */
+export interface ChatFallback {
+  from_model: string;
+  to_model: string;
+  reason: string;
+}
 
 /** A larger-context model the Upgrade option can switch to (board card 7D). */
 export interface ModelOption {

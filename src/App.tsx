@@ -5,6 +5,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { CalendarView } from "./components/calendar/CalendarView";
 import { ChatView } from "./components/ChatView";
+import { ProviderChip } from "./components/ProviderChip";
+import { FallbackStrip } from "./components/FallbackStrip";
 import { ConversationTitle } from "./components/ConversationTitle";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
@@ -37,6 +39,7 @@ import { useResizable } from "./lib/useResizable";
 import { CollapseTab } from "./components/CollapseTab";
 import { useChatStream } from "./lib/useChatStream";
 import { useProjectChat } from "./lib/useProjectChat";
+import { useLocalLlmStatus } from "./lib/useLocalLlmStatus";
 import { isNewChatTrigger } from "./lib/chatSession";
 import { useUpdater } from "./lib/useUpdater";
 import { useDevMode } from "./lib/capabilities";
@@ -150,6 +153,9 @@ export default function App() {
   // per-project chat can't drift apart (see useChatStream). The guard key is the
   // conversation currently on screen.
   const chat = useChatStream(() => activeIdRef.current);
+  // Live local-endpoint status for the chat provider surfaces (sidebar Local line, composer chip,
+  // per-message provenance). One instance, shared down — the "subscribe once" rule (#297 PR6).
+  const localAi = useLocalLlmStatus();
   const update = useUpdater();
   const { teachVisible } = useTheme();
   const { devMode } = useDevMode();
@@ -828,6 +834,7 @@ export default function App() {
                     ? Math.max(0, settings.background_models.length - 1)
                     : 0
                 }
+                localAi={localAi}
               />
             )}
 
@@ -840,6 +847,7 @@ export default function App() {
                 <ProjectView
                   project={selectedProject}
                   chat={projectChat}
+                  localAi={localAi}
                   focusDocId={selectedDocId}
                   onOpenChatCitation={openChatCitation}
                   onUpgrade={handleUpgrade}
@@ -893,6 +901,9 @@ export default function App() {
                     {chat.error}
                   </div>
                 )}
+                {chat.fallback && (
+                  <FallbackStrip fallback={chat.fallback} onDismiss={chat.dismissFallback} />
+                )}
                 {activeConv && (
                   <div className="flex items-center border-b border-rule px-4 py-2">
                     <ConversationTitle
@@ -910,6 +921,8 @@ export default function App() {
                   messages={chat.messages}
                   prompts={chat.prompts}
                   confidences={chat.confidences}
+                  providers={chat.providers}
+                  showProvenance={!!localAi?.configured}
                   streaming={chat.streaming}
                   onOpenChatCitation={openChatCitation}
                   focusTurn={focusTurn}
@@ -918,11 +931,14 @@ export default function App() {
                   disabled={chat.sending}
                   onSend={handleSend}
                   leftTools={
-                    <ContextMeter
-                      conversationId={activeId}
-                      refreshKey={chat.messages.length}
-                      onUpgrade={handleUpgrade}
-                    />
+                    <div className="flex items-center gap-2">
+                      <ContextMeter
+                        conversationId={activeId}
+                        refreshKey={chat.messages.length}
+                        onUpgrade={handleUpgrade}
+                      />
+                      <ProviderChip status={localAi} />
+                    </div>
                   }
                   rightTools={<RetrievalExplainPanel messages={chat.messages} />}
                 />

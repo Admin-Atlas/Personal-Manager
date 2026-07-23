@@ -81,6 +81,14 @@ export function formatWhen(iso: string): string {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
+/** A model id trimmed to its bare name for compact display ("meta-llama/Llama-3-8B" → "Llama-3-8B"):
+ *  drops the provider/namespace prefix before the first slash. Shared by the sidebar model rows and
+ *  the chat provenance footer / fallback strip. */
+export function shortModel(id: string): string {
+  const slash = id.indexOf("/");
+  return slash >= 0 ? id.slice(slash + 1) : id;
+}
+
 /** A byte count as an exact human size ("1.4 GB"). (StorageSettings keeps its own `formatSize` —
  *  that one deliberately floors at MB and marks estimates with `~`.) */
 export function formatBytes(n: number): string {
