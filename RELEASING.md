@@ -142,7 +142,12 @@ which live in **two places**, both part of this PR:
 - **`.github/RELEASE_NOTES.md`** — update the version and the "What's new" digest.
   This file **is** the GitHub Release page (the publish job passes it as
   `--notes-file`), so it must carry the install and self-update instructions a
-  downloader needs, written for non-technical readers.
+  downloader needs, written for non-technical readers. **The routine rollup touches
+  only the version header and the "What's new" digest** — the `## Install` lines and
+  the bottom `## 🐧 Linux` guide (per-format table + AppImage/rpm/deb commands) are
+  durable boilerplate: leave them intact unless the install or update mechanics change.
+  Three Linux formats ship — AppImage (self-updating), rpm, deb — and a package install
+  can't self-update (it's shown a "reinstall to update" note; see `update_delivery.rs`).
 
 Open the PR. **Stop here — do not merge.**
 
