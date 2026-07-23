@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.48.0-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "Local AI is smarter about fitting bigger models on your machine. A model keeps a running memory of the conversation as it goes (its “KV cache”), and until now PM always sized that at full precision — so a model that was close to fitting had to either drop to a more compressed, lower-quality version or shrink how much text it can consider at once. PM now quietly compresses that running memory to a near-lossless half-size setting when — and only when — doing so lets the model keep its full context or a higher-quality version instead. Cards that use it show a small “q8_0 KV” note so you can see what changed, and anything that already fit is untouched. It helps most on computers with a graphics card, where it can now fit setups that used to spill over.",
+    ],
+  },
+  {
     version: "3.47.0-alpha",
     date: "2026-07-23",
     highlights: [

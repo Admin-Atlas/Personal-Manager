@@ -607,6 +607,10 @@ function NumbersGuide() {
       "How much text the model can consider at once. PM shrinks this to fit your memory when it has to, down to a floor.",
     ],
     [
+      "q8_0 KV",
+      "The running memory for the conversation is sized at f16 by default. When a card shows “q8_0 KV”, PM compressed that cache (near-lossless) so the model keeps a longer context or a higher-quality quant instead of shrinking either.",
+    ],
+    [
       "Speed",
       "A rough tokens-per-second estimate for how fast replies stream on your machine — higher is snappier.",
     ],
@@ -632,8 +636,9 @@ function NumbersGuide() {
         </div>
       ))}
       <p className="pt-1 text-faint">
-        Numbers are estimates — a conservative default that assumes an f16 KV cache. Your real speed
-        and memory depend on your runner and settings.
+        Numbers are estimates. Memory assumes an f16 KV cache by default; where a card shows “q8_0
+        KV”, PM sized it on a compressed (near-lossless) cache to keep a larger context or quant.
+        Your real speed and memory depend on your runner and settings.
       </p>
     </dl>
   );
@@ -646,16 +651,17 @@ function ConfigMetrics({ fit }: { fit: LocalFitResult }) {
     <>
       {fit.quant && <span>{fit.quant}</span>}
       {fit.context != null && <span>{(fit.context / 1024).toFixed(0)}k ctx</span>}
+      {fit.kv === "q8_0" && <span>q8_0 KV</span>}
       {fit.est_tokens_per_sec != null && <span>~{fit.est_tokens_per_sec.toFixed(0)} tok/s</span>}
       {fit.est_memory_gb != null && <span>{fmtGb(fit.est_memory_gb)}</span>}
     </>
   );
 }
 
-/** One labelled config row in a Split card. `notes[0]` is the shared f16-KV line (rendered once at the
- *  card foot); this shows the config-specific caveat (system-RAM vs GPU, halved/tight) beneath it. */
+/** One labelled config row in a Split card: the mono metrics (with a “q8_0 KV” chip when the cache was
+ *  compressed) plus this config's situational caveat (system-RAM vs GPU, halved/tight). */
 function ConfigRow({ label, fit }: { label: string; fit: LocalFitResult }) {
-  const caveat = fit.notes.slice(1).join(" ");
+  const caveat = fit.notes.join(" ");
   return (
     <div>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
@@ -734,6 +740,7 @@ function RecommendationCard({
               {isMoe && <span>{rec.active_parameters_b}B active</span>}
               {f.quant && <span>{f.quant}</span>}
               {f.context != null && <span>{(f.context / 1024).toFixed(0)}k ctx</span>}
+              {f.kv === "q8_0" && <span>q8_0 KV</span>}
               {f.est_tokens_per_sec != null && (
                 <span>~{f.est_tokens_per_sec.toFixed(0)} tok/s</span>
               )}
@@ -790,8 +797,8 @@ function RecommendationCard({
       )}
 
       {rec.gpu.kind === "split"
-        ? // Split already showed each config's caveat inline; only the shared f16 line remains.
-          f.notes[0] && <p className="mt-1.5 text-[11px] text-faint">{f.notes[0]}</p>
+        ? // Each Split row states its own caveat (and KV chip) via ConfigRow — nothing shared to add.
+          null
         : f.notes.length > 0 && (
             <p className="mt-1.5 text-[11px] text-faint">{f.notes.join(" ")}</p>
           )}
