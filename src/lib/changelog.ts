@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.44.2-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "Turning a shared vault back into a private one now locks other accounts out of the folder more reliably. When you make a vault you'd shared on this PC private again, PM decrypts your notes back to plain files in place — so any Windows account you'd linked has to lose its folder access at that moment. PM now does that by reading the permissions actually on the folder and clearing every account but you, instead of leaning on a saved list of who to remove that could be out of date or tampered with. Your notes were always safe while shared; this tightens the hand-back to private. (macOS and Linux already worked this way, and nothing changes if you've never shared a vault.)",
+    ],
+  },
+  {
     version: "3.44.1-alpha",
     date: "2026-07-23",
     highlights: [
