@@ -19,6 +19,20 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.44.1-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "PM 3.44.1 rolls up everything since the last release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
+      "One optional thing after updating: if you chatted with PM before this update, open the Documents tab and click Rebuild once. PM no longer treats its own past answers as source material when it searches your notes, and that single Rebuild clears the older answers out of search so a stale reply can't quietly shape a new one. If you're new to PM, there's nothing you need to do.",
+      "Run AI on your own machine — free, and private. A new Settings › Local AI tab scans your computer, recommends on-device models it can actually run (and roughly how fast), connects to a local model server like Ollama or LM Studio, and lets you send your chats — or just the behind-the-scenes work — to it, falling back to the cloud only when the local model isn't reachable. A model on your own machine means nothing leaves your device — and PM now shows you which model answered, and says so honestly when a reply came from the cloud instead. If you use Ollama, PM can download a recommended model straight into it.",
+      "You can now start PM without an API key. On first run, choose a cloud provider, a model on your own device, or “set up AI later” — PM works either way, and tells you plainly when a feature needs an AI provider you haven't set up yet. Already using PM? Nothing changes.",
+      "PM grounds its answers more carefully. It now measures how strong the best match to your question really is, and when nothing fits well it says so and answers from general knowledge rather than dressing up a weak guess as a fact from your notes. It also weighs the whole shortlist of passages (not just a rough top few) and reads each one's section heading, so the passage you actually meant is likelier to surface — and there's a “Save as note” under each answer to keep a good reply as a real, searchable note in your vault.",
+      "The file-reader is now sealed off on every system. The helper that opens and converts your files runs with no way to reach the internet and can only see the file it's working on — not your vault, not the rest of your computer — first on Windows, and now on Linux and macOS too. So even a booby-trapped document can't use it to phone home or snoop around. It's an extra wall, not a gate: if the sandbox can't fully start, PM keeps working and reports a short code (like SBX-3101) you can quote in a bug report.",
+      "Settings got a big tidy. Changes now save the moment you make them — the Save button is gone — the tabs are grouped and icon-labelled down the side with their sub-sections listed to jump straight to, and a small “Reset” appears next to anything you've moved off its default (with a “Reset to defaults” on each tab). Your API keys, search language and time zone are deliberately left untouched.",
+      "Steadier under the hood. A rebuild now resumes where it left off instead of starting over, and search keeps working the whole way through; your passphrase is taken exactly as you type it; photos saved into a vault survive a passphrase change and come out in a plain-files export; “Remove PM data” now clears every vault key PM had cached, not just the current one; one corrupt photo can no longer freeze the document engine; and a chat reply that fails partway through is reported as a failure instead of being saved as though it were the answer. Your calendars also keep their list in sync on every sync and decide whether something is “today” in your own timezone.",
+    ],
+  },
+  {
     version: "3.44.0-alpha",
     date: "2026-07-23",
     highlights: [
