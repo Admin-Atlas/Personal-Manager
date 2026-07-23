@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.46.0-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "Local AI now sizes each model two ways on a computer with a graphics card: the highest-quality setup that fits your memory, and a faster, lighter one that fits inside your GPU — usually a smaller, more compressed version at a shorter context, but replies stream far quicker. The Workbench shows both side by side with the speed difference spelled out, so you can choose. Before, PM only ever suggested the highest-quality setup, even when a lighter one would have run many times faster on your card. If a model already fits your graphics card, or your Mac shares one pool of memory, you'll just see the single best setup — and with no dedicated graphics card, nothing changes. PM still never switches for you.",
+    ],
+  },
+  {
     version: "3.45.1-alpha",
     date: "2026-07-23",
     highlights: [

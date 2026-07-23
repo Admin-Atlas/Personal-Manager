@@ -572,6 +572,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
     let fit_hw = fit::FitHardware {
         available_ram_gb: hardware.available_ram_gb,
         vram_gb: hardware.vram_gb,
+        unified_memory: hardware.unified_memory,
     };
 
     // Score the curated catalog.
@@ -579,26 +580,35 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
     let mut curated: Vec<Recommendation> = cat
         .entries
         .iter()
-        .map(|e| Recommendation {
-            repo: e.repo.clone(),
-            display_name: e.display_name.clone(),
-            architecture: e.architecture.clone(),
-            role_hint: e.role_hint.clone(),
-            parameters_b: e.parameters_b,
-            active_parameters_b: e.active_parameters_b,
-            context_length: e.context_length,
-            multimodal: e.multimodal,
-            reasoning: e.reasoning,
-            install: e.install.clone(),
-            // Honour the generator's judgment: an entry it marked fit-unknown is never silently scored.
-            fit: match e.fit {
-                local_catalog::FitClass::Unknown => {
-                    fit::unknown("PM can't estimate this model's fit.".to_string())
-                }
+        .map(|e| {
+            // Honour the generator's judgment: an entry it marked fit-unknown is never silently
+            // scored. When it is scored, also derive the faster GPU-resident config (if any).
+            let (fit, gpu) = match e.fit {
+                local_catalog::FitClass::Unknown => (
+                    fit::unknown("PM can't estimate this model's fit.".to_string()),
+                    fit::GpuFit::Single,
+                ),
                 local_catalog::FitClass::Computed => {
-                    fit::fit(&local_catalog::entry_to_spec(e), &fit_hw)
+                    let spec = local_catalog::entry_to_spec(e);
+                    let fit = fit::fit(&spec, &fit_hw);
+                    let gpu = fit::gpu_fit(&spec, &fit_hw, &fit);
+                    (fit, gpu)
                 }
-            },
+            };
+            Recommendation {
+                repo: e.repo.clone(),
+                display_name: e.display_name.clone(),
+                architecture: e.architecture.clone(),
+                role_hint: e.role_hint.clone(),
+                parameters_b: e.parameters_b,
+                active_parameters_b: e.active_parameters_b,
+                context_length: e.context_length,
+                multimodal: e.multimodal,
+                reasoning: e.reasoning,
+                install: e.install.clone(),
+                fit,
+                gpu,
+            }
         })
         .collect();
     curated.sort_by(|a, b| {
@@ -671,6 +681,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
     Ok(Recommendations {
         hardware,
         reserve_gb: fit::reserve_gb(),
+        gpu_reserve_gb: fit::gpu_reserve_gb(),
         catalog_version: cat.catalog_version,
         catalog_generated_at: cat.generated_at.clone(),
         endpoint_configured,
@@ -715,7 +726,11 @@ pub struct Recommendation {
     pub multimodal: bool,
     pub reasoning: Option<bool>,
     pub install: local_catalog::InstallHints,
+    /// The highest-quality config that fits system RAM (unchanged from before the two-budget split).
     pub fit: fit::FitResult,
+    /// Whether a faster GPU-resident config is worth showing beside `fit` (#457). `Single` when there
+    /// is nothing distinct to add (no discrete GPU, unified memory, unscoreable, or already on GPU).
+    pub gpu: fit::GpuFit,
 }
 
 /// A model the configured endpoint already serves, matched to the catalog when possible.
@@ -732,6 +747,8 @@ pub struct Recommendations {
     pub hardware: hardware::Hardware,
     /// System RAM kept free when scoring (surfaced so the UI can state it).
     pub reserve_gb: f64,
+    /// VRAM kept free when sizing the GPU-resident config (surfaced beside `reserve_gb`).
+    pub gpu_reserve_gb: f64,
     pub catalog_version: u32,
     /// The UTC date the catalog content last changed — for a "catalog from <date>" line.
     pub catalog_generated_at: String,

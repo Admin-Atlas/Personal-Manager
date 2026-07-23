@@ -28,6 +28,12 @@ use serde::Serialize;
 /// from `available_ram` to get the usable budget. CALIBRATE: 2 GB is a guess for a low-RAM box.
 const PM_RESERVE_GB: f64 = 2.0;
 
+/// VRAM PM keeps free when sizing the *GPU-resident* config, for the display framebuffer plus the
+/// runtime's compute/context buffers that live outside the flat `OVERHEAD_GB`. Smaller than
+/// `PM_RESERVE_GB` because VRAM holds only those, not the whole OS + PM. Subtracted from VRAM to get
+/// the GPU budget; never added to the footprint. CALIBRATE: 1 GB is a first-pass guess.
+const GPU_RESERVE_GB: f64 = 1.0;
+
 /// Flat runtime overhead beyond weights + KV (compute buffers, allocator slack, the graph itself).
 /// CALIBRATE.
 const OVERHEAD_GB: f64 = 0.5;
@@ -140,9 +146,13 @@ pub struct FitHardware {
     /// Free system RAM in GB. On Apple Silicon this is unified memory; on a discrete-GPU box it is
     /// system RAM (the always-available pool a model can run from, even if slowly).
     pub available_ram_gb: f64,
-    /// Dedicated GPU VRAM in GB, if a reliable figure was read. Only refines the speed estimate —
-    /// the fit verdict is scored against RAM, so we never over-promise a fit we can't run.
+    /// Dedicated GPU VRAM in GB, if a reliable figure was read. The *quality* verdict is scored
+    /// against RAM (so we never over-promise a fit we can't run); VRAM refines the speed estimate and
+    /// drives the separate GPU-resident config (`gpu_fit`).
     pub vram_gb: Option<f64>,
+    /// Apple-Silicon-style shared memory: VRAM is a slice of system RAM at the same bandwidth, so
+    /// there is no distinct faster "GPU" config to offer (`gpu_fit` returns `Single`).
+    pub unified_memory: bool,
 }
 
 /// A model to score. `candidates` are best-quant-first; `active_params_b` drives the KV + throughput
@@ -177,7 +187,7 @@ pub enum Verdict {
 }
 
 /// The full result of scoring one model against one machine.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FitResult {
     pub verdict: Verdict,
     /// The chosen quant (the best that fits), if any.
@@ -190,6 +200,23 @@ pub struct FitResult {
     pub notes: Vec<String>,
 }
 
+/// The relationship between a model's highest-quality (system-RAM) config and a faster GPU-resident
+/// config, decided in Rust so the UI never has to infer the trade-off. The highest-quality config is
+/// always the top-level `FitResult`; this only ever *adds* a faster alternative.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GpuFit {
+    /// One config is the whole story: no discrete GPU, unified memory, a model we won't score, or the
+    /// highest-quality config already fits VRAM (so it already runs at GPU speed).
+    Single,
+    /// A genuinely faster GPU-resident config exists beside the highest-quality one. Invariant: `fit`
+    /// fits VRAM and its throughput beats the RAM config's.
+    Split { fit: FitResult },
+    /// A discrete GPU exists but nothing fits its VRAM even at the floor context (e.g. an MoE whose
+    /// full weights exceed VRAM — still usable in system RAM at its active-parameter speed).
+    NoGpuResident,
+}
+
 const F16_KV_NOTE: &str = "Estimate assumes an f16 KV cache (the conservative default).";
 
 // --- the pure functions ------------------------------------------------------------------------
@@ -198,6 +225,11 @@ const F16_KV_NOTE: &str = "Estimate assumes an f16 KV cache (the conservative de
 /// Surfaced so the UI can state the reserve honestly rather than hide it in a pessimistic number.
 pub fn reserve_gb() -> f64 {
     PM_RESERVE_GB
+}
+
+/// The VRAM PM keeps free when sizing the GPU-resident config. Surfaced so the UI can state it.
+pub fn gpu_reserve_gb() -> f64 {
+    GPU_RESERVE_GB
 }
 
 /// f16 KV-cache footprint for `ctx` tokens at `active_params_b` billion active params.
@@ -252,12 +284,23 @@ fn context_ladder(target: u32) -> Vec<u32> {
     out
 }
 
-/// Score one model against one machine. Pure.
+/// Score one model against one machine's *system RAM* — the highest-quality config that fits. Pure.
+/// A thin wrapper over [`fit_within`] with the RAM budget; behaviour is unchanged from before the
+/// two-budget split (pinned by `fit_within_reproduces_fit_for_the_ram_budget`).
+pub fn fit(spec: &ModelSpec, hw: &FitHardware) -> FitResult {
+    let budget = (hw.available_ram_gb - PM_RESERVE_GB).max(0.0);
+    fit_within(spec, budget, hw)
+}
+
+/// Score one model against an explicit memory `budget_gb`, reusing one degradation ladder. `fit()`
+/// passes the system-RAM budget; [`gpu_fit`] passes the VRAM budget for the GPU-resident config.
 ///
 /// Order of degradation (locked decision): keep the full context and step the quant down the ladder
 /// first; only halve the context — the more alarming, visible compromise — when no quant fits at
-/// full context.
-pub fn fit(spec: &ModelSpec, hw: &FitHardware) -> FitResult {
+/// full context. The refuse-to-guess guards live here so every budget refuses identically. `hw` is
+/// used only to word the GPU/system-RAM note and pick the throughput bandwidth (both compare the
+/// chosen footprint against raw `vram_gb`); the *budget* is the sole fit gate.
+fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
     // Refuse-to-guess guards run first, before any arithmetic.
     if matches!(spec.arch, Architecture::Ssm) {
         return unknown(format!(
@@ -276,8 +319,6 @@ pub fn fit(spec: &ModelSpec, hw: &FitHardware) -> FitResult {
         );
     }
 
-    let budget = (hw.available_ram_gb - PM_RESERVE_GB).max(0.0);
-
     // Best quant first (highest bytes-per-param = highest quality that we might afford).
     let mut candidates = spec.candidates.clone();
     candidates.sort_by(|a, b| {
@@ -290,9 +331,9 @@ pub fn fit(spec: &ModelSpec, hw: &FitHardware) -> FitResult {
     for (rung, &ctx) in context_ladder(spec.target_context).iter().enumerate() {
         for cand in &candidates {
             let mem = footprint_gb(spec, cand, ctx);
-            if mem <= budget {
+            if mem <= budget_gb {
                 let halved = rung > 0;
-                let headroom = budget - mem;
+                let headroom = budget_gb - mem;
                 let verdict = if halved {
                     Verdict::HalvedContext
                 } else if headroom >= COMFORT_MARGIN_GB {
@@ -345,6 +386,49 @@ pub fn fit(spec: &ModelSpec, hw: &FitHardware) -> FitResult {
             "Too large for this machine's memory — better run in the cloud.".to_string(),
         ],
     }
+}
+
+/// Decide whether a faster GPU-resident config is worth showing beside the highest-quality
+/// (`ram_fit`) one. Pure; reuses [`fit_within`] against the VRAM budget (`vram − GPU_RESERVE_GB`).
+///
+/// The "already fits the GPU" gate uses *raw* VRAM (not `vram − reserve`) on purpose: it must match
+/// the note/speed predicate inside `fit_within` (`vram >= footprint`). If the quality config already
+/// clears that bar it already reports GPU-class speed, so there is nothing faster to offer — and
+/// gating on the reserve-shrunk budget here would let a config the same code labels "runs in system
+/// RAM" sit beside a "fastest on GPU" row in the reserve band, contradicting itself.
+pub fn gpu_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> GpuFit {
+    // VRAM is a slice of the same RAM pool → no distinct faster config. NOTE: today only the
+    // Apple-Silicon probe sets `unified_memory`; a non-Apple integrated GPU (AMD APU / Intel iGPU)
+    // with a large shared carve-out isn't flagged, so it could surface a Split whose "GPU speed" is
+    // really shared-RAM speed. Narrow (needs a big UMA carve-out AND a spilling model) and the speed
+    // mislabel predates this; a proper fix needs integrated-GPU detection — tracked as a #457 follow-up.
+    if hw.unified_memory {
+        return GpuFit::Single;
+    }
+    let Some(vram) = hw.vram_gb else {
+        return GpuFit::Single; // No discrete-GPU figure to size against.
+    };
+    // Never guess past the RAM verdict: an unscoreable model, or one already bound for the cloud.
+    if matches!(ram_fit.verdict, Verdict::Unknown | Verdict::StayOnCloud) {
+        return GpuFit::Single;
+    }
+    // The quality config already runs on the GPU, so it already reports GPU speed — nothing faster to
+    // offer. Uses raw VRAM (not the reserve budget) to stay coherent with fit_within's own on-GPU
+    // predicate; compared against the rounded `est_memory_gb`, so a sub-0.01 GB sliver at the exact
+    // boundary can defer a Split (conservative — it only ever hides one, never fabricates a bad one).
+    if ram_fit.est_memory_gb.is_some_and(|m| m <= vram) {
+        return GpuFit::Single;
+    }
+
+    let gpu = fit_within(spec, (vram - GPU_RESERVE_GB).max(0.0), hw);
+    // A GPU config only counts if it actually fits VRAM and differs from the RAM pick.
+    if matches!(gpu.verdict, Verdict::Unknown | Verdict::StayOnCloud) {
+        return GpuFit::NoGpuResident;
+    }
+    if gpu.quant == ram_fit.quant && gpu.context == ram_fit.context {
+        return GpuFit::Single; // Defensive: identical pick — nothing distinct to show.
+    }
+    GpuFit::Split { fit: gpu }
 }
 
 /// A fit result for a model we deliberately won't score — an unmodelled architecture, a multimodal
@@ -402,6 +486,16 @@ mod tests {
         FitHardware {
             available_ram_gb: gb,
             vram_gb: None,
+            unified_memory: false,
+        }
+    }
+
+    /// A discrete-GPU machine: `ram` GB free system RAM, `vram` GB dedicated VRAM.
+    fn gpu(ram: f64, vram: f64) -> FitHardware {
+        FitHardware {
+            available_ram_gb: ram,
+            vram_gb: Some(vram),
+            unified_memory: false,
         }
     }
 
@@ -599,16 +693,156 @@ mod tests {
             &FitHardware {
                 available_ram_gb: 32.0,
                 vram_gb: None,
+                unified_memory: false,
             },
         );
-        let gpu = fit(
+        let on_gpu = fit(
             &spec,
             &FitHardware {
                 available_ram_gb: 32.0,
                 vram_gb: Some(24.0),
+                unified_memory: false,
             },
         );
-        assert!(gpu.est_tokens_per_sec.unwrap() > cpu.est_tokens_per_sec.unwrap());
-        assert!(gpu.notes.iter().any(|n| n.contains("GPU-class speed")));
+        assert!(on_gpu.est_tokens_per_sec.unwrap() > cpu.est_tokens_per_sec.unwrap());
+        assert!(on_gpu.notes.iter().any(|n| n.contains("GPU-class speed")));
+    }
+
+    // --- two-budget GPU-resident scoring (#457) ------------------------------------------------
+
+    #[test]
+    fn fit_within_reproduces_fit_for_the_ram_budget() {
+        // The extraction is behaviour-preserving: fit() is exactly fit_within() at the RAM budget.
+        let spec = dense(7.0, 8192, vec![q(Quant::Q4_K_M, 4.3), q(Quant::Q8_0, 8.0)]);
+        for hw in [ram(32.0), ram(8.0), gpu(22.0, 8.0), ram(3.0)] {
+            let budget = (hw.available_ram_gb - PM_RESERVE_GB).max(0.0);
+            assert_eq!(fit(&spec, &hw), fit_within(&spec, budget, &hw));
+        }
+    }
+
+    #[test]
+    fn gpu_fit_single_without_a_discrete_gpu() {
+        let spec = dense(7.0, 8192, vec![q(Quant::Q8_0, 8.0)]);
+        let hw = ram(32.0); // vram_gb == None
+        let rf = fit(&spec, &hw);
+        assert_eq!(gpu_fit(&spec, &hw, &rf), GpuFit::Single);
+    }
+
+    #[test]
+    fn gpu_fit_single_on_unified_memory() {
+        // A shared pool (Apple Silicon): VRAM is that same RAM, so there's no distinct faster config.
+        let spec = dense(7.0, 8192, vec![q(Quant::Q8_0, 8.0)]);
+        let hw = FitHardware {
+            available_ram_gb: 24.0,
+            vram_gb: Some(18.0),
+            unified_memory: true,
+        };
+        let rf = fit(&spec, &hw);
+        assert_eq!(gpu_fit(&spec, &hw, &rf), GpuFit::Single);
+    }
+
+    #[test]
+    fn gpu_fit_splits_when_quality_spills_to_system_ram() {
+        // The motivating case: big free RAM + small VRAM. fit() maxes fidelity (Q8_0, spills to RAM);
+        // gpu_fit finds a smaller quant that fits VRAM and runs much faster.
+        let spec = dense(7.0, 32768, vec![q(Quant::Q8_0, 7.5), q(Quant::Q4_K_M, 4.4)]);
+        let hw = gpu(22.0, 8.0);
+        let rf = fit(&spec, &hw);
+        assert_eq!(rf.quant, Some(Quant::Q8_0));
+        assert!(rf.est_memory_gb.unwrap() > 8.0); // the quality pick spilled past VRAM
+        match gpu_fit(&spec, &hw, &rf) {
+            GpuFit::Split { fit } => {
+                assert_eq!(fit.quant, Some(Quant::Q4_K_M));
+                // honours the GPU reserve (fits vram − GPU_RESERVE_GB, not just raw vram)
+                assert!(fit.est_memory_gb.unwrap() <= 8.0 - gpu_reserve_gb() + 1e-6);
+                assert!(fit.est_tokens_per_sec.unwrap() > rf.est_tokens_per_sec.unwrap());
+                assert!(fit.notes.iter().any(|n| n.contains("GPU-class speed")));
+            }
+            other => panic!("expected Split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_fit_single_when_quality_already_fits_the_gpu() {
+        // A small model whose highest-quality config already fits VRAM → one config, no lossier split.
+        let spec = dense(3.0, 8192, vec![q(Quant::Q8_0, 3.0)]);
+        let hw = gpu(22.0, 8.0);
+        let rf = fit(&spec, &hw);
+        assert!(rf.est_memory_gb.unwrap() <= 8.0);
+        assert_eq!(gpu_fit(&spec, &hw, &rf), GpuFit::Single);
+    }
+
+    #[test]
+    fn gpu_fit_no_gpu_resident_when_nothing_fits_vram() {
+        // Weights alone exceed VRAM (an MoE-shaped case): usable in RAM, but no GPU-resident config.
+        let spec = dense(30.0, 8192, vec![q(Quant::Q4_K_M, 18.0)]);
+        let hw = gpu(40.0, 8.0);
+        let rf = fit(&spec, &hw);
+        assert!(matches!(rf.verdict, Verdict::Comfortable | Verdict::Tight));
+        assert_eq!(gpu_fit(&spec, &hw, &rf), GpuFit::NoGpuResident);
+    }
+
+    #[test]
+    fn gpu_fit_reserve_excludes_a_config_that_only_fits_raw_vram() {
+        // Q6_K's footprint (~8.0 GB) fits raw 8 GB VRAM but not the reserve-shrunk 7 GB budget, so no
+        // GPU-resident config is offered — the reserve is honoured, not raw VRAM.
+        let spec = dense(3.0, 4096, vec![q(Quant::Q8_0, 9.0), q(Quant::Q6_K, 7.4)]);
+        let hw = gpu(22.0, 8.0);
+        let rf = fit(&spec, &hw);
+        assert!(rf.est_memory_gb.unwrap() > 8.0); // the quality pick (Q8_0) spilled past VRAM
+        assert_eq!(gpu_fit(&spec, &hw, &rf), GpuFit::NoGpuResident);
+    }
+
+    #[test]
+    fn gpu_fit_single_for_unknown_or_cloud_ram_fit() {
+        let hw = gpu(22.0, 8.0);
+        // Unscoreable architecture → RAM verdict Unknown → never invent a GPU config.
+        let ssm = ModelSpec {
+            arch: Architecture::Ssm,
+            ..dense(7.0, 4096, vec![q(Quant::Q4_K_M, 4.0)])
+        };
+        let rf = fit(&ssm, &hw);
+        assert_eq!(rf.verdict, Verdict::Unknown);
+        assert_eq!(gpu_fit(&ssm, &hw, &rf), GpuFit::Single);
+
+        // Too big even for RAM → StayOnCloud stands; a GPU sub-story would be noise.
+        let huge = dense(405.0, 8192, vec![q(Quant::IQ2_XS, 146.0)]);
+        let small = gpu(16.0, 8.0);
+        let rf2 = fit(&huge, &small);
+        assert_eq!(rf2.verdict, Verdict::StayOnCloud);
+        assert_eq!(gpu_fit(&huge, &small, &rf2), GpuFit::Single);
+    }
+
+    #[test]
+    fn gpu_fit_multimodal_projector_counts_against_vram() {
+        let base = ModelSpec {
+            multimodal: true,
+            projector_gb: Some(1.0),
+            ..dense(7.0, 32768, vec![q(Quant::Q8_0, 7.5), q(Quant::Q4_K_M, 4.4)])
+        };
+        let hw = gpu(22.0, 8.0);
+        let rf = fit(&base, &hw);
+        match gpu_fit(&base, &hw, &rf) {
+            GpuFit::Split { fit } => {
+                assert_eq!(fit.quant, Some(Quant::Q4_K_M));
+                // the projector's 1 GB is inside the VRAM budget too
+                assert!(fit.est_memory_gb.unwrap() <= 8.0 - gpu_reserve_gb() + 1e-6);
+            }
+            other => panic!("expected Split, got {other:?}"),
+        }
+        // No projector size for a multimodal model → unscoreable → no invented GPU config.
+        let missing = ModelSpec {
+            projector_gb: None,
+            ..base
+        };
+        let rfm = fit(&missing, &hw);
+        assert_eq!(rfm.verdict, Verdict::Unknown);
+        assert_eq!(gpu_fit(&missing, &hw, &rfm), GpuFit::Single);
+    }
+
+    #[test]
+    fn gpu_reserve_is_smaller_than_the_system_reserve() {
+        // VRAM holds only the display + compute buffers, not the whole OS + PM.
+        assert!(gpu_reserve_gb() < reserve_gb());
     }
 }

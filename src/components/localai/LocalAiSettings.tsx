@@ -21,6 +21,7 @@ import {
 import type {
   DetectedEndpoint,
   EndpointCheck,
+  LocalFitResult,
   LocalFitVerdict,
   LocalLlmConfig,
   LocalLlmStatus,
@@ -581,6 +582,12 @@ function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
         </p>
       )}
       {h.notes.length > 0 && <p className="mt-1.5 text-xs text-faint">{h.notes.join(" ")}</p>}
+      {h.vram_gb != null && !h.unified_memory && (
+        <p className="mt-1.5 text-xs text-faint">
+          Sized with ~{recs.reserve_gb.toFixed(0)} GB of RAM and ~{recs.gpu_reserve_gb.toFixed(0)}{" "}
+          GB of GPU memory kept free.
+        </p>
+      )}
     </div>
   );
 }
@@ -611,6 +618,10 @@ function NumbersGuide() {
       "MoE (mixture of experts)",
       "A large model where only a few billion parameters fire per word. It runs at the speed of that small active part, but its whole weight still has to fit in memory — so a MoE is fast for its size, not lighter to load. Cards show both the total and the active size.",
     ],
+    [
+      "Two ways to run (with a graphics card)",
+      "When your best-quality fit is larger than your graphics memory, PM also shows a faster config that fits inside your GPU — usually a smaller quant and a shorter context, but replies stream much quicker. Both are yours to choose; PM never switches for you.",
+    ],
   ];
   return (
     <dl className="mt-1 space-y-1.5 text-xs">
@@ -625,6 +636,36 @@ function NumbersGuide() {
         and memory depend on your runner and settings.
       </p>
     </dl>
+  );
+}
+
+/** The per-config mono metric spans (quant · context · speed · memory), shared by the single- and
+ *  two-config (Split) card layouts. */
+function ConfigMetrics({ fit }: { fit: LocalFitResult }) {
+  return (
+    <>
+      {fit.quant && <span>{fit.quant}</span>}
+      {fit.context != null && <span>{(fit.context / 1024).toFixed(0)}k ctx</span>}
+      {fit.est_tokens_per_sec != null && <span>~{fit.est_tokens_per_sec.toFixed(0)} tok/s</span>}
+      {fit.est_memory_gb != null && <span>{fmtGb(fit.est_memory_gb)}</span>}
+    </>
+  );
+}
+
+/** One labelled config row in a Split card. `notes[0]` is the shared f16-KV line (rendered once at the
+ *  card foot); this shows the config-specific caveat (system-RAM vs GPU, halved/tight) beneath it. */
+function ConfigRow({ label, fit }: { label: string; fit: LocalFitResult }) {
+  const caveat = fit.notes.slice(1).join(" ");
+  return (
+    <div>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="shrink-0 text-[10px] font-medium text-ink3">{label}</span>
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
+          <ConfigMetrics fit={fit} />
+        </div>
+      </div>
+      {caveat && <p className="mt-0.5 text-[10px] text-faint">{caveat}</p>}
+    </div>
   );
 }
 
@@ -665,16 +706,40 @@ function RecommendationCard({
             {rec.reasoning && <span className="text-[10px] text-ink4">reasoning</span>}
             {rec.role_hint && <span className="text-[10px] text-ink4">suits {rec.role_hint}</span>}
           </div>
-          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
-            <span>
-              {rec.parameters_b}B{isMoe ? " total" : ""}
-            </span>
-            {isMoe && <span>{rec.active_parameters_b}B active</span>}
-            {f.quant && <span>{f.quant}</span>}
-            {f.context != null && <span>{(f.context / 1024).toFixed(0)}k ctx</span>}
-            {f.est_tokens_per_sec != null && <span>~{f.est_tokens_per_sec.toFixed(0)} tok/s</span>}
-            {f.est_memory_gb != null && <span>{fmtGb(f.est_memory_gb)}</span>}
-          </div>
+          {rec.gpu.kind === "split" ? (
+            <div className="mt-1 space-y-1">
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
+                <span>
+                  {rec.parameters_b}B{isMoe ? " total" : ""}
+                </span>
+                {isMoe && <span>{rec.active_parameters_b}B active</span>}
+              </div>
+              <p className="text-[10px] text-ink4">
+                Two ways to run it here — same model, lighter settings for speed:
+              </p>
+              <ConfigRow label="Highest quality" fit={f} />
+              <ConfigRow label="Fastest on GPU" fit={rec.gpu.fit} />
+              {canPull && (
+                <p className="text-[10px] text-faint">
+                  Download fetches the runner's default quant — set the quant &amp; context to
+                  match.
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
+              <span>
+                {rec.parameters_b}B{isMoe ? " total" : ""}
+              </span>
+              {isMoe && <span>{rec.active_parameters_b}B active</span>}
+              {f.quant && <span>{f.quant}</span>}
+              {f.context != null && <span>{(f.context / 1024).toFixed(0)}k ctx</span>}
+              {f.est_tokens_per_sec != null && (
+                <span>~{f.est_tokens_per_sec.toFixed(0)} tok/s</span>
+              )}
+              {f.est_memory_gb != null && <span>{fmtGb(f.est_memory_gb)}</span>}
+            </div>
+          )}
         </div>
         <div className="shrink-0">
           {installed ? (
@@ -724,7 +789,12 @@ function RecommendationCard({
         </div>
       )}
 
-      {f.notes.length > 0 && <p className="mt-1.5 text-[11px] text-faint">{f.notes.join(" ")}</p>}
+      {rec.gpu.kind === "split"
+        ? // Split already showed each config's caveat inline; only the shared f16 line remains.
+          f.notes[0] && <p className="mt-1.5 text-[11px] text-faint">{f.notes[0]}</p>
+        : f.notes.length > 0 && (
+            <p className="mt-1.5 text-[11px] text-faint">{f.notes.join(" ")}</p>
+          )}
     </div>
   );
 }
