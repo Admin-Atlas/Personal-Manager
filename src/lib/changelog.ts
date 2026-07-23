@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.47.0-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "Local AI now reads the real graphics memory on more computers. On Windows, PM couldn't tell how much memory was on a dedicated AMD or Intel graphics card bigger than 4 GB — Windows reports that figure in a field that maxes out at 4 GB — so those cards quietly fell back to sizing models on your system memory and never got the faster “on your GPU” setup. PM now reads the true amount straight from the graphics system, so an Intel Arc or a larger Radeon card gets the same two-way sizing an NVIDIA card already did. NVIDIA cards, smaller cards, integrated graphics and Macs are unaffected. (Reading a dedicated Intel card's memory on Linux is still to come — it needs a different route there.)",
+    ],
+  },
+  {
     version: "3.46.1-alpha",
     date: "2026-07-23",
     highlights: [
