@@ -1307,6 +1307,15 @@ pub fn smart_app_control_state() -> crate::smart_app_control::SmartAppControlSta
     crate::smart_app_control::state()
 }
 
+/// Whether the running app is a Linux **package** install (rpm/deb) rather than an AppImage.
+/// Tauri's in-app updater can only replace an AppImage in place, so on a package install the
+/// updater UI skips the (doomed) background auto-download and points the user at reinstalling
+/// the new package instead. False on Windows, macOS, and the Linux AppImage.
+#[tauri::command]
+pub fn package_managed_linux() -> bool {
+    crate::update_delivery::package_managed_linux()
+}
+
 /// The enabled local Windows accounts, for the share wizard's "who can open it" picker
 /// (so nobody has to hand-copy a SID). Best-effort: on failure or off-Windows the UI
 /// falls back to the manual name/SID field.

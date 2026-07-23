@@ -163,6 +163,12 @@ export const settingsDefaults = () => invoke<Settings>("settings_defaults");
  *  would silently block. Off-Windows / when SAC is absent this resolves to "unknown". */
 export const smartAppControlState = () => invoke<SmartAppControlState>("smart_app_control_state");
 
+/** Whether this is a Linux package install (rpm/deb) the in-app updater can't apply to — Tauri's
+ *  updater only replaces an AppImage in place, so on a package install the updater UI points the
+ *  user at reinstalling instead of a self-update that can't work. False on Windows, macOS, and the
+ *  Linux AppImage. */
+export const packageManagedLinux = () => invoke<boolean>("package_managed_linux");
+
 /** Turn query-time reranking on/off (a cross-encoder re-scores search hits). Stateless — never
  *  triggers a Rebuild; the effect lands on the next query. */
 export const setReranking = (enabled: boolean) => invoke<void>("set_reranking", { enabled });

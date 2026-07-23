@@ -1,7 +1,7 @@
 name: Linux bundle dry-run
 
 # Proves the Linux packaging lane WITHOUT cutting a release and WITHOUT any
-# secret: builds the real AppImage + rpm bundles (including the fetched,
+# secret: builds the real AppImage + rpm + deb bundles (including the fetched,
 # SHA-pinned interpreter) and runs the same bundled-interpreter smoke the
 # release job runs. Signing uses a THROWAWAY key generated in-run — the
 # bundler requires one because createUpdaterArtifacts is on — so this proves
@@ -74,7 +74,7 @@ jobs:
             echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
           } >> "$GITHUB_ENV"
 
-      - name: Build AppImage + rpm
+      - name: Build AppImage + rpm + deb
         env:
           # Belt-and-braces with libfuse2 above: run the AppImage tooling
           # (linuxdeploy + plugins) by self-extraction, never FUSE-mounting.
@@ -86,20 +86,21 @@ jobs:
           NO_STRIP: "true"
         # --verbose so a bundler failure prints linuxdeploy's own output instead
         # of the bare one-liner.
-        run: npm run tauri build -- --verbose --bundles appimage,rpm
+        run: npm run tauri build -- --verbose --bundles appimage,rpm,deb
 
       # The same script release.yml runs (single source — the two can't drift).
       - name: Smoke-test the bundled interpreter
         shell: bash
         run: bash scripts/smoke-bundled-python.sh src-tauri/target/release/bundle
 
-      - name: Assert both artifacts exist (with the AppImage's updater .sig)
+      - name: Assert all artifacts exist (with the AppImage's updater .sig)
         shell: bash
         run: |
           set -euo pipefail
           base=src-tauri/target/release/bundle
-          ls -l "$base"/appimage/ "$base"/rpm/
+          ls -l "$base"/appimage/ "$base"/rpm/ "$base"/deb/
           test -n "$(find "$base"/appimage -name '*.AppImage' -print -quit)"
           test -n "$(find "$base"/appimage -name '*.AppImage.sig' -print -quit)"
           test -n "$(find "$base"/rpm -name '*.rpm' -print -quit)"
+          test -n "$(find "$base"/deb -name '*.deb' -print -quit)"
           echo "Linux bundle dry-run passed."

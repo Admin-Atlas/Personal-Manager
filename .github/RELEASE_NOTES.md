@@ -6,9 +6,9 @@ PM desktop release — **v3.44.1-alpha**.
 
 🪟 **Windows** — download the file ending in **`-setup.exe`** and run it.
 🍎 **macOS** — download the **`.dmg`** file, then drag **PM** to **Applications**.
-🐧 **Linux (x86_64)** — download the **`.AppImage`**, make it executable (`chmod +x`) and
-run it; it auto-updates like the others. On Fedora-family systems you can instead install
-the **`.rpm`** with `dnf` and update it later with `dnf upgrade`.
+🐧 **Linux (x86_64)** — the **`.AppImage`** runs on any distro and auto-updates like the
+others; or install the native **`.rpm`** (Fedora/RHEL) or **`.deb`** (Debian/Ubuntu). One-line
+commands and how to pick are in the **Linux guide** near the bottom of this page.
 
 That's it. PM is **self-contained** — everything it needs (including a private Python
 runtime for the document features) is inside that one file. Nothing else to install.
@@ -40,9 +40,10 @@ unsigned): download the `.dmg` above and drag **PM** to **Applications** again, 
 **Replace** when asked. Everything you have is kept — just replace the old copy rather
 than keeping two around.
 
-**🐧 Linux.** The **AppImage** updates itself exactly like the Windows app. If you
-installed the **`.rpm`**, update it with your package manager (`dnf upgrade`) when a new
-release lands.
+**🐧 Linux.** The **AppImage** updates itself exactly like the Windows app. A **package**
+install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "reinstall to
+update" note when a new version lands; download the new package (see the Linux guide below) and
+run the same install command. Your notes, projects and settings are kept.
 
 ## What's new in 3.44.1-alpha
 
@@ -94,6 +95,45 @@ Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
 
 > This is an **alpha**: expect rough edges, and please report anything that bites.
+
+## 🐧 Linux — the detailed install & update guide
+
+**Download ONE file that matches your system**, then follow its row. Not sure which? Pick the
+**AppImage** if you want automatic updates; pick the native **rpm/deb** if you'd rather PM just
+land in your app menu with no fuss.
+
+| Your distro | Download | Install & run | Updates | App-menu icon |
+| --- | --- | --- | --- | --- |
+| **Any distro** | `PM_*.AppImage` | `chmod +x PM_*.AppImage`, then `./PM_*.AppImage` | **Automatic**, in-app (like Windows/macOS) | Add it yourself |
+| Fedora · RHEL · openSUSE | `PM-*.rpm` | `sudo dnf install ./PM-*.rpm` | Manual — reinstall the newer `.rpm` | Added for you |
+| Debian · Ubuntu · Mint · Pop!_OS | `pm_*.deb` | `sudo apt install ./pm_*.deb` | Manual — reinstall the newer `.deb` | Added for you |
+
+Every file is **self-contained** — the private Python runtime for the document features is inside,
+so there's nothing else to install. (Tip: to type a filename, press **Tab** to auto-complete it.)
+
+**AppImage — the self-updating one.** The AppImage *is* the whole app in a single file; there's no
+installer step. Keep it somewhere you own, e.g. `~/Applications/`, so it can replace itself in place
+when it updates — **don't delete it.** It won't add its own menu entry: run it from the file, or use
+a helper like [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever) to give it an icon. If it
+won't start and mentions **FUSE**, install the FUSE 2 runtime (`sudo dnf install fuse` on Fedora,
+`sudo apt install libfuse2` on Debian/Ubuntu) or run it with `./PM_*.AppImage --appimage-extract-and-run`.
+
+**rpm / deb — the native packages.** These are real installers: your package manager copies PM into
+place, adds the menu entry and icon, and records it — so you can **delete the downloaded package
+afterwards** (unlike the AppImage). The leading `./` matters — it tells the package manager the file
+is local, and dependencies are pulled in for you. If the package is refused for being unsigned, allow
+it once: `sudo dnf install --nogpgcheck ./PM-*.rpm`, or confirm the prompt on Debian/Ubuntu. To
+update later, download the new release's package and run the same install command; your data is kept.
+
+**Your data outlives any uninstall.** Removing PM (either format, or deleting the AppImage) leaves
+your vault and the regenerable `runtime/` (Python venv + models) under
+`~/.local/share/Personal Manager`. Clear it from **Settings → Storage** or **Settings → Remove PM
+data** before uninstalling, or delete that folder by hand.
+
+**Secrets need a running keychain.** PM stores its encryption keys in the freedesktop Secret Service
+— KWallet (KDE) or GNOME Keyring — over D-Bus. Every mainstream desktop provides one, so expect a
+one-time wallet/keyring prompt on first launch. On a minimal window-manager setup you must run one
+yourself, or PM can't store the key that protects its database.
 
 ## Third-party
 

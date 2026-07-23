@@ -262,7 +262,8 @@ jobs:
           cp "$base"/dmg/*.dmg staged/ || true
 
       # AppImage (+ its updater .sig — the only Linux format Tauri's updater
-      # handles) and the rpm as a plain dnf-installable asset.
+      # handles) plus the rpm (Fedora/RHEL) and deb (Debian/Ubuntu) as plain
+      # package-manager-installable assets.
       - name: Stage Linux artifacts
         if: startsWith(matrix.os, 'ubuntu-')
         shell: bash
@@ -272,6 +273,7 @@ jobs:
           cp "$base"/appimage/*.AppImage staged/
           cp "$base"/appimage/*.AppImage.sig staged/
           cp "$base"/rpm/*.rpm staged/
+          cp "$base"/deb/*.deb staged/
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

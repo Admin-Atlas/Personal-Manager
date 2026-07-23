@@ -142,7 +142,12 @@ which live in **two places**, both part of this PR:
 - **`.github/RELEASE_NOTES.md`** — update the version and the "What's new" digest.
   This file **is** the GitHub Release page (the publish job passes it as
   `--notes-file`), so it must carry the install and self-update instructions a
-  downloader needs, written for non-technical readers.
+  downloader needs, written for non-technical readers. **The routine rollup touches
+  only the version header and the "What's new" digest** — the `## Install` lines and
+  the bottom `## 🐧 Linux` guide (per-format table + AppImage/rpm/deb commands) are
+  durable boilerplate: leave them intact unless the install or update mechanics change.
+  Three Linux formats ship — AppImage (self-updating), rpm, deb — and a package install
+  can't self-update (it's shown a "reinstall to update" note; see `update_delivery.rs`).
 
 Open the PR. **Stop here — do not merge.**
 
@@ -202,13 +207,13 @@ Two checks:
    **sees the update and applies it**.
 
 Per-platform artifact set to expect on the release page: Windows `-setup.exe`,
-macOS `.app.tar.gz` + `.dmg`, Linux `.AppImage` + `.rpm`, plus `latest.json`
+macOS `.app.tar.gz` + `.dmg`, Linux `.AppImage` + `.rpm` + `.deb`, plus `latest.json`
 (updater feed: `windows-x86_64`, `darwin-x86_64`/`aarch64`, `linux-x86_64` — the
-AppImage is the only Linux format the updater handles; rpm users update via dnf),
-`SHA256SUMS`, and `THIRD-PARTY-NOTICES.txt`.
+AppImage is the only Linux format the updater handles; rpm/deb users update by
+reinstalling the next release's package), `SHA256SUMS`, and `THIRD-PARTY-NOTICES.txt`.
 
 > **Linux lane dry-run:** `.github/workflows/linux-bundle-dryrun.yml` builds the real
-> AppImage + rpm and smoke-tests the bundled interpreter **without a tag and without
+> AppImage + rpm + deb and smoke-tests the bundled interpreter **without a tag and without
 > secrets** (it signs with a throwaway key). It runs automatically on PRs touching the
 > Linux packaging surface and via manual dispatch — use it before a release whenever
 > the Linux lane changed, and to answer version-format questions (rpm rejects a raw

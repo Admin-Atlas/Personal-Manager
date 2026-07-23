@@ -31,6 +31,49 @@ export function UpdateBanner({ update }: { update: AppUpdate }) {
   }
 
   const label = update.version ? `Version ${update.version}` : "An update";
+
+  // A Linux package install (rpm/deb) can't be updated in place — Tauri's updater only swaps an
+  // AppImage. So we never downloaded one; invite a reinstall from the releases page instead of a
+  // restart that would do nothing. (Windows/macOS and the AppImage never take this branch.)
+  if (update.packageManaged) {
+    if (update.dismissed) {
+      return (
+        <div className="flex items-center justify-end gap-2 border-b border-border bg-accent-soft px-4 py-1 text-xs text-ink3">
+          <span>{label} available — reinstall to update</span>
+          <a
+            href={update.releasesUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-ink underline underline-offset-2 hover:text-ink2"
+          >
+            Get it
+          </a>
+        </div>
+      );
+    }
+    return (
+      <div className={shell}>
+        <span>
+          {label} is available. PM was installed from a package, so it can&apos;t update itself —
+          download the new package and reinstall to update.
+        </span>
+        <span className={actions}>
+          <a
+            href={update.releasesUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-ink underline underline-offset-2 hover:text-ink2"
+          >
+            Get the update
+          </a>
+          <Button variant="tertiary" onClick={update.dismiss} className="px-2 py-1 text-xs">
+            Later
+          </Button>
+        </span>
+      </div>
+    );
+  }
+
   const sacBlocked = update.sac === "enforced";
   // A restart threw (macOS) or a prior attempt silently didn't apply (a non-SAC Windows block,
   // e.g. SmartScreen "Don't run") — a manual download is the way forward in both.
