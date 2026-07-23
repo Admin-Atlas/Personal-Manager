@@ -1112,6 +1112,7 @@ pub fn run() {
             local_ai::set_local_llm_token,
             local_ai::clear_local_llm_token,
             local_ai::list_local_llm_models,
+            local_ai::pull_local_model,
             local_ai::local_llm_status,
             // Workbench (#296): hardware scan + per-machine model recommendations.
             local_ai::local_hardware_scan,

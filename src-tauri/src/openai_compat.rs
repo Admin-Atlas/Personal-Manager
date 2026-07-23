@@ -539,6 +539,121 @@ pub async fn probe(base_url: &str, token: Option<&str>) -> LocalResult<Vec<Strin
     Ok(models_from_list(&value))
 }
 
+/// One progress tick from an Ollama `/api/pull` stream.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PullProgress {
+    /// Ollama's status line for this tick ("pulling manifest", "downloading", "verifying sha256",
+    /// "writing manifest", "success").
+    pub status: String,
+    /// Bytes fetched / total for the layer currently downloading, when Ollama reports them.
+    pub completed_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    /// True on the terminal "success" line.
+    pub done: bool,
+}
+
+/// Ask an Ollama server to download `model` into itself, streaming progress. Ollama is the only local
+/// runner PM knows with a native pull API (LM Studio / llama-server have none — the tab shows a
+/// copy-paste command for those). PM downloads NOTHING itself and proxies nothing: this asks the
+/// user's own server to fetch the weights from wherever it is configured to. `base_url` is the
+/// normalised endpoint (no `/v1`); Ollama's native route is `{base_url}/api/pull`.
+pub async fn pull_ollama_model<F>(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+    mut on_progress: F,
+) -> LocalResult<()>
+where
+    F: FnMut(PullProgress),
+{
+    // Both keys on purpose: current Ollama reads `model`, older builds read `name`.
+    let body = serde_json::json!({ "model": model, "name": model, "stream": true });
+    let url = format!("{base_url}/api/pull");
+    let mut req = client_for(base_url).post(&url).json(&body);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let response = req
+        .send()
+        .await
+        .map_err(|e| LocalFailure::new(classify_send_error(&e), e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LocalFailure::new(
+            classify_http(status.as_u16(), &body),
+            crate::error::truncate_detail(&body),
+        ));
+    }
+
+    // Ollama streams newline-delimited JSON objects. Buffer bytes and parse each complete line; a
+    // stalled (open-but-idle) stream is bounded by a generous per-chunk deadline so a dead download
+    // can't hang the tab forever.
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let next = match tokio::time::timeout(tunables::PULL_STALL_TIMEOUT, stream.next()).await {
+            Ok(next) => next,
+            Err(_elapsed) => {
+                return Err(LocalFailure::new(
+                    LocalFailKind::Timeout,
+                    "the download stalled — no progress from the server",
+                ));
+            }
+        };
+        let Some(chunk) = next else {
+            break; // the byte stream ended
+        };
+        let bytes = chunk.map_err(|e| LocalFailure::new(classify_send_error(&e), e.to_string()))?;
+        buf.extend_from_slice(&bytes);
+        // The endpoint is untrusted: a broken/hostile server dribbling newline-free bytes would reset
+        // the stall timer each chunk and grow `buf` without bound. Cap it like the SSE line assembler.
+        if buf.len() > MAX_SSE_LINE_BYTES {
+            return Err(LocalFailure::new(
+                LocalFailKind::MalformedStream,
+                "the download stream sent an oversized line",
+            ));
+        }
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue; // a partial or non-JSON keep-alive line — wait for more bytes
+            };
+            // Ollama reports a pull failure as an {"error": "..."} line, not an HTTP error.
+            if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                return Err(LocalFailure::new(
+                    LocalFailKind::MalformedStream,
+                    crate::error::truncate_detail(err),
+                ));
+            }
+            let status = v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let done = status == "success";
+            on_progress(PullProgress {
+                status,
+                completed_bytes: v.get("completed").and_then(serde_json::Value::as_u64),
+                total_bytes: v.get("total").and_then(serde_json::Value::as_u64),
+                done,
+            });
+            if done {
+                return Ok(()); // terminal line — don't wait a stall-timeout for the server to hang up
+            }
+        }
+    }
+    Err(LocalFailure::new(
+        LocalFailKind::MalformedStream,
+        "the download ended without a success line",
+    ))
+}
+
 /// Stream a chat completion from a local endpoint. `on_token` is called with each content delta.
 /// Classifies every failure structurally (`LocalFailKind`) and aborts an obvious token loop.
 pub async fn stream_chat<F>(
