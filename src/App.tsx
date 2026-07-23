@@ -40,6 +40,7 @@ import { CollapseTab } from "./components/CollapseTab";
 import { useChatStream } from "./lib/useChatStream";
 import { useProjectChat } from "./lib/useProjectChat";
 import { useLocalLlmStatus } from "./lib/useLocalLlmStatus";
+import { aiReady as deriveAiReady } from "./lib/aiGate";
 import { isNewChatTrigger } from "./lib/chatSession";
 import { useUpdater } from "./lib/useUpdater";
 import { useDevMode } from "./lib/capabilities";
@@ -52,7 +53,7 @@ import {
   deleteConversation,
   getMessages,
   getSettings,
-  hasOpenRouterKey,
+  aiProviderStatus,
   listConversations,
   listSharedVaults,
   markActivity,
@@ -86,7 +87,7 @@ import { markJustJoinedVault } from "./lib/joinedVault";
 
 export default function App() {
   const [loading, setLoading] = useState(true);
-  const [keySet, setKeySet] = useState(false);
+  const [aiReady, setAiReady] = useState(false);
   // The optional biometric app-lock (soft UI gate). Locked at launch when the user has
   // turned it on; lifted once the OS verifies them (see LockScreen). The store is already
   // decrypted regardless — this only withholds the window.
@@ -283,15 +284,15 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       try {
-        // The four boot reads are independent, so fetch them in ONE parallel batch rather than four
-        // serial round-trips behind each other (F-09). `has_openrouter_key` reads the OS keychain,
-        // not the encrypted store, so it's safe to fetch eagerly even when a gate below early-returns
-        // before it's consumed. The gate ORDER is preserved exactly.
-        const [appLocked, vs, writerLock, has, offers] = await Promise.all([
+        // These boot reads are independent, so fetch them in ONE parallel batch rather than serial
+        // round-trips behind each other (F-09). AI readiness is NOT in this batch: `ai_provider_status`
+        // reads the encrypted store (onboarding flag + local-endpoint settings), which isn't open
+        // until past the locked/curtained/fault/needs-unlock gates below — so it's read after them.
+        // The gate ORDER is preserved exactly.
+        const [appLocked, vs, writerLock, offers] = await Promise.all([
           appLockStatus().catch(() => null),
           vaultStatus().catch(() => null),
           vaultLockStatus().catch(() => null),
-          hasOpenRouterKey().catch(() => false),
           listSharedVaults().catch(() => []),
         ]);
         setSharedOffers(offers);
@@ -314,10 +315,13 @@ export default function App() {
           setVaultNeedsUnlock(true);
           return;
         }
-        setKeySet(has);
+        // Store is open past every gate — read AI readiness: a cloud key, a configured local
+        // endpoint, or a prior "set up AI later" (#295). Existing keyed users pass on the key.
+        const ready = deriveAiReady(await aiProviderStatus());
+        setAiReady(ready);
         // Defer the primed conversation's getMessages off the first-paint path (the landing view is
         // Focus, so those messages aren't shown yet); loaded lazily on first chat open (F-09).
-        if (has) await refreshConversations(true, true);
+        if (ready) await refreshConversations(true, true);
       } catch (e) {
         chat.setError(String(e));
       } finally {
@@ -331,13 +335,14 @@ export default function App() {
     setVaultNeedsUnlock(false);
     setLoading(true);
     try {
-      // Independent reads in one parallel batch, same shape as the boot effect above: a vault-status
-      // failure is tolerated (null), a keychain failure still surfaces through the catch.
-      const [vs, has] = await Promise.all([vaultStatus().catch(() => null), hasOpenRouterKey()]);
+      // The store is now open (just unlocked), so both reads are safe in one parallel batch: a
+      // vault-status failure is tolerated (null), an ai-provider-status failure surfaces via catch.
+      const [vs, status] = await Promise.all([vaultStatus().catch(() => null), aiProviderStatus()]);
       setVault(vs);
-      setKeySet(has);
+      const ready = deriveAiReady(status);
+      setAiReady(ready);
       // Passphrase-vault cold start also lands on Focus, so defer messages identically (F-09).
-      if (has) await refreshConversations(true, true);
+      if (ready) await refreshConversations(true, true);
     } catch (e) {
       chat.setError(String(e));
     } finally {
@@ -350,14 +355,16 @@ export default function App() {
   async function becomeActiveWriter() {
     setLoading(true);
     try {
-      // Same parallel-batch shape as the boot effect (the two reads are independent).
-      const [writerLock, has] = await Promise.all([
+      // Same parallel-batch shape as the boot effect (the two reads are independent; the store is
+      // open again on acquisition, so ai_provider_status is safe here).
+      const [writerLock, status] = await Promise.all([
         vaultLockStatus().catch(() => null),
-        hasOpenRouterKey(),
+        aiProviderStatus(),
       ]);
       setVaultLock(writerLock);
-      setKeySet(has);
-      if (has) await refreshConversations(true);
+      const ready = deriveAiReady(status);
+      setAiReady(ready);
+      if (ready) await refreshConversations(true);
     } catch (e) {
       chat.setError(String(e));
     } finally {
@@ -436,20 +443,20 @@ export default function App() {
 
   // Keep the sidebar's review badge current as the user moves around the app.
   useEffect(() => {
-    if (keySet) void refreshReviewCount();
-  }, [keySet, view, refreshReviewCount]);
+    if (aiReady) void refreshReviewCount();
+  }, [aiReady, view, refreshReviewCount]);
 
   // Resume a Drive sync interrupted by a previous close/crash mid-index. Runs once the vault is open
-  // (keySet implies an unlocked store), detached in the backend — already-indexed files survive, so
+  // (aiReady implies an unlocked store), detached in the backend — already-indexed files survive, so
   // it just finishes the outstanding work. A no-op when there's nothing pending.
   useEffect(() => {
-    if (keySet) void resumeDriveSync().catch(() => {});
-  }, [keySet]);
+    if (aiReady) void resumeDriveSync().catch(() => {});
+  }, [aiReady]);
 
   // Same for an interrupted OneDrive sync (independent connector, its own resume marker).
   useEffect(() => {
-    if (keySet) void resumeOneDriveSync().catch(() => {});
-  }, [keySet]);
+    if (aiReady) void resumeOneDriveSync().catch(() => {});
+  }, [aiReady]);
 
   // Resume a rebuild interrupted by a previous close/crash. Like the connector resumes above, this one
   // genuinely CONTINUES the interrupted pass rather than restarting it (#371): each document the pass
@@ -457,21 +464,21 @@ export default function App() {
   // updated in between and would now chunk differently, in which case it honestly rebuilds everything.
   // A no-op when there's nothing pending.
   useEffect(() => {
-    if (keySet) void resumeRebuild().catch(() => {});
-  }, [keySet]);
+    if (aiReady) void resumeRebuild().catch(() => {});
+  }, [aiReady]);
 
   // And an interrupted local-folder sync (board card 6, its own resume marker). The live filesystem
   // watcher is spawned separately at app setup; this just finishes any walk left mid-index by a close.
   useEffect(() => {
-    if (keySet) void resumeLocalFolderSync().catch(() => {});
-  }, [keySet]);
+    if (aiReady) void resumeLocalFolderSync().catch(() => {});
+  }, [aiReady]);
 
   // Keep the read-only calendar mirror fresh in the background: one poll shortly after unlock, then
   // every 15 minutes. The mirror feeds the calendar view, the focus agenda, the daily briefing, and
   // chat's "what's on" answer, so it belongs at app scope (not the tab, which unmounts). Best-effort
   // and guarded against overlap; a manual "Refresh now" in the calendar header re-polls on demand.
   useEffect(() => {
-    if (!keySet) return;
+    if (!aiReady) return;
     let syncing = false;
     const poll = async () => {
       if (syncing) return;
@@ -487,7 +494,7 @@ export default function App() {
     void poll();
     const id = setInterval(() => void poll(), 15 * 60 * 1000);
     return () => clearInterval(id);
-  }, [keySet]);
+  }, [aiReady]);
 
   // Load the boot-primed conversation's messages the first time the user opens chat (F-09): cold
   // start primes the selection but defers this fetch off the first-paint path. Fires at most once.
@@ -529,11 +536,11 @@ export default function App() {
   // force layout off the main thread (a worker), and the semantic layout in the backend (which defers
   // to an active Drive sync). Both prime caches so opening the Map is instant and never stutters launch.
   useEffect(() => {
-    if (keySet) {
+    if (aiReady) {
       warmMapLayout();
       void startSemanticLayout().catch(() => {});
     }
-  }, [keySet]);
+  }, [aiReady]);
 
   async function selectConversation(id: number) {
     activeIdRef.current = id; // adopt synchronously so a racing later selection wins the post-await guard
@@ -728,7 +735,7 @@ export default function App() {
   // pattern as the backup-restore switch; the just-joined flag lets onboarding and the
   // Connectors tab explain what's theirs alone. Skipping falls through to onboarding
   // for this launch; the offer returns next launch.
-  if (!keySet && !joinSkipped && vault?.mode === "device" && sharedOffers.length > 0) {
+  if (!aiReady && !joinSkipped && vault?.mode === "device" && sharedOffers.length > 0) {
     return (
       <VaultJoin
         vaults={sharedOffers}
@@ -741,12 +748,12 @@ export default function App() {
     );
   }
 
-  if (!keySet) {
+  if (!aiReady) {
     return (
       <SettingsView
         onboarding
         onClose={async () => {
-          setKeySet(true);
+          setAiReady(true);
           await refreshConversations(true);
         }}
       />

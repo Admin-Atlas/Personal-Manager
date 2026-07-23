@@ -45,6 +45,11 @@ pub(crate) const TIME_ZONE_KEY: &str = "time_zone";
 /// (security preference → backend), not localStorage.
 const APP_LOCK_ENABLED_KEY: &str = "app_lock_enabled";
 
+/// First-run onboarding has been completed / dismissed. Set once (the wizard's finish or its "Set up
+/// AI later" link) and read by the keyless-onboarding gate (#295). Absent → `false`; no migration
+/// (settings is key/value). Existing keyed users never set it — they pass the gate on the cloud key.
+pub(crate) const ONBOARDING_DONE_KEY: &str = "onboarding_done";
+
 #[derive(Serialize)]
 pub struct Settings {
     /// Ordered preferred models for chat (user-facing) and background work
@@ -191,6 +196,39 @@ pub fn set_reranking(state: State<'_, AppState>, enabled: bool) -> Result<()> {
 pub fn set_retrieval_k(state: State<'_, AppState>, k: usize) -> Result<()> {
     let conn = state.conn()?;
     db::set_retrieval_k(&conn, k)
+}
+
+/// Whether the user has an AI provider available, for the keyless-onboarding gate (#295). ANY one of
+/// the three makes PM "ready" and dismisses the first-run wizard: a cloud key, a configured local
+/// endpoint, or an explicit "set up AI later". Existing keyed users satisfy `has_cloud_key`, so the
+/// new gate is a strict superset of the old key-only one — no migration, no backfill.
+#[derive(Serialize)]
+pub struct AiProviderStatus {
+    pub has_cloud_key: bool,
+    pub local_configured: bool,
+    pub onboarding_done: bool,
+}
+
+#[tauri::command]
+pub fn ai_provider_status(state: State<'_, AppState>) -> Result<AiProviderStatus> {
+    // Keychain read first (safe even when the store is locked), then the two store-backed reads.
+    let has_cloud_key = crate::secrets::get_openrouter_key()?.is_some();
+    let conn = state.conn()?;
+    let local_configured = crate::llm_gateway::local_chat_configured(&conn)?;
+    let onboarding_done = db::get_bool(&conn, ONBOARDING_DONE_KEY, false)?;
+    Ok(AiProviderStatus {
+        has_cloud_key,
+        local_configured,
+        onboarding_done,
+    })
+}
+
+/// Mark first-run onboarding complete — the wizard's finish, or its "Set up AI later" link. Idempotent
+/// (writes `true`); read back by [`ai_provider_status`].
+#[tauri::command]
+pub fn set_onboarding_done(state: State<'_, AppState>) -> Result<()> {
+    let conn = state.conn()?;
+    db::set_bool(&conn, ONBOARDING_DONE_KEY, true)
 }
 
 /// One language/embedder choice offered at vault creation.

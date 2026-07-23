@@ -1397,6 +1397,14 @@ export interface LocalLlmConfig {
   has_token: boolean;
 }
 
+/** Whether an AI provider is available, for the keyless-onboarding gate (#295, settings.rs
+ *  `AiProviderStatus`). Any one dismisses the first-run wizard; see `lib/aiGate.ts`. */
+export interface AiProviderStatus {
+  has_cloud_key: boolean;
+  local_configured: boolean;
+  onboarding_done: boolean;
+}
+
 /** Live endpoint status for the tab's connection chip (local_ai.rs LocalLlmStatus). */
 export interface LocalLlmStatus {
   configured: boolean;
