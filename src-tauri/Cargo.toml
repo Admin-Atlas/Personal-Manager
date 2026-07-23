@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.46.1-alpha"
+version = "3.47.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -150,6 +150,9 @@ windows = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_System_Pipes",
+    # Workbench hardware scan (#461): read a discrete GPU's true VRAM via DXGI, since the WMI
+    # AdapterRAM field is a uint32 that saturates at 4 GB (see hardware.rs).
+    "Win32_Graphics_Dxgi",
 ] }
 windows-future = "0.2"
 

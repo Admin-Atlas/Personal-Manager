@@ -6,7 +6,8 @@
 //!
 //! `sysinfo` covers RAM / CPU / disk on every OS (it already calls the right native API under the
 //! hood). It has no GPU/VRAM/battery, so those are hand-rolled per-OS: on Windows a CIM query for the
-//! video controller plus `nvidia-smi`; on Apple Silicon the unified-memory fraction; on Linux
+//! video controller, `nvidia-smi`, and a DXGI enumeration for a discrete card's true VRAM (the CIM
+//! `AdapterRAM` field saturates at 4 GB); on Apple Silicon the unified-memory fraction; on Linux
 //! `nvidia-smi` plus the AMD sysfs node. **No battery/AC here** — that's the deferred power-aware
 //! routing card (#432).
 //!
@@ -50,7 +51,7 @@ pub struct Hardware {
     pub gpu_name: Option<String>,
     pub gpu_vendor: Option<String>,
     pub vram_gb: Option<f64>,
-    /// How VRAM was read: `nvidia-smi` | `adapter_ram` | `apple_unified` | `amd_sysfs`.
+    /// How VRAM was read: `nvidia-smi` | `dxgi` | `adapter_ram` | `apple_unified` | `amd_sysfs`.
     pub vram_source: Option<String>,
     /// Apple-Silicon-style shared CPU/GPU memory (VRAM is a slice of system RAM, not separate).
     pub unified_memory: bool,
@@ -185,6 +186,29 @@ fn probe_gpu() -> GpuProbe {
     probe.unified = probe.source.as_deref() != Some("nvidia-smi")
         && probe.name.as_deref().is_some_and(integrated_gpu_from_name);
 
+    // Any discrete non-NVIDIA card over 4 GB (Intel Arc, AMD RX/Pro) saturates the uint32 AdapterRAM,
+    // so we still have no VRAM — read the true DedicatedVideoMemory (a 64-bit SIZE_T) via DXGI. Only
+    // for a discrete card (an integrated GPU has no distinct pool to size), and never overriding the
+    // authoritative nvidia-smi figure (which already set vram_gb, so this is skipped).
+    if probe.vram_gb.is_none() && !probe.unified {
+        let adapters = dxgi_enumerate();
+        if let Some(a) = pick_dxgi_discrete(&adapters) {
+            probe.vram_gb = Some(round1(a.dedicated_bytes as f64 / GIB));
+            probe.source = Some("dxgi".to_string());
+            // DXGI can also name the card when CIM came back empty.
+            if probe.name.is_none() {
+                probe.name = Some(a.name.clone());
+            }
+            if probe.vendor.is_none() {
+                probe.vendor = probe
+                    .name
+                    .as_deref()
+                    .and_then(vendor_from_name)
+                    .or_else(|| vendor_from_pci_id(a.vendor_id));
+            }
+        }
+    }
+
     // A named GPU we couldn't size reliably: say so plainly, don't invent a number.
     if probe.name.is_some() && probe.vram_gb.is_none() {
         probe
@@ -192,6 +216,41 @@ fn probe_gpu() -> GpuProbe {
             .push("GPU VRAM couldn't be read reliably — sized on system RAM instead.".to_string());
     }
     probe
+}
+
+/// Enumerate the machine's DXGI adapters into our simple struct. Best-effort: any failure (no DXGI,
+/// a driver quirk) yields an empty list and the caller sizes on system RAM instead. Needs **no** COM
+/// apartment init — `CreateDXGIFactory1` is a direct `dxgi.dll` entry point — so it's safe to call
+/// from this plain blocking scan on any thread.
+#[cfg(windows)]
+fn dxgi_enumerate() -> Vec<DxgiAdapter> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+    };
+    let mut out = Vec::new();
+    // SAFETY: factory creation and adapter enumeration are thread-agnostic and take no COM init. Each
+    // COM interface (factory, adapter) is released on drop by the `windows` crate's RAII wrappers, and
+    // `GetDesc1` fills a plain POD `DXGI_ADAPTER_DESC1` we copy out of immediately. `EnumAdapters1`
+    // returns `Err(DXGI_ERROR_NOT_FOUND)` past the last adapter, ending the loop.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+            return out;
+        };
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            out.push(DxgiAdapter {
+                name: utf16_trim_to_string(&desc.Description),
+                vendor_id: desc.VendorId,
+                dedicated_bytes: desc.DedicatedVideoMemory as u64,
+                is_software: (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
@@ -243,6 +302,11 @@ fn probe_gpu() -> GpuProbe {
         // Integrated (APU) → the "VRAM" is a shared-RAM carve-out, not a distinct faster pool: no Split.
         probe.unified = amd_is_integrated(card);
     }
+    // Discrete Intel Arc (i915 / xe) has no VRAM-size sysfs node in mainline — `mem_info_vram_total`
+    // is amdgpu-only. Reading it needs a DRM query ioctl on the render node
+    // (`DRM_I915_QUERY_MEMORY_REGIONS` / `DRM_XE_DEVICE_QUERY_MEM_REGIONS`), deferred on #461 as it
+    // can't be exercised without an Arc-on-Linux box. Until then a discrete Arc on Linux sizes on
+    // system RAM — the same honest fallback as any card whose VRAM we can't read.
     probe
 }
 
@@ -387,6 +451,57 @@ fn pick_gpu(lines: &[GpuLine]) -> Option<GpuLine> {
 #[cfg(any(windows, test))]
 fn adapter_ram_reliable(bytes: u64) -> bool {
     bytes > 0 && bytes < ADAPTER_RAM_CEILING
+}
+
+/// A DXGI adapter as we care about it: its description, PCI vendor id, dedicated-VRAM bytes (a 64-bit
+/// `SIZE_T`, so no `AdapterRAM` saturation), and whether it's the software/WARP renderer (which has no
+/// real VRAM and must be ignored). The live enumerator fills these from `DXGI_ADAPTER_DESC1`; the pure
+/// picker below is what the tests exercise.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone)]
+struct DxgiAdapter {
+    name: String,
+    vendor_id: u32,
+    dedicated_bytes: u64,
+    is_software: bool,
+}
+
+/// A dedicated pool below this isn't a discrete card's VRAM — it's a BIOS-reserved integrated carve-out
+/// (typically 128–512 MiB) or a stub. Discrete GPUs relevant to local models start at a couple of GiB,
+/// so a 1 GiB floor cleanly separates them and keeps an unrecognised iGPU from reporting a "VRAM" number.
+#[cfg(any(windows, test))]
+const DXGI_MIN_DEDICATED_BYTES: u64 = 1_073_741_824;
+
+/// The hardware adapter with the most dedicated VRAM, if it clears the discrete floor — i.e. the
+/// discrete card. Skips the software/WARP renderer. `None` on an integrated-only machine (no adapter
+/// clears the floor), which is correct: there's no distinct VRAM pool to size a GPU-resident config in.
+#[cfg(any(windows, test))]
+fn pick_dxgi_discrete(adapters: &[DxgiAdapter]) -> Option<&DxgiAdapter> {
+    adapters
+        .iter()
+        .filter(|a| !a.is_software && a.dedicated_bytes >= DXGI_MIN_DEDICATED_BYTES)
+        .max_by_key(|a| a.dedicated_bytes)
+}
+
+/// A GPU vendor from its PCI vendor id — the last-resort fill when DXGI is the only source that named
+/// the card (CIM returned nothing) and the description string didn't classify. `None` for anything
+/// outside the three GPU vendors (e.g. `0x1414`, Microsoft's WARP — already filtered as software).
+#[cfg(any(windows, test))]
+fn vendor_from_pci_id(vendor_id: u32) -> Option<String> {
+    match vendor_id {
+        0x10DE => Some("NVIDIA".to_string()),
+        0x1002 => Some("AMD".to_string()),
+        0x8086 => Some("Intel".to_string()),
+        _ => None,
+    }
+}
+
+/// Decode a fixed-size, NUL-padded UTF-16 buffer (a `DXGI_ADAPTER_DESC1.Description` is `[u16; 128]`)
+/// into a trimmed `String`, stopping at the first NUL. Lossy on the rare invalid code unit.
+#[cfg(any(windows, test))]
+fn utf16_trim_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end]).trim().to_string()
 }
 
 /// The largest `memory.total` (MiB) across `nvidia-smi --query-gpu` lines, or `None`.
@@ -623,6 +738,60 @@ mod tests {
             "NVIDIA GeForce RTX 5070 Laptop GPU"
         ));
         assert!(!integrated_gpu_from_name("Some Unknown Adapter"));
+    }
+
+    #[test]
+    fn dxgi_picks_the_largest_discrete_skipping_software_and_igpu_carveouts() {
+        fn adapter(name: &str, vendor_id: u32, bytes: u64, is_software: bool) -> DxgiAdapter {
+            DxgiAdapter {
+                name: name.into(),
+                vendor_id,
+                dedicated_bytes: bytes,
+                is_software,
+            }
+        }
+        let adapters = vec![
+            adapter("Intel Arc B580", 0x8086, 12 * 1_073_741_824, false), // 12 GiB discrete
+            adapter("Intel UHD Graphics", 0x8086, 128 * 1_048_576, false), // 128 MiB iGPU carve-out
+            adapter("Microsoft Basic Render Driver", 0x1414, 0, true),    // WARP — skipped
+        ];
+        let picked = pick_dxgi_discrete(&adapters).unwrap();
+        assert_eq!(picked.name, "Intel Arc B580");
+        // The picked adapter's vendor id resolves (this also exercises the DXGI-only vendor fallback).
+        assert_eq!(
+            vendor_from_pci_id(picked.vendor_id).as_deref(),
+            Some("Intel")
+        );
+
+        // A huge software adapter is still skipped; a sub-floor iGPU alone yields nothing. A real
+        // iGPU reports a ~128 MiB BIOS carve-out here (verified live on Iris Xe), well under the floor.
+        assert!(pick_dxgi_discrete(&[adapter("WARP", 0x1414, 64 * 1_073_741_824, true)]).is_none());
+        assert!(
+            pick_dxgi_discrete(&[adapter("Intel Iris Xe", 0x8086, 512 * 1_048_576, false)])
+                .is_none()
+        );
+        assert!(pick_dxgi_discrete(&[]).is_none());
+    }
+
+    #[test]
+    fn utf16_description_is_decoded_and_nul_trimmed() {
+        // "Arc" followed by a NUL and trailing padding — decode stops at the NUL, trims the rest.
+        let mut buf = [0u16; 8];
+        for (slot, ch) in buf.iter_mut().zip("Arc".encode_utf16()) {
+            *slot = ch;
+        }
+        assert_eq!(utf16_trim_to_string(&buf), "Arc");
+        assert_eq!(utf16_trim_to_string(&[0u16; 4]), ""); // all-NUL → empty
+        assert_eq!(utf16_trim_to_string(&[]), "");
+    }
+
+    #[test]
+    fn vendor_from_pci_id_maps_the_three_gpu_vendors() {
+        assert_eq!(vendor_from_pci_id(0x10DE).as_deref(), Some("NVIDIA"));
+        assert_eq!(vendor_from_pci_id(0x1002).as_deref(), Some("AMD"));
+        assert_eq!(vendor_from_pci_id(0x8086).as_deref(), Some("Intel"));
+        assert_eq!(vendor_from_pci_id(0x1414), None); // Microsoft WARP
+        assert_eq!(vendor_from_pci_id(0), None);
     }
 
     #[test]
