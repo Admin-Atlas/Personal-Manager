@@ -74,6 +74,7 @@ mod retrieval_diag;
 mod review;
 mod secret;
 mod secrets;
+mod settings;
 mod sidecar;
 #[cfg(windows)]
 mod sidecar_sandbox;
@@ -1117,25 +1118,25 @@ pub fn run() {
             // Workbench (#296): hardware scan + per-machine model recommendations.
             local_ai::local_hardware_scan,
             local_ai::local_model_recommendations,
-            commands::get_settings,
-            commands::set_indexing_speed,
-            commands::set_chat_models,
-            commands::set_background_models,
-            commands::set_chat_auto_switch,
-            commands::set_background_auto_switch,
-            commands::set_help_mode,
-            commands::set_reranking,
-            commands::set_retrieval_k,
-            commands::set_retrieval_confidence_threshold,
+            settings::get_settings,
+            settings::set_indexing_speed,
+            settings::set_chat_models,
+            settings::set_background_models,
+            settings::set_chat_auto_switch,
+            settings::set_background_auto_switch,
+            settings::set_help_mode,
+            settings::set_reranking,
+            settings::set_retrieval_k,
+            settings::set_retrieval_confidence_threshold,
             commands::retrieval_explain,
             commands::retrieval_diagnose,
-            commands::language_options,
-            commands::set_vault_embedder,
-            commands::set_time_zone,
-            commands::get_pref,
-            commands::set_pref,
-            commands::app_lock_status,
-            commands::set_app_lock,
+            settings::language_options,
+            settings::set_vault_embedder,
+            settings::set_time_zone,
+            settings::get_pref,
+            settings::set_pref,
+            settings::app_lock_status,
+            settings::set_app_lock,
             commands::unlock_app,
             commands::vault_status,
             commands::retry_open_vault,

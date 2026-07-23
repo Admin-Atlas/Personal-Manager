@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.41.1-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "Under-the-hood tidying of the Settings internals, with no change to how anything works: the backend code that stores your preferences moved into its own tidy home, and the on/off settings now share one small helper instead of each repeating the same steps. Purely groundwork — it makes the next batch of settings quicker and safer to add.",
+    ],
+  },
+  {
     version: "3.41.0-alpha",
     date: "2026-07-23",
     highlights: [
