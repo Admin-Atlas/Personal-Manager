@@ -195,11 +195,84 @@ mod platform {
         Ok(())
     }
 
-    /// Lock a shared vault folder down to its owner: remove inherited ACEs, then grant
-    /// Full inheritable access to the current user, Administrators, and any
-    /// `extra_principals` (account names or `S-1-...` SIDs) to link from the start.
+    /// Parse `icacls <dir>` stdout into the principals holding an EXPLICIT (non-inherited)
+    /// ACE on the folder itself. icacls echoes the target path then the first ACE on line
+    /// one and indents the rest; each ACE reads `<principal>:(<flags…>)<perms>`. The
+    /// principal — which may contain spaces and a `DOMAIN\` prefix — is everything before
+    /// the first `:(`; on line one the echoed `dir` is stripped first so the path's own
+    /// content can't be mistaken for a principal. Lines carrying the `(I)` inherited marker
+    /// are skipped (those are removed wholesale by `/inheritance:r`), as is the localized
+    /// "processed" trailer (it has no `:(`). Keying off `:(` and `(I)` — both printed
+    /// untranslated by icacls — keeps this locale-robust. Pure, so it is unit-tested on
+    /// every platform without touching a filesystem.
+    fn parse_ace_principals(dir: &str, output: &str) -> Vec<String> {
+        let mut principals = Vec::new();
+        for (i, raw) in output.lines().enumerate() {
+            let line = if i == 0 {
+                raw.strip_prefix(dir).unwrap_or(raw)
+            } else {
+                raw
+            };
+            let line = line.trim();
+            let Some(sep) = line.find(":(") else { continue };
+            let (principal, flags) = line.split_at(sep);
+            // `(I)` marks an inherited ACE; `/inheritance:r` clears those, so skip them here
+            // and only collect genuine explicit grants. `(IO)`/`(CI)`/… don't match `(I)`.
+            if flags.contains("(I)") {
+                continue;
+            }
+            let principal = principal.trim();
+            if !principal.is_empty() {
+                principals.push(principal.to_string());
+            }
+        }
+        principals
+    }
+
+    /// The principals with an explicit ACE on `dir`, read back via `icacls <dir>` (no `/T`).
+    /// The piece [`restrict_to_owner`] needs to strip a previously-linked account whose
+    /// explicit grant `/grant:r` would otherwise leave in place — without depending on any
+    /// external record of who was linked. Best-effort by contract: an error means "couldn't
+    /// enumerate", and the caller leans on its other guards rather than failing the lockdown.
+    fn explicit_principals(dir: &Path) -> Result<Vec<String>> {
+        let out = Command::new("icacls")
+            .arg(dir)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| Error::Other(format!("could not run icacls: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::Other(format!(
+                "icacls read failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(parse_ace_principals(
+            &dir.to_string_lossy(),
+            &String::from_utf8_lossy(&out.stdout),
+        ))
+    }
+
+    /// Lock a shared vault folder down to its owner: strip any pre-existing EXPLICIT ACE,
+    /// remove inherited ACEs, then grant Full inheritable access to the current user,
+    /// Administrators, and any `extra_principals` (account names or `S-1-...` SIDs) to link
+    /// from the start.
+    ///
+    /// The upfront strip is what makes this safe as the *make-private* lockdown: `/grant:r`
+    /// only replaces the principals it names, so a previously-linked account keeps its
+    /// explicit (inheritable) ACE — and unlike macOS (`chmod -R -N`) and Linux (a `chmod 700`
+    /// root that zeroes the ACL mask), the Windows arm had no wholesale clear, so removal used
+    /// to depend on an external list of who to revoke. Reading the folder's actual ACEs and
+    /// stripping every one closes that gap: the re-grant below then re-admits exactly the
+    /// owner, Administrators, and `extra_principals`. Best-effort — an enumeration hiccup must
+    /// not fail the whole lockdown, since the `/inheritance:r` + `/grant:r` remains the primary
+    /// owner-only guarantee, and each strip of an absent principal is a harmless no-op.
     pub fn restrict_to_owner(dir: &Path, extra_principals: &[String]) -> Result<()> {
         let me = current_user_sid()?;
+        if let Ok(existing) = explicit_principals(dir) {
+            for principal in existing {
+                let _ = revoke_access(dir, &principal);
+            }
+        }
         let mut args = vec![
             "/inheritance:r".to_string(),
             "/grant:r".to_string(),
@@ -283,7 +356,9 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::{grant_arg, icacls_failed_count, parse_sid_from_csv, remove_arg};
+        use super::{
+            grant_arg, icacls_failed_count, parse_ace_principals, parse_sid_from_csv, remove_arg,
+        };
 
         #[test]
         fn grant_arg_uses_star_for_sids_and_bare_for_names() {
@@ -326,6 +401,45 @@ mod platform {
                 Some("S-1-5-21-111-222-333-1001")
             );
             assert_eq!(parse_sid_from_csv("no sid here"), None);
+        }
+
+        #[test]
+        fn ace_parse_keeps_explicit_drops_inherited_and_trailer() {
+            let dir = "C:\\ProgramData\\org.itsatlas.pm\\vault";
+            // icacls echoes the path on line one, indents the rest; `(I)` = inherited.
+            let out = "C:\\ProgramData\\org.itsatlas.pm\\vault DESKTOP-PC\\bobby:(OI)(CI)(F)\r\n\
+                       \x20                                    BUILTIN\\Administrators:(OI)(CI)(F)\r\n\
+                       \x20                                    DESKTOP-PC\\mallory:(OI)(CI)(F)\r\n\
+                       \x20                                    BUILTIN\\Users:(I)(OI)(CI)(RX)\r\n\
+                       \x20                                    NT AUTHORITY\\SYSTEM:(I)(OI)(CI)(F)\r\n\
+                       \r\n\
+                       Successfully processed 1 files; Failed processing 0 files.\r\n";
+            // Explicit ACEs (incl. the linked account) survive; inherited rows and the
+            // localized trailer are dropped.
+            assert_eq!(
+                parse_ace_principals(dir, out),
+                vec![
+                    "DESKTOP-PC\\bobby".to_string(),
+                    "BUILTIN\\Administrators".to_string(),
+                    "DESKTOP-PC\\mallory".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn ace_parse_handles_names_with_spaces_and_raw_sids() {
+            // A principal name can contain spaces; stripping the echoed dir off line one is
+            // what makes that unambiguous. An unresolved principal prints as a raw SID.
+            let dir = "C:\\v";
+            let out = "C:\\v NT AUTHORITY\\Authenticated Users:(OI)(CI)(F)\r\n\
+                       \x20   S-1-5-21-9-9-9-1005:(OI)(CI)(F)\r\n";
+            assert_eq!(
+                parse_ace_principals(dir, out),
+                vec![
+                    "NT AUTHORITY\\Authenticated Users".to_string(),
+                    "S-1-5-21-9-9-9-1005".to_string(),
+                ]
+            );
         }
     }
 }
