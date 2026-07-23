@@ -1321,6 +1321,9 @@ export interface LocalHardware {
   vram_gb: number | null;
   /** "nvidia-smi" | "dxgi" | "adapter_ram" | "apple_unified" | "amd_sysfs" — how VRAM was read. */
   vram_source: string | null;
+  /** The GPU's peak memory bandwidth (GB/s) when its model is recognised, else null (the speed
+   *  estimate then uses a flat default). Sharpens the tok/s figure only, never the fit verdict. */
+  gpu_bandwidth_gbps: number | null;
   unified_memory: boolean;
   is_wsl: boolean;
   notes: string[];

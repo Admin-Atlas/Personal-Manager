@@ -572,6 +572,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
     let fit_hw = fit::FitHardware {
         available_ram_gb: hardware.available_ram_gb,
         vram_gb: hardware.vram_gb,
+        gpu_bandwidth_gbps: hardware.gpu_bandwidth_gbps,
         unified_memory: hardware.unified_memory,
     };
 

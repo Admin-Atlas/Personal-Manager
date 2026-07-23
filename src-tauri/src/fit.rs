@@ -52,9 +52,11 @@ const CONTEXT_FLOOR: u32 = 4096;
 /// dual-channel DDR4 ballpark; real numbers vary widely by kit and channel population.
 const SYSTEM_BANDWIDTH_GBPS: f64 = 40.0;
 
-/// Dedicated-GPU read bandwidth, used only when the chosen footprint fits in VRAM. CALIBRATE:
-/// mid-range discrete GPUs land ~300-500 GB/s; 400 is a deliberately mid, non-flattering pick.
-const GPU_BANDWIDTH_GBPS: f64 = 400.0;
+/// Fallback dedicated-GPU read bandwidth, used only when the footprint fits in VRAM *and* the card
+/// wasn't recognised by the per-model bandwidth table (`hardware::gpu_bandwidth_gbps`). CALIBRATE:
+/// mid-range discrete GPUs land ~300-500 GB/s; 400 is a deliberately mid, non-flattering pick for the
+/// unknown case. A recognised card overrides this with its real spec via `FitHardware`.
+const GPU_BANDWIDTH_FALLBACK_GBPS: f64 = 400.0;
 
 /// f16 KV-cache proxy: GB of cache per (billion active params × token). Deliberately a compact
 /// heuristic, not a per-architecture derivation — it can't see `n_kv_heads`/`head_dim`, so it
@@ -183,6 +185,10 @@ pub struct FitHardware {
     /// against RAM (so we never over-promise a fit we can't run); VRAM refines the speed estimate and
     /// drives the separate GPU-resident config (`gpu_fit`).
     pub vram_gb: Option<f64>,
+    /// The GPU's real peak memory bandwidth (GB/s) when its model was recognised
+    /// (`hardware::gpu_bandwidth_gbps`), else `None` → the flat [`GPU_BANDWIDTH_FALLBACK_GBPS`]. Only
+    /// sharpens the on-GPU tok/s estimate; never affects which config fits.
+    pub gpu_bandwidth_gbps: Option<f64>,
     /// Shared-memory GPU — Apple Silicon, OR a non-Apple integrated GPU / APU: VRAM is a slice of
     /// system RAM at the same bandwidth, so there is no distinct faster "GPU" config to offer
     /// (`gpu_fit` returns `Single`). Set by the hardware probe's integrated-GPU detection (#459).
@@ -298,7 +304,8 @@ fn tokens_per_sec(
     }
     let on_gpu = hw.vram_gb.is_some_and(|v| v >= footprint_gb);
     let bandwidth = if on_gpu {
-        GPU_BANDWIDTH_GBPS
+        // A recognised card's real spec, else the flat fallback for an unlisted GPU.
+        hw.gpu_bandwidth_gbps.unwrap_or(GPU_BANDWIDTH_FALLBACK_GBPS)
     } else {
         SYSTEM_BANDWIDTH_GBPS
     };
@@ -530,6 +537,7 @@ mod tests {
         FitHardware {
             available_ram_gb: gb,
             vram_gb: None,
+            gpu_bandwidth_gbps: None,
             unified_memory: false,
         }
     }
@@ -539,6 +547,7 @@ mod tests {
         FitHardware {
             available_ram_gb: ram,
             vram_gb: Some(vram),
+            gpu_bandwidth_gbps: None,
             unified_memory: false,
         }
     }
@@ -775,6 +784,7 @@ mod tests {
             &FitHardware {
                 available_ram_gb: 32.0,
                 vram_gb: None,
+                gpu_bandwidth_gbps: None,
                 unified_memory: false,
             },
         );
@@ -783,11 +793,38 @@ mod tests {
             &FitHardware {
                 available_ram_gb: 32.0,
                 vram_gb: Some(24.0),
+                gpu_bandwidth_gbps: None,
                 unified_memory: false,
             },
         );
         assert!(on_gpu.est_tokens_per_sec.unwrap() > cpu.est_tokens_per_sec.unwrap());
         assert!(on_gpu.notes.iter().any(|n| n.contains("GPU-class speed")));
+    }
+
+    #[test]
+    fn a_recognised_gpu_bandwidth_calibrates_the_tok_s_estimate() {
+        // Same model, same VRAM fit — only the GPU's known bandwidth differs. A faster card must
+        // report a proportionally faster tok/s; an unknown card falls back to the flat default.
+        let spec = dense(7.0, 4096, vec![q(Quant::Q4_K_M, 4.3)]);
+        let base = FitHardware {
+            available_ram_gb: 32.0,
+            vram_gb: Some(24.0),
+            gpu_bandwidth_gbps: None, // → GPU_BANDWIDTH_FALLBACK_GBPS
+            unified_memory: false,
+        };
+        let fast = FitHardware {
+            gpu_bandwidth_gbps: Some(1008.0), // e.g. an RTX 4090
+            ..base
+        };
+        let slow = FitHardware {
+            gpu_bandwidth_gbps: Some(186.0), // e.g. an Arc A380
+            ..base
+        };
+        let tps = |hw: &FitHardware| fit(&spec, hw).est_tokens_per_sec.unwrap();
+        assert!(tps(&fast) > tps(&base)); // 1008 beats the 400 fallback
+        assert!(tps(&base) > tps(&slow)); // 400 fallback beats a genuinely slow 186 card
+                                          // Throughput scales linearly with bandwidth: 1008/186 ≈ the tok/s ratio.
+        assert!((tps(&fast) / tps(&slow) - 1008.0 / 186.0).abs() < 0.2);
     }
 
     // --- two-budget GPU-resident scoring (#457) ------------------------------------------------
@@ -817,6 +854,7 @@ mod tests {
         let hw = FitHardware {
             available_ram_gb: 24.0,
             vram_gb: Some(18.0),
+            gpu_bandwidth_gbps: None,
             unified_memory: true,
         };
         let rf = fit(&spec, &hw);
