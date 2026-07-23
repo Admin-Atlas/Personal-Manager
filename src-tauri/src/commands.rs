@@ -117,6 +117,10 @@ pub enum ChatEvent {
         message_id: i64,
         content: String,
         citations: Vec<Citation>,
+        /// Which provider actually answered this turn — `"local"` or `"cloud"` (the
+        /// `usage_log.provider` token). The per-message "via <model> - local/cloud" footer reads it
+        /// live; it is NOT persisted with the message (a reloaded history turn shows the model only).
+        served_by: String,
     },
     Error {
         message: String,
@@ -2020,6 +2024,7 @@ pub async fn send_message(
         message_id,
         content: reply,
         citations,
+        served_by: meta.provider.as_str().to_string(),
     });
     Ok(())
 }
@@ -7704,6 +7709,32 @@ mod rebuild_marker_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the chat honesty wire shape the PR6 frontend depends on: `Done` carries a `served_by`
+    /// tag ("local"/"cloud"), and `Fallback` is the adjacently-tagged snake_case variant the TS
+    /// `ChatEvent` union mirrors. A rename here would silently desync `src/lib/types.ts`.
+    #[test]
+    fn chat_event_done_and_fallback_serialize_the_honesty_fields() {
+        let done = serde_json::to_value(ChatEvent::Done {
+            message_id: 7,
+            content: "hi".into(),
+            citations: vec![],
+            served_by: "local".into(),
+        })
+        .unwrap();
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["served_by"], "local");
+
+        let fb = serde_json::to_value(ChatEvent::Fallback {
+            from_model: "llama3".into(),
+            to_model: "gpt-cloud".into(),
+            reason: "hard_failure:timeout".into(),
+        })
+        .unwrap();
+        assert_eq!(fb["type"], "fallback");
+        assert_eq!(fb["from_model"], "llama3");
+        assert_eq!(fb["reason"], "hard_failure:timeout");
+    }
 
     /// A minimal retrieved chunk for the M-7 assembler tests: only the fields the grounding payload
     /// reads matter; the chat-provenance fields stay `None`.

@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useId, useState } from "react";
-import type { Conversation } from "../lib/types";
+import type { Conversation, LocalLlmStatus } from "../lib/types";
 import { listProjects } from "../lib/ipc";
+import { shortModel } from "../lib/format";
+import { localEndpointState, LOCAL_STATE_TOKEN } from "../lib/localStatus";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme } from "../theme";
 import { Button, ConfirmDialog, Modal, NavItem, Select } from "./ui";
@@ -46,6 +48,9 @@ interface Props {
   /** How many auto-switch fallbacks are configured behind each primary (0 = none). */
   chatFallbacks: number;
   backgroundFallbacks: number;
+  /** Live local-endpoint status (#297). Adds a coloured "Local" line to the model footer — but ONLY
+   *  when an endpoint is configured; `null`/unconfigured renders nothing (zero-pixel for cloud-only). */
+  localAi: LocalLlmStatus | null;
   /** Live width (px) from the resize hook, and its drag handle + feedback (owned by App so the
    *  collapsed reopen tab can render in the sidebar's place). */
   width: number;
@@ -70,6 +75,7 @@ export function Sidebar({
   backgroundModel,
   chatFallbacks,
   backgroundFallbacks,
+  localAi,
   width,
   onStartResize,
   resizing,
@@ -290,6 +296,7 @@ export function Sidebar({
           >
             <ModelRow role="Chat" id={chatModel} fallbacks={chatFallbacks} />
             <ModelRow role="Tasks" id={backgroundModel} fallbacks={backgroundFallbacks} />
+            <LocalRow status={localAi} />
           </button>
         )}
         <button
@@ -330,9 +337,30 @@ function ModelRow({ role, id, fallbacks }: { role: string; id: string | null; fa
 }
 
 /** Drop the provider prefix for a compact label ("anthropic/claude-x" → "claude-x"). */
-function shortModel(id: string): string {
-  const slash = id.indexOf("/");
-  return slash >= 0 ? id.slice(slash + 1) : id;
+/** The local-endpoint status line in the model footer (#297). Renders NOTHING unless an endpoint is
+ *  configured (the zero-pixel contract). "resting" is the dead-host cooldown, during which background
+ *  work goes to cloud — the honest signal a user who chose local wants to see. */
+function LocalRow({ status }: { status: LocalLlmStatus | null }) {
+  const state = localEndpointState(status);
+  if (state === null) return null;
+  const label =
+    state === "connected"
+      ? "connected"
+      : state === "resting"
+        ? "resting · using cloud"
+        : "unreachable";
+  return (
+    <div className="flex items-center gap-1.5 text-xs leading-5">
+      <span className="w-9 shrink-0 font-mono text-faint">Local</span>
+      <span
+        className="min-w-0 flex-1 truncate"
+        style={{ color: `var(${LOCAL_STATE_TOKEN[state]})` }}
+        title="Local model endpoint status — click to manage in Settings"
+      >
+        {label}
+      </span>
+    </div>
+  );
 }
 
 /** The "move a chat into a project (or back to global)" picker (card B, chat transfer). Fetches the

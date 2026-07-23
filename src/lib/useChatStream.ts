@@ -4,7 +4,7 @@
 import { useCallback, useRef, useState } from "react";
 import { sendMessage } from "./ipc";
 import { useDevMode } from "./capabilities";
-import type { GroundingConfidence, Message, PromptMessage } from "./types";
+import type { ChatFallback, GroundingConfidence, Message, PromptMessage } from "./types";
 
 /**
  * Chat send + streaming state, shared by the global chat (App) and the
@@ -33,6 +33,15 @@ export function useChatStream(currentConvId: () => number | null) {
   // with the same lifecycle (kept across switches so a captured readout doesn't vanish on a tab switch),
   // for calibrating the gate.
   const [confidences, setConfidences] = useState<Record<number, GroundingConfidence>>({});
+  // Which provider actually answered each turn ("local"/"cloud"), keyed by assistant message id (from
+  // the `done` event) — the source for ChatView's per-message "via <model> - local/cloud" footer. Same
+  // lifecycle as `prompts`/`confidences`: captured live, never persisted, kept across switches (it only
+  // renders under its own turn, so a reloaded-from-history turn simply has no entry and shows model-only).
+  const [providers, setProviders] = useState<Record<number, "local" | "cloud">>({});
+  // Transient like `error`: set when a turn fell back from the preferred local endpoint to cloud (the
+  // `fallback` event, which arrives after the tokens and before `done`). Rendered as the dismissible
+  // FallbackStrip and cleared on dismiss / next send / conversation switch — NOT on `done`.
+  const [fallback, setFallback] = useState<ChatFallback | null>(null);
 
   // Keep the getter in a ref so `send` can stay stable across renders.
   const currentRef = useRef(currentConvId);
@@ -53,7 +62,12 @@ export function useChatStream(currentConvId: () => number | null) {
     setStreaming(null);
     setSending(false);
     setError(null);
+    setFallback(null);
   }, []);
+
+  /** Dismiss the fallback honesty strip (the user has seen it). Transient-only; a new send or a
+   *  conversation switch also clears it. */
+  const dismissFallback = useCallback(() => setFallback(null), []);
 
   /** Append the user's message optimistically and stream the assistant reply
    *  into `streaming`. Resolves once the exchange is persisted (whether or not
@@ -61,6 +75,7 @@ export function useChatStream(currentConvId: () => number | null) {
   const send = useCallback(async (convId: number, text: string) => {
     const isCurrent = () => currentRef.current() === convId;
     setError(null);
+    setFallback(null);
     const optimistic: Message = {
       id: -Date.now(),
       conversation_id: convId,
@@ -96,6 +111,15 @@ export function useChatStream(currentConvId: () => number | null) {
             if (p && isCurrent()) setPrompts((prev) => ({ ...prev, [event.message_id]: p }));
             const c = capturedConfidence;
             if (c && isCurrent()) setConfidences((prev) => ({ ...prev, [event.message_id]: c }));
+            if (isCurrent())
+              setProviders((prev) => ({ ...prev, [event.message_id]: event.served_by }));
+          } else if (event.type === "fallback") {
+            if (isCurrent())
+              setFallback({
+                from_model: event.from_model,
+                to_model: event.to_model,
+                reason: event.reason,
+              });
           } else if (event.type === "error" && isCurrent()) {
             setError(event.message);
           }
@@ -123,5 +147,8 @@ export function useChatStream(currentConvId: () => number | null) {
     send,
     prompts,
     confidences,
+    providers,
+    fallback,
+    dismissFallback,
   };
 }

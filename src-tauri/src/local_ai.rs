@@ -337,19 +337,25 @@ pub async fn set_local_llm_endpoint(app: AppHandle, url: String) -> Result<Strin
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     db::set_setting(&conn, LOCAL_BASE_URL_KEY, &normalized)?;
+    drop(conn);
+    // A newly-configured endpoint should light up the chat sidebar / status chip at once.
+    crate::llm_gateway::ping_status(&app);
     Ok(normalized)
 }
 
 /// Forget the local endpoint entirely: the base URL, both role models, and the token. Routing
 /// preferences are left as-is (absent base URL already makes them fall through to cloud).
 #[tauri::command]
-pub fn clear_local_llm_endpoint(state: State<'_, AppState>) -> Result<()> {
+pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
+    let state = app.state::<AppState>();
     let conn = state.conn()?;
     db::delete_setting(&conn, LOCAL_BASE_URL_KEY)?;
     db::delete_setting(&conn, LOCAL_CHAT_MODEL_KEY)?;
     db::delete_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?;
     drop(conn);
     secrets::clear_local_llm_endpoint_token()?;
+    // A forgotten endpoint should drop the chat sidebar's provider line to zero pixels at once.
+    crate::llm_gateway::ping_status(&app);
     Ok(())
 }
 

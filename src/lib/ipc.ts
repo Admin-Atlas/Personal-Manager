@@ -1264,6 +1264,13 @@ export const listLocalLlmModels = () => invoke<string[]>("list_local_llm_models"
  *  one server probe per 30s, so a fast poll can't hammer the user's server. */
 export const localLlmStatus = () => invoke<LocalLlmStatus>("local_llm_status");
 
+/** Fires when the local endpoint's health may have changed — a chat/background call succeeded or
+ *  failed (opening/closing a cooldown), or the endpoint was (re)configured or cleared. Payload-less:
+ *  the listener refetches {@link localLlmStatus} itself (which is server-side debounced). Backend
+ *  emitter: `llm_gateway::ping_status`. */
+export const onLocalLlmStatus = (handler: () => void): Promise<UnlistenFn> =>
+  listen("local-llm://status", () => handler());
+
 /** Ask the configured (Ollama) endpoint to download `model` into itself, streaming progress. Only
  *  Ollama has a native pull API — the tab shows a copy-paste command for other runners. PM downloads
  *  nothing itself; this triggers the user's own server to fetch the weights. */

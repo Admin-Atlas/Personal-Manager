@@ -15,7 +15,7 @@
 
 use std::time::Instant;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{Error, Result};
 use crate::local_slot::{
@@ -233,6 +233,19 @@ impl CallMeta {
 pub struct LlmOutcome {
     pub completion: Completion,
     pub meta: CallMeta,
+}
+
+/// Nudge any listening UI (the Local AI tab, the chat sidebar's provider line) to refetch
+/// `local_llm_status` because the local endpoint's health may have just changed — recovered to
+/// reachable, or dropped into a dead-host cooldown. A payload-less ping: the frontend reads the
+/// fresh snapshot itself, and `local_llm_status` debounces its actual probe
+/// ([`local_slot::tunables::HEALTH_PROBE_DEBOUNCE`]) so a burst of pings can't hammer the user's
+/// server. Fired only where health can transition (an Ok resets strikes; a failure may open a
+/// cooldown); cooldown EXPIRY is time-based, so the frontend also refetches once at the deadline.
+/// `pub(crate)` so the endpoint set/clear commands ([`local_ai`]) fire the same event through one
+/// owner of the name string.
+pub(crate) fn ping_status(app: &AppHandle) {
+    let _ = app.emit("local-llm://status", ());
 }
 
 /// The cloud arm's hydrated inputs: the API key and the ordered model list (auto-switch fallback).
@@ -468,6 +481,7 @@ async fn run_local_complete(
         match rt.slot.run_background(attempt).await {
             SlotOutcome::Ran(Ok(completion)) => {
                 rt.record(CallOutcome::Ok);
+                ping_status(app);
                 ensure_local_window_cached(app, local);
                 return Ok(LlmOutcome {
                     completion,
@@ -490,6 +504,7 @@ async fn run_local_complete(
             }
             SlotOutcome::Ran(Err(failure)) => {
                 rt.record(CallOutcome::for_failure(&failure.kind));
+                ping_status(app);
                 // A host that ANSWERED "model loading" is alive and warming up — recheck with a capped
                 // full-jitter backoff across the whole cold-load window, so the model completes locally
                 // (honouring a local-then-cloud user's local preference, sparing needless cloud spend)
@@ -627,6 +642,7 @@ where
     match local_result {
         Ok(completion) => {
             rt.record(CallOutcome::Ok);
+            ping_status(app);
             ensure_local_window_cached(app, local);
             Ok(LlmOutcome {
                 completion,
@@ -635,6 +651,7 @@ where
         }
         Err(failure) => {
             rt.record(CallOutcome::for_failure(&failure.kind));
+            ping_status(app);
             match cloud {
                 // Nothing shown yet — a clean fallback to cloud is safe.
                 Some(cloud) if !first => {

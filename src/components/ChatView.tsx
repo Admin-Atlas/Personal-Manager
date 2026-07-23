@@ -14,7 +14,7 @@ import type { Citation, GroundingConfidence, Message, PromptMessage } from "../l
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
-import { formatDate, formatDateLocal } from "../lib/format";
+import { formatDate, formatDateLocal, shortModel } from "../lib/format";
 import { getSettings, ingestNote, setRetrievalConfidenceThreshold } from "../lib/ipc";
 
 interface Props {
@@ -28,6 +28,13 @@ interface Props {
   /** Developer mode only: the grounding-confidence readout for a turn (top rerank score / threshold /
    *  gated), keyed by assistant message id, shown under the answer for calibrating the gate (card #402). */
   confidences?: Record<number, GroundingConfidence>;
+  /** Which provider answered each turn ("local"/"cloud"), keyed by assistant message id (#297). Live-
+   *  session only (from the `done` event) — a reloaded-from-history turn has no entry and shows the
+   *  model name alone (the provider is not persisted). */
+  providers?: Record<number, "local" | "cloud">;
+  /** Show the per-message "via <model> · local/cloud" provenance footer. True only when a local
+   *  endpoint is configured, so a cloud-only user sees no change (#297). */
+  showProvenance?: boolean;
   /** Open a past chat a citation points to, at its cited turn (board card 7E PR3). Absent in surfaces
    *  where chat citations don't navigate. */
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
@@ -345,6 +352,8 @@ const MessageBlock = memo(function MessageBlock({
   message,
   prompt,
   confidence,
+  provider,
+  showProvenance,
   showPrompt,
   onOpenChatCitation,
   highlight,
@@ -353,6 +362,8 @@ const MessageBlock = memo(function MessageBlock({
   message: Message;
   prompt?: PromptMessage[];
   confidence?: GroundingConfidence;
+  provider?: "local" | "cloud";
+  showProvenance?: boolean;
   showPrompt?: boolean;
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
   highlight?: boolean;
@@ -403,6 +414,12 @@ const MessageBlock = memo(function MessageBlock({
       {message.role === "assistant" && atLeast("standard") && message.content.trim() !== "" && (
         <SaveAsNoteButton message={message} />
       )}
+      {showProvenance && message.role === "assistant" && atLeast("standard") && message.model && (
+        <p className="px-1 text-[10px] text-faint" data-help="chat-provenance">
+          via {shortModel(message.model)}
+          {provider ? ` · ${provider}` : ""}
+        </p>
+      )}
     </div>
   );
 });
@@ -412,6 +429,8 @@ export function ChatView({
   streaming,
   prompts,
   confidences,
+  providers,
+  showProvenance,
   onOpenChatCitation,
   focusTurn,
 }: Props) {
@@ -499,6 +518,8 @@ export function ChatView({
             message={m}
             prompt={prompts?.[m.id]}
             confidence={confidences?.[m.id]}
+            provider={providers?.[m.id]}
+            showProvenance={showProvenance}
             showPrompt={devMode}
             onOpenChatCitation={openCitation}
             highlight={flashMsg === m.id}

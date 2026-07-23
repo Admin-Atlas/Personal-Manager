@@ -5,13 +5,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Composer } from "./Composer";
 import { ContextMeter } from "./ContextMeter";
+import { ProviderChip } from "./ProviderChip";
+import { FallbackStrip } from "./FallbackStrip";
 import { RetrievalExplainPanel } from "./RetrievalExplainPanel";
 import { listDocuments, listMilestones, listProjects, setDocumentMetadata } from "../lib/ipc";
 import { useResizable } from "../lib/useResizable";
 import { useSidebarSplit } from "../lib/useSidebarSplit";
 import { idleSince } from "../lib/chatSession";
 import type { ProjectChat } from "../lib/useProjectChat";
-import type { Document, Milestone } from "../lib/types";
+import type { Document, LocalLlmStatus, Milestone } from "../lib/types";
 import { Button, Input } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { MilestoneList } from "./MilestoneList";
@@ -40,6 +42,9 @@ interface Props {
   project: string;
   /** The project's scoped chat session (owned by App so the left sidebar can list it too). */
   chat: ProjectChat;
+  /** Live local-endpoint status (#297), for the chat's fallback strip / provider chip / provenance
+   *  footer. Passed from App (the single subscription); `null`/unconfigured renders nothing. */
+  localAi: LocalLlmStatus | null;
   /** A file to scroll to and briefly highlight (set by the command palette). */
   focusDocId?: number | null;
   /** Open a past chat a citation points to, at its cited turn — routes up to App's global chat view
@@ -58,6 +63,7 @@ interface Props {
 export function ProjectView({
   project,
   chat,
+  localAi,
   focusDocId,
   onOpenChatCitation,
   onUpgrade,
@@ -382,10 +388,15 @@ export function ProjectView({
               {chat.error}
             </div>
           )}
+          {chat.fallback && (
+            <FallbackStrip fallback={chat.fallback} onDismiss={chat.dismissFallback} />
+          )}
           <ChatView
             messages={chat.messages}
             prompts={chat.prompts}
             confidences={chat.confidences}
+            providers={chat.providers}
+            showProvenance={!!localAi?.configured}
             streaming={chat.streaming}
             onOpenChatCitation={onOpenChatCitation}
           />
@@ -414,11 +425,14 @@ export function ProjectView({
             disabled={chat.sending}
             onSend={chat.handleSend}
             leftTools={
-              <ContextMeter
-                conversationId={chat.convId}
-                refreshKey={chat.messages.length}
-                onUpgrade={onUpgrade}
-              />
+              <div className="flex items-center gap-2">
+                <ContextMeter
+                  conversationId={chat.convId}
+                  refreshKey={chat.messages.length}
+                  onUpgrade={onUpgrade}
+                />
+                <ProviderChip status={localAi} />
+              </div>
             }
             rightTools={<RetrievalExplainPanel messages={chat.messages} project={project} />}
           />

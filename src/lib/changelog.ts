@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.43.0-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "When you run a local model, PM now shows you which one answered — and tells you honestly when a reply came from the cloud instead. A small “Local” line in the sidebar and a pill next to the message box show whether your local model is connected, resting, or unreachable, and a gentle note appears above the chat whenever a reply had to fall back to the cloud (because the local model was busy, still loading, or couldn’t be reached). If you don’t use a local model, nothing changes.",
+    ],
+  },
+  {
     version: "3.42.0-alpha",
     date: "2026-07-23",
     highlights: [
