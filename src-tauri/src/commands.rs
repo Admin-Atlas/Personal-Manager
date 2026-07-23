@@ -6812,9 +6812,17 @@ fn adopt_restored_vault(
     // A restored device vault is already private; a passphrase vault becomes private only if asked.
     let target_private = make_private || !restored_is_passphrase;
 
-    // Re-home only a genuine restore-staging vault, and only onto a pristine home slot.
-    let is_restore_staging =
-        staging_root.starts_with(data_dir.join(crate::wipe::RESTORE_STAGING_DIR));
+    // Re-home only a genuine restore-staging vault, and only onto a pristine home slot. The
+    // staging prefix gate fronts destructive steps (vacating home, `remove_dir_all`, the relocate
+    // that deletes the source), so reject any `..` component first: `Path::starts_with` is
+    // component-wise and would otherwise let a crafted `…/restored-vaults/<ts>/../../elsewhere`
+    // satisfy the prefix while the OS resolves it out of the staging tree. A real restore target
+    // (`data_dir/restored-vaults/restore-<ts>`) never contains `..`.
+    let has_parent_traversal = staging_root
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir));
+    let is_restore_staging = !has_parent_traversal
+        && staging_root.starts_with(data_dir.join(crate::wipe::RESTORE_STAGING_DIR));
     let rehome = is_restore_staging && home_is_pristine(data_dir)?;
 
     // Vacate the pristine default so the relocate's collision guard sees a Vacant home. Only reached
