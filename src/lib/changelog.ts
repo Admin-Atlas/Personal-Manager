@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.46.1-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "The new two-way local-model sizing now treats integrated graphics honestly. On a computer whose graphics share system memory - Apple Silicon, or an AMD/Intel integrated GPU - PM no longer offers a lighter “faster on your GPU” setup that wouldn't actually be faster (there's no separate graphics memory to win from). Those machines simply see the single best setup, as they should. Computers with a real dedicated graphics card are unaffected.",
+    ],
+  },
+  {
     version: "3.46.0-alpha",
     date: "2026-07-23",
     highlights: [
