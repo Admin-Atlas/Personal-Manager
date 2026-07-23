@@ -287,16 +287,23 @@ export function LocalAiSettings() {
         data-help="settings-localai-models"
         className="mt-5 border-t border-border pt-4"
       >
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
-          Recommended models
-        </label>
+        <div className="flex items-baseline justify-between gap-2">
+          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+            Recommended models
+          </label>
+          {!loading && recs && recs.curated.length > 0 && (
+            <span className="shrink-0 text-[11px] text-ink4">
+              {recs.curated.length} in the catalog
+            </span>
+          )}
+        </div>
         <Collapsible title="What do these numbers mean?" defaultOpen={false} className="mt-2">
           <NumbersGuide />
         </Collapsible>
         {loading ? (
           <p className="mt-3 text-xs text-ink4">Sizing models against your machine…</p>
         ) : recs && recs.curated.length > 0 ? (
-          <div className="mt-3 space-y-2">
+          <div className="mt-3 max-h-80 space-y-2 overflow-y-auto pr-1">
             {recs.curated.map((rec) => (
               <RecommendationCard
                 key={rec.repo}
@@ -600,6 +607,10 @@ function NumbersGuide() {
       "Memory",
       "About how much RAM (or VRAM) the model needs loaded. It must sit under what you have free, with headroom.",
     ],
+    [
+      "MoE (mixture of experts)",
+      "A large model where only a few billion parameters fire per word. It runs at the speed of that small active part, but its whole weight still has to fit in memory — so a MoE is fast for its size, not lighter to load. Cards show both the total and the active size.",
+    ],
   ];
   return (
     <dl className="mt-1 space-y-1.5 text-xs">
@@ -635,6 +646,8 @@ function RecommendationCard({
   busy: boolean;
 }) {
   const f = rec.fit;
+  // MoE when fewer params are active per token than the model holds (matches the catalog's own rule).
+  const isMoe = rec.active_parameters_b + 0.01 < rec.parameters_b;
   const tag = ollamaTag(rec.install.ollama);
   const pct =
     pullProg && pullProg.total_bytes
@@ -647,11 +660,16 @@ function RecommendationCard({
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="text-sm font-medium text-ink">{rec.display_name}</span>
             <FitBadge verdict={f.verdict} />
+            {isMoe && <span className="text-[10px] text-ink4">MoE</span>}
             {rec.multimodal && <span className="text-[10px] text-ink4">vision</span>}
             {rec.reasoning && <span className="text-[10px] text-ink4">reasoning</span>}
+            {rec.role_hint && <span className="text-[10px] text-ink4">suits {rec.role_hint}</span>}
           </div>
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
-            <span>{rec.parameters_b}B</span>
+            <span>
+              {rec.parameters_b}B{isMoe ? " total" : ""}
+            </span>
+            {isMoe && <span>{rec.active_parameters_b}B active</span>}
             {f.quant && <span>{f.quant}</span>}
             {f.context != null && <span>{(f.context / 1024).toFixed(0)}k ctx</span>}
             {f.est_tokens_per_sec != null && <span>~{f.est_tokens_per_sec.toFixed(0)} tok/s</span>}
