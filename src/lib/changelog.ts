@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.45.1-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "Restoring a backup onto a new computer settles in properly now. When you bring a backup to a fresh machine and switch to it, PM moves the restored vault into place as your everyday vault — instead of leaving it parked in a side folder you had to shuffle files out of by hand. And if the backup was a passphrase-protected “shareable” vault, PM asks whether to make it private to this device (the usual choice — sharing is something you set up per computer, and none of that setup travels in a backup) or keep the passphrase, and it no longer carries the original computer's owner tag across. Restoring onto a computer that already has a vault, or restoring to recover the same machine, is unchanged.",
+    ],
+  },
+  {
     version: "3.45.0-alpha",
     date: "2026-07-23",
     highlights: [

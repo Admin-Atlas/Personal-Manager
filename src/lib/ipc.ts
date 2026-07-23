@@ -1128,8 +1128,12 @@ export const createLocalBackup = (destPath: string, passphrase: string) =>
 export const restoreLocalBackup = (srcPath: string, passphrase: string) =>
   invoke<RestoreSummary>("restore_local_backup", { srcPath, passphrase });
 
-/** Point this profile at a restored vault folder and open it (uses the key seeded during restore). */
-export const switchToVault = (folder: string) => invoke<void>("switch_to_vault", { folder });
+/** Point this profile at a restored vault folder and open it (uses the key seeded during restore). On a
+ *  fresh machine the vault is adopted into the profile's home location; a restored passphrase
+ *  ("shareable") vault is made private on this device when `makePrivate`, else kept passphrase-protected
+ *  (ignored for a device-mode restore). */
+export const switchToVault = (folder: string, makePrivate: boolean) =>
+  invoke<void>("switch_to_vault", { folder, makePrivate });
 
 /** The current backup/restore snapshot — restores the progress UI on return + shows the last result. */
 export const backupStatus = () => invoke<BackupState>("backup_status");

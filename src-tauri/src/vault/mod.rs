@@ -416,6 +416,24 @@ pub fn authenticate_meta(
     Ok(report)
 }
 
+/// Reconcile a freshly-adopted vault's metadata to THIS machine after a backup restore (or a
+/// relocate-home): drop any `owner_sid` the source recorded — a Windows account SID that can't be
+/// valid on the adopting machine/account (see [`is_vault_owner`]), and which off its origin account
+/// would gate connector setup against a foreign owner — then (re-)stamp the meta MAC under `master`.
+/// Clearing the MAC first makes [`authenticate_meta`] treat this as a fresh stamp, so neither the
+/// cleared owner nor a keep-passphrase adopt (which preserves the source meta verbatim, cloned MAC and
+/// all) reads as "altered outside PM" on the next open. `master` MUST already be authenticated (the DB
+/// opened with it). Idempotent: a device vault (owner already `None`) just gets a clean re-stamp.
+pub fn normalize_adopted_meta(vault_root: &Path, master: &[u8; KEY_LEN]) -> Result<()> {
+    let Some(mut meta) = load_meta(vault_root)? else {
+        return Ok(());
+    };
+    meta.owner_sid = None;
+    meta.meta_mac = None;
+    authenticate_meta(vault_root, &meta, master)?;
+    Ok(())
+}
+
 /// The resolved on-disk locations of a vault, after consulting the per-profile
 /// pointer. For the default (no pointer) these are exactly today's paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1329,6 +1347,31 @@ mod tests {
         );
         let r4 = authenticate_meta(dir.path(), &repaired, &master).unwrap();
         assert!(!r4.needs_warning(), "the re-secured meta verifies cleanly");
+    }
+
+    #[test]
+    fn normalize_adopted_meta_clears_owner_sid_and_restamps_clean() {
+        // A cross-machine restore adopts a vault whose meta carries a foreign account's `owner_sid`
+        // and a MAC computed over it. Normalizing must drop the SID and re-stamp so the very next
+        // authenticated open sees NO tampering (a stale MAC would surface a false "altered outside PM").
+        let dir = tempfile::tempdir().unwrap();
+        let master = [7u8; KEY_LEN];
+        let mut meta = VaultMeta::new_device();
+        meta.owner_sid = Some("S-1-5-21-1111111111-2222222222-3333333333-1001".into());
+        // Stamp a MAC over the owner-bearing meta, as an adopted vault would carry on disk.
+        meta.meta_mac = Some(meta_mac(&meta, &master).unwrap().to_hex().to_string());
+        store_meta(dir.path(), &meta).unwrap();
+
+        normalize_adopted_meta(dir.path(), &master).unwrap();
+
+        let after = load_meta(dir.path()).unwrap().unwrap();
+        assert_eq!(after.owner_sid, None, "the foreign owner SID is cleared");
+        assert!(after.meta_mac.is_some(), "a fresh MAC is stamped");
+        let report = authenticate_meta(dir.path(), &after, &master).unwrap();
+        assert!(
+            !report.needs_warning(),
+            "the re-stamped meta verifies cleanly (no false tamper warning)"
+        );
     }
 
     #[test]

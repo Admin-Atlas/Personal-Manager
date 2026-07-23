@@ -94,6 +94,9 @@ export function BackupSettings() {
   const [restorePass, setRestorePass] = useState("");
   const [restored, setRestored] = useState<RestoreSummary | null>(null);
   const [switching, setSwitching] = useState(false);
+  // When a restored vault was passphrase-protected ("shareable"), the user chooses on this machine:
+  // make it private (default — none of the sharing setup travels in a backup), or keep the passphrase.
+  const [restoreAsPrivate, setRestoreAsPrivate] = useState(true);
 
   // Proton Drive destination. `proton` = CLI install status (null = still checking); `conn` =
   // session status once installed; `protonBackups` = archives already on Drive.
@@ -384,7 +387,9 @@ export function BackupSettings() {
     setError(null);
     try {
       setSwitching(true);
-      await switchToVault(restored.target_dir);
+      // A device-mode restore is already private; only a passphrase restore honours the choice.
+      const makePrivate = restored.key_mode === "passphrase" ? restoreAsPrivate : true;
+      await switchToVault(restored.target_dir, makePrivate);
       // The active vault changed underneath the whole app; reload so every view re-reads it.
       window.location.reload();
     } catch (e) {
@@ -645,6 +650,39 @@ export function BackupSettings() {
             From a backup made {formatDateTime(restored.created_at)}. It&rsquo;s in a new folder;
             your current vault is still active until you switch.
           </p>
+          {restored.key_mode === "passphrase" && (
+            <fieldset className="mt-2 flex flex-col gap-1" disabled={switching}>
+              <legend className="text-xs text-ink4">
+                This backup was passphrase-protected for sharing. On this device:
+              </legend>
+              <label className="flex cursor-pointer items-start gap-2 text-xs text-ink3">
+                <input
+                  type="radio"
+                  name="restore-privacy"
+                  className="mt-0.5"
+                  checked={restoreAsPrivate}
+                  onChange={() => setRestoreAsPrivate(true)}
+                />
+                <span>
+                  <span className="text-ink2">Make it private to this device</span> — recommended;
+                  your notes are re-encrypted with a device key and open without a passphrase.
+                </span>
+              </label>
+              <label className="flex cursor-pointer items-start gap-2 text-xs text-ink3">
+                <input
+                  type="radio"
+                  name="restore-privacy"
+                  className="mt-0.5"
+                  checked={!restoreAsPrivate}
+                  onChange={() => setRestoreAsPrivate(false)}
+                />
+                <span>
+                  <span className="text-ink2">Keep it passphrase-protected</span> — notes stay
+                  encrypted at rest; you can share the vault again later.
+                </span>
+              </label>
+            </fieldset>
+          )}
           <div className="mt-2">
             <Button variant="primary" onClick={doSwitch} disabled={switching}>
               {switching ? "Switching…" : "Switch to the restored vault"}

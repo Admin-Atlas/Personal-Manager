@@ -5423,7 +5423,8 @@ pub fn open_source(app: AppHandle, state: State<'_, AppState>, doc_id: i64) -> R
 
 #[cfg(test)]
 mod vault_command_tests {
-    use super::needs_move_home;
+    use super::{home_is_pristine, needs_move_home};
+    use crate::vault;
     use std::path::Path;
 
     #[test]
@@ -5437,6 +5438,21 @@ mod vault_command_tests {
         // A vault already at (or under) the profile data dir stays put.
         assert!(!needs_move_home(data_dir, data_dir));
         assert!(!needs_move_home(&data_dir.join("vault"), data_dir));
+    }
+
+    #[test]
+    fn home_is_pristine_frees_an_empty_slot_but_never_clobbers_a_passphrase_home() {
+        // A free (no-vault) home slot is pristine — a restore may be adopted into it.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(home_is_pristine(empty.path()).unwrap());
+
+        // A passphrase ("shareable") home vault is a deliberate, real vault — refused before any DB
+        // open (so this guard needs no keychain), so a restore never overwrites it.
+        let pass = tempfile::tempdir().unwrap();
+        let mut meta = vault::VaultMeta::new_device();
+        meta.key_mode = vault::KeyMode::Passphrase;
+        vault::store_meta(pass.path(), &meta).unwrap();
+        assert!(!home_is_pristine(pass.path()).unwrap());
     }
 }
 
@@ -6749,12 +6765,132 @@ pub async fn restore_local_backup(
 /// by `restore_local_backup` into this device's keychain (`vault_key::<id>`), then opens.
 /// Works for a device-source vault too — no passphrase is needed because the restore
 /// recovered the key.
+/// Whether this profile's DEFAULT home slot holds only a pristine (empty, device-mode) vault — the one
+/// case where re-homing a restored vault may replace it. A missing vault (free slot), a passphrase
+/// (shareable) home vault, one PM can't open/inspect, or one that already holds any documents ALL read
+/// as NOT pristine, so a restore never clobbers real data — it falls back to running from its folder.
+fn home_is_pristine(data_dir: &std::path::Path) -> Result<bool> {
+    let Some(meta) = vault::load_meta(data_dir)? else {
+        return Ok(true); // no vault at the default location → the slot is free
+    };
+    if meta.key_mode != vault::KeyMode::Device {
+        return Ok(false); // a passphrase home vault is a deliberate, real vault — never clobber it
+    }
+    let Some(key) = vault::current_db_key(&meta)? else {
+        return Ok(false); // can't resolve its key → treat as real, leave it alone
+    };
+    let Ok(conn) = crate::db::open(&data_dir.join("pm.sqlite"), key.expose()) else {
+        return Ok(false); // unreadable → treat as real, never clobber
+    };
+    let has_docs: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM documents)", [], |r| r.get(0))
+        .unwrap_or(true); // on any query error, assume not-pristine
+    Ok(!has_docs)
+}
+
+/// Reconcile a just-activated restored vault to THIS machine (blocking; runs off the async thread).
+///
+/// Three things happen, in order:
+/// 1. **Re-home** — when the vault sits in the restore-staging folder AND the home slot is a pristine
+///    default vault, vacate that empty default and relocate the restored vault into the profile's
+///    default location (via the crash-safe, journaled [`migrate_vault`]), so it becomes the local
+///    vault instead of a pointer into a "staging" folder. Falls back to running from the folder when
+///    home already holds real data.
+/// 2. **Private vs passphrase** — a restored passphrase ("shareable") vault is made private on this
+///    device when `make_private` (re-key to a device key, decrypt notes at rest), or kept
+///    passphrase-protected otherwise. A restored device vault is already private.
+/// 3. **Normalize identity** — always drop the source `owner_sid` and re-stamp the meta MAC, so a
+///    foreign Windows account SID never rides along (see [`vault::normalize_adopted_meta`]).
+fn adopt_restored_vault(
+    app: &AppHandle,
+    staging_root: &std::path::Path,
+    restored_meta: &vault::VaultMeta,
+    data_dir: &std::path::Path,
+    make_private: bool,
+) -> Result<Vec<String>> {
+    let restored_is_passphrase = restored_meta.key_mode == vault::KeyMode::Passphrase;
+    // A restored device vault is already private; a passphrase vault becomes private only if asked.
+    let target_private = make_private || !restored_is_passphrase;
+
+    // Re-home only a genuine restore-staging vault, and only onto a pristine home slot. The
+    // staging prefix gate fronts destructive steps (vacating home, `remove_dir_all`, the relocate
+    // that deletes the source), so reject any `..` component first: `Path::starts_with` is
+    // component-wise and would otherwise let a crafted `…/restored-vaults/<ts>/../../elsewhere`
+    // satisfy the prefix while the OS resolves it out of the staging tree. A real restore target
+    // (`data_dir/restored-vaults/restore-<ts>`) never contains `..`.
+    let has_parent_traversal = staging_root
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir));
+    let is_restore_staging = !has_parent_traversal
+        && staging_root.starts_with(data_dir.join(crate::wipe::RESTORE_STAGING_DIR));
+    let rehome = is_restore_staging && home_is_pristine(data_dir)?;
+
+    // Vacate the pristine default so the relocate's collision guard sees a Vacant home. Only reached
+    // once `home_is_pristine` has confirmed it's an empty device vault — safe to drop.
+    if rehome {
+        crate::vault::migrate::delete_vault_artifacts(data_dir);
+    }
+
+    let mut warnings = Vec::new();
+    // Migrate when re-homing (a location move) or when converting a passphrase vault to private. A
+    // keep-passphrase-in-place restore needs no migration — only the identity normalize below.
+    let needs_migration = rehome || (target_private && restored_is_passphrase);
+    if needs_migration {
+        let target_location = rehome.then(|| data_dir.to_path_buf());
+        let plan = if target_private {
+            crate::vault::migrate::MigrationPlan {
+                target_key_mode: vault::KeyMode::Device,
+                new_passphrase: None,
+                target_markdown: vault::MarkdownEncryption::None,
+                target_location,
+            }
+        } else {
+            crate::vault::migrate::MigrationPlan {
+                target_key_mode: vault::KeyMode::Passphrase,
+                new_passphrase: None, // keep the restored key — this is a location move only
+                target_markdown: vault::MarkdownEncryption::XChaCha20Poly1305,
+                target_location,
+            }
+        };
+        warnings = crate::vault::migrate::migrate_vault(app, plan)?;
+    }
+
+    // Normalize the FINAL vault's metadata (owner_sid + MAC). `resolve` reads the pointer, which the
+    // relocate flipped to the home location (or which still names the staging folder when not re-homed).
+    let final_resolved = vault::resolve(app)?;
+    if let Some(final_meta) = vault::load_meta(&final_resolved.vault_root)? {
+        if let Some(key) = vault::current_db_key(&final_meta)? {
+            let master = vault::master_from_db_key_hex(key.expose())?;
+            vault::normalize_adopted_meta(&final_resolved.vault_root, &master)?;
+        }
+    }
+
+    // A re-home lands the vault at the default location — drop the (now-redundant) pointer so the UI
+    // treats it as the local vault, not a "pointed"/joined one, and clear the emptied staging folder.
+    if rehome {
+        let _ = vault::pointer::clear(data_dir);
+        let _ = std::fs::remove_dir_all(staging_root);
+    }
+
+    Ok(warnings)
+}
+
+/// Commit a restored (or otherwise relocated) vault as this profile's active vault, then reconcile it
+/// to this machine. `make_private` decides whether a restored passphrase ("shareable") vault is made
+/// private on this device or kept passphrase-protected (ignored for a device-mode restore). The key
+/// stashed in memory by the restore is promoted to the keychain here — the deliberate commit point.
 #[tauri::command]
-pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: String) -> Result<()> {
+pub async fn switch_to_vault(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder: String,
+    make_private: bool,
+) -> Result<()> {
     // L-5: `folder` is a webview string pointing at an existing vault folder — require a real,
     // absolute, well-formed location before we open `folder/pm.sqlite` and promote its key.
     pathguard::sanitize_source(&folder)?;
     let root = std::path::PathBuf::from(&folder);
+    let data_dir = paths::data_dir(&app)?;
     let meta = vault::load_meta(&root)?
         .ok_or_else(|| Error::Other("no PM vault found in that folder".into()))?;
     // If this folder was just restored, promote its stashed key into the keychain NOW (the
@@ -6783,8 +6919,23 @@ pub fn switch_to_vault(app: AppHandle, state: State<'_, AppState>, folder: Strin
     // Point this profile here, then install the new session — `attach_profile_here`
     // stores the pointer first (the next launch reads it), and `open_session` swaps
     // `db` + `vault` together and drops the old connection, so there's no
-    // locked-in-between window.
-    attach_profile_here(&app, &state, root, conn, runtime)?;
+    // locked-in-between window. This makes the restored vault the active vault that
+    // `adopt_restored_vault` then re-homes / normalizes.
+    attach_profile_here(&app, &state, root.clone(), conn, runtime)?;
+
+    // Reconcile to this machine (re-home + private/normalize). Heavy work (a full re-key / copy) runs
+    // off the async runtime thread; it reads `AppState` back through the `AppHandle`, like the other
+    // migration commands.
+    let app2 = app.clone();
+    let mut warnings = tokio::task::spawn_blocking(move || {
+        adopt_restored_vault(&app2, &root, &meta, &data_dir, make_private)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("adopt task panicked: {e}")))??;
+    // Re-engage the writer lock for the final (possibly relocated) vault — best-effort, mirroring the
+    // other mode-change commands (a device vault needs none; a passphrase vault does).
+    engage_or_warn(&app, &mut warnings);
+
     // Committed: drop the staged-restore banner so a reopened Backup panel doesn't offer to
     // "switch" to the vault that's now already active.
     if let Ok(mut snap) = state.backup_state.lock() {
