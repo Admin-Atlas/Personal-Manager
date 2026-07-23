@@ -185,13 +185,21 @@ Actions secrets and macOS builds sign + notarize automatically, with no code cha
 
 ## Installing on Linux
 
-Two formats ship per release, both x86_64:
+Three formats ship per release, all x86_64 — pick one:
 
-- **AppImage** (recommended — it auto-updates like the Windows build): download,
-  `chmod +x PM_*.AppImage`, run. If your distro lacks FUSE (recent Fedora minimal
-  installs), either `sudo dnf install fuse` or run with `--appimage-extract-and-run`.
-- **rpm** (Fedora/RHEL): `sudo dnf install ./PM-*.rpm`. Package-manager installs update
-  via the next release's rpm — the in-app auto-updater only covers the AppImage.
+- **AppImage** (any distro; the only self-updating format — it auto-updates like the
+  Windows build): download, `chmod +x PM_*.AppImage`, run. Keep it somewhere you own
+  (e.g. `~/Applications/`) so it can replace itself in place. If your distro lacks FUSE
+  (recent Fedora minimal installs), either `sudo dnf install fuse` (Fedora) /
+  `sudo apt install libfuse2` (Debian/Ubuntu) or run with `--appimage-extract-and-run`.
+- **rpm** (Fedora/RHEL/openSUSE): `sudo dnf install ./PM-*.rpm` — adds a menu entry and
+  icon; the downloaded file is disposable afterwards.
+- **deb** (Debian/Ubuntu/Mint): `sudo apt install ./pm_*.deb` — same as the rpm.
+
+A **package** install (rpm/deb) can't self-update: the in-app updater only replaces an
+AppImage in place, so PM detects a package install and, rather than a doomed auto-update,
+shows a "reinstall to update" note linking to the releases page. Update by installing the
+next release's package.
 
 Two Linux-specific notes:
 
@@ -200,12 +208,12 @@ Two Linux-specific notes:
   mainstream desktop provides one; expect a one-time wallet/keyring prompt on first
   launch. On a minimal window-manager setup you must run one yourself, or PM cannot
   store the key that protects its database.
-- **Uninstalling** (rpm removal or deleting the AppImage) leaves PM's data —
+- **Uninstalling** (rpm/deb removal or deleting the AppImage) leaves PM's data —
   including the multi-hundred-MB regenerable `runtime/` (Python venv + models) —
   under `~/.local/share/Personal Manager`. Free it from **Settings → Storage**, use
   **Settings → Remove PM data** before uninstalling, or delete the folder by hand.
-  (An rpm `%postun` script is deliberately not used: it runs as root and can't safely
-  enumerate per-user data.)
+  (An rpm `%postun` / deb maintainer script is deliberately not used: it runs as root
+  and can't safely enumerate per-user data.)
 
 ## Moving between computers (Windows ↔ Linux ↔ macOS)
 

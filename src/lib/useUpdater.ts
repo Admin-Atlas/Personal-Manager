@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
-import { smartAppControlState } from "./ipc";
+import { smartAppControlState, packageManagedLinux } from "./ipc";
 import type { SmartAppControlState } from "./types";
 import { evaluateAttemptMarker } from "./updateGate";
 
@@ -19,6 +19,13 @@ import { evaluateAttemptMarker } from "./updateGate";
  * Every step is best-effort: offline, dev builds (no signature), or a malformed
  * feed all just leave the app in the "idle" state with no visible error — the
  * check simply runs again next launch.
+ *
+ * Linux caveat this hook defends against: Tauri's updater applies an update by replacing the
+ * running AppImage in place (found via the `APPIMAGE` env var). A package install (rpm/deb) sets
+ * no such variable, but `check()` compares versions only — so a package install is still offered
+ * the AppImage update and would silently download the whole thing before `install()` fails. We ask
+ * the backend up front whether this is a package install and, if so, skip the download entirely and
+ * surface a "reinstall to update" banner pointing at the releases page instead.
  *
  * Windows caveat this hook defends against: our installer is an unsigned NSIS setup, and
  * the updater plugin applies an update by launching it and exiting the process WITHOUT
@@ -56,6 +63,10 @@ export interface AppUpdate {
    *  version and the feed is re-offering the same update) — the banner warns instead of
    *  looping a download-and-fail. */
   blockedByPriorAttempt: boolean;
+  /** True on a Linux package install (rpm/deb), which the in-app updater can't apply in place.
+   *  The banner then invites a reinstall from the releases page rather than a restart, and no
+   *  AppImage is downloaded. False on Windows, macOS, and the Linux AppImage. */
+  packageManaged: boolean;
   /** The releases page for the manual-download fallback. */
   releasesUrl: string;
   restart: () => void;
@@ -74,6 +85,7 @@ export function useUpdater(): AppUpdate {
   const [installFailed, setInstallFailed] = useState(false);
   const [sac, setSac] = useState<SmartAppControlState>("unknown");
   const [blockedByPriorAttempt, setBlockedByPriorAttempt] = useState(false);
+  const [packageManaged, setPackageManaged] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,6 +97,16 @@ export function useUpdater(): AppUpdate {
         if (!cancelled) setSac(s);
       } catch {
         // Leave "unknown" — the UI treats that as "proceed normally".
+      }
+
+      // Is this a Linux package install (rpm/deb)? Independent of whether an update exists, and
+      // best-effort — default false (behave as a self-updating build) if the query fails.
+      let pkg = false;
+      try {
+        pkg = await packageManagedLinux();
+        if (!cancelled) setPackageManaged(pkg);
+      } catch {
+        // Leave false — treat as self-updating.
       }
 
       let running = "";
@@ -118,8 +140,16 @@ export function useUpdater(): AppUpdate {
 
       if (!found || cancelled) return;
 
-      setUpdate(found);
       setVersion(found.version);
+
+      // A Linux package install can't be updated in place by the plugin — don't download the
+      // AppImage (it would only fail to apply). Surface a "reinstall to update" banner instead.
+      if (pkg) {
+        setStatus("ready");
+        return;
+      }
+
+      setUpdate(found);
       setStatus("downloading");
 
       try {
@@ -212,6 +242,7 @@ export function useUpdater(): AppUpdate {
     installFailed,
     sac,
     blockedByPriorAttempt,
+    packageManaged,
     releasesUrl: RELEASES_URL,
     restart,
     dismiss,

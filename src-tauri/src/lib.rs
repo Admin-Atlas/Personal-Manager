@@ -92,6 +92,7 @@ mod sidecar_stage;
 mod smart_app_control;
 mod splitter;
 mod spreadsheets;
+mod update_delivery;
 mod vault;
 mod wipe;
 
@@ -1322,6 +1323,7 @@ pub fn run() {
             commands::backup_to_gdrive,
             commands::restore_from_gdrive,
             commands::smart_app_control_state,
+            commands::package_managed_linux,
             // Developer mode (issue #78) — read-only inspection. Always registered (the
             // commands are harmless reads); only the UI is gated by the runtime `devMode`.
             commands_dev::dev_system_info,
