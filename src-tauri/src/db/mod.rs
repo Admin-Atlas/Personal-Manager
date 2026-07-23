@@ -52,6 +52,23 @@ pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read a boolean `settings` value stored as `"true"`/`"false"`, using `default` when the key is
+/// absent or holds anything else. The one true reader for the on/off toggles that used to hand-roll
+/// `== Some("true")` at each call site.
+pub fn get_bool(conn: &Connection, key: &str, default: bool) -> Result<bool> {
+    Ok(match get_setting(conn, key)?.as_deref() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => default,
+    })
+}
+
+/// Persist a boolean `settings` value as `"true"`/`"false"` — the writer paired with [`get_bool`],
+/// replacing the hand-rolled `if enabled { "true" } else { "false" }` sites.
+pub fn set_bool(conn: &Connection, key: &str, value: bool) -> Result<()> {
+    set_setting(conn, key, if value { "true" } else { "false" })
+}
+
 /// Settings key for the indexing-speed preference: "fast" (default, max throughput) or "gentle"
 /// (paced so a low-end machine stays usable while it indexes in the background).
 pub const INDEXING_SPEED_KEY: &str = "indexing_speed";
@@ -147,11 +164,7 @@ pub fn reranking_enabled(conn: &Connection) -> Result<bool> {
 
 /// Turn query-time reranking on or off (stateless — never triggers a Rebuild).
 pub fn set_reranking(conn: &Connection, enabled: bool) -> Result<()> {
-    set_setting(
-        conn,
-        RERANKING_ENABLED_KEY,
-        if enabled { "true" } else { "false" },
-    )
+    set_bool(conn, RERANKING_ENABLED_KEY, enabled)
 }
 
 /// The `settings` key for the retrieval depth `k` — how many fused candidates survive to the

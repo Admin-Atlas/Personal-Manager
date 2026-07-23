@@ -17,10 +17,6 @@ use std::time::Instant;
 
 use tauri::{AppHandle, Manager};
 
-use crate::commands::{
-    effective_models, BACKGROUND_AUTO_SWITCH_KEY, BACKGROUND_MODELS_KEY, CHAT_AUTO_SWITCH_KEY,
-    CHAT_MODELS_KEY,
-};
 use crate::error::{Error, Result};
 use crate::local_slot::{
     loading_retry_backoff, preemption_retry_delay, tunables, CallOutcome, SlotOutcome,
@@ -28,6 +24,10 @@ use crate::local_slot::{
 use crate::openai_compat::{self, LocalFailKind, LocalFailure};
 use crate::openrouter::{self, ChatMessage, Completion};
 use crate::secret::Secret;
+use crate::settings::{
+    effective_models, BACKGROUND_AUTO_SWITCH_KEY, BACKGROUND_MODELS_KEY, CHAT_AUTO_SWITCH_KEY,
+    CHAT_MODELS_KEY,
+};
 use crate::{db, secrets, AppState};
 
 /// Which of PM's two AI roles a request belongs to. Chat is the interactive, user-facing model;
