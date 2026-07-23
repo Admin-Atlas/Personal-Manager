@@ -561,7 +561,7 @@ function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
     [
       "Graphics",
       h.gpu_name
-        ? `${h.gpu_name}${h.vram_gb ? ` · ${fmtGb(h.vram_gb)}${h.unified_memory ? " unified" : " VRAM"}` : ""}`
+        ? `${h.gpu_name}${h.vram_gb ? ` · ${fmtGb(h.vram_gb)}${h.unified_memory ? " unified" : " VRAM"}` : ""}${h.gpu_bandwidth_gbps ? ` · ~${h.gpu_bandwidth_gbps.toFixed(0)} GB/s` : ""}`
         : "No dedicated GPU detected",
     ],
     ["Free disk", fmtGb(h.disk_free_gb)],
@@ -586,6 +586,12 @@ function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
         <p className="mt-1.5 text-xs text-faint">
           Sized with ~{recs.reserve_gb.toFixed(0)} GB of RAM and ~{recs.gpu_reserve_gb.toFixed(0)}{" "}
           GB of GPU memory kept free.
+        </p>
+      )}
+      {h.vram_gb != null && !h.unified_memory && h.gpu_bandwidth_gbps == null && (
+        <p className="mt-1.5 text-xs text-faint">
+          Speed estimates use a default graphics-memory bandwidth — this card's exact model wasn't
+          recognised.
         </p>
       )}
     </div>

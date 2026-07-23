@@ -53,6 +53,11 @@ pub struct Hardware {
     pub vram_gb: Option<f64>,
     /// How VRAM was read: `nvidia-smi` | `dxgi` | `adapter_ram` | `apple_unified` | `amd_sysfs`.
     pub vram_source: Option<String>,
+    /// The GPU's peak memory bandwidth (GB/s), matched from its name against a curated table, when
+    /// recognised. `None` = an unlisted card (or a probe that only reports a generic name, e.g. Linux
+    /// `nvidia-smi`): fit-scoring falls back to a flat default for the speed estimate. Sharpens the
+    /// display-only tok/s only — never the fit verdict.
+    pub gpu_bandwidth_gbps: Option<f64>,
     /// Apple-Silicon-style shared CPU/GPU memory (VRAM is a slice of system RAM, not separate).
     pub unified_memory: bool,
     pub is_wsl: bool,
@@ -89,6 +94,15 @@ pub fn scan(data_dir: Option<&std::path::Path>) -> Hardware {
     hw.vram_source = gpu.source;
     hw.unified_memory = gpu.unified;
     hw.notes.extend(gpu.notes);
+
+    // Calibrate the GPU speed estimate to the actual card, when its name is specific enough to match
+    // the curated bandwidth table (Windows reports full model names; a generic "NVIDIA GPU" from the
+    // Linux probe won't match and falls back to the flat default — honest, never a wrong number). VRAM
+    // disambiguates the few names that ship two bandwidths (RTX 3060/3080, Arc A770).
+    hw.gpu_bandwidth_gbps = hw
+        .gpu_name
+        .as_deref()
+        .and_then(|name| gpu_bandwidth_gbps(name, hw.vram_gb));
 
     hw
 }
@@ -608,6 +622,180 @@ fn pci_bus_is_integrated(link_target: &str) -> bool {
         .is_some_and(|bus| bus == "00")
 }
 
+// --- GPU memory bandwidth: name (+ VRAM) → GB/s, for the tok/s speed estimate ------------------
+//
+// Peak theoretical VRAM bandwidth (GB/s) per discrete GPU, from manufacturer / TechPowerUp specs
+// (verified 2026-07). Decode of a memory-bound LLM runs at ~bandwidth / active-weight-bytes-per-token,
+// so a real per-card number turns fit.rs's flat 400-GB/s placeholder into a card-specific estimate (an
+// RTX 4090 ≈ 1008 vs an Arc A380 ≈ 186). Maintenance notes:
+//   * Keys are normalised (see `normalize_gpu_name`): lowercase, every non-alphanumeric run collapsed
+//     to one space. Match is substring containment, LONGEST key first, so "rtx 4080 super" beats the
+//     "rtx 4080" it contains, and "rx 7900 xtx" beats "rx 7900 xt". Add specific-before-generic; the
+//     longest-match rule handles the overlap.
+//   * A few marketing names ship two bandwidths that differ by memory capacity (RTX 3060, RTX 3080,
+//     Arc A770). Those use [`Bandwidth::ByVram`] and are resolved with the probed VRAM; when VRAM is
+//     unknown we return `None` (flat fallback) rather than guess the variant.
+//   * Discrete only. Integrated GPUs are flagged `unified_memory` and never reach the GPU-speed path;
+//     Apple Silicon reports a generic name and stays on the default too (its bandwidth spans M1→Ultra).
+//     Datacenter parts (A100/H100) are deliberately omitted — no PM desktop runs one, and their
+//     SXM-vs-PCIe name variants would only add substring hazards.
+#[derive(Debug, Clone, Copy)]
+enum Bandwidth {
+    /// One bandwidth for every card that reports this name.
+    Fixed(f64),
+    /// `high` GB/s at/above `threshold_gb` of VRAM, else `low` — for a name whose bus width (hence
+    /// bandwidth) differs by memory capacity, disambiguated by the probed VRAM.
+    ByVram {
+        threshold_gb: f64,
+        high: f64,
+        low: f64,
+    },
+}
+
+const GPU_BANDWIDTH_TABLE: &[(&str, Bandwidth)] = &[
+    // ---- NVIDIA GeForce RTX 50-series ----
+    ("rtx 5090", Bandwidth::Fixed(1792.0)),
+    ("rtx 5080", Bandwidth::Fixed(960.0)),
+    ("rtx 5070 ti", Bandwidth::Fixed(896.0)),
+    ("rtx 5070", Bandwidth::Fixed(672.0)),
+    ("rtx 5060 ti", Bandwidth::Fixed(448.0)), // 8 GB and 16 GB both 448
+    ("rtx 5060", Bandwidth::Fixed(448.0)),
+    // ---- NVIDIA GeForce RTX 40-series ----
+    ("rtx 4090", Bandwidth::Fixed(1008.0)),
+    ("rtx 4080 super", Bandwidth::Fixed(736.0)),
+    ("rtx 4080", Bandwidth::Fixed(717.0)),
+    ("rtx 4070 ti super", Bandwidth::Fixed(672.0)),
+    ("rtx 4070 ti", Bandwidth::Fixed(504.0)),
+    ("rtx 4070 super", Bandwidth::Fixed(504.0)),
+    ("rtx 4070", Bandwidth::Fixed(504.0)),
+    ("rtx 4060 ti", Bandwidth::Fixed(288.0)), // 8 GB and 16 GB both 288
+    ("rtx 4060", Bandwidth::Fixed(272.0)),
+    // ---- NVIDIA GeForce RTX 30-series ----
+    ("rtx 3090 ti", Bandwidth::Fixed(1008.0)),
+    ("rtx 3090", Bandwidth::Fixed(936.0)),
+    ("rtx 3080 ti", Bandwidth::Fixed(912.0)),
+    (
+        "rtx 3080",
+        Bandwidth::ByVram {
+            threshold_gb: 11.0,
+            high: 912.0,
+            low: 760.0,
+        },
+    ), // 12 GB = 912, 10 GB = 760
+    ("rtx 3070 ti", Bandwidth::Fixed(608.0)),
+    ("rtx 3070", Bandwidth::Fixed(448.0)),
+    ("rtx 3060 ti", Bandwidth::Fixed(448.0)),
+    (
+        "rtx 3060",
+        Bandwidth::ByVram {
+            threshold_gb: 10.0,
+            high: 360.0,
+            low: 240.0,
+        },
+    ), // 12 GB = 360, 8 GB = 240
+    ("rtx 3050", Bandwidth::Fixed(224.0)),
+    // ---- NVIDIA GeForce RTX 20-series ----
+    ("rtx 2080 ti", Bandwidth::Fixed(616.0)),
+    ("rtx 2080 super", Bandwidth::Fixed(496.0)),
+    ("rtx 2070 super", Bandwidth::Fixed(448.0)),
+    ("rtx 2060", Bandwidth::Fixed(336.0)),
+    // ---- NVIDIA single-GPU workstation ----
+    ("rtx 6000 ada", Bandwidth::Fixed(960.0)),
+    ("rtx a6000", Bandwidth::Fixed(768.0)),
+    ("rtx a5000", Bandwidth::Fixed(768.0)),
+    ("rtx a4000", Bandwidth::Fixed(448.0)),
+    ("l40s", Bandwidth::Fixed(864.0)),
+    // ---- AMD Radeon RX 9000 / 7000 ----
+    ("radeon rx 9070 xt", Bandwidth::Fixed(640.0)),
+    ("radeon rx 9070", Bandwidth::Fixed(640.0)),
+    ("radeon rx 7900 xtx", Bandwidth::Fixed(960.0)),
+    ("radeon rx 7900 xt", Bandwidth::Fixed(800.0)),
+    ("radeon rx 7900 gre", Bandwidth::Fixed(576.0)),
+    ("radeon rx 7800 xt", Bandwidth::Fixed(624.0)),
+    ("radeon rx 7700 xt", Bandwidth::Fixed(432.0)),
+    ("radeon rx 7600", Bandwidth::Fixed(288.0)),
+    // ---- AMD Radeon RX 6000 ----
+    ("radeon rx 6950 xt", Bandwidth::Fixed(576.0)),
+    ("radeon rx 6900 xt", Bandwidth::Fixed(512.0)),
+    ("radeon rx 6800 xt", Bandwidth::Fixed(512.0)),
+    ("radeon rx 6800", Bandwidth::Fixed(512.0)),
+    ("radeon rx 6750 xt", Bandwidth::Fixed(432.0)),
+    ("radeon rx 6700 xt", Bandwidth::Fixed(384.0)),
+    ("radeon rx 6600 xt", Bandwidth::Fixed(256.0)),
+    ("radeon rx 6600", Bandwidth::Fixed(224.0)),
+    ("radeon pro w7900", Bandwidth::Fixed(864.0)),
+    ("radeon pro w7800", Bandwidth::Fixed(576.0)),
+    // ---- Intel Arc ----
+    ("arc b580", Bandwidth::Fixed(456.0)),
+    ("arc b570", Bandwidth::Fixed(380.0)),
+    (
+        "arc a770",
+        Bandwidth::ByVram {
+            threshold_gb: 12.0,
+            high: 560.0,
+            low: 512.0,
+        },
+    ), // 16 GB = 560, 8 GB = 512
+    ("arc a750", Bandwidth::Fixed(512.0)),
+    ("arc a580", Bandwidth::Fixed(512.0)),
+    ("arc a380", Bandwidth::Fixed(186.0)),
+    ("arc a310", Bandwidth::Fixed(124.0)),
+];
+
+/// Normalise a GPU name for table matching: lowercase, and collapse every run of non-alphanumeric
+/// characters (spaces, `(R)`, `(TM)`, hyphens, punctuation) to a single space. So `"AMD Radeon(TM) RX
+/// 7900 XTX"` and `"Intel(R) Arc(TM) A770 Graphics"` reduce to `"amd radeon rx 7900 xtx"` / `"intel arc
+/// a770 graphics"`, which the model-token keys (`"radeon rx 7900 xtx"`, `"arc a770"`) match by
+/// containment.
+fn normalize_gpu_name(name: &str) -> String {
+    // Drop the trademark markers FIRST: their letters (`(TM)` → `tm`, `(R)` → `r`) would otherwise
+    // survive as tokens wedged between the model words and break substring matching.
+    let cleaned = name
+        .to_ascii_lowercase()
+        .replace("(tm)", " ")
+        .replace("(r)", " ")
+        .replace(['™', '®'], " ");
+    let mut out = String::with_capacity(cleaned.len());
+    let mut prev_space = true; // leading true → no leading space
+    for c in cleaned.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// The best (longest, most specific) bandwidth entry whose key is a substring of the normalised name —
+/// so `"rtx 4080 super"` wins over the `"rtx 4080"` it contains. Returns the unresolved [`Bandwidth`]
+/// (a `ByVram` entry still needs the VRAM to pick a number). `table` is a parameter so the match logic
+/// is unit-testable independent of the real data.
+fn match_bandwidth(name: &str, table: &[(&str, Bandwidth)]) -> Option<Bandwidth> {
+    let n = normalize_gpu_name(name);
+    table
+        .iter()
+        .filter(|(key, _)| n.contains(key))
+        .max_by_key(|(key, _)| key.len())
+        .map(|&(_, bw)| bw)
+}
+
+/// The GPU's peak memory bandwidth (GB/s) from its reported name and VRAM, or `None` for an
+/// unrecognised card — or a capacity-ambiguous one whose VRAM we couldn't read (the caller then falls
+/// back to fit-scoring's flat default). Pure; safe on every platform.
+pub fn gpu_bandwidth_gbps(name: &str, vram_gb: Option<f64>) -> Option<f64> {
+    match match_bandwidth(name, GPU_BANDWIDTH_TABLE)? {
+        Bandwidth::Fixed(gbps) => Some(gbps),
+        Bandwidth::ByVram {
+            threshold_gb,
+            high,
+            low,
+        } => vram_gb.map(|v| if v >= threshold_gb { high } else { low }),
+    }
+}
+
 fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
@@ -792,6 +980,95 @@ mod tests {
         assert_eq!(vendor_from_pci_id(0x8086).as_deref(), Some("Intel"));
         assert_eq!(vendor_from_pci_id(0x1414), None); // Microsoft WARP
         assert_eq!(vendor_from_pci_id(0), None);
+    }
+
+    #[test]
+    fn normalize_gpu_name_strips_vendor_noise_and_collapses_space() {
+        assert_eq!(
+            normalize_gpu_name("AMD Radeon(TM) RX 7900 XTX"),
+            "amd radeon rx 7900 xtx"
+        );
+        assert_eq!(
+            normalize_gpu_name("Intel(R) Arc(TM) A770 Graphics"),
+            "intel arc a770 graphics"
+        );
+        assert_eq!(
+            normalize_gpu_name("  NVIDIA   GeForce  RTX 4090 "),
+            "nvidia geforce rtx 4090"
+        );
+    }
+
+    #[test]
+    fn bandwidth_prefers_the_more_specific_model_name() {
+        // Longest-match on real data: "4080 super" (736) must beat the "rtx 4080" (717) it contains,
+        // and "7900 xtx" (960) must beat the "7900 xt" (800) it contains — the two classic collisions.
+        let v = Some(16.0);
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 4080 SUPER", v),
+            Some(736.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 4080", v),
+            Some(717.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("AMD Radeon RX 7900 XTX", Some(24.0)),
+            Some(960.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("AMD Radeon RX 7900 XT", Some(20.0)),
+            Some(800.0)
+        );
+    }
+
+    #[test]
+    fn bandwidth_disambiguates_shared_names_by_vram() {
+        // Same reported name, two bus widths → the probed VRAM picks the variant.
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 3060", Some(12.0)),
+            Some(360.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 3060", Some(8.0)),
+            Some(240.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 3080", Some(12.0)),
+            Some(912.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 3080", Some(10.0)),
+            Some(760.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("Intel(R) Arc(TM) A770 Graphics", Some(16.0)),
+            Some(560.0)
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("Intel(R) Arc(TM) A770 Graphics", Some(8.0)),
+            Some(512.0)
+        );
+        // A 3080 Ti still resolves to its own fixed value (the more specific key wins over "rtx 3080").
+        assert_eq!(
+            gpu_bandwidth_gbps("NVIDIA GeForce RTX 3080 Ti", Some(12.0)),
+            Some(912.0)
+        );
+        // Ambiguous name with unreadable VRAM → don't guess the variant → flat fallback.
+        assert_eq!(gpu_bandwidth_gbps("NVIDIA GeForce RTX 3060", None), None);
+    }
+
+    #[test]
+    fn unknown_or_generic_gpu_has_no_calibrated_bandwidth() {
+        // A generic name (Linux nvidia-smi) or an unlisted card → None → fit-scoring's flat default.
+        assert_eq!(gpu_bandwidth_gbps("NVIDIA GPU", Some(24.0)), None);
+        assert_eq!(
+            gpu_bandwidth_gbps("Some Unlisted Card 9999", Some(8.0)),
+            None
+        );
+        assert_eq!(
+            gpu_bandwidth_gbps("Intel(R) Arc(TM) Graphics", Some(2.0)),
+            None
+        ); // Core-Ultra iGPU
     }
 
     #[test]

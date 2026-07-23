@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.49.0-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "The Local AI speed estimates now match your actual graphics card. Before, PM assumed the same middle-of-the-road speed for every dedicated GPU, so a fast card and a modest one showed the same tokens-per-second guess. PM now looks up your card's real memory bandwidth — the thing that most governs how fast a local model replies — so the estimate reflects what you actually have (a high-end card reads its memory several times quicker than an entry-level one). Where one card name ships in two memory sizes that run at different speeds, PM uses your card's memory to tell them apart. If your exact card isn't recognised, PM says so and falls back to the old general estimate rather than guess. This only sharpens the speed number on the model cards — it never changes which models fit.",
+    ],
+  },
+  {
     version: "3.48.0-alpha",
     date: "2026-07-23",
     highlights: [
