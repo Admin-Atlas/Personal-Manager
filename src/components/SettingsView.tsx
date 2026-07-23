@@ -18,6 +18,7 @@ import {
 } from "../lib/ipc";
 import { BackupSettings } from "./BackupSettings";
 import { ConnectorsSettings } from "./ConnectorsSettings";
+import { LocalAiSettings } from "./localai/LocalAiSettings";
 import { AiModelsSettings } from "./settings/AiModelsSettings";
 import { DataSecuritySettings } from "./settings/DataSecuritySettings";
 import { DeveloperSettings } from "./settings/DeveloperSettings";
@@ -470,6 +471,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
             {tab === "general" && <GeneralSettings />}
 
             {tab === "ai" && <AiModelsSettings />}
+
+            {tab === "localai" && <LocalAiSettings />}
 
             {tab === "search" && <SearchSettings />}
 

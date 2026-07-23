@@ -1,0 +1,846 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { useEffect, useState } from "react";
+
+import {
+  checkLocalLlmEndpoint,
+  clearLocalLlmEndpoint,
+  getLocalLlmConfig,
+  listLocalLlmModels,
+  localHardwareScan,
+  localLlmStatus,
+  localModelRecommendations,
+  probeLocalLlmPorts,
+  pullLocalModel,
+  setLocalLlmEndpoint,
+  setLocalLlmRoleModel,
+  setLocalLlmRouting,
+  setLocalLlmToken,
+} from "../../lib/ipc";
+import type {
+  DetectedEndpoint,
+  EndpointCheck,
+  LocalFitVerdict,
+  LocalLlmConfig,
+  LocalLlmStatus,
+  LocalRecommendation,
+  LocalRecommendations,
+  PullProgress,
+} from "../../lib/types";
+import { ollamaGuide } from "../../lib/workbenchGuide";
+import { Button, Collapsible, Input, SectionInfo, Select } from "../ui";
+
+/** The Local AI tab (#296): read this machine's hardware, size a curated model catalog against it,
+ *  and turn on the local-endpoint provider (#297) — connect a local server, assign it to the chat /
+ *  background roles, with cloud fallback. Self-contained and immediate-persist; errors surface inline.
+ *  Frontend-only over existing backend commands, plus the one streaming Ollama pull. */
+export function LocalAiSettings() {
+  const [recs, setRecs] = useState<LocalRecommendations | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [rescanning, setRescanning] = useState(false);
+  const [config, setConfig] = useState<LocalLlmConfig | null>(null);
+  const [status, setStatus] = useState<LocalLlmStatus | null>(null);
+  const [served, setServed] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  // Endpoint form.
+  const [urlInput, setUrlInput] = useState("");
+  const [detected, setDetected] = useState<DetectedEndpoint[] | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [check, setCheck] = useState<EndpointCheck | null>(null);
+  const [tokenInput, setTokenInput] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  // Model pull (Ollama only).
+  const [pulling, setPulling] = useState<string | null>(null);
+  const [pullProg, setPullProg] = useState<PullProgress | null>(null);
+
+  const configured = !!config?.base_url;
+  // Whether the connected endpoint is an Ollama server (the only runner with a one-click pull API).
+  // Heuristic: Ollama's default port. A non-Ollama endpoint gets a copy-paste command instead.
+  const isOllama = !!config?.base_url?.includes(":11434");
+
+  async function reloadConfig() {
+    const cfg = await getLocalLlmConfig();
+    setConfig(cfg);
+    if (cfg.base_url) {
+      setUrlInput((u) => u || cfg.base_url || "");
+      listLocalLlmModels()
+        .then(setServed)
+        .catch(() => setServed([]));
+    } else {
+      setServed([]);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      // Load config and recommendations INDEPENDENTLY: config drives the endpoint/roles UI, while
+      // recommendations are a best-effort readout — a hardware-scan failure must not blank a
+      // genuinely-configured endpoint (so you can still see its status, disconnect, or reassign).
+      try {
+        const cfg = await getLocalLlmConfig();
+        if (cancelled) return;
+        setConfig(cfg);
+        if (cfg.base_url) {
+          setUrlInput(cfg.base_url);
+          listLocalLlmModels()
+            .then((m) => !cancelled && setServed(m))
+            .catch(() => {});
+        }
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      }
+      try {
+        const r = await localModelRecommendations();
+        if (!cancelled) setRecs(r);
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Poll the live status while an endpoint is configured (the backend debounces the actual probe to
+  // once / 30s, so this can't hammer the user's server).
+  useEffect(() => {
+    if (!configured) {
+      setStatus(null);
+      return;
+    }
+    let cancelled = false;
+    const tick = () =>
+      localLlmStatus()
+        .then((s) => !cancelled && setStatus(s))
+        .catch(() => {});
+    void tick();
+    const id = setInterval(tick, 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [configured]);
+
+  async function rescan() {
+    setRescanning(true);
+    setError(null);
+    try {
+      await localHardwareScan(true);
+      setRecs(await localModelRecommendations());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRescanning(false);
+    }
+  }
+
+  async function autodetect() {
+    setError(null);
+    try {
+      const found = await probeLocalLlmPorts();
+      setDetected(found);
+      if (found.length === 1) setUrlInput(found[0].url);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function runCheck() {
+    if (!urlInput.trim()) return;
+    setChecking(true);
+    setCheck(null);
+    setError(null);
+    try {
+      setCheck(await checkLocalLlmEndpoint(urlInput.trim(), tokenInput.trim() || undefined));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function saveEndpoint() {
+    if (!urlInput.trim()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      if (tokenInput.trim()) await setLocalLlmToken(tokenInput.trim());
+      const normalized = await setLocalLlmEndpoint(urlInput.trim());
+      setUrlInput(normalized);
+      setTokenInput("");
+      setCheck(null);
+      await reloadConfig();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function disconnect() {
+    setError(null);
+    try {
+      await clearLocalLlmEndpoint();
+      setCheck(null);
+      setDetected(null);
+      await reloadConfig();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function changeRoleModel(role: "chat" | "background", model: string) {
+    setConfig((c) => (c ? { ...c, [`${role}_model`]: model || null } : c));
+    void setLocalLlmRoleModel(role, model).catch((e) => setError(String(e)));
+  }
+
+  function changeRouting(role: "chat" | "background", pref: string) {
+    setConfig((c) => (c ? { ...c, [`${role}_routing`]: pref } : c));
+    void setLocalLlmRouting(role, pref as "cloud" | "local" | "local-then-cloud").catch((e) =>
+      setError(String(e)),
+    );
+  }
+
+  async function pull(rec: LocalRecommendation) {
+    const tag = ollamaTag(rec.install.ollama);
+    if (!tag) return;
+    setPulling(rec.repo);
+    setPullProg(null);
+    setError(null);
+    try {
+      await pullLocalModel(tag, setPullProg);
+      await reloadConfig(); // the model now shows as served / installed
+      setRecs(await localModelRecommendations());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPulling(null);
+      setPullProg(null);
+    }
+  }
+
+  const installedRepos = new Set(
+    (recs?.installed ?? []).map((m) => m.matched_repo).filter(Boolean),
+  );
+
+  return (
+    <>
+      {error && (
+        <div
+          className="mt-4 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
+          style={{
+            borderColor: "color-mix(in oklab, var(--st-due) 45%, transparent)",
+            background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+            color: "var(--st-due)",
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {/* ── Your machine ─────────────────────────────────────────────────────────────────── */}
+      <div
+        id="sec-localai-machine"
+        data-settings-section
+        data-help="settings-localai-machine"
+        className="mt-5 border-t border-border pt-4"
+      >
+        <div className="flex items-center justify-between">
+          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+            Your machine
+          </label>
+          <Button
+            variant="tertiary"
+            onClick={() => void rescan()}
+            disabled={rescanning}
+            className="px-2 py-0.5 text-xs"
+          >
+            {rescanning ? "Scanning…" : "Re-scan"}
+          </Button>
+        </div>
+        {loading ? (
+          <p className="mt-2 text-xs text-ink4">Scanning your hardware…</p>
+        ) : recs ? (
+          <HardwareReadout recs={recs} />
+        ) : (
+          <p className="mt-2 text-xs text-ink4">Couldn't read your hardware.</p>
+        )}
+        <SectionInfo title="How PM reads your machine">
+          <p>
+            PM checks your memory, processor, and graphics card entirely on this device — nothing is
+            sent anywhere. It uses this only to work out which local models would run well, and how
+            fast.
+          </p>
+        </SectionInfo>
+      </div>
+
+      {/* ── Recommended models ───────────────────────────────────────────────────────────── */}
+      <div
+        id="sec-localai-models"
+        data-settings-section
+        data-help="settings-localai-models"
+        className="mt-5 border-t border-border pt-4"
+      >
+        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+          Recommended models
+        </label>
+        <Collapsible title="What do these numbers mean?" defaultOpen={false} className="mt-2">
+          <NumbersGuide />
+        </Collapsible>
+        {loading ? (
+          <p className="mt-3 text-xs text-ink4">Sizing models against your machine…</p>
+        ) : recs && recs.curated.length > 0 ? (
+          <div className="mt-3 space-y-2">
+            {recs.curated.map((rec) => (
+              <RecommendationCard
+                key={rec.repo}
+                rec={rec}
+                installed={installedRepos.has(rec.repo)}
+                canPull={configured && isOllama && !!ollamaTag(rec.install.ollama)}
+                pulling={pulling === rec.repo}
+                pullProg={pulling === rec.repo ? pullProg : null}
+                onPull={() => void pull(rec)}
+                busy={pulling !== null}
+              />
+            ))}
+          </div>
+        ) : (
+          <p className="mt-3 text-xs text-ink4">No catalog models to show.</p>
+        )}
+        <p className="mt-3 text-xs text-faint">
+          Local models don't appear in Settings → AI &amp; Models → Usage &amp; cost — that ledger
+          tracks only your paid cloud (OpenRouter) calls. Running a model on your own machine has no
+          per-use cost to count.
+        </p>
+      </div>
+
+      {/* ── Connect an endpoint ──────────────────────────────────────────────────────────── */}
+      <div
+        id="sec-localai-endpoint"
+        data-settings-section
+        data-help="settings-localai-endpoint"
+        className="mt-5 border-t border-border pt-4"
+      >
+        <div className="flex items-center justify-between">
+          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+            Connect an endpoint
+          </label>
+          {configured && <StatusChip status={status} />}
+        </div>
+
+        {configured ? (
+          <div className="mt-2">
+            <p className="text-xs text-ink4">
+              Connected to <span className="break-all text-ink2">{config?.base_url}</span>
+              {config?.has_token ? " (with a saved token)" : ""}.
+            </p>
+            <div className="mt-2">
+              <Button variant="tertiary" onClick={() => void disconnect()}>
+                Disconnect
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-2 space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="secondary" onClick={() => void autodetect()}>
+                Auto-detect a local server
+              </Button>
+              <span className="text-xs text-ink4">
+                Looks for Ollama, LM Studio, and llama-server on this machine.
+              </span>
+            </div>
+            {detected && (
+              <div className="text-xs">
+                {detected.length === 0 ? (
+                  <p className="text-ink4">
+                    No local server found. Install one below, then auto-detect again.
+                  </p>
+                ) : (
+                  <ul className="space-y-1">
+                    {detected.map((d) => (
+                      <li key={d.url}>
+                        <button
+                          type="button"
+                          onClick={() => setUrlInput(d.url)}
+                          className="text-accent-text underline hover:brightness-110"
+                        >
+                          {d.label} — {d.url}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+            <div>
+              <label className="block text-sm font-medium text-ink2">Endpoint URL</label>
+              <Input
+                value={urlInput}
+                onChange={(e) => {
+                  setUrlInput(e.target.value);
+                  setCheck(null); // a prior check is stale once the URL changes
+                }}
+                placeholder="http://localhost:11434"
+                className="mt-1"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-ink2">
+                Token <span className="text-ink4">(optional — only for a remote endpoint)</span>
+              </label>
+              <Input
+                type="password"
+                autoComplete="off"
+                value={tokenInput}
+                onChange={(e) => {
+                  setTokenInput(e.target.value);
+                  setCheck(null);
+                }}
+                placeholder="bearer token"
+                className="mt-1"
+              />
+            </div>
+            {check && <EndpointCheckResult check={check} />}
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="secondary"
+                onClick={() => void runCheck()}
+                disabled={checking || !urlInput.trim()}
+              >
+                {checking ? "Checking…" : "Check"}
+              </Button>
+              <Button
+                variant="primary"
+                onClick={() => void saveEndpoint()}
+                disabled={saving || !urlInput.trim()}
+              >
+                {saving ? "Connecting…" : "Connect"}
+              </Button>
+            </div>
+            <Collapsible title="Don't have a local server yet?" defaultOpen={false}>
+              <RunnerInstall />
+            </Collapsible>
+          </div>
+        )}
+
+        <SectionInfo title="What leaves your device">
+          <p>
+            A server on <span className="text-ink2">this machine</span> (localhost / 127.0.0.1)
+            keeps everything on your device — nothing leaves it, which is even stronger than the
+            zero-retention promise PM makes to cloud providers.
+          </p>
+          <p>
+            A <span className="text-ink2">remote</span> endpoint (another computer, your LAN, or a
+            Tailscale address) means your chats are sent to that server — PM can't vouch for what it
+            does with them. PM refuses to send a token and your chats in the clear to a public
+            address, and warns when a server is exposed on your network.
+          </p>
+          <p>
+            PM never downloads model weights itself. Your runner (Ollama / LM Studio) fetches them
+            from wherever it's configured to — the Ollama registry or Hugging Face.
+          </p>
+        </SectionInfo>
+      </div>
+
+      {/* ── Assign roles ─────────────────────────────────────────────────────────────────── */}
+      <div
+        id="sec-localai-roles"
+        data-settings-section
+        data-help="settings-localai-roles"
+        className="mt-5 border-t border-border pt-4"
+      >
+        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+          Assign roles
+        </label>
+        {!configured ? (
+          <p className="mt-2 text-xs text-ink4">
+            Connect an endpoint above to route PM's chat or background work to a local model.
+          </p>
+        ) : (
+          <div className="mt-3 space-y-4">
+            <RoleRow
+              label="Chat"
+              hint="Answers your chats."
+              model={config?.chat_model ?? ""}
+              routing={config?.chat_routing ?? "cloud"}
+              served={served}
+              onModel={(m) => changeRoleModel("chat", m)}
+              onRouting={(p) => changeRouting("chat", p)}
+            />
+            <RoleRow
+              label="Background"
+              hint="Sorting proposals, titles, summaries, and learning."
+              model={config?.background_model ?? ""}
+              routing={config?.background_routing ?? "cloud"}
+              served={served}
+              onModel={(m) => changeRoleModel("background", m)}
+              onRouting={(p) => changeRouting("background", p)}
+            />
+          </div>
+        )}
+        <SectionInfo title="How routing & fallback work">
+          <p>
+            <span className="text-ink2">Cloud</span> keeps using your OpenRouter model.{" "}
+            <span className="text-ink2">Local only</span> uses the model you picked and fails if
+            it's unreachable. <span className="text-ink2">Local, fall back to cloud</span> tries
+            local first and quietly hands off to your cloud model only on a hard failure (an
+            unreachable or broken server) — never to chase quality.
+          </p>
+        </SectionInfo>
+      </div>
+    </>
+  );
+}
+
+// ── Small pieces ──────────────────────────────────────────────────────────────────────────────
+
+const VERDICT: Record<LocalFitVerdict, { label: string; token: string }> = {
+  comfortable: { label: "Comfortable", token: "--st-quick" },
+  tight: { label: "Tight fit", token: "--st-look" },
+  halved_context: { label: "Reduced context", token: "--st-look" },
+  stay_on_cloud: { label: "Too big — stay on cloud", token: "--st-due" },
+  unknown: { label: "Unknown", token: "--ink4" },
+};
+
+function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
+  const v = VERDICT[verdict];
+  return (
+    <span
+      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] font-medium"
+      style={{
+        color: `var(${v.token})`,
+        background: `color-mix(in oklab, var(${v.token}) 15%, transparent)`,
+      }}
+    >
+      {v.label}
+    </span>
+  );
+}
+
+function fmtGb(n: number | null): string {
+  return n == null ? "—" : `${n.toFixed(1)} GB`;
+}
+
+function fmtBytes(n: number | null | undefined): string {
+  if (n == null) return "—";
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(0)} MB`;
+  return `${(n / 1e3).toFixed(0)} KB`;
+}
+
+/** The `ollama pull <tag>` install hint reduced to just the tag (for the pull API / a copy button). */
+function ollamaTag(hint: string | null): string | null {
+  if (!hint) return null;
+  const m = hint.trim().match(/ollama\s+(?:pull|run)\s+(\S+)/i);
+  return m ? m[1] : null;
+}
+
+function HardwareReadout({ recs }: { recs: LocalRecommendations }) {
+  const h = recs.hardware;
+  const rows: Array<[string, string]> = [
+    ["Memory", `${fmtGb(h.available_ram_gb)} free of ${fmtGb(h.total_ram_gb)}`],
+    [
+      "Processor",
+      `${h.cpu_brand ?? "—"}${h.cpu_cores ? ` · ${h.cpu_cores} cores` : ""}${h.cpu_threads ? ` / ${h.cpu_threads} threads` : ""}`,
+    ],
+    [
+      "Graphics",
+      h.gpu_name
+        ? `${h.gpu_name}${h.vram_gb ? ` · ${fmtGb(h.vram_gb)}${h.unified_memory ? " unified" : " VRAM"}` : ""}`
+        : "No dedicated GPU detected",
+    ],
+    ["Free disk", fmtGb(h.disk_free_gb)],
+  ];
+  return (
+    <div className="mt-3">
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+        {rows.map(([k, v]) => (
+          <div key={k} className="contents">
+            <dt className="text-ink4">{k}</dt>
+            <dd className="text-ink2">{v}</dd>
+          </div>
+        ))}
+      </dl>
+      {h.is_wsl && (
+        <p className="mt-1.5 text-xs text-faint">
+          Running under WSL — GPU access depends on your WSL setup.
+        </p>
+      )}
+      {h.notes.length > 0 && <p className="mt-1.5 text-xs text-faint">{h.notes.join(" ")}</p>}
+    </div>
+  );
+}
+
+function NumbersGuide() {
+  const items: Array<[string, string]> = [
+    [
+      "Fit",
+      "Whether the model runs comfortably, only with a shrunk context, or is too big for now.",
+    ],
+    [
+      "Quant",
+      "How much the weights are compressed. Lower (e.g. Q4) is smaller and faster; higher (Q6/Q8) is more faithful but heavier.",
+    ],
+    [
+      "Context",
+      "How much text the model can consider at once. PM shrinks this to fit your memory when it has to, down to a floor.",
+    ],
+    [
+      "Speed",
+      "A rough tokens-per-second estimate for how fast replies stream on your machine — higher is snappier.",
+    ],
+    [
+      "Memory",
+      "About how much RAM (or VRAM) the model needs loaded. It must sit under what you have free, with headroom.",
+    ],
+  ];
+  return (
+    <dl className="mt-1 space-y-1.5 text-xs">
+      {items.map(([k, v]) => (
+        <div key={k}>
+          <dt className="inline font-medium text-ink2">{k}: </dt>
+          <dd className="inline text-ink4">{v}</dd>
+        </div>
+      ))}
+      <p className="pt-1 text-faint">
+        Numbers are estimates — a conservative default that assumes an f16 KV cache. Your real speed
+        and memory depend on your runner and settings.
+      </p>
+    </dl>
+  );
+}
+
+function RecommendationCard({
+  rec,
+  installed,
+  canPull,
+  pulling,
+  pullProg,
+  onPull,
+  busy,
+}: {
+  rec: LocalRecommendation;
+  installed: boolean;
+  canPull: boolean;
+  pulling: boolean;
+  pullProg: PullProgress | null;
+  onPull: () => void;
+  busy: boolean;
+}) {
+  const f = rec.fit;
+  const tag = ollamaTag(rec.install.ollama);
+  const pct =
+    pullProg && pullProg.total_bytes
+      ? Math.min(100, Math.round((100 * (pullProg.completed_bytes ?? 0)) / pullProg.total_bytes))
+      : null;
+  return (
+    <div className="rounded-[var(--radius-sm)] border border-border p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="text-sm font-medium text-ink">{rec.display_name}</span>
+            <FitBadge verdict={f.verdict} />
+            {rec.multimodal && <span className="text-[10px] text-ink4">vision</span>}
+            {rec.reasoning && <span className="text-[10px] text-ink4">reasoning</span>}
+          </div>
+          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
+            <span>{rec.parameters_b}B</span>
+            {f.quant && <span>{f.quant}</span>}
+            {f.context != null && <span>{(f.context / 1024).toFixed(0)}k ctx</span>}
+            {f.est_tokens_per_sec != null && <span>~{f.est_tokens_per_sec.toFixed(0)} tok/s</span>}
+            {f.est_memory_gb != null && <span>{fmtGb(f.est_memory_gb)}</span>}
+          </div>
+        </div>
+        <div className="shrink-0">
+          {installed ? (
+            <span className="text-xs font-medium text-st-quick">Installed</span>
+          ) : canPull ? (
+            <Button
+              variant="secondary"
+              onClick={onPull}
+              disabled={busy || f.verdict === "stay_on_cloud"}
+              className="text-xs"
+            >
+              {pulling ? "Downloading…" : "Download"}
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
+      {pulling && (
+        <div className="mt-2">
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface">
+            <div
+              className="h-full rounded-full bg-accent transition-[width] duration-300"
+              style={{ width: pct != null ? `${pct}%` : "100%" }}
+            />
+          </div>
+          <p className="mt-1 font-mono text-[10px] text-ink4">
+            {pullProg?.status ?? "starting…"}
+            {pullProg?.total_bytes
+              ? ` · ${fmtBytes(pullProg.completed_bytes)} / ${fmtBytes(pullProg.total_bytes)}`
+              : ""}
+          </p>
+        </div>
+      )}
+
+      {!installed && !canPull && tag && (
+        <div className="mt-2 flex items-center gap-2">
+          <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[11px] text-ink3">
+            ollama pull {tag}
+          </code>
+          <Button
+            variant="tertiary"
+            onClick={() => void navigator.clipboard?.writeText(`ollama pull ${tag}`)}
+            className="px-2 py-0.5 text-xs"
+          >
+            Copy
+          </Button>
+        </div>
+      )}
+
+      {f.notes.length > 0 && <p className="mt-1.5 text-[11px] text-faint">{f.notes.join(" ")}</p>}
+    </div>
+  );
+}
+
+function StatusChip({ status }: { status: LocalLlmStatus | null }) {
+  let label = "Checking…";
+  let token = "--ink4";
+  if (status) {
+    if (status.in_cooldown) {
+      label = `Cooling down (${status.cooldown_remaining_s}s)`;
+      token = "--st-look";
+    } else if (status.reachable) {
+      label = "Connected";
+      token = "--st-quick";
+    } else {
+      label = "Unreachable";
+      token = "--st-due";
+    }
+  }
+  return (
+    <span
+      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] font-medium"
+      style={{
+        color: `var(${token})`,
+        background: `color-mix(in oklab, var(${token}) 15%, transparent)`,
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+function EndpointCheckResult({ check }: { check: EndpointCheck }) {
+  const bad = check.scheme_verdict === "refused_public_cleartext" || !check.reachable;
+  const warn =
+    check.posture !== "loopback" ||
+    check.exposed_on_network ||
+    check.scheme_verdict === "warn_unencrypted";
+  const token = bad ? "--st-due" : warn ? "--st-look" : "--st-quick";
+  return (
+    <div
+      className="rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
+      style={{
+        borderColor: `color-mix(in oklab, var(${token}) 45%, transparent)`,
+        background: `color-mix(in oklab, var(${token}) 12%, transparent)`,
+        color: "var(--ink2)",
+      }}
+    >
+      <p className="font-medium" style={{ color: `var(${token})` }}>
+        {check.reachable ? `Reachable · ${check.models.length} model(s)` : "Not reachable"}
+        {check.posture !== "loopback" ? ` · ${check.posture}` : ""}
+      </p>
+      {check.posture !== "loopback" && check.scheme_verdict !== "refused_public_cleartext" && (
+        <p className="mt-1">
+          This is a remote server — your chats will be sent to it. PM can't vouch for what it does
+          with them.
+        </p>
+      )}
+      {check.message && <p className="mt-1">{check.message}</p>}
+    </div>
+  );
+}
+
+const ROUTING_OPTIONS = [
+  { value: "cloud", label: "Cloud" },
+  { value: "local", label: "Local only" },
+  { value: "local-then-cloud", label: "Local, fall back to cloud" },
+];
+
+function RoleRow({
+  label,
+  hint,
+  model,
+  routing,
+  served,
+  onModel,
+  onRouting,
+}: {
+  label: string;
+  hint: string;
+  model: string;
+  routing: string;
+  served: string[];
+  onModel: (m: string) => void;
+  onRouting: (p: string) => void;
+}) {
+  // Keep the currently-saved model selectable even if the endpoint isn't serving it right now.
+  const options = model && !served.includes(model) ? [model, ...served] : served;
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-sm font-medium text-ink2">{label}</span>
+        <span className="text-[11px] text-ink4">{hint}</span>
+      </div>
+      <div className="mt-1.5 flex flex-wrap items-center gap-2">
+        <Select
+          value={model}
+          onChange={(e) => onModel(e.target.value)}
+          className="min-w-[10rem] flex-1"
+        >
+          <option value="">— use cloud —</option>
+          {options.map((m) => (
+            <option key={m} value={m}>
+              {m}
+            </option>
+          ))}
+        </Select>
+        <Select value={routing} onChange={(e) => onRouting(e.target.value)}>
+          {ROUTING_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </Select>
+      </div>
+    </div>
+  );
+}
+
+function RunnerInstall() {
+  const g = ollamaGuide();
+  return (
+    <div className="mt-1 text-xs text-ink4">
+      <p className="text-ink2">{g.name}</p>
+      <p className="mt-0.5">{g.summary}</p>
+      <ol className="ml-4 mt-1.5 list-decimal space-y-1">
+        {g.steps.map((s, i) => (
+          <li key={i}>{s}</li>
+        ))}
+      </ol>
+      <p className="mt-1.5">
+        LM Studio and llama-server also work — connect them by URL above (they have no one-click
+        download, so you pick models in their own app).
+      </p>
+    </div>
+  );
+}

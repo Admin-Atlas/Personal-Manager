@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.41.0-alpha",
+    date: "2026-07-23",
+    highlights: [
+      "Run AI on your own machine — free, and private. The new Settings → Local AI tab scans your computer, recommends on-device models it can actually run (and roughly how fast), connects to a local model server like Ollama or LM Studio, and lets you send your chats — or just the behind-the-scenes work — to it, falling back to the cloud only if the local model isn't reachable. A model on your own machine means nothing leaves your device. If you use Ollama, PM can download a recommended model straight into it.",
+    ],
+  },
+  {
     version: "3.40.0-alpha",
     date: "2026-07-22",
     highlights: [
