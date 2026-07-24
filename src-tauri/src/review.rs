@@ -44,6 +44,75 @@ impl Proposal {
     }
 }
 
+/// Persist a proposal to the regenerable `document_proposals` cache (v39), keyed by document.
+/// The Review tab hydrates from this on load so re-opening the app repaints proposals the model
+/// already produced instead of re-billing for them. Upsert — an explicit Re-propose overwrites.
+/// `model` is the served model (UI/debug only), `None` on the best-effort fallback path.
+pub fn cache_proposal(
+    conn: &Connection,
+    document_id: i64,
+    proposal: &Proposal,
+    model: Option<&str>,
+) -> Result<()> {
+    // tags is a Vec<String> — always serialisable; fall back to an empty array rather than error.
+    let tags = serde_json::to_string(&proposal.tags).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO document_proposals \
+             (document_id, project, tags, importance, reasoning, model) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(document_id) DO UPDATE SET \
+             project = excluded.project, tags = excluded.tags, importance = excluded.importance, \
+             reasoning = excluded.reasoning, model = excluded.model, \
+             created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        params![
+            document_id,
+            proposal.project,
+            tags,
+            proposal.importance,
+            proposal.reasoning,
+            model,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The cached proposals for documents still awaiting review (`reviewed = 0`), so the Review tab can
+/// repaint on load without a model call. Rows whose document has since been reviewed/removed are
+/// filtered out (and pruned by `commit_review` / `ON DELETE CASCADE` anyway).
+pub fn cached_proposals(conn: &Connection) -> Result<Vec<(i64, Proposal)>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.document_id, p.project, p.tags, p.importance, p.reasoning \
+           FROM document_proposals p \
+           JOIN documents d ON d.id = p.document_id \
+          WHERE d.reviewed = 0",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let tags: String = r.get(2)?;
+            Ok((
+                r.get::<_, i64>(0)?,
+                Proposal {
+                    project: r.get(1)?,
+                    tags: serde_json::from_str(&tags).unwrap_or_default(),
+                    importance: r.get(3)?,
+                    reasoning: r.get(4)?,
+                },
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Drop a document's cached proposal — called as it leaves the review queue on commit (belt-and-braces
+/// alongside the `ON DELETE CASCADE` that covers an actual document deletion).
+pub fn drop_cached_proposal(conn: &Connection, document_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM document_proposals WHERE document_id = ?1",
+        params![document_id],
+    )?;
+    Ok(())
+}
+
 /// Streamed to the UI as proposals come back (mirrors `IngestEvent`).
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

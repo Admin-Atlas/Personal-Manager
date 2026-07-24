@@ -3053,6 +3053,30 @@ pub fn review_queue_count(state: State<'_, AppState>) -> Result<i64> {
     ingest::review_queue_count(&conn)
 }
 
+/// One cached AI proposal keyed by document — what `cached_proposals` returns so the Review tab can
+/// repaint on load without a model call. `proposal` mirrors the streamed `ReviewEvent::Proposed`
+/// payload, so the frontend seeds it through exactly the same path.
+#[derive(serde::Serialize)]
+pub struct CachedProposal {
+    pub document_id: i64,
+    pub proposal: review::Proposal,
+}
+
+/// The AI proposals persisted for documents still awaiting review (the v39 cache). The Review tab
+/// reads this on load so re-opening the app never re-asks the model for proposals it already has —
+/// only genuinely un-proposed documents reach `propose_metadata`.
+#[tauri::command]
+pub fn cached_proposals(state: State<'_, AppState>) -> Result<Vec<CachedProposal>> {
+    let conn = state.conn()?;
+    Ok(review::cached_proposals(&conn)?
+        .into_iter()
+        .map(|(document_id, proposal)| CachedProposal {
+            document_id,
+            proposal,
+        })
+        .collect())
+}
+
 /// Append a document's Drive parent-folder as one plain-text line to the global filing profile — the
 /// preamble seam `review::propose` already reads (§4.5), so folder context arrives with no new
 /// parameter and no numeric prior. Returns the (owned) per-document profile: the folder line appended
@@ -3190,17 +3214,22 @@ pub async fn propose_metadata(
             doc_profile.as_deref(),
         )
         .await;
+        // The served model, for the proposal cache's `model` column — captured before `usage_info`
+        // is consumed into the cost rows below. `None` on the best-effort fallback path.
+        let served_model = usage_info.as_ref().and_then(|(_, m, _)| m.clone());
         if let Some((usage, served, meta)) = usage_info {
             usage_rows.push((served, usage, meta));
         }
-        // Resolve the model's project string to its canonical form for display, so a known variant
-        // is shown (and later committed) as the canonical name — the variant never surfaces. A
-        // short read-only lock, dropped before the next iteration's model call (rule #4).
-        proposal.project = {
+        // Resolve the model's project string to its canonical form for display (a known variant is
+        // shown, and later committed, as the canonical name — the variant never surfaces), and
+        // persist the finished proposal to the regenerable cache so re-opening the app repaints it
+        // instead of re-billing the model. One short lock, dropped before the next model call (rule #4).
+        {
             let state = app.state::<AppState>();
             let conn = state.conn()?;
-            entities::resolve_to_canonical(&conn, &proposal.project)?
-        };
+            proposal.project = entities::resolve_to_canonical(&conn, &proposal.project)?;
+            review::cache_proposal(&conn, p.id, &proposal, served_model.as_deref())?;
+        }
         let _ = on_event.send(ReviewEvent::Proposed {
             document_id: p.id,
             proposal,
@@ -3304,6 +3333,10 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                 )?;
                 written.push(w);
                 entities::reassign_document(&tx, d.document_id, entity_id)?;
+                // This document is leaving the review queue — drop its cached proposal (belt-and-braces
+                // alongside the ON DELETE CASCADE that covers an actual deletion). Inside the tx, so it
+                // rolls back with everything else if the commit fails.
+                review::drop_cached_proposal(&tx, d.document_id)?;
                 // Capture the model's corrected-away name as a forward-going alias (merge-guarded),
                 // so the same variant resolves to this canonical next time instead of recurring.
                 // A correction is also a deliberate vouch for the chosen entity — record it as

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.57.1-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Review now remembers the AI's suggestions between sessions. Before, if you closed PM with items still waiting in Review, re-opening it would ask the AI to suggest a project, tags and importance for the whole queue all over again -- quietly spending credits on work it had already done. PM now saves each suggestion as it arrives and reloads it on startup, so it only asks the model about genuinely new, un-suggested items. Re-propose still regenerates everything from scratch whenever you want a fresh take.",
+    ],
+  },
+  {
     version: "3.57.0-alpha",
     date: "2026-07-24",
     highlights: [

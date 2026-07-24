@@ -1090,6 +1090,26 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_swm_access_root    ON shared_with_me_access(root_id);
     CREATE INDEX idx_swm_access_account ON shared_with_me_access(account_id);
     "#,
+    // v39: persist the Review tab's AI proposals as a regenerable cache. Until now a proposal
+    // (project / tags / importance / reasoning) lived only in the webview's in-memory map, so on
+    // app restart the queue looked entirely un-proposed and `propose_metadata` re-billed the model
+    // for every item it had already classified. This table caches each streamed proposal keyed by
+    // document; the Review tab hydrates from it on load and only asks the model for genuinely
+    // un-proposed documents, and `commit_review` drops the row as a document leaves the queue.
+    // Fully derived from the model call — additive, no backfill (rule #3): an existing store just
+    // gains an empty table, and any document missing a row simply re-proposes exactly as before.
+    // `ON DELETE CASCADE` mirrors `doc_layout` (v16), so deleting a document takes its cache with it.
+    r#"
+    CREATE TABLE document_proposals (
+        document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+        project     TEXT NOT NULL,           -- canonical project name the model proposed
+        tags        TEXT NOT NULL,           -- JSON array, mirrors the streamed Proposal.tags
+        importance  TEXT,                     -- 'high'|'medium'|'low' or NULL (unclear), like documents.importance
+        reasoning   TEXT NOT NULL,
+        model       TEXT,                     -- served model that produced it (UI/debug only); NULL on the fallback path
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1145,7 +1165,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 38,
+            version, 39,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1160,7 +1180,8 @@ mod tests {
              per-calendar quiet flag is v34; rebuild pass stamp (#371) is v35; \
              usage_log kind CHECK relaxed for chat housekeeping is v36; \
              usage_log provider/latency/fallback columns (via writable_schema=RESET) is v37; \
-             Drive shared-with-me access relation is v38)"
+             Drive shared-with-me access relation is v38; \
+             Review AI-proposal cache is v39)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
