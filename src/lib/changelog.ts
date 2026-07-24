@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.56.2-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Security housekeeping: updated a networking library in our dependencies to a patched version as a precaution. PM doesn't use the affected feature, so nothing changes for you — it just keeps our supply chain clear of known advisories.",
+    ],
+  },
+  {
     version: "3.56.1-alpha",
     date: "2026-07-24",
     highlights: [
