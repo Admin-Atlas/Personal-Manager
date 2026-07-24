@@ -1217,6 +1217,7 @@ pub fn run() {
             commands::set_document_metadata,
             commands::list_entities,
             commands::add_entity_alias,
+            commands::remove_entity_alias,
             commands::rename_entity,
             commands::merge_entities,
             commands::list_project_overviews,

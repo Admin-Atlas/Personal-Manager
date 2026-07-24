@@ -3616,6 +3616,23 @@ pub async fn add_entity_alias(app: AppHandle, entity_id: i64, alias: String) -> 
     .await
 }
 
+/// Remove an alias from a project entity — undo a name/merge decision from the Teach tab. Wrapped in
+/// the entity-mutation write path so `entities.pmrules` is persisted (and rolls back on failure). Any
+/// documents still literally filed under the removed name are re-homed to a fresh standalone entity by
+/// `entities::remove_alias`; the documents' name is unchanged (only the backing entity moves), so no
+/// vault frontmatter rewrite is needed.
+#[tauri::command]
+pub async fn remove_entity_alias(app: AppHandle, entity_id: i64, alias: String) -> Result<()> {
+    spawn_entity_mutation(
+        app,
+        move |tx, _vault, _cipher, _vault_root, _manifest_cipher| {
+            entities::remove_alias(tx, entity_id, &alias)?;
+            Ok(Vec::new())
+        },
+    )
+    .await
+}
+
 /// Rename a canonical project — a one-row identity update plus a frontmatter/cache rewrite of its
 /// documents to the new canonical name (the payoff of identity-not-name).
 #[tauri::command]
