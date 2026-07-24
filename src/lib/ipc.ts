@@ -1199,6 +1199,20 @@ export const backupToProton = (passphrase: string) =>
 export const restoreFromProton = (name: string, passphrase: string) =>
   invoke<RestoreSummary>("restore_from_proton", { name, passphrase });
 
+/** Back up now to ONE connected destination ("proton" | "gdrive") using the stored passphrase,
+ *  pruning to keep-last-N like a scheduled run. Only usable once a passphrase is remembered. */
+export const backupNow = (destination: "proton" | "gdrive") =>
+  invoke<void>("backup_now", { destination });
+
+/** This vault's archive-name prefix, so the UI can count THIS vault's archives (vs. any other vault
+ *  sharing the account/folder) for the reconciliation banner. */
+export const backupArchivePrefix = () => invoke<string>("backup_archive_prefix");
+
+/** Trim this vault's backups at a destination to keep-last-N now (the banner's "delete oldest").
+ *  Recoverable (Proton/Drive trash). Returns how many were trimmed. */
+export const pruneOwnBackups = (destination: "proton" | "gdrive") =>
+  invoke<number>("prune_own_backups", { destination });
+
 /** The current automatic-backup schedule (cadence + retention + keychain opt-in + last run). */
 export const getBackupSchedule = () => invoke<BackupSchedule>("get_backup_schedule");
 

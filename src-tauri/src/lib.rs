@@ -1341,6 +1341,9 @@ pub fn run() {
             commands::list_gdrive_backups,
             commands::backup_to_gdrive,
             commands::restore_from_gdrive,
+            commands::backup_now,
+            commands::backup_archive_prefix,
+            commands::prune_own_backups,
             commands::smart_app_control_state,
             commands::package_managed_linux,
             // Developer mode (issue #78) — read-only inspection. Always registered (the
