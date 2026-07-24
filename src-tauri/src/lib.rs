@@ -786,6 +786,22 @@ impl AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Linux/WebKitGTK stability: the WebKitWebProcess renderer SIGABRTs on close when a
+    // Skia GPU painting thread tears down its thread-local SkiaGLContext
+    // (eglDestroyContext) while the process is already running exit handlers — an
+    // upstream teardown race in WebKitGTK's Skia backend. Forcing Skia CPU rasterization
+    // means no per-painting-thread GL context is created, so there is nothing to race at
+    // exit. Accelerated compositing stays on; only layer rasterization moves to the CPU
+    // (negligible for PM's DOM-heavy UI + 2D-canvas map, which uses no WebGL). The var is
+    // value-sensitive ("1" = CPU); respect an explicit user override (any value). Must be
+    // the FIRST statement: set_var is only sound while single-threaded, and no threads
+    // exist before Builder starts (single-instance plugin, tokio runtime, and GTK/WebKit
+    // all init inside/after it). Remove once the fleet is on a fixed system WebKitGTK.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_SKIA_ENABLE_CPU_RENDERING").is_none() {
+        std::env::set_var("WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
+    }
+
     tauri::Builder::default()
         // Must be registered first. One instance only: a second launch (e.g. a
         // double-click or an updater relaunch overlap) focuses the running window
