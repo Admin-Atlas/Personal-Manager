@@ -15,9 +15,21 @@ export interface ChangelogEntry {
   version: string; // matches the released app version, no leading "v"
   date: string; // YYYY-MM-DD
   highlights: string[]; // short user-facing bullet points
+  /** True only on entries that map to an actual tagged GitHub release (RELEASING.md §2), so What's
+   *  New can mark the release boundaries among the interim per-PR dev bumps. Omitted (falsy) on a
+   *  dev-bump entry — which is what the top entry is on a developer machine between releases. Set
+   *  when a release is cut; the `--tag` release gate refuses to tag if the top entry lacks it. */
+  release?: boolean;
 }
 
 export const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "3.63.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "What's New now marks which versions were actual releases. Between releases there are lots of small interim versions (one per change we make), so it wasn't obvious which entries were the ones that actually shipped to you. Tagged releases now carry a “Release” badge here, so you can see at a glance when the last real release was and read every change that landed in each version along the way. (On a developer's own machine the newest version is usually an interim build with no badge — that's expected.)",
+    ],
+  },
   {
     version: "3.62.0-alpha",
     date: "2026-07-24",
@@ -232,6 +244,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.44.1-alpha",
+    release: true,
     date: "2026-07-23",
     highlights: [
       "PM 3.44.1 rolls up everything since the last release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
@@ -640,6 +653,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.17.1-alpha",
+    release: true,
     date: "2026-07-15",
     highlights: [
       "PM 3.17.1 rolls up everything since the last release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
@@ -747,6 +761,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.9.1-alpha",
+    release: true,
     date: "2026-07-13",
     highlights: [
       "PM 3.9.1 rolls up everything since the last release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
@@ -822,6 +837,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.6.2-alpha",
+    release: true,
     date: "2026-07-13",
     highlights: [
       "PM 3.6.2 rolls up everything since the last release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
@@ -923,6 +939,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.0.2-alpha",
+    release: true,
     date: "2026-07-10",
     highlights: [
       "Fixed: a brand-new vault could freeze PM moments after its very first launch — the window went grey and “Not Responding” and never recovered. First starts now boot cleanly.",
@@ -938,6 +955,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "3.0.0-alpha",
+    release: true,
     date: "2026-07-08",
     highlights: [
       "PM 3.0.0 rolls up everything since the last public release into one update. Here's the tour at a glance — every line below has its full story in the entries that follow.",
@@ -2250,6 +2268,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "2.1.2-alpha",
+    release: true,
     date: "2026-06-24",
     highlights: [
       "Clearer downloads: the release page now leads with a simple, one-file install guide for Windows and macOS — it's obvious which single file to grab and how to open it. No change to how you use PM.",
@@ -2267,6 +2286,7 @@ export const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "2.0.1-alpha",
+    release: true,
     date: "2026-06-23",
     highlights: [
       "Behind-the-scenes fixes to how PM is packaged and shipped, so the Windows installer builds correctly and the macOS app bundles cleanly — no change to how you use PM. (This is the build that delivers the first public release.)",

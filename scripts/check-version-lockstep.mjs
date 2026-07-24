@@ -87,6 +87,20 @@ function fromChangelog(rel) {
 }
 
 /**
+ * Whether the TOP changelog entry carries `release: true`. Release-gate only: a tagged release must
+ * mark its newest entry (RELEASING.md §2) so What's New shows the release boundary among the interim
+ * per-PR dev bumps. The top entry spans from its `version:` to the next entry's `version:`.
+ */
+function topChangelogHasRelease(rel) {
+  const txt = read(rel);
+  const after = txt.slice(txt.indexOf("export const CHANGELOG"));
+  const firstV = after.indexOf("version:");
+  const secondV = after.indexOf("version:", firstV + 1);
+  const topEntry = secondV === -1 ? after.slice(firstV) : after.slice(firstV, secondV);
+  return /release:\s*true/.test(topEntry);
+}
+
+/**
  * The version named in the RELEASE_NOTES.md header (e.g. `… — **v3.0.2-alpha**.`).
  * The `**v` bold-with-v marker uniquely picks the header out of the body, which
  * mentions other versions in prose without that exact wrapper. Release-gate only.
@@ -230,6 +244,20 @@ if (tag) {
     );
   }
   console.log(`✓ tag: ${current} matches ${tag}`);
+
+  // The newest changelog entry (which already equals the tag version, via lockstep) must be flagged
+  // `release: true`, so What's New marks this as a release boundary rather than another interim dev
+  // bump. Release-gate only (with --tag) — the per-PR gate never runs this, so ordinary dev bumps
+  // stay unmarked. "All PAST releases marked" is a one-time backfill (CI can't infer which untagged
+  // versions were meant to be releases), so this enforces only the version being tagged now.
+  if (!topChangelogHasRelease("src/lib/changelog.ts")) {
+    fail(
+      `the newest src/lib/changelog.ts entry (${current}) is not marked as a release. A tagged ` +
+        `release must set \`release: true\` on its top entry (RELEASING.md §2) so What's New shows ` +
+        `the release boundary. Add it before tagging.`,
+    );
+  }
+  console.log(`✓ release marker: newest changelog entry is flagged release: true`);
 
   // The published release body must name the version being shipped. This runs
   // only at release (with --tag), never in the PR gate — RELEASE_NOTES.md is a
