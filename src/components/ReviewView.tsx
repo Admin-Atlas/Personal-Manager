@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import {
   aiProviderStatus,
   commitReview,
@@ -42,6 +42,13 @@ const PROJECTS_LIST_ID = "review-projects";
 const proposalCache = new Map<number, MetadataProposal>();
 const editCache = new Map<number, Edit>();
 
+/** A stable, connector-unique key for a document's parent folder — `source_type` disambiguates a leaf
+ *  folder id that two connectors might share. `null` when the document has no folder (a vault / chat /
+ *  photo doc), so it never groups with anything. */
+function folderKeyOf(d: Document): string | null {
+  return d.source_parent_folder_id ? `${d.source_type}:${d.source_parent_folder_id}` : null;
+}
+
 export function ReviewView({ onChanged, onOpenSettings }: Props) {
   const [queue, setQueue] = useState<Document[]>([]);
   const [proposals, setProposals] = useState<Record<number, MetadataProposal>>({});
@@ -61,6 +68,11 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
   // an unreachable local endpoint …) so the user can fix it — shown as a calm note, never a red error.
   const [aiError, setAiError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The row whose "apply to the rest of this folder" panel is open, plus which sibling ids are ticked
+  // (all, by default). One panel open at a time. This is B — a deterministic bulk file, no AI involved.
+  const [folderApply, setFolderApply] = useState<{ docId: number; checked: Set<number> } | null>(
+    null,
+  );
   // Rows the user has hand-edited; a late streaming proposal must not overwrite
   // them. Reset at the start of each proposal run (including Re-propose).
   const dirtyRef = useRef<Set<number>>(new Set());
@@ -270,6 +282,134 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
     return { needsReview, autofiled };
   }, [queue, proposals]);
 
+  // --- B: apply a filing to the rest of a folder ------------------------------------------------
+  // Group the live queue by parent folder so a row can offer to file the OTHER unsorted files from the
+  // same folder the same way. Recomputed from the live queue, so filing items keeps the counts honest.
+  const folderGroups = useMemo(() => {
+    const map = new Map<string, number[]>();
+    for (const d of queue) {
+      const key = folderKeyOf(d);
+      if (!key) continue;
+      const list = map.get(key);
+      if (list) list.push(d.id);
+      else map.set(key, [d.id]);
+    }
+    return map;
+  }, [queue]);
+
+  /** The other in-queue documents sharing `doc`'s folder (excluding itself); empty when it has none. */
+  function folderSiblings(doc: Document): Document[] {
+    const key = folderKeyOf(doc);
+    if (!key) return [];
+    const ids = new Set(folderGroups.get(key) ?? []);
+    return queue.filter((d) => d.id !== doc.id && ids.has(d.id));
+  }
+
+  /** The project a row would apply to its folder — trimmed, and only when it's a real one (the button
+   *  stays hidden until a project is chosen, so "Unsorted" is never bulk-applied). */
+  function folderApplyProject(doc: Document): string | null {
+    const p = (edits[doc.id]?.project ?? doc.project).trim();
+    return p && p.toLowerCase() !== "unsorted" ? p : null;
+  }
+
+  function openFolderApply(doc: Document) {
+    setFolderApply({ docId: doc.id, checked: new Set(folderSiblings(doc).map((d) => d.id)) });
+  }
+  function toggleFolderSibling(id: number) {
+    setFolderApply((cur) => {
+      if (!cur) return cur;
+      const checked = new Set(cur.checked);
+      if (checked.has(id)) checked.delete(id);
+      else checked.add(id);
+      return { ...cur, checked };
+    });
+  }
+
+  // File `doc` plus the ticked folder-siblings, all into `doc`'s project — each keeps its own tags and
+  // importance. Confirm-gated by the panel, reversible (it's just filing), and no model is called.
+  async function applyFolder(doc: Document, siblingIds: number[]) {
+    const project = folderApplyProject(doc);
+    if (!project) return;
+    const ids = [doc.id, ...siblingIds];
+    if (proposing || committing || ids.some((id) => committingIds.has(id))) return;
+    setCommittingIds((s) => {
+      const next = new Set(s);
+      ids.forEach((id) => next.add(id));
+      return next;
+    });
+    setError(null);
+    try {
+      const byId = new Map(queue.map((d) => [d.id, d]));
+      const decisions = ids
+        .map((id) => byId.get(id))
+        .filter((d): d is Document => !!d)
+        .map((d) => ({ ...decisionFor(d), project }));
+      await commitReview(decisions);
+      const idSet = new Set(ids);
+      for (const id of ids) {
+        proposalCache.delete(id);
+        editCache.delete(id);
+      }
+      setQueue((q) => q.filter((d) => !idSet.has(d.id)));
+      setProposals((prev) => {
+        const next = { ...prev };
+        ids.forEach((id) => delete next[id]);
+        return next;
+      });
+      setEdits((prev) => {
+        const next = { ...prev };
+        ids.forEach((id) => delete next[id]);
+        return next;
+      });
+      setFolderApply(null);
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCommittingIds((s) => {
+        const next = new Set(s);
+        ids.forEach((id) => next.delete(id));
+        return next;
+      });
+    }
+  }
+
+  // One row (+ its folder-apply panel when open), shared by the main list and the auto-filed one.
+  function renderRow(doc: Document) {
+    const siblings = folderSiblings(doc);
+    const canApply = folderApplyProject(doc) !== null;
+    const panel = folderApply && folderApply.docId === doc.id ? folderApply : null;
+    return (
+      <Fragment key={doc.id}>
+        <ReviewRow
+          doc={doc}
+          proposal={proposals[doc.id]}
+          edit={edits[doc.id]}
+          committing={committingIds.has(doc.id)}
+          disabled={committing || committingIds.has(doc.id) || (proposing && !proposals[doc.id])}
+          noSuggestions={!aiEnabled || !!aiError}
+          folderApplyCount={canApply && !panel ? siblings.length : 0}
+          folderName={doc.source_parent_folder_name}
+          onChange={(patch) => updateEdit(doc.id, patch)}
+          onApprove={() => void commitOne(doc)}
+          onApplyFolder={() => openFolderApply(doc)}
+        />
+        {panel && (
+          <FolderApplyPanel
+            folderName={doc.source_parent_folder_name}
+            project={folderApplyProject(doc) ?? "Unsorted"}
+            siblings={siblings}
+            checked={panel.checked}
+            busy={committingIds.has(doc.id)}
+            onToggle={toggleFolderSibling}
+            onApply={() => void applyFolder(doc, [...panel.checked])}
+            onCancel={() => setFolderApply(null)}
+          />
+        )}
+      </Fragment>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b border-border px-6 py-3">
@@ -359,23 +499,7 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
                 ))}
               </datalist>
 
-              <ul className="flex flex-col gap-3">
-                {needsReview.map((doc) => (
-                  <ReviewRow
-                    key={doc.id}
-                    doc={doc}
-                    proposal={proposals[doc.id]}
-                    edit={edits[doc.id]}
-                    committing={committingIds.has(doc.id)}
-                    disabled={
-                      committing || committingIds.has(doc.id) || (proposing && !proposals[doc.id])
-                    }
-                    noSuggestions={!aiEnabled || !!aiError}
-                    onChange={(patch) => updateEdit(doc.id, patch)}
-                    onApprove={() => void commitOne(doc)}
-                  />
-                ))}
-              </ul>
+              <ul className="flex flex-col gap-3">{needsReview.map(renderRow)}</ul>
 
               {autofiled.length > 0 && (
                 <div className="mt-5">
@@ -387,25 +511,7 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
                     {showAutofiled ? "▾" : "▸"} Auto-filed · low importance ({autofiled.length})
                   </button>
                   {showAutofiled && (
-                    <ul className="mt-3 flex flex-col gap-3">
-                      {autofiled.map((doc) => (
-                        <ReviewRow
-                          key={doc.id}
-                          doc={doc}
-                          proposal={proposals[doc.id]}
-                          edit={edits[doc.id]}
-                          committing={committingIds.has(doc.id)}
-                          disabled={
-                            committing ||
-                            committingIds.has(doc.id) ||
-                            (proposing && !proposals[doc.id])
-                          }
-                          noSuggestions={!aiEnabled || !!aiError}
-                          onChange={(patch) => updateEdit(doc.id, patch)}
-                          onApprove={() => void commitOne(doc)}
-                        />
-                      ))}
-                    </ul>
+                    <ul className="mt-3 flex flex-col gap-3">{autofiled.map(renderRow)}</ul>
                   )}
                 </div>
               )}
@@ -424,8 +530,11 @@ function ReviewRow({
   committing,
   disabled,
   noSuggestions,
+  folderApplyCount,
+  folderName,
   onChange,
   onApprove,
+  onApplyFolder,
 }: {
   doc: Document;
   proposal?: MetadataProposal;
@@ -437,9 +546,16 @@ function ReviewRow({
   disabled: boolean;
   /** No suggestion is coming (AI off, or it failed) — prompt the user to fill the fields in. */
   noSuggestions: boolean;
+  /** How many OTHER unsorted files share this document's folder — 0 hides the folder-apply action
+   *  (also 0 until a real project is chosen for this row). */
+  folderApplyCount: number;
+  /** The folder's display name (leaf) for the folder-apply label. */
+  folderName: string | null;
   onChange: (patch: Partial<Edit>) => void;
   /** File just this document with the values shown, leaving the rest of the queue. */
   onApprove: () => void;
+  /** Open the "file the rest of this folder the same way" panel. */
+  onApplyFolder: () => void;
 }) {
   const { showPower } = useDepth();
   // Open the same shared, app-level document reader the Documents tab and project file list use
@@ -508,6 +624,77 @@ function ReviewRow({
 
         <div className="mt-3" data-help="review-tags">
           <TagEditor tags={value.tags} onChange={(tags) => onChange({ tags })} />
+        </div>
+
+        {folderApplyCount > 0 && (
+          <button
+            type="button"
+            onClick={onApplyFolder}
+            disabled={disabled}
+            data-help="review-apply-folder"
+            className="mt-3 text-left text-xs text-accent-text transition hover:brightness-110 disabled:opacity-50"
+          >
+            Apply this filing to {folderApplyCount} other file{folderApplyCount === 1 ? "" : "s"}{" "}
+            from
+            {folderName ? ` ${folderName}` : " this folder"} →
+          </button>
+        )}
+      </Card>
+    </li>
+  );
+}
+
+/** The deterministic "file the rest of this folder the same way" panel (B). Lists the folder's other
+ *  unsorted files with a tick each (all on by default) and, on Apply, files this document plus the
+ *  ticked ones into the row's chosen project — each keeping its own tags and importance. No AI. */
+function FolderApplyPanel({
+  folderName,
+  project,
+  siblings,
+  checked,
+  busy,
+  onToggle,
+  onApply,
+  onCancel,
+}: {
+  folderName: string | null;
+  project: string;
+  siblings: Document[];
+  checked: Set<number>;
+  busy: boolean;
+  onToggle: (id: number) => void;
+  onApply: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <li>
+      <Card className="border-accent-soft p-4" data-help="review-folder-panel">
+        <p className="text-sm text-ink2">
+          Apply <span className="font-medium text-accent-text">{project}</span> to this file and the
+          ticked files from <span className="font-medium">{folderName ?? "this folder"}</span>:
+        </p>
+        <ul className="mt-2 flex max-h-48 flex-col gap-1 overflow-y-auto">
+          {siblings.map((s) => (
+            <li key={s.id}>
+              <label className="flex items-center gap-2 text-sm text-ink3">
+                <input
+                  type="checkbox"
+                  checked={checked.has(s.id)}
+                  onChange={() => onToggle(s.id)}
+                  className="accent-[var(--accent)]"
+                />
+                <span className="truncate">{s.title}</span>
+              </label>
+            </li>
+          ))}
+        </ul>
+        <div className="mt-3 flex justify-end gap-2">
+          <Button variant="tertiary" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={onApply} disabled={busy || checked.size === 0}>
+            {busy ? "Filing…" : `File ${checked.size + 1} files`}
+          </Button>
         </div>
       </Card>
     </li>

@@ -411,6 +411,11 @@ export interface Document {
   external_ref: string | null;
   /** The stable source id for an index-only item (`null` for a vault document). */
   source_id: string | null;
+  /** The immediate parent folder of a connector-synced item — `_id` is the connector-unique key and
+   *  `_name` the leaf name for display; both null for a vault / chat / photo document. Drives the
+   *  Review "apply this filing to the rest of the folder" action. */
+  source_parent_folder_id: string | null;
+  source_parent_folder_name: string | null;
 }
 
 /**
