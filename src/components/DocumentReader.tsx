@@ -48,6 +48,8 @@ interface Props {
   /** Vault-level retrieval-config staleness (one global signal — never per-document). */
   stale: boolean;
   onClose: () => void;
+  /** Navigate to the document's project — renders the project name as a link when provided. */
+  onOpenProject?: (project: string) => void;
 }
 
 // The reader is a resizable right dock. It never grows past half the window (the reading pane should
@@ -64,7 +66,7 @@ function clampReaderWidth(w: number): number {
   return Math.max(min, Math.min(max, w));
 }
 
-export function DocumentReader({ doc, stale, onClose }: Props) {
+export function DocumentReader({ doc, stale, onClose, onOpenProject }: Props) {
   // Two orthogonal axes: `showPower` (density preset) turns the overlay ON; `devMode` (capability)
   // swaps the overlay substrate from rendered Markdown to raw source.
   const { showPower } = useDepth();
@@ -294,7 +296,19 @@ export function DocumentReader({ doc, stale, onClose }: Props) {
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-ink4">
             <span>{TYPE_LABEL[doc.source_type] ?? doc.source_type}</span>
-            {doc.project && <span>· {doc.project}</span>}
+            {doc.project &&
+              (onOpenProject ? (
+                <button
+                  type="button"
+                  onClick={() => onOpenProject(doc.project)}
+                  className="text-accent-text hover:brightness-110"
+                  title={`Open project ${doc.project}`}
+                >
+                  · {doc.project}
+                </button>
+              ) : (
+                <span>· {doc.project}</span>
+              ))}
             <span>· {formatDate(doc.ingested_at)}</span>
           </div>
         </div>

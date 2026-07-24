@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.52.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Clicking a document on the memory map now opens it in the reading panel — the same one you get from the Documents tab — so you can read it right there instead of jumping to its whole project. The project name in that panel is now a link, so the project is still one click away. The map also redraws crisply now if you drag the window onto a screen with different scaling.",
+    ],
+  },
+  {
     version: "3.51.0-alpha",
     date: "2026-07-24",
     highlights: [

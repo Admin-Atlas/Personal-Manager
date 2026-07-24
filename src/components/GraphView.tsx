@@ -31,6 +31,7 @@ import {
 import { IngestProgress } from "./IngestProgress";
 import { Skeleton } from "./ui";
 import type { Document, SemanticLayout } from "../lib/types";
+import { useReader } from "../lib/reader";
 import { graphColor, useTheme, useDepth } from "../theme";
 
 /**
@@ -114,8 +115,11 @@ function fitTransform(bounds: Bounds, w: number, h: number): Transform {
 
 const isDashed = (doc?: Document) => !!doc && (!doc.reviewed || doc.source_type === "index_only");
 
-export function GraphView({ onOpenProject }: { onOpenProject?: (project: string) => void }) {
+export function GraphView() {
   const { mode, system, accent } = useTheme();
+  // Clicking a node opens the shared document reader (the same one the Documents tab uses); the
+  // reader's project name links back to the project. GraphView is mounted inside <ReaderProvider>.
+  const { openReader } = useReader();
   const [documents, setDocuments] = useState<Document[]>([]);
   const [base, setBase] = useState<BaseLayout | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -439,6 +443,22 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
     return () => ro.disconnect();
   }, [draw]);
 
+  // devicePixelRatio can change without a CSS-size change — dragging the window between displays of
+  // different scale, or an OS zoom step. The ResizeObserver above won't fire then, so the canvas keeps
+  // its old backing resolution (blurry) until the next interaction. A matchMedia on the current dpr
+  // fires exactly on that change; redraw (draw re-reads devicePixelRatio) and re-arm at the new dpr.
+  useEffect(() => {
+    let mql = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    const onChange = () => {
+      requestAnimationFrame(draw);
+      mql.removeEventListener("change", onChange);
+      mql = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      mql.addEventListener("change", onChange);
+    };
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, [draw]);
+
   // ---- pointer interaction (hit-test in world coords) ----
   const nodeAt = useCallback(
     (clientX: number, clientY: number): PositionedNode | null => {
@@ -462,11 +482,11 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
   // Keep the latest callbacks reachable from the once-attached native/window listeners.
   const drawRef = useRef(draw);
   const nodeAtRef = useRef(nodeAt);
-  const onOpenRef = useRef(onOpenProject);
+  const openReaderRef = useRef(openReader);
   useEffect(() => {
     drawRef.current = draw;
     nodeAtRef.current = nodeAt;
-    onOpenRef.current = onOpenProject;
+    openReaderRef.current = openReader;
   });
 
   /** Zoom about a point (screen px), clamped so the whole map is never smaller than half the fit. */
@@ -548,7 +568,7 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       setGrabbing(false);
       if (!drag.moved) {
         const hit = nodeAtRef.current(e.clientX, e.clientY);
-        if (hit?.doc && onOpenRef.current) onOpenRef.current(hit.doc.project);
+        if (hit?.doc) openReaderRef.current(hit.doc);
       }
     };
     window.addEventListener("mousemove", onMove);
@@ -598,7 +618,7 @@ export function GraphView({ onOpenProject }: { onOpenProject?: (project: string)
       ? placed > 0 && placed < documents.length
         ? `showing the top ${placed} of ${documents.length} documents by meaning · scroll to zoom, drag to pan`
         : `${documents.length} document${documents.length === 1 ? "" : "s"} by meaning · scroll to zoom, drag to pan`
-      : `${documents.length} document${documents.length === 1 ? "" : "s"} across ${legend.length} project${legend.length === 1 ? "" : "s"} · scroll to zoom, drag to pan, click to open`;
+      : `${documents.length} document${documents.length === 1 ? "" : "s"} across ${legend.length} project${legend.length === 1 ? "" : "s"} · scroll to zoom, drag to pan, click a document to read it`;
 
   // The toggle's help differs by whether t-SNE is installed (explain what it is vs that it's running).
   const toggleHelp = tsneInstalled ? "map-layout-toggle-tsne" : "map-layout-toggle";

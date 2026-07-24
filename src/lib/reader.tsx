@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The app-level document reader mount. The reader (a docked, read-only view onto an already-indexed
-// document) is opened from several surfaces — the Documents tab, a project's file list, and a
-// clickable source citation in chat — so it can't live inside any one of them. This provider holds
+// document) is opened from several surfaces — the Documents tab, a project's file list, a clickable
+// source citation in chat, and a memory-map node — so it can't live inside any one of them. This
+// provider holds
 // the one open document, mounts the single `<DocumentReader>` at app scope (it is `position: fixed`,
 // so it floats over whatever view is active), and hands every surface an `openReader`/`openReaderById`
 // via context — mirroring the app's other root contexts (Help/Theme/Capability) rather than threading
@@ -27,7 +28,17 @@ interface ReaderState {
 
 const ReaderContext = createContext<ReaderState | null>(null);
 
-export function ReaderProvider({ view, children }: { view: string; children: ReactNode }) {
+export function ReaderProvider({
+  view,
+  onOpenProject,
+  children,
+}: {
+  view: string;
+  /** Navigate to a document's project (the reader's clickable project name). Provided by App; the
+   *  reader auto-closes on the resulting view change. */
+  onOpenProject?: (project: string) => void;
+  children: ReactNode;
+}) {
   const [current, setCurrent] = useState<Document | null>(null);
   // Vault-level retrieval staleness (one global signal — never per-document) for the reader's chunk
   // overlay note. Read once; it only changes on a config change + rebuild, both of which are rare.
@@ -60,7 +71,14 @@ export function ReaderProvider({ view, children }: { view: string; children: Rea
   return (
     <ReaderContext.Provider value={{ current, openReader, openReaderById, closeReader }}>
       {children}
-      {current && <DocumentReader doc={current} stale={stale} onClose={closeReader} />}
+      {current && (
+        <DocumentReader
+          doc={current}
+          stale={stale}
+          onClose={closeReader}
+          onOpenProject={onOpenProject}
+        />
+      )}
     </ReaderContext.Provider>
   );
 }
