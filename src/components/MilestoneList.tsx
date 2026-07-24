@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState } from "react";
+import { useEffect, useRef, useState, type Ref } from "react";
 import type { Milestone } from "../lib/types";
 import {
   addMilestone,
@@ -45,6 +45,18 @@ export function MilestoneList({
   // of silently no-opping (F3-8). Declared before the read-only early return to keep the hook
   // order stable.
   const [error, setError] = useState<string | null>(null);
+  // Scroll the first not-yet-completed milestone to the top of the panel once per project, so the
+  // list opens on what's next with any completed ones tucked above (scroll up to see them) — only
+  // when there are completed rows before it. Hooks run before the read-only early return to keep the
+  // hook order stable; there the ref simply isn't attached, so the effect no-ops.
+  const firstUnmetIdx = milestones.findIndex((m) => m.state !== "met");
+  const anchorRef = useRef<HTMLDivElement | null>(null);
+  const scrolledForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (milestones.length === 0 || scrolledForRef.current === project) return;
+    scrolledForRef.current = project;
+    if (firstUnmetIdx > 0) anchorRef.current?.scrollIntoView({ block: "start" });
+  }, [project, milestones, firstUnmetIdx]);
   if (readOnly) {
     return <MilestoneSummary milestones={milestones} />;
   }
@@ -62,6 +74,7 @@ export function MilestoneList({
           m={m}
           isFirst={i === 0}
           isLast={i === milestones.length - 1}
+          anchorRef={i === firstUnmetIdx ? anchorRef : undefined}
           onChanged={onChanged}
           onError={setError}
           onMove={
@@ -122,6 +135,7 @@ function MilestoneRow({
   m,
   isFirst,
   isLast,
+  anchorRef,
   onChanged,
   onError,
   onMove,
@@ -129,6 +143,8 @@ function MilestoneRow({
   m: Milestone;
   isFirst: boolean;
   isLast: boolean;
+  /** Attached to the first not-yet-completed row so the list can scroll it into view on open. */
+  anchorRef?: Ref<HTMLDivElement>;
   onChanged: () => void;
   onError: (message: string | null) => void;
   /** Reorder within the list. Omitted (undefined) hides the ↑/↓ arrows — see `manualOrder`. */
@@ -156,6 +172,7 @@ function MilestoneRow({
   // `min-w-0 flex-1` so it shrinks rather than forcing horizontal overflow.
   return (
     <div
+      ref={anchorRef}
       className={`rounded-[var(--radius-sm)] border border-border bg-surface px-2.5 py-1.5 ${
         met ? "opacity-70" : ""
       }`}

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.51.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "A project's milestones now sort by deadline by default and open on the next one you haven't ticked off, with completed milestones tucked just above — scroll up to see what's done. A new \"Completed\" checkbox by the sort controls hides or shows the finished ones, and your sort choice is now remembered when you leave a project and come back. You can still switch to Manual to drag milestones into your own order.",
+    ],
+  },
+  {
     version: "3.50.0-alpha",
     date: "2026-07-24",
     highlights: [

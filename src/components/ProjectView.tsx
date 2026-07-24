@@ -22,6 +22,14 @@ import { ChatBadge } from "./ChatBadge";
 import { CollapseTab } from "./CollapseTab";
 import { rankImportance } from "../lib/importance";
 import { useReader } from "../lib/reader";
+import {
+  readMilestoneSort,
+  readShowCompletedMilestones,
+  writeMilestoneSort,
+  writeShowCompletedMilestones,
+  type MsSort,
+  type MsSortKey,
+} from "../lib/milestonePrefs";
 import { useDepth, useTheme } from "../theme";
 
 const PROJECT_LIST_ID = "focus-projects";
@@ -29,12 +37,6 @@ const PROJECT_LIST_ID = "focus-projects";
 type FileSortKey = "name" | "importance";
 interface FileSort {
   key: FileSortKey;
-  dir: "asc" | "desc";
-}
-
-type MsSortKey = "manual" | "deadline" | "label";
-interface MsSort {
-  key: MsSortKey;
   dir: "asc" | "desc";
 }
 
@@ -86,9 +88,15 @@ export function ProjectView({
   const { openReader, current: readerDoc } = useReader();
   // How the Files panel is ordered. Name A→Z by default; clicking a key again reverses it.
   const [sort, setSort] = useState<FileSort>({ key: "name", dir: "asc" });
-  // How the Milestones panel is ordered. Manual (backend sort_order) by default, so the ↑/↓ arrows
-  // work and today's behaviour is unchanged. Per-session (no localStorage), like the Files sort.
-  const [msSort, setMsSort] = useState<MsSort>({ key: "manual", dir: "asc" });
+  // How the Milestones panel is ordered — deadline (soonest first) by default now, remembered per
+  // device across projects. Display-only: the backend sort_order is untouched (governing() reads it).
+  const [msSort, setMsSort] = useState<MsSort>(readMilestoneSort);
+  useEffect(() => writeMilestoneSort(msSort), [msSort]);
+  // Whether completed ("met") milestones are shown; default true — the scroll-to-next below tucks
+  // them above the fold rather than hiding history. Ignored under Manual sort, where the ↑/↓ reorder
+  // needs every row.
+  const [showCompleted, setShowCompleted] = useState(readShowCompletedMilestones);
+  useEffect(() => writeShowCompletedMilestones(showCompleted), [showCompleted]);
   // The right panel's width is a fraction of the window (drag the left edge to resize, stays
   // proportional on window resize), clamped so it can't get so narrow the content scrolls.
   const {
@@ -165,6 +173,18 @@ export function ProjectView({
       return a.sort_order - b.sort_order || a.id - b.id;
     });
   }, [milestones, msSort]);
+
+  // Whether there's any completed milestone to hide — gates the "Completed" checkbox.
+  const hasMetMilestones = useMemo(() => milestones.some((m) => m.state === "met"), [milestones]);
+  // The list actually shown: completed ones dropped when hidden — except under Manual sort, where the
+  // ↑/↓ reorder maps array indices to sort_order and must see every row.
+  const displayMilestones = useMemo(
+    () =>
+      showCompleted || msSort.key === "manual"
+        ? sortedMilestones
+        : sortedMilestones.filter((m) => m.state !== "met"),
+    [sortedMilestones, showCompleted, msSort.key],
+  );
 
   const refreshMilestones = () => {
     listMilestones(project)
@@ -335,6 +355,20 @@ export function ProjectView({
         <span className="font-mono text-xs uppercase tracking-wide text-ink4">Milestones</span>
         {showMeta && milestones.length > 1 && (
           <div className="flex items-center gap-2 text-[10px] text-ink4">
+            {msSort.key !== "manual" && hasMetMilestones && (
+              <label
+                className="flex cursor-pointer items-center gap-1"
+                title="Show completed milestones"
+              >
+                <input
+                  type="checkbox"
+                  checked={showCompleted}
+                  onChange={(e) => setShowCompleted(e.target.checked)}
+                  className="accent-[var(--accent)]"
+                />
+                <span>Completed</span>
+              </label>
+            )}
             <SortToggle
               label="Manual"
               sortKey="manual"
@@ -350,7 +384,7 @@ export function ProjectView({
       <div className="mt-2">
         <MilestoneList
           project={project}
-          milestones={sortedMilestones}
+          milestones={displayMilestones}
           onChanged={refreshMilestones}
           readOnly={!showMeta}
           manualOrder={msSort.key === "manual"}
