@@ -40,9 +40,11 @@ interface Props {
   onboarding: boolean;
   /** Jump to the Dev tab (issue #78) — closes Settings and navigates. Non-onboarding only. */
   onOpenDev?: () => void;
+  /** Jump to the Teach tab — closes Settings and navigates (after an AI-memory import). */
+  onOpenTeach?: () => void;
 }
 
-export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
+export function SettingsView({ onClose, onboarding, onOpenDev, onOpenTeach }: Props) {
   const [key, setKey] = useState("");
   // First-run AI-provider choice (#295): a cloud key, or a local model on this device. The local
   // pane reports readiness (an endpoint + a chat model configured) up through `localReady`.
@@ -517,7 +519,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev }: Props) {
           >
             {tab === "general" && <GeneralSettings />}
 
-            {tab === "ai" && <AiModelsSettings />}
+            {tab === "ai" && <AiModelsSettings onOpenTeach={onOpenTeach} />}
 
             {tab === "localai" && <LocalAiSettings />}
 

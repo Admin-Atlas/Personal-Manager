@@ -1186,6 +1186,7 @@ pub fn run() {
             commands::confirm_preference,
             commands::delete_preference,
             commands::parse_preference_statement,
+            commands::import_ai_memory,
             commands::list_conversations,
             commands::create_conversation,
             commands::get_messages,

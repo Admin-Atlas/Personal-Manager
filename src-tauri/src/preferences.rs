@@ -43,6 +43,10 @@ pub const SOURCE_INFERRED: &str = "inferred";
 /// and surfaced in Teach as an unconfirmed suggestion — distinct from `user` (typed straight into Teach)
 /// and from `inferred` (PM deducing an unstated preference, deferred to Stage 5).
 pub const SOURCE_CHAT: &str = "chat";
+/// A preference imported from another AI's memory export (ChatGPT/Gemini/Claude), distilled into
+/// records and surfaced in Teach as an unconfirmed suggestion — like `chat`/`inferred`, it is withheld
+/// from live prompts until the user keeps it, but tagged distinctly so its origin is clear.
+pub const SOURCE_IMPORTED: &str = "imported";
 
 /// Hard cap on the total preference text injected into one system prompt. The old blob carried a
 /// flat 4000-char cap; we keep the same bound, now over the *relevant* set rather than one blob —
@@ -177,7 +181,7 @@ pub fn relevant_preferences(conn: &Connection, ctx: PrefContext) -> Result<Vec<P
         "SELECT {SELECT_COLS} FROM preferences p LEFT JOIN entities e ON e.id = p.entity_id \
          WHERE (p.scope = 'global' OR p.scope = 'context' \
                 OR (p.scope = 'project' AND p.entity_id = ?1)) \
-           AND (p.source NOT IN ('chat', 'inferred') OR p.user_confirmed = 1) \
+           AND (p.source NOT IN ('chat', 'inferred', 'imported') OR p.user_confirmed = 1) \
          ORDER BY (p.source = 'user') DESC, p.confidence DESC, p.id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -280,6 +284,7 @@ pub fn add_preference(
     let source = match source {
         SOURCE_INFERRED => SOURCE_INFERRED,
         SOURCE_CHAT => SOURCE_CHAT,
+        SOURCE_IMPORTED => SOURCE_IMPORTED,
         _ => SOURCE_USER,
     };
     conn.execute(

@@ -1130,6 +1130,20 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE calendar_events ADD COLUMN created            TEXT;
     ALTER TABLE calendar_events ADD COLUMN updated            TEXT;
     "#,
+    // v41 (import AI memory): admit 'imported' as a preferences.source provenance value, so memory
+    // pasted from another AI (ChatGPT/Gemini/Claude) and distilled into records is tagged distinctly
+    // from user/inferred/chat and gets its own "Imported" chip in Teach. A writable_schema text-patch
+    // relaxes the source CHECK (SQLite can't ALTER a column CHECK in place); the v28 relaxation already
+    // appended 'chat', so the CURRENT stored list is 'user','inferred','chat'. No table is ALTERed after
+    // this patch in the same batch, so no writable_schema=RESET is needed (see the v17 note); the
+    // end-of-run schema-cookie bump makes this connection reparse the relaxed CHECK.
+    r#"
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master
+       SET sql = replace(sql, '''user'',''inferred'',''chat''', '''user'',''inferred'',''chat'',''imported''')
+     WHERE type = 'table' AND name = 'preferences';
+    PRAGMA writable_schema = OFF;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1185,7 +1199,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 40,
+            version, 41,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1202,7 +1216,8 @@ mod tests {
              usage_log provider/latency/fallback columns (via writable_schema=RESET) is v37; \
              Drive shared-with-me access relation is v38; \
              Review AI-proposal cache is v39; \
-             calendar event popup detail columns is v40)"
+             calendar event popup detail columns is v40; \
+             preferences.source admits 'imported' is v41)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -1963,9 +1978,11 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("source='{src}' should insert: {e}"));
         }
+        // ('imported' is admitted from v41 onward — see the v41 test below; use a genuinely-unknown
+        // value here to prove the relaxed CHECK still rejects out-of-set sources.)
         assert!(
             conn.execute(
-                "INSERT INTO preferences(scope, value, source) VALUES ('global', 'x', 'imported')",
+                "INSERT INTO preferences(scope, value, source) VALUES ('global', 'x', 'bogus')",
                 [],
             )
             .is_err(),
@@ -1989,6 +2006,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor, None, "extraction cursor defaults NULL");
+    }
+
+    /// v41 relaxes the `preferences.source` CHECK to admit 'imported' (memory brought in from another
+    /// AI), proving the writable_schema patch + cookie reparse took effect on this connection, while an
+    /// out-of-set source is still rejected.
+    #[test]
+    fn preferences_admit_imported_source() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+
+        conn.execute(
+            "INSERT INTO preferences(scope, value, source) VALUES ('global', 'v-imported', 'imported')",
+            [],
+        )
+        .expect("source='imported' should insert after v41");
+        assert!(
+            conn.execute(
+                "INSERT INTO preferences(scope, value, source) VALUES ('global', 'x', 'bogus')",
+                [],
+            )
+            .is_err(),
+            "an unknown source must still violate the relaxed CHECK"
+        );
     }
 
     /// v36 relaxes the `usage_log.kind` CHECK to admit the four background housekeeping kinds

@@ -969,6 +969,10 @@ export default function App() {
                     setShowSettings(false);
                     setView("dev");
                   }}
+                  onOpenTeach={() => {
+                    setShowSettings(false);
+                    setView("teach");
+                  }}
                 />
               </div>
             )}

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.60.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "You can now bring your preferences over from another AI. If you've built up a “memory” in ChatGPT, Gemini or Claude, go to Settings → AI & Models → Import AI memory: copy the prompt there, run it in that assistant, and paste its reply back. PM turns it into tidy preference records and stages them in Teach → Preferences as suggestions -- nothing changes how PM works for you until you review each one and click Keep. Whatever you paste is treated as data, never as instructions.",
+    ],
+  },
+  {
     version: "3.59.0-alpha",
     date: "2026-07-24",
     highlights: [
