@@ -30,7 +30,8 @@ import type {
 import { formatClock, formatDate, formatDateOnly } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
 import { rankImportance } from "../lib/importance";
-import { Button, Card, Input, Skeleton, StatusBadge, Select } from "./ui";
+import { Button, Card, Input, Skeleton, StatusBadge, Select, SegmentedControl } from "./ui";
+import { readFocusLayout, writeFocusLayout, type FocusLayout } from "../lib/focusPrefs";
 import { useDepth } from "../theme";
 
 interface Props {
@@ -256,6 +257,13 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     );
   }, [projects, sort]);
 
+  // Split (side-by-side) vs stacked layout — per-device, shared with the Settings → General toggle.
+  const [layout, setLayout] = useState<FocusLayout>(readFocusLayout);
+  function changeLayout(next: FocusLayout) {
+    setLayout(next);
+    writeFocusLayout(next);
+  }
+
   async function suggestAll() {
     if (proposing || projects.length === 0) return;
     setProposing(true);
@@ -274,28 +282,125 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     }
   }
 
+  // The two columns, split out so the side-by-side and stacked layouts arrange the same JSX without
+  // duplicating it. In stacked mode they render one after another exactly as before.
+  const briefingAndActions = (
+    <>
+      <Briefing briefing={briefing} busy={briefingBusy} onRefresh={regenerateBriefing} />
+      {!loading && projects.length > 0 && (
+        <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
+      )}
+      {events.length > 0 && <Agenda events={events} />}
+    </>
+  );
+  const projectList = loading ? (
+    <ul className="flex flex-col gap-2">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <li key={i}>
+          <Skeleton className="h-16 w-full" />
+        </li>
+      ))}
+    </ul>
+  ) : projects.length === 0 ? (
+    <p className="text-sm text-ink4">
+      No projects yet. Ingest some documents and sort them in Review.
+    </p>
+  ) : (
+    <>
+      <div
+        className="mb-2 flex items-center justify-end gap-1.5 text-xs text-ink4"
+        data-help="focus-sort"
+      >
+        <span>Sort</span>
+        <Select
+          value={sort.key}
+          onChange={(e) => {
+            const key = e.target.value as SortKey;
+            // Choosing a key applies its natural direction; the ↑/↓ button flips it.
+            setSort((cur) => (cur.key === key ? cur : { key, dir: DEFAULT_DIR[key] }));
+          }}
+          compact
+          title="Reorder projects"
+        >
+          {(Object.keys(SORT_LABELS) as SortKey[]).map((k) => (
+            <option key={k} value={k}>
+              {SORT_LABELS[k]}
+            </option>
+          ))}
+        </Select>
+        <button
+          type="button"
+          onClick={() => setSort((s) => ({ ...s, dir: s.dir === "asc" ? "desc" : "asc" }))}
+          title={
+            sort.dir === "asc"
+              ? "Ascending — click for descending"
+              : "Descending — click for ascending"
+          }
+          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 hover:bg-surface hover:text-ink2"
+        >
+          {sort.dir === "asc" ? "↑" : "↓"}
+        </button>
+      </div>
+      <ul className="flex flex-col gap-2" data-help="focus-cards">
+        {sorted.map((p) => (
+          <ProjectCard
+            key={p.name}
+            project={p}
+            otherProjects={names.filter((n) => n !== p.name)}
+            proposal={proposals[p.name]}
+            editing={editing === p.name}
+            onEdit={() => setEditing(editing === p.name ? null : p.name)}
+            onOpen={() => onOpenProject(p.name)}
+            onChanged={refresh}
+            onSaved={async () => {
+              setEditing(null);
+              await refresh();
+            }}
+          />
+        ))}
+      </ul>
+    </>
+  );
+
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between border-b border-border px-6 py-3">
+      <header className="flex items-center justify-between gap-3 border-b border-border px-6 py-3">
         <div data-help="focus-header">
           <h1 className="font-head text-sm font-semibold text-ink">Focus</h1>
           <p className="text-xs text-ink3">
             Every project, one status — what to look at right now.
           </p>
         </div>
-        <Button
-          variant="secondary"
-          onClick={suggestAll}
-          disabled={proposing || projects.length === 0}
-          data-help="focus-suggest"
-          title="Let the AI propose a size, parent, blocker and deadline for each project"
-        >
-          {proposing ? "Suggesting…" : "Suggest attributes (AI)"}
-        </Button>
+        <div className="flex items-center gap-2">
+          {/* Split puts the briefing/actions/agenda beside the project list; stacked is one column.
+              Hidden below lg, where the layout collapses to one column regardless. */}
+          <SegmentedControl
+            className="hidden lg:inline-flex"
+            value={layout}
+            onChange={changeLayout}
+            options={[
+              {
+                value: "split",
+                label: "Split",
+                title: "Briefing and agenda beside the project list",
+              },
+              { value: "vertical", label: "Stacked", title: "Everything in one column" },
+            ]}
+          />
+          <Button
+            variant="secondary"
+            onClick={suggestAll}
+            disabled={proposing || projects.length === 0}
+            data-help="focus-suggest"
+            title="Let the AI propose a size, parent, blocker and deadline for each project"
+          >
+            {proposing ? "Suggesting…" : "Suggest attributes (AI)"}
+          </Button>
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-3xl px-6 py-6">
+        <div className={`mx-auto px-6 py-6 ${layout === "split" ? "max-w-6xl" : "max-w-3xl"}`}>
           {error && (
             <div
               className="mb-4 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
@@ -307,77 +412,17 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
               {error}
             </div>
           )}
-          <Briefing briefing={briefing} busy={briefingBusy} onRefresh={regenerateBriefing} />
-          {!loading && projects.length > 0 && (
-            <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
-          )}
-          {events.length > 0 && <Agenda events={events} />}
-          {loading ? (
-            <ul className="flex flex-col gap-2">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <li key={i}>
-                  <Skeleton className="h-16 w-full" />
-                </li>
-              ))}
-            </ul>
-          ) : projects.length === 0 ? (
-            <p className="text-sm text-ink4">
-              No projects yet. Ingest some documents and sort them in Review.
-            </p>
+          {layout === "split" ? (
+            // Two columns on a wide screen (briefing/actions/agenda | project list); the grid falls
+            // back to one column below lg, so a narrow window reads like the stacked layout.
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,22rem)_1fr]">
+              <div className="min-w-0">{briefingAndActions}</div>
+              <div className="min-w-0">{projectList}</div>
+            </div>
           ) : (
             <>
-              <div
-                className="mb-2 flex items-center justify-end gap-1.5 text-xs text-ink4"
-                data-help="focus-sort"
-              >
-                <span>Sort</span>
-                <Select
-                  value={sort.key}
-                  onChange={(e) => {
-                    const key = e.target.value as SortKey;
-                    // Choosing a key applies its natural direction; the ↑/↓ button flips it.
-                    setSort((cur) => (cur.key === key ? cur : { key, dir: DEFAULT_DIR[key] }));
-                  }}
-                  compact
-                  title="Reorder projects"
-                >
-                  {(Object.keys(SORT_LABELS) as SortKey[]).map((k) => (
-                    <option key={k} value={k}>
-                      {SORT_LABELS[k]}
-                    </option>
-                  ))}
-                </Select>
-                <button
-                  type="button"
-                  onClick={() => setSort((s) => ({ ...s, dir: s.dir === "asc" ? "desc" : "asc" }))}
-                  title={
-                    sort.dir === "asc"
-                      ? "Ascending — click for descending"
-                      : "Descending — click for ascending"
-                  }
-                  className="rounded-[var(--radius-sm)] px-1.5 py-0.5 hover:bg-surface hover:text-ink2"
-                >
-                  {sort.dir === "asc" ? "↑" : "↓"}
-                </button>
-              </div>
-              <ul className="flex flex-col gap-2" data-help="focus-cards">
-                {sorted.map((p) => (
-                  <ProjectCard
-                    key={p.name}
-                    project={p}
-                    otherProjects={names.filter((n) => n !== p.name)}
-                    proposal={proposals[p.name]}
-                    editing={editing === p.name}
-                    onEdit={() => setEditing(editing === p.name ? null : p.name)}
-                    onOpen={() => onOpenProject(p.name)}
-                    onChanged={refresh}
-                    onSaved={async () => {
-                      setEditing(null);
-                      await refresh();
-                    }}
-                  />
-                ))}
-              </ul>
+              {briefingAndActions}
+              {projectList}
             </>
           )}
         </div>

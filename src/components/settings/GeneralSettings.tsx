@@ -21,6 +21,7 @@ import {
   readMapMode,
   type MapLayoutMode,
 } from "../../lib/mapPrefs";
+import { readFocusLayout, writeFocusLayout, type FocusLayout } from "../../lib/focusPrefs";
 import { readConfirmDelete, writeConfirmDelete } from "../../lib/pinboard/prefs";
 import {
   ACCENTS,
@@ -67,6 +68,9 @@ export function GeneralSettings() {
   // Seeded from localStorage rather than watched: the toggle is the only writer here, and the
   // Pinboard reads the pref fresh at the moment you click delete (see pinboard/prefs.ts).
   const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
+  // The Focus tab's default layout (split | stacked). Shared with the Focus header toggle; this is the
+  // only other writer, seeded from localStorage like confirmDelete above.
+  const [focusLayout, setFocusLayout] = useState<FocusLayout>(readFocusLayout);
   // Memory map (the Map tab): the default grouping, cohesion blend, node cap, and the optional t-SNE
   // component's install/enable state.
   const [mapGrouping, setMapGrouping] = useState<MapLayoutMode>(readMapMode);
@@ -130,6 +134,11 @@ export function GeneralSettings() {
     };
   }, []);
 
+  function changeFocusLayout(next: FocusLayout) {
+    setFocusLayout(next);
+    writeFocusLayout(next); // shared with the Focus header toggle
+  }
+
   function changeMapGrouping(next: MapLayoutMode) {
     setMapGrouping(next);
     localStorage.setItem(MAP_MODE_KEY, next); // shared with the Map header toggle
@@ -189,10 +198,15 @@ export function GeneralSettings() {
   const mapIsDefault =
     mapGrouping === "project" && mapCohesion === 0 && mapNodeCap === 1000 && mapTsneEnabled;
   const confirmDeleteIsDefault = confirmDelete;
+  const focusLayoutIsDefault = focusLayout === "split";
   const helpIsDefault = !help.enabled;
   // The whole tab, minus the deliberately-excluded time zone (device-derived, not a preference).
   const generalIsDefault =
-    appearanceIsDefault && mapIsDefault && confirmDeleteIsDefault && helpIsDefault;
+    appearanceIsDefault &&
+    mapIsDefault &&
+    confirmDeleteIsDefault &&
+    focusLayoutIsDefault &&
+    helpIsDefault;
 
   function resetMap() {
     changeMapGrouping("project"); // state + shared localStorage key
@@ -205,10 +219,14 @@ export function GeneralSettings() {
     setConfirmDelete(true);
     writeConfirmDelete(true);
   }
+  function resetFocusLayout() {
+    changeFocusLayout("split");
+  }
   function resetGeneral() {
     resetAppearance();
     resetMap();
     resetConfirmDelete();
+    resetFocusLayout();
     help.setEnabled(false);
     // Time zone is intentionally left alone — it's derived from the device, not a taste preference.
   }
@@ -441,6 +459,30 @@ export function GeneralSettings() {
             </p>
           )}
         </SectionInfo>
+      </div>
+
+      <div
+        id="sec-general-focus"
+        data-settings-section
+        className="mt-5 border-t border-border pt-4"
+      >
+        <div className="flex items-center justify-between gap-2">
+          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+            Focus
+          </label>
+          {!focusLayoutIsDefault && <ResetLink onReset={resetFocusLayout} label="Reset layout" />}
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <span className="text-sm text-ink2">Layout</span>
+          <SegmentedControl
+            value={focusLayout}
+            onChange={changeFocusLayout}
+            options={[
+              { value: "split", label: "Split" },
+              { value: "vertical", label: "Stacked" },
+            ]}
+          />
+        </div>
       </div>
 
       <div
