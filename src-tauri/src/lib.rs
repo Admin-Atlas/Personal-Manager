@@ -1244,6 +1244,7 @@ pub fn run() {
             commands::sync_calendar,
             commands::list_calendar_events,
             commands::list_all_calendar_events,
+            commands::event_flags,
             commands::connect_drive,
             commands::disconnect_drive,
             commands::drive_status,

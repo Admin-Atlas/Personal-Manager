@@ -20,7 +20,7 @@
 use chrono::NaiveDateTime;
 use serde_json::Value;
 
-use crate::calendar::{CalendarEvent, RawCalendarInput};
+use crate::calendar::{Attendee, CalendarEvent, RawCalendarInput};
 use crate::error::{Error, Result};
 use crate::{microsoft, secrets};
 
@@ -28,9 +28,13 @@ use crate::{microsoft, secrets};
 /// even the wide ~13-month mirror band keeps any real calendar far under 250 × 100 events).
 const PAGE_SIZE: usize = 250;
 const MAX_PAGES: usize = 100;
-/// The field projection for one event — only what the mirror needs.
+/// The field projection for one event — only what the mirror needs. Graph returns ONLY the named
+/// fields, so the v40 popup detail (showAs / attendees / organizer / onlineMeeting / recurrence /
+/// sensitivity / timestamps) has to be requested here or it never arrives in `parse_event`.
 const SELECT_EVENT: &str =
-    "id,subject,bodyPreview,location,start,end,isAllDay,isCancelled,webLink,iCalUId";
+    "id,subject,bodyPreview,location,start,end,isAllDay,isCancelled,webLink,\
+iCalUId,showAs,attendees,organizer,onlineMeeting,onlineMeetingUrl,recurrence,seriesMasterId,\
+sensitivity,createdDateTime,lastModifiedDateTime";
 
 // --- identity / namespacing ----------------------------------------------------------------------
 
@@ -178,6 +182,74 @@ fn parse_events(mirror_calendar_id: &str, value: &Value) -> (Vec<CalendarEvent>,
     (events, next)
 }
 
+/// Graph `showAs` → the shared show_as vocabulary (busy | free | tentative | oof | elsewhere).
+fn graph_show_as(e: &Value) -> Option<String> {
+    match e.get("showAs").and_then(Value::as_str) {
+        Some("free") => Some("free"),
+        Some("tentative") => Some("tentative"),
+        Some("busy") => Some("busy"),
+        Some("oof") => Some("oof"),
+        Some("workingElsewhere") => Some("elsewhere"),
+        _ => None,
+    }
+    .map(str::to_string)
+}
+
+/// Graph attendees → the shared `Attendee` shape (empty when none). Graph doesn't flag self/organizer
+/// on an attendee row, so those stay false; the organiser is carried separately (`graph_organizer`).
+fn graph_attendees(e: &Value) -> Vec<Attendee> {
+    e.get("attendees")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|a| {
+                    let email = a.get("emailAddress");
+                    Attendee {
+                        name: email
+                            .and_then(|m| m.get("name"))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string),
+                        email: email
+                            .and_then(|m| m.get("address"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        response: a
+                            .get("status")
+                            .and_then(|s| s.get("response"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        optional: a.get("type").and_then(Value::as_str) == Some("optional"),
+                        organizer: false,
+                        is_self: false,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The organiser as a display string (name preferred, else the address).
+fn graph_organizer(e: &Value) -> Option<String> {
+    let email = e.get("organizer").and_then(|o| o.get("emailAddress"))?;
+    email
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| email.get("address").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+/// A Teams/online-meeting join link, when the event has one.
+fn graph_conference(e: &Value) -> Option<String> {
+    e.get("onlineMeeting")
+        .and_then(|m| m.get("joinUrl"))
+        .and_then(Value::as_str)
+        .or_else(|| e.get("onlineMeetingUrl").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn parse_event(mirror_calendar_id: &str, e: &Value) -> Option<CalendarEvent> {
     if e.get("isCancelled").and_then(Value::as_bool) == Some(true) {
         return None;
@@ -235,6 +307,32 @@ fn parse_event(mirror_calendar_id: &str, e: &Value) -> Option<CalendarEvent> {
         all_day,
         html_link: e.get("webLink").and_then(Value::as_str).map(str::to_string),
         uid,
+        show_as: graph_show_as(e),
+        organizer: graph_organizer(e),
+        attendees: graph_attendees(e),
+        conference_url: graph_conference(e),
+        // calendarView pre-expands a series into instances that carry a seriesMasterId + a non-single
+        // `type`; the recurrence rule itself lives only on the master, so no summary is available here.
+        recurring: e.get("seriesMasterId").and_then(Value::as_str).is_some()
+            || matches!(
+                e.get("type").and_then(Value::as_str),
+                Some("occurrence" | "exception" | "seriesMaster")
+            ),
+        recurrence_summary: None,
+        status: None,
+        visibility: e
+            .get("sensitivity")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && *s != "normal")
+            .map(str::to_string),
+        created: e
+            .get("createdDateTime")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        updated: e
+            .get("lastModifiedDateTime")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 

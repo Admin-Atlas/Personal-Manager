@@ -54,8 +54,8 @@ interface Props {
   /** The ticking "now" (device-local) so past events grey and the now-line tracks the minute. Defaults
    *  to the render-time clock for embeds that don't thread a tick. */
   now?: Date;
-  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay bands only). */
-  onEventClick?: (ev: CalendarEvent) => void;
+  /** Open an event's detail popup, anchored at the event's on-screen rect. */
+  onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
 }
 
 const LOCAL_COL = 54; // width of the local hour column (px)
@@ -373,6 +373,7 @@ export function TimeGridView({
                   showTime={!minimal}
                   showLocation={showPower}
                   isPast={isEventPast(card.ev, nowDate)}
+                  onSelect={onEventClick ? (rect) => onEventClick(card.ev, rect) : undefined}
                 />
               ))}
               {c.isToday && <NowLine topPx={(nowMin / 60) * rowH} />}

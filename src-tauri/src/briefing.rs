@@ -442,6 +442,7 @@ mod tests {
             all_day: false,
             html_link: None,
             uid: Some(uid.into()),
+            ..Default::default()
         }
     }
 

@@ -50,7 +50,25 @@ const MAX_FEED_BYTES: usize = 10 * 1024 * 1024;
 /// cross-provider anchor stored for the Stage-4 correspondence card. The DB also carries a nullable
 /// `entity_id` correspondence slot, but nothing writes it this stage, so it's deliberately absent from
 /// this struct.
-#[derive(Clone, Serialize)]
+/// One attendee on an event, as surfaced in the detail popup. Stored as a JSON array in the
+/// `calendar_events.attendees` column (so no per-attendee table), parsed back on read. Every field is
+/// optional/defaulted so a sparse provider record (email-only, or name-only) still round-trips.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct Attendee {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    /// accepted | declined | tentative | needsAction (provider terms normalised where cheap).
+    pub response: Option<String>,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default)]
+    pub organizer: bool,
+    /// This account is the attendee (Google `self`, Graph — matched by the connected address).
+    #[serde(default, rename = "self")]
+    pub is_self: bool,
+}
+
+#[derive(Clone, Serialize, Default)]
 pub struct CalendarEvent {
     pub id: String,
     pub calendar_id: String,
@@ -65,6 +83,27 @@ pub struct CalendarEvent {
     /// The provider's stable iCal UID (Google `iCalUID`, Graph `iCalUId`, ICS `UID`). `None` when the
     /// feed omits it. The Stage-4 anchor; not used for read-only rendering.
     pub uid: Option<String>,
+    // --- richer detail for the event popup (all additive/nullable; parsed per provider) ---
+    /// How the time reads on the owner's calendar: busy | free | tentative | oof | elsewhere.
+    pub show_as: Option<String>,
+    /// The organiser as a display string ("Name" or the email).
+    pub organizer: Option<String>,
+    /// Attendees (may be empty). Serialised to the `attendees` JSON column, parsed back on read.
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
+    /// A join link (Google Meet/`hangoutLink`, Graph `onlineMeeting.joinUrl`).
+    pub conference_url: Option<String>,
+    /// Whether the event is part of a recurring series.
+    pub recurring: bool,
+    /// A short human/recurrence-rule summary when available (the raw RRULE for ICS/Google).
+    pub recurrence_summary: Option<String>,
+    /// Provider status (confirmed | tentative). Cancelled events are dropped before the mirror.
+    pub status: Option<String>,
+    /// Visibility class (default | public | private | confidential).
+    pub visibility: Option<String>,
+    /// Provider create / last-modified timestamps, when supplied.
+    pub created: Option<String>,
+    pub updated: Option<String>,
 }
 
 /// The calendar event that made a project "Due soon" — shown on its focus card so
@@ -560,6 +599,66 @@ fn parse_calendars(value: &serde_json::Value) -> Vec<RawCalendar> {
         .unwrap_or_default()
 }
 
+/// Google attendees → the shared `Attendee` shape (empty when the event lists none).
+fn google_attendees(it: &serde_json::Value) -> Vec<Attendee> {
+    it.get("attendees")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|a| Attendee {
+                    name: a
+                        .get("displayName")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    email: a.get("email").and_then(|v| v.as_str()).map(str::to_string),
+                    response: a
+                        .get("responseStatus")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    optional: a.get("optional").and_then(|v| v.as_bool()).unwrap_or(false),
+                    organizer: a
+                        .get("organizer")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    is_self: a.get("self").and_then(|v| v.as_bool()).unwrap_or(false),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The organiser as a display string (name preferred, else email).
+fn google_organizer(it: &serde_json::Value) -> Option<String> {
+    let org = it.get("organizer")?;
+    org.get("displayName")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| org.get("email").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// A video-call join link: `hangoutLink`, else the first http conferenceData entry point.
+fn google_conference(it: &serde_json::Value) -> Option<String> {
+    if let Some(h) = it
+        .get("hangoutLink")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(h.to_string());
+    }
+    it.get("conferenceData")
+        .and_then(|c| c.get("entryPoints"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter().find_map(|e| {
+                e.get("uri")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| s.starts_with("http"))
+            })
+        })
+        .map(str::to_string)
+}
+
 fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEvent> {
     let Some(items) = value.get("items").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -608,6 +707,45 @@ fn parse_events(calendar_id: &str, value: &serde_json::Value) -> Vec<CalendarEve
                 .get("iCalUID")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            // transparency defaults to "opaque" (busy); only "transparent" reads as free.
+            show_as: Some(
+                if it.get("transparency").and_then(|v| v.as_str()) == Some("transparent") {
+                    "free"
+                } else {
+                    "busy"
+                }
+                .to_string(),
+            ),
+            organizer: google_organizer(it),
+            attendees: google_attendees(it),
+            conference_url: google_conference(it),
+            recurring: it.get("recurrence").is_some() || it.get("recurringEventId").is_some(),
+            recurrence_summary: it
+                .get("recurrence")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .filter(|s| !s.is_empty()),
+            status: it
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            visibility: it
+                .get("visibility")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            created: it
+                .get("created")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            updated: it
+                .get("updated")
+                .and_then(|v| v.as_str())
                 .map(str::to_string),
         });
     }
@@ -1108,18 +1246,31 @@ fn events_hash(events: &[CalendarEvent]) -> String {
     let mut lines: Vec<String> = events
         .iter()
         .map(|e| {
-            format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                e.id,
-                e.summary,
+            // The v40 detail fields are folded in so an edit to any of them (or the one-time gain of
+            // the columns themselves) changes the hash and rewrites the row on the next sync.
+            let attendees = serde_json::to_string(&e.attendees).unwrap_or_default();
+            [
+                e.id.as_str(),
+                e.summary.as_str(),
                 e.description.as_deref().unwrap_or(""),
                 e.location.as_deref().unwrap_or(""),
-                e.start,
+                e.start.as_str(),
                 e.end.as_deref().unwrap_or(""),
-                e.all_day,
+                if e.all_day { "1" } else { "0" },
                 e.html_link.as_deref().unwrap_or(""),
                 e.uid.as_deref().unwrap_or(""),
-            )
+                e.show_as.as_deref().unwrap_or(""),
+                e.organizer.as_deref().unwrap_or(""),
+                attendees.as_str(),
+                e.conference_url.as_deref().unwrap_or(""),
+                if e.recurring { "1" } else { "0" },
+                e.recurrence_summary.as_deref().unwrap_or(""),
+                e.status.as_deref().unwrap_or(""),
+                e.visibility.as_deref().unwrap_or(""),
+                e.created.as_deref().unwrap_or(""),
+                e.updated.as_deref().unwrap_or(""),
+            ]
+            .join("\u{1f}")
         })
         .collect();
     lines.sort();
@@ -1162,10 +1313,21 @@ pub fn replace_events(
             .description
             .as_deref()
             .map(|d| clip(d, MAX_DESCRIPTION_CHARS));
+        // Untrusted free-text from the provider — clip like description/location. Attendees are stored
+        // as a JSON array (NULL when none), parsed back on read.
+        let organizer = e.organizer.as_deref().map(|o| clip(o, MAX_LOCATION_CHARS));
+        let recurrence_summary = e
+            .recurrence_summary
+            .as_deref()
+            .map(|r| clip(r, MAX_LOCATION_CHARS));
+        let attendees = (!e.attendees.is_empty())
+            .then(|| serde_json::to_string(&e.attendees).unwrap_or_else(|_| "[]".to_string()));
         tx.execute(
             "INSERT OR REPLACE INTO calendar_events \
-             (id, calendar_id, summary, description, location, start, end, all_day, html_link, uid) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             (id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
+              show_as, organizer, attendees, conference_url, recurring, recurrence_summary, status, \
+              visibility, created, updated) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 e.id,
                 e.calendar_id,
@@ -1176,7 +1338,17 @@ pub fn replace_events(
                 e.end,
                 e.all_day as i64,
                 e.html_link,
-                e.uid
+                e.uid,
+                e.show_as,
+                organizer,
+                attendees,
+                e.conference_url,
+                e.recurring as i64,
+                recurrence_summary,
+                e.status,
+                e.visibility,
+                e.created,
+                e.updated,
             ],
         )?;
     }
@@ -1240,6 +1412,9 @@ fn agenda_query(
         let all_day: i64 = r.get(7)?;
         let ended: i64 = r.get(10)?;
         Ok(AgendaEvent {
+            // The v40 detail fields (show_as/attendees/…) are only surfaced by the Calendar tab's
+            // event popup via `list_all_events`; the assistant/focus paths this query feeds don't use
+            // them, so they default to empty here rather than widening this hot query.
             event: CalendarEvent {
                 id: r.get(0)?,
                 calendar_id: r.get(1)?,
@@ -1251,6 +1426,7 @@ fn agenda_query(
                 all_day: all_day != 0,
                 html_link: r.get(8)?,
                 uid: r.get(9)?,
+                ..Default::default()
             },
             ended: ended != 0,
         })
@@ -1315,12 +1491,16 @@ pub fn focus_agenda(conn: &Connection, days: i64, zone: chrono_tz::Tz) -> Result
 /// ([`agenda_query`]) but still shown here on the Calendar tab — that's the whole point of quiet.
 pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
     let mut stmt = conn.prepare(
-        "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid \
+        "SELECT id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
+                show_as, organizer, attendees, conference_url, recurring, recurrence_summary, status, \
+                visibility, created, updated \
          FROM calendar_events \
          ORDER BY start",
     )?;
     let rows = stmt.query_map([], |r| {
         let all_day: i64 = r.get(7)?;
+        let recurring: i64 = r.get(14)?;
+        let attendees_json: Option<String> = r.get(12)?;
         Ok(CalendarEvent {
             id: r.get(0)?,
             calendar_id: r.get(1)?,
@@ -1332,6 +1512,18 @@ pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
             all_day: all_day != 0,
             html_link: r.get(8)?,
             uid: r.get(9)?,
+            show_as: r.get(10)?,
+            organizer: r.get(11)?,
+            attendees: attendees_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+            conference_url: r.get(13)?,
+            recurring: recurring != 0,
+            recurrence_summary: r.get(15)?,
+            status: r.get(16)?,
+            visibility: r.get(17)?,
+            created: r.get(18)?,
+            updated: r.get(19)?,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1435,6 +1627,7 @@ mod tests {
             all_day: false,
             html_link: None,
             uid: None,
+            ..Default::default()
         }
     }
 
@@ -1668,6 +1861,7 @@ mod tests {
                 all_day: false,
                 html_link: None,
                 uid: None,
+                ..Default::default()
             },
         }
     }

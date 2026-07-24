@@ -31,6 +31,8 @@ interface Props {
   showLocation: boolean;
   /** The event has fully passed — grey it back so what's done recedes. */
   isPast?: boolean;
+  /** Open the event's detail popup, anchored at the card's on-screen rect. */
+  onSelect?: (anchor: DOMRect) => void;
 }
 
 // Height thresholds below which a line has no room — keep them out of the render so a squeezed card
@@ -50,6 +52,7 @@ export function EventCard({
   showTime,
   showLocation,
   isPast,
+  onSelect,
 }: Props) {
   const style: CSSProperties = {
     top: `${topPx}px`,
@@ -69,11 +72,25 @@ export function EventCard({
     <div
       className={cn(
         "absolute overflow-hidden rounded-[var(--radius-sm)] border border-border border-l-[3px] px-1.5 py-0.5",
+        onSelect && "cursor-pointer hover:brightness-110",
         isPast && PAST_EVENT_CLASS,
       )}
       style={style}
       title={summary}
       aria-label={ariaLabel}
+      role={onSelect ? "button" : undefined}
+      tabIndex={onSelect ? 0 : undefined}
+      onClick={onSelect ? (e) => onSelect(e.currentTarget.getBoundingClientRect()) : undefined}
+      onKeyDown={
+        onSelect
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onSelect(e.currentTarget.getBoundingClientRect());
+              }
+            }
+          : undefined
+      }
     >
       <div className="truncate font-head text-[11px] font-medium leading-tight text-ink">
         {summary}

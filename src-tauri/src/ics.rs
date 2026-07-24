@@ -166,10 +166,37 @@ fn expand_vevent(
         starts.retain(|s| !skip.contains(&s.timestamp()));
     }
 
+    // v40 detail fields for the event popup — parsed once from the VEVENT block (constant across a
+    // recurring series' occurrences), then stamped on each event below. ICS attendees (multi-line
+    // ATTENDEE properties) are a follow-up: read-only subscription feeds rarely carry them.
+    let show_as = Some(
+        if find(block, "TRANSP") == Some("TRANSPARENT") {
+            "free"
+        } else {
+            "busy"
+        }
+        .to_string(),
+    );
+    let organizer = find_prop(block, "ORGANIZER").map(|(params, val)| {
+        param(params, "CN").map(unescape).unwrap_or_else(|| {
+            val.trim_start_matches("mailto:")
+                .trim_start_matches("MAILTO:")
+                .to_string()
+        })
+    });
+    let recurring = block.iter().any(|l| is_prop(l, "RRULE"));
+    let recurrence_summary = find(block, "RRULE").map(str::to_string);
+    let status = find(block, "STATUS").map(str::to_string);
+    let visibility = find(block, "CLASS").map(str::to_string);
+    let created = find(block, "CREATED").map(str::to_string);
+    let updated = find(block, "LAST-MODIFIED")
+        .or_else(|| find(block, "DTSTAMP"))
+        .map(str::to_string);
+
     starts
         .into_iter()
         .map(|s| {
-            make_event(
+            let mut ev = make_event(
                 feed_id,
                 &uid,
                 &summary,
@@ -179,7 +206,16 @@ fn expand_vevent(
                 dur,
                 all_day,
                 tz,
-            )
+            );
+            ev.show_as = show_as.clone();
+            ev.organizer = organizer.clone();
+            ev.recurring = recurring;
+            ev.recurrence_summary = recurrence_summary.clone();
+            ev.status = status.clone();
+            ev.visibility = visibility.clone();
+            ev.created = created.clone();
+            ev.updated = updated.clone();
+            ev
         })
         .collect()
 }
@@ -421,6 +457,10 @@ fn make_event(
         html_link: None,
         // The iCal UID is the durable cross-provider anchor; an empty UID stores as None.
         uid: (!uid.is_empty()).then(|| uid.to_string()),
+        // The v40 detail fields (show_as / organizer / recurrence / …) are the same for every
+        // occurrence of a recurring VEVENT, so `expand_vevent` computes them once and sets them on
+        // each returned event rather than threading them through this per-occurrence builder.
+        ..Default::default()
     }
 }
 

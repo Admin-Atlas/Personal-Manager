@@ -1,0 +1,324 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// The click-to-open detail popup for a calendar event (card 6 follow-up). PM is the calendar
+// aggregator, so this surfaces everything the mirror holds — source calendar, when, busy/free,
+// location, attendees + organiser, conferencing, recurrence, description, and any linked milestone /
+// project / PM flag — plus buttons to open the event in its source calendar, its project, or the
+// Pinboard. It's an in-place floating panel (the pinboard folder-popup pattern): fixed-position,
+// clamped to the viewport, dismissed by click-outside or Escape. The description is the one piece of
+// untrusted provider text, so it renders ONLY through the sanitising Markdown boundary.
+
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import type { Calendar, CalendarEvent, Flag, Milestone } from "../../../lib/types";
+import { eventFlags, openUrl } from "../../../lib/ipc";
+import { formatClock, formatDateLocal } from "../../../lib/format";
+import { parseLocal } from "../../../lib/calendar-layout";
+import { useDepth } from "../../../theme";
+import { Button } from "../../ui";
+import { Markdown } from "../../../lib/markdown";
+
+interface Props {
+  event: CalendarEvent;
+  /** The clicked element's on-screen rect, so the panel opens beside it. */
+  anchor: DOMRect;
+  /** The owning calendar (name + provider), when resolvable. */
+  calendar: Calendar | null;
+  /** The calendar's source colour. */
+  color: string;
+  /** A milestone linked to this event (by iCal UID), for the "Open in Project" action. */
+  milestone: Milestone | null;
+  onClose: () => void;
+  onOpenProject?: (project: string) => void;
+  onOpenPinboard?: () => void;
+}
+
+const MARGIN = 8;
+
+/** A human "when" line: an all-day date (or range), or a date + start–end clock. */
+function whenText(ev: CalendarEvent): string {
+  const start = parseLocal(ev.start, ev.all_day);
+  if (!start) return ev.start;
+  if (ev.all_day) {
+    const end = ev.end ? parseLocal(ev.end, true) : null;
+    // All-day end is exclusive; show a range only when it spans more than the single start day.
+    if (end && end.getTime() - 86_400_000 > start.getTime()) {
+      const last = new Date(end.getTime() - 86_400_000);
+      return `All day · ${formatDateLocal(start)} – ${formatDateLocal(last)}`;
+    }
+    return `All day · ${formatDateLocal(start)}`;
+  }
+  const end = ev.end ? parseLocal(ev.end, false) : null;
+  const clock = end ? `${formatClock(start)}–${formatClock(end)}` : formatClock(start);
+  return `${formatDateLocal(start)} · ${clock}`;
+}
+
+/** busy/free/tentative/oof/elsewhere → a friendly label. */
+function showAsLabel(v: string): string {
+  switch (v) {
+    case "free":
+      return "Free";
+    case "tentative":
+      return "Tentative";
+    case "oof":
+      return "Out of office";
+    case "elsewhere":
+      return "Working elsewhere";
+    default:
+      return "Busy";
+  }
+}
+
+/** attendee response → a friendly label (Google/Graph terms). */
+function responseLabel(v: string | null): string | null {
+  switch (v) {
+    case "accepted":
+      return "accepted";
+    case "declined":
+      return "declined";
+    case "tentative":
+    case "tentativelyAccepted":
+      return "maybe";
+    case "needsAction":
+    case "notResponded":
+    case "none":
+      return "no reply";
+    case "organizer":
+      return "organiser";
+    default:
+      return null;
+  }
+}
+
+/** "Open in Google" / "Open in Outlook" / a generic label from the provider. */
+function sourceLabel(provider: string | undefined): string {
+  switch (provider) {
+    case "google":
+      return "Open in Google Calendar";
+    case "outlook":
+    case "microsoft":
+      return "Open in Outlook";
+    default:
+      return "Open in calendar";
+  }
+}
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex gap-2 text-xs">
+      <span className="w-20 shrink-0 font-mono uppercase tracking-wide text-ink4">{label}</span>
+      <div className="min-w-0 flex-1 text-ink2">{children}</div>
+    </div>
+  );
+}
+
+export function CalendarEventPopover({
+  event,
+  anchor,
+  calendar,
+  color,
+  milestone,
+  onClose,
+  onOpenProject,
+  onOpenPinboard,
+}: Props) {
+  const { showPower } = useDepth();
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const [flags, setFlags] = useState<Flag[]>([]);
+
+  // Position beside the anchor once measured: clamp horizontally, prefer below, flip above (or clamp
+  // to the bottom) when there isn't room. Hidden until placed so it never flashes at 0,0.
+  useLayoutEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const left = Math.max(MARGIN, Math.min(anchor.left, window.innerWidth - w - MARGIN));
+    let top = anchor.bottom + 6;
+    if (top + h + MARGIN > window.innerHeight) {
+      const above = anchor.top - 6 - h;
+      top = above >= MARGIN ? above : Math.max(MARGIN, window.innerHeight - h - MARGIN);
+    }
+    setPos({ left, top });
+  }, [anchor]);
+
+  // Dismiss on Escape or a click/tap outside the panel.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    const onDown = (e: MouseEvent) => {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onDown);
+    };
+  }, [onClose]);
+
+  // Load any PM flags anchored on this event's UID.
+  useEffect(() => {
+    if (!event.uid) {
+      setFlags([]);
+      return;
+    }
+    let alive = true;
+    eventFlags(event.uid)
+      .then((f) => {
+        if (alive) setFlags(f);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [event.uid]);
+
+  const attendees = event.attendees ?? [];
+
+  return (
+    <div
+      ref={panelRef}
+      role="dialog"
+      aria-label={event.summary}
+      className="fixed z-50 flex max-h-[75vh] w-[340px] flex-col overflow-hidden rounded-[var(--radius)] border border-border2 bg-panel shadow-2xl"
+      style={{
+        left: pos?.left ?? anchor.left,
+        top: pos?.top ?? anchor.bottom + 6,
+        visibility: pos ? "visible" : "hidden",
+      }}
+    >
+      {/* Header */}
+      <div className="flex items-start justify-between gap-2 border-b border-border px-3 py-2.5">
+        <div className="min-w-0">
+          <h2 className="break-words font-head text-sm font-semibold text-ink">{event.summary}</h2>
+          <div className="mt-0.5 flex items-center gap-1.5 text-xs text-ink4">
+            <span
+              className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
+              style={{ background: color }}
+            />
+            <span className="truncate">{calendar?.name ?? "Calendar"}</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className="shrink-0 rounded-[var(--radius-sm)] px-1.5 text-ink4 hover:bg-surface hover:text-ink"
+        >
+          ×
+        </button>
+      </div>
+
+      {/* Body */}
+      <div className="flex flex-col gap-2 overflow-y-auto px-3 py-3">
+        <Field label="When">
+          <div>{whenText(event)}</div>
+          {event.recurring && (
+            <div className="mt-0.5 text-ink4">
+              Repeats{event.recurrence_summary ? ` · ${event.recurrence_summary}` : ""}
+            </div>
+          )}
+        </Field>
+
+        {event.show_as && <Field label="Shows as">{showAsLabel(event.show_as)}</Field>}
+        {event.location && <Field label="Where">{event.location}</Field>}
+
+        {event.organizer && <Field label="Organiser">{event.organizer}</Field>}
+
+        {attendees.length > 0 && (
+          <Field label="Guests">
+            <ul className="flex flex-col gap-0.5">
+              {attendees.map((a, i) => {
+                const resp = responseLabel(a.response);
+                return (
+                  <li key={a.email ?? a.name ?? i} className="truncate">
+                    {a.name ?? a.email ?? "(unknown)"}
+                    {a.optional ? " (optional)" : ""}
+                    {resp ? <span className="text-ink4"> — {resp}</span> : null}
+                  </li>
+                );
+              })}
+            </ul>
+          </Field>
+        )}
+
+        {event.conference_url && (
+          <Field label="Call">
+            <button
+              type="button"
+              onClick={() => void openUrl(event.conference_url!)}
+              className="truncate text-left text-accent-text hover:brightness-110"
+            >
+              Join the call →
+            </button>
+          </Field>
+        )}
+
+        {milestone && (
+          <Field label="Project">
+            <span className="text-ink">{milestone.project_name}</span>
+            {milestone.label ? <span className="text-ink4"> · {milestone.label}</span> : null}
+          </Field>
+        )}
+
+        {flags.length > 0 && (
+          <Field label="Flags">
+            <ul className="flex flex-col gap-0.5">
+              {flags.map((f) => (
+                <li key={f.id} className="truncate text-ink2">
+                  {f.type.replace(/-/g, " ")}
+                </li>
+              ))}
+            </ul>
+          </Field>
+        )}
+
+        {event.description && (
+          <div className="mt-1 border-t border-border pt-2 text-xs text-ink2">
+            <Markdown>{event.description}</Markdown>
+          </div>
+        )}
+
+        {/* Power-depth provenance: status, visibility, recurrence UID, timestamps. */}
+        {showPower && (
+          <div className="mt-1 flex flex-col gap-1 border-t border-border pt-2 text-[11px] text-ink4">
+            {event.status && <div>Status: {event.status}</div>}
+            {event.visibility && <div>Visibility: {event.visibility}</div>}
+            {event.uid && <div className="break-all">UID: {event.uid}</div>}
+            {event.updated && <div>Updated: {event.updated}</div>}
+          </div>
+        )}
+      </div>
+
+      {/* Actions */}
+      <div className="flex flex-wrap gap-2 border-t border-border px-3 py-2.5">
+        {event.html_link && (
+          <Button
+            variant="secondary"
+            className="text-xs"
+            onClick={() => void openUrl(event.html_link!)}
+          >
+            {sourceLabel(calendar?.provider)}
+          </Button>
+        )}
+        {milestone && onOpenProject && (
+          <Button
+            variant="tertiary"
+            className="text-xs"
+            onClick={() => onOpenProject(milestone.project_name)}
+          >
+            Open in Project
+          </Button>
+        )}
+        {onOpenPinboard && (
+          <Button variant="tertiary" className="text-xs" onClick={onOpenPinboard}>
+            Open in Pinboard
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}

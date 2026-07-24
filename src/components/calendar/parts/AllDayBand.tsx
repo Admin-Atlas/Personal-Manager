@@ -14,7 +14,6 @@ import {
   dayDiff,
   eventDaySpan,
   isEventPast,
-  isOverlayEvent,
   packBands,
   PAST_EVENT_CLASS,
   type BandInput,
@@ -37,8 +36,8 @@ interface Props {
   /** The ticking "now" (device-local) so a band whose last day is past greys back. Defaults to the
    *  render-time clock for embeds that don't thread a tick. */
   now?: Date;
-  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay bands only). */
-  onEventClick?: (ev: CalendarEvent) => void;
+  /** Open an event's detail popup, anchored at the band's on-screen rect. */
+  onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
 }
 
 const LANE_H = 20;
@@ -109,7 +108,7 @@ export function AllDayBand({
           const color = colorOf(b.ev.calendar_id);
           const leftPct = (b.startDay / ndays) * 100;
           const widthPct = ((b.endDay - b.startDay + 1) / ndays) * 100;
-          const clickable = isOverlayEvent(b.ev);
+          const clickable = !!onEventClick;
           const past = isEventPast(b.ev, nowRef);
           return (
             <div
@@ -135,13 +134,17 @@ export function AllDayBand({
               aria-label={b.ev.summary}
               role={clickable ? "button" : undefined}
               tabIndex={clickable ? 0 : undefined}
-              onClick={clickable ? () => onEventClick?.(b.ev) : undefined}
+              onClick={
+                clickable
+                  ? (e) => onEventClick?.(b.ev, e.currentTarget.getBoundingClientRect())
+                  : undefined
+              }
               onKeyDown={
                 clickable
                   ? (e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        onEventClick?.(b.ev);
+                        onEventClick?.(b.ev, e.currentTarget.getBoundingClientRect());
                       }
                     }
                   : undefined
