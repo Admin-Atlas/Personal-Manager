@@ -957,6 +957,7 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN uid; \
              ALTER TABLE calendar_events DROP COLUMN entity_id; \
              DROP TABLE doc_layout; \
+             DROP TABLE document_proposals; \
              DROP TABLE shared_drive_access; \
              DROP TABLE shared_with_me_access; \
              DROP TABLE connector_sources; \
@@ -1111,6 +1112,7 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN uid; \
              ALTER TABLE calendar_events DROP COLUMN entity_id; \
              DROP TABLE doc_layout; \
+             DROP TABLE document_proposals; \
              DROP TABLE shared_drive_access; \
              DROP TABLE shared_with_me_access; \
              DROP TABLE connector_sources; \

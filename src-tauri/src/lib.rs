@@ -1210,6 +1210,7 @@ pub fn run() {
             commands::list_projects,
             commands::review_queue,
             commands::review_queue_count,
+            commands::cached_proposals,
             commands::propose_metadata,
             commands::commit_review,
             commands::set_document_metadata,

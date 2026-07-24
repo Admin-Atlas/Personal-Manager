@@ -4,6 +4,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import {
   aiProviderStatus,
+  cachedProposals,
   commitReview,
   listProjects,
   proposeMetadata,
@@ -89,13 +90,22 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
   async function load() {
     setError(null);
     try {
-      const [q, p] = await Promise.all([reviewQueue(), listProjects()]);
+      const [q, p, cached] = await Promise.all([reviewQueue(), listProjects(), cachedProposals()]);
       setQueue(q);
       setProjects(p);
       // Prune cache entries for documents that have left the queue (committed/removed elsewhere).
       const ids = new Set(q.map((d) => d.id));
       for (const id of [...proposalCache.keys()]) if (!ids.has(id)) proposalCache.delete(id);
       for (const id of [...editCache.keys()]) if (!ids.has(id)) editCache.delete(id);
+      // Hydrate the in-memory cache from the persisted proposals so a restart repaints what the model
+      // already produced. Only genuinely un-proposed docs then fall into the `missing` pass below, so
+      // re-opening the app never re-bills for a proposal it already has. A proposal already in memory
+      // (freshly streamed) wins over the DB copy.
+      for (const { document_id, proposal } of cached) {
+        if (ids.has(document_id) && !proposalCache.has(document_id)) {
+          proposalCache.set(document_id, proposal);
+        }
+      }
       // Restore any cached proposals/edits; seed the rest from each document's current values.
       const restored: Record<number, MetadataProposal> = {};
       const seededEdits: Record<number, Edit> = {};

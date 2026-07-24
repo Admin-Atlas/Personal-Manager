@@ -58,6 +58,7 @@ import type {
   LocalSubfolder,
   Message,
   IngestJobState,
+  MetadataProposal,
   ModelInfo,
   OcrStatus,
   OneDriveAccount,
@@ -613,6 +614,12 @@ export const listProjects = () => invoke<string[]>("list_projects");
 export const reviewQueue = () => invoke<Document[]>("review_queue");
 /** Just the review-queue length for the sidebar badge (F-47) — avoids materialising the whole queue. */
 export const reviewQueueCount = () => invoke<number>("review_queue_count");
+
+/** The AI proposals persisted for documents still in the review queue. The Review tab hydrates its
+ *  in-memory cache from this on load, so re-opening the app repaints proposals the model already
+ *  produced instead of re-billing for them. */
+export const cachedProposals = () =>
+  invoke<{ document_id: number; proposal: MetadataProposal }[]>("cached_proposals");
 
 /** Ask the AI to propose project/tags/importance for the unreviewed documents,
  *  streaming each proposal back as it's ready. Pass `documentIds` to scope it. */
