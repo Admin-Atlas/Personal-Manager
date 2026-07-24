@@ -6,6 +6,9 @@
 //! matches the app's bundle identifier, so they can't collide with other apps'
 //! keychain entries.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
 use keyring::Entry;
 use zeroize::Zeroizing;
 
@@ -16,6 +19,17 @@ use crate::secret::Secret;
 // two in step: renaming this orphans every existing keychain entry (including the
 // DB key, which makes the old encrypted store unreadable).
 const SERVICE: &str = "org.itsatlas.pm";
+/// The single keychain item that holds **every** PM secret as one JSON `{name: value}` map. macOS
+/// shows one keychain-consent dialog per keychain *item*, so collapsing the ~dozen per-secret items
+/// into this one means a single "Always Allow" covers all of PM's secrets at once — interim relief
+/// for the unsigned-build prompt storm (one dialog per item, features loading in behind each) until
+/// Developer-ID signing lands (`docs/MACOS-SIGNING.md`; the storm's real cause is an unsigned build's
+/// unstable code identity, not this storage shape). **Honest trade-off, stated plainly:** that one
+/// grant is coarser than the old per-item grants — any code running *as PM*, once the user allows it,
+/// can read every secret, not just the one it asked for. Windows Credential Manager never prompts, so
+/// this only changes anything on macOS. The `<name>` constants below are the *logical* keys inside
+/// the map (and the *legacy* per-item entries, read once and folded into the bundle on first access).
+const BUNDLE_KEY: &str = "pm_secrets";
 const OPENROUTER_KEY: &str = "openrouter_api_key";
 /// A separate key for non-interactive background work (sorting-review proposals,
 /// the Learning-You profile distillation), so the user can see at a glance which
@@ -61,7 +75,11 @@ fn entry(name: &str) -> Result<Entry> {
     Entry::new(SERVICE, name).map_err(Error::from)
 }
 
-fn get(name: &str) -> Result<Option<String>> {
+// --- Raw single-item keychain primitives (one OS keychain item per call) --------------------
+// These touch a keychain item DIRECTLY. Only the bundle machinery and the one-time legacy
+// migration use them; every typed accessor goes through the cached `get`/`set`/`delete` below.
+
+fn kc_get(name: &str) -> Result<Option<String>> {
     match entry(name)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -69,16 +87,192 @@ fn get(name: &str) -> Result<Option<String>> {
     }
 }
 
-fn set(name: &str, value: &str) -> Result<()> {
+fn kc_set(name: &str, value: &str) -> Result<()> {
     entry(name)?.set_password(value).map_err(Error::from)
 }
 
-/// Remove an entry; absent is success (so disconnect is idempotent).
-fn delete(name: &str) -> Result<()> {
+/// Remove a keychain item; absent is success (so cleanup/disconnect is idempotent).
+fn kc_delete(name: &str) -> Result<()> {
     match entry(name)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(Error::from(e)),
     }
+}
+
+// --- The bundle: all secrets in one keychain item, cached in memory for the process ----------
+//
+// Every secret lives in ONE keychain item ([`BUNDLE_KEY`]) as a JSON `{name: value}` map, read
+// exactly once per process into [`CACHE`] and served from memory thereafter — which is what collapses
+// the macOS "one keychain prompt per item" storm to a single grant. `get`/`set`/`delete` keep the
+// exact signatures the typed accessors already call, so the whole change hides behind this seam.
+//
+// Legacy per-item entries (the old on-keychain shape) are folded in LAZILY and additively: a cache
+// miss reads the matching legacy item once, writes it into the bundle, VERIFIES the bundle persisted,
+// and only then deletes the legacy item — so a failed bundle write can never orphan a value (the DB
+// key most of all). No value is ever re-keyed; a fresh install simply starts with an empty bundle.
+
+/// Serialise the in-memory map to the bundle's on-keychain JSON. `BTreeMap` for deterministic output
+/// (stable across writes, and unit-testable). Wrapped in `Zeroizing` so the transient
+/// all-secrets-in-one-string plaintext is wiped once written.
+fn encode_bundle(present: &HashMap<String, Secret>) -> Zeroizing<String> {
+    let ordered: BTreeMap<&str, &str> = present
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.expose()))
+        .collect();
+    Zeroizing::new(serde_json::to_string(&ordered).unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// Parse the bundle JSON back into the in-memory map. A missing/empty/corrupt/wrong-shape bundle
+/// reads as an empty map (best-effort — never an error), so a damaged item degrades to "nothing
+/// cached yet" (and any still-present legacy items re-migrate) rather than bricking secret access.
+fn decode_bundle(raw: &str) -> HashMap<String, Secret> {
+    serde_json::from_str::<HashMap<String, String>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, Secret::from(v)))
+        .collect()
+}
+
+#[derive(Default)]
+struct SecretCache {
+    loaded: bool,
+    /// Mirrors the persisted bundle: logical key -> value.
+    present: HashMap<String, Secret>,
+    /// Session-only negative cache: keys proven absent (bundle AND any legacy item), so a
+    /// never-set / already-migrated key is not re-read from the keychain on every call.
+    absent: HashSet<String>,
+}
+
+impl SecretCache {
+    /// Read the bundle item once. Errors only if the keychain itself is unreachable.
+    fn load(&mut self) -> Result<()> {
+        if self.loaded {
+            return Ok(());
+        }
+        if let Some(raw) = kc_get(BUNDLE_KEY)? {
+            let raw = Zeroizing::new(raw);
+            self.present = decode_bundle(&raw);
+        }
+        self.loaded = true;
+        Ok(())
+    }
+
+    /// Write the whole map back to the single bundle item.
+    fn persist(&self) -> Result<()> {
+        let json = encode_bundle(&self.present);
+        kc_set(BUNDLE_KEY, json.as_str())
+    }
+
+    /// Confirm the bundle on the keychain actually holds `name` after a write — the guard that lets
+    /// migration delete a legacy item without risk of orphaning its value.
+    fn bundle_has(&self, name: &str) -> bool {
+        matches!(kc_get(BUNDLE_KEY), Ok(Some(raw)) if decode_bundle(&raw).contains_key(name))
+    }
+
+    fn get(&mut self, name: &str) -> Result<Option<String>> {
+        self.load()?;
+        if let Some(v) = self.present.get(name) {
+            return Ok(Some(v.expose().to_string()));
+        }
+        if self.absent.contains(name) {
+            return Ok(None);
+        }
+        // First miss: fold a legacy per-item entry into the bundle, if one exists.
+        match kc_get(name)? {
+            Some(value) => {
+                self.present
+                    .insert(name.to_string(), Secret::from(value.clone()));
+                // Persist + verify BEFORE removing the legacy item, so a write failure keeps the
+                // legacy copy as the fallback — never orphan a value (the DB key above all).
+                if self.persist().is_ok() && self.bundle_has(name) {
+                    let _ = kc_delete(name);
+                }
+                Ok(Some(value))
+            }
+            None => {
+                self.absent.insert(name.to_string());
+                Ok(None)
+            }
+        }
+    }
+
+    fn set(&mut self, name: &str, value: &str) -> Result<()> {
+        self.load()?;
+        let previous = self.present.insert(name.to_string(), Secret::from(value));
+        self.absent.remove(name);
+        if let Err(e) = self.persist() {
+            // Roll back so the cache never claims a value the keychain doesn't hold.
+            match previous {
+                Some(old) => {
+                    self.present.insert(name.to_string(), old);
+                }
+                None => {
+                    self.present.remove(name);
+                }
+            }
+            return Err(e);
+        }
+        // A value written before the bundle existed may also sit in a legacy item; clear it.
+        let _ = kc_delete(name);
+        Ok(())
+    }
+
+    fn delete(&mut self, name: &str) -> Result<()> {
+        self.load()?;
+        let removed = self.present.remove(name);
+        self.absent.insert(name.to_string());
+        if removed.is_some() {
+            if let Err(e) = self.persist() {
+                if let Some(v) = removed {
+                    self.present.insert(name.to_string(), v); // roll back
+                }
+                self.absent.remove(name);
+                return Err(e);
+            }
+        }
+        // Remove any legacy item too (idempotent — absent is success).
+        let _ = kc_delete(name);
+        Ok(())
+    }
+
+    /// Drop every cached secret. Used by the wipe after the keychain items are deleted, so a later
+    /// read can't serve a just-erased secret; next access reloads from the now-empty bundle.
+    fn clear(&mut self) {
+        self.present.clear();
+        self.absent.clear();
+        self.loaded = false;
+    }
+}
+
+/// Process-wide secret cache: one bundle read, served from memory (see [`BUNDLE_KEY`]). A poisoned
+/// lock is recovered rather than propagated — a panic elsewhere must not make every secret
+/// unreadable and brick the app.
+static CACHE: LazyLock<Mutex<SecretCache>> = LazyLock::new(|| Mutex::new(SecretCache::default()));
+
+fn cache() -> MutexGuard<'static, SecretCache> {
+    CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn get(name: &str) -> Result<Option<String>> {
+    cache().get(name)
+}
+
+fn set(name: &str, value: &str) -> Result<()> {
+    cache().set(name, value)
+}
+
+/// Remove a secret; absent is success (so disconnect is idempotent).
+fn delete(name: &str) -> Result<()> {
+    cache().delete(name)
+}
+
+/// Drop the in-memory secret cache — the wipe calls this after erasing the keychain items so a
+/// later read can't serve a just-deleted secret from memory (the app quits right after a wipe, but
+/// the invariant shouldn't depend on that timing).
+fn clear_cache() {
+    cache().clear();
 }
 
 /// The stored backup passphrase for unattended (scheduled) backups, if the user opted in.
@@ -500,19 +694,29 @@ pub fn wipe_all_secrets(
 ) -> usize {
     let mut deleted = 0usize;
 
-    // Delete one entry, counting it only if it was actually there. An error (rare — the credential
-    // store being unavailable) is swallowed so a single stubborn entry can't abort the whole wipe.
-    let mut wipe = |key: &str| {
-        if let Ok(entry) = entry(key) {
-            if entry.delete_credential().is_ok() {
-                deleted += 1;
+    {
+        // Delete one entry, counting it only if it was actually there. An error (rare — the
+        // credential store being unavailable) is swallowed so a single stubborn entry can't abort
+        // the whole wipe.
+        let mut wipe = |key: &str| {
+            if let Ok(entry) = entry(key) {
+                if entry.delete_credential().is_ok() {
+                    deleted += 1;
+                }
             }
-        }
-    };
+        };
 
-    for key in all_secret_keys(token_keys, google_client_emails, vault_ids) {
-        wipe(&key);
+        // The single bundle item now holds every migrated secret, so this one delete erases them
+        // all; the per-key deletes below then mop up any legacy items not yet folded into it (a
+        // partial install, or a key never read this session). Absent = success throughout.
+        wipe(BUNDLE_KEY);
+        for key in all_secret_keys(token_keys, google_client_emails, vault_ids) {
+            wipe(&key);
+        }
     }
+
+    // Drop the in-memory copies so nothing can be read back from the cache after the erase.
+    clear_cache();
 
     deleted
 }
@@ -602,6 +806,69 @@ mod tests {
             deduped.len(),
             keys.len(),
             "the wipe list must not delete the same key twice"
+        );
+    }
+
+    // --- The bundle codec: the one piece the keychain can't be tested against, so it's pure ---
+    //
+    // Deliberately generic, non-secret-shaped fixtures so the repo's gitleaks rules don't fire.
+
+    #[test]
+    fn bundle_round_trips_every_entry() {
+        let mut m = HashMap::new();
+        m.insert(
+            "db_encryption_key".to_string(),
+            Secret::from("aa00bb11cc22"),
+        );
+        m.insert(
+            "google_oauth_token_calendar::a@x.com".to_string(),
+            Secret::from("value-under-test-0002"),
+        );
+        let encoded = encode_bundle(&m);
+        let decoded = decode_bundle(&encoded);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            decoded.get("db_encryption_key").unwrap().expose(),
+            "aa00bb11cc22"
+        );
+        assert_eq!(
+            decoded
+                .get("google_oauth_token_calendar::a@x.com")
+                .unwrap()
+                .expose(),
+            "value-under-test-0002"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_bundle_reads_as_empty_never_an_error() {
+        // The safety valve: a damaged item must degrade to "nothing cached", not brick every read.
+        assert!(decode_bundle("").is_empty());
+        assert!(decode_bundle("not valid json {{{").is_empty());
+        assert!(
+            decode_bundle("[1,2,3]").is_empty(),
+            "wrong shape reads as empty"
+        );
+        assert!(decode_bundle("null").is_empty());
+    }
+
+    #[test]
+    fn an_empty_map_encodes_to_an_empty_object() {
+        let empty: HashMap<String, Secret> = HashMap::new();
+        assert_eq!(encode_bundle(&empty).as_str(), "{}");
+        assert!(decode_bundle(&encode_bundle(&empty)).is_empty());
+    }
+
+    #[test]
+    fn bundle_output_is_deterministic() {
+        // BTreeMap ordering keeps writes stable (idempotent-looking, and reviewable).
+        let mut m = HashMap::new();
+        m.insert("z_key".to_string(), Secret::from("one"));
+        m.insert("a_key".to_string(), Secret::from("two"));
+        m.insert("m_key".to_string(), Secret::from("three"));
+        assert_eq!(encode_bundle(&m).as_str(), encode_bundle(&m).as_str());
+        assert!(
+            encode_bundle(&m).find("a_key").unwrap() < encode_bundle(&m).find("z_key").unwrap()
         );
     }
 }

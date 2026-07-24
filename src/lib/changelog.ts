@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.57.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      'macOS: PM now asks for your keychain permission once at startup instead of once for every saved secret. If you use PM on a Mac, you may have seen it show several login-password or "Always Allow" prompts in a row while it loaded — macOS asks separately for each stored item (your database key, API key, and calendar or cloud sign-ins), and PM used to keep each in its own keychain entry. It now stores them together in a single entry, so one "Always Allow" covers everything and the repeated prompts stop. Windows and Linux were never affected. One honest note: that single approval is a little broader than before — allowing it lets PM read all of its own saved secrets at once rather than one at a time — and none of them ever leave PM.',
+    ],
+  },
+  {
     version: "3.56.2-alpha",
     date: "2026-07-24",
     highlights: [
