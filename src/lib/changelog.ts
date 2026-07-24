@@ -26,6 +26,20 @@ export const CHANGELOG: ChangelogEntry[] = [
     ],
   },
   {
+    version: "3.52.2-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Milestones on the calendar now show which project they belong to. A milestone appears as an all-day item on its due date; it now reads as “milestone · project”, so two milestones with similar names in different projects are easy to tell apart at a glance.",
+    ],
+  },
+  {
+    version: "3.52.1-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "You can now make the left sidebar noticeably thinner. Its minimum width is now half what it was, so you can shrink it down and give the main view more room. As before, dragging the edge all the way to the left tucks the sidebar away behind the little reopen tab.",
+    ],
+  },
+  {
     version: "3.52.0-alpha",
     date: "2026-07-24",
     highlights: [
