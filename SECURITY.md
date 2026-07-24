@@ -18,7 +18,12 @@ model weights itself — PM does not); and, only if you configure them, a read-o
 calendar fetch, a read-only sync of the cloud accounts you connect (Google Drive, Google
 Sheets, OneDrive), and encrypted backups to your own cloud. There is no telemetry, analytics,
 or crash reporting. At rest, the **SQLCipher store** (settings, search index) is encrypted with
-a key held in the OS keychain; your **documents live in a plaintext Markdown vault**,
+a key held in the OS keychain. PM keeps its secrets (the database key, your API key, any OAuth
+tokens) together in a **single keychain entry**, so on macOS one keychain authorization
+("Always Allow") covers all of them rather than prompting once per secret — a deliberate
+convenience trade-off: that one grant is *coarser* than a per-secret grant, so any code running as
+PM, once you allow it, can read every secret, not just one. The secrets themselves never leave the
+Rust backend. Your **documents live in a plaintext Markdown vault**,
 so their at-rest protection relies on your own OS full-disk encryption (BitLocker /
 FileVault) — a deliberate choice to keep your notes openable by any tool, not a gap
 to report. PM treats **all ingested content as untrusted data,
