@@ -22,7 +22,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     version: "3.49.1-alpha",
     date: "2026-07-24",
     highlights: [
-      "The week and day calendar views now draw their hour gridlines cleanly. Depending on your screen's scaling, some of the faint grey hour lines could come out uneven or drop out entirely; PM now draws each one as a crisp single-pixel line, so they're all there and evenly spaced.",
+      "The hour gridlines in the week and day calendar views now render cleanly on Retina Macs. Some of the faint grey hour lines could previously come out uneven or drop out entirely there; PM now draws each as a crisp single-pixel line so they all show up. (Windows and Linux were unaffected.)",
     ],
   },
   {

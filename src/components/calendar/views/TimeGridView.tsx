@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // One pixel time-grid engine for both Day (1 column) and Week (7). Hour rules are explicit 1px
-// border divs snapped to whole pixels — a repeating-linear-gradient aliased them into uneven
-// hairlines under fractional row heights and Windows display scaling. Timed events are absolutely
-// positioned from
+// border divs snapped to whole pixels — a repeating-linear-gradient at a fractional row-height
+// period aliased into uneven/missing hairlines on WebKit at high DPR (Retina macOS); Blink (the
+// Windows WebView2 engine) and non-Retina WebKitGTK (Linux) were unaffected. Timed events are
+// absolutely positioned from
 // minutes-since-local-midnight (DST-tolerant, never an absolute UTC delta) and de-overlapped into
 // equal-width lane columns via calendar-layout. All-day / multi-day events lift into the AllDayBand;
 // timed events crossing midnight are already multi-day, so they lift too. Today's column gets an
@@ -235,9 +236,11 @@ export function TimeGridView({
   }, [scrollKey, scrollHour, rowH, bodyHeight]);
 
   const nowMin = minutesFromLocalMidnight(new Date());
-  // Hour rules as one crisp 1px line per hour, snapped to whole pixels so every rule renders
-  // identically — a repeating-linear-gradient with a fractional rowH period aliased them (uneven,
-  // sometimes missing, under Windows display scaling). Rounding also aligns each line to its label.
+  // Hour rules as one crisp 1px line per hour, each snapped to a whole pixel so it lands on the
+  // device-pixel grid and renders identically. A repeating-linear-gradient at a fractional rowH
+  // period aliased them on WebKit at high DPR (Retina macOS) — uneven, some missing — while Blink
+  // (Windows) and non-Retina WebKitGTK (Linux) were fine. An integer CSS px is a whole number of
+  // device px at Retina's integer DPR, so the border can't straddle two device rows and blur.
   const hourTops = Array.from({ length: HOURS }, (_, h) => Math.round(h * rowH));
 
   return (
@@ -321,7 +324,7 @@ export function TimeGridView({
               className={cn("relative flex-1 border-l border-rule", c.isToday && "bg-accent-soft")}
             >
               {/* Hour rules — one crisp 1px line per hour, painted under the cards so today's tint
-                  shows through. Explicit divs (not a repeating gradient) render evenly at any rowH. */}
+                  shows through. Explicit divs (not a repeating gradient) stay crisp at any rowH. */}
               {hourTops.map((top, h) => (
                 <div
                   key={h}
