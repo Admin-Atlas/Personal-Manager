@@ -366,7 +366,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       out.push({
         id: `milestone:${m.id}`,
         calendar_id: MILESTONE_CALENDAR_ID,
-        summary: m.state === "met" ? `✓ ${m.label}` : m.label,
+        // Suffix the owning project so two milestones with similar labels in different projects are
+        // distinguishable on the all-day row (a milestone always belongs to exactly one project).
+        summary:
+          m.state === "met" ? `✓ ${m.label} · ${m.project_name}` : `${m.label} · ${m.project_name}`,
         description: null,
         location: null,
         start: m.due_date.slice(0, 10),

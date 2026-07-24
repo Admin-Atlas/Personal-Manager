@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.52.2-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Milestones on the calendar now show which project they belong to. A milestone appears as an all-day item on its due date; it now reads as “milestone · project”, so two milestones with similar names in different projects are easy to tell apart at a glance.",
+    ],
+  },
+  {
     version: "3.52.0-alpha",
     date: "2026-07-24",
     highlights: [
