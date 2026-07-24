@@ -4,16 +4,17 @@
 /** The Pinboard's grid geometry and the pure snap/clamp/collision helpers. No React, no
  *  DOM — just math, so the drag/resize behaviour is easy to reason about and unit-test in
  *  isolation (in the spirit of the backend's pure cores). The board is **bounded**, but the
- *  extent is no longer a hard constant: `COLS`/`ROWS` are the *minimum* size (the legacy board),
- *  and the view grows the board to fill the window (see PinboardView). Every helper therefore
- *  takes the current `cols`/`rows` bounds, defaulting to the legacy floor for callers that don't
- *  care. The cell size (`CELL`) and every font stay fixed — only the number of cells changes. */
+ *  extent is not a hard constant: the view sizes the board to the window and passes the current
+ *  `cols`/`rows` into every helper (see PinboardView). `COLS`/`ROWS` are just the legacy default
+ *  used when a caller supplies no bounds. The cell size (`CELL`) and every font stay fixed — only
+ *  the number of cells changes. */
 
 import type { CellPoint, Rect, Widget, WidgetKind } from "./types";
 
 /** Pixels per grid cell — fixed. The board's pixel size is cols×CELL by rows×CELL. */
 export const CELL = 24;
-/** The board's minimum extent in cells (the original fixed board); it never shrinks below this. */
+/** The legacy default board extent in cells (the original fixed board), used when a caller passes no
+ *  bounds; the live board now tracks the window, which may be smaller or (with content) taller. */
 export const COLS = 44;
 export const ROWS = 28;
 
@@ -37,15 +38,6 @@ export const FOLDER_MIN: Min = { w: FOLDER_W, h: FOLDER_H };
  *  Threaded through the clamp path so a 3×3 folder tile survives load instead of being bumped to 4. */
 export function minSize(kind: WidgetKind): Min {
   return kind === "folder" ? FOLDER_MIN : DEFAULT_MIN;
-}
-
-/** The board's cell extent for a pixel viewport, never smaller than the legacy COLS×ROWS floor.
- *  Pure — the caller supplies the measured/screen pixels (keeps this module DOM-free). */
-export function boundsForPx(px: { w: number; h: number }): { cols: number; rows: number } {
-  return {
-    cols: Math.max(COLS, Math.floor(px.w / CELL)),
-    rows: Math.max(ROWS, Math.floor(px.h / CELL)),
-  };
 }
 
 /** Snap a pixel offset to the nearest whole cell. */

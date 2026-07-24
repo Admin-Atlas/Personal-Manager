@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.49.3-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "The Pinboard now fits your app window instead of your whole screen. On Macs and Linux it could open larger than the window with scrollbars down the side and along the bottom, because it was sized to the full display. It's now sized to the window: a board imported from a wider screen tidies itself to fit when it opens, and it only grows downward (never sideways) when it holds more than fits — so it never spills past the edges. Moving notes into a folder shrinks it back. (Windows already looked right.)",
+    ],
+  },
+  {
     version: "3.49.2-alpha",
     date: "2026-07-24",
     highlights: [

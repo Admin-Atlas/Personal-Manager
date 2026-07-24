@@ -8,7 +8,7 @@
 // regression; the persist effect is gated on the initial load so the empty default can't
 // clobber a stored board before it arrives.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getPref, setPref } from "../ipc";
 import {
   clampRect,
@@ -188,20 +188,34 @@ function commitForPatch(id: string, patch: Partial<Widget>): CommitKind {
 }
 
 /** Board state + the mutators the view needs. Loads once from the store on mount and
- *  re-persists every change. `bounds` is the board's maximum cell extent (the screen size —
- *  see PinboardView): stored widgets are clamped to it on load and new widgets placed within it,
- *  so a widget dragged into the enlarged board survives a reload instead of snapping back.
+ *  re-persists every change. `viewport` is the measured window (see PinboardView); the board's live
+ *  extent is that grown to contain its content, computed here and returned as `bounds` (and read via
+ *  a ref by the load effect + mutators): stored widgets are clamped to it on load and new widgets
+ *  placed within it, so a widget survives a reload instead of snapping back.
  *
  *  Undo lives HERE rather than around the view's handlers, because this is the only writer: widgets
  *  are also created and destroyed inside `resolveDrop` (filing, folding) and dropped by `parseBoard`,
  *  paths no caller sees — and nothing outside could rebuild a deleted widget's id, text and rect
  *  anyway. One funnel, one place to be right. */
-export function usePinboard(bounds: { cols: number; rows: number } = { cols: COLS, rows: ROWS }) {
+export function usePinboard(viewport: { cols: number; rows: number } = { cols: COLS, rows: ROWS }) {
   const [hist, setHist] = useState<History<Board>>(() => initHistory(EMPTY_BOARD));
   const board = hist.present;
-  // Read through a ref so the mount-only load effect and the stable mutators always see the
-  // current bounds without re-subscribing (bounds is derived from the fixed screen size, so it
-  // doesn't actually change, but this keeps the hooks honest).
+
+  // The board's live cell extent: the window (`viewport`), grown to contain any widget that sits past
+  // it — the load-time reflow only wraps overhanging widgets downward, so growth is vertical and the
+  // board scrolls to reach it. Filing a widget into a folder drops the top-level extent, so this
+  // shrinks back to the window. Read through a ref so the mount-only load effect and the stable
+  // mutators track it without re-subscribing, and returned so the canvas + drag clamp size to the same
+  // value. Never persisted — a pure function of window + content, so it always fits the current screen.
+  const bounds = useMemo(() => {
+    let cols = viewport.cols;
+    let rows = viewport.rows;
+    for (const w of board.widgets) {
+      cols = Math.max(cols, w.rect.x + w.rect.w);
+      rows = Math.max(rows, w.rect.y + w.rect.h);
+    }
+    return { cols, rows };
+  }, [viewport, board.widgets]);
   const boundsRef = useRef(bounds);
   boundsRef.current = bounds;
 
@@ -529,6 +543,9 @@ export function usePinboard(bounds: { cols: number; rows: number } = { cols: COL
 
   return {
     board,
+    /** The board's live cell extent (the window grown to contain content). The canvas sizes to it and
+     *  the drag clamp reads it, so every consumer agrees on one board size. */
+    bounds,
     /** Whether the stored board arrived. The add buttons wait on `ready`: a widget created before the
      *  load lands is overwritten by it, and with a history that would be an unrecoverable loss. */
     load,
