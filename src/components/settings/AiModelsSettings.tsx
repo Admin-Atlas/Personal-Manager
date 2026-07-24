@@ -20,8 +20,9 @@ import {
 } from "../../lib/ipc";
 import type { CostSummary, Settings } from "../../lib/types";
 import { ModelListEditor } from "../ModelListEditor";
-import { Button, Input, SectionInfo } from "../ui";
+import { Button, Input, SectionInfo, Toggle } from "../ui";
 import { TabResetSection } from "./ResetControls";
+import { readReviewAiEnabled, writeReviewAiEnabled } from "../../lib/reviewPrefs";
 
 /** Order-sensitive equality for the two model-role lists — a reset is offered only when a role's
  *  ordered list (or its auto-switch) differs from the default. */
@@ -59,6 +60,9 @@ export function AiModelsSettings() {
   const [defaults, setDefaults] = useState<Settings | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [refreshingPrices, setRefreshingPrices] = useState(false);
+  // Whether Review asks the model to suggest a project/tags/importance per item. A per-device frontend
+  // gate (localStorage), shared with the Review tab's "Turn on AI" banner — off by default.
+  const [reviewAi, setReviewAi] = useState(readReviewAiEnabled);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -154,6 +158,10 @@ export function AiModelsSettings() {
   function changeBackgroundAuto(on: boolean) {
     setBackgroundAuto(on);
     void setBackgroundAutoSwitch(on).catch((e) => setError(String(e)));
+  }
+  function changeReviewAi(on: boolean) {
+    setReviewAi(on);
+    writeReviewAiEnabled(on); // shared with the Review tab's "Turn on AI" banner
   }
 
   async function refreshPrices() {
@@ -284,6 +292,26 @@ export function AiModelsSettings() {
         />
       </div>
 
+      <div id="sec-ai-review" data-settings-section className="mt-5 border-t border-border pt-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+              Filing suggestions
+            </label>
+            <p className="mt-1 text-xs text-ink4">
+              Let PM propose a project, tags and importance for each new item in Review — a real
+              help when you're importing a lot. Off by default; uses the background model above. You
+              can also turn this on from the banner in Review.
+            </p>
+          </div>
+          <Toggle
+            checked={reviewAi}
+            onChange={changeReviewAi}
+            ariaLabel="AI filing suggestions in Review"
+          />
+        </div>
+      </div>
+
       {cost && (
         <div
           id="sec-ai-usage"
@@ -382,15 +410,16 @@ export function AiModelsSettings() {
 
       <TabResetSection
         tabName="AI & Models"
-        isDefault={chatRoleIsDefault && backgroundRoleIsDefault}
+        isDefault={chatRoleIsDefault && backgroundRoleIsDefault && !reviewAi}
         onReset={() => {
           resetChatRole();
           resetBackgroundRole();
+          changeReviewAi(false);
         }}
         confirmBody={
           <>
-            Restores the chat and background models — and their auto-switch — to the defaults. Your
-            saved API keys aren&apos;t affected.
+            Restores the chat and background models (and their auto-switch) and turns Review filing
+            suggestions back off. Your saved API keys aren&apos;t affected.
           </>
         }
       />

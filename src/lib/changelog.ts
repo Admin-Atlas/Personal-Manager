@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.54.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Filing documents in Review no longer waits on the AI. You can now approve each item the moment its suggestion is ready — a row's Approve button lights up as soon as that file is sorted, so you can clear the done ones while the rest are still being worked out, instead of waiting for the whole batch.",
+      "AI suggestions in Review are now something you turn on, not a requirement. On a fresh install they start off, with a banner offering to switch them on — a real help when you're importing a lot — and you can also toggle them under Settings → AI & Models. When they're on but can't run, Review tells you why (no model linked, no credits, a local endpoint that's unreachable) and lets you set the project, tags and importance yourself and approve. The AI is always a help, never a gate.",
+    ],
+  },
+  {
     version: "3.53.0-alpha",
     date: "2026-07-24",
     highlights: [

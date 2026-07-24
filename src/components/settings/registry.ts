@@ -87,6 +87,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
         sections: [
           { id: "sec-ai-keys", label: "API keys" },
           { id: "sec-ai-models", label: "Models" },
+          { id: "sec-ai-review", label: "Filing suggestions" },
           { id: "sec-ai-usage", label: "Usage & cost" },
         ],
       },
