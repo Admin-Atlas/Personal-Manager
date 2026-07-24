@@ -35,6 +35,7 @@ export function NavItem({
     <button
       type="button"
       data-help={helpId}
+      aria-current={active ? "page" : undefined}
       onClick={onClick}
       className={cn(
         "flex w-full items-center justify-between gap-2 rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-sm transition",

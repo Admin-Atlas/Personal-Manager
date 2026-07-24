@@ -6,8 +6,9 @@
 // the same under any accent). Consolidates the app's ad-hoc bg-neutral-950/80 overlays and backs
 // the design's Approval / Permission patterns.
 
-import { useEffect, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useRef, type CSSProperties, type ReactNode } from "react";
 import { cn } from "./cn";
+import { useFocusTrap } from "../../lib/useFocusTrap";
 
 export interface ModalProps {
   open: boolean;
@@ -41,6 +42,8 @@ export function Modal({
   className,
   labelledBy,
 }: ModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -49,6 +52,10 @@ export function Modal({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
+
+  // Trap Tab inside the dialog, focus into it on open, and restore focus to the opener on close —
+  // fixes every dialog (ConfirmDialog, MoveConversationDialog, …) at once.
+  useFocusTrap(open, dialogRef);
 
   if (!open) return null;
 
@@ -64,9 +71,11 @@ export function Modal({
       }}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={labelledBy}
+        tabIndex={-1}
         style={style}
         className={cn(
           "w-full rounded-[var(--radius)] border border-border2 bg-surface shadow-2xl",

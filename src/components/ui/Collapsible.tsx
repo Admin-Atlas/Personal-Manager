@@ -58,7 +58,12 @@ export function Collapsible({
         className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
         style={{ gridTemplateRows: open ? "1fr" : "0fr" }}
       >
-        <div className="overflow-hidden">{children}</div>
+        {/* `inert` when collapsed removes the (still-rendered, height-0) body from the tab order and
+            the a11y tree — otherwise the grid 0fr trick hides it visually but keyboard focus and
+            screen readers still reach it. React 19 drops the attribute when false. */}
+        <div className="overflow-hidden" inert={!open}>
+          {children}
+        </div>
       </div>
     </div>
   );

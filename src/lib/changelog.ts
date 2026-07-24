@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.64.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "PM is starting to work better for keyboard and screen-reader users, and this is the groundwork. Open a dialog now and your keyboard focus stays inside it -- Tab moves between its own buttons instead of drifting onto the page behind -- and closing it puts focus back where you were. A clear outline follows the keyboard as you Tab around, so you can always see what's selected; it only appears for keyboard use, so nothing looks different when you're clicking with the mouse. Collapsed sections no longer quietly hold onto hidden focus, and screen readers can now announce which section of the sidebar you're on. The options you'll actually see -- text size, higher contrast, colour-blind-friendly palettes and reduced motion, gathered in a new Accessibility tab -- are coming in the next few updates.",
+    ],
+  },
+  {
     version: "3.63.0-alpha",
     date: "2026-07-25",
     highlights: [
