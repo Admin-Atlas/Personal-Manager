@@ -764,7 +764,7 @@ export default function App() {
     <HelpContext.Provider value={{ enabled: helpMode, setEnabled: updateHelpMode }}>
       {/* The document reader mounts once here so any surface — Documents, a project's file list, a
           chat citation — can open it via useReader(). Closes itself when the top-level view changes. */}
-      <ReaderProvider view={view}>
+      <ReaderProvider view={view} onOpenProject={openProject}>
         <div className={`flex h-full flex-col bg-bg text-ink ${helpMode ? "help-mode" : ""}`}>
           <UpdateBanner update={update} />
           {metaWarning && (
@@ -883,7 +883,7 @@ export default function App() {
               </main>
             ) : view === "graph" ? (
               <main className="flex h-full flex-1 flex-col">
-                <GraphView onOpenProject={openProject} />
+                <GraphView />
               </main>
             ) : view === "pinboard" ? (
               // min-w-0 lets the oversized pinboard board stay contained in its own
