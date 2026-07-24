@@ -28,7 +28,7 @@ import {
   updateMilestone,
 } from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
-import { CELL, boundsForPx, folderAtPointer } from "../lib/pinboard/grid";
+import { CELL, folderAtPointer } from "../lib/pinboard/grid";
 import {
   applyLineMarker,
   caretForRestore,
@@ -213,8 +213,10 @@ function WidgetTile({
  * The Pinboard (spec §4): a bounded planning board of draggable, resizable widgets —
  * post-it notes and simple dated timelines — persisted locally. Hand-rolled on pointer
  * events + CSS transforms with grid-snap (no layout library); the snap/clamp maths live in
- * `lib/pinboard/grid.ts`. The board is a fixed canvas the size of the device screen (cell size and
- * fonts fixed too) and scrolls both axes once the window is smaller than it. Notes, timelines and
+ * `lib/pinboard/grid.ts`. The board is sized to the window (cell size and fonts stay fixed): a board
+ * authored on a wider screen reflows to fit the current width on load, and the canvas grows only
+ * downward to hold content that doesn't fit — so it scrolls vertically when full but never overflows
+ * the window horizontally. Notes, timelines and
  * folders are available at every
  * depth; per-widget metadata shows at `power`. Notes are Markdown: they render in place and turn
  * back into an editor on click, with a formatting toolbar, keyboard shortcuts, and smart list
@@ -223,18 +225,34 @@ function WidgetTile({
 export function PinboardView() {
   const { showMeta, showPower } = useDepth();
   const scrollRef = useRef<HTMLDivElement>(null);
-  // The board is a FIXED canvas the size of the DEVICE SCREEN. It does not track the window and does
-  // not grow to contain its content in either axis: a board whose extent moved with the window (or
-  // with wherever the lowest note happened to sit) has no stable size to reason about — and the
-  // folder overlay is sized as a share of it. Make the window smaller and the board simply scrolls;
-  // `reflowToWidth` tidies a board authored on a wider screen back in on load. `boundsForPx` keeps
-  // the legacy COLS×ROWS floor. Computed once — `screen` is fixed for the life of the process.
-  const boardBounds = useMemo(
-    () => boundsForPx({ w: window.screen.availWidth, h: window.screen.availHeight }),
-    [],
-  );
+  // The board is sized to the WINDOW, not the whole device screen. It used to be a fixed canvas the
+  // size of `screen.avail*`; on a window that isn't maximised (common on macOS/Linux) that overflowed
+  // the viewport and showed scrollbars — the board read as "bigger than the screen". Measure the
+  // scroller instead (its p-6 gives a 24px inset each side → −48), floored on the CELL grid, and seed
+  // from the window so the first load reflow has a sane width before the layout effect measures.
+  const [measured, setMeasured] = useState(() => ({
+    cols: Math.max(1, Math.floor((window.innerWidth - 48) / CELL)),
+    rows: Math.max(1, Math.floor((window.innerHeight - 48) / CELL)),
+  }));
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () =>
+      setMeasured({
+        cols: Math.max(1, Math.floor((el.clientWidth - 48) / CELL)),
+        rows: Math.max(1, Math.floor((el.clientHeight - 48) / CELL)),
+      });
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // usePinboard grows the measured window to contain the board's content and hands the result back as
+  // `bounds` — the canvas sizes to it, and the drag clamp (below) reads it, so nothing overflows.
   const {
     board,
+    bounds: boardBounds,
     load,
     retryLoad,
     saveFailed,
@@ -253,7 +271,12 @@ export function PinboardView() {
     addTimelineItem,
     updateTimelineItem,
     removeTimelineItem,
-  } = usePinboard(boardBounds);
+  } = usePinboard(measured);
+
+  // The drag effect reads the bounds through a ref, so it never re-subscribes its pointer listeners to
+  // pick up a new value (the board grows/shrinks as the window resizes and content is added or filed).
+  const boardBoundsRef = useRef(boardBounds);
+  boardBoundsRef.current = boardBounds;
 
   // The board element itself (scrollRef is its scroller) — needed to turn a viewport pointer
   // position into a board cell, which is what decides whether a drop files into a folder.
@@ -266,12 +289,9 @@ export function PinboardView() {
   // A just-added widget id to scroll into view (set by the add buttons; cleared once scrolled).
   const [pendingScrollId, setPendingScrollId] = useState<string | null>(null);
 
-  // The drag effect reads the bounds through a ref, so it never re-subscribes its pointer listeners
-  // to pick up a new value.
-  const boardBoundsRef = useRef(boardBounds);
-  boardBoundsRef.current = boardBounds;
-  // Likewise the widget list, which the drag reads to find the folder under the pointer: as a dep it
-  // would re-subscribe the pointer listeners on every keystroke (a note's text lives in the board).
+  // The widget list, which the drag reads to find the folder under the pointer, is likewise read
+  // through a ref: as a dep it would re-subscribe the pointer listeners on every keystroke (a note's
+  // text lives in the board).
   const widgetsRef = useRef(board.widgets);
   widgetsRef.current = board.widgets;
 
@@ -434,10 +454,8 @@ export function PinboardView() {
     setPendingDelete(null);
   }, [pendingDelete, dontAskAgain, removeWidget]);
 
-  // An opened folder's overlay is 80% of the board — which is a fixed device-screen canvas, so this
-  // is one stable size rather than something that drifts with the window or with wherever the lowest
-  // note happens to sit. Clamped to the scrim's own box (which starts below the h-9 title bar and is
-  // inset by its p-6), because on a window smaller than the screen 80% of the board wouldn't fit.
+  // An opened folder's overlay is 80% of the board (now window-sized), clamped to the scrim's own box
+  // — which starts below the h-9 title bar and is inset by its p-6 — so it always fits the window.
   const overlaySize = useMemo(() => {
     const SCRIM_PAD = 24; // the scrim's p-6
     const TITLE_BAR = 36; // the scrim's top-9
@@ -612,9 +630,8 @@ export function PinboardView() {
                 open
                 onClose={() => setExpandedFolderId(null)}
                 // A share of the board, replacing Modal's own width/height/overflow defaults rather
-                // than competing with them. The board is a fixed device-screen canvas, so this is a
-                // stable size; the clamp is for a window smaller than the screen, where 80% of the
-                // board would not fit inside the scrim.
+                // than competing with them. `overlaySize` (above) is 80% of the window-sized board,
+                // clamped to the scrim so it always fits.
                 widthClassName=""
                 heightClassName=""
                 overflowClassName="overflow-hidden"
