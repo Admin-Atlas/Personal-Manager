@@ -92,6 +92,12 @@ pub struct Document {
     /// The stable source id for an index-only item (`None` for a vault document) — its manifest key
     /// and the handle the observe-and-react layer targets.
     pub source_id: Option<String>,
+    /// The immediate parent folder of a connector-synced item: `_id` is the stable, connector-unique
+    /// key (a Drive/OneDrive folder id, or a local full path) and `_name` the leaf name for display.
+    /// Both `None` for a vault / chat / photo document. Powers the Review "apply this filing to the
+    /// rest of the folder" action, which groups by (source_type, source_parent_folder_id).
+    pub source_parent_folder_id: Option<String>,
+    pub source_parent_folder_name: Option<String>,
 }
 
 /// The global event a rebuild's progress is broadcast on, alongside the caller's `Channel`.
@@ -2409,7 +2415,8 @@ pub(crate) fn leaf_embed_texts(chunks: &[splitter::Chunk]) -> Vec<String> {
 const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_path, d.ext, d.byte_size, \
      (SELECT count(*) FROM chunks c WHERE c.document_id = d.id), \
      d.created_at, d.ingested_at, d.project, d.tags, d.importance, d.reviewed, d.last_activity, \
-     d.source_type, d.source_state, d.external_ref, d.source_id";
+     d.source_type, d.source_state, d.external_ref, d.source_id, \
+     d.source_parent_folder_id, d.source_parent_folder_name";
 
 /// All documents, most-recent first, with their chunk counts.
 pub fn list_documents(conn: &Connection) -> Result<Vec<Document>> {
@@ -2473,6 +2480,8 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
         source_state: row.get(14)?,
         external_ref: row.get(15)?,
         source_id: row.get(16)?,
+        source_parent_folder_id: row.get(17)?,
+        source_parent_folder_name: row.get(18)?,
     })
 }
 

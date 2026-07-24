@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.55.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Filed a document from a synced folder in Review? You can now file the rest of that folder the same way in one click. When the file came from a folder you're indexing (a Drive/OneDrive folder or a local folder), the row offers to \"apply this filing to the N other files from that folder\" — you pick the project, tick or untick any you don't want, and they're all filed at once. It's a plain, undo-able filing action (no AI needed), and it matches files by their actual folder, so two folders that happen to share a name are never mixed up.",
+    ],
+  },
+  {
     version: "3.54.0-alpha",
     date: "2026-07-24",
     highlights: [
