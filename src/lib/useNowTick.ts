@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// A low-frequency "current time" tick for the calendar. Returns a Date that refreshes on an interval
-// (default once a minute) so the now-line advances and the "today" highlight rolls over at midnight
-// without needing an unrelated re-render. Cheap: one timer, no per-frame work.
+// A low-frequency "current time" tick shared across the app. Returns a Date that refreshes on an
+// interval (default once a minute) so time-derived UI advances without an unrelated re-render — the
+// calendar now-line / "today" rollover at 60s, the progress-bar elapsed timer at 1s. Cheap: one timer,
+// no per-frame work.
 
 import { useEffect, useState } from "react";
 

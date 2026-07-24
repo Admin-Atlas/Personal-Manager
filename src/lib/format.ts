@@ -6,6 +6,16 @@ export function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
+/** A running elapsed duration as `m:ss`, or `h:mm:ss` once it passes an hour — the progress-bar
+ *  timer. Negative/NaN inputs floor to `0:00`. */
+export function formatElapsed(ms: number): string {
+  const total = Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000)) : 0;
+  const s = total % 60;
+  const m = Math.floor(total / 60) % 60;
+  const h = Math.floor(total / 3600);
+  return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`;
+}
+
 /**
  * Format an ISO timestamp as DD-MM-YYYY, dropping the year when the date falls
  * in the current year. Leaves an unparseable value as-is.
