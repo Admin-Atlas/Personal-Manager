@@ -98,6 +98,18 @@ body {
   font-family: var(--ui);
 }
 
+/* Global keyboard focus indicator (WCAG 2.4.7 Focus Visible, 1.4.11 Non-text Contrast). Left
+ * UNLAYERED so it beats Tailwind's `.outline-none` utility (which Input/Textarea/Select set): an
+ * unlayered rule outranks any @layer rule regardless of specificity, so the ring lands without
+ * editing every primitive. `:focus-visible` keeps it keyboard-only for buttons/links — no ring on
+ * a mouse click, so the resting look is unchanged; text fields (which always warrant a focus cue)
+ * show it on focus either way. `--accent-text` is the mode-contrast-tuned accent, legible on every
+ * System × Mode; the outline follows each element's own border-radius automatically. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+}
+
 /* The Markdown render surface (src/lib/markdown.tsx) — the one sanitized renderer for ingested content.
  * Every element binds to a design token (never a hex literal); there is no typography plugin. */
 .pm-markdown {
