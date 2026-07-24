@@ -4580,6 +4580,26 @@ pub async fn list_drive_folders(
     drive::list_folders(&drive::account_token_key(&email), &drive_id, &parent_id).await
 }
 
+/// The account's "Shared with me" ROOTS — the top-level files/folders others granted it directly, for
+/// the shared-with-me picker. Both files and folders are selectable (unlike My/shared drives, which
+/// expose only folders). Read-only enumeration over the account's own token; no DB, no sidecar.
+#[tauri::command]
+pub async fn list_drive_shared_with_me_roots(email: String) -> Result<Vec<drive::SwmRoot>> {
+    drive::list_swm_root_choices(&drive::account_token_key(&email)).await
+}
+
+/// Shared-with-me roots already indexed by a DIFFERENT connected account → `rootId → owner email`. The
+/// picker greys those out ("synced by <owner>"), since a shared-with-me root is de-duplicated like a
+/// shared drive — only its owner indexes it, so this account needn't (and can't usefully) re-index it.
+#[tauri::command]
+pub fn drive_swm_root_owners(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<std::collections::HashMap<String, String>> {
+    let conn = state.conn()?;
+    drive::swm_root_owners_elsewhere(&conn, &email)
+}
+
 /// One account's indexing scope (My Drive on/off + opted-in shared drives and their folders).
 #[tauri::command]
 pub fn get_drive_scope(state: State<'_, AppState>, email: String) -> Result<drive::DriveScope> {

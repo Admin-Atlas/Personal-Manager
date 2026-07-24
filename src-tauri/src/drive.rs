@@ -62,9 +62,14 @@ const MAX_PAGES: usize = 1000;
 /// The field projection for a Drive file — kept tight (only what the connector needs). `parents` is
 /// requested explicitly (Drive API v3 returns nothing not named here) so a synced file can be tagged
 /// with the folder it was found in; a file usually has one parent, and we keep only the first.
-const FILE_FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum,trashed,webViewLink,parents";
+const FILE_FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum,trashed,webViewLink,parents,\
+sharedWithMe,ownedByMe,shortcutDetails(targetId,targetMimeType,targetResourceKey),\
+capabilities(canDownload,canExport),resourceKey";
 /// Drive's folder MIME type (folders are containers we walk, never files we index).
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+/// Drive's shortcut MIME type. Shared items often arrive as shortcuts; a shared-with-me shortcut is
+/// resolved to its `shortcutDetails.targetId` and indexed as the target (never the shortcut itself).
+const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 
 /// My Drive's root-folder alias. Doubles as the sentinel `drive_id` the folder picker / enumeration
 /// pass to mean "the personal drive" rather than a shared drive's id (`'root' in parents` lists
@@ -107,14 +112,41 @@ fn shared_prefix(drive_id: &str) -> String {
     format!("gdrive:sd:{drive_id}:")
 }
 
+/// The stable index-only `source_id` for a file reached through a **"Shared with me"** root:
+/// `gdrive:swm:<rootId>:<fileId>`. **Account-independent** (like a shared drive) — the picked root
+/// plays the container role that a shared drive's `driveId` plays, so PM indexes the item ONCE and
+/// de-duplicates it across accounts: whichever account syncs the root first owns + reconciles it (the
+/// `shared_with_me_access` relation), and `account_of` returns `None` for a swm id exactly as it does
+/// for a `sd:` id. `rootId == fileId` when the root is a single shared file rather than a folder.
+pub fn swm_source_id(root_id: &str, file_id: &str) -> String {
+    format!("gdrive:swm:{root_id}:{file_id}")
+}
+
+/// The `source_id` prefix matching every indexed item under one shared-with-me root (its reconcile +
+/// cleanup set): `gdrive:swm:<rootId>:`.
+fn swm_prefix(root_id: &str) -> String {
+    format!("gdrive:swm:{root_id}:")
+}
+
+/// The shared-with-me root id embedded in a swm source id (`gdrive:swm:<rootId>:<fileId>`), or `None`
+/// for a My-Drive / shared-drive / non-Drive id.
+pub fn swm_root_of(source_id: &str) -> Option<String> {
+    source_id
+        .strip_prefix("gdrive:swm:")?
+        .split_once(':')
+        .map(|(root_id, _)| root_id.to_string())
+}
+
 /// Recover the account email from a **My Drive** source id (`gdrive:<email>:<fileId>`). Shared-drive
 /// ids are account-independent (`gdrive:sd:<driveId>:<fileId>`), so they have no owning account here —
 /// [`token_key_for_source`] resolves an account that can reach them instead. An email carries no `:`,
 /// so the first `:` after the prefix splits it off.
 pub fn account_of(source_id: &str) -> Option<String> {
     let rest = source_id.strip_prefix("gdrive:")?;
-    if rest.starts_with("sd:") {
-        return None; // a shared-drive id — no single owning account in the id itself
+    // Account-independent namespaces carry no owning account in the id — `token_key_for_source`
+    // resolves a reaching account from the relevant access relation instead.
+    if rest.starts_with("sd:") || rest.starts_with("swm:") {
+        return None; // a shared-drive (`sd:`) or shared-with-me (`swm:`) id
     }
     rest.split_once(':').map(|(email, _)| email.to_string())
 }
@@ -307,7 +339,10 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<DriveAccount>> {
                      d.source_id LIKE ?1 || ':%' \
                      OR EXISTS (SELECT 1 FROM shared_drive_access a \
                                 WHERE a.account_id = ?1 AND a.is_owner = 1 \
-                                  AND d.source_id LIKE 'gdrive:sd:' || a.drive_id || ':%') )",
+                                  AND d.source_id LIKE 'gdrive:sd:' || a.drive_id || ':%') \
+                     OR EXISTS (SELECT 1 FROM shared_with_me_access s \
+                                WHERE s.account_id = ?1 AND s.is_owner = 1 \
+                                  AND d.source_id LIKE 'gdrive:swm:' || s.root_id || ':%') )",
                 params![account_id(&email)],
                 |r| r.get(0),
             )
@@ -452,10 +487,19 @@ pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
          WHERE source_type = 'index_only' AND source_id LIKE ?1 || ':%'",
         params![account],
     )?;
-    // Shared drives this account could reach — captured before the cascade removes its access rows.
+    // Shared drives + shared-with-me roots this account could reach — captured before the cascade
+    // removes its access rows, so each can be re-checked for orphaning afterwards.
     let drives: Vec<String> = {
         let mut stmt =
             conn.prepare("SELECT drive_id FROM shared_drive_access WHERE account_id = ?1")?;
+        let rows: Vec<String> = stmt
+            .query_map(params![account], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
+    let swm_roots: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT root_id FROM shared_with_me_access WHERE account_id = ?1")?;
         let rows: Vec<String> = stmt
             .query_map(params![account], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
@@ -467,6 +511,9 @@ pub fn forget_account(conn: &Connection, email: &str) -> Result<()> {
     )?;
     for drive_id in drives {
         soft_flag_orphaned_shared_drive(conn, &drive_id)?;
+    }
+    for root_id in swm_roots {
+        soft_flag_orphaned_swm_root(conn, &root_id)?;
     }
     secrets::clear_google_token_for(&account_token_key(email)).ok();
     // Forget the account's own Cloud-project client too, so reconnecting later with the shared
@@ -556,9 +603,118 @@ pub fn shared_drive_owners_elsewhere(
     Ok(map)
 }
 
+// --- shared-with-me root ownership (the swm siblings of the shared-drive access helpers above) -----
+
+/// If NO connected account can still reach shared-with-me root `root_id`, soft-flag every item indexed
+/// under it `unreachable` (kept findable, never deleted). A no-op while any account retains access.
+/// The swm sibling of [`soft_flag_orphaned_shared_drive`].
+fn soft_flag_orphaned_swm_root(conn: &Connection, root_id: &str) -> Result<()> {
+    let still_reachable: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM shared_with_me_access WHERE root_id = ?1)",
+        params![root_id],
+        |r| r.get(0),
+    )?;
+    if !still_reachable {
+        conn.execute(
+            "UPDATE documents SET source_state = 'unreachable' \
+             WHERE source_type = 'index_only' AND source_id LIKE ?1 || '%'",
+            params![swm_prefix(root_id)],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record that `email` can reach shared-with-me root `root_id` (caching `name` for the UI), and decide
+/// whether THIS account should index it. The first account to sync a root claims ownership and indexes
+/// it; later accounts with the same root shared don't re-index (the scope UI greys those out). Owning
+/// the root also avoids a divergent-permissions reconcile fight: only one account's view reconciles it.
+/// Returns true iff this account owns the root — the swm sibling of [`claim_or_skip_shared_drive`].
+pub fn claim_or_skip_swm_root(
+    conn: &Connection,
+    email: &str,
+    root_id: &str,
+    name: &str,
+) -> Result<bool> {
+    let account = account_id(email);
+    conn.execute(
+        "INSERT INTO shared_with_me_access(root_id, account_id, name) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(root_id, account_id) DO UPDATE SET name = excluded.name",
+        params![root_id, account, name],
+    )?;
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT account_id FROM shared_with_me_access WHERE root_id = ?1 AND is_owner = 1",
+            params![root_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match owner {
+        Some(o) if o == account => Ok(true),
+        Some(_) => Ok(false), // already owned + indexed by another account
+        None => {
+            conn.execute(
+                "UPDATE shared_with_me_access SET is_owner = 1 \
+                 WHERE root_id = ?1 AND account_id = ?2",
+                params![root_id, account],
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+/// The shared-with-me roots this `email` currently OWNS (indexes) — so a sync can release the ones that
+/// fell out of scope, and `set_scope` the ones the user unpicked.
+pub fn owned_swm_roots(conn: &Connection, email: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT root_id FROM shared_with_me_access WHERE account_id = ?1 AND is_owner = 1",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(params![account_id(email)], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Release `email`'s access to shared-with-me root `root_id` (it fell out of scope): drop its access
+/// row and, if that leaves the root reachable by no account, soft-flag the root's items. Dropping the
+/// OWNER leaves the root owner-less, re-claimed on another account's next sync.
+fn release_swm_root(conn: &Connection, email: &str, root_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM shared_with_me_access WHERE root_id = ?1 AND account_id = ?2",
+        params![root_id, account_id(email)],
+    )?;
+    soft_flag_orphaned_swm_root(conn, root_id)
+}
+
+/// Shared-with-me roots already owned (indexed) by a DIFFERENT account → `rootId → owner email`. The
+/// scope picker greys these out for `email` ("synced by <owner>"), the swm sibling of
+/// [`shared_drive_owners_elsewhere`].
+pub fn swm_root_owners_elsewhere(
+    conn: &Connection,
+    email: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let me = account_id(email);
+    let mut stmt = conn.prepare(
+        "SELECT root_id, account_id FROM shared_with_me_access WHERE is_owner = 1 AND account_id != ?1",
+    )?;
+    let rows = stmt.query_map(params![me], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (root_id, owner_account) = row?;
+        let owner_email = owner_account
+            .strip_prefix("gdrive:")
+            .unwrap_or(&owner_account)
+            .to_string();
+        map.insert(root_id, owner_email);
+    }
+    Ok(map)
+}
+
 /// The token key of an account that can reach the source behind `source_id`, for an on-demand body
-/// fetch. A **My Drive** id names its account directly. A **shared-drive** id is account-independent,
-/// so this resolves an account with access (preferring the owner) from `shared_drive_access`.
+/// fetch. A **My Drive** id names its account directly. A **shared-drive** (`sd:`) or **shared-with-me**
+/// (`swm:`) id is account-independent, so this resolves an account with access (preferring the owner)
+/// from `shared_drive_access` / `shared_with_me_access` respectively.
 pub fn token_key_for_source(conn: &Connection, source_id: &str) -> Result<Option<String>> {
     if let Some(drive_id) = shared_drive_of(source_id) {
         let owner: Option<String> = conn
@@ -566,6 +722,17 @@ pub fn token_key_for_source(conn: &Connection, source_id: &str) -> Result<Option
                 "SELECT account_id FROM shared_drive_access WHERE drive_id = ?1 \
                  ORDER BY is_owner DESC LIMIT 1",
                 params![drive_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        return Ok(owner.and_then(|a| a.strip_prefix("gdrive:").map(account_token_key)));
+    }
+    if let Some(root_id) = swm_root_of(source_id) {
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT account_id FROM shared_with_me_access WHERE root_id = ?1 \
+                 ORDER BY is_owner DESC LIMIT 1",
+                params![root_id],
                 |r| r.get(0),
             )
             .optional()?;
@@ -627,6 +794,12 @@ pub struct SharedSelection {
     /// folder-scoped. Empty/absent in older stored scopes, so nothing is excluded by default.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Also index files that live directly in the shared drive's ROOT (not inside any folder). Only
+    /// meaningful in folder-scoped mode (`folders = Some`) — whole-drive already covers root files.
+    /// Absent in older stored scopes, so root files are excluded by default (folder-scope stayed
+    /// folders-only before this).
+    #[serde(default)]
+    pub include_root_files: bool,
 }
 
 /// What an account indexes: My Drive (the whole personal drive, the existing default) plus any
@@ -650,9 +823,23 @@ pub struct DriveScope {
     /// default.
     #[serde(default)]
     pub my_drive_exclude: Vec<String>,
+    /// Also index files that live directly in My Drive's ROOT (not inside any folder). Only meaningful
+    /// in folder-scoped My Drive (`my_drive_folders = Some`) — whole-drive already covers root files.
+    /// Absent in older stored scopes → root files excluded by default.
+    #[serde(default)]
+    pub my_drive_include_root_files: bool,
     /// Opted-in shared drives (each re-enumerated + reconciled per sync).
     #[serde(default)]
     pub shared: Vec<SharedSelection>,
+    /// Index files/folders **shared directly with this account** ("Shared with me"). Off by default —
+    /// the collection can be large and noisy. Absent in older stored scopes → off.
+    #[serde(default)]
+    pub shared_with_me: bool,
+    /// Which shared-with-me roots to index: `None` = every root shared with the account; `Some(ids)` =
+    /// only these picked roots (a folder root is walked recursively, a file root indexed on its own).
+    /// Absent in older stored scopes → None (but only consulted when `shared_with_me` is on).
+    #[serde(default)]
+    pub shared_with_me_roots: Option<Vec<String>>,
 }
 
 fn yes() -> bool {
@@ -665,7 +852,10 @@ impl Default for DriveScope {
             my_drive: true,
             my_drive_folders: None,
             my_drive_exclude: Vec::new(),
+            my_drive_include_root_files: false,
             shared: Vec::new(),
+            shared_with_me: false,
+            shared_with_me_roots: None,
         }
     }
 }
@@ -745,6 +935,25 @@ pub fn set_scope(conn: &Connection, email: &str, scope: &DriveScope) -> Result<(
         )?;
         soft_flag_orphaned_shared_drive(conn, &drive_id)?;
     }
+    // Reconcile shared-with-me root ownership to the new scope, the swm sibling of the shared-drive
+    // release above. `None` = keep every owned root (swm on, all-roots mode, or a `Some` list is the
+    // keep-set); an empty keep-set (swm turned off) releases them all. A released root is soft-flagged
+    // if no account can still reach it, and re-claimed on another account's next sync.
+    let keep_swm: Option<std::collections::HashSet<&str>> = if scope.shared_with_me {
+        scope
+            .shared_with_me_roots
+            .as_ref()
+            .map(|ids| ids.iter().map(String::as_str).collect())
+    } else {
+        Some(std::collections::HashSet::new()) // swm off → release every owned root
+    };
+    if let Some(keep) = keep_swm {
+        for root_id in owned_swm_roots(conn, email)? {
+            if !keep.contains(root_id.as_str()) {
+                release_swm_root(conn, email, &root_id)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -782,6 +991,51 @@ pub fn known_my_drive_source_ids(conn: &Connection, email: &str) -> Result<Vec<S
     Ok(rows)
 }
 
+/// Every currently-healthy indexed item id under one **shared-with-me root** — the set its reconcile
+/// diffs the live enumeration against (same role as [`known_shared_source_ids`], keyed on the root
+/// rather than a drive). An account-independent `gdrive:swm:<rootId>:` prefix never collides with the
+/// My-Drive `gdrive:<email>:` prefix (an email is never literally "swm"), so the corpora stay disjoint.
+pub fn known_swm_source_ids(conn: &Connection, root_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_id FROM documents \
+         WHERE source_type = 'index_only' AND source_state = 'ok' \
+           AND source_id LIKE ?1 || '%'",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(params![swm_prefix(root_id)], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Adopt a legacy **leaked** row: a top-level shared file previously indexed under `email`'s My-Drive
+/// namespace (`gdrive:<email>:<fileId>`, back when the whole-drive baseline still returned
+/// shared-with-me items) is re-keyed IN PLACE to its shared-with-me id `gdrive:swm:<rootId>:<fileId>`.
+/// Because chunks + embeddings key on the document ROW id (not `source_id`), the re-key preserves the
+/// file's classification (project/tags/importance/reviewed/entity_id) AND its vectors — no re-embed.
+/// `UPDATE OR IGNORE` no-ops when there is no legacy row, or when the swm row already exists (a rare
+/// leftover My-Drive duplicate then lingers until a folder-scoped reconcile clears it — never a false
+/// delete). Runtime reconcile only, never a migration (rule #3); mirrors the v19 twin re-key.
+/// Called for each enumerated file BEFORE the root's reconcile reads its known set, so an adopted row
+/// is already in that set and matches as an `Update`/no-op rather than being re-ingested.
+pub fn adopt_legacy_swm_row(
+    conn: &Connection,
+    email: &str,
+    root_id: &str,
+    file_id: &str,
+) -> Result<()> {
+    let old = source_id_for(email, file_id);
+    let new = swm_source_id(root_id, file_id);
+    if old == new {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE OR IGNORE documents SET source_id = ?2 \
+         WHERE source_type = 'index_only' AND source_id = ?1",
+        params![old, new],
+    )?;
+    Ok(())
+}
+
 // --- Drive file model + pure parsing/mapping (the unit-tested core) ------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -797,6 +1051,25 @@ pub struct DriveFile {
     /// human-readable name at sync time and snapshotted onto the document as sorting-review context.
     /// `None` when Drive reports no parent (e.g. a shared-drive root item) or the field was absent.
     pub parent_id: Option<String>,
+    /// Drive's `sharedWithMe` — true iff this file is in the account's "Shared with me" collection.
+    /// Keeps the shared-with-me corpus disjoint from My Drive (`files_url` excludes it; `map_change`
+    /// routes it away from the My-Drive namespace). Not populated for shared-drive items (reads false).
+    pub shared_with_me: bool,
+    /// Drive's `ownedByMe` — false for a shared-with-me item, true for an owned My-Drive file. Not
+    /// populated for shared-drive items (reads false).
+    pub owned_by_me: bool,
+    /// For a shortcut (`application/vnd.google-apps.shortcut`): the target's id / mime / resourceKey, so
+    /// a shared-with-me shortcut resolves to (and is indexed as) its target. `None` for a non-shortcut.
+    pub shortcut_target_id: Option<String>,
+    pub shortcut_target_mime: Option<String>,
+    pub shortcut_target_resource_key: Option<String>,
+    /// Per-user capability gates for a body fetch — `canDownload` (blobs) / `canExport` (Google-native
+    /// docs). `None` (field absent) is treated as "allowed"; a genuine block still surfaces as a 403.
+    pub can_download: Option<bool>,
+    pub can_export: Option<bool>,
+    /// The `resourceKey` some link-shared items need in the `X-Goog-Drive-Resource-Keys` header to be
+    /// read; persisted with the pointer so an on-demand body fetch can replay it. `None` otherwise.
+    pub resource_key: Option<String>,
 }
 
 /// Lets a folder-scoped enumeration reconcile through the shared [`index_only::reconcile_enumeration`]
@@ -956,6 +1229,38 @@ fn parse_file(v: &Value) -> Option<DriveFile> {
             .and_then(|ps| ps.first())
             .and_then(Value::as_str)
             .map(String::from),
+        shared_with_me: v
+            .get("sharedWithMe")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        owned_by_me: v.get("ownedByMe").and_then(Value::as_bool).unwrap_or(false),
+        shortcut_target_id: v
+            .get("shortcutDetails")
+            .and_then(|s| s.get("targetId"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        shortcut_target_mime: v
+            .get("shortcutDetails")
+            .and_then(|s| s.get("targetMimeType"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        shortcut_target_resource_key: v
+            .get("shortcutDetails")
+            .and_then(|s| s.get("targetResourceKey"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        can_download: v
+            .get("capabilities")
+            .and_then(|c| c.get("canDownload"))
+            .and_then(Value::as_bool),
+        can_export: v
+            .get("capabilities")
+            .and_then(|c| c.get("canExport"))
+            .and_then(Value::as_bool),
+        resource_key: v
+            .get("resourceKey")
+            .and_then(Value::as_str)
+            .map(String::from),
     })
 }
 
@@ -1031,8 +1336,19 @@ fn change_event(source_id: String, change: &DriveChange, known: bool) -> Option<
     })
 }
 
-/// Map a **My Drive** change (the `gdrive:<email>:<fileId>` namespace).
+/// Map a **My Drive** change (the `gdrive:<email>:<fileId>` namespace). The user changes feed also
+/// carries "Shared with me" edits; those belong to the swm corpus (its per-root reconcile owns them),
+/// so a change whose file is shared-with-me is skipped here to keep the corpora disjoint. A *removal*
+/// carries no file payload, so it can't be classified — it maps to a `Delete` on the (now-unused)
+/// My-Drive id and no-ops via the reducer, which is harmless.
 pub fn map_change(change: &DriveChange, email: &str, known: bool) -> Option<ChangeEvent> {
+    if change
+        .file
+        .as_ref()
+        .is_some_and(|f| f.shared_with_me && !f.owned_by_me)
+    {
+        return None;
+    }
     change_event(source_id_for(email, &change.file_id), change, known)
 }
 
@@ -1108,7 +1424,10 @@ fn files_url(page: Option<&str>) -> Result<String> {
         .map_err(|e| Error::Other(e.to_string()))?;
     {
         let mut q = url.query_pairs_mut();
-        q.append_pair("q", "trashed = false");
+        // Exclude "Shared with me" from the whole-drive My-Drive baseline so the two corpora stay
+        // disjoint (shared-with-me items are indexed under their own `gdrive:swm:` namespace). Without
+        // this a file shared with the account would be indexed twice — once here, once by the swm pass.
+        q.append_pair("q", "trashed = false and sharedWithMe = false");
         q.append_pair("pageSize", "200");
         q.append_pair("spaces", "drive");
         q.append_pair("orderBy", "modifiedTime desc");
@@ -1270,7 +1589,7 @@ pub async fn enumerate_shared(
             .await
         }
         Some(roots) => {
-            walk_folders(token_key, roots, exclude, |q, page| {
+            walk_folders(token_key, roots, exclude, false, |q, page| {
                 shared_files_url(drive_id, q, FILE_FIELDS, "", page)
             })
             .await
@@ -1280,16 +1599,24 @@ pub async fn enumerate_shared(
 
 /// Walk a set of root folders (recursively, breadth via a queue), collecting the non-folder files
 /// beneath them — deduped, and each folder walked once even if reachable from two selections. The
-/// `url_for(q, page)` closure builds each `files.list` page URL, so My Drive (`my_files_url`) and
-/// shared drives (`shared_files_url`) share one walk. Folders themselves are never returned.
-/// Any folder id in `exclude` is never enqueued — pruning that folder and its whole subtree (its
-/// files are only ever discovered by walking into it), both as a seed root and as a descended child.
-/// Returns the deduped files plus whether the walk was cut short by the folder-count guard (`true` ⇒
-/// INCOMPLETE — the caller must not treat an unseen file as deleted; see [`connector_sync::paginate`]).
+/// `url_for(q, page)` closure builds each `files.list` page URL, so My Drive (`my_files_url`), shared
+/// drives (`shared_files_url`) and shared-with-me (`swm_files_url`) share one walk. Folders themselves
+/// are never returned. Any folder id in `exclude` is never enqueued — pruning that folder and its whole
+/// subtree, both as a seed root and as a descended child.
+///
+/// `tolerant` governs a per-item permission gap. In a **shared-with-me** subtree, divergent
+/// permissions are normal — you can see a folder but not enter one child folder (403/404). A tolerant
+/// walk **skips that subtree and marks the result incomplete** (so the reconcile infers NO deletions)
+/// instead of failing the whole account; a non-tolerant walk (My Drive / shared drives, where access
+/// is uniform) propagates the error as before. A transient rate-limit always propagates.
+///
+/// Returns the deduped files plus whether the walk was cut short (`true` ⇒ INCOMPLETE — the caller must
+/// not treat an unseen file as deleted; see [`connector_sync::paginate`]).
 async fn walk_folders(
     token_key: &str,
     roots: &[String],
     exclude: &[String],
+    tolerant: bool,
     url_for: impl Fn(&str, Option<&str>) -> Result<String>,
 ) -> Result<(Vec<DriveFile>, bool)> {
     use std::collections::HashSet;
@@ -1297,6 +1624,7 @@ async fn walk_folders(
     let mut out: Vec<DriveFile> = Vec::new();
     let mut seen_folders: HashSet<String> = HashSet::new();
     let mut seen_files: HashSet<String> = HashSet::new();
+    let mut truncated = false;
     let mut queue: Vec<String> = roots
         .iter()
         .filter(|r| !excluded.contains(r.as_str()))
@@ -1316,7 +1644,16 @@ async fn walk_folders(
         let mut page: Option<String> = None;
         loop {
             let url = url_for(&q, page.as_deref())?;
-            let v = google::authorized_get(token_key, &url).await?;
+            let v = match google::authorized_get(token_key, &url).await {
+                Ok(v) => v,
+                // A per-item 403/404 inside a shared-with-me subtree: skip this folder and flag the
+                // walk incomplete so the reconcile won't soft-delete files we simply couldn't reach.
+                Err(e) if tolerant && is_item_forbidden_or_missing(&e) => {
+                    truncated = true;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             let (children, next) = parse_files(&v);
             for child in children {
                 if child.mime_type == FOLDER_MIME {
@@ -1333,7 +1670,7 @@ async fn walk_folders(
             }
         }
     }
-    Ok((out, false))
+    Ok((out, truncated))
 }
 
 /// Enumerate the files under the selected **My Drive** folders (recursively, deduped, minus any
@@ -1344,7 +1681,171 @@ pub async fn enumerate_my_folders(
     folders: &[String],
     exclude: &[String],
 ) -> Result<(Vec<DriveFile>, bool)> {
-    walk_folders(token_key, folders, exclude, my_files_url).await
+    walk_folders(token_key, folders, exclude, false, my_files_url).await
+}
+
+/// Enumerate the files that live DIRECTLY in a drive's root (not inside any folder) — the loose files
+/// folder-scoped mode misses, offered as an opt-in "Files in the drive root". `drive_id` selects the
+/// corpus like [`list_folders`]: `MY_DRIVE_ROOT` walks the personal drive's root, any other id a shared
+/// drive's root (whose root folder id equals the drive id). Root-level FOLDERS are dropped (the folder
+/// picker owns those); only loose files are returned, with the pagination-guard truncated flag.
+pub async fn enumerate_root_files(
+    token_key: &str,
+    drive_id: &str,
+) -> Result<(Vec<DriveFile>, bool)> {
+    let my_drive = drive_id == MY_DRIVE_ROOT;
+    let parent = if my_drive { MY_DRIVE_ROOT } else { drive_id };
+    let q = format!("'{parent}' in parents and trashed = false");
+    let (files, truncated) = connector_sync::paginate(MAX_PAGES, |page| {
+        let q = q.as_str();
+        async move {
+            let url = if my_drive {
+                my_files_url(q, page.as_deref())?
+            } else {
+                shared_files_url(drive_id, q, FILE_FIELDS, "", page.as_deref())?
+            };
+            let v = google::authorized_get(token_key, &url).await?;
+            Ok(parse_files(&v))
+        }
+    })
+    .await?;
+    let files = files
+        .into_iter()
+        .filter(|f| f.mime_type != FOLDER_MIME)
+        .collect();
+    Ok((files, truncated))
+}
+
+// --- "Shared with me" (files/folders granted directly to the account) ----------------------------
+
+/// A user-corpus `files.list` URL for an arbitrary `q`, with the all-drives flags set — the
+/// "Shared with me" counterpart to `my_files_url`. A shared-with-me item can live in another user's
+/// shared drive, so `includeItemsFromAllDrives`/`supportsAllDrives` are needed for a `'<id>' in parents`
+/// walk to reach descendants; the `sharedWithMe = true` filter (roots) or the parent filter scopes it.
+fn swm_files_url(q: &str, page: Option<&str>) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/files"))
+        .map_err(|e| Error::Other(e.to_string()))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("q", q);
+        qp.append_pair("pageSize", "200");
+        qp.append_pair("spaces", "drive");
+        qp.append_pair("includeItemsFromAllDrives", "true");
+        qp.append_pair("supportsAllDrives", "true");
+        qp.append_pair("fields", &format!("nextPageToken,files({FILE_FIELDS})"));
+        if let Some(t) = page {
+            qp.append_pair("pageToken", t);
+        }
+    }
+    Ok(url.to_string())
+}
+
+/// One item at the top of the account's "Shared with me" collection — a directly-shared file or folder
+/// offered in the scope picker. `is_folder` picks the icon and decides whether choosing it pulls in a
+/// whole subtree; a shortcut reports its target's folder-ness.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SwmRoot {
+    pub id: String,
+    pub name: String,
+    pub is_folder: bool,
+}
+
+/// Whether a shared-with-me root (or a shortcut's target) is a folder — choosing it walks a whole
+/// subtree rather than indexing a single file.
+fn root_is_folder(root: &DriveFile) -> bool {
+    root.mime_type == FOLDER_MIME
+        || (root.mime_type == SHORTCUT_MIME
+            && root.shortcut_target_mime.as_deref() == Some(FOLDER_MIME))
+}
+
+/// List the account's "Shared with me" ROOTS — the top-level files/folders others granted it directly.
+/// `sharedWithMe = true` returns only these roots, NEVER a shared folder's descendants (those are
+/// reached by walking `'<folderId>' in parents`, see [`enumerate_swm_root`]). Carries the truncated
+/// flag from the pagination guard.
+pub async fn list_swm_roots(token_key: &str) -> Result<(Vec<DriveFile>, bool)> {
+    connector_sync::paginate(MAX_PAGES, |page| async move {
+        let url = swm_files_url("sharedWithMe = true and trashed = false", page.as_deref())?;
+        let v = google::authorized_get(token_key, &url).await?;
+        Ok(parse_files(&v))
+    })
+    .await
+}
+
+/// The picker's view of the shared-with-me roots (id + name + folder-ness). A truncated listing just
+/// shows fewer rows (a picker has no deletion semantics), so the guard flag is discarded.
+pub async fn list_swm_root_choices(token_key: &str) -> Result<Vec<SwmRoot>> {
+    let (roots, _truncated) = list_swm_roots(token_key).await?;
+    Ok(roots
+        .iter()
+        .map(|r| SwmRoot {
+            id: r.id.clone(),
+            name: r.name.clone(),
+            is_folder: root_is_folder(r),
+        })
+        .collect())
+}
+
+/// The files to index for ONE shared-with-me root, later keyed under `gdrive:swm:<rootId>:`: a
+/// **folder** root is walked recursively (tolerating per-item permission gaps); a **shortcut** is
+/// resolved to its target (a folder target walked, a file target fetched); a single **file** root is
+/// indexed on its own. Returns the files plus whether the enumeration was incomplete (⇒ no reconcile
+/// deletions for this root).
+pub async fn enumerate_swm_root(
+    token_key: &str,
+    root: &DriveFile,
+) -> Result<(Vec<DriveFile>, bool)> {
+    if root.mime_type == SHORTCUT_MIME {
+        return enumerate_swm_shortcut(token_key, root).await;
+    }
+    if root.mime_type == FOLDER_MIME {
+        return walk_folders(
+            token_key,
+            std::slice::from_ref(&root.id),
+            &[],
+            true,
+            swm_files_url,
+        )
+        .await;
+    }
+    // A single shared file — index it directly (its own metadata drives change detection).
+    Ok((vec![root.clone()], false))
+}
+
+/// Resolve a shared-with-me shortcut to the item it points at and enumerate THAT (a folder target is
+/// walked, a file target fetched). One hop only — a shortcut-to-shortcut is skipped. An unreachable
+/// target (deleted, forbidden, or a transient blip) yields nothing and marks the root incomplete, so a
+/// still-present target is never soft-deleted over a momentary failure.
+async fn enumerate_swm_shortcut(
+    token_key: &str,
+    root: &DriveFile,
+) -> Result<(Vec<DriveFile>, bool)> {
+    let (target_id, target_mime) = match (&root.shortcut_target_id, &root.shortcut_target_mime) {
+        (Some(id), Some(mime)) => (id.as_str(), mime.as_str()),
+        _ => return Ok((Vec::new(), false)), // a shortcut with no resolvable target
+    };
+    if target_mime == SHORTCUT_MIME {
+        return Ok((Vec::new(), false)); // never chase a shortcut chain
+    }
+    if target_mime == FOLDER_MIME {
+        return walk_folders(
+            token_key,
+            &[target_id.to_string()],
+            &[],
+            true,
+            swm_files_url,
+        )
+        .await;
+    }
+    match fetch_file_with_key(
+        token_key,
+        target_id,
+        root.shortcut_target_resource_key.as_deref(),
+    )
+    .await
+    {
+        Ok(f) => Ok((vec![f], false)),
+        Err(_) => Ok((Vec::new(), true)), // target unreachable — skip without deleting
+    }
 }
 
 /// The delta baseline cursor (`changes.getStartPageToken`). `drive_id: Some` scopes it to one shared
@@ -1436,9 +1937,28 @@ pub async fn list_shared_changes(
 /// Fetch one file's metadata (for body-on-demand, where we hold only the stored pointer).
 /// `supportsAllDrives` so a shared-drive file resolves too (harmless for My Drive files).
 pub async fn fetch_file(token_key: &str, file_id: &str) -> Result<DriveFile> {
+    fetch_file_with_key(token_key, file_id, None).await
+}
+
+/// As [`fetch_file`], but replays `resource_key` in the `X-Goog-Drive-Resource-Keys` header so a
+/// link-shared ("Shared with me") item whose `files.get` needs it still resolves. `None` = no header.
+pub async fn fetch_file_with_key(
+    token_key: &str,
+    file_id: &str,
+    resource_key: Option<&str>,
+) -> Result<DriveFile> {
     let url = format!("{DRIVE_API}/files/{file_id}?fields={FILE_FIELDS}&supportsAllDrives=true");
-    let v = google::authorized_get(token_key, &url).await?;
+    let header = resource_key.map(|k| format!("{file_id}/{k}"));
+    let v = google::authorized_get_with_keys(token_key, &url, header.as_deref()).await?;
     parse_file(&v).ok_or_else(|| Error::Other("Drive returned no file for that id.".into()))
+}
+
+/// The `X-Goog-Drive-Resource-Keys` header value for one file (`fileId/resourceKey`), or `None` when
+/// the file carries no resource key (the common case — only some link-shared items need it).
+fn resource_key_header(file: &DriveFile) -> Option<String> {
+    file.resource_key
+        .as_ref()
+        .map(|k| format!("{}/{}", file.id, k))
 }
 
 /// Export a Google Sheet's FULL grid as an `.xlsx` workbook to a temp file, for the "import fully"
@@ -1510,6 +2030,18 @@ pub fn is_auth_failure(err: &Error) -> bool {
     s.contains("(401") || s.contains("(403")
 }
 
+/// True if a Drive error is a per-ITEM access failure — forbidden (403) or gone (404) — rather than a
+/// transient rate-limit. Lets a shared-with-me walk skip one unreachable file/folder (divergent
+/// permissions are normal there) without failing the whole account, and lets a body fetch soft-flag one
+/// revoked item instead of erroring the account (M2). A rate-limit 403 is excluded (it's retryable).
+pub fn is_item_forbidden_or_missing(err: &Error) -> bool {
+    if is_rate_limited(err) {
+        return false;
+    }
+    let s = err.to_string();
+    s.contains("(403") || s.contains("(404")
+}
+
 /// Fetch a file's body as indexable text, or `None` if it has no useful text (skipped type, empty
 /// export, or over the size cap). Google-native docs are exported to text; text files downloaded
 /// directly; binaries downloaded to a temp file and converted via the sidecar. Never holds the DB
@@ -1519,6 +2051,8 @@ pub async fn fetch_body(
     token_key: &str,
     file: &DriveFile,
 ) -> Result<Option<String>> {
+    // A link-shared ("Shared with me") item may need its resourceKey replayed on the download/export.
+    let keys = resource_key_header(file);
     match fetch_plan(&file.mime_type) {
         FetchPlan::Skip => Ok(None),
         FetchPlan::Export { mime } => {
@@ -1527,8 +2061,13 @@ pub async fn fetch_body(
             url.query_pairs_mut()
                 .append_pair("mimeType", mime)
                 .append_pair("supportsAllDrives", "true");
-            let bytes =
-                google::authorized_get_bytes(token_key, url.as_str(), MAX_FILE_BYTES).await?;
+            let bytes = google::authorized_get_bytes_with_keys(
+                token_key,
+                url.as_str(),
+                MAX_FILE_BYTES,
+                keys.as_deref(),
+            )
+            .await?;
             Ok(non_empty(&String::from_utf8_lossy(&bytes)))
         }
         FetchPlan::DownloadText => {
@@ -1536,7 +2075,13 @@ pub async fn fetch_body(
                 "{DRIVE_API}/files/{}?alt=media&supportsAllDrives=true",
                 file.id
             );
-            let bytes = google::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await?;
+            let bytes = google::authorized_get_bytes_with_keys(
+                token_key,
+                &url,
+                MAX_FILE_BYTES,
+                keys.as_deref(),
+            )
+            .await?;
             Ok(non_empty(&String::from_utf8_lossy(&bytes)))
         }
         FetchPlan::DownloadBinary => {
@@ -1544,7 +2089,13 @@ pub async fn fetch_body(
                 "{DRIVE_API}/files/{}?alt=media&supportsAllDrives=true",
                 file.id
             );
-            let downloaded = google::authorized_get_bytes(token_key, &url, MAX_FILE_BYTES).await;
+            let downloaded = google::authorized_get_bytes_with_keys(
+                token_key,
+                &url,
+                MAX_FILE_BYTES,
+                keys.as_deref(),
+            )
+            .await;
             convert_downloaded_binary(state, "pm-drive-", &file.name, downloaded)
         }
         FetchPlan::SheetMetadata => fetch_sheet_metadata(token_key, file).await,
@@ -1762,6 +2313,14 @@ mod tests {
             trashed: false,
             web_view_link: Some(format!("https://drive/{id}")),
             parent_id: None,
+            shared_with_me: false,
+            owned_by_me: true,
+            shortcut_target_id: None,
+            shortcut_target_mime: None,
+            shortcut_target_resource_key: None,
+            can_download: None,
+            can_export: None,
+            resource_key: None,
         }
     }
 
@@ -1792,6 +2351,75 @@ mod tests {
             "a My-Drive id"
         );
         assert_eq!(twin_survivor_id("not-a-drive-id"), None);
+    }
+
+    #[test]
+    fn swm_source_id_is_account_independent_and_round_trips() {
+        let sid = swm_source_id("ROOT9", "FILE7");
+        assert_eq!(sid, "gdrive:swm:ROOT9:FILE7");
+        assert_eq!(swm_root_of(&sid).as_deref(), Some("ROOT9"));
+        // Account-independent, like a shared-drive id: no owning account in the id itself.
+        assert_eq!(account_of(&sid), None);
+        // Never collides with a My-Drive account prefix (an email is never literally "swm").
+        assert!(!sid.starts_with(&format!("gdrive:{}:", "a@b.com")));
+        // A single-file root keys as gdrive:swm:<id>:<id>.
+        assert_eq!(swm_source_id("F", "F"), "gdrive:swm:F:F");
+    }
+
+    #[test]
+    fn root_is_folder_classifies_files_folders_and_shortcuts() {
+        let folder = file("D", FOLDER_MIME, None, "t");
+        assert!(root_is_folder(&folder));
+
+        let plain = file("F", "application/pdf", Some("m"), "t");
+        assert!(!root_is_folder(&plain));
+
+        let mut sc_to_folder = file("S1", SHORTCUT_MIME, None, "t");
+        sc_to_folder.shortcut_target_mime = Some(FOLDER_MIME.into());
+        assert!(root_is_folder(&sc_to_folder));
+
+        let mut sc_to_file = file("S2", SHORTCUT_MIME, None, "t");
+        sc_to_file.shortcut_target_mime = Some("application/pdf".into());
+        assert!(!root_is_folder(&sc_to_file));
+    }
+
+    #[test]
+    fn map_change_routes_shared_with_me_out_of_my_drive() {
+        // An owned My-Drive change maps into the My-Drive namespace.
+        let owned = DriveChange {
+            file_id: "F1".into(),
+            removed: false,
+            file: Some(file("F1", "text/plain", Some("m1"), "t1")),
+        };
+        assert!(matches!(
+            map_change(&owned, "a@b.com", false),
+            Some(ChangeEvent::Add { .. })
+        ));
+
+        // A shared-with-me change is skipped here — the per-root swm reconcile owns it.
+        let mut shared = file("F2", "text/plain", Some("m2"), "t2");
+        shared.shared_with_me = true;
+        shared.owned_by_me = false;
+        let change = DriveChange {
+            file_id: "F2".into(),
+            removed: false,
+            file: Some(shared),
+        };
+        assert_eq!(map_change(&change, "a@b.com", false), None);
+    }
+
+    #[test]
+    fn drive_scope_and_selection_default_new_fields_on_a_legacy_blob() {
+        // An older stored scope (no shared-with-me / root-files fields) deserialises with them defaulted.
+        let scope: DriveScope =
+            serde_json::from_str(r#"{"my_drive":true,"my_drive_folders":null,"shared":[]}"#)
+                .unwrap();
+        assert!(!scope.shared_with_me);
+        assert_eq!(scope.shared_with_me_roots, None);
+        assert!(!scope.my_drive_include_root_files);
+        let sel: SharedSelection =
+            serde_json::from_str(r#"{"drive_id":"D","name":"n","folders":null}"#).unwrap();
+        assert!(!sel.include_root_files);
     }
 
     #[test]
@@ -2205,6 +2833,14 @@ mod tests {
             trashed: false,
             web_view_link: Some("https://docs.google.com/spreadsheets/d/sid".into()),
             parent_id: None,
+            shared_with_me: false,
+            owned_by_me: true,
+            shortcut_target_id: None,
+            shortcut_target_mime: None,
+            shortcut_target_resource_key: None,
+            can_download: None,
+            can_export: None,
+            resource_key: None,
         }
     }
 

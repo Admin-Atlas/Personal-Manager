@@ -211,8 +211,24 @@ async fn run_consent_inner(
 /// access token first if it's near expiry, and retries once after a refresh on 401. Never
 /// touches the DB, so callers hold no lock across it (rule #4).
 pub async fn authorized_get(token_key: &str, url: &str) -> Result<serde_json::Value> {
+    authorized_get_with_keys(token_key, url, None).await
+}
+
+/// As [`authorized_get`], plus the Drive `X-Goog-Drive-Resource-Keys` header when `resource_keys` is
+/// `Some` — required to read some LINK-shared items (a "Shared with me" file the user reached via a
+/// link and hasn't opened before). The header value is `fileId/resourceKey` (comma-separated for
+/// several). `None` sends no header, so every existing caller is unchanged.
+pub async fn authorized_get_with_keys(
+    token_key: &str,
+    url: &str,
+    resource_keys: Option<&str>,
+) -> Result<serde_json::Value> {
     let resp = authorized_send(&http()?, token_key, |c, bearer| {
-        c.get(url).bearer_auth(bearer)
+        let rb = c.get(url).bearer_auth(bearer);
+        match resource_keys {
+            Some(k) => rb.header("X-Goog-Drive-Resource-Keys", k),
+            None => rb,
+        }
     })
     .await?;
     json_or_err(resp).await
@@ -221,8 +237,23 @@ pub async fn authorized_get(token_key: &str, url: &str) -> Result<serde_json::Va
 /// As [`authorized_get`], but returns the raw response BYTES — for Drive file downloads/exports,
 /// whose bodies are not JSON. Caps the body at `max_bytes` so a huge file can't balloon memory.
 pub async fn authorized_get_bytes(token_key: &str, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    authorized_get_bytes_with_keys(token_key, url, max_bytes, None).await
+}
+
+/// As [`authorized_get_bytes`], plus the `X-Goog-Drive-Resource-Keys` header (see
+/// [`authorized_get_with_keys`]) for downloading/exporting a link-shared item's body.
+pub async fn authorized_get_bytes_with_keys(
+    token_key: &str,
+    url: &str,
+    max_bytes: usize,
+    resource_keys: Option<&str>,
+) -> Result<Vec<u8>> {
     let resp = authorized_send(&http()?, token_key, |c, bearer| {
-        c.get(url).bearer_auth(bearer)
+        let rb = c.get(url).bearer_auth(bearer);
+        match resource_keys {
+            Some(k) => rb.header("X-Goog-Drive-Resource-Keys", k),
+            None => rb,
+        }
     })
     .await?;
     if !resp.status().is_success() {

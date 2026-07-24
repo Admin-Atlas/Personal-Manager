@@ -183,6 +183,15 @@ trait CloudDriver: Send + Sync {
     /// The file's display name for the report/progress (falls back to the source id when absent).
     fn file_name(file: &Self::File) -> String;
 
+    /// Whether a body-fetch error is a per-ITEM access failure (the item was revoked/removed for this
+    /// user — common for a "Shared with me" grant that was pulled) rather than an account-wide or
+    /// transient failure. Lets phase 2 skip that one file (record an issue, keep the account healthy)
+    /// instead of failing the whole account (M2). Defaults to `false` — every fetch error fails the
+    /// account, the pre-existing behavior — so only Drive opts in.
+    fn is_item_gone(_err: &Error) -> bool {
+        false
+    }
+
     /// Gather one account's work off the DB lock (phase 1): the whole-drive delta cursor and/or a
     /// folder-scoped reconcile, plus Drive's opted-in shared drives. Returns the [`AccountWork`] and
     /// any soft (per-account) error to fold into the pass's `last_err` — hard errors (a poisoned
@@ -596,15 +605,23 @@ async fn run_cloud_pass<C: CloudDriver>(
                     }
                     Err(e) => {
                         processed += 1;
-                        failed += 1;
                         record_issue(
                             &mut issues,
                             &mut issues_truncated,
                             &name,
                             &format!("Couldn't fetch from {}: {e}", C::PROVIDER_LABEL),
                         );
-                        last_err = Some(e);
-                        account_failed = true;
+                        // A per-item revoke/removal (e.g. a "Shared with me" grant the owner pulled)
+                        // skips just this file — recorded as an issue, account stays healthy — instead
+                        // of failing the whole account. Any other error (transient/auth/network) still
+                        // fails the account so its cursor is held and it retries next pass (F-29, M2).
+                        if C::is_item_gone(&e) {
+                            skipped += 1;
+                        } else {
+                            failed += 1;
+                            account_failed = true;
+                            last_err = Some(e);
+                        }
                         emit_progress::<C>(
                             app,
                             CloudSyncEvent::Item {
@@ -774,8 +791,15 @@ async fn gather_shared(
 ) -> Result<(Vec<DriveItem>, Option<(String, String)>, bool)> {
     match sel.folders.as_deref() {
         Some(folders) => {
-            let (items, truncated) =
-                gather_shared_folders(app, token_key, &sel.drive_id, folders, &sel.exclude).await?;
+            let (items, truncated) = gather_shared_folders(
+                app,
+                token_key,
+                &sel.drive_id,
+                folders,
+                &sel.exclude,
+                sel.include_root_files,
+            )
+            .await?;
             Ok((items, None, truncated))
         }
         None => gather_shared_whole(app, token_key, email, &sel.drive_id).await,
@@ -793,9 +817,18 @@ async fn gather_shared_folders(
     drive_id: &str,
     folders: &[String],
     exclude: &[String],
+    include_root_files: bool,
 ) -> Result<(Vec<DriveItem>, bool)> {
-    let (files, truncated) =
+    let (mut files, mut truncated) =
         drive::enumerate_shared(token_key, drive_id, Some(folders), exclude).await?;
+    // Fix 4: also index files loose in the drive's root when opted in — a file has one parent, so a
+    // root file never overlaps a folder-walked file (no dedup needed). Reconciled against the whole
+    // drive's known set below, so toggling this off soft-removes the root files like unselecting a folder.
+    if include_root_files {
+        let (root_files, rt) = drive::enumerate_root_files(token_key, drive_id).await?;
+        files.extend(root_files);
+        truncated |= rt;
+    }
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -824,8 +857,16 @@ async fn gather_my_drive_folders(
     email: &str,
     folders: &[String],
     exclude: &[String],
+    include_root_files: bool,
 ) -> Result<(Vec<DriveItem>, bool)> {
-    let (files, truncated) = drive::enumerate_my_folders(token_key, folders, exclude).await?;
+    let (mut files, mut truncated) =
+        drive::enumerate_my_folders(token_key, folders, exclude).await?;
+    // Fix 4: also index files loose in My Drive's root when opted in (see [`gather_shared_folders`]).
+    if include_root_files {
+        let (root_files, rt) = drive::enumerate_root_files(token_key, drive::MY_DRIVE_ROOT).await?;
+        files.extend(root_files);
+        truncated |= rt;
+    }
     let known: std::collections::HashSet<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -928,6 +969,69 @@ async fn gather_shared_whole(
     Ok((items, Some((drive_id.to_string(), new_cursor)), truncated))
 }
 
+/// Gather the account's **Shared with me** work. Lists the picked shared roots (or all, when the scope
+/// carries no explicit list), and for each root this account OWNS (first-come via
+/// `claim_or_skip_swm_root`, so a root shared with two connected accounts is indexed once) enumerates
+/// its files — a folder root walked recursively, a shortcut resolved to its target, a single file
+/// indexed on its own — and reconciles them under the root's own account-independent
+/// `gdrive:swm:<rootId>:` namespace (no cursor). Legacy leaked rows are adopted in place first
+/// ([`drive::adopt_legacy_swm_row`]). Returns the items plus whether any enumeration was incomplete
+/// (⇒ no reconcile deletions for the affected root).
+async fn gather_shared_with_me(
+    app: &AppHandle,
+    token_key: &str,
+    email: &str,
+    picked: Option<&[String]>,
+) -> Result<(Vec<DriveItem>, bool)> {
+    let (roots, mut truncated) = drive::list_swm_roots(token_key).await?;
+    let picked_set: Option<std::collections::HashSet<&str>> =
+        picked.map(|ids| ids.iter().map(String::as_str).collect());
+
+    let mut items: Vec<DriveItem> = Vec::new();
+    for root in &roots {
+        // Honour the pick list (`None` = every shared root).
+        if picked_set
+            .as_ref()
+            .is_some_and(|s| !s.contains(root.id.as_str()))
+        {
+            continue;
+        }
+        // Claim ownership; a root already owned by another connected account is indexed there — skip.
+        let owns = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            drive::claim_or_skip_swm_root(&conn, email, &root.id, &root.name)?
+        };
+        if !owns {
+            continue;
+        }
+        let (files, root_truncated) = drive::enumerate_swm_root(token_key, root).await?;
+        truncated |= root_truncated;
+        // Adopt any legacy My-Drive-namespaced rows for these files, THEN read the root's known set —
+        // so an adopted row is already in that set and reconciles as an Update/no-op, not a re-ingest.
+        let known: std::collections::HashSet<String> = {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            for f in &files {
+                drive::adopt_legacy_swm_row(&conn, email, &root.id, &f.id)?;
+            }
+            drive::known_swm_source_ids(&conn, &root.id)?
+                .into_iter()
+                .collect()
+        };
+        let root_id = root.id.clone();
+        let mut recon: Vec<DriveItem> =
+            index_only::reconcile_enumeration(files, known, !root_truncated, |file_id| {
+                drive::swm_source_id(&root_id, file_id)
+            })
+            .into_iter()
+            .map(drive_reconciled)
+            .collect();
+        items.append(&mut recon);
+    }
+    Ok((items, truncated))
+}
+
 /// The Google Drive connector's [`CloudDriver`] — see [`crate::commands::sync_drive`] /
 /// [`crate::commands::resume_drive_sync`]. Honours each account's scope: **My Drive** (on by default)
 /// uses the efficient delta cursor (first sync enumerates everything, later syncs the changes feed);
@@ -983,6 +1087,9 @@ impl CloudDriver for DriveDriver {
     fn file_name(file: &drive::DriveFile) -> String {
         file.name.clone()
     }
+    fn is_item_gone(err: &Error) -> bool {
+        drive::is_item_forbidden_or_missing(err)
+    }
 
     async fn gather_account(
         &self,
@@ -1014,6 +1121,7 @@ impl CloudDriver for DriveDriver {
                         &email,
                         folders,
                         &scope.my_drive_exclude,
+                        scope.my_drive_include_root_files,
                     )
                     .await
                     {
@@ -1132,6 +1240,32 @@ impl CloudDriver for DriveDriver {
                             break;
                         }
                     }
+                }
+            }
+        }
+
+        // --- Shared with me: files/folders granted directly to the account, indexed under their own
+        // account-independent `gdrive:swm:<rootId>:` namespace and de-duplicated across accounts via
+        // `claim_or_skip_swm_root` (the same ownership model as shared drives). Re-enumerated +
+        // reconciled per picked root each pass, no cursor. Skipped if the account already auth-failed. ---
+        if scope.shared_with_me && !auth_failed {
+            match gather_shared_with_me(
+                app,
+                &token_key,
+                &email,
+                scope.shared_with_me_roots.as_deref(),
+            )
+            .await
+            {
+                Ok((mut recon, truncated)) => {
+                    items.append(&mut recon);
+                    coverage_incomplete |= truncated;
+                }
+                Err(e) => {
+                    if drive::is_auth_failure(&e) {
+                        auth_failed = true;
+                    }
+                    last_err = Some(e);
                 }
             }
         }

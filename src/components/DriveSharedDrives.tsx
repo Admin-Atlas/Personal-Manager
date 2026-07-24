@@ -4,12 +4,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   driveSharedOwners,
+  driveSwmRootOwners,
   getDriveScope,
   listDriveFolders,
   listDriveSharedDrives,
+  listDriveSharedWithMeRoots,
   setDriveScope,
 } from "../lib/ipc";
-import type { DriveScope, SharedDrive, SharedSelection } from "../lib/types";
+import type { DriveScope, SharedDrive, SharedSelection, SwmRoot } from "../lib/types";
 import { FolderPicker } from "./FolderPicker";
 import { SegmentedControl } from "./ui";
 
@@ -137,6 +139,29 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
       ),
     });
 
+  // Root-file opt-ins (folder-scoped only) — see [`RootFilesToggle`].
+  const setMyRootFiles = (on: boolean) => commit({ ...scope, my_drive_include_root_files: on });
+  const setDriveRootFiles = (driveId: string, on: boolean) =>
+    commit({
+      ...scope,
+      shared: scope.shared.map((s) =>
+        s.drive_id === driveId ? { ...s, include_root_files: on } : s,
+      ),
+    });
+
+  // Shared with me: a master toggle plus Everything (`roots == null`) vs Choose (a picked-id list).
+  const swmWhole = scope.shared_with_me_roots == null;
+  const setSharedWithMe = (on: boolean) =>
+    commit({
+      ...scope,
+      shared_with_me: on,
+      // A freshly-enabled corpus starts in "Choose" (empty) so it doesn't flood the review queue.
+      shared_with_me_roots: on ? (scope.shared_with_me_roots ?? []) : scope.shared_with_me_roots,
+    });
+  const setSwmWhole = (whole: boolean) =>
+    commit({ ...scope, shared_with_me_roots: whole ? null : [] });
+  const setSwmRoots = (ids: string[]) => commit({ ...scope, shared_with_me_roots: ids });
+
   return (
     <div className="mt-2 space-y-3" data-help="settings-drive-shared">
       <div>
@@ -167,13 +192,19 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
               ]}
             />
             {!myWhole && (
-              <DriveFolderPicker
-                email={email}
-                driveId={MY_DRIVE_ROOT}
-                selected={scope.my_drive_folders ?? []}
-                excluded={scope.my_drive_exclude ?? []}
-                onChange={setMyFolders}
-              />
+              <>
+                <DriveFolderPicker
+                  email={email}
+                  driveId={MY_DRIVE_ROOT}
+                  selected={scope.my_drive_folders ?? []}
+                  excluded={scope.my_drive_exclude ?? []}
+                  onChange={setMyFolders}
+                />
+                <RootFilesToggle
+                  checked={scope.my_drive_include_root_files ?? false}
+                  onChange={setMyRootFiles}
+                />
+              </>
             )}
           </div>
         )}
@@ -226,15 +257,21 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
                         ]}
                       />
                       {!whole && (
-                        <DriveFolderPicker
-                          email={email}
-                          driveId={d.id}
-                          selected={sel.folders ?? []}
-                          excluded={sel.exclude ?? []}
-                          onChange={(selected, excluded) =>
-                            setDriveFolders(d.id, selected, excluded)
-                          }
-                        />
+                        <>
+                          <DriveFolderPicker
+                            email={email}
+                            driveId={d.id}
+                            selected={sel.folders ?? []}
+                            excluded={sel.exclude ?? []}
+                            onChange={(selected, excluded) =>
+                              setDriveFolders(d.id, selected, excluded)
+                            }
+                          />
+                          <RootFilesToggle
+                            checked={sel.include_root_files ?? false}
+                            onChange={(on) => setDriveRootFiles(d.id, on)}
+                          />
+                        </>
                       )}
                     </div>
                   )}
@@ -242,6 +279,46 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
               );
             })}
           </ul>
+        )}
+      </div>
+
+      <div>
+        <div className="font-mono text-[10px] uppercase tracking-wide text-ink4">
+          Shared with me
+        </div>
+        <label className="mt-2 flex items-start gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={scope.shared_with_me ?? false}
+            onChange={(e) => setSharedWithMe(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="text-ink2">Files &amp; folders shared with you</span> — index items
+            others shared directly with this account (separate from My Drive and shared drives).{" "}
+            {!scope.shared_with_me && (
+              <span className="text-ink4">Off by default — this collection can be large.</span>
+            )}
+          </span>
+        </label>
+        {scope.shared_with_me && (
+          <div className="mt-2 pl-5">
+            <SegmentedControl
+              value={swmWhole ? "whole" : "choose"}
+              onChange={(v) => setSwmWhole(v === "whole")}
+              options={[
+                { value: "choose", label: "Choose items" },
+                { value: "whole", label: "Everything" },
+              ]}
+            />
+            {!swmWhole && (
+              <SharedWithMeRoots
+                email={email}
+                selected={scope.shared_with_me_roots ?? []}
+                onChange={setSwmRoots}
+              />
+            )}
+          </div>
         )}
       </div>
 
@@ -284,5 +361,120 @@ function DriveFolderPicker({
       excluded={excluded}
       onChange={(next) => onChange(next.selected, next.excluded)}
     />
+  );
+}
+
+/** The "Files in the drive root" opt-in shown under a folder-scoped selection — loose files at a
+ *  drive's top level aren't inside any folder, so the folder picker alone can't reach them. */
+function RootFilesToggle({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (on: boolean) => void;
+}) {
+  return (
+    <label className="mt-2 flex items-start gap-2 text-[11px]">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5"
+      />
+      <span className="text-ink3">
+        Also index files in the drive’s root (loose files not inside any folder).
+      </span>
+    </label>
+  );
+}
+
+/** The flat picker of "Shared with me" roots — files AND folders (a folder pulls in its whole
+ *  subtree; a trailing “/” marks a folder). Roots already indexed by another connected account are
+ *  greyed out (de-duplicated like a shared drive). Loads its own roots + owners on mount, so the list
+ *  is fetched only when the "Choose items" view is actually shown. */
+function SharedWithMeRoots({
+  email,
+  selected,
+  onChange,
+}: {
+  email: string;
+  selected: string[];
+  onChange: (ids: string[]) => void;
+}) {
+  const [roots, setRoots] = useState<SwmRoot[] | null>(null);
+  const [owners, setOwners] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const [rs, ow] = await Promise.all([
+        listDriveSharedWithMeRoots(email),
+        driveSwmRootOwners(email),
+      ]);
+      setRoots(rs);
+      setOwners(ow);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [email]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  if (error) {
+    return (
+      <p className="mt-2 text-xs text-st-due">
+        {error}
+        <button type="button" onClick={load} className="ml-2 underline">
+          Retry
+        </button>
+      </p>
+    );
+  }
+  if (roots == null) {
+    return <p className="mt-2 text-xs text-ink4">Loading shared items…</p>;
+  }
+  if (roots.length === 0) {
+    return <p className="mt-2 text-xs text-ink4">Nothing has been shared with this account.</p>;
+  }
+
+  const sel = new Set(selected);
+  const toggle = (id: string, on: boolean) => {
+    const next = new Set(sel);
+    if (on) next.add(id);
+    else next.delete(id);
+    onChange([...next]);
+  };
+
+  return (
+    <ul className="mt-2 divide-y divide-rule">
+      {roots.map((r) => {
+        const ownedBy = owners[r.id];
+        return (
+          <li key={r.id} className="py-1.5 first:pt-0 last:pb-0">
+            <label className={`flex items-center gap-2 text-xs ${ownedBy ? "opacity-60" : ""}`}>
+              <input
+                type="checkbox"
+                checked={ownedBy ? true : sel.has(r.id)}
+                disabled={!!ownedBy}
+                onChange={(e) => toggle(r.id, e.target.checked)}
+                className={ownedBy ? "cursor-not-allowed" : ""}
+              />
+              <span className="truncate text-ink2">
+                {r.name}
+                {r.is_folder ? "/" : ""}
+              </span>
+            </label>
+            {ownedBy && (
+              <p className="mt-0.5 pl-5 text-[11px] text-ink4">
+                Already synced by <span className="text-ink3">{ownedBy}</span>.
+              </p>
+            )}
+          </li>
+        );
+      })}
+    </ul>
   );
 }

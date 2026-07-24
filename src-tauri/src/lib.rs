@@ -1239,6 +1239,8 @@ pub fn run() {
             commands::list_drive_shared_drives,
             commands::drive_shared_owners,
             commands::list_drive_folders,
+            commands::list_drive_shared_with_me_roots,
+            commands::drive_swm_root_owners,
             commands::get_drive_scope,
             commands::set_drive_scope,
             commands::onedrive_status,

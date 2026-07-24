@@ -733,6 +733,16 @@ export interface SharedSelection {
   folders: string[] | null;
   /** Subfolder ids to skip within the chosen `folders` (each prunes that folder + its subtree). */
   exclude?: string[];
+  /** Also index files that live directly in the shared drive's root (folder-scoped mode only). */
+  include_root_files?: boolean;
+}
+
+/** One item at the top of an account's "Shared with me" collection — a directly-shared file or folder
+ *  offered in the picker. `is_folder` decides whether choosing it pulls in a whole subtree. */
+export interface SwmRoot {
+  id: string;
+  name: string;
+  is_folder: boolean;
 }
 
 /** What one account indexes: the personal My Drive plus any opted-in shared drives. Default scope is
@@ -744,7 +754,13 @@ export interface DriveScope {
   my_drive_folders: string[] | null;
   /** Subfolder ids to skip within the chosen `my_drive_folders` (each prunes that folder + subtree). */
   my_drive_exclude?: string[];
+  /** Also index files loose in My Drive's root (folder-scoped mode only). */
+  my_drive_include_root_files?: boolean;
   shared: SharedSelection[];
+  /** Index files/folders shared directly with this account ("Shared with me"). Off by default. */
+  shared_with_me?: boolean;
+  /** `null`/absent = every shared-with-me root; otherwise only these picked roots (file OR folder ids). */
+  shared_with_me_roots?: string[] | null;
 }
 
 /** Snapshot of an in-flight Drive sync, so the UI can resume showing progress after navigating away

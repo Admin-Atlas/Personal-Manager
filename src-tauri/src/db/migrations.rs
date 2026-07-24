@@ -1058,6 +1058,38 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE usage_log ADD COLUMN latency_ms      INTEGER;  -- wall-clock of the serving leg, ms
     ALTER TABLE usage_log ADD COLUMN fallback_reason TEXT;     -- why cloud served vs preferred local; NULL = none
     "#,
+    // v38 (#480): Google Drive "Shared with me" support + resource-key persistence.
+    //
+    // "Shared with me" is Drive's THIRD collection — files/folders other users grant you directly —
+    // distinct from My Drive and shared (Team) drives. Its items are indexed ACCOUNT-INDEPENDENTLY under
+    // `gdrive:swm:<rootId>:<fileId>` (the user-picked root as the container, an exact structural mirror
+    // of the shared-drive id `gdrive:sd:<driveId>:<fileId>`; `rootId == fileId` for a file root) and
+    // de-duplicated across accounts exactly like shared drives: the first account to sync a picked root
+    // OWNS it and reconciles it, others with the same root shared skip (the scope UI greys them out).
+    //
+    // `shared_with_me_access` is that access relation — one row per (root, account) recording who can
+    // reach each shared root and which account owns its index. `account_id` FKs the registry with
+    // ON DELETE CASCADE, so disconnecting an account drops its access rows (the connector then
+    // soft-flags any root no remaining account can reach). It mirrors `shared_drive_access` (v19) with
+    // `root_id` in the container role that `drive_id` plays there.
+    //
+    // Link-shared items may need their Drive `resourceKey` replayed in the `X-Goog-Drive-Resource-Keys`
+    // header. That header is applied at SYNC time from the in-hand file metadata (see
+    // `drive::resource_key_header`); persisting the key so an ON-DEMAND live-body re-fetch can replay it
+    // for a resource-key-GATED item is a follow-up (direct shares — the common case — need no key). So
+    // this migration adds only the access relation, no `documents` column yet.
+    r#"
+    CREATE TABLE shared_with_me_access (
+        root_id    TEXT NOT NULL,   -- the picked shared root's Drive fileId (a folder or a single file)
+        account_id TEXT NOT NULL REFERENCES connector_sources(id) ON DELETE CASCADE,
+        is_owner   INTEGER NOT NULL DEFAULT 0,   -- the one account whose sync indexes + reconciles this root
+        name       TEXT,                          -- cached root display name (UI convenience)
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (root_id, account_id)
+    );
+    CREATE INDEX idx_swm_access_root    ON shared_with_me_access(root_id);
+    CREATE INDEX idx_swm_access_account ON shared_with_me_access(account_id);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1113,7 +1145,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 37,
+            version, 38,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1127,7 +1159,8 @@ mod tests {
              structured flag layer is v32; per-flag instance timestamp (F-18) is v33; \
              per-calendar quiet flag is v34; rebuild pass stamp (#371) is v35; \
              usage_log kind CHECK relaxed for chat housekeeping is v36; \
-             usage_log provider/latency/fallback columns (via writable_schema=RESET) is v37)"
+             usage_log provider/latency/fallback columns (via writable_schema=RESET) is v37; \
+             Drive shared-with-me access relation is v38)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
