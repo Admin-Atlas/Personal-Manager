@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.50.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "The Focus tab now uses the width of your screen. Your project list sits beside the daily briefing, quick actions and upcoming events, instead of stacked in one narrow column with empty space down both sides. On a narrow window it folds back to a single column. This split view is the new default — you can switch back to a stacked column from the toggle in the Focus header, or under Settings → General → Focus.",
+    ],
+  },
+  {
     version: "3.49.3-alpha",
     date: "2026-07-24",
     highlights: [
