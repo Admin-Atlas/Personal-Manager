@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.59.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Click any event on the calendar to see its full details in a pop-up. Until now only your own milestones and pinboard notes responded to a click; now every event does. The pop-up shows everything PM has synced for it -- which calendar it's on, when, whether you're marked busy or free, the location, the guest list and organiser, a video-call link, whether it repeats, and the full description -- plus quick buttons to open it in its source calendar (Google / Outlook), jump to its linked project, or open the Pinboard. To make this useful, PM now pulls in those richer details (busy/free, guests, organiser, meeting links, recurrence) from Google, Outlook and subscribed (Apple / iCal) calendars, so the aggregated view finally carries what you'd see in the original app. Existing calendars fill in the new details on their next sync.",
+    ],
+  },
+  {
     version: "3.58.1-alpha",
     date: "2026-07-24",
     highlights: [

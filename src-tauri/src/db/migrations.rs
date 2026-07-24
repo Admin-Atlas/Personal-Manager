@@ -1110,6 +1110,26 @@ const MIGRATIONS: &[&str] = &[
         created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
     "#,
+    // v40 (calendar event popup): richer per-event detail for the click-to-open event popover. The
+    // v6/v18 mirror carried only the fields the agenda/month views paint (title, times, location,
+    // link, uid); PM is the calendar aggregator, so the detail popup surfaces everything the providers
+    // hold. These additive columns are populated per provider (Google transparency/attendees/organizer/
+    // conference/recurrence, Graph showAs/attendees/onlineMeeting, ICS TRANSP/ATTENDEE/ORGANIZER/RRULE)
+    // on the next sync — the F-49 event hash folds them in, so existing rows rewrite once. All
+    // nullable/defaulted (rule #3): a pre-v40 row reads them as "unknown" like any other additive
+    // column. `calendar_events` carries no writable_schema patch, so plain ALTERs suffice (no RESET).
+    r#"
+    ALTER TABLE calendar_events ADD COLUMN show_as            TEXT;    -- busy|free|tentative|oof|elsewhere
+    ALTER TABLE calendar_events ADD COLUMN organizer          TEXT;    -- display name or email
+    ALTER TABLE calendar_events ADD COLUMN attendees          TEXT;    -- JSON array of {name,email,response,...}
+    ALTER TABLE calendar_events ADD COLUMN conference_url     TEXT;    -- Meet/Teams join link
+    ALTER TABLE calendar_events ADD COLUMN recurring          INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE calendar_events ADD COLUMN recurrence_summary TEXT;    -- raw RRULE / human summary
+    ALTER TABLE calendar_events ADD COLUMN status             TEXT;    -- confirmed|tentative
+    ALTER TABLE calendar_events ADD COLUMN visibility         TEXT;    -- default|public|private|confidential
+    ALTER TABLE calendar_events ADD COLUMN created            TEXT;
+    ALTER TABLE calendar_events ADD COLUMN updated            TEXT;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1165,7 +1185,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 39,
+            version, 40,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1181,7 +1201,8 @@ mod tests {
              usage_log kind CHECK relaxed for chat housekeeping is v36; \
              usage_log provider/latency/fallback columns (via writable_schema=RESET) is v37; \
              Drive shared-with-me access relation is v38; \
-             Review AI-proposal cache is v39)"
+             Review AI-proposal cache is v39; \
+             calendar event popup detail columns is v40)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

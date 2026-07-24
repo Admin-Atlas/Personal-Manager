@@ -8,12 +8,7 @@
 // today's number chip only — every source colour comes from the categorical palette, never the accent.
 
 import type { CalendarEvent } from "../../../lib/types";
-import {
-  dayKey,
-  isEventPast,
-  isOverlayEvent,
-  PAST_EVENT_CLASS,
-} from "../../../lib/calendar-layout";
+import { dayKey, isEventPast, PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -27,8 +22,8 @@ interface Props {
   colorOf: (calendarId: string) => string;
   /** The ticking "now" (device-local) so past chips/bands grey back. Defaults to the render clock. */
   now?: Date;
-  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay chips only). */
-  onEventClick?: (ev: CalendarEvent) => void;
+  /** Open an event's detail popup, anchored at the chip/band's on-screen rect. */
+  onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
 }
 
 const BAND_H = 16;
@@ -114,7 +109,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                   ) : (
                     <div className="flex min-h-0 flex-col gap-0.5 overflow-hidden">
                       {cell.chips.slice(0, maxChips).map((ev) => {
-                        const clickable = isOverlayEvent(ev);
+                        const clickable = !!onEventClick;
                         return (
                           <div
                             key={ev.id}
@@ -127,13 +122,17 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                             title={ev.summary}
                             role={clickable ? "button" : undefined}
                             tabIndex={clickable ? 0 : undefined}
-                            onClick={clickable ? () => onEventClick?.(ev) : undefined}
+                            onClick={
+                              clickable
+                                ? (e) => onEventClick?.(ev, e.currentTarget.getBoundingClientRect())
+                                : undefined
+                            }
                             onKeyDown={
                               clickable
                                 ? (e) => {
                                     if (e.key === "Enter" || e.key === " ") {
                                       e.preventDefault();
-                                      onEventClick?.(ev);
+                                      onEventClick?.(ev, e.currentTarget.getBoundingClientRect());
                                     }
                                   }
                                 : undefined
@@ -172,6 +171,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                     key={b.ev.id}
                     className={cn(
                       "absolute overflow-hidden px-1.5 text-[11px] leading-[14px]",
+                      onEventClick && "pointer-events-auto cursor-pointer hover:brightness-110",
                       isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
                     )}
                     style={{
@@ -187,6 +187,23 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                       borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
                     }}
                     title={b.ev.summary}
+                    role={onEventClick ? "button" : undefined}
+                    tabIndex={onEventClick ? 0 : undefined}
+                    onClick={
+                      onEventClick
+                        ? (e) => onEventClick(b.ev, e.currentTarget.getBoundingClientRect())
+                        : undefined
+                    }
+                    onKeyDown={
+                      onEventClick
+                        ? (e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              onEventClick(b.ev, e.currentTarget.getBoundingClientRect());
+                            }
+                          }
+                        : undefined
+                    }
                   >
                     <span className="truncate text-ink">
                       {b.continuesLeft ? "‹ " : ""}

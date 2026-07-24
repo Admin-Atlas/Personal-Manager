@@ -803,6 +803,9 @@ export const listCalendarEvents = () => invoke<AgendaEvent[]>("list_calendar_eve
  *  calendar view (card 8). The client filters to the visible range + locally-hidden calendars. */
 export const listAllCalendarEvents = () => invoke<CalendarEvent[]>("list_all_calendar_events");
 
+/** The active PM flags anchored on a calendar event's iCal UID — for the event detail popup. */
+export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid });
+
 // --- Google Drive (index-only connector, board card 4A) ---
 
 /** The Drive connector's state: whether the shared Google client is set up + connected accounts. */

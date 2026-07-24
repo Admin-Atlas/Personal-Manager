@@ -4476,6 +4476,21 @@ pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<Calend
     calendar::list_all_events(&conn)
 }
 
+/// The active PM flags anchored on a calendar event's iCal UID — shown in the event detail popup so a
+/// linked "prepare ahead" / "happening today" flag is visible where the event is. Empty when the event
+/// has no UID or no flags. (A calendar flag's `anchor` IS the event's iCal UID — flags.rs.)
+#[tauri::command]
+pub fn event_flags(state: State<'_, AppState>, uid: String) -> Result<Vec<flags::Flag>> {
+    if uid.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = state.conn()?;
+    Ok(flags::list_active(&conn, Some(flags::ANCHOR_CALENDAR))?
+        .into_iter()
+        .filter(|f| f.anchor == uid)
+        .collect())
+}
+
 /// The upcoming events in the mirror, for the focus-view agenda. Each row carries `ended` — the agenda
 /// widens the strict "not yet ended" gate to keep events that finished earlier today (in the user's
 /// zone) so the view can show them de-emphasised until the user's local midnight.

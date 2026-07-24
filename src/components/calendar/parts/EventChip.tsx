@@ -18,9 +18,9 @@ interface Props {
   showTime: boolean;
   /** The event has fully passed — grey it back so what's done recedes. */
   isPast?: boolean;
-  /** When set, the chip is interactive (the PM overlays only) — click / Enter / Space fires it.
-   *  Synced events leave this undefined and stay non-interactive. */
-  onClick?: () => void;
+  /** When set, the chip is interactive — click / Enter / Space opens the event's detail popup,
+   *  anchored at the chip's on-screen rect. */
+  onClick?: (anchor: DOMRect) => void;
 }
 
 export function EventChip({ summary, color, timeLabel, showTime, isPast, onClick }: Props) {
@@ -39,13 +39,13 @@ export function EventChip({ summary, color, timeLabel, showTime, isPast, onClick
       aria-label={[timeLabel, summary].filter(Boolean).join(", ")}
       role={onClick ? "button" : undefined}
       tabIndex={onClick ? 0 : undefined}
-      onClick={onClick}
+      onClick={onClick ? (e) => onClick(e.currentTarget.getBoundingClientRect()) : undefined}
       onKeyDown={
         onClick
           ? (e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                onClick();
+                onClick(e.currentTarget.getBoundingClientRect());
               }
             }
           : undefined

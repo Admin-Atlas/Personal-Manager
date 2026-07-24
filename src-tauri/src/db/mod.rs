@@ -956,6 +956,16 @@ mod tests {
              DROP TABLE calendars; \
              ALTER TABLE calendar_events DROP COLUMN uid; \
              ALTER TABLE calendar_events DROP COLUMN entity_id; \
+             ALTER TABLE calendar_events DROP COLUMN show_as; \
+             ALTER TABLE calendar_events DROP COLUMN organizer; \
+             ALTER TABLE calendar_events DROP COLUMN attendees; \
+             ALTER TABLE calendar_events DROP COLUMN conference_url; \
+             ALTER TABLE calendar_events DROP COLUMN recurring; \
+             ALTER TABLE calendar_events DROP COLUMN recurrence_summary; \
+             ALTER TABLE calendar_events DROP COLUMN status; \
+             ALTER TABLE calendar_events DROP COLUMN visibility; \
+             ALTER TABLE calendar_events DROP COLUMN created; \
+             ALTER TABLE calendar_events DROP COLUMN updated; \
              DROP TABLE doc_layout; \
              DROP TABLE document_proposals; \
              DROP TABLE shared_drive_access; \
@@ -1111,6 +1121,16 @@ mod tests {
              DROP TABLE calendars; \
              ALTER TABLE calendar_events DROP COLUMN uid; \
              ALTER TABLE calendar_events DROP COLUMN entity_id; \
+             ALTER TABLE calendar_events DROP COLUMN show_as; \
+             ALTER TABLE calendar_events DROP COLUMN organizer; \
+             ALTER TABLE calendar_events DROP COLUMN attendees; \
+             ALTER TABLE calendar_events DROP COLUMN conference_url; \
+             ALTER TABLE calendar_events DROP COLUMN recurring; \
+             ALTER TABLE calendar_events DROP COLUMN recurrence_summary; \
+             ALTER TABLE calendar_events DROP COLUMN status; \
+             ALTER TABLE calendar_events DROP COLUMN visibility; \
+             ALTER TABLE calendar_events DROP COLUMN created; \
+             ALTER TABLE calendar_events DROP COLUMN updated; \
              DROP TABLE doc_layout; \
              DROP TABLE document_proposals; \
              DROP TABLE shared_drive_access; \

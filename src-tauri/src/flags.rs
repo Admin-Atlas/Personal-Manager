@@ -1242,6 +1242,7 @@ mod tests {
             all_day: false,
             html_link: None,
             uid: uid.map(|s| s.into()),
+            ..Default::default()
         }
     }
 

@@ -54,6 +54,7 @@ import { PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
 import { milestoneColor, pinboardColor, sourceColors, useTheme, useUserTime } from "../../theme";
 import { Skeleton } from "../ui";
 import { useNowTick } from "./parts/useNowTick";
+import { CalendarEventPopover } from "./parts/CalendarEventPopover";
 import { CalendarHeader } from "./CalendarHeader";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
@@ -424,19 +425,25 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     return out;
   }, [events, hidden, milestoneEvents, pinboardEvents]);
 
-  // The only interactive elements on the otherwise read-only calendar: a milestone opens its project,
-  // a freeform pinboard entry opens the Pinboard (it has no project to open). Real synced events are
-  // never wired to a click (isOverlayEvent === false).
+  // The event popup that's open, anchored at the clicked element's rect (null = closed).
+  const [eventPopup, setEventPopup] = useState<{ ev: CalendarEvent; anchor: DOMRect } | null>(null);
+
+  // Clicking an event: a PM overlay keeps its jump (a milestone opens its project, a freeform pinboard
+  // entry opens the Pinboard), while a real synced event opens the in-place detail popup anchored at
+  // the click. Every event is now clickable (was overlay-only).
   const onEventClick = useCallback(
-    (ev: CalendarEvent) => {
+    (ev: CalendarEvent, anchor: DOMRect) => {
       if (isPinboardEvent(ev)) {
         onOpenPinboard?.();
         return;
       }
-      if (!isMilestoneEvent(ev)) return;
-      const id = Number(ev.id.slice("milestone:".length));
-      const m = milestones.find((x) => x.id === id);
-      if (m) onOpenProject?.(m.project_name);
+      if (isMilestoneEvent(ev)) {
+        const id = Number(ev.id.slice("milestone:".length));
+        const m = milestones.find((x) => x.id === id);
+        if (m) onOpenProject?.(m.project_name);
+        return;
+      }
+      setEventPopup({ ev, anchor });
     },
     [milestones, onOpenProject, onOpenPinboard],
   );
@@ -696,6 +703,37 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         >
           {renderBody()}
         </div>
+      )}
+
+      {eventPopup && (
+        <CalendarEventPopover
+          event={eventPopup.ev}
+          anchor={eventPopup.anchor}
+          calendar={overview?.calendars.find((c) => c.id === eventPopup.ev.calendar_id) ?? null}
+          color={colorOf(eventPopup.ev.calendar_id)}
+          milestone={
+            eventPopup.ev.uid
+              ? (milestones.find((m) => m.event_uid && m.event_uid === eventPopup.ev.uid) ?? null)
+              : null
+          }
+          onClose={() => setEventPopup(null)}
+          onOpenProject={
+            onOpenProject
+              ? (p) => {
+                  setEventPopup(null);
+                  onOpenProject(p);
+                }
+              : undefined
+          }
+          onOpenPinboard={
+            onOpenPinboard
+              ? () => {
+                  setEventPopup(null);
+                  onOpenPinboard();
+                }
+              : undefined
+          }
+        />
       )}
     </div>
   );

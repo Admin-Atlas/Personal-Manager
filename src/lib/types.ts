@@ -1068,8 +1068,21 @@ export type LayoutProgressEvent =
   | { state: "done"; method: string }
   | { state: "error"; message: string };
 
-/** A mirrored calendar event (the agenda list). `start` is an ISO datetime, or a
- *  plain date for all-day events. */
+/** One attendee on an event, as surfaced in the detail popup. */
+export interface Attendee {
+  name: string | null;
+  email: string | null;
+  /** accepted | declined | tentative | needsAction (provider terms). */
+  response: string | null;
+  optional: boolean;
+  organizer: boolean;
+  /** This account is the attendee (Rust `is_self`, serialised as `self`). */
+  self: boolean;
+}
+
+/** A mirrored calendar event (the agenda list + the detail popup). `start` is an ISO datetime, or a
+ *  plain date for all-day events. The fields below `uid` are the richer detail the popup shows; they
+ *  are populated per provider and default to empty on the assistant/focus read paths. */
 export interface CalendarEvent {
   id: string;
   calendar_id: string;
@@ -1082,6 +1095,23 @@ export interface CalendarEvent {
   html_link: string | null;
   /** The event's stable iCal UID — the anchor a milestone links to (card 7). */
   uid: string | null;
+  // The synced mirror always sends the fields below; PM's own synthetic overlay events (milestones,
+  // pinboard) omit them, so they're optional — and the detail popup, which only opens for synced
+  // events, reads them null-safely.
+  /** How the time reads on the owner's calendar: busy | free | tentative | oof | elsewhere. */
+  show_as?: string | null;
+  /** The organiser as a display string. */
+  organizer?: string | null;
+  attendees?: Attendee[];
+  /** A video-call join link (Meet / Teams). */
+  conference_url?: string | null;
+  recurring?: boolean;
+  /** A short recurrence summary (the raw RRULE for ICS / Google). */
+  recurrence_summary?: string | null;
+  status?: string | null;
+  visibility?: string | null;
+  created?: string | null;
+  updated?: string | null;
 }
 
 /** A focus-agenda row: a mirrored event plus whether it has already ended. The focus agenda widens

@@ -12,7 +12,6 @@ import {
   dayKey,
   groupEventsFromDay,
   isEventPast,
-  isOverlayEvent,
   PAST_EVENT_CLASS,
   startOfDay,
   weekdayShort,
@@ -28,8 +27,8 @@ interface Props {
   colorOf: (calendarId: string) => string;
   /** The ticking "now" (device-local) so an earlier-today event greys back. Defaults to the render clock. */
   now?: Date;
-  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay rows only). */
-  onEventClick?: (ev: CalendarEvent) => void;
+  /** Open an event's detail popup, anchored at the row's on-screen rect. */
+  onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
 }
 
 /** An event's clock time for the agenda row: the local start time, or "all-day". */
@@ -80,7 +79,7 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
             </div>
             <ul className="flex flex-1 flex-col gap-1">
               {g.items.map((ev) => {
-                const clickable = isOverlayEvent(ev);
+                const clickable = !!onEventClick;
                 return (
                   <li
                     key={ev.id}
@@ -92,13 +91,17 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
                     style={{ borderLeftColor: colorOf(ev.calendar_id) }}
                     role={clickable ? "button" : undefined}
                     tabIndex={clickable ? 0 : undefined}
-                    onClick={clickable ? () => onEventClick?.(ev) : undefined}
+                    onClick={
+                      clickable
+                        ? (e) => onEventClick?.(ev, e.currentTarget.getBoundingClientRect())
+                        : undefined
+                    }
                     onKeyDown={
                       clickable
                         ? (e) => {
                             if (e.key === "Enter" || e.key === " ") {
                               e.preventDefault();
-                              onEventClick?.(ev);
+                              onEventClick?.(ev, e.currentTarget.getBoundingClientRect());
                             }
                           }
                         : undefined

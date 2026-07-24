@@ -14,7 +14,6 @@ import {
   addDays,
   dayKey,
   isEventPast,
-  isOverlayEvent,
   PAST_EVENT_CLASS,
   startOfDay,
 } from "../../../lib/calendar-layout";
@@ -40,8 +39,8 @@ interface Props {
   onFocusDate: (d: Date) => void;
   /** The ticking "now" (device-local) so past chips/bands grey back. Defaults to the render clock. */
   now?: Date;
-  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay chips only). */
-  onEventClick?: (ev: CalendarEvent) => void;
+  /** Open an event's detail popup, anchored at the chip/band's on-screen rect. */
+  onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
 }
 
 const BAND_H = 16;
@@ -275,7 +274,7 @@ export function MonthView({ cursor, events, colorOf, onFocusDate, now, onEventCl
                             timeLabel={ev.all_day ? "" : formatClockIso(ev.start)}
                             showTime={showMeta}
                             isPast={isEventPast(ev, nowDate)}
-                            onClick={isOverlayEvent(ev) ? () => onEventClick?.(ev) : undefined}
+                            onClick={onEventClick ? (rect) => onEventClick(ev, rect) : undefined}
                           />
                         ))}
                         {hidden > 0 && (
@@ -302,7 +301,10 @@ export function MonthView({ cursor, events, colorOf, onFocusDate, now, onEventCl
                     <div
                       key={b.ev.id}
                       className={cn(
+                        // The band overlay is pointer-events-none so day cells stay clickable; a band
+                        // re-enables its own pointer events to open the event popup.
                         "absolute overflow-hidden px-1.5 text-[11px] leading-[14px]",
+                        onEventClick && "pointer-events-auto cursor-pointer hover:brightness-110",
                         isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
                       )}
                       style={{
@@ -318,6 +320,23 @@ export function MonthView({ cursor, events, colorOf, onFocusDate, now, onEventCl
                         borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
                       }}
                       title={b.ev.summary}
+                      role={onEventClick ? "button" : undefined}
+                      tabIndex={onEventClick ? 0 : undefined}
+                      onClick={
+                        onEventClick
+                          ? (e) => onEventClick(b.ev, e.currentTarget.getBoundingClientRect())
+                          : undefined
+                      }
+                      onKeyDown={
+                        onEventClick
+                          ? (e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                onEventClick(b.ev, e.currentTarget.getBoundingClientRect());
+                              }
+                            }
+                          : undefined
+                      }
                     >
                       <span className="truncate font-head text-ink">
                         {b.continuesLeft ? "‹ " : ""}

@@ -16,7 +16,6 @@ import {
   eventDaySpan,
   groupEventsFromDay,
   isEventPast,
-  isOverlayEvent,
   PAST_EVENT_CLASS,
   startOfDay,
   weekdayShort,
@@ -34,8 +33,8 @@ interface Props {
   fromDay?: Date;
   /** The ticking "now" (device-local) so a past event greys back. Defaults to the render clock. */
   now?: Date;
-  /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay rows only). */
-  onEventClick?: (ev: CalendarEvent) => void;
+  /** Open an event's detail popup, anchored at the row's on-screen rect. */
+  onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
 }
 
 interface DayRow {
@@ -105,7 +104,7 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventCli
             ) : (
               <ul className="flex flex-col gap-0.5">
                 {row.items.map((ev) => {
-                  const clickable = isOverlayEvent(ev);
+                  const clickable = !!onEventClick;
                   return (
                     <li
                       key={ev.id}
@@ -116,13 +115,17 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventCli
                       )}
                       role={clickable ? "button" : undefined}
                       tabIndex={clickable ? 0 : undefined}
-                      onClick={clickable ? () => onEventClick?.(ev) : undefined}
+                      onClick={
+                        clickable
+                          ? (e) => onEventClick?.(ev, e.currentTarget.getBoundingClientRect())
+                          : undefined
+                      }
                       onKeyDown={
                         clickable
                           ? (e) => {
                               if (e.key === "Enter" || e.key === " ") {
                                 e.preventDefault();
-                                onEventClick?.(ev);
+                                onEventClick?.(ev, e.currentTarget.getBoundingClientRect());
                               }
                             }
                           : undefined
