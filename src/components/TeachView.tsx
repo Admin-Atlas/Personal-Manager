@@ -12,6 +12,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   addEntityAlias,
+  removeEntityAlias,
   listEntities,
   listProjectOverviews,
   mergeEntities,
@@ -223,6 +224,7 @@ export function TeachView() {
                     onAliasChange={(value) => setAliasing({ id: entity.id, value })}
                     onAliasCommit={commitAlias}
                     onAliasCancel={() => setAliasing(null)}
+                    onAliasRemove={(alias) => void run(() => removeEntityAlias(entity.id, alias))}
                     onMerge={() => openMerge(entity)}
                   />
                 ))}
@@ -252,6 +254,20 @@ export function TeachView() {
               disappears.
             </p>
 
+            {mergeSource.canonical_name === UNSORTED && (
+              <p
+                className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
+                style={{
+                  borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
+                  background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
+                }}
+              >
+                Unsorted is PM&rsquo;s inbox — it can&rsquo;t be merged into another project.
+                Everything new lands here first, so folding it away would empty your inbox into that
+                project.
+              </p>
+            )}
+
             <label className="mt-4 block text-xs text-ink3">Keep this project</label>
             <select
               value={mergeTargetId ?? ""}
@@ -275,7 +291,7 @@ export function TeachView() {
               <Button
                 variant="primary"
                 onClick={() => void confirmMerge()}
-                disabled={busy || mergeTargetId == null}
+                disabled={busy || mergeTargetId == null || mergeSource.canonical_name === UNSORTED}
               >
                 {busy
                   ? "Merging…"
@@ -306,6 +322,7 @@ function EntityCard({
   onAliasChange,
   onAliasCommit,
   onAliasCancel,
+  onAliasRemove,
   onMerge,
 }: {
   entity: Entity;
@@ -322,11 +339,16 @@ function EntityCard({
   onAliasChange: (v: string) => void;
   onAliasCommit: () => void;
   onAliasCancel: () => void;
+  onAliasRemove: (alias: string) => void;
   onMerge: () => void;
 }) {
   // The aliases are every known name; drop the canonical self-alias to show only the *variants*
   // that resolve to it.
   const variants = entity.aliases.filter((a) => a !== entity.canonical_name);
+  // The seeded Unsorted inbox can't be renamed or merged away (the backend refuses both). Disable
+  // those affordances here so the guard reads as a guided control, not a raw error after the click —
+  // parity with the merge modal's block. Adding / removing its alternate names stays allowed.
+  const isUnsorted = entity.canonical_name === UNSORTED;
   const { devMode } = useDevMode();
 
   return (
@@ -380,10 +402,24 @@ function EntityCard({
 
           {renaming == null && (
             <div className="flex shrink-0 items-center gap-1">
-              <Button variant="tertiary" onClick={onRenameStart} disabled={busy}>
+              <Button
+                variant="tertiary"
+                onClick={onRenameStart}
+                disabled={busy || isUnsorted}
+                title={isUnsorted ? "Unsorted is PM's inbox and can't be renamed" : undefined}
+              >
                 Rename
               </Button>
-              <Button variant="tertiary" onClick={onMerge} disabled={busy}>
+              <Button
+                variant="tertiary"
+                onClick={onMerge}
+                disabled={busy || isUnsorted}
+                title={
+                  isUnsorted
+                    ? "Unsorted is PM's inbox and can't be merged into another project"
+                    : undefined
+                }
+              >
                 Merge…
               </Button>
               <Button variant="tertiary" onClick={onAliasStart} disabled={busy}>
@@ -402,10 +438,20 @@ function EntityCard({
             {variants.map((alias) => (
               <span
                 key={alias}
-                className="inline-flex items-center rounded-[var(--radius-sm)] bg-accent-soft px-2 py-0.5 text-xs text-accent-text"
+                className="group inline-flex items-center gap-1 rounded-[var(--radius-sm)] bg-accent-soft px-2 py-0.5 text-xs text-accent-text"
                 title={`Resolves to ${entity.canonical_name}`}
               >
                 {alias}
+                <button
+                  type="button"
+                  onClick={() => onAliasRemove(alias)}
+                  disabled={busy}
+                  aria-label={`Remove the name ${alias}`}
+                  title={`Remove “${alias}” — it stops resolving to ${entity.canonical_name}`}
+                  className="opacity-0 transition hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+                >
+                  ×
+                </button>
               </span>
             ))}
             {aliasing != null && (

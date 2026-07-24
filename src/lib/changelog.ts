@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.62.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "You can now undo a project-name decision in Teach, and PM protects your inbox. In the Teach tab, hover over any of a project's alternate names and a small × appears -- click it to remove that name, so it stops being treated as the project from now on. Honest note: this reverses the name and pulls any files still literally saved under that exact name back out into their own project, but it can't retroactively un-merge files an earlier merge already renamed to the project you kept (PM doesn't store that history) -- for those, restore a backup from before the merge. Separately, the special “Unsorted” inbox is now protected: it can't be merged into another project or renamed away, so a stray click can never sweep everything waiting to be sorted into the wrong place.",
+    ],
+  },
+  {
     version: "3.61.0-alpha",
     date: "2026-07-24",
     highlights: [

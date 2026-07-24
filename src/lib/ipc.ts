@@ -659,6 +659,10 @@ export const listEntities = (kind?: string) =>
 export const addEntityAlias = (entityId: number, alias: string) =>
   invoke<void>("add_entity_alias", { entityId, alias });
 
+/** Remove an alias from a project entity — reverse a name/merge decision from Teach. */
+export const removeEntityAlias = (entityId: number, alias: string) =>
+  invoke<void>("remove_entity_alias", { entityId, alias });
+
 /** Rename a canonical project — a one-row identity update that also rewrites its documents'
  *  vault frontmatter + cache to the new name. */
 export const renameEntity = (entityId: number, newName: string) =>

@@ -214,6 +214,53 @@ pub fn add_alias(conn: &Connection, entity_id: i64, alias: &str) -> Result<AddAl
     }
 }
 
+/// Remove `alias` from `entity_id` — the reverse of [`add_alias`], for undoing a name/merge decision
+/// in the Teach tab. Refuses to remove the entity's own canonical name (its self-alias), which would
+/// orphan it. Any documents / projects STILL literally filed under this exact (case-sensitive) name
+/// are re-homed to a fresh standalone entity of that name, so the removal can never leave a NULL
+/// `entity_id` after a mirror rebuild. Documents filed under the entity's CANONICAL name are
+/// unaffected — this reverses the ALIAS, not the survivor. A no-op if the alias isn't this entity's.
+pub fn remove_alias(conn: &Connection, entity_id: i64, alias: &str) -> Result<()> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Ok(());
+    }
+    if alias == canonical_name(conn, entity_id)? {
+        return Err(Error::Other(
+            "a project's own name can't be removed — rename or merge the project instead".into(),
+        ));
+    }
+    // Only remove an alias this entity actually owns (never touch another entity's alias).
+    match lookup_alias(conn, alias)? {
+        Some(owner) if owner == entity_id => {}
+        _ => return Ok(()),
+    }
+    conn.execute(
+        "DELETE FROM entity_aliases WHERE entity_id = ?1 AND alias = ?2",
+        params![entity_id, alias],
+    )?;
+    // Re-home anything still literally filed under this name to a fresh standalone entity, so the
+    // alias's removal can't orphan a row (no NULL entity_id after `rebuild_mirror_from_rules`).
+    let has_rows: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE project = ?1) \
+              OR EXISTS(SELECT 1 FROM projects  WHERE name    = ?1)",
+        params![alias],
+        |r| r.get(0),
+    )?;
+    if has_rows {
+        let standalone = create_project(conn, alias)?;
+        conn.execute(
+            "UPDATE documents SET entity_id = ?2 WHERE project = ?1",
+            params![alias, standalone],
+        )?;
+        conn.execute(
+            "UPDATE projects SET entity_id = ?2 WHERE name = ?1",
+            params![alias, standalone],
+        )?;
+    }
+    Ok(())
+}
+
 /// Point one document at `entity_id` — the *reassignment* case (a misfile), distinct from a
 /// *merge*. Mirror-only; the caller rewrites the document's canonical-name cache + vault
 /// frontmatter to match.
@@ -232,6 +279,13 @@ pub fn rename_entity(conn: &Connection, entity_id: i64, new_canonical: &str) -> 
     let new_canonical = new_canonical.trim();
     if new_canonical.is_empty() {
         return Err(Error::Other("a project name is required".into()));
+    }
+    // Never rename the seeded Unsorted inbox away — everything (fresh ingest, chat, the review queue's
+    // fallback) lands there by that exact case-sensitive name, so renaming it would strand the inbox.
+    if resolve_project(conn, "Unsorted", false)? == Some(entity_id) {
+        return Err(Error::Other(
+            "Unsorted is PM's inbox and can't be renamed".into(),
+        ));
     }
     // Refuse to collide with a different existing project's canonical (that's a merge).
     if let Some(other) = conn
@@ -265,6 +319,14 @@ pub fn rename_entity(conn: &Connection, entity_id: i64, new_canonical: &str) -> 
 pub fn merge_entities(conn: &Connection, from_id: i64, into_id: i64) -> Result<()> {
     if from_id == into_id {
         return Ok(());
+    }
+    // Never merge FROM the seeded Unsorted inbox — that would sweep every unreviewed / inbox document
+    // into another project (the case-sensitive "Unsorted", never a lowercase variant). Merging INTO
+    // Unsorted stays allowed (a deliberate "these belong in the inbox").
+    if resolve_project(conn, "Unsorted", false)? == Some(from_id) {
+        return Err(Error::Other(
+            "Unsorted is PM's inbox and can't be merged into another project".into(),
+        ));
     }
     // Aliases are globally unique, so each belongs to exactly one entity — moving them never
     // collides. The canonical self-alias of the source comes along, becoming a plain alias of
@@ -737,6 +799,61 @@ mod tests {
             Some(pm)
         );
         assert!(rename_entity(&conn, pm, "Research").is_err());
+    }
+
+    #[test]
+    fn remove_alias_reverses_and_rehomes_without_orphaning() {
+        let (_d, conn) = store_with_doc("PM");
+        let pm = resolve_project(&conn, "PM", false).unwrap().unwrap();
+
+        // Add then remove a plain alias: it stops resolving, and removing the self-alias is refused.
+        assert_eq!(add_alias(&conn, pm, "Atlas - PM").unwrap(), AddAlias::Added);
+        remove_alias(&conn, pm, "Atlas - PM").unwrap();
+        assert_eq!(resolve_project(&conn, "Atlas - PM", false).unwrap(), None);
+        assert!(
+            remove_alias(&conn, pm, "PM").is_err(),
+            "removing an entity's own name (self-alias) is refused"
+        );
+
+        // A doc literally filed under a name that was then merged into PM: removing that alias
+        // re-homes the doc to a fresh standalone entity of that name — never orphaned, never left on
+        // the survivor — so the mirror invariant (no NULL entity_id) holds.
+        let (_d2, conn2) = store_with_doc("side-project");
+        let side = resolve_project(&conn2, "side-project", false)
+            .unwrap()
+            .unwrap();
+        let pm2 = resolve_project(&conn2, "PM", true).unwrap().unwrap();
+        merge_entities(&conn2, side, pm2).unwrap(); // doc.project stays "side-project", entity=PM
+        remove_alias(&conn2, pm2, "side-project").unwrap();
+        let rehomed = resolve_project(&conn2, "side-project", false).unwrap();
+        assert!(
+            rehomed.is_some(),
+            "the removed name re-homes to a live entity"
+        );
+        assert_ne!(
+            rehomed,
+            Some(pm2),
+            "it is a fresh standalone entity, not the survivor"
+        );
+        let doc_entity: i64 = conn2
+            .query_row(
+                "SELECT entity_id FROM documents WHERE vault_path='a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(Some(doc_entity), rehomed, "the re-homed doc points at it");
+
+        // The seeded Unsorted inbox can't be merged FROM or renamed away.
+        let unsorted = resolve_project(&conn, "Unsorted", false).unwrap().unwrap();
+        assert!(
+            merge_entities(&conn, unsorted, pm).is_err(),
+            "merging FROM Unsorted is refused"
+        );
+        assert!(
+            rename_entity(&conn, unsorted, "Inbox").is_err(),
+            "renaming Unsorted is refused"
+        );
     }
 
     #[test]
