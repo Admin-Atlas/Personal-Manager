@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.49.1-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "The week and day calendar views now draw their hour gridlines cleanly. Depending on your screen's scaling, some of the faint grey hour lines could come out uneven or drop out entirely; PM now draws each one as a crisp single-pixel line, so they're all there and evenly spaced.",
+    ],
+  },
+  {
     version: "3.49.0-alpha",
     date: "2026-07-23",
     highlights: [

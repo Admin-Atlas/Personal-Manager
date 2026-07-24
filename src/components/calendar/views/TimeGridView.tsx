@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// One pixel time-grid engine for both Day (1 column) and Week (7). Hour rules are a
-// repeating-linear-gradient in var(--rule); timed events are absolutely positioned from
+// One pixel time-grid engine for both Day (1 column) and Week (7). Hour rules are explicit 1px
+// border divs snapped to whole pixels — a repeating-linear-gradient aliased them into uneven
+// hairlines under fractional row heights and Windows display scaling. Timed events are absolutely
+// positioned from
 // minutes-since-local-midnight (DST-tolerant, never an absolute UTC delta) and de-overlapped into
 // equal-width lane columns via calendar-layout. All-day / multi-day events lift into the AllDayBand;
 // timed events crossing midnight are already multi-day, so they lift too. Today's column gets an
@@ -233,7 +235,10 @@ export function TimeGridView({
   }, [scrollKey, scrollHour, rowH, bodyHeight]);
 
   const nowMin = minutesFromLocalMidnight(new Date());
-  const hourLines = `repeating-linear-gradient(to bottom, var(--rule) 0, var(--rule) 1px, transparent 1px, transparent ${rowH}px)`;
+  // Hour rules as one crisp 1px line per hour, snapped to whole pixels so every rule renders
+  // identically — a repeating-linear-gradient with a fractional rowH period aliased them (uneven,
+  // sometimes missing, under Windows display scaling). Rounding also aligns each line to its label.
+  const hourTops = Array.from({ length: HOURS }, (_, h) => Math.round(h * rowH));
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
@@ -314,14 +319,16 @@ export function TimeGridView({
             <div
               key={dayKey(c.day)}
               className={cn("relative flex-1 border-l border-rule", c.isToday && "bg-accent-soft")}
-              style={{ background: c.isToday ? undefined : hourLines }}
             >
-              {c.isToday && (
+              {/* Hour rules — one crisp 1px line per hour, painted under the cards so today's tint
+                  shows through. Explicit divs (not a repeating gradient) render evenly at any rowH. */}
+              {hourTops.map((top, h) => (
                 <div
-                  className="pointer-events-none absolute inset-0"
-                  style={{ background: hourLines }}
+                  key={h}
+                  className="pointer-events-none absolute inset-x-0 border-t border-rule"
+                  style={{ top }}
                 />
-              )}
+              ))}
               {c.cards.map((card) => (
                 <EventCard
                   key={card.ev.id}
