@@ -13,9 +13,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 
 import {
+  backupArchivePrefix,
   backupGdriveConnect,
   backupGdriveDisconnect,
   backupGdriveStatus,
+  backupNow,
   backupStatus,
   backupToGdrive,
   backupToProton,
@@ -30,6 +32,7 @@ import {
   protonConnect,
   protonDisconnect,
   protonStatus,
+  pruneOwnBackups,
   restoreFromGdrive,
   restoreFromProton,
   restoreLocalBackup,
@@ -52,6 +55,7 @@ import type {
 } from "../lib/types";
 import { formatDateTime } from "../lib/format";
 import { isOpaquePhase, describeFailures } from "../lib/backup";
+import { readReconcileDismissed, writeReconcileDismissed } from "../lib/backupPrefs";
 import { Button, Input, SectionInfo } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { IngestProgress } from "./IngestProgress";
@@ -131,6 +135,15 @@ export function BackupSettings() {
   const [freqDraft, setFreqDraft] = useState<BackupSchedule["frequency"]>("off");
   const [retentionDraft, setRetentionDraft] = useState("5");
   const [savingSchedule, setSavingSchedule] = useState(false);
+
+  // This vault's archive-name prefix, so we can count only THIS vault's archives at a shared
+  // destination for the "you have more backups than keep-last-N" reconciliation banner. Loaded once.
+  const [archivePrefix, setArchivePrefix] = useState<string | null>(null);
+  // Per-destination dismissal of that banner (persisted, keyed by destination + account).
+  const [reconcileDismissed, setReconcileDismissed] = useState<{
+    proton: boolean;
+    gdrive: boolean;
+  }>({ proton: false, gdrive: false });
 
   // Schedule + passphrase-stored state is independent of Proton, so load it on its own.
   const refreshSchedule = useCallback(async () => {
@@ -227,6 +240,20 @@ export function BackupSettings() {
   useEffect(() => {
     void refreshSchedule();
   }, [refreshSchedule]);
+  // The vault's archive prefix is stable for the session — fetch it once.
+  useEffect(() => {
+    backupArchivePrefix()
+      .then(setArchivePrefix)
+      .catch(() => setArchivePrefix(null));
+  }, []);
+  // Re-read the banner's dismissal whenever the connected account changes (a different account is a
+  // different backup location, so a prior dismissal shouldn't carry over).
+  useEffect(() => {
+    setReconcileDismissed({
+      proton: readReconcileDismissed("proton", conn?.account ?? null),
+      gdrive: readReconcileDismissed("gdrive", schedule?.gdrive_account ?? null),
+    });
+  }, [conn?.account, schedule?.gdrive_account]);
 
   const mounted = useRef(true);
   useEffect(() => {
@@ -290,6 +317,21 @@ export function BackupSettings() {
     schedule?.proton_enabled ? "Proton Drive" : null,
     schedule?.gdrive_enabled ? "Google Drive" : null,
   ].filter(Boolean) as string[];
+
+  // This vault's own archive count at each destination (the listing includes every vault's archives
+  // sharing the account/folder, so filter by our prefix). `null` until both the prefix and the
+  // listing have loaded. The reconciliation banner fires when a destination holds more than keep-N.
+  const keepN = schedule?.retention_n ?? null;
+  const protonOwnCount =
+    archivePrefix && protonBackups
+      ? protonBackups.filter((b) => b.name.startsWith(archivePrefix)).length
+      : null;
+  const gdriveOwnCount =
+    archivePrefix && gdriveBackups
+      ? gdriveBackups.filter((b) => b.name.startsWith(archivePrefix)).length
+      : null;
+  const protonOverLimit = protonOwnCount !== null && keepN !== null && protonOwnCount > keepN;
+  const gdriveOverLimit = gdriveOwnCount !== null && keepN !== null && gdriveOwnCount > keepN;
 
   async function doRememberPass() {
     if (!backupValid) return;
@@ -507,6 +549,106 @@ export function BackupSettings() {
     } finally {
       setRunning(false);
     }
+  }
+
+  // "Back up now" from a connected panel: uses the STORED passphrase and prunes to keep-last-N (a
+  // scheduled-style run), so it only appears once a passphrase is remembered. Distinct from the
+  // typed-passphrase "Save to …" buttons in the section above, which never prune.
+  async function doBackupNow(kind: "proton" | "gdrive") {
+    setError(null);
+    setMessage(null);
+    try {
+      setRunning(true);
+      await backupNow(kind);
+      setMessage(kind === "proton" ? "Backed up to Proton Drive." : "Backed up to Google Drive.");
+      if (kind === "proton") await refreshProton();
+      else await refreshGdrive();
+      await refreshSchedule();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  // Reconciliation banner action: raise keep-last-N to the number already at the destination, so the
+  // next backup rolls the oldest off instead of the setting quietly capping below what's stored.
+  async function doRaiseKeepN(kind: "proton" | "gdrive") {
+    const present = kind === "proton" ? protonOwnCount : gdriveOwnCount;
+    if (present == null) return;
+    setScheduleSaveError(null);
+    try {
+      // Keep the current cadence; only lift the retention. ("off" needs no passphrase, so this works
+      // whether or not automatic backups are on.)
+      await setBackupSchedule(schedule?.frequency ?? "off", present);
+      await refreshSchedule();
+    } catch (e) {
+      setScheduleSaveError(String(e));
+    }
+  }
+
+  // Reconciliation banner action: trim this vault's archives at the destination to keep-last-N now
+  // (recoverable — Proton/Drive trash).
+  async function doPruneOldest(kind: "proton" | "gdrive") {
+    setError(null);
+    try {
+      if (kind === "proton") setProtonBusy(true);
+      else setGdriveBusy(true);
+      await pruneOwnBackups(kind);
+      if (kind === "proton") await refreshProton();
+      else await refreshGdrive();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      if (kind === "proton") setProtonBusy(false);
+      else setGdriveBusy(false);
+    }
+  }
+
+  function doDismissReconcile(kind: "proton" | "gdrive") {
+    const account =
+      kind === "proton" ? (conn?.account ?? null) : (schedule?.gdrive_account ?? null);
+    writeReconcileDismissed(kind, account);
+    setReconcileDismissed((prev) => ({ ...prev, [kind]: true }));
+  }
+
+  // The banner shown at the top of a connected panel when the destination holds more of THIS vault's
+  // archives than keep-last-N — offering to keep them all (raise N) or trim to N now.
+  function reconcileBanner(kind: "proton" | "gdrive") {
+    const present = kind === "proton" ? protonOwnCount : gdriveOwnCount;
+    const over = kind === "proton" ? protonOverLimit : gdriveOverLimit;
+    if (!over || reconcileDismissed[kind] || present == null || keepN == null) return null;
+    const destBusy = kind === "proton" ? protonBusy : gdriveBusy;
+    return (
+      <div
+        className="flex flex-col gap-2 rounded-[var(--radius)] border px-3 py-2.5 text-sm text-ink3"
+        style={{
+          borderColor: "color-mix(in oklab, var(--st-due) 35%, transparent)",
+          background: "color-mix(in oklab, var(--st-due) 12%, transparent)",
+        }}
+      >
+        <p>
+          This destination holds <span className="font-medium">{present}</span> backups of this
+          vault — more than your keep-last-{keepN} limit. Older backups aren&rsquo;t trimmed
+          automatically until you reconcile this.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" onClick={() => void doRaiseKeepN(kind)} disabled={busy}>
+            Keep all {present}
+          </Button>
+          <Button
+            variant="tertiary"
+            onClick={() => void doPruneOldest(kind)}
+            disabled={busy || destBusy}
+          >
+            Delete oldest, keep {keepN}
+          </Button>
+          <Button variant="tertiary" onClick={() => doDismissReconcile(kind)} disabled={busy}>
+            Dismiss
+          </Button>
+        </div>
+      </div>
+    );
   }
 
   async function doGdriveRestore() {
@@ -891,6 +1033,7 @@ export function BackupSettings() {
           </div>
         ) : (
           <div className="mt-2 flex max-w-sm flex-col gap-3">
+            {reconcileBanner("proton")}
             <div className="flex items-center justify-between gap-2 rounded-[var(--radius-sm)] border border-border2 bg-surface p-3">
               <div className="min-w-0">
                 <p className="text-sm text-st-quick">Connected</p>
@@ -904,11 +1047,27 @@ export function BackupSettings() {
                 Disconnect
               </Button>
             </div>
-            <p className="text-xs text-ink4">
-              Enter a passphrase under &ldquo;Backup passphrase&rdquo; above, then choose{" "}
-              <span className="font-medium">Save to Proton Drive</span> — or set up automatic
-              backups below.
-            </p>
+            {passphraseStored ? (
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-ink4">
+                  Backs up with your remembered passphrase and keeps the last {keepN}.
+                </p>
+                <Button
+                  variant="secondary"
+                  onClick={() => void doBackupNow("proton")}
+                  disabled={busy}
+                  className="shrink-0"
+                >
+                  {running ? "Backing up…" : "Back up now"}
+                </Button>
+              </div>
+            ) : (
+              <p className="text-xs text-ink4">
+                Enter a passphrase under &ldquo;Backup passphrase&rdquo; above, then choose{" "}
+                <span className="font-medium">Save to Proton Drive</span> — or set up automatic
+                backups below.
+              </p>
+            )}
 
             <div>
               <p className="font-mono text-xs uppercase tracking-wide text-ink3">On Proton Drive</p>
@@ -1041,6 +1200,7 @@ export function BackupSettings() {
           </div>
         ) : (
           <div className="mt-2 flex max-w-sm flex-col gap-3">
+            {reconcileBanner("gdrive")}
             <div className="flex items-center justify-between gap-2 rounded-[var(--radius-sm)] border border-border2 bg-surface p-3">
               <div className="min-w-0">
                 <p className="text-sm text-st-quick">Connected</p>
@@ -1054,11 +1214,27 @@ export function BackupSettings() {
                 Disconnect
               </Button>
             </div>
-            <p className="text-xs text-ink4">
-              Enter a passphrase under &ldquo;Backup passphrase&rdquo; above, then choose{" "}
-              <span className="font-medium">Save to Google Drive</span> — or set up automatic
-              backups below.
-            </p>
+            {passphraseStored ? (
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-ink4">
+                  Backs up with your remembered passphrase and keeps the last {keepN}.
+                </p>
+                <Button
+                  variant="secondary"
+                  onClick={() => void doBackupNow("gdrive")}
+                  disabled={busy}
+                  className="shrink-0"
+                >
+                  {running ? "Backing up…" : "Back up now"}
+                </Button>
+              </div>
+            ) : (
+              <p className="text-xs text-ink4">
+                Enter a passphrase under &ldquo;Backup passphrase&rdquo; above, then choose{" "}
+                <span className="font-medium">Save to Google Drive</span> — or set up automatic
+                backups below.
+              </p>
+            )}
 
             <div>
               <p className="font-mono text-xs uppercase tracking-wide text-ink3">On Google Drive</p>

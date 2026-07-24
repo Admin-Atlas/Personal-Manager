@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.58.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "You can now back up on demand to a connected cloud, and PM helps keep that cloud tidy. On the Backup screen, each connected Proton Drive or Google Drive gets a \"Back up now\" button that uses your remembered passphrase and keeps only your most recent few backups (the keep-last-N you set) -- just like an automatic run, with no need to re-type the passphrase. And if a destination already holds more backups of this vault than your limit (say you had been saving manually for a while), PM shows a one-time note offering to either keep them all (raising the limit to match) or tidy up now by trashing the oldest down to your limit. It only ever counts and trims this vault's own backups, so a shared Drive folder is never touched by mistake, and nothing is hard-deleted -- trimmed backups go to the cloud's trash.",
+    ],
+  },
+  {
     version: "3.57.1-alpha",
     date: "2026-07-24",
     highlights: [

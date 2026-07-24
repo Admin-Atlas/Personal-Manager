@@ -7469,6 +7469,97 @@ pub(crate) async fn run_backup(
     }
 }
 
+/// Build a single backup destination from its stable kind ("proton" | "gdrive") — the same keys
+/// `BackupDestination::kind()` reports. Proton needs the located CLI; Google Drive needs the backup
+/// account's token key. Shared by the per-destination "Back up now" + reconciliation commands.
+fn backup_destination_for(
+    kind: &str,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<BackupDestination> {
+    match kind {
+        "proton" => Ok(BackupDestination::Proton {
+            cli: require_proton_cli(state)?,
+        }),
+        "gdrive" => Ok(BackupDestination::GoogleDrive {
+            token_key: gdrive_backup_token_key(app)?,
+        }),
+        other => Err(Error::Other(format!("unknown backup destination: {other}"))),
+    }
+}
+
+/// This vault's archive-name prefix (`pm-backup-<vaultId>-`), so a count/prune only ever considers
+/// archives THIS vault created — never another device/vault sharing the same account + folder.
+fn current_vault_prefix(app: &AppHandle) -> Result<String> {
+    let resolved = vault::resolve(app)?;
+    let meta = vault::load_meta(&resolved.vault_root)?
+        .ok_or_else(|| Error::Other("this vault has no metadata".into()))?;
+    Ok(crate::backup::naming::archive_prefix(&meta.vault_id))
+}
+
+/// The current keep-last-N retention, defaulting exactly like the scheduler and Settings UI.
+fn backup_retention_n(state: &AppState) -> Result<u32> {
+    use crate::backup::schedule::{BACKUP_RETENTION_KEY, DEFAULT_RETENTION_N};
+    let conn = state.conn()?;
+    Ok(crate::db::get_setting(&conn, BACKUP_RETENTION_KEY)?
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_RETENTION_N))
+}
+
+/// Back up this vault to ONE already-connected destination now, using the STORED passphrase and
+/// pruning to keep-last-N (like a scheduled run). `destination` is the stable kind ("proton" |
+/// "gdrive"). Distinct from `backup_to_proton`/`backup_to_gdrive` (typed passphrase, no prune) — this
+/// is the connected-panel "Back up now" that only appears once a passphrase is remembered.
+#[tauri::command]
+pub async fn backup_now(app: AppHandle, destination: String) -> Result<()> {
+    let pass = secrets::get_backup_passphrase()?.ok_or_else(|| {
+        Error::Other("turn on \"remember passphrase\" before using Back up now".into())
+    })?;
+    // Build the destination + read retention under a short-lived state guard, dropped before the
+    // long `run_backup` await so nothing non-Send is held across it.
+    let (dest, retention_n) = {
+        let state = app.state::<AppState>();
+        (
+            backup_destination_for(&destination, &state, &app)?,
+            backup_retention_n(&state)?,
+        )
+    };
+    run_backup(
+        &app,
+        pass.expose().to_string(),
+        vec![dest],
+        Some(retention_n),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// This vault's backup archive-name prefix (`pm-backup-<vaultId>-`), so the UI can tell THIS vault's
+/// archives apart from any other vault sharing the same account/folder when it counts them against
+/// keep-last-N for the reconciliation banner. Not sensitive — the same prefix already appears in
+/// every archive name shown in the restore list.
+#[tauri::command]
+pub fn backup_archive_prefix(app: AppHandle) -> Result<String> {
+    current_vault_prefix(&app)
+}
+
+/// Prune this vault's backups at a destination to keep-last-N now — the reconciliation banner's
+/// "delete oldest" action. Recoverable (Proton Trash / Drive trash), never a hard delete; only this
+/// vault's archives (by prefix) are considered. Returns how many were trimmed.
+#[tauri::command]
+pub async fn prune_own_backups(app: AppHandle, destination: String) -> Result<u32> {
+    let (dest, prefix, keep_n) = {
+        let state = app.state::<AppState>();
+        (
+            backup_destination_for(&destination, &state, &app)?,
+            current_vault_prefix(&app)?,
+            backup_retention_n(&state)?,
+        )
+    };
+    let trimmed = dest.apply_retention(keep_n as usize, &prefix).await?;
+    Ok(trimmed as u32)
+}
+
 /// Create an encrypted archive and push it to Proton Drive. Same portable format as a local
 /// backup; the temp file never leaves the machine unencrypted and is discarded after upload.
 #[tauri::command]
