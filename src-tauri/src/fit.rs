@@ -449,9 +449,10 @@ fn fit_within(spec: &ModelSpec, budget_gb: f64, hw: &FitHardware) -> FitResult {
 pub fn gpu_fit(spec: &ModelSpec, hw: &FitHardware, ram_fit: &FitResult) -> GpuFit {
     // VRAM is a slice of the same RAM pool → no distinct faster config. `unified_memory` covers Apple
     // Silicon AND non-Apple integrated GPUs (AMD APU / Intel iGPU), flagged by the hardware probe
-    // (#459: Windows by controller name, Linux AMD by PCI bus). What it deliberately does NOT change
-    // is bandwidth realism for the *single* config that fits a shared carve-out (still scored at GPU
-    // bandwidth) — that stays the v2 per-GPU calibration item.
+    // (#459: Windows by controller name, Linux AMD by PCI bus). It does NOT change bandwidth realism
+    // for the *single* config that fits a shared carve-out: that stays the flat GPU-bandwidth fallback.
+    // Per-GPU bandwidth calibration shipped (#467) but deliberately skips unified memory — an
+    // Apple/APU/iGPU probe name is generic, matches no entry, and resolves to the fallback anyway.
     if hw.unified_memory {
         return GpuFit::Single;
     }

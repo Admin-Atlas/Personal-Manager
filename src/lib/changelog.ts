@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.49.1-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "The hour gridlines in the week and day calendar views now render cleanly on Retina Macs. Some of the faint grey hour lines could previously come out uneven or drop out entirely there; PM now draws each as a crisp single-pixel line so they all show up. (Windows and Linux were unaffected.)",
+    ],
+  },
+  {
     version: "3.49.0-alpha",
     date: "2026-07-23",
     highlights: [
