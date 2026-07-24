@@ -13,10 +13,13 @@ import {
   clampSpanToRange,
   dayDiff,
   eventDaySpan,
+  isEventPast,
   isOverlayEvent,
   packBands,
+  PAST_EVENT_CLASS,
   type BandInput,
 } from "../../../lib/calendar-layout";
+import { cn } from "../../ui";
 
 interface Props {
   /** Band events only (multi-day, or single all-day) — the view pre-filters. */
@@ -31,6 +34,9 @@ interface Props {
   endGutterPx?: number;
   /** Depth gate for the "all-day" gutter label. */
   showLabel: boolean;
+  /** The ticking "now" (device-local) so a band whose last day is past greys back. Defaults to the
+   *  render-time clock for embeds that don't thread a tick. */
+  now?: Date;
   /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay bands only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
@@ -50,9 +56,11 @@ export function AllDayBand({
   gutterPx,
   endGutterPx = 0,
   showLabel,
+  now,
   onEventClick,
 }: Props) {
   const ndays = days.length;
+  const nowRef = now ?? new Date();
 
   const { placed, laneCount } = useMemo(() => {
     if (ndays === 0) return { placed: [] as (Placed & { lane: number })[], laneCount: 0 };
@@ -102,12 +110,15 @@ export function AllDayBand({
           const leftPct = (b.startDay / ndays) * 100;
           const widthPct = ((b.endDay - b.startDay + 1) / ndays) * 100;
           const clickable = isOverlayEvent(b.ev);
+          const past = isEventPast(b.ev, nowRef);
           return (
             <div
               key={b.ev.id}
-              className={`absolute overflow-hidden px-1.5 text-[11px] leading-[18px] ${
-                clickable ? "cursor-pointer hover:brightness-110" : ""
-              }`}
+              className={cn(
+                "absolute overflow-hidden px-1.5 text-[11px] leading-[18px]",
+                clickable && "cursor-pointer hover:brightness-110",
+                past && PAST_EVENT_CLASS,
+              )}
               style={{
                 top: `${b.lane * LANE_H}px`,
                 left: `${leftPct}%`,

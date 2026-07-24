@@ -15,7 +15,9 @@ import {
   dayKey,
   eventDaySpan,
   groupEventsFromDay,
+  isEventPast,
   isOverlayEvent,
+  PAST_EVENT_CLASS,
   startOfDay,
   weekdayShort,
 } from "../../../lib/calendar-layout";
@@ -30,6 +32,8 @@ interface Props {
   days?: Date[];
   /** Open-ended Agenda anchor: group events on/after this day, omitting empty days. Ignored if `days`. */
   fromDay?: Date;
+  /** The ticking "now" (device-local) so a past event greys back. Defaults to the render clock. */
+  now?: Date;
   /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay rows only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
@@ -49,9 +53,10 @@ function rowTime(ev: CalendarEvent, day: Date): string {
   return formatClock(start);
 }
 
-export function TerminalAgenda({ events, colorOf, days, fromDay, onEventClick }: Props) {
+export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventClick }: Props) {
   const { showPower } = useDepth();
   const bounded = !!(days && days.length > 0);
+  const nowDate = now ?? new Date();
 
   const rows = useMemo<DayRow[]>(() => {
     if (days && days.length > 0) {
@@ -81,7 +86,7 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, onEventClick }:
     );
   }
 
-  const todayKey = dayKey(startOfDay(new Date()));
+  const todayKey = dayKey(startOfDay(nowDate));
 
   return (
     <div className="flex-1 overflow-y-auto px-4 py-2 font-mono">
@@ -107,6 +112,7 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, onEventClick }:
                       className={cn(
                         "flex items-baseline gap-2 text-sm",
                         clickable && "cursor-pointer rounded-[var(--radius-sm)] hover:bg-surface",
+                        isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
                       )}
                       role={clickable ? "button" : undefined}
                       tabIndex={clickable ? 0 : undefined}

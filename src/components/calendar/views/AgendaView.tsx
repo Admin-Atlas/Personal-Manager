@@ -11,7 +11,9 @@ import { formatClockIso, formatDateLocal } from "../../../lib/format";
 import {
   dayKey,
   groupEventsFromDay,
+  isEventPast,
   isOverlayEvent,
+  PAST_EVENT_CLASS,
   startOfDay,
   weekdayShort,
 } from "../../../lib/calendar-layout";
@@ -24,6 +26,8 @@ interface Props {
   /** Show events on/after this day — including a multi-day event still running through it. */
   fromDay: Date;
   colorOf: (calendarId: string) => string;
+  /** The ticking "now" (device-local) so an earlier-today event greys back. Defaults to the render clock. */
+  now?: Date;
   /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay rows only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
@@ -33,8 +37,9 @@ function eventTime(ev: CalendarEvent): string {
   return ev.all_day ? "all-day" : formatClockIso(ev.start);
 }
 
-export function AgendaView({ events, fromDay, colorOf, onEventClick }: Props) {
+export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Props) {
   const { showMeta, showPower } = useDepth();
+  const nowDate = now ?? new Date();
 
   const groups = useMemo(() => groupEventsFromDay(events, fromDay), [events, fromDay]);
 
@@ -46,7 +51,7 @@ export function AgendaView({ events, fromDay, colorOf, onEventClick }: Props) {
     );
   }
 
-  const todayKey = dayKey(startOfDay(new Date()));
+  const todayKey = dayKey(startOfDay(nowDate));
 
   return (
     <div className="flex-1 overflow-y-auto px-4 py-2">
@@ -82,6 +87,7 @@ export function AgendaView({ events, fromDay, colorOf, onEventClick }: Props) {
                     className={cn(
                       "flex items-baseline gap-3 border-l-[3px] py-0.5 pl-2.5",
                       clickable && "cursor-pointer rounded-[var(--radius-sm)] hover:bg-surface",
+                      isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
                     )}
                     style={{ borderLeftColor: colorOf(ev.calendar_id) }}
                     role={clickable ? "button" : undefined}

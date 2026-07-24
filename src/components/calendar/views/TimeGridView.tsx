@@ -18,6 +18,7 @@ import {
   assignColumns,
   dayKey,
   eventDaySpan,
+  isEventPast,
   isMultiDay,
   minutesFromLocalMidnight,
   parseLocal,
@@ -50,6 +51,9 @@ interface Props {
   /** When false, hides the add-zone control — for a compact embed (the Focus Upcoming grid) that runs
    *  with no extra zones and has no room for them. Defaults to true. */
   allowZones?: boolean;
+  /** The ticking "now" (device-local) so past events grey and the now-line tracks the minute. Defaults
+   *  to the render-time clock for embeds that don't thread a tick. */
+  now?: Date;
   /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay bands only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
@@ -105,9 +109,11 @@ export function TimeGridView({
   zones,
   onZonesChange,
   allowZones = true,
+  now,
   onEventClick,
 }: Props) {
   const { minimal, showPower } = useDepth();
+  const nowDate = now ?? new Date();
   // Derived from the framed window: scroll to its start on mount, stretch rows so the window fills
   // the body exactly. The grid itself always spans the full 24h; scrolling reaches the rest.
   const windowHours = Math.max(bounds.endHour - bounds.startHour, MIN_WINDOW);
@@ -239,7 +245,7 @@ export function TimeGridView({
     scrolledKeyRef.current = scrollKey;
   }, [scrollKey, scrollHour, rowH, bodyHeight]);
 
-  const nowMin = minutesFromLocalMidnight(new Date());
+  const nowMin = minutesFromLocalMidnight(nowDate);
   // Hour rules as one crisp 1px line per hour, each snapped to a whole pixel so it lands on the
   // device-pixel grid and renders identically. A repeating-linear-gradient at a fractional rowH
   // period aliased them on WebKit at high DPR (Retina macOS) — uneven, some missing — while Blink
@@ -259,7 +265,15 @@ export function TimeGridView({
           allowAdd={allowZones}
         />
         {columns.map((c) => (
-          <div key={dayKey(c.day)} className="flex-1 border-l border-rule px-2 py-1 text-center">
+          <div
+            key={dayKey(c.day)}
+            className={cn(
+              "flex-1 border-l px-2 py-1 text-center",
+              // Today's column carries the accent-soft wash below; use the heavier neutral rule so the
+              // divider doesn't vanish into it on low-chroma accents (mono/Eigengrau) in slate/editorial.
+              c.isToday ? "border-border" : "border-rule",
+            )}
+          >
             <div
               className={cn(
                 "font-head text-xs uppercase tracking-wide",
@@ -283,6 +297,7 @@ export function TimeGridView({
         gutterPx={gutterPx}
         endGutterPx={scrollbarW}
         showLabel={!minimal}
+        now={nowDate}
         onEventClick={onEventClick}
       />
 
@@ -326,14 +341,21 @@ export function TimeGridView({
           {columns.map((c) => (
             <div
               key={dayKey(c.day)}
-              className={cn("relative flex-1 border-l border-rule", c.isToday && "bg-accent-soft")}
+              className={cn(
+                "relative flex-1 border-l",
+                c.isToday ? "border-border bg-accent-soft" : "border-rule",
+              )}
             >
               {/* Hour rules — one crisp 1px line per hour, painted under the cards so today's tint
-                  shows through. Explicit divs (not a repeating gradient) stay crisp at any rowH. */}
+                  shows through. Explicit divs (not a repeating gradient) stay crisp at any rowH. On
+                  today's column the tint would swallow the light --rule, so use the heavier --border. */}
               {hourTops.map((top, h) => (
                 <div
                   key={h}
-                  className="pointer-events-none absolute inset-x-0 border-t border-rule"
+                  className={cn(
+                    "pointer-events-none absolute inset-x-0 border-t",
+                    c.isToday ? "border-border" : "border-rule",
+                  )}
                   style={{ top }}
                 />
               ))}
@@ -350,6 +372,7 @@ export function TimeGridView({
                   widthPct={card.widthPct}
                   showTime={!minimal}
                   showLocation={showPower}
+                  isPast={isEventPast(card.ev, nowDate)}
                 />
               ))}
               {c.isToday && <NowLine topPx={(nowMin / 60) * rowH} />}

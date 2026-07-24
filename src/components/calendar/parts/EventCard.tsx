@@ -2,11 +2,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // One timed event in the pixel time-grid (Week/Day). Absolutely positioned by the geometry the view
-// computes from calendar-layout; the card itself only paints. Surface + border are tokens; the single
-// per-source colour is the left rule (the same move as the agenda row), passed in — never a hex here.
-// Meta reveals with depth AND available height (a 20px sliver has no room for a time line).
+// computes from calendar-layout; the card itself only paints. The fill is a shade of the event's own
+// source colour mixed into the surface via color-mix (token-safe — no source hex written here), so a
+// timed block reads as its calendar's colour like the all-day bands do, instead of a flat neutral that
+// vanished into the grid. Opaque-over-surface (not …, transparent) on purpose: timed cards overlap and
+// sit over the today-column tint, where a translucent fill goes muddy. Meta reveals with depth AND
+// available height (a 20px sliver has no room for a time line); a past event is greyed via isPast.
 
 import type { CSSProperties } from "react";
+import { cn } from "../../ui";
+import { PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
 
 interface Props {
   summary: string;
@@ -24,6 +29,8 @@ interface Props {
   showTime: boolean;
   /** Depth gate for the location line (Power, and only on tall cards). */
   showLocation: boolean;
+  /** The event has fully passed — grey it back so what's done recedes. */
+  isPast?: boolean;
 }
 
 // Height thresholds below which a line has no room — keep them out of the render so a squeezed card
@@ -42,6 +49,7 @@ export function EventCard({
   widthPct,
   showTime,
   showLocation,
+  isPast,
 }: Props) {
   const style: CSSProperties = {
     top: `${topPx}px`,
@@ -49,6 +57,7 @@ export function EventCard({
     left: `calc(${leftPct}% + 1px)`,
     width: `calc(${widthPct}% - 2px)`,
     borderLeftColor: color,
+    background: `color-mix(in oklab, ${color} 18%, var(--surface))`,
   };
   const withTime = showTime && heightPx >= TIME_MIN_H;
   const withLoc = showLocation && !!location && heightPx >= LOC_MIN_H;
@@ -58,7 +67,10 @@ export function EventCard({
 
   return (
     <div
-      className="absolute overflow-hidden rounded-[var(--radius-sm)] border border-border border-l-[3px] bg-surface px-1.5 py-0.5"
+      className={cn(
+        "absolute overflow-hidden rounded-[var(--radius-sm)] border border-border border-l-[3px] px-1.5 py-0.5",
+        isPast && PAST_EVENT_CLASS,
+      )}
       style={style}
       title={summary}
       aria-label={ariaLabel}
