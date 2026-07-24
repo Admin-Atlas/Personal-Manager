@@ -5877,6 +5877,50 @@ pub async fn parse_preference_statement(
     Ok(draft)
 }
 
+/// Import a memory/preferences export pasted from another AI (ChatGPT / Gemini / Claude): distil it
+/// into structured records and stage each as an UNCONFIRMED, `imported`-sourced preference the user
+/// reviews and keeps in Teach -> Preferences (withheld from live prompts until kept). The pasted text
+/// is untrusted DATA (the distil prompt hardens this). Returns how many NEW records were staged (dedup
+/// skips ones already present). Distillation yields global/context records only, so there is no project
+/// to resolve — this is general "how I like things", not PM-project-specific.
+#[tauri::command]
+pub async fn import_ai_memory(app: AppHandle, text: String) -> Result<usize> {
+    // Bound the paste so a huge export can't balloon the model call.
+    const MAX_IMPORT_CHARS: usize = 20_000;
+    let text: String = text.trim().chars().take(MAX_IMPORT_CHARS).collect();
+    if text.is_empty() {
+        return Err(Error::Other("paste your exported memory first".into()));
+    }
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+        return Err(Error::Other(llm_gateway::no_provider_message()));
+    };
+    let drafts = preferences::distill_blob(&app, &plan, &text).await?;
+
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    let tx = conn.unchecked_transaction()?;
+    let mut imported = 0usize;
+    for d in &drafts {
+        // distill_blob emits only global/context records (no project scope), so entity_id is None.
+        if preferences::pref_exists(&tx, &d.scope, None, d.condition.as_deref(), &d.value)? {
+            continue;
+        }
+        preferences::add_preference(
+            &tx,
+            &d.scope,
+            None,
+            d.condition.as_deref(),
+            &d.value,
+            preferences::SOURCE_IMPORTED,
+            preferences::inferred_seed_confidence(),
+            false,
+        )?;
+        imported += 1;
+    }
+    tx.commit()?;
+    Ok(imported)
+}
+
 // --- daily briefing (Step 7, spec §4 P1) ---
 
 /// The stored "here's your picture today" briefing + whether it's due a refresh, for

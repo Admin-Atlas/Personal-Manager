@@ -415,6 +415,10 @@ export const deletePreference = (id: number) => invoke<void>("delete_preference"
 export const parsePreferenceStatement = (text: string) =>
   invoke<DraftPreference>("parse_preference_statement", { text });
 
+/** Import a memory/preferences export pasted from another AI: distils it into unconfirmed "imported"
+ *  preferences the user reviews and keeps in Teach. Returns how many NEW records were staged. */
+export const importAiMemory = (text: string) => invoke<number>("import_ai_memory", { text });
+
 export const listConversations = () => invoke<Conversation[]>("list_conversations");
 
 /** Start a conversation, optionally scoped to a project (Step 5) so its chat

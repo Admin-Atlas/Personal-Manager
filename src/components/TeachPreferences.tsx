@@ -208,7 +208,9 @@ function PreferenceRow({
   // records and ones PM noticed you state in chat (source "chat", card 7F) surface this way; a chat
   // one gets its own origin label so it's clear where the suggestion came from.
   const fromChat = pref.source === "chat";
-  const unconfirmed = (pref.source === "inferred" || fromChat) && !pref.user_confirmed;
+  const fromImported = pref.source === "imported";
+  const unconfirmed =
+    (pref.source === "inferred" || fromChat || fromImported) && !pref.user_confirmed;
   const { devMode } = useDevMode();
 
   return (
@@ -224,10 +226,12 @@ function PreferenceRow({
                 title={
                   fromChat
                     ? "PM noticed you said this in chat — keep it if it's right."
-                    : "PM carried this over from your earlier profile — keep it if it's right."
+                    : fromImported
+                      ? "Imported from another AI's memory — keep it if it's right."
+                      : "PM carried this over from your earlier profile — keep it if it's right."
                 }
               >
-                {fromChat ? "Suggested from chat" : "Suggested"}
+                {fromChat ? "Suggested from chat" : fromImported ? "Imported" : "Suggested"}
               </span>
             )}
             {showPower && (

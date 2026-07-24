@@ -9,6 +9,7 @@ import {
   getSettings,
   hasOpenRouterBackgroundKey,
   hasOpenRouterKey,
+  importAiMemory,
   refreshPricing,
   setBackgroundAutoSwitch,
   setBackgroundModels,
@@ -20,7 +21,7 @@ import {
 } from "../../lib/ipc";
 import type { CostSummary, Settings } from "../../lib/types";
 import { ModelListEditor } from "../ModelListEditor";
-import { Button, Input, SectionInfo, Toggle } from "../ui";
+import { Button, Input, SectionInfo, Textarea, Toggle } from "../ui";
 import { TabResetSection } from "./ResetControls";
 import { readReviewAiEnabled, writeReviewAiEnabled } from "../../lib/reviewPrefs";
 
@@ -37,11 +38,25 @@ function fmtUsd(v: number | null): string {
   return v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
 }
 
+/** The copy-paste prompt handed to another AI to produce a clean, importable memory export. Kept
+ *  factual + durable, and explicitly excludes anything sensitive. */
+const IMPORT_PROMPT =
+  "Summarise everything you know about me and how I like to work, communicate, and organise things " +
+  "as a plain list of short factual statements, one per line. Include only durable preferences and " +
+  "facts about me — not our conversation, and nothing sensitive like passwords, financial details, " +
+  "or health information.";
+
 /** The AI & Models Settings tab. Self-contained and immediate-save: model lists and auto-switch
  *  persist the moment you change them; the API keys save when you click away from the field, with a
  *  green confirmation. Errors surface inline. Onboarding has its own key + model inputs (they share a
- *  Get-started button there) — this is the non-onboarding tab. */
-export function AiModelsSettings() {
+ *  Get-started button there) — this is the non-onboarding tab. `onOpenTeach` opens the Teach tab so
+ *  the user can review freshly-imported preferences. */
+export function AiModelsSettings({ onOpenTeach }: { onOpenTeach?: () => void }) {
+  const [memoryText, setMemoryText] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<string | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [promptCopied, setPromptCopied] = useState(false);
   const [key, setKey] = useState("");
   const [bgKey, setBgKey] = useState("");
   const [keyAlreadySet, setKeyAlreadySet] = useState(false);
@@ -162,6 +177,33 @@ export function AiModelsSettings() {
   function changeReviewAi(on: boolean) {
     setReviewAi(on);
     writeReviewAiEnabled(on); // shared with the Review tab's "Turn on AI" banner
+  }
+
+  function copyPrompt() {
+    void navigator.clipboard?.writeText(IMPORT_PROMPT).then(() => {
+      setPromptCopied(true);
+      setTimeout(() => setPromptCopied(false), 1500);
+    });
+  }
+
+  async function doImportMemory() {
+    if (!memoryText.trim() || importing) return;
+    setImporting(true);
+    setImportResult(null);
+    setImportError(null);
+    try {
+      const n = await importAiMemory(memoryText);
+      setImportResult(
+        n === 0
+          ? "No new preferences found — anything importable was already saved."
+          : `${n} preference${n === 1 ? "" : "s"} imported. Review and keep them in Teach.`,
+      );
+      setMemoryText("");
+    } catch (e) {
+      setImportError(String(e));
+    } finally {
+      setImporting(false);
+    }
   }
 
   async function refreshPrices() {
@@ -309,6 +351,57 @@ export function AiModelsSettings() {
             onChange={changeReviewAi}
             ariaLabel="AI filing suggestions in Review"
           />
+        </div>
+      </div>
+
+      <div id="sec-ai-memory" data-settings-section className="mt-5 border-t border-border pt-4">
+        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+          Import AI memory
+        </label>
+        <p className="mt-1 text-xs text-ink4">
+          Bringing preferences over from ChatGPT, Gemini or Claude? Copy the prompt below, run it in
+          that AI, then paste its reply here. PM turns it into preference records you review and
+          keep in Teach — nothing takes effect until you keep it. Uses the background model above.
+        </p>
+
+        <div className="mt-3 rounded-[var(--radius-sm)] border border-border2 bg-surface p-2">
+          <div className="flex items-start justify-between gap-2">
+            <p className="min-w-0 flex-1 text-xs text-ink3">{IMPORT_PROMPT}</p>
+            <Button variant="tertiary" className="shrink-0 text-xs" onClick={copyPrompt}>
+              {promptCopied ? "Copied ✓" : "Copy"}
+            </Button>
+          </div>
+        </div>
+
+        <Textarea
+          className="mt-2 h-28 w-full text-xs"
+          placeholder="Paste the AI's reply here…"
+          value={memoryText}
+          onChange={(e) => setMemoryText(e.currentTarget.value)}
+        />
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => void doImportMemory()}
+            disabled={importing || !memoryText.trim()}
+          >
+            {importing ? "Importing…" : "Import"}
+          </Button>
+          {importError && <span className="text-xs text-st-due">{importError}</span>}
+          {importResult && (
+            <span className="flex items-center gap-1.5 text-xs text-ink3">
+              {importResult}
+              {onOpenTeach && (
+                <button
+                  type="button"
+                  onClick={onOpenTeach}
+                  className="text-accent-text hover:brightness-110"
+                >
+                  Open Teach →
+                </button>
+              )}
+            </span>
+          )}
         </div>
       </div>
 
