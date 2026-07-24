@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { commitReview, listProjects, proposeMetadata, reviewQueue } from "../lib/ipc";
+import {
+  aiProviderStatus,
+  commitReview,
+  listProjects,
+  proposeMetadata,
+  reviewQueue,
+} from "../lib/ipc";
 import type { Document, Importance, MetadataProposal, ReviewDecision } from "../lib/types";
 import { formatDate } from "../lib/format";
 import { useDepth } from "../theme";
@@ -12,10 +18,13 @@ import { TagEditor } from "./TagEditor";
 import { ChatBadge } from "./ChatBadge";
 import { rankImportance } from "../lib/importance";
 import { useReader } from "../lib/reader";
+import { readReviewAiEnabled, writeReviewAiEnabled } from "../lib/reviewPrefs";
 
 interface Props {
   /** Called after the queue changes so the parent can refresh the sidebar badge. */
   onChanged: () => void;
+  /** Open the Settings dialog — the "Turn on AI"/"fix it" affordances point at AI & Models. */
+  onOpenSettings: () => void;
 }
 
 interface Edit {
@@ -33,7 +42,7 @@ const PROJECTS_LIST_ID = "review-projects";
 const proposalCache = new Map<number, MetadataProposal>();
 const editCache = new Map<number, Edit>();
 
-export function ReviewView({ onChanged }: Props) {
+export function ReviewView({ onChanged, onOpenSettings }: Props) {
   const [queue, setQueue] = useState<Document[]>([]);
   const [proposals, setProposals] = useState<Record<number, MetadataProposal>>({});
   const [edits, setEdits] = useState<Record<number, Edit>>({});
@@ -45,6 +54,12 @@ export function ReviewView({ onChanged }: Props) {
   // the whole queue.
   const [committingIds, setCommittingIds] = useState<Set<number>>(new Set());
   const [showAutofiled, setShowAutofiled] = useState(false);
+  // Whether Review asks the model for suggestions (default off — the AI is an enhancement, not a
+  // requirement). The banner nudges the user to turn it on; the Settings → AI & Models toggle mirrors it.
+  const [aiEnabled, setAiEnabled] = useState(readReviewAiEnabled);
+  // When suggestions are ON but couldn't run, the plain-language reason (no model linked, no credits,
+  // an unreachable local endpoint …) so the user can fix it — shown as a calm note, never a red error.
+  const [aiError, setAiError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Rows the user has hand-edited; a late streaming proposal must not overwrite
   // them. Reset at the start of each proposal run (including Re-propose).
@@ -86,7 +101,8 @@ export function ReviewView({ onChanged }: Props) {
       // Only ask the model for documents we don't already have a proposal for — so peeking at the
       // tab (or a few new items arriving) never re-runs proposals the model already produced.
       const missing = q.filter((d) => !proposalCache.has(d.id)).map((d) => d.id);
-      if (missing.length > 0) await runProposals(missing);
+      // Only ask the model when suggestions are turned on — otherwise the user files these by hand.
+      if (missing.length > 0 && readReviewAiEnabled()) await runProposals(missing);
     } catch (e) {
       setError(String(e));
     }
@@ -108,8 +124,18 @@ export function ReviewView({ onChanged }: Props) {
     const myRun = ++runRef.current;
     setProposing(true);
     setError(null);
+    setAiError(null);
     dirtyRef.current = new Set();
     try {
+      // Suggestions are on, but they need a working model. No provider linked, or a live failure
+      // (no credits, an unreachable local endpoint, a rejected key) becomes a calm "here's why — file
+      // by hand" note rather than a red error, and never blocks manual filing.
+      const status = await aiProviderStatus();
+      if (runRef.current !== myRun) return;
+      if (!status.has_cloud_key && !status.local_configured) {
+        setAiError("no AI model is linked yet");
+        return;
+      }
       await proposeMetadata((event) => {
         if (runRef.current !== myRun) return; // superseded run or unmounted
         if (event.type !== "proposed") return;
@@ -127,10 +153,19 @@ export function ReviewView({ onChanged }: Props) {
         setEdits((prev) => ({ ...prev, [document_id]: edit }));
       }, ids);
     } catch (e) {
-      if (runRef.current === myRun) setError(String(e));
+      if (runRef.current === myRun) setAiError(String(e));
     } finally {
       if (runRef.current === myRun) setProposing(false);
     }
+  }
+
+  // Turn suggestions on from the banner: remember the choice, then propose for everything still
+  // un-suggested. If a model isn't set up yet, runProposals surfaces the reason as a calm note.
+  function enableAi() {
+    writeReviewAiEnabled(true);
+    setAiEnabled(true);
+    const missing = queue.filter((d) => !proposalCache.has(d.id)).map((d) => d.id);
+    void runProposals(missing);
   }
 
   function updateEdit(id: number, patch: Partial<Edit>) {
@@ -250,7 +285,9 @@ export function ReviewView({ onChanged }: Props) {
           <Button
             variant="tertiary"
             onClick={repropose}
-            disabled={proposing || committing || committingIds.size > 0 || queue.length === 0}
+            disabled={
+              proposing || committing || committingIds.size > 0 || queue.length === 0 || !aiEnabled
+            }
             data-help="review-repropose"
             title="Re-run the AI proposals"
           >
@@ -281,6 +318,35 @@ export function ReviewView({ onChanged }: Props) {
             </div>
           )}
 
+          {/* Suggestions off (the fresh-install default): nudge to turn them on — a big help when
+              importing a lot — while manual filing stays fully available. */}
+          {queue.length > 0 && !aiEnabled && (
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-border bg-panel px-3 py-2.5 text-sm text-ink3">
+              <p className="min-w-0 flex-1">
+                Turn on AI suggestions to have PM propose a project, tags and importance for each
+                item — a real help when you're importing a lot. You can always set them yourself and
+                Approve.
+              </p>
+              <Button variant="secondary" onClick={enableAi} className="shrink-0">
+                Turn on AI
+              </Button>
+            </div>
+          )}
+
+          {/* Suggestions on but no model could run: name the reason so the user can debug (no credits,
+              no model linked, endpoint down, …) and point them at Settings — filing by hand still works. */}
+          {queue.length > 0 && aiEnabled && aiError && (
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-border bg-panel px-3 py-2.5 text-sm text-ink3">
+              <p className="min-w-0 flex-1">
+                No AI available right now — continue by hand.{" "}
+                <span className="text-ink4">(The reason: {aiError}.)</span>
+              </p>
+              <Button variant="tertiary" onClick={onOpenSettings} className="shrink-0">
+                Open Settings
+              </Button>
+            </div>
+          )}
+
           {queue.length === 0 ? (
             <p className="text-sm text-ink4">
               Every document is sorted. New items appear here after you ingest them.
@@ -301,7 +367,10 @@ export function ReviewView({ onChanged }: Props) {
                     proposal={proposals[doc.id]}
                     edit={edits[doc.id]}
                     committing={committingIds.has(doc.id)}
-                    disabled={proposing || committing || committingIds.has(doc.id)}
+                    disabled={
+                      committing || committingIds.has(doc.id) || (proposing && !proposals[doc.id])
+                    }
+                    noSuggestions={!aiEnabled || !!aiError}
                     onChange={(patch) => updateEdit(doc.id, patch)}
                     onApprove={() => void commitOne(doc)}
                   />
@@ -326,7 +395,12 @@ export function ReviewView({ onChanged }: Props) {
                           proposal={proposals[doc.id]}
                           edit={edits[doc.id]}
                           committing={committingIds.has(doc.id)}
-                          disabled={proposing || committing || committingIds.has(doc.id)}
+                          disabled={
+                            committing ||
+                            committingIds.has(doc.id) ||
+                            (proposing && !proposals[doc.id])
+                          }
+                          noSuggestions={!aiEnabled || !!aiError}
                           onChange={(patch) => updateEdit(doc.id, patch)}
                           onApprove={() => void commitOne(doc)}
                         />
@@ -349,6 +423,7 @@ function ReviewRow({
   edit,
   committing,
   disabled,
+  noSuggestions,
   onChange,
   onApprove,
 }: {
@@ -357,8 +432,11 @@ function ReviewRow({
   edit?: Edit;
   /** This row is being filed by its own Approve button (drives its "Saving…" label). */
   committing: boolean;
-  /** Approve is unavailable (proposals still streaming, or a commit is in flight). */
+  /** Approve is unavailable — this row's own proposal is still streaming, or a commit is in flight.
+   *  A row becomes approvable the moment ITS proposal lands, not when the whole batch finishes. */
   disabled: boolean;
+  /** No suggestion is coming (AI off, or it failed) — prompt the user to fill the fields in. */
+  noSuggestions: boolean;
   onChange: (patch: Partial<Edit>) => void;
   /** File just this document with the values shown, leaving the rest of the queue. */
   onApprove: () => void;
@@ -397,6 +475,10 @@ function ReviewRow({
         </div>
         {proposal?.reasoning ? (
           <p className="mt-1 text-xs text-ink3">{proposal.reasoning}</p>
+        ) : noSuggestions ? (
+          <p className="mt-1 text-xs text-ink4">
+            No AI suggestion — set the project, importance and tags below.
+          </p>
         ) : (
           <p className="mt-1 text-xs text-ink4">Awaiting proposal…</p>
         )}

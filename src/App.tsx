@@ -877,7 +877,10 @@ export default function App() {
               </main>
             ) : view === "review" ? (
               <main className="flex h-full flex-1 flex-col">
-                <ReviewView onChanged={refreshReviewCount} />
+                <ReviewView
+                  onChanged={refreshReviewCount}
+                  onOpenSettings={() => setShowSettings(true)}
+                />
               </main>
             ) : view === "teach" ? (
               <main className="flex h-full flex-1 flex-col">
