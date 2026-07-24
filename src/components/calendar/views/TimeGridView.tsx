@@ -47,6 +47,9 @@ interface Props {
   zones: string[];
   /** Add/remove an extra gutter zone — the corner control lives in the header row's gutter cell. */
   onZonesChange: (zones: string[]) => void;
+  /** When false, hides the add-zone control — for a compact embed (the Focus Upcoming grid) that runs
+   *  with no extra zones and has no room for them. Defaults to true. */
+  allowZones?: boolean;
   /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay bands only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
@@ -101,6 +104,7 @@ export function TimeGridView({
   bounds,
   zones,
   onZonesChange,
+  allowZones = true,
   onEventClick,
 }: Props) {
   const { minimal, showPower } = useDepth();
@@ -252,6 +256,7 @@ export function TimeGridView({
           onChange={onZonesChange}
           zoneCol={ZONE_COL}
           localCol={LOCAL_COL}
+          allowAdd={allowZones}
         />
         {columns.map((c) => (
           <div key={dayKey(c.day)} className="flex-1 border-l border-rule px-2 py-1 text-center">

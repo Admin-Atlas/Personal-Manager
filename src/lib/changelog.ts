@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.53.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "The Focus tab's “Upcoming” box can now show a short day-by-day calendar instead of a plain list. Switch between List and Days from the toggle at the top of the box (or under Settings → General → Focus). The Days view shows up to four days side by side as an hour grid — with the same Work / Day / 24h hour options as the calendar — and the ‹ › arrows step it a day forward or back, with a Today chip to jump straight back. It opens on today and stays where you leave it while you're on the tab. List stays the default.",
+    ],
+  },
+  {
     version: "3.52.2-alpha",
     date: "2026-07-24",
     highlights: [
