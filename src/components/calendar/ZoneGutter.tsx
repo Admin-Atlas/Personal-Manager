@@ -24,10 +24,13 @@ interface Props {
   /** Column widths (px), matching the body gutter so each header sits over its own hour-label column. */
   zoneCol: number;
   localCol: number;
+  /** When false, the add-zone control is hidden — for a compact embed (the Focus Upcoming grid) that
+   *  has no room for extra zone columns and always runs with `zones = []`. Defaults to true. */
+  allowAdd?: boolean;
 }
 
 /** The corner add/remove strip. Width mirrors the body gutter (local + one column per extra zone). */
-export function ZoneGutter({ zones, onChange, zoneCol, localCol }: Props) {
+export function ZoneGutter({ zones, onChange, zoneCol, localCol, allowAdd = true }: Props) {
   const atCap = zones.length >= MAX_EXTRA_ZONES;
   const width = localCol + zones.length * zoneCol;
 
@@ -56,7 +59,9 @@ export function ZoneGutter({ zones, onChange, zoneCol, localCol }: Props) {
         className="flex items-end justify-end gap-1 px-1 pb-0.5"
         style={{ width: `${localCol}px` }}
       >
-        {!atCap && <AddZone zones={zones} onChange={onChange} compact={zones.length > 0} />}
+        {allowAdd && !atCap && (
+          <AddZone zones={zones} onChange={onChange} compact={zones.length > 0} />
+        )}
         {zones.length > 0 && (
           <span
             className="truncate font-mono text-[9px] uppercase tracking-tight text-ink4"

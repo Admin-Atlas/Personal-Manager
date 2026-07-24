@@ -60,6 +60,16 @@ export function formatClockIso(iso: string): string {
   return formatClock(new Date(iso));
 }
 
+/** A short "when" for a calendar event — a bare date for all-day, date + time otherwise. Shared by the
+ *  Focus agenda list and the per-project card so the two read identically. All-day events carry a bare
+ *  date, formatted from its own calendar day so it can't shift a day in a UTC-negative zone (F-14). */
+export function formatEventWhen(start: string, allDay?: boolean): string {
+  const d = new Date(start);
+  if (Number.isNaN(d.getTime())) return start.slice(0, 16);
+  if (allDay || !start.includes("T")) return formatDateOnly(start);
+  return `${formatDate(start)} ${formatClock(d)}`;
+}
+
 /**
  * Format an ISO timestamp as the same DD-MM(-YYYY) date plus a locale time
  * (hour:minute). Leaves an unparseable value as-is.

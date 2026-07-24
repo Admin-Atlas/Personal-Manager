@@ -17,6 +17,7 @@ import {
   syncCalendar,
 } from "../lib/ipc";
 import { MilestoneList } from "./MilestoneList";
+import { FocusUpcoming } from "./FocusUpcoming";
 import type {
   AgendaEvent,
   DailyBriefing,
@@ -27,7 +28,7 @@ import type {
   ProjectSize,
   ProjectStatus,
 } from "../lib/types";
-import { formatClock, formatDate, formatDateOnly } from "../lib/format";
+import { formatDate, formatDateOnly, formatEventWhen } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
 import { rankImportance } from "../lib/importance";
 import { Button, Card, Input, Skeleton, StatusBadge, Select, SegmentedControl } from "./ui";
@@ -147,6 +148,8 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   /** Focus-agenda events (empty when not connected). Includes events that ended earlier today, tagged
    *  `ended` — the Agenda greys those rather than hiding them. */
   const [events, setEvents] = useState<AgendaEvent[]>(() => cachedEvents);
+  /** Connected-calendar ids, for colouring the Upcoming grid's events (Week display mode). */
+  const [calendarIds, setCalendarIds] = useState<string[]>([]);
   /** The daily briefing (Step 7); null until loaded, then refreshed when stale. */
   const [briefing, setBriefing] = useState<DailyBriefing | null>(() => cachedBriefing);
   const [briefingBusy, setBriefingBusy] = useState(false);
@@ -229,6 +232,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     void (async () => {
       try {
         const overview = await calendarOverview();
+        if (aliveRef.current) setCalendarIds(overview.calendars.map((c) => c.id));
         if (overview.accounts.length > 0) {
           await syncCalendar().catch(() => {});
           const evts = await listCalendarEvents();
@@ -290,7 +294,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
       {!loading && projects.length > 0 && (
         <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
       )}
-      {events.length > 0 && <Agenda events={events} />}
+      {events.length > 0 && <FocusUpcoming listEvents={events} calendarIds={calendarIds} />}
     </>
   );
   const projectList = loading ? (
@@ -942,48 +946,4 @@ function ConfirmRow({
       </span>
     </div>
   );
-}
-
-/** The "Upcoming" agenda — the next handful of events from connected calendars. An event that already
- *  ended today stays listed (a real day stays visible until its own midnight) but greyed. */
-function Agenda({ events }: { events: AgendaEvent[] }) {
-  const shown = events.slice(0, 8);
-  return (
-    <Card className="mb-5 px-4 py-3" data-help="focus-agenda">
-      <h2 className="mb-2 font-mono text-xs font-semibold uppercase tracking-wide text-ink3">
-        Upcoming
-      </h2>
-      <ul className="flex flex-col gap-1.5">
-        {shown.map((e) => (
-          <li
-            key={e.id}
-            className={`flex items-baseline gap-3 text-sm${e.ended ? " opacity-45" : ""}`}
-          >
-            <span className="w-32 shrink-0 font-mono text-xs text-ink3">
-              {formatEventWhen(e.start, e.all_day)}
-            </span>
-            <span className="truncate text-ink2">{e.summary}</span>
-            {e.location && <span className="truncate text-xs text-ink4">{e.location}</span>}
-            {e.ended && <span className="shrink-0 text-xs text-ink4">ended</span>}
-          </li>
-        ))}
-      </ul>
-      {events.length > shown.length && (
-        <p className="mt-2 text-xs text-ink4">+{events.length - shown.length} more</p>
-      )}
-    </Card>
-  );
-}
-
-/** A short "when" for a calendar event — date for all-day, date + time otherwise. */
-function formatEventWhen(start: string, allDay?: boolean): string {
-  const d = new Date(start);
-  if (Number.isNaN(d.getTime())) return start.slice(0, 16);
-  // All-day events carry a bare date — format from its own calendar day so it can't shift a day in a
-  // UTC-negative zone (F-14). A timed event keeps the timezone-aware local date + clock.
-  if (allDay || !start.includes("T")) return formatDateOnly(start);
-  // The clock goes through `format.ts` like every other surface. Hand-rolling it here meant this tab
-  // used `hour: "numeric"` while the shared helper uses `"2-digit"` — so the same 9am event read
-  // "9:05" on Focus and "09:05" everywhere else, for no reason anyone chose.
-  return `${formatDate(start)} ${formatClock(d)}`;
 }

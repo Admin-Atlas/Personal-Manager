@@ -21,7 +21,22 @@ import {
   readMapMode,
   type MapLayoutMode,
 } from "../../lib/mapPrefs";
-import { readFocusLayout, writeFocusLayout, type FocusLayout } from "../../lib/focusPrefs";
+import {
+  clampFocusUpcomingDays,
+  FOCUS_UPCOMING_MAX_DAYS,
+  FOCUS_UPCOMING_MIN_DAYS,
+  readFocusLayout,
+  readFocusUpcomingDays,
+  readFocusUpcomingMode,
+  readFocusUpcomingRange,
+  writeFocusLayout,
+  writeFocusUpcomingDays,
+  writeFocusUpcomingMode,
+  writeFocusUpcomingRange,
+  type FocusLayout,
+  type FocusUpcomingMode,
+} from "../../lib/focusPrefs";
+import type { CalendarRange } from "../../lib/calendarPrefs";
 import { readConfirmDelete, writeConfirmDelete } from "../../lib/pinboard/prefs";
 import {
   ACCENTS,
@@ -71,6 +86,15 @@ export function GeneralSettings() {
   // The Focus tab's default layout (split | stacked). Shared with the Focus header toggle; this is the
   // only other writer, seeded from localStorage like confirmDelete above.
   const [focusLayout, setFocusLayout] = useState<FocusLayout>(readFocusLayout);
+  // The Focus "Upcoming" section: agenda list vs the few-day grid, plus the grid's hour window and how
+  // many days it shows. Shared with the Upcoming header controls (same keys), seeded from localStorage.
+  const [focusUpcomingMode, setFocusUpcomingMode] =
+    useState<FocusUpcomingMode>(readFocusUpcomingMode);
+  const [focusUpcomingRange, setFocusUpcomingRange] =
+    useState<CalendarRange>(readFocusUpcomingRange);
+  const [focusUpcomingDays, setFocusUpcomingDays] = useState<number>(() =>
+    clampFocusUpcomingDays(readFocusUpcomingDays()),
+  );
   // Memory map (the Map tab): the default grouping, cohesion blend, node cap, and the optional t-SNE
   // component's install/enable state.
   const [mapGrouping, setMapGrouping] = useState<MapLayoutMode>(readMapMode);
@@ -138,6 +162,19 @@ export function GeneralSettings() {
     setFocusLayout(next);
     writeFocusLayout(next); // shared with the Focus header toggle
   }
+  function changeFocusUpcomingMode(next: FocusUpcomingMode) {
+    setFocusUpcomingMode(next);
+    writeFocusUpcomingMode(next); // shared with the Upcoming header toggle
+  }
+  function changeFocusUpcomingRange(next: CalendarRange) {
+    setFocusUpcomingRange(next);
+    writeFocusUpcomingRange(next);
+  }
+  function changeFocusUpcomingDays(next: number) {
+    const clamped = clampFocusUpcomingDays(next);
+    setFocusUpcomingDays(clamped);
+    writeFocusUpcomingDays(clamped);
+  }
 
   function changeMapGrouping(next: MapLayoutMode) {
     setMapGrouping(next);
@@ -199,13 +236,16 @@ export function GeneralSettings() {
     mapGrouping === "project" && mapCohesion === 0 && mapNodeCap === 1000 && mapTsneEnabled;
   const confirmDeleteIsDefault = confirmDelete;
   const focusLayoutIsDefault = focusLayout === "split";
+  const focusUpcomingIsDefault =
+    focusUpcomingMode === "list" && focusUpcomingRange === "day" && focusUpcomingDays === 3;
+  const focusIsDefault = focusLayoutIsDefault && focusUpcomingIsDefault;
   const helpIsDefault = !help.enabled;
   // The whole tab, minus the deliberately-excluded time zone (device-derived, not a preference).
   const generalIsDefault =
     appearanceIsDefault &&
     mapIsDefault &&
     confirmDeleteIsDefault &&
-    focusLayoutIsDefault &&
+    focusIsDefault &&
     helpIsDefault;
 
   function resetMap() {
@@ -219,14 +259,17 @@ export function GeneralSettings() {
     setConfirmDelete(true);
     writeConfirmDelete(true);
   }
-  function resetFocusLayout() {
+  function resetFocus() {
     changeFocusLayout("split");
+    changeFocusUpcomingMode("list");
+    changeFocusUpcomingRange("day");
+    changeFocusUpcomingDays(3);
   }
   function resetGeneral() {
     resetAppearance();
     resetMap();
     resetConfirmDelete();
-    resetFocusLayout();
+    resetFocus();
     help.setEnabled(false);
     // Time zone is intentionally left alone — it's derived from the device, not a taste preference.
   }
@@ -470,7 +513,7 @@ export function GeneralSettings() {
           <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
             Focus
           </label>
-          {!focusLayoutIsDefault && <ResetLink onReset={resetFocusLayout} label="Reset layout" />}
+          {!focusIsDefault && <ResetLink onReset={resetFocus} label="Reset Focus" />}
         </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           <span className="text-sm text-ink2">Layout</span>
@@ -483,6 +526,47 @@ export function GeneralSettings() {
             ]}
           />
         </div>
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <span className="text-sm text-ink2">Upcoming</span>
+          <SegmentedControl
+            value={focusUpcomingMode}
+            onChange={changeFocusUpcomingMode}
+            options={[
+              { value: "list", label: "List" },
+              { value: "week", label: "Days" },
+            ]}
+          />
+        </div>
+        {focusUpcomingMode === "week" && (
+          <>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-sm text-ink2">Upcoming hours</span>
+              <SegmentedControl
+                value={focusUpcomingRange}
+                onChange={changeFocusUpcomingRange}
+                options={[
+                  { value: "work", label: "Work" },
+                  { value: "day", label: "Day" },
+                  { value: "full", label: "24h" },
+                ]}
+              />
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-sm text-ink2">Days shown</span>
+              <SegmentedControl
+                value={String(focusUpcomingDays)}
+                onChange={(v) => changeFocusUpcomingDays(Number(v))}
+                options={Array.from(
+                  { length: FOCUS_UPCOMING_MAX_DAYS - FOCUS_UPCOMING_MIN_DAYS + 1 },
+                  (_, i) => {
+                    const n = FOCUS_UPCOMING_MIN_DAYS + i;
+                    return { value: String(n), label: String(n) };
+                  },
+                )}
+              />
+            </div>
+          </>
+        )}
       </div>
 
       <div
