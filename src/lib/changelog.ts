@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.56.1-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Linux: fixed a harmless-but-noisy crash report that popped up every time you closed PM (a WebKitGTK renderer shutdown quirk on some graphics drivers). Nothing was actually lost — your data is saved well before the app exits — but the app now shuts down cleanly instead of leaving a crash notification behind.",
+    ],
+  },
+  {
     version: "3.56.0-alpha",
     date: "2026-07-24",
     highlights: [
