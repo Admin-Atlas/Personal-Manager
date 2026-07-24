@@ -139,6 +139,9 @@ which live in **two places**, both part of this PR:
 - **`src/lib/changelog.ts`** — add the release's entry at the top: an at-a-glance
   digest of the accumulated per-PR entries (which stay below it as the detail).
   The lockstep gate reads this top entry, so a missing one fails the version check.
+  **Set `release: true` on this digest entry** (the per-PR entries below it stay
+  unmarked) so What's New badges the release boundary — the `--tag` release gate
+  refuses to tag if the newest entry lacks it.
 - **`.github/RELEASE_NOTES.md`** — update the version and the "What's new" digest.
   This file **is** the GitHub Release page (the publish job passes it as
   `--notes-file`), so it must carry the install and self-update instructions a

@@ -46,6 +46,14 @@ export function WhatsNew({
                   Current
                 </span>
               )}
+              {entry.release && (
+                <span
+                  className="rounded-[var(--radius-sm)] bg-accent px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wide text-accent-ink"
+                  title="A tagged release — the version that shipped, not an interim dev build"
+                >
+                  Release
+                </span>
+              )}
               <span className="ml-auto font-mono text-xs text-ink4">{entry.date}</span>
             </div>
             <ul className="mt-2 space-y-1.5">
