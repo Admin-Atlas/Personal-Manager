@@ -526,7 +526,9 @@ export default function App() {
   const leftBar = useResizable({
     storageKey: "pm.sidebar.frac",
     defaultFrac: 0.17,
-    minFrac: 0.14,
+    // Half the old 0.14 floor, so the bar can be dragged noticeably thinner before it bottoms out;
+    // the snap-collapse still fires only once pinned at this minimum and dragged into the left edge.
+    minFrac: 0.07,
     maxFrac: 0.32,
     edge: "right",
     collapsible: true,
