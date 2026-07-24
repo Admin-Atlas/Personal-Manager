@@ -178,6 +178,26 @@ export function isMultiDay(ev: CalendarEvent): boolean {
   return !!span && span.endDay.getTime() > span.startDay.getTime();
 }
 
+/** Whether an event has fully passed as of `now` (device-local) — drives the greyed "past event"
+ *  styling. A timed event is past once its end (or its start, if it has no end) is before now; an
+ *  all-day / multi-day event is past once its last day is before today. An event happening right now,
+ *  or later today, is never past. */
+export function isEventPast(ev: CalendarEvent, now: Date): boolean {
+  if (ev.all_day || isMultiDay(ev)) {
+    const span = eventDaySpan(ev);
+    return !!span && span.endDay.getTime() < startOfDay(now).getTime();
+  }
+  const start = parseLocal(ev.start, false);
+  if (!start) return false;
+  const end = ev.end ? parseLocal(ev.end, false) : null;
+  return (end ?? start).getTime() < now.getTime();
+}
+
+/** Tailwind treatment for an event that has fully passed — muted + desaturated so what's done
+ *  recedes (Notion-style), composing over each event's own coloured fill. Kept here so every calendar
+ *  surface greys past events identically. */
+export const PAST_EVENT_CLASS = "opacity-60 saturate-[0.4]";
+
 // --- timed-event overlap lanes -------------------------------------------------------------------
 
 export interface TimedInput {

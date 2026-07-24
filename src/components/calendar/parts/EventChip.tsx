@@ -6,6 +6,9 @@
 // via color-mix, so the categorical hue arrives as a prop and no source hex is written in a component.
 // Multi-day events render as bands (AllDayBand-style), not chips; Min depth collapses chips to dots.
 
+import { cn } from "../../ui";
+import { PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
+
 interface Props {
   summary: string;
   color: string;
@@ -13,17 +16,21 @@ interface Props {
   timeLabel: string;
   /** Depth gate: show the time prefix (Power). */
   showTime: boolean;
+  /** The event has fully passed — grey it back so what's done recedes. */
+  isPast?: boolean;
   /** When set, the chip is interactive (the PM overlays only) — click / Enter / Space fires it.
    *  Synced events leave this undefined and stay non-interactive. */
   onClick?: () => void;
 }
 
-export function EventChip({ summary, color, timeLabel, showTime, onClick }: Props) {
+export function EventChip({ summary, color, timeLabel, showTime, isPast, onClick }: Props) {
   return (
     <div
-      className={`flex items-center gap-1 overflow-hidden rounded-[var(--radius-sm)] border-l-[2px] px-1 py-px text-[11px] leading-tight ${
-        onClick ? "cursor-pointer hover:brightness-110" : ""
-      }`}
+      className={cn(
+        "flex items-center gap-1 overflow-hidden rounded-[var(--radius-sm)] border-l-[2px] px-1 py-px text-[11px] leading-tight",
+        onClick && "cursor-pointer hover:brightness-110",
+        isPast && PAST_EVENT_CLASS,
+      )}
       style={{
         background: `color-mix(in oklab, ${color} 16%, transparent)`,
         borderLeftColor: color,

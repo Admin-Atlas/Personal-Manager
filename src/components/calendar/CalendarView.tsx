@@ -532,6 +532,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               cursor={cursor}
               events={visibleEvents}
               colorOf={colorOf}
+              now={now}
               onEventClick={onEventClick}
             />
           );
@@ -550,6 +551,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               events={visibleEvents}
               colorOf={colorOf}
               days={gridDays}
+              now={now}
               onEventClick={onEventClick}
             />
           );
@@ -560,6 +562,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               events={visibleEvents}
               colorOf={colorOf}
               fromDay={cursor}
+              now={now}
               onEventClick={onEventClick}
             />
           );
@@ -572,6 +575,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             events={visibleEvents}
             fromDay={cursor}
             colorOf={colorOf}
+            now={now}
             onEventClick={onEventClick}
           />
         );
@@ -582,6 +586,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             events={visibleEvents}
             colorOf={colorOf}
             onFocusDate={onFocusDate}
+            now={now}
             onEventClick={onEventClick}
           />
         );
@@ -606,6 +611,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             bounds={activeBounds}
             zones={zones}
             onZonesChange={onZonesChange}
+            now={now}
             onEventClick={onEventClick}
           />
         );

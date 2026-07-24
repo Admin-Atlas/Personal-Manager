@@ -10,7 +10,14 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
-import { addDays, dayKey, isOverlayEvent, startOfDay } from "../../../lib/calendar-layout";
+import {
+  addDays,
+  dayKey,
+  isEventPast,
+  isOverlayEvent,
+  PAST_EVENT_CLASS,
+  startOfDay,
+} from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -31,6 +38,8 @@ interface Props {
   colorOf: (calendarId: string) => string;
   /** Reports the month filling the view as the user scrolls, so the header label can track it. */
   onFocusDate: (d: Date) => void;
+  /** The ticking "now" (device-local) so past chips/bands grey back. Defaults to the render clock. */
+  now?: Date;
   /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay chips only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
@@ -51,9 +60,10 @@ const firstOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth(), 1);
 /** A week's representative month = its Thursday (ISO), so a boundary week picks the majority side. */
 const weekMonthKey = (w: MonthWeekRow) => monthKey(w.cells[3].date);
 
-export function MonthView({ cursor, events, colorOf, onFocusDate, onEventClick }: Props) {
+export function MonthView({ cursor, events, colorOf, onFocusDate, now, onEventClick }: Props) {
   const { minimal, showMeta, showPower } = useDepth();
   const maxChips = showPower ? 4 : 3;
+  const nowDate = now ?? new Date();
 
   // The rendered window is anchored on a month and rebuilt only when the cursor jumps outside it.
   const [anchor, setAnchor] = useState(() => firstOfMonth(cursor));
@@ -264,6 +274,7 @@ export function MonthView({ cursor, events, colorOf, onFocusDate, onEventClick }
                             color={colorOf(ev.calendar_id)}
                             timeLabel={ev.all_day ? "" : formatClockIso(ev.start)}
                             showTime={showMeta}
+                            isPast={isEventPast(ev, nowDate)}
                             onClick={isOverlayEvent(ev) ? () => onEventClick?.(ev) : undefined}
                           />
                         ))}
@@ -290,7 +301,10 @@ export function MonthView({ cursor, events, colorOf, onFocusDate, onEventClick }
                   return (
                     <div
                       key={b.ev.id}
-                      className="absolute overflow-hidden px-1.5 text-[11px] leading-[14px]"
+                      className={cn(
+                        "absolute overflow-hidden px-1.5 text-[11px] leading-[14px]",
+                        isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
+                      )}
                       style={{
                         top: `${b.lane * BAND_H}px`,
                         left: `${leftPct}%`,

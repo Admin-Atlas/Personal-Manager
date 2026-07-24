@@ -8,7 +8,12 @@
 // today's number chip only — every source colour comes from the categorical palette, never the accent.
 
 import type { CalendarEvent } from "../../../lib/types";
-import { dayKey, isOverlayEvent } from "../../../lib/calendar-layout";
+import {
+  dayKey,
+  isEventPast,
+  isOverlayEvent,
+  PAST_EVENT_CLASS,
+} from "../../../lib/calendar-layout";
 import { formatClockIso } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -20,6 +25,8 @@ interface Props {
   /** Already filtered to visible (non-hidden) calendars. */
   events: CalendarEvent[];
   colorOf: (calendarId: string) => string;
+  /** The ticking "now" (device-local) so past chips/bands grey back. Defaults to the render clock. */
+  now?: Date;
   /** Open a PM overlay event — a milestone's project, or the Pinboard (fires for overlay chips only). */
   onEventClick?: (ev: CalendarEvent) => void;
 }
@@ -29,9 +36,10 @@ const NUM_H = 22;
 const CELL_PAD = 4; // matches the cells' py-1, so the row-relative band overlay clears the number row
 const MAX_DOTS = 5;
 
-export function TerminalMonthTable({ cursor, events, colorOf, onEventClick }: Props) {
+export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick }: Props) {
   const { minimal, showMeta, showPower } = useDepth();
   const maxChips = showPower ? 4 : 3;
+  const nowDate = now ?? new Date();
 
   const { weeks, weekdayLabels } = useMonthGrid(cursor, events);
 
@@ -113,6 +121,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, onEventClick }: Pr
                             className={cn(
                               "flex items-center gap-1 overflow-hidden border-l-2 pl-1 text-[11px] leading-tight",
                               clickable && "cursor-pointer hover:brightness-110",
+                              isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
                             )}
                             style={{ borderLeftColor: colorOf(ev.calendar_id) }}
                             title={ev.summary}
@@ -161,7 +170,10 @@ export function TerminalMonthTable({ cursor, events, colorOf, onEventClick }: Pr
                 return (
                   <div
                     key={b.ev.id}
-                    className="absolute overflow-hidden px-1.5 text-[11px] leading-[14px]"
+                    className={cn(
+                      "absolute overflow-hidden px-1.5 text-[11px] leading-[14px]",
+                      isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
+                    )}
                     style={{
                       top: `${b.lane * BAND_H}px`,
                       left: `${leftPct}%`,

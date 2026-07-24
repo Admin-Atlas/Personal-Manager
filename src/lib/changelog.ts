@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.58.1-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "The calendar reads more clearly at a glance. Timed events now carry a soft tint of their calendar's colour (the way all-day events already do), instead of a plain grey block that blended into the grid. The current day's column keeps its hour and day lines visible even on the quieter colour themes, where they used to wash out. And events that have already finished are gently greyed, so what's still ahead stands out from what's done.",
+    ],
+  },
+  {
     version: "3.58.0-alpha",
     date: "2026-07-24",
     highlights: [
