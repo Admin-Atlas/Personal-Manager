@@ -53,7 +53,7 @@ import { pinboardEntries, type PinboardEntry } from "../../lib/pinboard/calendar
 import { PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
 import { milestoneColor, pinboardColor, sourceColors, useTheme, useUserTime } from "../../theme";
 import { Skeleton } from "../ui";
-import { useNowTick } from "./parts/useNowTick";
+import { useNowTick } from "../../lib/useNowTick";
 import { CalendarEventPopover } from "./parts/CalendarEventPopover";
 import { CalendarHeader } from "./CalendarHeader";
 import { AgendaView } from "./views/AgendaView";

@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.61.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "Power users: progress bars now show how long the current task has been running. With the Power display density on, a live timer appears on the right of loading bars -- during ingests, re-indexing, syncs, backups and downloads -- next to the percentage or item count. It even ticks during the early “setting up” phase where there's no count yet, which is exactly when a long download benefits from it. One honest note: for a bar that reappears part-way through a task (say you reopened the Backup panel mid-upload), the timer counts from when it reappeared, not the original start.",
+    ],
+  },
+  {
     version: "3.60.0-alpha",
     date: "2026-07-24",
     highlights: [
