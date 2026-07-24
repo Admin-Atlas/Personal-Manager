@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "pm"
-version = "3.49.0-alpha"
+version = "3.49.2-alpha"
 dependencies = [
  "argon2",
  "base64 0.22.1",

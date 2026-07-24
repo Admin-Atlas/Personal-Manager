@@ -338,7 +338,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
                     // Choosing a key applies its natural direction; the ↑/↓ button flips it.
                     setSort((cur) => (cur.key === key ? cur : { key, dir: DEFAULT_DIR[key] }));
                   }}
-                  className="h-7 py-0 text-xs"
+                  compact
                   title="Reorder projects"
                 >
                   {(Object.keys(SORT_LABELS) as SortKey[]).map((k) => (

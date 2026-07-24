@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.49.2-alpha",
+    date: "2026-07-24",
+    highlights: [
+      "The Sort dropdown on the Focus tab now shows its text centered and in full on Linux. It was rendering too low, with the bottom of the letters clipped off; the control is now sized so the text sits properly on every system. (Windows and Mac already looked right.)",
+    ],
+  },
+  {
     version: "3.49.0-alpha",
     date: "2026-07-23",
     highlights: [
