@@ -19,6 +19,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.56.0-alpha",
+    date: "2026-07-24",
+    highlights: [
+      'Google Drive now indexes the files and folders people share with you. "Shared with me" is a separate place in Drive — apart from your own My Drive and from shared (Team) drives — and until now PM couldn\'t reach it, so anything a colleague shared straight to you (especially the contents of a shared folder) was invisible. Open a Google account under Settings → Connectors → Drive, turn on "Shared with me", and pick the specific files or folders you want: a folder brings its whole contents, shortcuts are followed to the real file, and if you connect two accounts on the same team a file shared with both is indexed just once. Everything stays read-only and index-only, like the rest of Drive.',
+      'When you index only some folders of a Drive, you can now also include the loose files sitting in the drive\'s root — the ones not tucked inside any folder — with a checkbox under "Choose folders".',
+    ],
+  },
+  {
     version: "3.55.0-alpha",
     date: "2026-07-24",
     highlights: [

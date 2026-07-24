@@ -80,6 +80,7 @@ import type {
   SemanticLayout,
   Settings,
   SharedDrive,
+  SwmRoot,
   SidecarStatus,
   SandboxReport,
   NetSelftest,
@@ -859,6 +860,16 @@ export const driveSharedOwners = (email: string) =>
  *  drive's id as `parentId` for the top level. */
 export const listDriveFolders = (email: string, driveId: string, parentId: string) =>
   invoke<DriveFolder[]>("list_drive_folders", { email, driveId, parentId });
+
+/** The account's "Shared with me" roots (top-level files/folders others shared directly), for the
+ *  shared-with-me picker — both files and folders are selectable. */
+export const listDriveSharedWithMeRoots = (email: string) =>
+  invoke<SwmRoot[]>("list_drive_shared_with_me_roots", { email });
+
+/** Shared-with-me roots already indexed by a DIFFERENT connected account → `{ [rootId]: ownerEmail }`.
+ *  The picker greys those out (a shared-with-me root is de-duplicated — only its owner indexes it). */
+export const driveSwmRootOwners = (email: string) =>
+  invoke<Record<string, string>>("drive_swm_root_owners", { email });
 
 /** Read one account's indexing scope (My Drive on/off + opted-in shared drives and folders). */
 export const getDriveScope = (email: string) => invoke<DriveScope>("get_drive_scope", { email });

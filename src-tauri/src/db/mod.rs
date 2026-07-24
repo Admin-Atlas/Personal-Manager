@@ -958,6 +958,7 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN entity_id; \
              DROP TABLE doc_layout; \
              DROP TABLE shared_drive_access; \
+             DROP TABLE shared_with_me_access; \
              DROP TABLE connector_sources; \
              DROP TABLE preferences; \
              DROP INDEX idx_documents_source_id; \
@@ -1111,6 +1112,7 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN entity_id; \
              DROP TABLE doc_layout; \
              DROP TABLE shared_drive_access; \
+             DROP TABLE shared_with_me_access; \
              DROP TABLE connector_sources; \
              DROP TABLE preferences; \
              DROP INDEX idx_documents_source_id; \
