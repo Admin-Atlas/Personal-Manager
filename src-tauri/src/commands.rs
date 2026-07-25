@@ -3189,43 +3189,84 @@ pub async fn propose_metadata(
     let mut proposed = 0;
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
         Vec::new();
-    for p in pending {
-        // The global profile and this document's folder go in as separate arguments: the profile is
-        // run-wide and stays in the cached system prefix, the folder is per-document and rides in the
-        // user message as data (#509). `propose` is called once per document, so a folder can never
-        // leak into another document's prompt; it BIASES the proposal but never pre-assigns a project
-        // (the LLM proposal stays the review checkpoint).
-        let (mut proposal, usage_info) = review::propose(
-            &app,
-            &plan,
-            &p.title,
-            &p.body,
-            &projects,
-            profile.as_deref(),
-            folder_context(p.folder.as_deref()),
-        )
-        .await;
-        // The served model, for the proposal cache's `model` column — captured before `usage_info`
-        // is consumed into the cost rows below. `None` on the best-effort fallback path.
-        let served_model = usage_info.as_ref().and_then(|(_, m, _)| m.clone());
-        if let Some((usage, served, meta)) = usage_info {
-            usage_rows.push((served, usage, meta));
+    // Documents are classified a batch at a time: one call proposes for several, which is where
+    // most of the saving is (the instructions + canonical projects + profile are sent once per call,
+    // not once per document). The global profile goes in as its own argument so it stays in the
+    // cached system prefix; each document's folder rides in the user message beside it, as data
+    // (#509). A folder BIASES its own document's proposal but never pre-assigns a project — the
+    // review checkpoint is unchanged.
+    for chunk in review::batches(&pending) {
+        let docs: Vec<review::DocInput<'_>> = chunk
+            .iter()
+            .map(|p| review::DocInput {
+                title: &p.title,
+                body: &p.body,
+                folder: folder_context(p.folder.as_deref()),
+            })
+            .collect();
+        let mut outcome =
+            review::propose_batch(&app, &plan, &docs, &projects, profile.as_deref()).await;
+        let batch_error = outcome.error.clone();
+        // The served model per document, for the proposal cache's `model` column (UI/debug only).
+        // Starts as whichever model answered the batch; a retried document overwrites its own slot,
+        // since an auto-switch fallback may have served it from a different model.
+        let batch_model = outcome.usage.as_ref().and_then(|(_, m, _)| m.clone());
+        let mut served: Vec<Option<String>> = vec![batch_model; chunk.len()];
+        if let Some((usage, model, meta)) = outcome.usage.take() {
+            usage_rows.push((model, usage, meta));
         }
-        // Resolve the model's project string to its canonical form for display (a known variant is
-        // shown, and later committed, as the canonical name — the variant never surfaces), and
-        // persist the finished proposal to the regenerable cache so re-opening the app repaints it
-        // instead of re-billing the model. One short lock, dropped before the next model call (rule #4).
-        {
-            let state = app.state::<AppState>();
-            let conn = state.conn()?;
-            proposal.project = entities::resolve_to_canonical(&conn, &proposal.project)?;
-            review::cache_proposal(&conn, p.id, &proposal, served_model.as_deref())?;
+
+        // Any document the batch didn't answer for is retried on its own before we give up on it.
+        // This is what makes batching safe on a cheap model: it can lose track part-way through a
+        // multi-document reply and still degrade to one-call-per-document, never to a wrong answer
+        // silently attached to the wrong file.
+        for (i, slot) in outcome.proposals.iter_mut().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            let mut retry =
+                review::propose_batch(&app, &plan, &docs[i..=i], &projects, profile.as_deref())
+                    .await;
+            served[i] = retry.usage.as_ref().and_then(|(_, m, _)| m.clone());
+            let retry_error = retry.error.clone();
+            if let Some((usage, model, meta)) = retry.usage.take() {
+                usage_rows.push((model, usage, meta));
+            }
+            *slot = retry.proposals.into_iter().next().flatten().or_else(|| {
+                // Batch and retry both came back empty. Surface the call error if there was one,
+                // otherwise say plainly that the reply couldn't be read — the document stays in the
+                // queue as Unsorted for manual filing either way.
+                Some(review::Proposal::fallback(
+                    retry_error
+                        .or_else(|| batch_error.clone())
+                        .unwrap_or_else(|| {
+                            "Could not auto-classify (unreadable model reply).".to_string()
+                        }),
+                ))
+            });
         }
-        let _ = on_event.send(ReviewEvent::Proposed {
-            document_id: p.id,
-            proposal,
-        });
-        proposed += 1;
+
+        for ((p, proposal), model) in chunk.iter().zip(outcome.proposals).zip(&served) {
+            let Some(mut proposal) = proposal else {
+                continue;
+            };
+            // Resolve the model's project string to its canonical form for display (a known variant
+            // is shown, and later committed, as the canonical name — the variant never surfaces),
+            // and persist the finished proposal to the regenerable cache so re-opening the app
+            // repaints it instead of re-billing the model. One short lock, dropped before the next
+            // model call (rule #4).
+            {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                proposal.project = entities::resolve_to_canonical(&conn, &proposal.project)?;
+                review::cache_proposal(&conn, p.id, &proposal, model.as_deref())?;
+            }
+            let _ = on_event.send(ReviewEvent::Proposed {
+                document_id: p.id,
+                proposal,
+            });
+            proposed += 1;
+        }
     }
     log_background_usage(&app, plan.models(), &usage_rows);
     let _ = on_event.send(ReviewEvent::Finished { proposed });

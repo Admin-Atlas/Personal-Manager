@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.70.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Sorting a big import is cheaper. Review used to ask the AI about your documents one at a time, re-sending the same instructions and project list with every single file -- so a hundred new documents meant a hundred near-identical requests. It now asks about several documents per request, which cuts most of that repetition. Suggestions still appear as they arrive (now in small groups rather than one by one), and if the AI ever loses track part-way through a group, PM quietly re-asks about those documents on their own rather than risking a suggestion landing on the wrong file.",
+    ],
+  },
+  {
     version: "3.69.1-alpha",
     date: "2026-07-25",
     highlights: [
