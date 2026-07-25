@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.69.1-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Filing suggestions now treat folder names as information, not instructions. When PM asks the AI where a file belongs, the folder the file came from was being written into PM's own instructions rather than passed alongside the document. Folders can be named anything -- and since PM can index folders other people share with you, that name isn't always yours -- so a folder named to look like an order could nudge a suggestion in a way you didn't intend. The folder now travels with the document as plain information, clearly marked as something to read rather than obey. Your suggestions are unchanged, and there's a bonus: PM can now reuse far more of each request, so a big import should cost less to sort.",
+    ],
+  },
+  {
     version: "3.69.0-alpha",
     date: "2026-07-25",
     highlights: [
