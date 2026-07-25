@@ -40,12 +40,14 @@ import {
 } from "../../lib/focusPrefs";
 import {
   briefingPrefsAreDefault,
+  readBriefingFloat,
   readBriefingInSidebar,
-  readBriefingWindow,
   resetBriefingPrefs,
+  writeBriefingFloat,
   writeBriefingInSidebar,
-  writeBriefingWindow,
+  type BriefingFloat,
 } from "../../lib/briefingPrefs";
+import { getTrayEnabled, setTrayEnabled, toggleBriefingWindow } from "../../lib/ipc";
 import type { CalendarRange } from "../../lib/calendarPrefs";
 import { readConfirmDelete, writeConfirmDelete } from "../../lib/pinboard/prefs";
 import {
@@ -101,14 +103,36 @@ export function GeneralSettings() {
   // only other writer, seeded from localStorage like confirmDelete above.
   // Where the briefing shows, beyond the Focus tab. Both off by default.
   const [briefingSidebar, setBriefingSidebar] = useState(readBriefingInSidebar);
-  const [briefingWindow, setBriefingWindow] = useState(readBriefingWindow);
+  const [briefingFloat, setBriefingFloat] = useState<BriefingFloat>(readBriefingFloat);
+  // The tray icon is backend-owned (Rust reads it at boot), so it loads asynchronously rather than
+  // seeding from localStorage like its neighbours.
+  const [trayOn, setTrayOn] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    getTrayEnabled()
+      .then((on) => alive && setTrayOn(on))
+      .catch(() => {
+        /* leave it off — the tray is optional */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
   function changeBriefingSidebar(on: boolean) {
     setBriefingSidebar(on);
     writeBriefingInSidebar(on);
   }
-  function changeBriefingWindow(on: boolean) {
-    setBriefingWindow(on);
-    writeBriefingWindow(on);
+  function changeBriefingFloat(mode: BriefingFloat) {
+    setBriefingFloat(mode);
+    writeBriefingFloat(mode);
+    // The "always on top" level is a real OS window the Rust side owns, so ask it to show or hide.
+    void toggleBriefingWindow(mode === "onTop").catch(() => {
+      /* best-effort: the in-app levels don't need it and a failure must not block the setting */
+    });
+  }
+  function changeTray(on: boolean) {
+    setTrayOn(on);
+    void setTrayEnabled(on).catch(() => setTrayOn(!on));
   }
   const [focusLayout, setFocusLayout] = useState<FocusLayout>(readFocusLayout);
   // The Focus "Upcoming" section: agenda list vs the few-day grid, plus the grid's hour window and how
@@ -263,7 +287,8 @@ export function GeneralSettings() {
   const focusLayoutIsDefault = focusLayout === "split";
   const focusUpcomingIsDefault =
     focusUpcomingMode === "list" && focusUpcomingRange === "day" && focusUpcomingDays === 3;
-  const briefingIsDefault = !briefingSidebar && !briefingWindow && briefingPrefsAreDefault();
+  const briefingIsDefault =
+    !briefingSidebar && briefingFloat === "off" && briefingPrefsAreDefault();
   // Panel visibility is set on the Focus tab itself, but "Reset Focus" must still restore it.
   const [panelsDefault, setPanelsDefault] = useState(focusPanelsAreDefault);
   const focusIsDefault =
@@ -292,8 +317,9 @@ export function GeneralSettings() {
     resetFocusPanels();
     setPanelsDefault(true);
     setBriefingSidebar(false);
-    setBriefingWindow(false);
+    setBriefingFloat("off");
     resetBriefingPrefs();
+    void toggleBriefingWindow(false).catch(() => {});
     changeFocusLayout("split");
     changeFocusUpcomingMode("list");
     changeFocusUpcomingRange("day");
@@ -572,12 +598,27 @@ export function GeneralSettings() {
           className="mt-3 flex items-center justify-between gap-3"
           data-help="settings-briefing-window"
         >
-          <span className="text-sm text-ink2">Show today&rsquo;s briefing in a floating panel</span>
-          <Toggle
-            checked={briefingWindow}
-            onChange={changeBriefingWindow}
-            ariaLabel="Show today's briefing in a floating panel"
+          <span className="text-sm text-ink2">Floating briefing</span>
+          <SegmentedControl
+            value={briefingFloat}
+            onChange={changeBriefingFloat}
+            options={[
+              { value: "off", label: "Off" },
+              { value: "inApp", label: "Inside PM", title: "A panel inside PM's own window" },
+              {
+                value: "onTop",
+                label: "Always on top",
+                title: "A separate window that floats over other apps",
+              },
+            ]}
           />
+        </div>
+        <div
+          className="mt-3 flex items-center justify-between gap-3"
+          data-help="settings-tray-icon"
+        >
+          <span className="text-sm text-ink2">Tray / menu bar icon</span>
+          <Toggle checked={trayOn} onChange={changeTray} ariaLabel="Show a tray or menu bar icon" />
         </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           <span className="text-sm text-ink2">Layout</span>

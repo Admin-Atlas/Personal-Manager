@@ -74,7 +74,7 @@ jobs:
         # backs the keyring crate's Secret Service backend (Linux secrets store).
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
       - name: rustfmt (--check)
         run: just cargo-fmt

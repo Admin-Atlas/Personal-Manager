@@ -41,7 +41,17 @@ interface BriefingState {
 
 const BriefingContext = createContext<BriefingState | null>(null);
 
-export function BriefingProvider({ children }: { children: ReactNode }) {
+export function BriefingProvider({
+  children,
+  autoRefresh = true,
+}: {
+  children: ReactNode;
+  /** Whether this provider may kick off the once-a-day stale regeneration. The main window's
+   *  provider owns that; the briefing window passes false. `refresh_daily_briefing` has no backend
+   *  single-flight, so two providers both deciding the briefing was stale would mean two model
+   *  calls and a race on the stored timestamp -- the very thing this file exists to prevent. */
+  autoRefresh?: boolean;
+}) {
   const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -88,12 +98,12 @@ export function BriefingProvider({ children }: { children: ReactNode }) {
         const stored = await getDailyBriefing();
         if (!aliveRef.current) return;
         setBriefing(stored);
-        if (stored.stale) void refresh();
+        if (autoRefresh && stored.stale) void refresh();
       } catch {
         /* the briefing is optional — every surface renders without it */
       }
     })();
-  }, [refresh]);
+  }, [refresh, autoRefresh]);
 
   return (
     <BriefingContext.Provider value={{ briefing, busy, refresh }}>

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "briefing-window",
+  "description": "The always-on-top briefing panel. Deliberately NOT added to default.json's window list: that capability grants dialog, process-exit/restart and updater permissions, none of which a read-only briefing panel has any business holding. The one thing it needs that its own app commands can't provide is the ability to be dragged by its header, since it is frameless like the main window. Everything else about the window — creating, showing, hiding, positioning — is owned by the Rust side in tray.rs, and the panel's data comes from PM's own commands, which are not ACL-gated.",
+  "windows": ["briefing"],
+  "permissions": ["core:window:allow-start-dragging"]
+}

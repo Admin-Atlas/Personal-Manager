@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.76.0-alpha"
+version = "3.77.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -33,7 +33,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 # Silent background auto-update + app relaunch after install (desktop only).
 tauri-plugin-updater = "2"

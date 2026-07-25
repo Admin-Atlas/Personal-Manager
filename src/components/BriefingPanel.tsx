@@ -29,9 +29,9 @@ import {
   type PanelRect,
 } from "../lib/floatingPanel";
 import {
-  readBriefingWindow,
+  readBriefingFloat,
   subscribeBriefingPrefs,
-  writeBriefingWindow,
+  writeBriefingFloat,
 } from "../lib/briefingPrefs";
 
 function viewport() {
@@ -41,8 +41,10 @@ function viewport() {
 export function BriefingPanel() {
   // Settings renders as an overlay over the live app, so read-at-mount would leave the toggle
   // looking broken until a remount. Subscribe to the same signal the prefs writer dispatches.
-  const [enabled, setEnabled] = useState(readBriefingWindow);
-  useEffect(() => subscribeBriefingPrefs(() => setEnabled(readBriefingWindow())), []);
+  // Only the "inside PM" level draws this panel; "always on top" is a real OS window owned by
+  // the Rust side, and "off" is neither.
+  const [enabled, setEnabled] = useState(() => readBriefingFloat() === "inApp");
+  useEffect(() => subscribeBriefingPrefs(() => setEnabled(readBriefingFloat() === "inApp")), []);
 
   const [rect, setRect] = useState<PanelRect>(() => readPanelRect(viewport()));
   const [dragging, setDragging] = useState(false);
@@ -117,7 +119,7 @@ export function BriefingPanel() {
           onPointerDown={(e) => e.stopPropagation()}
           onClick={() => {
             setEnabled(false);
-            writeBriefingWindow(false);
+            writeBriefingFloat("off");
           }}
           title="Hide the floating briefing (turn it back on in Settings → General → Focus)"
           aria-label="Hide the floating briefing"

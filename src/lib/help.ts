@@ -107,8 +107,12 @@ export const HELP: Record<string, HelpEntry> = {
     body: "Pins today's briefing to the bottom of the left sidebar, so what needs doing today stays visible whichever tab you're on. It's the same briefing as the one on the Focus tab — same text, and refreshing either one updates both. Off by default. If you'd rather see it only here, turn the Focus tab's briefing card off from the Panels control on that tab.",
   },
   "settings-briefing-window": {
-    title: "Today's briefing in a floating panel",
-    body: "Floats today's briefing over whatever you're doing, in a small panel you can drag by its header and resize from its bottom-right corner. It stays put as you move between tabs, and remembers where you left it. It floats above PM's own views but below dialogs, so a pop-up is never hidden behind it — and it floats within PM's window, not over other applications. Off by default; the ✕ on the panel hides it again.",
+    title: "Floating briefing",
+    body: "Whether today's briefing floats, and how far. 'Inside PM' is a small panel you can drag and resize that stays put as you move between tabs — it lives inside PM's own window, so it costs nothing extra to run, and it sits above PM's views but below dialogs so a pop-up is never hidden behind it. 'Always on top' is a separate little window that floats over your other applications too, so you can keep today in view while you work elsewhere; it costs a second window's worth of memory, which is why it isn't the default. 'Off' is the default and shows it only on the Focus tab.",
+  },
+  "settings-tray-icon": {
+    title: "Tray / menu bar icon",
+    body: "Puts a small PM icon in your system tray (Windows), menu bar (Mac) or panel (Linux). Click it — or right-click and choose 'Today's briefing' — to pop the briefing up without going to find PM's window. While this is on, closing PM's window leaves it running behind the icon instead of quitting, and 'Quit PM' moves to the icon's menu; switch it off and closing the window quits as it always has. On Linux a left click does nothing (the desktop never tells applications about it), so use the right-click menu — and the icon only appears if your desktop shows tray icons at all: KDE Plasma, XFCE, Cinnamon and MATE do, while GNOME needs its AppIndicator extension installed.",
   },
   "settings-map-tab": {
     title: "Map tab",

@@ -55,7 +55,7 @@ jobs:
         # dies with a bare "failed to run linuxdeploy" without it.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev libfuse2
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev libfuse2
 
       - run: npm ci
 

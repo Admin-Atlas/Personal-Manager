@@ -92,6 +92,7 @@ mod sidecar_stage;
 mod smart_app_control;
 mod splitter;
 mod spreadsheets;
+mod tray;
 mod update_delivery;
 mod vault;
 mod wipe;
@@ -809,12 +810,19 @@ pub fn run() {
         // with different keys and orphan one of them (rule #2).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
+                // `show` + `unminimize` first: with the tray on, closing the main window only hides
+                // it, so a second launch must bring it back rather than focusing something invisible.
+                let _ = window.show();
+                let _ = window.unminimize();
                 let _ = window.set_focus();
             }
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Close policy for both windows: the briefing panel always just hides, and the main
+        // window hides instead of quitting ONLY when the tray is on (see tray.rs).
+        .on_window_event(tray::on_window_event)
         .setup(|app| {
             let handle = app.handle();
             // One-time: move the Google Calendar token from the legacy shared keychain key to its
@@ -1111,6 +1119,12 @@ pub fn run() {
             // catch-up reconcile on each unlock (self-healing anything changed while closed), and is a
             // no-op until a folder is tracked. Observer-only — takes no vault lock.
             localfolder::spawn_local_watcher(handle.clone());
+
+            // The tray icon and the always-on-top briefing window. Both start hidden; the tray is
+            // shown only if the user has switched it on. Best-effort: a desktop with no
+            // StatusNotifierItem host (or no appindicator library at all) must not block startup.
+            let _ = tray::build_briefing_window(handle);
+            tray::init(handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1303,6 +1317,9 @@ pub fn run() {
             commands::document_chunk_spans,
             commands::read_document_image,
             commands::open_url,
+            commands::get_tray_enabled,
+            commands::set_tray_enabled,
+            commands::toggle_briefing_window,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::resolve_flag,

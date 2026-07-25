@@ -30,6 +30,7 @@ use crate::settings::{
     effective_models, CHAT_AUTO_SWITCH_KEY, CHAT_MODELS_KEY, DEFAULT_MODEL, TIME_ZONE_KEY,
 };
 use crate::sidecar::SidecarStatus;
+use crate::tray;
 use crate::{
     applock, briefing, chat, chat_prefs, chat_summary, chat_title, clock, cloud_sync,
     context_budget, cost, db, drive, entities, flags, index_only, localfolder, lock_session,
@@ -5974,6 +5975,27 @@ pub async fn import_ai_memory(app: AppHandle, text: String) -> Result<usize> {
 
 /// The stored "here's your picture today" briefing + whether it's due a refresh, for
 /// the focus view. Read-only — no model call, so it's cheap on every mount.
+/// Whether the tray / menu-bar icon is switched on. Backend-owned because Rust reads it at boot
+/// (to decide the icon's visibility, and whether closing the main window quits or hides).
+#[tauri::command]
+pub fn get_tray_enabled(app: AppHandle) -> bool {
+    tray::tray_enabled(&app)
+}
+
+/// Switch the tray icon on or off, persisting the choice. Also hides the briefing window when the
+/// tray goes off, so no floating panel is left with no way back to it.
+#[tauri::command]
+pub fn set_tray_enabled(app: AppHandle, enabled: bool) -> Result<()> {
+    tray::set_tray_enabled(&app, enabled)
+}
+
+/// Show or hide the always-on-top briefing window. `forceShow` opens it without toggling, which is
+/// what the Settings control wants when the user picks "Always on top".
+#[tauri::command]
+pub fn toggle_briefing_window(app: AppHandle, force_show: bool) -> Result<()> {
+    tray::toggle_briefing_window(&app, force_show)
+}
+
 #[tauri::command]
 pub fn get_daily_briefing(state: State<'_, AppState>) -> Result<briefing::DailyBriefing> {
     let conn = state.conn()?;
