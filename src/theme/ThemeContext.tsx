@@ -63,6 +63,10 @@ export interface ThemeState {
    *  the user can override, e.g. hide both once the assistant files things well on its own. */
   teachVisible: boolean;
   setTeachVisible: (v: boolean) => void;
+  /** Whether the **Map** tab is shown. A Depth-keyed reveal the user can override, on the same
+   *  footing as the learning tools above. */
+  mapVisible: boolean;
+  setMapVisible: (v: boolean) => void;
   /** True when every appearance axis (System, Mode, Accent, Depth, Location, Teach) is at its
    *  out-of-the-box default — drives whether Settings offers an appearance "Reset". */
   appearanceIsDefault: boolean;
@@ -158,6 +162,14 @@ type TeachPref = "auto" | "show" | "hide";
 const TEACH_PREFS: readonly TeachPref[] = ["auto", "show", "hide"];
 const DEFAULT_TEACH: TeachPref = "auto";
 
+// The Map-tab visibility override, the same shape as Teach above: "auto" follows the Depth preset
+// (hidden for minimalist, shown for standard/power), "show"/"hide" are explicit Settings choices.
+// The semantic map is an exploratory surface rather than a daily one, so a minimalist preset has no
+// use for it -- but someone on `min` who does want it can say so and keep it.
+type MapPref = "auto" | "show" | "hide";
+const MAP_PREFS: readonly MapPref[] = ["auto", "show", "hide"];
+const DEFAULT_MAP: MapPref = "auto";
+
 const KEY = {
   system: "pm:theme:system",
   mode: "pm:theme:mode", // legacy (pre-2.84): held "dark"|"light"; still read once for migration
@@ -167,6 +179,7 @@ const KEY = {
   depth: "pm:theme:depth",
   accentBySystem: "pm:theme:accentBySystem",
   teach: "pm:theme:teach",
+  map: "pm:theme:map",
   fontScale: "pm:a11y:fontScale",
   reduceMotion: "pm:a11y:reduceMotion",
   legibleFont: "pm:a11y:legibleFont",
@@ -235,6 +248,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   });
   const [teachPref, setTeachPrefState] = useState<TeachPref>(() =>
     oneOf(read(KEY.teach), TEACH_PREFS, DEFAULT_TEACH),
+  );
+  const [mapPref, setMapPrefState] = useState<MapPref>(() =>
+    oneOf(read(KEY.map), MAP_PREFS, DEFAULT_MAP),
   );
   const [fontScale, setFontScale] = useState<FontScale>(() =>
     oneOf(read(KEY.fontScale), FONT_SCALES, DEFAULT_FONT_SCALE),
@@ -402,6 +418,14 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.teach, pref);
   }
 
+  // The Map tab, on the same footing (see MapPref above).
+  const mapVisible = mapPref === "auto" ? depth !== "min" : mapPref === "show";
+  function setMapVisible(visible: boolean): void {
+    const pref: MapPref = visible ? "show" : "hide";
+    setMapPrefState(pref);
+    write(KEY.map, pref);
+  }
+
   // Whether the appearance is untouched from the defaults (the accent default is System-relative, so
   // it's compared against the default System's default accent). Drives the Settings "Reset" affordance.
   const appearanceIsDefault =
@@ -410,7 +434,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     depth === DEFAULT_DEPTH &&
     accent === defaultAccentFor(DEFAULT_SYSTEM) &&
     autoLocation === "" &&
-    teachPref === DEFAULT_TEACH;
+    teachPref === DEFAULT_TEACH &&
+    mapPref === DEFAULT_MAP;
 
   const accessibilityIsDefault =
     fontScale === DEFAULT_FONT_SCALE &&
@@ -436,12 +461,14 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   function resetAppearance(): void {
     write(KEY.accentBySystem, "{}");
     write(KEY.teach, DEFAULT_TEACH);
+    write(KEY.map, DEFAULT_MAP);
     setSystemState(DEFAULT_SYSTEM);
     setModePrefState(DEFAULT_MODE_PREF);
     setDepthState(DEFAULT_DEPTH);
     setAccentState(defaultAccentFor(DEFAULT_SYSTEM));
     setAutoLocationState("");
     setTeachPrefState(DEFAULT_TEACH);
+    setMapPrefState(DEFAULT_MAP);
   }
 
   // Apply + persist whenever an axis (or the resolved Mode) changes (also runs on mount → themed
@@ -519,6 +546,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setAutoLocation: setAutoLocationState,
     teachVisible,
     setTeachVisible,
+    mapVisible,
+    setMapVisible,
     appearanceIsDefault,
     resetAppearance,
     fontScale,

@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.73.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "The sidebar now scrolls when it runs out of room. On a short window, or with larger text, the What's New and Settings buttons at the bottom could be pushed off the edge with no way to reach them -- now the tabs and your chat list scroll together and those buttons stay put.",
+      "The Map tab now follows your chosen preset, like the Review and Teach tabs already do: hidden on Minimal, shown on Standard and Power. There is a new switch in Settings > General if you want it either way regardless.",
+    ],
+  },
+  {
     version: "3.72.4-alpha",
     date: "2026-07-25",
     highlights: [

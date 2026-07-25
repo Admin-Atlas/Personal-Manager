@@ -71,7 +71,7 @@ export function CommandPalette({
 }: Props) {
   const { showPower } = useDepth();
   // The Teach destination is only offered when the tab is visible (same Depth/Settings gate).
-  const { teachVisible } = useTheme();
+  const { teachVisible, mapVisible } = useTheme();
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const [projects, setProjects] = useState<ProjectOverview[]>([]);
@@ -149,7 +149,9 @@ export function CommandPalette({
 
     const gotoItems: PaletteItem[] = [
       ...NAV_DESTS.filter(
-        (dest) => (dest.view !== "teach" && dest.view !== "review") || teachVisible,
+        (dest) =>
+          ((dest.view !== "teach" && dest.view !== "review") || teachVisible) &&
+          (dest.view !== "graph" || mapVisible),
       ).map((dest) => ({
         id: `goto:${dest.view}`,
         kind: "goto" as const,

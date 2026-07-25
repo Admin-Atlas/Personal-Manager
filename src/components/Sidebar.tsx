@@ -83,7 +83,7 @@ export function Sidebar({
   const { showMeta } = useDepth();
   // The Teach tab is a Depth-keyed feature reveal (hidden for the minimalist preset), overridable
   // in Settings. Hiding it hides only the editor — deterministic alias resolution keeps running.
-  const { teachVisible } = useTheme();
+  const { teachVisible, mapVisible } = useTheme();
   // The Dev tab is an orthogonal capability reveal (issue #78) — independent of Depth, shown only
   // when the user turns Developer mode on in Settings.
   const { devMode } = useDevMode();
@@ -98,7 +98,7 @@ export function Sidebar({
   return (
     <aside
       style={{ width }}
-      className="relative flex h-full flex-col border-r border-border bg-panel"
+      className="relative flex h-full flex-col overflow-hidden border-r border-border bg-panel"
     >
       {/* Right-edge grip: drag to resize; drag all the way to the window edge to snap it shut. */}
       <div
@@ -111,7 +111,7 @@ export function Sidebar({
           resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
         }`}
       />
-      <div className="flex items-center justify-between px-4 py-3">
+      <div className="flex shrink-0 items-center justify-between px-4 py-3">
         <div className="flex items-center gap-2">
           <span className="font-head text-sm font-semibold tracking-wide text-ink">PM</span>
           <span
@@ -132,7 +132,7 @@ export function Sidebar({
         )}
       </div>
 
-      <div className="px-2 pb-2">
+      <div className="shrink-0 px-2 pb-2">
         <button
           onClick={onOpenPalette}
           data-help="sidebar-search"
@@ -144,111 +144,128 @@ export function Sidebar({
         </button>
       </div>
 
-      <nav className="flex flex-col gap-1 px-2 pb-2">
-        <NavItem
-          active={view === "focus" || view === "project"}
-          onClick={() => onNavigate("focus")}
-          helpId="nav-focus"
-        >
-          Focus
-        </NavItem>
-        <NavItem active={view === "chat"} onClick={() => onNavigate("chat")} helpId="nav-chat">
-          Chat
-        </NavItem>
-        <NavItem
-          active={view === "calendar"}
-          onClick={() => onNavigate("calendar")}
-          helpId="nav-calendar"
-        >
-          Calendar
-        </NavItem>
-        <NavItem
-          active={view === "documents"}
-          onClick={() => onNavigate("documents")}
-          helpId="nav-documents"
-        >
-          Documents
-        </NavItem>
-        {/* Review + Teach are the "learning tools" — shown/hidden together by `teachVisible`. */}
-        {teachVisible && (
+      {/* Nav + conversations share one scroller: with every optional tab shown, a short window or a
+          large text size used to push the footer (What's New / Settings) past the bottom edge, where
+          the shell's `overflow-hidden` clipped it and left no way to reach it. `min-h-0` is what lets
+          this shrink below its content so the scrollbar appears; the app-wide axis normaliser
+          (installed once in App) covers wheel behaviour, so nothing is wired per-surface here. */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
+        <nav className="flex flex-col gap-1 px-2 pb-2">
           <NavItem
-            active={view === "review"}
-            onClick={() => onNavigate("review")}
-            helpId="nav-review"
-            trailing={<CountBadge count={reviewCount} />}
+            active={view === "focus" || view === "project"}
+            onClick={() => onNavigate("focus")}
+            helpId="nav-focus"
           >
-            Review
+            Focus
           </NavItem>
-        )}
-        {teachVisible && (
-          <NavItem active={view === "teach"} onClick={() => onNavigate("teach")} helpId="nav-teach">
-            Teach
+          <NavItem active={view === "chat"} onClick={() => onNavigate("chat")} helpId="nav-chat">
+            Chat
           </NavItem>
-        )}
-        <NavItem active={view === "graph"} onClick={() => onNavigate("graph")} helpId="nav-graph">
-          Map
-        </NavItem>
-        <NavItem
-          active={view === "pinboard"}
-          onClick={() => onNavigate("pinboard")}
-          helpId="nav-pinboard"
-        >
-          Pinboard
-        </NavItem>
-        {devMode && (
-          <NavItem active={view === "dev"} onClick={() => onNavigate("dev")} helpId="nav-dev">
-            Dev
+          <NavItem
+            active={view === "calendar"}
+            onClick={() => onNavigate("calendar")}
+            helpId="nav-calendar"
+          >
+            Calendar
           </NavItem>
-        )}
-      </nav>
+          <NavItem
+            active={view === "documents"}
+            onClick={() => onNavigate("documents")}
+            helpId="nav-documents"
+          >
+            Documents
+          </NavItem>
+          {/* Review + Teach are the "learning tools" — shown/hidden together by `teachVisible`. */}
+          {teachVisible && (
+            <NavItem
+              active={view === "review"}
+              onClick={() => onNavigate("review")}
+              helpId="nav-review"
+              trailing={<CountBadge count={reviewCount} />}
+            >
+              Review
+            </NavItem>
+          )}
+          {teachVisible && (
+            <NavItem
+              active={view === "teach"}
+              onClick={() => onNavigate("teach")}
+              helpId="nav-teach"
+            >
+              Teach
+            </NavItem>
+          )}
+          {mapVisible && (
+            <NavItem
+              active={view === "graph"}
+              onClick={() => onNavigate("graph")}
+              helpId="nav-graph"
+            >
+              Map
+            </NavItem>
+          )}
+          <NavItem
+            active={view === "pinboard"}
+            onClick={() => onNavigate("pinboard")}
+            helpId="nav-pinboard"
+          >
+            Pinboard
+          </NavItem>
+          {devMode && (
+            <NavItem active={view === "dev"} onClick={() => onNavigate("dev")} helpId="nav-dev">
+              Dev
+            </NavItem>
+          )}
+        </nav>
 
-      <div className="flex-1 overflow-y-auto px-2">
-        {/* The global chat lists all conversations; an open project lists just its own (fed from
+        <div className="px-2">
+          {/* The global chat lists all conversations; an open project lists just its own (fed from
             App's project chat session), so a project's history sits here like the global chat's. */}
-        {(view === "chat" || view === "project") && (
-          <div data-help="conversations-list">
-            <p className="px-2 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-faint">
-              Conversations
-            </p>
-            {conversations.length === 0 && (
-              <p className="px-2 py-2 text-xs text-faint">No conversations yet.</p>
-            )}
-            {conversations.map((c) => (
-              // The row controls sit OUTSIDE the NavItem (itself a <button>) — a button can't nest a
-              // button. They're hover-revealed siblings overlaid on the row's right edge; `pr-14` on
-              // the NavItem keeps a long title from sliding under them.
-              <div key={c.id} className="group relative">
-                <NavItem
-                  active={c.id === activeId}
-                  onClick={() => onSelect(c.id)}
-                  className="mb-1 pr-14"
-                >
-                  <span title={c.title}>{c.title}</span>
-                </NavItem>
-                <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setPendingMove(c)}
-                    title="Move to a project"
-                    aria-label={`Move conversation “${c.title}” to a project`}
-                    className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+          {(view === "chat" || view === "project") && (
+            <div data-help="conversations-list">
+              <p className="px-2 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-faint">
+                Conversations
+              </p>
+              {conversations.length === 0 && (
+                <p className="px-2 py-2 text-xs text-faint">No conversations yet.</p>
+              )}
+              {conversations.map((c) => (
+                // The row controls sit OUTSIDE the NavItem (itself a <button>) — a button can't nest a
+                // button. They're hover-revealed siblings overlaid on the row's right edge; `pr-14` on
+                // the NavItem keeps a long title from sliding under them.
+                <div key={c.id} className="group relative">
+                  <NavItem
+                    active={c.id === activeId}
+                    onClick={() => onSelect(c.id)}
+                    className="mb-1 pr-14"
                   >
-                    <span aria-hidden="true">📁</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPendingDelete(c)}
-                    title="Delete chat"
-                    aria-label={`Delete conversation “${c.title}”`}
-                    className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
-                  >
-                    <span aria-hidden="true">🗑</span>
-                  </button>
+                    <span title={c.title}>{c.title}</span>
+                  </NavItem>
+                  <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setPendingMove(c)}
+                      title="Move to a project"
+                      aria-label={`Move conversation “${c.title}” to a project`}
+                      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+                    >
+                      <span aria-hidden="true">📁</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPendingDelete(c)}
+                      title="Delete chat"
+                      aria-label={`Delete conversation “${c.title}”`}
+                      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
+                    >
+                      <span aria-hidden="true">🗑</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
-        )}
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       <ConfirmDialog
@@ -283,7 +300,7 @@ export function Sidebar({
         />
       )}
 
-      <div className="border-t border-border p-2">
+      <div className="shrink-0 border-t border-border p-2">
         {/* The model footer is an optional feature reveal — hidden whole in Minimal mode. Gate the
             entire button (not just the rows) so no empty, hover-highlighting ghost box is left
             behind and the divider sits directly above "What's New". */}

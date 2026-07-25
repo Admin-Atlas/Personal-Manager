@@ -98,6 +98,37 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Review & Teach tabs",
     body: "Show or hide the two 'learning tools' — Review (approve the assistant's filing of new items) and Teach (correct its naming rules and preferences) — together in the sidebar. They're on for the Standard and Power presets and off for Minimal, but you can override that here. Turn them off once the assistant files things well enough on its own that you no longer want to curate; nothing is lost — new items still index and auto-file, and PM keeps applying what you've already taught it. Turn them back on any time.",
   },
+  "settings-map-tab": {
+    title: "Map tab",
+    body: "Show or hide the Map — the semantic picture of everything you've filed, laid out so related things sit near each other. Like the learning tools above, it follows your preset by default: on for Standard and Power, off for Minimal, since a pared-back setup rarely wants an exploratory view. Overriding here wins either way. Hiding it changes nothing about your data or the search behind it; the Map is still there the moment you switch it back on.",
+  },
+
+  // Accessibility tab (each mirrors that section's own folded note, so help mode answers the same
+  // question without the reader having to unfold it).
+  "settings-a11y-text": {
+    title: "Text size",
+    body: "Scales all of PM's text AND its spacing together, the way your browser's zoom does — so lines stay comfortable rather than cramming more in. It's the same control as 'Text size' under Appearance; changing it in either place changes both. Very large sizes may reveal a few places that don't reflow perfectly yet.",
+  },
+  "settings-a11y-contrast": {
+    title: "Text & edge contrast",
+    body: "Sets how strongly PM's text and edges stand out from the background. 'AA' meets the recommended 4.5:1 for body text and is the default on a new install. 'High' goes further (AAA, 7:1) and firms up the faintest text and the borders — useful in bright rooms or on a dim screen. 'Legacy' is PM's original, softer ramp, kept so an existing install's look isn't changed underneath you.",
+  },
+  "settings-a11y-density": {
+    title: "Density",
+    body: "Sets how large PM's controls are, and with them how big a target you have to hit. 'Standard' meets the recommended 24px minimum and is the default on a new install. 'Comfortable' grows targets to 44px, which helps a lot if precise clicking is hard or you're on a touchscreen. 'Compact' keeps PM's original tighter spacing and fits more on screen.",
+  },
+  "settings-a11y-motion": {
+    title: "Animations",
+    body: "'System' follows the reduce-motion setting your device already has, so PM matches everything else you use. 'Reduced' turns PM's animations and transitions off regardless — worth choosing if movement is distracting or causes discomfort. Nothing is hidden either way; things simply appear rather than slide.",
+  },
+  "settings-a11y-font": {
+    title: "Legible font",
+    body: "Switches PM's interface and heading text to Atkinson Hyperlegible, a typeface drawn specifically so easily-confused letters — l and I, O and 0 — stay distinct. Numbers and code keep their monospaced font, where alignment matters more.",
+  },
+  "settings-a11y-color": {
+    title: "Colour-blind-safe palette",
+    body: "Swaps the colours PM uses to tell things apart — Map nodes, calendar sources, and the project status colours — for an Okabe–Ito set chosen to stay distinguishable under the common types of colour vision. Text labels and icons are unaffected, so nothing is ever carried by colour alone.",
+  },
 
   // Command palette (Step 5b)
   "command-palette": {

@@ -41,6 +41,25 @@ interface ResizableResult {
   expand: () => void;
 }
 
+// localStorage can throw (a locked-down webview, private mode, a full quota) — every other pref
+// reader in the app wraps it, and this one didn't. Two of the five calls sit inside `useState`
+// initialisers, so an unguarded throw there happens DURING RENDER of the app shell and takes the
+// whole window down rather than losing a remembered width. Same shape as ThemeContext's read/write.
+function readLs(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writeLs(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* best-effort: the panel still works, it just won't be remembered */
+  }
+}
+
 /**
  * A panel width stored as a *fraction of the window*, never a pixel count, so it stays
  * proportional as the window resizes (per the "relative, not pixel-locked" requirement).
@@ -59,12 +78,10 @@ export function useResizable({
 }: Options): ResizableResult {
   const collapsedKey = `${storageKey}.collapsed`;
   const [frac, setFrac] = useState(() => {
-    const raw = Number(localStorage.getItem(storageKey));
+    const raw = Number(readLs(storageKey));
     return clamp(Number.isFinite(raw) && raw > 0 ? raw : defaultFrac, minFrac, maxFrac);
   });
-  const [collapsed, setCollapsed] = useState(
-    () => collapsible && localStorage.getItem(collapsedKey) === "true",
-  );
+  const [collapsed, setCollapsed] = useState(() => collapsible && readLs(collapsedKey) === "true");
   const [resizing, setResizing] = useState(false);
   const [vw, setVw] = useState(() => window.innerWidth);
   const fracRef = useRef(frac);
@@ -81,8 +98,8 @@ export function useResizable({
   const expand = useCallback(() => {
     setCollapsed(false);
     setFrac(minFrac); // reopen at the minimum so the user can drag it back out
-    localStorage.setItem(collapsedKey, "false");
-    localStorage.setItem(storageKey, String(minFrac));
+    writeLs(collapsedKey, "false");
+    writeLs(storageKey, String(minFrac));
   }, [collapsedKey, minFrac, storageKey]);
 
   const startResize = useCallback(
@@ -119,8 +136,8 @@ export function useResizable({
         window.removeEventListener("pointercancel", finish);
         window.removeEventListener("blur", finish);
         setResizing(false);
-        localStorage.setItem(storageKey, String(fracRef.current));
-        if (collapsible) localStorage.setItem(collapsedKey, String(collapsedDuringDrag));
+        writeLs(storageKey, String(fracRef.current));
+        if (collapsible) writeLs(collapsedKey, String(collapsedDuringDrag));
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", finish);
