@@ -16,6 +16,7 @@ import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
 import { formatDate, formatDateLocal, shortModel } from "../lib/format";
 import { getSettings, ingestNote, setRetrievalConfidenceThreshold } from "../lib/ipc";
+import { VisuallyHidden } from "./ui";
 
 interface Props {
   messages: Message[];
@@ -110,9 +111,32 @@ function Bubble({
           isUser ? "bg-accent text-accent-ink" : "bg-surface text-ink"
         }`}
       >
+        {/* Author, for screen readers only: sighted users read it from left/right alignment + colour. */}
+        <VisuallyHidden>{isUser ? "You said: " : "Assistant said: "}</VisuallyHidden>
         {body}
       </div>
     </div>
+  );
+}
+
+/** A polite, screen-reader-only announcement of the assistant's reply once it finishes streaming. The
+ *  visible bubble updates on every token, which would flood assistive tech, so we announce the whole
+ *  answer once when the stream ends instead. */
+function StreamAnnouncer({ streaming }: { streaming: string | null }) {
+  const [reply, setReply] = useState("");
+  const lastRef = useRef("");
+  useEffect(() => {
+    if (streaming !== null) {
+      lastRef.current = streaming;
+    } else if (lastRef.current) {
+      setReply(lastRef.current);
+      lastRef.current = "";
+    }
+  }, [streaming]);
+  return (
+    <VisuallyHidden role="status" aria-live="polite">
+      {reply}
+    </VisuallyHidden>
   );
 }
 
@@ -527,6 +551,7 @@ export function ChatView({
           />
         ))}
         {streaming !== null && <Bubble role="assistant" content={streaming} />}
+        <StreamAnnouncer streaming={streaming} />
         <div ref={endRef} />
       </div>
     </div>

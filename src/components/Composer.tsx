@@ -157,7 +157,7 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
       {(recording || transcribing || recorder.error) && (
         <div className={`mt-2 ${COMPOSER_GRID}`}>
           <div />
-          <div>
+          <div role="status" aria-live="polite">
             {recording && (
               <p className="text-xs" style={{ color: "var(--st-due)" }}>
                 Recording… click the mic to stop.

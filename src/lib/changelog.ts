@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.65.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "More of PM now works with the keyboard and with screen readers. The “drop files here” area, the file rows in Documents and in a project's file list, and pinboard notes can all be reached and opened with the keyboard now, not just the mouse. Screen readers announce the assistant's reply once it finishes, read progress bars as “3 of 10” rather than a bare percentage, and speak the voice-recording status. The vault passphrase box and its error messages are now properly labelled and announced. And the quick-jump palette (Ctrl/Cmd+K) describes its results list to assistive tech. It's all under the hood -- nothing looks different on screen.",
+    ],
+  },
+  {
     version: "3.64.0-alpha",
     date: "2026-07-25",
     highlights: [

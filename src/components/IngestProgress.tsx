@@ -58,9 +58,13 @@ export function IngestProgress({
     ? formatElapsed(now.getTime() - (startedAt ?? mountedAt.current))
     : null;
 
+  // Spoken value for screen readers: the count (or percent) rather than a bare "%", once known.
+  const valueText =
+    frac === null ? undefined : mode === "percent" ? `${pct}%` : `${processed} of ${total}`;
+
   return (
     <div className={className}>
-      <Progress value={value} label={label} />
+      <Progress value={value} label={label} valueText={valueText} />
       {(showText || elapsed) && (
         // Rendered whenever there's a count line OR an elapsed timer — so at Power the timer is visible
         // even during the shimmer phase, where the count line (which needs a total) is not.

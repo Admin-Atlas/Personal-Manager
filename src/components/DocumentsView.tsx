@@ -26,6 +26,7 @@ import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/
 import { formatDate } from "../lib/format";
 import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
+import { interactiveProps } from "../lib/interactiveProps";
 import { useDepth, useTheme } from "../theme";
 import { Button, Card, Collapsible, ConfirmDialog, Input } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
@@ -693,7 +694,8 @@ export function DocumentsView({ onReviewClick }: Props) {
           {error && status?.state !== "error" && <Banner tone="warn">{error}</Banner>}
 
           <div
-            onClick={pickFiles}
+            {...interactiveProps(() => void pickFiles())}
+            aria-label="Add documents"
             data-help="documents-dropzone"
             className={`cursor-pointer rounded-[var(--radius)] border-2 border-dashed p-10 text-center transition-colors ${
               dragging ? "border-accent bg-surface" : "border-border2 hover:border-border"
@@ -896,6 +898,20 @@ export function DocumentsView({ onReviewClick }: Props) {
                     <Fragment key={doc.id}>
                       <tr
                         onClick={() => openReader(doc)}
+                        // Keyboard access without claiming role="button" (which would break the row's
+                        // table semantics and nest a button inside a button): make the row focusable and
+                        // open on Enter/Space, but only when the row ITSELF has focus — a keypress on the
+                        // inner edit button is a different target and is left to it.
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (
+                            e.target === e.currentTarget &&
+                            (e.key === "Enter" || e.key === " ")
+                          ) {
+                            e.preventDefault();
+                            openReader(doc);
+                          }
+                        }}
                         // F-48: let the browser skip layout/paint for off-screen rows (the table isn't
                         // virtualized and grows with connector estates). `contain-intrinsic-size` reserves
                         // a row-height placeholder so the scrollbar stays stable.

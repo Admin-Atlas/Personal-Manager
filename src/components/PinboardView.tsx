@@ -1134,6 +1134,15 @@ const NoteBody = memo(function NoteBody({
           // pm-note-md scopes the flush-checkbox rule to notes (index.css) without touching chat/reader.
           className="pm-note-md min-h-0 flex-1 cursor-text overflow-auto px-2 text-sm"
           onClick={() => setEditing(true)}
+          // Keyboard path into edit mode. No role/aria-label — it's the note's content region, so its
+          // text stays the accessible name; Enter only edits when the region itself (not a link inside) is focused.
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.target === e.currentTarget && e.key === "Enter") {
+              e.preventDefault();
+              setEditing(true);
+            }
+          }}
           title="Click to edit"
         >
           <Markdown>{toRenderMarkdown(text)}</Markdown>
