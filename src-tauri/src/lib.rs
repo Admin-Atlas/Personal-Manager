@@ -388,6 +388,19 @@ pub struct AppState {
     /// [`session_unavailable_message`] — "access denied" must never masquerade as
     /// "the vault is locked" (the ACL-lockout incident).
     pub vault_fault: Mutex<Option<error::VaultFault>>,
+    /// Single-flight guard for the daily-briefing regeneration. A `tokio::Mutex` rather than the
+    /// [`BusyGuard`] pattern above because the wanted semantics differ: a second caller must WAIT
+    /// for the running generation and take its result, not give up. The briefing is shown in up to
+    /// three places at once (Focus card, sidebar panel, always-on-top window) plus three background
+    /// triggers, and each webview has its own frontend guard that cannot see the others — so
+    /// "collapse concurrent refreshes" has to be enforced here. Without it, two overlapping model
+    /// calls race on the stored trio and can pair an OLDER body with a NEWER timestamp.
+    pub briefing_refresh: tokio::sync::Mutex<()>,
+    /// Set when something that feeds the briefing changes (a calendar sync landing events, a
+    /// milestone edited, a flag resolved). The briefing scheduler consumes it on its next tick, so
+    /// a burst of edits coalesces into ONE check — and that check still only spends a model call
+    /// if the facts actually differ. See [`briefing::nudge`].
+    pub briefing_dirty: AtomicBool,
     /// Local-endpoint runtime (#297): the single-inference slot (chat preempts background), the
     /// dead-host circuit breaker, and the per-endpoint context-window cache. In-memory — a restart
     /// re-probes, since the loaded model / window can change across relaunches.
@@ -1041,6 +1054,8 @@ pub fn run() {
                 backup_busy: AtomicBool::new(false),
                 pending_restore_keys: Mutex::new(std::collections::HashMap::new()),
                 vault_fault: Mutex::new(boot_fault),
+                briefing_refresh: tokio::sync::Mutex::new(()),
+                briefing_dirty: AtomicBool::new(false),
                 local_ai: local_slot::LocalRuntime::default(),
             });
 
@@ -1102,6 +1117,13 @@ pub fn run() {
             // also runs synchronously on every briefing refresh; gated on unlocked + idle + not
             // mid-sync, and a no-op until there are milestones/events in the near window.
             flags::spawn_flag_detection_scheduler(handle.clone());
+
+            // Keep the daily briefing current without the user clicking Refresh (#540): picks up an
+            // inputs-changed nudge (calendar sync, milestone edit, flag resolved) within a minute
+            // and otherwise checks hourly. A check that finds the facts unmoved costs one DB pass
+            // and no model call, so a quiet day is free. The launch check is the frontend's, since
+            // it fires after unlock, when the store is actually open.
+            briefing::spawn_briefing_scheduler(handle.clone());
 
             // Give each conversation a real 5-7 word title (board card 7E) once it has a few turns: a launch
             // pass titles any session that crossed the threshold while the app was closed (the eager
@@ -1328,6 +1350,7 @@ pub fn run() {
             commands::close_briefing_window,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
+            commands::sync_daily_briefing,
             commands::resolve_flag,
             commands::route_focus_input,
             commands::cost_summary,

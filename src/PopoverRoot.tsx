@@ -29,10 +29,11 @@ export function PopoverRoot() {
   return (
     <ThemeProvider>
       <UserTimeProvider>
-        {/* autoRefresh off: the main window's provider already owns the once-a-day stale check, and
-            `refresh_daily_briefing` has no backend single-flight — two providers both deciding the
-            briefing was stale would fire two model calls and race on the stored timestamp. This
-            window shows what is stored and refreshes only when the user asks. */}
+        {/* autoRefresh off: the main window's provider owns the launch check. Since #540 the
+            backend is single-flighted, so a second check here would fold rather than race — but a
+            display-only window still shouldn't be the one deciding when the model runs. It shows
+            what is stored, follows `briefing://updated` for regenerations it didn't start, and
+            calls the model only when the user clicks its own Refresh. */}
         <BriefingProvider autoRefresh={false}>
           <div className="flex h-full flex-col bg-panel text-ink">
             {/* The window is frameless, so this strip is what drags it. `data-tauri-drag-region` is

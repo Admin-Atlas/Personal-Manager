@@ -24,10 +24,14 @@
 //! them.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use chrono_tz::Tz;
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use tauri::{AppHandle, Manager};
 
 use crate::calendar::CalendarEvent;
 use crate::clock;
@@ -37,14 +41,26 @@ use crate::flags::{self, Flag};
 use crate::milestones::{self, Milestone};
 use crate::openrouter::{self, ChatMessage};
 use crate::projects::{ProjectOverview, ProjectStatus};
+use crate::AppState;
 
 /// Settings keys — the briefing lives in the key/value `settings` table (additive
 /// text, no migration), like the Learning-You profile.
 const BRIEFING_KEY: &str = "daily_briefing";
 const BRIEFING_UPDATED_KEY: &str = "daily_briefing_updated_at";
+/// Fingerprint ([`snapshot_fingerprint`]) of the facts the stored briefing was written from. This
+/// is what lets an automatic check tell "nothing has moved" from "re-brief", so the launch / hourly
+/// / inputs-changed triggers cost a DB pass rather than a model call each.
+const BRIEFING_INPUTS_KEY: &str = "daily_briefing_inputs";
 
-/// A briefing older than this reads as stale, so the focus view regenerates it on
-/// open roughly once or twice a day rather than on every mount.
+/// Broadcast to every window after a regeneration lands, so a briefing surface shows the new text
+/// without polling — including the ones nobody clicked (the sidebar panel, the always-on-top
+/// window) and the ones a *background* trigger regenerated behind.
+pub const BRIEFING_UPDATED_EVENT: &str = "briefing://updated";
+
+/// A briefing older than this reads as stale. Now only a FALLBACK: it decides the pre-3.80 case
+/// where a stored briefing has no fingerprint beside it, and seeds the very first briefing. Once a
+/// fingerprint exists, freshness is decided by the facts moving, not by the clock — see
+/// [`auto_refresh_due`].
 const STALE_HOURS: f64 = 12.0;
 
 /// How far ahead the briefing's agenda looks (in step with the §4.1 "Due soon"
@@ -74,11 +90,58 @@ pub fn get_briefing(conn: &Connection) -> Result<DailyBriefing> {
     })
 }
 
-/// Persist a freshly generated briefing + the time it was generated.
-pub fn save_briefing(conn: &Connection, briefing: &str, now: &str) -> Result<()> {
-    db::set_setting(conn, BRIEFING_KEY, briefing)?;
-    db::set_setting(conn, BRIEFING_UPDATED_KEY, now)?;
+/// Persist a freshly generated briefing + the time it was generated + the fingerprint of the facts
+/// it was written from. One transaction, because these three are one fact: a body paired with the
+/// wrong timestamp (or the wrong fingerprint) is exactly the corruption the single-flight guard on
+/// the command exists to prevent, and a torn write would reintroduce it by the back door.
+pub fn save_briefing(
+    conn: &Connection,
+    briefing: &str,
+    now: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    db::set_setting(&tx, BRIEFING_KEY, briefing)?;
+    db::set_setting(&tx, BRIEFING_UPDATED_KEY, now)?;
+    db::set_setting(&tx, BRIEFING_INPUTS_KEY, fingerprint)?;
+    tx.commit()?;
     Ok(())
+}
+
+/// The fingerprint stored beside the current briefing, or `None` for a briefing written before
+/// 3.80 (or none at all).
+pub fn stored_fingerprint(conn: &Connection) -> Result<Option<String>> {
+    db::get_setting(conn, BRIEFING_INPUTS_KEY)
+}
+
+/// Fingerprint the FACTS a briefing was written from, so an automatic trigger can tell whether
+/// anything actually moved before spending a model call.
+///
+/// The snapshot's FIRST line is `Today is <local time> (<zone>).`, which changes every minute —
+/// hashing the whole string would make every check look like a change and turn the schedulers into
+/// a token meter. Everything below it is the substance: the active flags with their dates and day
+/// counts, and the ambient project tail. A day rollover still lands here (yesterday's "in 3 days"
+/// becomes "in 2 days"), which is a re-brief we DO want.
+pub fn snapshot_fingerprint(snapshot: &str) -> String {
+    let facts = snapshot
+        .split_once('\n')
+        .map(|(_, rest)| rest)
+        .unwrap_or(snapshot);
+    crate::ingest::hex_digest(facts.as_bytes())
+}
+
+/// Whether an automatic trigger (launch, the hourly tick, an inputs-changed nudge) should spend a
+/// model call. Pure, so the policy is unit-testable without a DB, a clock or a network — the
+/// manual Refresh button bypasses it entirely and always regenerates.
+///
+/// The rule is content-addressed, not time-addressed: re-brief when the facts differ from the ones
+/// the stored briefing was written from. `stale` is only consulted when there is no fingerprint to
+/// compare against, which means a briefing stored before 3.80 or none at all.
+pub fn auto_refresh_due(stored: Option<&str>, current: &str, stale: bool) -> bool {
+    match stored {
+        Some(fp) => fp != current,
+        None => stale,
+    }
 }
 
 /// True when there's no briefing yet or the stored one is older than [`STALE_HOURS`].
@@ -394,6 +457,91 @@ fn clean(raw: &str) -> String {
     t.trim().to_string()
 }
 
+// --- automatic refresh triggers (launch, hourly, inputs changed) ---
+
+/// How often the scheduler looks at the world. Short because a tick is nearly free — an atomic
+/// read, and on most ticks nothing else. What keeps the MODEL calls rare is [`auto_refresh_due`],
+/// not this interval.
+const TICK_SECS: u64 = 60;
+/// The floor: check at least this often even when nothing nudged, so a day rollover or a deadline
+/// crossing into range is picked up by an app left open. An hour in which no fact moved still
+/// costs no model call — the check ends at the fingerprint comparison.
+const CHECK_INTERVAL_MINUTES: i64 = 60;
+/// RFC3339 stamp of the last automatic check, so the cadence survives a restart (mirrors
+/// [`crate::flags::LAST_FLAG_SCAN_AT_KEY`]).
+pub const LAST_BRIEFING_CHECK_AT_KEY: &str = "last_briefing_check_at";
+
+/// Whether the hourly floor has elapsed. Pure (unit-tested without a clock), mirroring
+/// [`crate::flags`]'s `scan_due`.
+fn check_due(last_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last_at {
+        None => true,
+        Some(last) => {
+            now.signed_duration_since(last) >= ChronoDuration::minutes(CHECK_INTERVAL_MINUTES)
+        }
+    }
+}
+
+/// Tell the scheduler the briefing's inputs may have moved — call after anything that changes the
+/// facts it briefs on (a calendar sync landing new events, a milestone edited, a flag resolved).
+///
+/// Deliberately a FLAG, not a refresh. Editing three milestones in a row would otherwise be three
+/// model calls; setting a flag lets the next tick coalesce the burst into one check, and that check
+/// still only spends a model call if the facts genuinely differ. Takes `&AppState` rather than an
+/// `AppHandle` so a plain synchronous command can call it without changing its signature: one
+/// relaxed atomic store, no lock, no I/O, and nothing that can fail.
+pub fn nudge(state: &AppState) {
+    state.briefing_dirty.store(true, Ordering::Relaxed);
+}
+
+/// Keeps the briefing current without the user asking: picks up a nudge within a minute, and
+/// otherwise checks hourly. Spawned once from `setup` alongside the other schedulers.
+///
+/// Gated on unlocked + not-mid-sync (so it never briefs off a half-synced calendar mirror) and —
+/// like every scheduler here — never holds the DB guard across an `.await` (repo rule #4). Not
+/// idle-gated, unlike the flag backstop: a briefing the user is looking at is exactly the one that
+/// should follow a calendar change, and the fingerprint gate already keeps a quiet hour free.
+pub fn spawn_briefing_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(TICK_SECS)).await;
+
+            // Everything in this block is synchronous, so no guard crosses the `.await` below.
+            let due = {
+                let state = app.state::<AppState>();
+                if state.sync_active() {
+                    continue;
+                }
+                // Check the store BEFORE consuming the nudge: a locked vault must not swallow it.
+                let Ok(conn) = state.conn() else { continue };
+                let nudged = state.briefing_dirty.swap(false, Ordering::Relaxed);
+                nudged
+                    || check_due(
+                        db::get_setting_time(&conn, LAST_BRIEFING_CHECK_AT_KEY),
+                        Utc::now(),
+                    )
+            };
+            if !due {
+                continue;
+            }
+
+            if let Err(e) = crate::commands::refresh_briefing_auto(&app).await {
+                eprintln!("briefing auto-refresh skipped: {e}");
+            }
+            stamp_check(&app);
+        }
+    });
+}
+
+/// Record that a check just happened — whether or not it regenerated, and whether or not it
+/// failed. The stamp paces the CHECK, so a persistent failure (no provider, offline) retries
+/// hourly rather than every minute. Best-effort: a store that locked mid-tick simply skips it.
+fn stamp_check(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let Ok(conn) = state.conn() else { return };
+    let _ = db::set_setting(&conn, LAST_BRIEFING_CHECK_AT_KEY, &Utc::now().to_rfc3339());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +730,76 @@ mod tests {
             "Focus on PM v1 today."
         );
         assert_eq!(clean("  plain briefing  "), "plain briefing");
+    }
+
+    /// The whole cost gate rests on the clock line being line ONE of the snapshot — if a future
+    /// edit moves it, every check would look like a change and quietly start billing per tick.
+    #[test]
+    fn snapshot_puts_the_volatile_clock_line_first() {
+        let snap = build_flag_snapshot(
+            &[],
+            &[],
+            &[overview("Steady", ProjectStatus::OnTrack, vec![])],
+            &[],
+            "2026-07-03T08:00",
+            Tz::UTC,
+        )
+        .unwrap();
+        assert!(snap.lines().next().unwrap().starts_with("Today is "));
+    }
+
+    #[test]
+    fn fingerprint_ignores_the_clock_but_tracks_the_facts() {
+        // Same facts, a minute later — the briefing does not need rewriting.
+        let a = "Today is 2026-07-03T08:00 (UTC).\nOverdue: launch for PM v1\n";
+        let b = "Today is 2026-07-03T08:01 (UTC).\nOverdue: launch for PM v1\n";
+        assert_eq!(snapshot_fingerprint(a), snapshot_fingerprint(b));
+
+        // A fact moved (a new event landed from a calendar sync) — this one is worth a model call.
+        let c = "Today is 2026-07-03T08:00 (UTC).\nOverdue: launch for PM v1\nHappening today: Standup\n";
+        assert_ne!(snapshot_fingerprint(a), snapshot_fingerprint(c));
+
+        // A day rollover changes the rendered day counts, so it re-briefs by itself.
+        let d = "Today is 2026-07-04T08:00 (UTC).\nDue soon: beta for PM v1 - due 2026-07-06 (in 2 days)\n";
+        let e = "Today is 2026-07-03T08:00 (UTC).\nDue soon: beta for PM v1 - due 2026-07-06 (in 3 days)\n";
+        assert_ne!(snapshot_fingerprint(d), snapshot_fingerprint(e));
+
+        // Degenerate input (no newline) still hashes rather than panicking.
+        assert_eq!(
+            snapshot_fingerprint("no newline"),
+            snapshot_fingerprint("no newline")
+        );
+    }
+
+    #[test]
+    fn auto_refresh_is_content_addressed_and_falls_back_to_staleness() {
+        // Fingerprint present: the facts decide, and the clock is irrelevant either way.
+        assert!(
+            !auto_refresh_due(Some("abc"), "abc", true),
+            "unchanged facts never re-brief"
+        );
+        assert!(
+            auto_refresh_due(Some("abc"), "xyz", false),
+            "moved facts always re-brief"
+        );
+        // No fingerprint (a briefing stored before 3.80, or none at all): fall back to staleness.
+        assert!(auto_refresh_due(None, "abc", true));
+        assert!(!auto_refresh_due(None, "abc", false));
+    }
+
+    #[test]
+    fn check_due_respects_the_hourly_floor() {
+        let now = DateTime::parse_from_rfc3339("2026-07-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(check_due(None, now), "never checked -> due");
+        assert!(
+            !check_due(Some(now - ChronoDuration::minutes(59)), now),
+            "within the hour -> not due"
+        );
+        assert!(
+            check_due(Some(now - ChronoDuration::minutes(60)), now),
+            "the hour elapsed -> due"
+        );
     }
 }
