@@ -111,3 +111,72 @@ export function writeFocusUpcomingDays(days: number): void {
     /* best-effort */
   }
 }
+
+// --- which panels the Focus tab shows -----------------------------------------------------------
+// The Focus tab is a stack of self-contained panels, and not everyone wants all of them. This is the
+// user's choice of which to show, in the same "widget" spirit as the calendar's per-calendar
+// visibility — and it borrows that module's shape deliberately (calendarPrefs readHidden/writeHidden).
+//
+// We store what is HIDDEN, not what is visible. That way the default is "everything shows" with no
+// stored state to migrate, and any panel added later ships visible rather than silently absent for
+// everyone who already has a stored preference.
+
+/** The Focus panels a user can switch off. The header is deliberately absent: it carries the control
+ *  that brings a panel back, so hiding it would strand the user with no way to undo. */
+export type FocusPanel = "briefing" | "actions" | "upcoming" | "projects";
+
+/** Display order + labels, shared by the Focus header control and any other lister. */
+export const FOCUS_PANELS: { id: FocusPanel; label: string }[] = [
+  { id: "briefing", label: "Today's briefing" },
+  { id: "actions", label: "Focus box" },
+  { id: "upcoming", label: "Upcoming" },
+  { id: "projects", label: "Projects" },
+];
+
+const FOCUS_HIDDEN_KEY = "pm.focus.hidden";
+const PANEL_IDS = new Set<string>(FOCUS_PANELS.map((p) => p.id));
+
+/** The app-wide "a setting changed" signal, so a mounted Focus view follows a Settings-side reset. */
+const CHANGED_EVENT = "pm:settings-changed";
+
+/** The set of panels the user has switched off. Unreadable or absent ⇒ nothing hidden. */
+export function readFocusHiddenPanels(): Set<FocusPanel> {
+  try {
+    const raw = localStorage.getItem(FOCUS_HIDDEN_KEY);
+    if (raw) {
+      const arr: unknown = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        // Filtered against the known ids, so a stale id from an older build can't hide a panel that
+        // no longer answers to that name.
+        return new Set(
+          arr.filter((x): x is FocusPanel => typeof x === "string" && PANEL_IDS.has(x)),
+        );
+      }
+    }
+  } catch {
+    /* nothing hidden */
+  }
+  return new Set();
+}
+
+export function writeFocusHiddenPanels(hidden: Set<FocusPanel>): void {
+  try {
+    localStorage.setItem(FOCUS_HIDDEN_KEY, JSON.stringify([...hidden]));
+  } catch {
+    /* best-effort */
+  }
+  try {
+    window.dispatchEvent(new Event(CHANGED_EVENT));
+  } catch {
+    /* non-browser context (tests) */
+  }
+}
+
+/** True when no panel is hidden — drives Settings' "Reset Focus" affordance. */
+export function focusPanelsAreDefault(): boolean {
+  return readFocusHiddenPanels().size === 0;
+}
+
+export function resetFocusPanels(): void {
+  writeFocusHiddenPanels(new Set());
+}

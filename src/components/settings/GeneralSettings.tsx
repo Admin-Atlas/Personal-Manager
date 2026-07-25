@@ -29,6 +29,8 @@ import {
   readFocusUpcomingDays,
   readFocusUpcomingMode,
   readFocusUpcomingRange,
+  focusPanelsAreDefault,
+  resetFocusPanels,
   writeFocusLayout,
   writeFocusUpcomingDays,
   writeFocusUpcomingMode,
@@ -262,7 +264,10 @@ export function GeneralSettings() {
   const focusUpcomingIsDefault =
     focusUpcomingMode === "list" && focusUpcomingRange === "day" && focusUpcomingDays === 3;
   const briefingIsDefault = !briefingSidebar && !briefingWindow && briefingPrefsAreDefault();
-  const focusIsDefault = focusLayoutIsDefault && focusUpcomingIsDefault && briefingIsDefault;
+  // Panel visibility is set on the Focus tab itself, but "Reset Focus" must still restore it.
+  const [panelsDefault, setPanelsDefault] = useState(focusPanelsAreDefault);
+  const focusIsDefault =
+    focusLayoutIsDefault && focusUpcomingIsDefault && briefingIsDefault && panelsDefault;
   const helpIsDefault = !help.enabled;
   // The whole tab, minus the deliberately-excluded time zone (device-derived, not a preference).
   const generalIsDefault =
@@ -284,6 +289,8 @@ export function GeneralSettings() {
     writeConfirmDelete(true);
   }
   function resetFocus() {
+    resetFocusPanels();
+    setPanelsDefault(true);
     setBriefingSidebar(false);
     setBriefingWindow(false);
     resetBriefingPrefs();
@@ -789,8 +796,8 @@ export function GeneralSettings() {
         confirmBody={
           <>
             Restores appearance (System, Mode, Accent, Depth, Location), the memory-map view, the
-            pinboard delete confirmation, the Focus tab (including where the briefing shows), and
-            help mode to their defaults. Your time zone is left as-is.
+            pinboard delete confirmation, the Focus tab (which panels it shows and where the
+            briefing appears), and help mode to their defaults. Your time zone is left as-is.
           </>
         }
       />

@@ -98,6 +98,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Review & Teach tabs",
     body: "Show or hide the two 'learning tools' — Review (approve the assistant's filing of new items) and Teach (correct its naming rules and preferences) — together in the sidebar. They're on for the Standard and Power presets and off for Minimal, but you can override that here. Turn them off once the assistant files things well enough on its own that you no longer want to curate; nothing is lost — new items still index and auto-file, and PM keeps applying what you've already taught it. Turn them back on any time.",
   },
+  "focus-panels": {
+    title: "Panels",
+    body: "Choose which parts of the Focus tab you want to see — today's briefing, the focus box, Upcoming, and the projects list. Switch one off and it disappears from the tab; switch it back on here whenever you want it. The count on the button is how many of the four are showing. One panel always has to stay visible, so the last one's tick can't be cleared and the tab can never end up empty. It's remembered on this device, and 'Reset Focus' in Settings brings them all back.",
+  },
   "settings-briefing-sidebar": {
     title: "Today's briefing in the sidebar",
     body: "Pins today's briefing to the bottom of the left sidebar, so what needs doing today stays visible whichever tab you're on. It's the same briefing as the one on the Focus tab — same text, and refreshing either one updates both. Off by default. If you'd rather see it only here, turn the Focus tab's briefing card off from the Panels control on that tab.",
