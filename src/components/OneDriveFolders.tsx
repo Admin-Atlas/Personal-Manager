@@ -113,7 +113,7 @@ export function OneDriveFolders({ email, onSaved }: { email: string; onSaved: ()
 
       {error && <p className="text-xs text-st-due">{error}</p>}
 
-      <p className="text-[11px] text-ink4">
+      <p className="text-[0.6875rem] text-ink4">
         {saving ? "Saving…" : "Changes saved"} — applied next time you{" "}
         <span className="text-ink3">Sync now</span> above.
       </p>

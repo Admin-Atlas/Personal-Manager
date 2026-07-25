@@ -326,7 +326,7 @@ export function CalendarConnection({
           subtitle="Connected accounts + per-source state. No tokens or feed URLs (keychain-only) are ever shown."
           className="mt-4"
         >
-          <div className="grid grid-cols-1 gap-x-6 gap-y-1 font-mono text-[11px] text-ink4 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-x-6 gap-y-1 font-mono text-[0.6875rem] text-ink4 sm:grid-cols-2">
             <span>
               accounts: <span className="text-ink3">{accounts.length}</span>
             </span>
@@ -400,7 +400,7 @@ function AccountBlock({
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate text-sm text-ink">{account.email ?? account.label}</span>
           {unreachable ? (
-            <span className="shrink-0 text-[10px] uppercase tracking-wide text-st-due">
+            <span className="shrink-0 text-[0.625rem] uppercase tracking-wide text-st-due">
               unreachable
             </span>
           ) : (
@@ -429,10 +429,12 @@ function AccountBlock({
                   className="accent-[var(--accent)]"
                 />
                 <span className="truncate">{c.name}</span>
-                {c.is_primary && <span className="font-mono text-[10px] text-ink4">primary</span>}
+                {c.is_primary && (
+                  <span className="font-mono text-[0.625rem] text-ink4">primary</span>
+                )}
                 {c.selected && (
                   <label
-                    className="ml-auto flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-ink4"
+                    className="ml-auto flex shrink-0 cursor-pointer items-center gap-1 text-[0.625rem] text-ink4"
                     title="Keep this calendar on the Calendar tab, but leave it out of reminders, the daily briefing, and chat."
                   >
                     <input
@@ -449,7 +451,7 @@ function AccountBlock({
             ))}
           </ul>
           {calendars.some((c) => c.selected) && (
-            <p className="mt-1 text-[10px] text-ink4">
+            <p className="mt-1 text-[0.625rem] text-ink4">
               &ldquo;Quiet&rdquo; keeps a calendar visible on the Calendar tab but out of reminders,
               the daily briefing, and chat.
             </p>

@@ -218,7 +218,7 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
               {committing ? "Saving…" : "Use this depth"}
             </Button>
           </div>
-          <p className="mt-2 text-[11px] leading-snug text-ink4">
+          <p className="mt-2 text-[0.6875rem] leading-snug text-ink4">
             Depth is the size of the candidate <em>pool</em> the reranker gets to weigh — not how
             many results are shown. Widen it and a note that ranked just below the cut can finally
             reach the reranker; a note beyond it never does, however relevant it is.
@@ -231,7 +231,7 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
 
         {explain && (
           <div className="mt-3">
-            <p className="font-mono text-[11px] text-ink4">
+            <p className="font-mono text-[0.6875rem] text-ink4">
               {explain.embedder_label} · rerank {explain.reranking_enabled ? "on" : "off"}
               {explain.reranking_enabled ? ` (applied: ${explain.reranked ? "yes" : "no"})` : ""} ·
               k={explain.k}

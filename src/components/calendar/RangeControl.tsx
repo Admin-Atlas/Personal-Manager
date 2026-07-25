@@ -139,7 +139,7 @@ function RangeEditor({
           title="Set hours"
           aria-label={`Set ${rangeKey} hours`}
           className={cn(
-            "rounded-r-[var(--radius-sm)] px-1 py-1 text-[10px] transition",
+            "inline-flex items-center justify-center min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] rounded-r-[var(--radius-sm)] text-[0.625rem] transition",
             active ? "text-accent-ink" : "text-ink4 hover:text-ink",
           )}
         >
@@ -182,7 +182,7 @@ function RangeEditor({
           <button
             type="button"
             onClick={onReset}
-            className="text-[11px] text-accent-text hover:underline"
+            className="text-[0.6875rem] text-accent-text hover:underline"
           >
             Reset to default
           </button>

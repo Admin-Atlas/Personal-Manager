@@ -226,8 +226,10 @@ function PromptPanel({ messages }: { messages: PromptMessage[] }) {
       <div className="flex flex-col gap-2 border-t border-rule px-2 py-2">
         {messages.map((m, i) => (
           <div key={i}>
-            <div className="font-mono text-[10px] uppercase tracking-wide text-ink4">{m.role}</div>
-            <pre className="mt-0.5 whitespace-pre-wrap break-words font-mono text-[11px] leading-snug text-ink2">
+            <div className="font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
+              {m.role}
+            </div>
+            <pre className="mt-0.5 whitespace-pre-wrap break-words font-mono text-[0.6875rem] leading-snug text-ink2">
               {m.content}
             </pre>
           </div>
@@ -286,7 +288,7 @@ function ConfidenceReadout({ confidence }: { confidence: GroundingConfidence }) 
   const top = confidence.top_score === null ? "— (ungrounded)" : confidence.top_score.toFixed(2);
   const thr = confidence.threshold === null ? "off" : confidence.threshold.toFixed(2);
   return (
-    <div className="select-text font-mono text-[10px] leading-snug text-ink4">
+    <div className="select-text font-mono text-[0.625rem] leading-snug text-ink4">
       confidence · top {top} · threshold {thr} · gated {confidence.gated ? "yes" : "no"}
     </div>
   );
@@ -334,7 +336,7 @@ function ConfidenceThresholdControl() {
     }
   };
   return (
-    <div className="flex items-center gap-2 font-mono text-[10px] text-ink4">
+    <div className="flex items-center gap-2 font-mono text-[0.625rem] text-ink4">
       <span className="uppercase tracking-wide">confidence gate</span>
       <button
         type="button"
@@ -445,7 +447,7 @@ const MessageBlock = memo(function MessageBlock({
         <SaveAsNoteButton message={message} />
       )}
       {showProvenance && message.role === "assistant" && atLeast("standard") && message.model && (
-        <p className="px-1 text-[10px] text-faint" data-help="chat-provenance">
+        <p className="px-1 text-[0.625rem] text-faint" data-help="chat-provenance">
           via {shortModel(message.model)}
           {provider ? ` · ${provider}` : ""}
         </p>

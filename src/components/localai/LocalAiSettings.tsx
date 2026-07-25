@@ -293,7 +293,7 @@ export function LocalAiSettings() {
             Recommended models
           </label>
           {!loading && recs && recs.curated.length > 0 && (
-            <span className="shrink-0 text-[11px] text-ink4">
+            <span className="shrink-0 text-[0.6875rem] text-ink4">
               {recs.curated.length} in the catalog
             </span>
           )}
@@ -521,7 +521,7 @@ function FitBadge({ verdict }: { verdict: LocalFitVerdict }) {
   const v = VERDICT[verdict];
   return (
     <span
-      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] font-medium"
+      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] font-medium"
       style={{
         color: `var(${v.token})`,
         background: `color-mix(in oklab, var(${v.token}) 15%, transparent)`,
@@ -671,12 +671,12 @@ function ConfigRow({ label, fit }: { label: string; fit: LocalFitResult }) {
   return (
     <div>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-        <span className="shrink-0 text-[10px] font-medium text-ink3">{label}</span>
-        <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
+        <span className="shrink-0 text-[0.625rem] font-medium text-ink3">{label}</span>
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[0.6875rem] text-ink4">
           <ConfigMetrics fit={fit} />
         </div>
       </div>
-      {caveat && <p className="mt-0.5 text-[10px] text-faint">{caveat}</p>}
+      {caveat && <p className="mt-0.5 text-[0.625rem] text-faint">{caveat}</p>}
     </div>
   );
 }
@@ -713,33 +713,35 @@ function RecommendationCard({
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="text-sm font-medium text-ink">{rec.display_name}</span>
             <FitBadge verdict={f.verdict} />
-            {isMoe && <span className="text-[10px] text-ink4">MoE</span>}
-            {rec.multimodal && <span className="text-[10px] text-ink4">vision</span>}
-            {rec.reasoning && <span className="text-[10px] text-ink4">reasoning</span>}
-            {rec.role_hint && <span className="text-[10px] text-ink4">suits {rec.role_hint}</span>}
+            {isMoe && <span className="text-[0.625rem] text-ink4">MoE</span>}
+            {rec.multimodal && <span className="text-[0.625rem] text-ink4">vision</span>}
+            {rec.reasoning && <span className="text-[0.625rem] text-ink4">reasoning</span>}
+            {rec.role_hint && (
+              <span className="text-[0.625rem] text-ink4">suits {rec.role_hint}</span>
+            )}
           </div>
           {rec.gpu.kind === "split" ? (
             <div className="mt-1 space-y-1">
-              <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[0.6875rem] text-ink4">
                 <span>
                   {rec.parameters_b}B{isMoe ? " total" : ""}
                 </span>
                 {isMoe && <span>{rec.active_parameters_b}B active</span>}
               </div>
-              <p className="text-[10px] text-ink4">
+              <p className="text-[0.625rem] text-ink4">
                 Two ways to run it here — same model, lighter settings for speed:
               </p>
               <ConfigRow label="Highest quality" fit={f} />
               <ConfigRow label="Fastest on GPU" fit={rec.gpu.fit} />
               {canPull && (
-                <p className="text-[10px] text-faint">
+                <p className="text-[0.625rem] text-faint">
                   Download fetches the runner's default quant — set the quant &amp; context to
                   match.
                 </p>
               )}
             </div>
           ) : (
-            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-ink4">
+            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[0.6875rem] text-ink4">
               <span>
                 {rec.parameters_b}B{isMoe ? " total" : ""}
               </span>
@@ -778,7 +780,7 @@ function RecommendationCard({
               style={{ width: pct != null ? `${pct}%` : "100%" }}
             />
           </div>
-          <p className="mt-1 font-mono text-[10px] text-ink4">
+          <p className="mt-1 font-mono text-[0.625rem] text-ink4">
             {pullProg?.status ?? "starting…"}
             {pullProg?.total_bytes
               ? ` · ${fmtBytes(pullProg.completed_bytes)} / ${fmtBytes(pullProg.total_bytes)}`
@@ -789,7 +791,7 @@ function RecommendationCard({
 
       {!installed && !canPull && tag && (
         <div className="mt-2 flex items-center gap-2">
-          <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[11px] text-ink3">
+          <code className="min-w-0 flex-1 truncate rounded-[var(--radius-sm)] bg-surface px-2 py-1 font-mono text-[0.6875rem] text-ink3">
             ollama pull {tag}
           </code>
           <Button
@@ -806,7 +808,7 @@ function RecommendationCard({
         ? // Each Split row states its own caveat (and KV chip) via ConfigRow — nothing shared to add.
           null
         : f.notes.length > 0 && (
-            <p className="mt-1.5 text-[11px] text-faint">{f.notes.join(" ")}</p>
+            <p className="mt-1.5 text-[0.6875rem] text-faint">{f.notes.join(" ")}</p>
           )}
     </div>
   );
@@ -829,7 +831,7 @@ function StatusChip({ status }: { status: LocalLlmStatus | null }) {
   }
   return (
     <span
-      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] font-medium"
+      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] font-medium"
       style={{
         color: `var(${token})`,
         background: `color-mix(in oklab, var(${token}) 15%, transparent)`,
@@ -900,7 +902,7 @@ function RoleRow({
     <div>
       <div className="flex items-baseline justify-between gap-3">
         <span className="text-sm font-medium text-ink2">{label}</span>
-        <span className="text-[11px] text-ink4">{hint}</span>
+        <span className="text-[0.6875rem] text-ink4">{hint}</span>
       </div>
       <div className="mt-1.5 flex flex-wrap items-center gap-2">
         <Select

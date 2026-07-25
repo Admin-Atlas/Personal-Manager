@@ -170,7 +170,7 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
   }, [gridDays, days]);
 
   const navBtn =
-    "rounded-[var(--radius-sm)] px-1.5 py-0.5 text-ink3 transition hover:bg-surface hover:text-ink2";
+    "inline-flex items-center justify-center min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] rounded-[var(--radius-sm)] px-1.5 py-0.5 text-ink3 transition hover:bg-surface hover:text-ink2";
 
   return (
     <Card className="mb-5 px-4 py-3" data-help="focus-agenda">

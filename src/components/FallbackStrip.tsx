@@ -3,6 +3,7 @@
 
 import type { ChatFallback } from "../lib/types";
 import { shortModel } from "../lib/format";
+import { IconButton } from "./ui";
 
 /**
  * Map the backend fallback slug (`ChatEvent::Fallback.reason`, e.g. `hard_failure:timeout` /
@@ -58,15 +59,9 @@ export function FallbackStrip({
         This reply came from the cloud — {fallbackCopy(fallback.reason)}
         {fallback.to_model ? ` (via ${shortModel(fallback.to_model)})` : ""}.
       </span>
-      <button
-        type="button"
-        onClick={onDismiss}
-        title="Dismiss"
-        aria-label="Dismiss"
-        className="shrink-0 text-ink4 hover:text-ink2"
-      >
+      <IconButton label="Dismiss" variant="subtle" onClick={onDismiss} className="shrink-0">
         ✕
-      </button>
+      </IconButton>
     </div>
   );
 }

@@ -101,7 +101,7 @@ export function AllDayBand({
         className="flex shrink-0 items-start justify-end pr-2 pt-1"
         style={{ width: `${gutterPx}px` }}
       >
-        {showLabel && <span className="font-mono text-[9px] text-faint">all-day</span>}
+        {showLabel && <span className="font-mono text-[0.5625rem] text-faint">all-day</span>}
       </div>
       <div className="relative flex-1" style={{ height: `${laneCount * LANE_H}px` }}>
         {placed.map((b) => {
@@ -114,7 +114,7 @@ export function AllDayBand({
             <div
               key={b.ev.id}
               className={cn(
-                "absolute overflow-hidden px-1.5 text-[11px] leading-[18px]",
+                "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[1.125rem]",
                 clickable && "cursor-pointer hover:brightness-110",
                 past && PAST_EVENT_CLASS,
               )}

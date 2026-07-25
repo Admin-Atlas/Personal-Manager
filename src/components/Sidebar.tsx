@@ -86,7 +86,7 @@ function ConversationRow({
           onClick={() => onMove(c)}
           title="Move to a project"
           aria-label={`Move conversation “${c.title}” to a project`}
-          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+          className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
         >
           <span aria-hidden="true">📁</span>
         </button>
@@ -95,7 +95,7 @@ function ConversationRow({
           onClick={() => onDelete(c)}
           title="Delete chat"
           aria-label={`Delete conversation “${c.title}”`}
-          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
+          className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
         >
           <span aria-hidden="true">🗑</span>
         </button>
@@ -223,7 +223,7 @@ export function Sidebar({
           <span className="font-head text-sm font-semibold tracking-wide text-ink">PM</span>
           <span
             title="PM is in alpha — under active development; expect rough edges and changes between updates."
-            className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wide text-accent-text"
+            className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[0.625rem] font-medium uppercase tracking-wide text-accent-text"
           >
             Alpha
           </span>
@@ -489,7 +489,7 @@ function ModelRow({ role, id, fallbacks }: { role: string; id: string | null; fa
       </span>
       {fallbacks > 0 && (
         <span
-          className="shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1 font-mono text-[10px] text-accent-text"
+          className="shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1 font-mono text-[0.625rem] text-accent-text"
           title={`${fallbacks} auto-switch fallback${fallbacks === 1 ? "" : "s"}`}
         >
           +{fallbacks}

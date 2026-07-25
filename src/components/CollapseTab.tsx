@@ -20,7 +20,7 @@ export function CollapseTab({ side, onExpand }: Props) {
       onClick={onExpand}
       title="Show panel"
       aria-label="Show panel"
-      className={`flex h-full w-5 shrink-0 items-center justify-center bg-panel text-ink4 transition-colors hover:bg-surface hover:text-ink ${
+      className={`flex h-full w-5 min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center bg-panel text-ink4 transition-colors hover:bg-surface hover:text-ink ${
         side === "left" ? "border-r border-border" : "border-l border-border"
       }`}
     >

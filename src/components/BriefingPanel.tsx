@@ -19,6 +19,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Briefing } from "./Briefing";
+import { IconButton } from "./ui";
 import { useBriefing } from "../lib/briefing";
 import {
   clampPanel,
@@ -114,22 +115,21 @@ export function BriefingPanel() {
         className="flex shrink-0 cursor-grab touch-none items-center justify-between gap-2 border-b border-border px-2 py-1 active:cursor-grabbing"
       >
         {/* Same title as the always-on-top window's strip (PopoverRoot) — one briefing, one name. */}
-        <span className="font-mono text-[11px] uppercase tracking-wide text-faint">
+        <span className="font-mono text-[0.6875rem] uppercase tracking-wide text-faint">
           Briefing — Today
         </span>
-        <button
-          type="button"
+        <IconButton
+          label="Hide the floating briefing"
+          title="Hide the floating briefing (turn it back on in Settings → General → Focus)"
           onPointerDown={(e) => e.stopPropagation()}
           onClick={() => {
             setEnabled(false);
             writeBriefingFloat("off");
           }}
-          title="Hide the floating briefing (turn it back on in Settings → General → Focus)"
-          aria-label="Hide the floating briefing"
-          className="rounded-[var(--radius-sm)] px-1.5 text-xs text-ink4 hover:bg-surface hover:text-ink"
+          className="text-xs"
         >
           <span aria-hidden="true">✕</span>
-        </button>
+        </IconButton>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">

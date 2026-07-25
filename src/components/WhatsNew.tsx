@@ -42,13 +42,13 @@ export function WhatsNew({
             <div className="flex items-baseline gap-2">
               <h2 className="font-head text-sm font-semibold text-ink">Version {entry.version}</h2>
               {entry.version === currentVersion && (
-                <span className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wide text-accent-text">
+                <span className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[0.625rem] font-medium uppercase tracking-wide text-accent-text">
                   Current
                 </span>
               )}
               {entry.release && (
                 <span
-                  className="rounded-[var(--radius-sm)] bg-accent px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wide text-accent-ink"
+                  className="rounded-[var(--radius-sm)] bg-accent px-1.5 py-0.5 font-mono text-[0.625rem] font-medium uppercase tracking-wide text-accent-ink"
                   title="A tagged release — the version that shipped, not an interim dev build"
                 >
                   Release

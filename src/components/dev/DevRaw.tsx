@@ -15,7 +15,7 @@ export interface DevRawProps {
 
 export function DevRaw({ label = "dev", fields }: DevRawProps) {
   return (
-    <div className="mt-2 border-t border-rule pt-1.5 font-mono text-[11px] leading-5 text-ink4">
+    <div className="mt-2 border-t border-rule pt-1.5 font-mono text-[0.6875rem] leading-5 text-ink4">
       <span className="uppercase tracking-wide text-ink3">{label}</span>{" "}
       {fields.map(([k, v], i) => (
         <span key={k}>

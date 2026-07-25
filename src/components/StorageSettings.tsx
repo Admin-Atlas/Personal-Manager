@@ -208,7 +208,7 @@ function StatusChip({ status }: { status: StorageComponent["status"] }) {
   const label =
     status === "required" ? "Required" : status === "in_use" ? "In use" : "Needs a step first";
   return (
-    <span className="rounded-[var(--radius-sm)] bg-bg px-1.5 py-0.5 font-mono text-[11px] text-ink4">
+    <span className="rounded-[var(--radius-sm)] bg-bg px-1.5 py-0.5 font-mono text-[0.6875rem] text-ink4">
       {label}
     </span>
   );

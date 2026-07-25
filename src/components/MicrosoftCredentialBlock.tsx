@@ -155,8 +155,8 @@ function ClientSetupGuide() {
       <li>
         3. Under <span className="text-ink2">Redirect URI</span>, pick platform{" "}
         <span className="text-ink2">Public client/native (mobile &amp; desktop)</span> and enter{" "}
-        <span className="font-mono text-[11px] text-ink2">http://127.0.0.1</span>. (You can also do
-        this later under{" "}
+        <span className="font-mono text-[0.6875rem] text-ink2">http://127.0.0.1</span>. (You can
+        also do this later under{" "}
         <span className="text-ink2">
           Authentication → Add a platform → Mobile and desktop applications
         </span>
@@ -173,8 +173,8 @@ function ClientSetupGuide() {
         <span className="text-ink2">Files.Read</span> — ask your admin, or use a personal Microsoft
         account instead. The “unverified app” notice is expected — continue past it. If the browser
         can’t reach the sign-in page, double-check the redirect URI is exactly{" "}
-        <span className="font-mono text-[11px] text-ink2">http://127.0.0.1</span> under Mobile &amp;
-        desktop.
+        <span className="font-mono text-[0.6875rem] text-ink2">http://127.0.0.1</span> under Mobile
+        &amp; desktop.
       </li>
     </ol>
   );

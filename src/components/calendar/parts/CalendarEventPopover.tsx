@@ -21,7 +21,7 @@ import { eventFlags, openUrl } from "../../../lib/ipc";
 import { formatClock, formatDateLocal } from "../../../lib/format";
 import { parseLocal } from "../../../lib/calendar-layout";
 import { useDepth } from "../../../theme";
-import { Button } from "../../ui";
+import { Button, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
 
 interface Props {
@@ -206,14 +206,9 @@ export function CalendarEventPopover({
             <span className="truncate">{calendar?.name ?? "Calendar"}</span>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close"
-          className="shrink-0 rounded-[var(--radius-sm)] px-1.5 text-ink4 hover:bg-surface hover:text-ink"
-        >
+        <IconButton label="Close" onClick={onClose} className="shrink-0">
           ×
-        </button>
+        </IconButton>
       </div>
 
       {/* Body */}
@@ -288,7 +283,7 @@ export function CalendarEventPopover({
 
         {/* Power-depth provenance: status, visibility, recurrence UID, timestamps. */}
         {showPower && (
-          <div className="mt-1 flex flex-col gap-1 border-t border-border pt-2 text-[11px] text-ink4">
+          <div className="mt-1 flex flex-col gap-1 border-t border-border pt-2 text-[0.6875rem] text-ink4">
             {event.status && <div>Status: {event.status}</div>}
             {event.visibility && <div>Visibility: {event.visibility}</div>}
             {event.uid && <div className="break-all">UID: {event.uid}</div>}

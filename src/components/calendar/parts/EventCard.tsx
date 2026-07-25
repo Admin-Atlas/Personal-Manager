@@ -92,11 +92,11 @@ export function EventCard({
           : undefined
       }
     >
-      <div className="truncate font-head text-[11px] font-medium leading-tight text-ink">
+      <div className="truncate font-head text-[0.6875rem] font-medium leading-tight text-ink">
         {summary}
       </div>
-      {withTime && <div className="truncate font-mono text-[9px] text-ink4">{timeLabel}</div>}
-      {withLoc && <div className="truncate font-mono text-[9px] text-ink4">{location}</div>}
+      {withTime && <div className="truncate font-mono text-[0.5625rem] text-ink4">{timeLabel}</div>}
+      {withLoc && <div className="truncate font-mono text-[0.5625rem] text-ink4">{location}</div>}
     </div>
   );
 }

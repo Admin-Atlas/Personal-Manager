@@ -72,7 +72,9 @@ export function TerminalYearTable({ cursor, events, onSelectDay }: Props) {
               )}
             >
               {new Date(year, m, 1).toLocaleDateString(undefined, { month: "long" })}
-              {m === currentMonth && <span className="text-[10px] text-accent-text">❮ now</span>}
+              {m === currentMonth && (
+                <span className="text-[0.625rem] text-accent-text">❮ now</span>
+              )}
             </div>
             <MiniMonth
               year={year}

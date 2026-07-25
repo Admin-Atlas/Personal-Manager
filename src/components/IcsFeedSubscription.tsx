@@ -91,7 +91,7 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
           {scoped ? "Apple Calendar" : "Calendar subscription (iCal)"}
         </span>
         <span
-          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-st-quick"
+          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 font-mono text-[0.625rem] uppercase tracking-wide text-st-quick"
           style={{ background: "color-mix(in oklab, var(--st-quick) 18%, transparent)" }}
         >
           no sign-in
@@ -302,8 +302,8 @@ function FeedGuide({ only }: { only?: "apple" }) {
           </li>
           <li>
             3. <span className="text-ink2">Copy Link</span>. If it starts with{" "}
-            <span className="font-mono text-[11px] text-ink2">webcal://</span>, change it to{" "}
-            <span className="font-mono text-[11px] text-ink2">https://</span>.
+            <span className="font-mono text-[0.6875rem] text-ink2">webcal://</span>, change it to{" "}
+            <span className="font-mono text-[0.6875rem] text-ink2">https://</span>.
           </li>
         </ol>
       </div>

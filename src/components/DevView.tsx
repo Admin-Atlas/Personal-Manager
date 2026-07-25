@@ -224,7 +224,7 @@ export function DevView() {
                 <p className="text-xs text-ink3">Readable dirs (everything else is denied):</p>
                 <ul className="mt-1 flex flex-col gap-0.5">
                   {sandbox.granted_dirs.map((d) => (
-                    <li key={d} className="break-all font-mono text-[11px] text-ink4">
+                    <li key={d} className="break-all font-mono text-[0.6875rem] text-ink4">
                       {d}
                     </li>
                   ))}
@@ -309,7 +309,7 @@ export function DevView() {
 
             {explain && (
               <div className="mt-3">
-                <p className="font-mono text-[11px] text-ink4">
+                <p className="font-mono text-[0.6875rem] text-ink4">
                   {explain.embedder_label} · rerank {explain.reranking_enabled ? "on" : "off"}
                   {explain.reranking_enabled
                     ? ` (applied: ${explain.reranked ? "yes" : "no"})`

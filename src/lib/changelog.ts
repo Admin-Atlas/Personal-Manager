@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.81.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Two accessibility touch-ups, both invisible unless you go looking. First, the Text size control now reaches the last few spots that used to ignore it -- a scattering of small labels (badges, timestamps, counts) were pinned to a fixed pixel size and stayed put when you scaled text up; they now grow with everything else, so Large and XL are consistent throughout. Second, small icon-only buttons -- the little ✕, chevron, folder and trash controls dotted around the calendar, pinboard, reader and sidebar -- now have a comfortably larger click/tap area (at least 24px, more on the Comfortable density) even though the icon itself looks the same, so they're easier to hit. Nothing changes how PM looks at your current settings.",
+    ],
+  },
+  {
     version: "3.80.0-alpha",
     date: "2026-07-25",
     highlights: [

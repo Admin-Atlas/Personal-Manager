@@ -122,7 +122,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
 
           {/* Count, a price-sort toggle, and the column hint for the prices. */}
           {models && !error && (
-            <div className="flex items-center gap-2 px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-faint">
+            <div className="flex items-center gap-2 px-3 py-1 font-mono text-[0.625rem] uppercase tracking-wide text-faint">
               <span>
                 {filtered.length} model{filtered.length === 1 ? "" : "s"}
               </span>
@@ -132,7 +132,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
                   setSort((s) => (s === "default" ? "asc" : s === "asc" ? "desc" : "default"))
                 }
                 title="Sort by input price"
-                className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] normal-case tracking-normal hover:bg-surface"
+                className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] normal-case tracking-normal hover:bg-surface"
               >
                 Sort: {sort === "asc" ? "price ↑" : sort === "desc" ? "price ↓" : "default"}
               </Button>
@@ -176,7 +176,7 @@ export function ModelPicker({ value, onChange, triggerLabel = "Choose a model…
                       {modelTags(m).map((t) => (
                         <span
                           key={t.label}
-                          className={`rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] font-medium ${t.cls}`}
+                          className={`rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] font-medium ${t.cls}`}
                         >
                           {t.label}
                         </span>

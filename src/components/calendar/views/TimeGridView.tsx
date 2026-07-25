@@ -298,7 +298,9 @@ export function TimeGridView({
             <div className={cn("font-mono text-sm", c.isToday ? "text-accent-text" : "text-ink2")}>
               {c.day.getDate()}
             </div>
-            {showPower && <div className="font-mono text-[10px] text-ink4">{c.count} events</div>}
+            {showPower && (
+              <div className="font-mono text-[0.625rem] text-ink4">{c.count} events</div>
+            )}
           </div>
         ))}
       </div>
@@ -329,7 +331,7 @@ export function TimeGridView({
                   h === 0 ? null : (
                     <div
                       key={h}
-                      className="absolute right-1 -translate-y-1/2 font-mono text-[9px] text-ink4"
+                      className="absolute right-1 -translate-y-1/2 font-mono text-[0.5625rem] text-ink4"
                       style={{ top: `${h * rowH}px` }}
                     >
                       {lab}
@@ -342,7 +344,7 @@ export function TimeGridView({
               {Array.from({ length: HOURS }, (_, h) => h).map((h) => (
                 <div
                   key={h}
-                  className="absolute right-2 -translate-y-1/2 font-mono text-[10px] text-ink4"
+                  className="absolute right-2 -translate-y-1/2 font-mono text-[0.625rem] text-ink4"
                   style={{ top: `${h * rowH}px` }}
                 >
                   {h === 0 ? "" : `${String(h).padStart(2, "0")}:00`}

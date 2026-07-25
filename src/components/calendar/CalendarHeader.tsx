@@ -141,7 +141,7 @@ export function CalendarHeader({
           {syncing ? "Refreshing…" : "Refresh"}
         </Button>
         <div className="flex items-center gap-2">
-          <span className="rounded-[var(--radius-sm)] border border-border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink4">
+          <span className="rounded-[var(--radius-sm)] border border-border px-1.5 py-0.5 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
             Read-only
           </span>
           {showMeta && synced && (

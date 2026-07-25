@@ -211,7 +211,9 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
       </div>
 
       <div>
-        <div className="font-mono text-[10px] uppercase tracking-wide text-ink4">Shared drives</div>
+        <div className="font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
+          Shared drives
+        </div>
         {drives && drives.length === 0 ? (
           <p className="mt-1 text-xs text-ink4">No shared drives are available on this account.</p>
         ) : (
@@ -229,7 +231,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
                       <input type="checkbox" checked disabled className="cursor-not-allowed" />
                       <span className="truncate text-ink3">{d.name}</span>
                     </div>
-                    <p className="mt-0.5 pl-5 text-[11px] text-ink4">
+                    <p className="mt-0.5 pl-5 text-[0.6875rem] text-ink4">
                       Already synced by <span className="text-ink3">{ownedBy}</span> — shared drives
                       are indexed once across your accounts.
                     </p>
@@ -283,7 +285,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
       </div>
 
       <div>
-        <div className="font-mono text-[10px] uppercase tracking-wide text-ink4">
+        <div className="font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
           Shared with me
         </div>
         <label className="mt-2 flex items-start gap-2 text-xs">
@@ -324,7 +326,7 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
 
       {error && <p className="text-xs text-st-due">{error}</p>}
 
-      <p className="text-[11px] text-ink4">
+      <p className="text-[0.6875rem] text-ink4">
         {saving ? "Saving…" : "Changes saved"} — applied next time you{" "}
         <span className="text-ink3">Sync now</span> above.
       </p>
@@ -374,7 +376,7 @@ function RootFilesToggle({
   onChange: (on: boolean) => void;
 }) {
   return (
-    <label className="mt-2 flex items-start gap-2 text-[11px]">
+    <label className="mt-2 flex items-start gap-2 text-[0.6875rem]">
       <input
         type="checkbox"
         checked={checked}
@@ -457,7 +459,7 @@ function SharedWithMeRoots({
 
   return (
     <>
-      <p className="mt-2 flex items-center justify-between gap-2 text-[11px] text-ink4">
+      <p className="mt-2 flex items-center justify-between gap-2 text-[0.6875rem] text-ink4">
         <span>
           {roots.length} shared item{roots.length === 1 ? "" : "s"}
           {chosen > 0 ? ` · ${chosen} selected` : ""}
@@ -492,7 +494,7 @@ function SharedWithMeRoots({
                 </span>
               </label>
               {ownedBy && (
-                <p className="mt-0.5 pl-5 text-[11px] text-ink4">
+                <p className="mt-0.5 pl-5 text-[0.6875rem] text-ink4">
                   Already synced by <span className="text-ink3">{ownedBy}</span>.
                 </p>
               )}

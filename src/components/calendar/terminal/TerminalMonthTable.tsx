@@ -45,7 +45,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
         {weekdayLabels.map((w, i) => (
           <div
             key={i}
-            className="px-2 py-1 text-center text-[10px] lowercase tracking-wide text-ink3"
+            className="px-2 py-1 text-center text-[0.625rem] lowercase tracking-wide text-ink3"
           >
             {w}
           </div>
@@ -85,7 +85,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                       {cell.date.getDate()}
                     </span>
                     {showPower && cell.chips.length > 0 && (
-                      <span className="text-[10px] text-ink4">{cell.chips.length}</span>
+                      <span className="text-[0.625rem] text-ink4">{cell.chips.length}</span>
                     )}
                   </div>
 
@@ -103,7 +103,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                         />
                       ))}
                       {dotsHidden > 0 && (
-                        <span className="text-[9px] text-ink4">+{dotsHidden}</span>
+                        <span className="text-[0.5625rem] text-ink4">+{dotsHidden}</span>
                       )}
                     </div>
                   ) : (
@@ -114,7 +114,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                           <div
                             key={ev.id}
                             className={cn(
-                              "flex items-center gap-1 overflow-hidden border-l-2 pl-1 text-[11px] leading-tight",
+                              "flex items-center gap-1 overflow-hidden border-l-2 pl-1 text-[0.6875rem] leading-tight",
                               clickable && "cursor-pointer hover:brightness-110",
                               isEventPast(ev, nowDate) && PAST_EVENT_CLASS,
                             )}
@@ -139,7 +139,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                             }
                           >
                             {showMeta && !ev.all_day && formatClockIso(ev.start) && (
-                              <span className="shrink-0 text-[9px] text-ink4">
+                              <span className="shrink-0 text-[0.5625rem] text-ink4">
                                 {formatClockIso(ev.start)}
                               </span>
                             )}
@@ -148,7 +148,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                         );
                       })}
                       {hiddenCount > 0 && (
-                        <span className="pl-1 text-[10px] text-ink4">+{hiddenCount} more</span>
+                        <span className="pl-1 text-[0.625rem] text-ink4">+{hiddenCount} more</span>
                       )}
                     </div>
                   )}
@@ -170,7 +170,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                   <div
                     key={b.ev.id}
                     className={cn(
-                      "absolute overflow-hidden px-1.5 text-[11px] leading-[14px]",
+                      "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[0.875rem]",
                       onEventClick && "pointer-events-auto cursor-pointer hover:brightness-110",
                       isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
                     )}
