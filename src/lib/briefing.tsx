@@ -8,13 +8,17 @@
 // the Sidebar renders in EVERY view: a sidebar panel and the Focus card are mounted AT THE SAME TIME
 // whenever the user is on Focus. Two independent copies of the old logic would each run its own
 // mount effect, each call `getDailyBriefing()`, and each hit the "if stale, regenerate" branch —
-// and `refresh_daily_briefing` has no single-flight guard on the backend. Two concurrent refreshes
-// mean two model calls, two usage-log rows, and a last-write-wins race on the two settings keys that
-// can pair an OLDER body with a NEWER timestamp. A Refresh clicked in one surface also wouldn't
-// reach the other, because the module cache was only read in a `useState` initialiser.
+// two model calls, two usage-log rows, and a last-write-wins race on the stored keys that can pair
+// an OLDER body with a NEWER timestamp. A Refresh clicked in one surface also wouldn't reach the
+// other, because the module cache was only read in a `useState` initialiser.
 //
 // So this is a provider, mirroring `reader.tsx`: one piece of state, one in-flight latch, one set of
 // subscribers. Every surface renders `<Briefing>` against `useBriefing()` and they cannot disagree.
+//
+// This latch covers ONE webview. Since #540 the same guarantee holds ACROSS windows — the backend
+// command is single-flighted too — so the two are layered rather than duplicated: this one keeps a
+// window's own surfaces in step and drives their shared busy state, and the backend one stops the
+// main window, the always-on-top window and the schedulers from overlapping.
 
 import {
   createContext,
@@ -26,7 +30,12 @@ import {
   type ReactNode,
 } from "react";
 import type { DailyBriefing } from "./types";
-import { getDailyBriefing, refreshDailyBriefing } from "./ipc";
+import {
+  getDailyBriefing,
+  onBriefingUpdated,
+  refreshDailyBriefing,
+  syncDailyBriefing,
+} from "./ipc";
 
 interface BriefingState {
   /** The current briefing, or null before the first load (and if the load failed). */
@@ -46,10 +55,10 @@ export function BriefingProvider({
   autoRefresh = true,
 }: {
   children: ReactNode;
-  /** Whether this provider may kick off the once-a-day stale regeneration. The main window's
-   *  provider owns that; the briefing window passes false. `refresh_daily_briefing` has no backend
-   *  single-flight, so two providers both deciding the briefing was stale would mean two model
-   *  calls and a race on the stored timestamp -- the very thing this file exists to prevent. */
+  /** Whether this provider runs the launch check. The main window's provider owns it; the
+   *  always-on-top window passes false and simply follows `briefing://updated`. Since #540 a second
+   *  check would be harmless (the backend folds it into the running one), but a display-only window
+   *  has no business deciding when the model runs -- it shows what the app decided. */
   autoRefresh?: boolean;
 }) {
   const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
@@ -70,12 +79,15 @@ export function BriefingProvider({
   // Assigned BEFORE the first await, so StrictMode's double mount cannot slip a second call past it.
   const inFlight = useRef<Promise<void> | null>(null);
 
-  const refresh = useCallback(() => {
+  // `force` separates the user asking (the Refresh button, always regenerates) from the app
+  // checking (the launch check, which regenerates only if the facts moved). Both go through the
+  // one latch, and the backend applies the same distinction again across windows.
+  const run = useCallback((force: boolean) => {
     if (inFlight.current) return inFlight.current;
     setBusy(true);
-    const run = (async () => {
+    const started = (async () => {
       try {
-        const next = await refreshDailyBriefing();
+        const next = force ? await refreshDailyBriefing() : await syncDailyBriefing();
         if (aliveRef.current) setBriefing(next);
       } catch {
         /* keep whatever we have — the briefing is optional */
@@ -84,26 +96,47 @@ export function BriefingProvider({
         if (aliveRef.current) setBusy(false);
       }
     })();
-    inFlight.current = run;
-    return run;
+    inFlight.current = started;
+    return started;
   }, []);
 
-  // Load the stored briefing once at app scope, and silently regenerate when it's stale (the backend
-  // computes `stale` against its own freshness window), so it refreshes about once a day on open
-  // rather than on every mount. Runs here instead of per-surface, so turning a surface on or off
-  // never triggers a model call.
+  const refresh = useCallback(() => run(true), [run]);
+
+  // Load the stored briefing once at app scope, then run the LAUNCH CHECK: the backend rebuilds the
+  // facts and regenerates only if they differ from the ones the stored briefing was written from.
+  // That covers the app having been closed for a day (dates move, so the facts move) without
+  // spending a model call on a relaunch five minutes later. Runs here instead of per-surface, so
+  // turning a surface on or off never triggers one either.
   useEffect(() => {
     void (async () => {
       try {
+        // Paint the stored briefing first — the check may take a model call's worth of seconds.
         const stored = await getDailyBriefing();
         if (!aliveRef.current) return;
         setBriefing(stored);
-        if (autoRefresh && stored.stale) void refresh();
+        if (autoRefresh) void run(false);
       } catch {
         /* the briefing is optional — every surface renders without it */
       }
     })();
-  }, [refresh, autoRefresh]);
+  }, [run, autoRefresh]);
+
+  // Follow regenerations this provider didn't start: the hourly scheduler, an inputs-changed nudge
+  // (calendar sync, milestone edit, flag resolved), or a Refresh clicked in the OTHER window. The
+  // event carries no payload deliberately — every listener re-reads, so nobody renders a briefing
+  // assembled from a stale event.
+  useEffect(() => {
+    const pending = onBriefingUpdated(() => {
+      void getDailyBriefing()
+        .then((next) => {
+          if (aliveRef.current) setBriefing(next);
+        })
+        .catch(() => {
+          /* optional, as everywhere else */
+        });
+    });
+    return () => void pending.then((un) => un()).catch(() => {});
+  }, []);
 
   return (
     <BriefingContext.Provider value={{ briefing, busy, refresh }}>

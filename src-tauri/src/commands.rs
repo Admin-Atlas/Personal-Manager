@@ -3878,6 +3878,7 @@ pub fn add_milestone(
     let conn = state.conn()?;
     let id = milestones::add(&conn, project, &label, due_date, event_uid)?;
     projects::touch(&conn, project)?;
+    briefing::nudge(&state);
     project_activity::record(&conn, project, project_activity::Kind::Milestone, Some(id));
     Ok(id)
 }
@@ -3894,6 +3895,7 @@ pub fn update_milestone(
     let conn = state.conn()?;
     milestones::update(&conn, id, &label, due_date)?;
     touch_milestone_project(&conn, id)?;
+    briefing::nudge(&state);
     Ok(())
 }
 
@@ -3925,6 +3927,7 @@ pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Re
         flags::reopen_milestone(&conn, id)?;
     }
     touch_milestone_project(&conn, id)?;
+    briefing::nudge(&state);
     Ok(())
 }
 
@@ -3935,6 +3938,7 @@ pub fn delete_milestone(state: State<'_, AppState>, id: i64) -> Result<()> {
     // Resolve the owning project before the row is gone, then bump its activity.
     let project = milestones::project_of(&conn, id)?;
     milestones::remove(&conn, id)?;
+    briefing::nudge(&state);
     if let Some(project) = project {
         projects::touch(&conn, &project)?;
         // The row is gone, but `source_ref` is a plain pointer (not an FK), so the deleted
@@ -4509,6 +4513,11 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
         if last_err.is_none() {
             calendar::set_last_sync(&conn)?;
         }
+        // The mirror just moved, so what the briefing says about today may have moved with it (a
+        // new meeting, a cancelled one, a time change). Flag it rather than regenerating here: the
+        // scheduler coalesces, and re-briefs only if the facts genuinely differ — so the ordinary
+        // case, a poll that pulled nothing new, costs nothing.
+        briefing::nudge(&state);
     }
 
     if let Some(e) = last_err {
@@ -6033,19 +6042,83 @@ pub fn get_daily_briefing(state: State<'_, AppState>) -> Result<briefing::DailyB
     briefing::get_briefing(&conn)
 }
 
-/// Regenerate the daily briefing from the current focus-view state (the "Refresh"
-/// button, and the focus view's once-a-day auto-refresh when stale). Returns the new
-/// briefing. Background work: runs on the background API key, never holds the DB lock
-/// across the model call (rule #4), and is a no-op (returns the stored value) when
-/// there's nothing to summarise.
+/// Regenerate the daily briefing unconditionally — the "Refresh" button in every surface that
+/// shows it. Returns the new briefing.
 #[tauri::command]
 pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBriefing> {
-    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+    run_briefing_refresh(&app, true).await
+}
+
+/// Regenerate the briefing ONLY if the facts it was written from have actually moved — the launch
+/// check, and what the frontend calls after an edit that feeds it (a milestone ticked, a flag
+/// resolved). Returns the current briefing either way.
+///
+/// This is the entry every automatic trigger uses, and the reason they can be frequent: the whole
+/// check is a DB pass and a fingerprint comparison, so an hour (or a calendar sync) in which
+/// nothing actually changed costs no tokens at all.
+#[tauri::command]
+pub async fn sync_daily_briefing(app: AppHandle) -> Result<briefing::DailyBriefing> {
+    run_briefing_refresh(&app, false).await
+}
+
+/// [`sync_daily_briefing`] for the background scheduler, which holds a borrowed `AppHandle` rather
+/// than a command's owned one.
+pub(crate) async fn refresh_briefing_auto(app: &AppHandle) -> Result<briefing::DailyBriefing> {
+    run_briefing_refresh(app, false).await
+}
+
+/// Regenerate the daily briefing from the current focus-view state. Background work: runs on the
+/// background API key, never holds the DB lock across the model call (rule #4), and is a no-op
+/// (returns the stored value) when there's nothing to summarise.
+///
+/// `force` separates the user asking from the app checking. Forced, it always calls the model and
+/// surfaces a missing-provider error. Unforced, it calls the model only when
+/// [`briefing::auto_refresh_due`] says the facts moved, and stays quiet when there's no provider —
+/// an hourly scheduler must not manufacture an error the user never triggered.
+async fn run_briefing_refresh(app: &AppHandle, force: bool) -> Result<briefing::DailyBriefing> {
+    let state = app.state::<AppState>();
+
+    // SINGLE-FLIGHT. The briefing renders in up to three places at once (Focus card, sidebar
+    // panel, always-on-top window) on top of three background triggers, and each webview's own
+    // guard is blind to the others — so overlap has to be stopped here or two model calls race on
+    // the stored trio and can leave an OLDER body wearing a NEWER timestamp.
+    //
+    // A second caller waits for the running generation, then decides whether it still has work.
+    // Folding unconditionally would be wrong: an automatic check that regenerates NOTHING (the
+    // common case) would swallow a Refresh the user clicked while it ran, and the click would look
+    // dead. So the waiter folds only when the wait actually produced a newer briefing — which
+    // covers "both windows clicked Refresh" with a single model call, while an explicit Refresh
+    // that waited on a no-op check goes on to do the work.
+    let _guard = match state.briefing_refresh.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Read where the briefing stands BEFORE blocking (and drop the guard first — no DB
+            // lock may cross an `.await`, rule #4).
+            let before = {
+                let conn = state.conn()?;
+                briefing::get_briefing(&conn)?.updated_at
+            };
+            let guard = state.briefing_refresh.lock().await;
+            let landed = {
+                let conn = state.conn()?;
+                briefing::get_briefing(&conn)?
+            };
+            if !force || landed.updated_at != before {
+                return Ok(landed);
+            }
+            guard
+        }
+    };
+
+    let Some(plan) = llm_gateway::resolve(app, Role::Background)? else {
+        if force {
+            return Err(Error::Other(llm_gateway::no_provider_message()));
+        }
+        let conn = state.conn()?;
+        return briefing::get_briefing(&conn);
     };
 
     let (snapshot, profile) = {
-        let state = app.state::<AppState>();
         let conn = state.conn()?;
         let zone = resolve_zone(&conn);
         let now = clock::now_local_iso(zone);
@@ -6072,26 +6145,44 @@ pub async fn refresh_daily_briefing(app: AppHandle) -> Result<briefing::DailyBri
 
     // Nothing to brief on yet — leave any prior briefing in place.
     let Some(snapshot) = snapshot else {
-        let state = app.state::<AppState>();
         let conn = state.conn()?;
         return briefing::get_briefing(&conn);
     };
 
-    let (text, usage, served, meta) =
-        briefing::generate(&app, &plan, &snapshot, profile.as_deref()).await?;
+    // The cost gate. Everything above this line is DB work; everything below spends a model call.
+    let fingerprint = briefing::snapshot_fingerprint(&snapshot);
+    if !force {
+        let conn = state.conn()?;
+        let stored = briefing::get_briefing(&conn)?;
+        if !briefing::auto_refresh_due(
+            briefing::stored_fingerprint(&conn)?.as_deref(),
+            &fingerprint,
+            stored.stale,
+        ) {
+            return Ok(stored);
+        }
+    }
 
-    let state = app.state::<AppState>();
-    let conn = state.conn()?;
-    let now = ingest::iso_now(&conn)?;
-    log_usage(
-        &conn,
-        "background",
-        served.as_deref().or(Some(plan.primary_model_id())),
-        &usage,
-        &meta,
-    );
-    briefing::save_briefing(&conn, &text, &now)?;
-    briefing::get_briefing(&conn)
+    let (text, usage, served, meta) =
+        briefing::generate(app, &plan, &snapshot, profile.as_deref()).await?;
+
+    let fresh = {
+        let conn = state.conn()?;
+        let now = ingest::iso_now(&conn)?;
+        log_usage(
+            &conn,
+            "background",
+            served.as_deref().or(Some(plan.primary_model_id())),
+            &usage,
+            &meta,
+        );
+        briefing::save_briefing(&conn, &text, &now, &fingerprint)?;
+        briefing::get_briefing(&conn)?
+    };
+    // Tell every window, not only the caller: a scheduled regeneration has no caller at all, and a
+    // Refresh clicked in one surface should land in the others rather than leaving them stale.
+    let _ = app.emit(briefing::BRIEFING_UPDATED_EVENT, ());
+    Ok(fresh)
 }
 
 /// Mark a flag done — a deliberate user assertion (card 9). Assertion outranks detection, so the flag
@@ -6133,6 +6224,9 @@ pub fn resolve_flag(
     if let Some(mid) = milestone_id {
         touch_milestone_project(&conn, mid)?;
     }
+    // A resolved flag leaves the active set the briefing renders, so the briefing that still names
+    // it is now wrong about the user's day — exactly the case worth re-briefing for.
+    briefing::nudge(&state);
     Ok(flag)
 }
 

@@ -1105,8 +1105,20 @@ export const markActivity = () => invoke<void>("mark_activity");
 /** The stored "here's your picture today" briefing + whether it's due a refresh. */
 export const getDailyBriefing = () => invoke<DailyBriefing>("get_daily_briefing");
 
-/** Regenerate the briefing from the current focus-view state; returns the new one. */
+/** Regenerate the briefing from the current focus-view state; returns the new one. The user asking
+ *  — always spends a model call. */
 export const refreshDailyBriefing = () => invoke<DailyBriefing>("refresh_daily_briefing");
+
+/** Regenerate the briefing only if the facts it was written from have actually moved; returns the
+ *  current one either way. The app checking — cheap enough to call on every launch, because a check
+ *  that finds nothing changed is a DB pass and no model call. */
+export const syncDailyBriefing = () => invoke<DailyBriefing>("sync_daily_briefing");
+
+/** Subscribe to `briefing://updated` (the event name is `briefing.rs`'s `BRIEFING_UPDATED_EVENT`) —
+ *  a regeneration landed, from any trigger in any window. Broadcast, so a briefing refreshed by the
+ *  hourly scheduler, or by a Refresh clicked in the other window, still reaches this one. */
+export const onBriefingUpdated = (handler: () => void): Promise<UnlistenFn> =>
+  listen("briefing://updated", () => handler());
 
 /** Whether the tray / menu-bar icon is on. Backend-owned: Rust reads it at boot to decide the
  *  icon's visibility and whether closing the main window quits or hides (see tray.rs). */

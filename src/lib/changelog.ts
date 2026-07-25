@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.80.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Your daily briefing keeps itself up to date. It used to be rewritten only when you opened PM and it was already more than half a day old -- so a meeting that appeared in your calendar this morning, or a milestone you ticked off, could leave the briefing quietly describing a day that had moved on. PM now checks when you open it, once an hour while it's running, and within a minute of anything that feeds the briefing changing: a calendar sync bringing in new events, a milestone added, edited or completed, or a reminder marked done.",
+      "Checking is not the same as rewriting, so this costs you almost nothing. PM compares the facts behind the briefing -- the deadlines, today's events, what's blocked, what's gone quiet -- against the ones it was written from, and only asks the model for new wording when something genuinely moved. An hour in which nothing changed uses no AI at all.",
+      "The briefing can no longer contradict itself between windows. If the same briefing was open in more than one place -- the Focus tab, the sidebar, the floating window -- two refreshes could overlap and leave the older text stamped with the newer time. Refreshes are now handled one at a time, and whichever window regenerates it, all the others update to match.",
+    ],
+  },
+  {
     version: "3.79.0-alpha",
     date: "2026-07-25",
     highlights: [
