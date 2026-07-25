@@ -12,6 +12,7 @@ import { Button, Collapsible, ConfirmDialog, Modal, NavItem, Select } from "./ui
 import { globalChats, projectChats } from "../lib/chatNav";
 import { Briefing } from "./Briefing";
 import { readBriefingInSidebar, subscribeBriefingPrefs } from "../lib/briefingPrefs";
+import { readChatSectionOpen, writeChatSectionOpen, type ChatSectionId } from "../lib/chatPrefs";
 
 export type View =
   | "focus"
@@ -31,24 +32,43 @@ const SHORTCUT_HINT =
 
 /** One foldable section of the Chats tab's sidebar, with a count and its own empty state. The
  *  heading keeps the mono/uppercase/faint treatment the single "Conversations" label had, so the
- *  two sections read as the same furniture rather than a new kind of thing. */
+ *  two sections read as the same furniture rather than a new kind of thing.
+ *
+ *  The fold is remembered per device (lib/chatPrefs). It has to be: this whole block is gated on
+ *  `view === "chat"`, so the section unmounts on every tab switch — before, that reseeded from
+ *  `defaultOpen` and the user's choice was lost on navigation as well as on restart. Reading in a
+ *  lazy initialiser therefore also repairs the tab-switch case for free, and the
+ *  `pm:settings-changed` subscription covers the case the initialiser can't: Settings renders as an
+ *  overlay over a STILL-MOUNTED Sidebar, so a reset from there has to reach us live. */
 function ChatSection({
+  id,
   title,
   count,
   empty,
   defaultOpen,
   children,
 }: {
+  id: ChatSectionId;
   title: string;
   count: number;
   empty: string;
   defaultOpen: boolean;
   children: ReactNode;
 }) {
+  const [open, setOpen] = useState(() => readChatSectionOpen(id) ?? defaultOpen);
+  useEffect(() => {
+    const sync = () => setOpen(readChatSectionOpen(id) ?? defaultOpen);
+    window.addEventListener("pm:settings-changed", sync);
+    return () => window.removeEventListener("pm:settings-changed", sync);
+  }, [id, defaultOpen]);
   return (
     <Collapsible
       className="pt-2"
-      defaultOpen={defaultOpen}
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        writeChatSectionOpen(id, next);
+      }}
       meta={count > 0 ? count : undefined}
       title={<span className="font-mono text-xs uppercase tracking-wide text-faint">{title}</span>}
     >
@@ -333,6 +353,7 @@ export function Sidebar({
           {view === "chat" && (
             <div data-help="conversations-list">
               <ChatSection
+                id="projects"
                 title="Projects"
                 count={projectGroups.length}
                 empty="No projects yet."
@@ -363,6 +384,7 @@ export function Sidebar({
               </ChatSection>
 
               <ChatSection
+                id="global"
                 title="Global chats"
                 count={unscoped.length}
                 empty="No global chats yet."

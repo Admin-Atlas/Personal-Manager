@@ -22,6 +22,7 @@ import {
   type MapLayoutMode,
 } from "../../lib/mapPrefs";
 import { focusViewPrefsAreDefault, resetFocusViewPrefs } from "../../lib/focusPrefs";
+import { chatSectionsAreDefault, resetChatSections } from "../../lib/chatPrefs";
 import {
   briefingPrefsAreDefault,
   readBriefingFloat,
@@ -264,12 +265,23 @@ export function GeneralSettings() {
   }, []);
   const focusIsDefault = briefingIsDefault && focusViewDefault;
   const helpIsDefault = !help.enabled;
+  // The Chats-tab sidebar folds, same story as the Focus prefs above: the control lives beside what
+  // it changes (one control, one home) and only the RESET lives here, so this needs the same live
+  // subscription rather than a read at mount. There is no Chats section on this tab to hang a
+  // dedicated ResetLink off, so the tab-level "Reset General" is its only home.
+  const [chatSectionsDefault, setChatSectionsDefault] = useState(chatSectionsAreDefault);
+  useEffect(() => {
+    const onChanged = () => setChatSectionsDefault(chatSectionsAreDefault());
+    window.addEventListener("pm:settings-changed", onChanged);
+    return () => window.removeEventListener("pm:settings-changed", onChanged);
+  }, []);
   // The whole tab, minus the deliberately-excluded time zone (device-derived, not a preference).
   const generalIsDefault =
     appearanceIsDefault &&
     mapIsDefault &&
     confirmDeleteIsDefault &&
     focusIsDefault &&
+    chatSectionsDefault &&
     helpIsDefault;
 
   function resetMap() {
@@ -298,6 +310,8 @@ export function GeneralSettings() {
     resetMap();
     resetConfirmDelete();
     resetFocus();
+    resetChatSections(); // the Chats-tab sidebar folds, back to density-derived
+    setChatSectionsDefault(true);
     help.setEnabled(false);
     // Time zone is intentionally left alone — it's derived from the device, not a taste preference.
   }
@@ -517,12 +531,44 @@ export function GeneralSettings() {
           <span className="text-sm text-ink2">Map tab</span>
           <Toggle checked={mapVisible} onChange={setMapVisible} ariaLabel="Show the Map tab" />
         </div>
-        {/* Both of Appearance's paragraphs — the "it saves itself" reassurance and the
-            Location field's format + privacy note — fold into this one disclosure at the
-            foot. The auto-mode status line and its "couldn't find your location" fallback
-            stay inline above: they're a readout and a gating hint, not explanation. */}
+        {/* Appearance's explanation folds into this one disclosure at the foot. The auto-mode status
+            line and its "couldn't find your location" fallback stay inline above: they're a readout
+            and a gating hint, not explanation.
+
+            It covers the five controls with no explanation anywhere else — System, Mode, Depth,
+            Accent, Text size — and deliberately stops there. The pinboard confirm toggle and the two
+            tab toggles already carry their own help-mode entries (`settings-pinboard-confirm-delete`,
+            `settings-teach-tab`, `settings-map-tab` in lib/help.ts), and repeating those here would
+            be a second copy to keep in step. Depth is the reason this was worth writing at all: it's
+            the only control in the section with neither an option tooltip nor a word of prose. */}
         <SectionInfo title="What these settings do">
-          <p>Applies instantly and is remembered on this device.</p>
+          <p>Everything here applies instantly and is remembered on this device.</p>
+          <p>
+            <strong>System</strong> is the overall look: Editorial has serif headings and warm paper
+            tones, Slate is a clean sans on cool neutrals, Terminal is monospace and high contrast.
+            It also decides which accent colours you can pick from.
+          </p>
+          <p>
+            <strong>Mode</strong> is light or dark. System follows your device's setting; Auto
+            follows sunrise and sunset where you are, so PM goes dark in the evening on its own.
+          </p>
+          <p>
+            <strong>Depth</strong> controls how much detail PM shows — it reveals and hides
+            information, it never rearranges the screen. Min keeps things spare: no meta lines,
+            slightly larger type, more breathing room. Standard adds the secondary detail — meta
+            lines, model footers, extra columns. Power adds the numbers you'd want if you're keeping
+            an eye on the machinery: token counts, what a call cost, exact timestamps and elapsed
+            times, and keyboard hints.
+          </p>
+          <p>
+            <strong>Accent</strong> is the highlight colour used for selection, links and focus
+            rings. The near-black swatch is Monochrome — it drops colour altogether and uses white
+            for accents instead.
+          </p>
+          <p>
+            <strong>Text size</strong> scales the whole interface's type. It's the same control as
+            the one on the Accessibility tab, so changing it in either place changes both.
+          </p>
           {modePref === "auto" && (
             <p>
               Location is a latitude, longitude pair. Blank uses your device's timezone

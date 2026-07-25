@@ -770,6 +770,9 @@ export interface DriveSyncState {
   running: boolean;
   processed: number;
   total: number | null;
+  /** Epoch ms this run actually began, so a bar mounting mid-run counts elapsed time from the true
+   *  start instead of restarting at 0:00. Null when idle. */
+  started_at_ms: number | null;
   /** The account (email) being synced, or null for an all-accounts pass. */
   account: string | null;
   last_report: SyncReport | null;
@@ -815,6 +818,9 @@ export interface BackupReport {
 /** Snapshot of an in-flight backup/restore, so the UI resumes progress after navigating away. */
 export interface BackupState {
   running: boolean;
+  /** Epoch ms this run actually began, so a bar mounting mid-run counts elapsed time from the true
+   *  start instead of restarting at 0:00. Null when idle. */
+  started_at_ms: number | null;
   phase: BackupPhase | null;
   fraction: number;
   last_report: BackupReport | null;
@@ -949,6 +955,9 @@ export interface OneDriveSyncState {
   running: boolean;
   processed: number;
   total: number | null;
+  /** Epoch ms this run actually began, so a bar mounting mid-run counts elapsed time from the true
+   *  start instead of restarting at 0:00. Null when idle. */
+  started_at_ms: number | null;
   account: string | null;
   last_report: SyncReport | null;
 }
@@ -989,6 +998,9 @@ export interface LocalFolderSyncState {
   running: boolean;
   processed: number;
   total: number | null;
+  /** Epoch ms this run actually began, so a bar mounting mid-run counts elapsed time from the true
+   *  start instead of restarting at 0:00. Null when idle. */
+  started_at_ms: number | null;
   /** The folder key being synced, or null for an all-folders pass. */
   folder: string | null;
   last_report: SyncReport | null;
@@ -1228,6 +1240,9 @@ export interface IngestJobState {
   running: boolean;
   processed: number;
   total: number | null;
+  /** Epoch ms this run actually began, so a bar mounting mid-run counts elapsed time from the true
+   *  start instead of restarting at 0:00. Null when idle. */
+  started_at_ms: number | null;
   /** The current setup message (engine install / model download); null once counting starts. */
   prep: string | null;
   /** The last finished rebuild's counts, so returning after it completed still shows the result. */

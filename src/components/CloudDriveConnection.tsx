@@ -347,6 +347,7 @@ export function CloudDriveConnection({
 
           {syncing && progress && (
             <SyncProgress
+              startedAt={ds.startedAt}
               processed={progress.processed}
               total={progress.total}
               label={syncTarget ? `Indexing ${syncTarget}` : meta.indexingAll}

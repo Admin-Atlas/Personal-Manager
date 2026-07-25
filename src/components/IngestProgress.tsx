@@ -28,10 +28,12 @@ interface Props {
   className?: string;
   /** "count" (default) → "X of Y" (+ % at power). "percent" → just the percentage (no item count). */
   mode?: "count" | "percent";
-  /** Epoch ms the operation actually started, for an exact Power-depth elapsed timer. Omit it and the
-   *  timer counts from when the bar mounted — so a detached/resumed bar (a restored ingest, or a
-   *  Rebuild/Sync/Backup panel reopened mid-run) honestly reads "since it reappeared", not the true
-   *  start (no backend snapshot carries one yet). */
+  /** Epoch ms the operation actually started, for an exact Power-depth elapsed timer. Every detached
+   *  job now carries one in its backend snapshot (`started_at_ms` on the sync / rebuild / backup
+   *  states), so a bar reopened mid-run counts from the true start rather than from when it
+   *  reappeared. Omit it and the timer falls back to the mount instant — correct only for a bar whose
+   *  mount IS the start (the Rebuild modal, which fires the rebuild itself) or for the on-demand
+   *  component downloads, which have no backend snapshot to restore from at all. */
   startedAt?: number;
 }
 

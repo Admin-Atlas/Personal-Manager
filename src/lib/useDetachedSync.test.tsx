@@ -27,6 +27,7 @@ const idle = (over: Partial<DriveSyncState> = {}): DriveSyncState => ({
   running: false,
   processed: 0,
   total: null,
+  started_at_ms: null,
   account: null,
   last_report: null,
   ...over,
@@ -74,6 +75,42 @@ describe("useDetachedSync", () => {
     await waitFor(() => expect(result.current.syncing).toBe(true));
     expect(result.current.progress).toEqual({ processed: 5, total: 10 });
     expect(result.current.target).toBe("a@b.com");
+  });
+
+  it("restores the sync's TRUE start time, not the remount instant", async () => {
+    // The reported bug: leaving a tab mid-sync and coming back restarted the elapsed timer at 0:00,
+    // because the bar had nothing but its own mount instant to count from. This mount is standing in
+    // for that return — the stamp must come from the backend snapshot.
+    const startedAt = 1_700_000_000_000;
+    const { opts } = makeOpts({
+      fetchStatus: vi.fn(async () =>
+        idle({ running: true, processed: 5, total: 10, started_at_ms: startedAt }),
+      ),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(result.current.syncing).toBe(true));
+    expect(result.current.startedAt).toBe(startedAt);
+  });
+
+  it("keeps the start time across per-file progress events", async () => {
+    // The trap in the obvious implementation: folding the stamp into `progress` means the next
+    // `counted` / `item` event replaces the object and drops it, restoring the bug one file later.
+    const startedAt = 1_700_000_000_000;
+    const { opts, emit } = makeOpts({
+      fetchStatus: vi.fn(async () =>
+        idle({ running: true, processed: 1, total: 9, started_at_ms: startedAt }),
+      ),
+    });
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(result.current.startedAt).toBe(startedAt));
+
+    await emit({ type: "counted", total: 9 });
+    expect(result.current.startedAt).toBe(startedAt);
+    await emit({ type: "item", processed: 4, total: 9, name: "f.md" });
+    expect(result.current.startedAt).toBe(startedAt);
+
+    await emit({ type: "finished", report: REPORT });
+    expect(result.current.startedAt).toBeNull(); // idle again
   });
 
   it("restores the last report when idle on mount", async () => {

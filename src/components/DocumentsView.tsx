@@ -83,6 +83,10 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [prep, setPrep] = useState<string | null>(null);
+  // Epoch ms the in-flight ingest/rebuild began. Restored from the backend snapshot on mount, so
+  // leaving this tab mid-run and returning shows elapsed time from the true start rather than
+  // restarting the timer at 0:00.
+  const [startedAt, setStartedAt] = useState<number | null>(null);
   const [items, setItems] = useState<ProgressItem[]>([]);
   // Determinate-bar inputs: `total` from the `counted` event, `processed` counted up as
   // each file lands. Null total (setup / model download) keeps the bar an indeterminate sweep.
@@ -236,6 +240,7 @@ export function DocumentsView({ onReviewClick }: Props) {
         setTotal(job.total);
         setProcessed(job.processed);
         setPrep(job.prep);
+        setStartedAt(job.started_at_ms);
         // Per-file rows aren't kept in the snapshot (they're transient and unbounded), so a
         // restored run shows the bar and counts, then fills the list as new files land.
         setItems([]);
@@ -412,6 +417,7 @@ export function DocumentsView({ onReviewClick }: Props) {
     setSummary(null);
     setError(null);
     setPrep(null);
+    setStartedAt(Date.now());
     try {
       await ingestPaths(paths, handleEvent, copyPhotosRef.current);
       setStatus(await sidecarStatus());
@@ -470,6 +476,7 @@ export function DocumentsView({ onReviewClick }: Props) {
     setSummary(null);
     setError(null);
     setPrep(null);
+    setStartedAt(Date.now()); // the backend stamps its own; a remount reads that one
     try {
       // Progress arrives on the global subscription set up at mount, not through this call — so
       // the rebuild keeps reporting even after this view unmounts. The backend refuses a second
@@ -819,6 +826,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                   label="Ingesting documents"
                   processed={processed}
                   total={total}
+                  startedAt={startedAt ?? undefined}
                 />
               )}
               {prep && <p className="px-1 py-1 text-sm text-ink3">{prep}</p>}

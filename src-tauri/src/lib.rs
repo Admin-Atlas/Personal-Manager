@@ -149,6 +149,25 @@ impl VaultRuntime {
     }
 }
 
+/// Wall-clock milliseconds since the Unix epoch — what the detached-job snapshots below stamp
+/// themselves with so a progress bar can show elapsed time from the TRUE start rather than from
+/// whenever its component last mounted.
+///
+/// Deliberately `SystemTime`, not `ingest::iso_now(&AppState)`: the stamps are taken while a sync
+/// slot's mutex is held, and `iso_now` reaches for the DB guard — an easy way to hit the
+/// non-reentrant-mutex freeze. Deliberately millis-since-epoch, not an ISO string: the frontend
+/// subtracts it from `Date.now()`, and a bare number needs no parsing or timezone handling.
+///
+/// Wall clock is skew-prone (an NTP step or a laptop sleep can move it), which a monotonic `Instant`
+/// would avoid — but an `Instant` can't be serialised into something the webview can subtract from.
+/// `formatElapsed` floors negatives at 0:00, so skew degrades to a stalled timer, never garbage.
+pub fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Shared app state. The SQLite connection is guarded by a mutex; commands lock
 /// it only for short synchronous work, never across an `.await`. The sidecar
 /// manages its own interior locking.
@@ -164,6 +183,11 @@ pub struct CloudSyncState {
     pub running: bool,
     pub processed: usize,
     pub total: Option<usize>,
+    /// When this sync run actually began ([`epoch_ms`]), so a bar that mounts mid-run shows elapsed
+    /// time from the true start instead of restarting at 0:00. `None` when idle. Set once in
+    /// `begin_pass` and deliberately KEPT across `reset_for_rerun`: the follow-up sweep is the same
+    /// run as far as the user is concerned, so the timer should keep counting, not restart.
+    pub started_at_ms: Option<i64>,
     /// The account being synced (email), or `None` for an all-accounts pass.
     pub account: Option<String>,
     /// Internal single-flight flag: a sync was requested while one was already running (e.g. the user
@@ -183,6 +207,8 @@ pub struct LocalFolderSyncState {
     pub running: bool,
     pub processed: usize,
     pub total: Option<usize>,
+    /// When this sync run began ([`epoch_ms`]) — see [`CloudSyncState::started_at_ms`].
+    pub started_at_ms: Option<i64>,
     /// The folder key being synced, or `None` for an all-folders pass.
     pub folder: Option<String>,
     /// Internal single-flight flag (a sync requested while one was running). Not exposed to the UI.
@@ -203,6 +229,11 @@ pub struct IngestJobState {
     pub running: bool,
     pub processed: usize,
     pub total: Option<usize>,
+    /// When this rebuild began ([`epoch_ms`]) — see [`CloudSyncState::started_at_ms`]. A rebuild
+    /// RESUMED after a relaunch is stamped afresh, so the timer reads "since resume" rather than
+    /// since the original interrupted run; carrying the original would mean persisting a timestamp
+    /// in the resume marker, and "since resume" is the honest reading of what is happening now.
+    pub started_at_ms: Option<i64>,
     /// The latest `Preparing` message (engine install / model download), so a UI mounting mid-setup
     /// shows the same indeterminate label as one that watched it start. Cleared once counting begins.
     pub prep: Option<String>,
@@ -242,10 +273,13 @@ impl connector_sync::SyncSlot for CloudSyncState {
         self.processed = 0;
         self.total = None;
         self.account = None;
+        // `started_at_ms` is deliberately NOT reset: the follow-up sweep is a continuation of the
+        // same run the user started, so the elapsed timer keeps counting instead of restarting.
     }
     fn begin_pass(&mut self, target: Option<String>) {
         *self = CloudSyncState {
             running: true,
+            started_at_ms: Some(epoch_ms()),
             account: target,
             ..Default::default()
         };
@@ -269,10 +303,12 @@ impl connector_sync::SyncSlot for LocalFolderSyncState {
         self.processed = 0;
         self.total = None;
         self.folder = None;
+        // `started_at_ms` deliberately kept — see the cloud slot above.
     }
     fn begin_pass(&mut self, target: Option<String>) {
         *self = LocalFolderSyncState {
             running: true,
+            started_at_ms: Some(epoch_ms()),
             folder: target,
             ..Default::default()
         };
@@ -285,6 +321,10 @@ impl connector_sync::SyncSlot for LocalFolderSyncState {
 #[derive(Default, Clone, serde::Serialize)]
 pub struct BackupState {
     pub running: bool,
+    /// When this backup/restore began ([`epoch_ms`]) — see [`CloudSyncState::started_at_ms`]. Stamped
+    /// EDGE-TRIGGERED on idle→running: every phase transition emits a `Phase` event, so stamping it
+    /// unconditionally there would restart the timer at each phase — worse than the bug it fixes.
+    pub started_at_ms: Option<i64>,
     /// The current phase (snapshot/pack/upload/download/restore/validate), or `None` when idle.
     pub phase: Option<backup::BackupPhase>,
     /// Monotonic `0.0..=1.0` progress within the current phase.

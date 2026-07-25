@@ -16,10 +16,57 @@
 
 import { aiProviderStatus, cachedProposals, proposeMetadata, reviewQueue } from "./ipc";
 import { readReviewAiEnabled } from "./reviewPrefs";
-import type { MetadataProposal } from "./types";
+import type { Importance, MetadataProposal } from "./types";
 
 /** Proposals by document id, for the life of the session. Survives unmounting the Review tab. */
 export const proposalCache = new Map<number, MetadataProposal>();
+
+/** The three fields a Review row lets you change. Structural, so the view can keep its own alias. */
+export interface ReviewEdit {
+  project: string;
+  tags: string[];
+  importance: Importance;
+}
+
+/** The document values a row falls back to when nothing better is known. */
+export interface ReviewEditSeed {
+  project: string;
+  tags: string[];
+  importance: Importance;
+}
+
+/**
+ * What a Review row's Project / Importance / Tags controls should show, in precedence order:
+ *
+ *   1. the user's own hand-edit, if they made one this session;
+ *   2. the AI's proposal — freshly streamed, or restored from `document_proposals` after a restart;
+ *   3. the document's stored values.
+ *
+ * Step 2 is the one that was missing (#486 shipped the DB round-trip but this seeding kept reading
+ * only the hand-edit cache), and it caused two separately-reported bugs: a proposal produced while
+ * the Review tab was closed — the post-sync background run — painted its reasoning over blank
+ * fields, and a restart did the same to every restored proposal. Blank fields are not cosmetic
+ * here: `decisionFor` commits what these controls hold while reporting the proposal as
+ * `proposed_*`, so approving a blanked row files it to Unsorted and logs a fabricated correction
+ * against the model.
+ *
+ * Pure and exported so the rule is pinned by tests rather than living inline in a 900-line view.
+ */
+export function seedReviewEdit(
+  handEdit: ReviewEdit | undefined,
+  proposal: MetadataProposal | undefined,
+  doc: ReviewEditSeed,
+): ReviewEdit {
+  if (handEdit) return handEdit;
+  // Copy the tag array rather than aliasing the cached proposal's: `decisionFor` compares the edit
+  // against the proposal to decide what to log as a correction, so a caller that ever mutated tags
+  // in place would move both sides at once and the correction would silently never be logged.
+  // Today's TagEditor always rebuilds the array, so this is a guard, not a live fix.
+  if (proposal) {
+    return { project: proposal.project, tags: [...proposal.tags], importance: proposal.importance };
+  }
+  return { project: doc.project, tags: [...doc.tags], importance: doc.importance };
+}
 
 type ProposalListener = (documentId: number, proposal: MetadataProposal) => void;
 const listeners = new Set<ProposalListener>();

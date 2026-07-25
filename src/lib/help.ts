@@ -276,7 +276,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-appearance": {
     title: "Appearance",
-    body: "Switch the visual System (Editorial / Slate / Terminal), Light or Dark mode, the accent colour, and Depth (how much detail is shown). Changes apply instantly and are remembered on this device.",
+    body: "Switch the visual System (Editorial / Slate / Terminal), the light/dark Mode (including System, which follows your device, and Auto, which follows sunrise and sunset), Depth (how much detail is shown — it reveals and hides, never rearranges), the accent colour, and the text size. Changes apply instantly and are remembered on this device.",
   },
   "settings-localai-machine": {
     title: "Your machine",
