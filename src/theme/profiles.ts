@@ -15,6 +15,11 @@ export type Mode = "dark" | "light";
  *  reaches tokens/components — this preference is what's persisted and shown in Settings. */
 export type ModePref = Mode | "system" | "auto";
 export type Depth = "min" | "standard" | "power";
+/** Control density / touch-target size (Accessibility). `compact` is today's tight sizing (pinned
+ *  for existing installs); `standard` meets WCAG 2.5.8 (24px) and is the fresh-install default;
+ *  `comfortable` reaches the 44px AAA (2.5.5) target for lower motor precision. See {@link DENSITIES}
+ *  and the density vars in tokens.ts. */
+export type Density = "compact" | "standard" | "comfortable";
 export type Role =
   | "bg"
   | "panel"
@@ -34,6 +39,7 @@ export const MODES: readonly Mode[] = ["dark", "light"];
 // The four Mode *preferences* offered in Settings (see {@link ModePref}). Order is the picker order.
 export const MODE_PREFS: readonly ModePref[] = ["light", "dark", "system", "auto"];
 export const DEPTHS: readonly Depth[] = ["min", "standard", "power"];
+export const DENSITIES: readonly Density[] = ["compact", "standard", "comfortable"];
 
 // Order is load-bearing: themeVars maps these positionally onto each ramp / status row.
 export const ROLES: readonly Role[] = [

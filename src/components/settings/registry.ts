@@ -83,6 +83,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
         Icon: AccessibilityIcon,
         sections: [
           { id: "sec-a11y-text", label: "Text size" },
+          { id: "sec-a11y-density", label: "Density" },
           { id: "sec-a11y-motion", label: "Motion" },
           { id: "sec-a11y-font", label: "Legible font" },
         ],

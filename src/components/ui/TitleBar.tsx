@@ -39,14 +39,19 @@ function SystemLabel() {
 }
 
 function MacDot({ label, onClick }: { label: string; onClick: () => void }) {
+  // The visible dot stays 12px, but the button is a 24px hit target (WCAG 2.5.8) with the dot
+  // centred inside. 24px targets can't sit at the old ~20px centres without overlapping, so the
+  // three dots read a touch more spread than before — a macOS-only change flagged for OS testing.
   return (
     <button
       type="button"
       aria-label={label}
       title={label}
       onClick={onClick}
-      className="h-3 w-3 rounded-full bg-[var(--border2)] transition-colors hover:bg-[var(--ink4)]"
-    />
+      className="group flex h-6 w-6 items-center justify-center"
+    >
+      <span className="h-3 w-3 rounded-full bg-[var(--border2)] transition-colors group-hover:bg-[var(--ink4)]" />
+    </button>
   );
 }
 
@@ -183,7 +188,7 @@ export function TitleBar() {
     >
       <div data-tauri-drag-region className="flex items-center gap-2 px-3">
         {IS_MAC && (
-          <div className="flex items-center gap-2">
+          <div className="flex items-center">
             {/* macOS order: close, minimize, zoom (left→right) */}
             <MacDot label="Close" onClick={close} />
             <MacDot label="Minimize" onClick={minimize} />

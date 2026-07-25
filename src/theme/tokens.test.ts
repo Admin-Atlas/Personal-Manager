@@ -17,6 +17,7 @@ describe("applyTheme accessibility axes", () => {
       fontScale: 1,
       reduceMotion: false,
       legibleFont: false,
+      density: "standard",
     });
     expect(el.style.getPropertyValue("--font-scale")).toBe("1");
     expect(el.dataset.reducedMotion).toBeUndefined();
@@ -29,6 +30,7 @@ describe("applyTheme accessibility axes", () => {
       fontScale: 1.3,
       reduceMotion: true,
       legibleFont: true,
+      density: "standard",
     });
     expect(el.style.getPropertyValue("--font-scale")).toBe("1.3");
     expect(el.dataset.reducedMotion).toBe("on");
@@ -38,11 +40,45 @@ describe("applyTheme accessibility axes", () => {
 
   it("clears the reduced-motion stamp when it's toggled back off", () => {
     const el = document.createElement("div");
-    const on = { fontScale: 1, reduceMotion: true, legibleFont: false };
-    const off = { fontScale: 1, reduceMotion: false, legibleFont: false };
+    const on = {
+      fontScale: 1,
+      reduceMotion: true,
+      legibleFont: false,
+      density: "standard" as const,
+    };
+    const off = {
+      fontScale: 1,
+      reduceMotion: false,
+      legibleFont: false,
+      density: "standard" as const,
+    };
     applyTheme(el, "slate", "dark", "mono", "standard", on);
     expect(el.dataset.reducedMotion).toBe("on");
     applyTheme(el, "slate", "dark", "mono", "standard", off);
     expect(el.dataset.reducedMotion).toBeUndefined();
+  });
+
+  it("stamps the density vars + data-density and re-derives when the level changes", () => {
+    const el = document.createElement("div");
+    applyTheme(el, "slate", "dark", "mono", "standard", {
+      fontScale: 1,
+      reduceMotion: false,
+      legibleFont: false,
+      density: "compact",
+    });
+    expect(el.dataset.density).toBe("compact");
+    expect(el.style.getPropertyValue("--tap-min")).toBe("24px");
+    // compact keeps today's 20px track (an existing install's look is undisturbed)
+    expect(el.style.getPropertyValue("--tg-track-h")).toBe("20px");
+
+    applyTheme(el, "slate", "dark", "mono", "standard", {
+      fontScale: 1,
+      reduceMotion: false,
+      legibleFont: false,
+      density: "comfortable",
+    });
+    expect(el.dataset.density).toBe("comfortable");
+    expect(el.style.getPropertyValue("--tap-min")).toBe("44px");
+    expect(el.style.getPropertyValue("--tg-track-h")).toBe("28px");
   });
 });

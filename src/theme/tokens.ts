@@ -19,12 +19,15 @@ import {
   type System,
   type Mode,
   type Depth,
+  type Density,
 } from "./profiles";
 
 export type ThemeVars = Record<`--${string}`, string>;
 
-/** The opt-in accessibility axes (Accessibility settings). Additive over the visual theme: their
- *  defaults ({ fontScale: 1, reduceMotion: false, legibleFont: false }) equal today's behaviour. */
+/** The opt-in accessibility axes (Accessibility settings). Additive over the visual theme. All but
+ *  `density` default to today's behaviour ({ fontScale: 1, reduceMotion: false, legibleFont: false });
+ *  `density` defaults to `standard` for fresh installs but is pinned to `compact` (today's sizing)
+ *  for existing installs by a one-time migration in ThemeContext — see {@link DENSITY_VARS}. */
 export interface A11yTheme {
   /** Whole-UI text scale (1 = 100%). Multiplies the root font-size, so all rem sizing scales. */
   fontScale: number;
@@ -32,11 +35,46 @@ export interface A11yTheme {
   reduceMotion: boolean;
   /** Swap the UI + heading faces for Atkinson Hyperlegible (a legible / dyslexia-friendly face). */
   legibleFont: boolean;
+  /** Control density / touch-target size (WCAG 2.5.8 / 2.5.5). */
+  density: Density;
 }
 
 // Atkinson Hyperlegible — the family name declared by @fontsource/atkinson-hyperlegible (imported in
 // fonts.ts). Overrides --ui/--head only; --mono (numbers/code) is left untouched.
 const LEGIBLE_STACK = '"Atkinson Hyperlegible", system-ui, sans-serif';
+
+// Density → control-sizing custom properties, read by the ui/ primitives (never a blunt global
+// `button{}` rule, which would swell calendar chips etc.). The visible switch track is separated
+// from its tap target so `compact` keeps today's 20px LOOK while still flooring a ≥24px HIT area
+// (WCAG 2.5.8 is satisfied by the actionable region, padding included). `standard` grows the visible
+// track to 24px; `comfortable` reaches the 44px AAA target. `--tap-min` also floors Button / Select /
+// SegmentedControl. Components fall back to the `standard` values via var()'s second arg, so the very
+// first paint (before applyTheme runs) is already compliant.
+export const DENSITY_VARS: Record<Density, Record<`--${string}`, string>> = {
+  compact: {
+    "--tap-min": "24px",
+    "--tg-track-h": "20px",
+    "--tg-track-w": "36px",
+    "--tg-knob": "16px",
+    // Knob rests at left:2px; on-travel of 14px lands it at 16px — exactly today's toggle geometry
+    // (h-5 w-9 track, translate-x-0.5 → translate-x-4), so a pinned/legacy install shifts by 0px.
+    "--tg-on": "14px",
+  },
+  standard: {
+    "--tap-min": "24px",
+    "--tg-track-h": "24px",
+    "--tg-track-w": "44px",
+    "--tg-knob": "20px",
+    "--tg-on": "20px",
+  },
+  comfortable: {
+    "--tap-min": "44px",
+    "--tg-track-h": "28px",
+    "--tg-track-w": "52px",
+    "--tg-knob": "24px",
+    "--tg-on": "24px",
+  },
+};
 
 export function themeVars(system: System, mode: Mode, accent: string): ThemeVars {
   const stat = STATUS[system][mode];
@@ -122,5 +160,10 @@ export function applyTheme(
     }
     if (a11y.reduceMotion) el.dataset.reducedMotion = "on";
     else delete el.dataset.reducedMotion;
+    el.dataset.density = a11y.density;
+    const dv = DENSITY_VARS[a11y.density];
+    for (const key of Object.keys(dv) as Array<keyof typeof dv>) {
+      el.style.setProperty(key, dv[key]);
+    }
   }
 }
