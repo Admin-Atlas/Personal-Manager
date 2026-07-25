@@ -3,7 +3,7 @@
 
 import { ModelPicker } from "./ModelPicker";
 import { ResetLink } from "./settings/ResetControls";
-import { Button, SectionInfo } from "./ui";
+import { Button, SectionInfo, Toggle } from "./ui";
 
 interface Props {
   label: string;
@@ -116,21 +116,12 @@ export function ModelListEditor({
 
       <div className="mt-2 flex items-start justify-between gap-3">
         <span className="text-xs font-medium text-ink2">Auto-switch on limit</span>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={autoSwitch}
-          onClick={() => onAutoSwitchChange(!autoSwitch)}
-          className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-            autoSwitch ? "bg-accent" : "bg-border2"
-          }`}
-        >
-          <span
-            className={`inline-block h-4 w-4 transform rounded-full bg-panel transition-transform ${
-              autoSwitch ? "translate-x-4" : "translate-x-0.5"
-            }`}
-          />
-        </button>
+        <Toggle
+          checked={autoSwitch}
+          onChange={onAutoSwitchChange}
+          ariaLabel="Auto-switch on limit"
+          className="mt-0.5"
+        />
       </div>
 
       <SectionInfo title="What this model does">

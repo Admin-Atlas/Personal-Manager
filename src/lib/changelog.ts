@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.67.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "The Accessibility tab gains a Density control -- Compact, Standard, or Comfortable -- that sets how large PM's controls and their tap/click targets are. Standard meets the recommended 24px minimum and is the default on a fresh install; Comfortable grows targets to 44px, which helps when precise clicking is hard. If you've been using PM already, nothing moves: you keep the original Compact spacing until you choose otherwise (or Reset the tab to the roomier default). Alongside it, every on/off switch in Settings now shares one consistent control, and the window buttons up top have larger, easier-to-hit areas -- all without changing how PM looks at your current setting.",
+    ],
+  },
+  {
     version: "3.66.0-alpha",
     date: "2026-07-25",
     highlights: [

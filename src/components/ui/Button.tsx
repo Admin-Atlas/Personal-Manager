@@ -31,7 +31,7 @@ export function Button({ variant = "secondary", className, children, ...rest }: 
   return (
     <button
       className={cn(
-        "inline-flex items-center justify-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1.5 text-sm transition disabled:cursor-not-allowed disabled:opacity-40",
+        "inline-flex min-h-[var(--tap-min,24px)] items-center justify-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1.5 text-sm transition disabled:cursor-not-allowed disabled:opacity-40",
         terminal && "font-mono",
         VARIANT[variant],
         className,

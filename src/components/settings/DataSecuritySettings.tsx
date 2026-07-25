@@ -9,7 +9,7 @@ import { IS_LINUX } from "../../lib/setupGuide";
 import type { AppLockStatus } from "../../lib/types";
 import { RemovePmData } from "../RemovePmData";
 import { VaultCard } from "../VaultCard";
-import { Button, SectionInfo } from "../ui";
+import { Button, SectionInfo, Toggle } from "../ui";
 
 /** The Data & Security Settings tab. Self-contained: the app-lock toggle and the export/reveal
  *  actions each persist/run immediately through their own IPC calls, so there's nothing to batch —
@@ -111,11 +111,10 @@ export function DataSecuritySettings() {
               </p>
             )}
           </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={appLock?.enabled ?? false}
-            aria-label="App lock"
+          <Toggle
+            checked={appLock?.enabled ?? false}
+            onChange={(v) => void toggleAppLock(v)}
+            ariaLabel="App lock"
             disabled={!appLock?.available}
             title={
               appLock?.available
@@ -124,17 +123,8 @@ export function DataSecuritySettings() {
                   ? "Feature not available on Linux yet"
                   : "Not available on this device"
             }
-            onClick={() => void toggleAppLock(!(appLock?.enabled ?? false))}
-            className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-              appLock?.enabled ? "bg-accent" : "bg-surface"
-            }`}
-          >
-            <span
-              className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                appLock?.enabled ? "translate-x-4" : "translate-x-0.5"
-              }`}
-            />
-          </button>
+            className="mt-0.5"
+          />
         </div>
         {appLock?.available && (
           <SectionInfo title="What does app lock do?">

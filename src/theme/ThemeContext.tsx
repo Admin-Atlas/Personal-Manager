@@ -22,10 +22,12 @@ import {
   SYSTEMS,
   MODE_PREFS,
   DEPTHS,
+  DENSITIES,
   type System,
   type Mode,
   type ModePref,
   type Depth,
+  type Density,
 } from "./profiles";
 import { resolveMode, type ModeResolution, type ModeSource } from "./resolveMode";
 import type { Coords } from "./timezones";
@@ -75,6 +77,11 @@ export interface ThemeState {
   /** Use Atkinson Hyperlegible for UI + heading text. */
   legibleFont: boolean;
   setLegibleFont: (v: boolean) => void;
+  /** Control density / touch-target size. `standard` (WCAG 2.5.8) is the fresh-install default;
+   *  existing installs are pinned to `compact` (today's sizing) by a one-time migration, so their
+   *  look is undisturbed until they choose otherwise or Reset. */
+  density: Density;
+  setDensity: (v: Density) => void;
   /** True when every accessibility axis is at its default — drives the Accessibility tab's "Reset". */
   accessibilityIsDefault: boolean;
   /** Restore the accessibility axes (font size, reduce motion, legible font) to their defaults. */
@@ -100,6 +107,27 @@ const FONT_SCALE_VALUES: Record<FontScale, number> = {
 const FONT_SCALES: readonly FontScale[] = ["small", "default", "large", "xlarge"];
 const DEFAULT_FONT_SCALE: FontScale = "default";
 
+// Density is the one accessibility axis whose compliant default differs from today's behaviour, so
+// it carries a one-time legacy pin: a *fresh* install gets `standard` (meets WCAG 2.5.8's 24px target
+// out of the box), while an *existing* install is pinned to `compact` (today's tight sizing) so the
+// update disturbs nothing. The pin needs no dedicated flag — a first launch that already has theme
+// state in localStorage (KEY.system) is by definition an existing user (see the density useState).
+// Once persisted the stored value always wins. Because a pinned user then reads density !== default,
+// the Accessibility tab surfaces its Reset, which restores the compliant `standard` — the "keep my
+// look, or reset to the compliant baseline" contract.
+const DEFAULT_DENSITY: Density = "standard";
+const LEGACY_DENSITY: Density = "compact";
+
+/** The density a fresh mount starts at. A stored value always wins; otherwise an install that
+ *  already carries theme state (`hasThemeState`, i.e. a `pm:theme:system` value is present) is an
+ *  existing user and is pinned to the legacy sizing, while a genuinely fresh install gets the
+ *  compliant default. Pure + exported so the one-time migration is unit-testable without mounting
+ *  the provider. */
+export function initialDensity(stored: string | null, hasThemeState: boolean): Density {
+  if (stored !== null) return oneOf(stored, DENSITIES, DEFAULT_DENSITY);
+  return hasThemeState ? LEGACY_DENSITY : DEFAULT_DENSITY;
+}
+
 // The Teach-tab visibility override: "auto" follows the Depth preset (hidden for minimalist,
 // shown for standard/power); "show"/"hide" are explicit choices made from Settings.
 type TeachPref = "auto" | "show" | "hide";
@@ -118,6 +146,7 @@ const KEY = {
   fontScale: "pm:a11y:fontScale",
   reduceMotion: "pm:a11y:reduceMotion",
   legibleFont: "pm:a11y:legibleFont",
+  density: "pm:a11y:density",
 };
 
 // localStorage can throw (locked-down webviews); never let a theme read/write crash the app.
@@ -188,6 +217,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     () => read(KEY.reduceMotion) === "true",
   );
   const [legibleFont, setLegibleFont] = useState<boolean>(() => read(KEY.legibleFont) === "true");
+  // Reads KEY.system to tell an existing install from a fresh one — safe here because the persist
+  // effect (which writes KEY.system) only runs after mount, so it still reflects the pre-upgrade state.
+  const [density, setDensity] = useState<Density>(() =>
+    initialDensity(read(KEY.density), read(KEY.system) !== null),
+  );
 
   // The resolved Mode (+ how/where it was resolved). Computed synchronously for a themed first
   // paint, then kept live by the effect below (OS changes, sunrise/sunset, focus).
@@ -231,6 +265,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     );
     setReduceMotion(b.reduceMotion === true);
     setLegibleFont(b.legibleFont === true);
+    // A blob without `density` predates this axis, so it belongs to an existing user whose folder was
+    // restored on a fresh machine → pin the legacy sizing, matching the localStorage migration above.
+    setDensity(oneOf(typeof b.density === "string" ? b.density : null, DENSITIES, LEGACY_DENSITY));
   }
 
   // One-shot hydration from the store. On a fresh machine (localStorage empty) the
@@ -340,12 +377,17 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     autoLocation === "" &&
     teachPref === DEFAULT_TEACH;
 
-  const accessibilityIsDefault = fontScale === DEFAULT_FONT_SCALE && !reduceMotion && !legibleFont;
+  const accessibilityIsDefault =
+    fontScale === DEFAULT_FONT_SCALE &&
+    !reduceMotion &&
+    !legibleFont &&
+    density === DEFAULT_DENSITY;
 
   function resetAccessibility(): void {
     setFontScale(DEFAULT_FONT_SCALE);
     setReduceMotion(false);
     setLegibleFont(false);
+    setDensity(DEFAULT_DENSITY);
   }
 
   // Restore every axis to its default in one go. The persist effect below mirrors the axis changes to
@@ -371,6 +413,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       fontScale: FONT_SCALE_VALUES[fontScale],
       reduceMotion,
       legibleFont,
+      density,
     });
     write(KEY.system, system);
     write(KEY.modePref, modePref);
@@ -380,6 +423,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.fontScale, fontScale);
     write(KEY.reduceMotion, String(reduceMotion));
     write(KEY.legibleFont, String(legibleFont));
+    write(KEY.density, density);
     if (hydrated) {
       const blob = {
         system,
@@ -391,6 +435,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         fontScale,
         reduceMotion,
         legibleFont,
+        density,
       };
       setPref(PREF_KEY, JSON.stringify(blob)).catch(() => {
         /* fire-and-forget — localStorage already holds the value */
@@ -406,6 +451,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     fontScale,
     reduceMotion,
     legibleFont,
+    density,
     hydrated,
   ]);
 
@@ -434,6 +480,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setReduceMotion,
     legibleFont,
     setLegibleFont,
+    density,
+    setDensity,
     accessibilityIsDefault,
     resetAccessibility,
   };

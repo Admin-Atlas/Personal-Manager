@@ -481,22 +481,11 @@ export function GeneralSettings() {
           data-help="settings-teach-tab"
         >
           <span className="text-sm text-ink2">Review &amp; Teach tabs</span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={teachVisible}
-            aria-label="Show the Review and Teach tabs"
-            onClick={() => setTeachVisible(!teachVisible)}
-            className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-              teachVisible ? "bg-accent" : "bg-surface"
-            }`}
-          >
-            <span
-              className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                teachVisible ? "translate-x-4" : "translate-x-0.5"
-              }`}
-            />
-          </button>
+          <Toggle
+            checked={teachVisible}
+            onChange={setTeachVisible}
+            ariaLabel="Show the Review and Teach tabs"
+          />
         </div>
         {/* Both of Appearance's paragraphs — the "it saves itself" reassurance and the
             Location field's format + privacy note — fold into this one disclosure at the
@@ -639,22 +628,11 @@ export function GeneralSettings() {
           {tsneInstalled === null ? (
             <span className="text-xs text-ink4">…</span>
           ) : tsneInstalled ? (
-            <button
-              type="button"
-              role="switch"
-              aria-checked={mapTsneEnabled}
-              aria-label="Use the enhanced t-SNE layout"
-              onClick={() => changeTsneEnabled(!mapTsneEnabled)}
-              className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                mapTsneEnabled ? "bg-accent" : "bg-surface"
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                  mapTsneEnabled ? "translate-x-4" : "translate-x-0.5"
-                }`}
-              />
-            </button>
+            <Toggle
+              checked={mapTsneEnabled}
+              onChange={changeTsneEnabled}
+              ariaLabel="Use the enhanced t-SNE layout"
+            />
           ) : (
             <Button variant="secondary" onClick={downloadTsne} disabled={installingTsne}>
               {installingTsne ? "Downloading…" : "Download"}
@@ -738,20 +716,12 @@ export function GeneralSettings() {
           <label className="block text-sm font-medium text-ink2">Help mode</label>
           <div className="flex items-center gap-2">
             {!helpIsDefault && <ResetLink onReset={() => help.setEnabled(false)} />}
-            <button
-              role="switch"
-              aria-checked={help.enabled}
-              onClick={() => help.setEnabled(!help.enabled)}
-              className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                help.enabled ? "bg-accent" : "bg-surface"
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-accent-ink transition-transform ${
-                  help.enabled ? "translate-x-4" : "translate-x-0.5"
-                }`}
-              />
-            </button>
+            <Toggle
+              checked={help.enabled}
+              onChange={help.setEnabled}
+              ariaLabel="Help mode"
+              className="mt-0.5"
+            />
           </div>
         </div>
         <SectionInfo title="What is help mode?">
