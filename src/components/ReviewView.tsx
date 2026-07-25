@@ -20,6 +20,14 @@ import { ChatBadge } from "./ChatBadge";
 import { rankImportance } from "../lib/importance";
 import { useReader } from "../lib/reader";
 import { readReviewAiEnabled, writeReviewAiEnabled } from "../lib/reviewPrefs";
+import {
+  currentProposalRun,
+  proposalCache,
+  pruneProposalCache,
+  publishProposal,
+  subscribeToProposals,
+  withProposalRun,
+} from "../lib/reviewProposals";
 
 interface Props {
   /** Called after the queue changes so the parent can refresh the sidebar badge. */
@@ -36,11 +44,10 @@ interface Edit {
 
 const PROJECTS_LIST_ID = "review-projects";
 
-// Module-level caches (keyed by document id) so leaving the Review tab and returning doesn't re-run
-// the AI proposals — those cost tokens, and the queue can be hundreds of items deep while a Drive
-// index is running. They survive unmount; `load` restores from them, only proposing for documents
-// not yet cached, prunes entries for docs that have left the queue, and "Re-propose" clears them.
-const proposalCache = new Map<number, MetadataProposal>();
+// The proposal cache and the single-run guard now live in `lib/reviewProposals`, shared with the
+// background run that fires after a connector sync (#513) — otherwise the two could propose for the
+// same documents at once and bill twice. Hand-edits stay local: they're UI state, and nothing
+// outside this view produces them.
 const editCache = new Map<number, Edit>();
 
 /** A stable, connector-unique key for a document's parent folder — `source_type` disambiguates a leaf
@@ -87,6 +94,23 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Paint proposals produced by a background run (after a connector sync, #513) as they land, so an
+  // open Review tab fills in live rather than only on the next reload. A row the user has already
+  // hand-edited keeps their edit — the same rule the view's own streaming callback follows.
+  useEffect(() => {
+    return subscribeToProposals((documentId, proposal) => {
+      setProposals((prev) => ({ ...prev, [documentId]: proposal }));
+      if (dirtyRef.current.has(documentId)) return;
+      const edit = {
+        project: proposal.project,
+        tags: proposal.tags,
+        importance: proposal.importance,
+      };
+      editCache.set(documentId, edit);
+      setEdits((prev) => ({ ...prev, [documentId]: edit }));
+    });
+  }, []);
+
   async function load() {
     setError(null);
     try {
@@ -95,7 +119,7 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
       setProjects(p);
       // Prune cache entries for documents that have left the queue (committed/removed elsewhere).
       const ids = new Set(q.map((d) => d.id));
-      for (const id of [...proposalCache.keys()]) if (!ids.has(id)) proposalCache.delete(id);
+      pruneProposalCache(ids);
       for (const id of [...editCache.keys()]) if (!ids.has(id)) editCache.delete(id);
       // Hydrate the in-memory cache from the persisted proposals so a restart repaints what the model
       // already produced. Only genuinely un-proposed docs then fall into the `missing` pass below, so
@@ -131,14 +155,17 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
   }
 
   // Regenerate from scratch (the explicit "Re-propose" action): clear the cache for the queue so
-  // every row is proposed afresh, discarding prior proposals and hand-edits.
-  function repropose() {
+  // every row is proposed afresh, discarding prior proposals and hand-edits. Any run already in
+  // flight (the tab's own, or a background one after a sync) is allowed to settle first — otherwise
+  // it would keep publishing into the cache we are about to clear.
+  async function repropose() {
+    await currentProposalRun();
     for (const d of queue) {
       proposalCache.delete(d.id);
       editCache.delete(d.id);
     }
     setProposals({});
-    void runProposals(queue.map((d) => d.id));
+    await runProposals(queue.map((d) => d.id));
   }
 
   async function runProposals(ids: number[]) {
@@ -149,31 +176,27 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
     setAiError(null);
     dirtyRef.current = new Set();
     try {
-      // Suggestions are on, but they need a working model. No provider linked, or a live failure
-      // (no credits, an unreachable local endpoint, a rejected key) becomes a calm "here's why — file
-      // by hand" note rather than a red error, and never blocks manual filing.
-      const status = await aiProviderStatus();
-      if (runRef.current !== myRun) return;
-      if (!status.has_cloud_key && !status.local_configured) {
-        setAiError("no AI model is linked yet");
-        return;
-      }
-      await proposeMetadata((event) => {
-        if (runRef.current !== myRun) return; // superseded run or unmounted
-        if (event.type !== "proposed") return;
-        const { document_id, proposal } = event;
-        proposalCache.set(document_id, proposal);
-        setProposals((prev) => ({ ...prev, [document_id]: proposal }));
-        // Don't clobber a row the user has already hand-edited while proposals stream.
-        if (dirtyRef.current.has(document_id)) return;
-        const edit = {
-          project: proposal.project,
-          tags: proposal.tags,
-          importance: proposal.importance,
-        };
-        editCache.set(document_id, edit);
-        setEdits((prev) => ({ ...prev, [document_id]: edit }));
-      }, ids);
+      // Joins a background run already covering these documents rather than starting a second one
+      // (#513). Either way results arrive through the shared subscription above, so the tab fills
+      // in live and nothing is billed twice.
+      await withProposalRun(async () => {
+        // Suggestions are on, but they need a working model. No provider linked, or a live failure
+        // (no credits, an unreachable local endpoint, a rejected key) becomes a calm "here's why —
+        // file by hand" note rather than a red error, and never blocks manual filing.
+        const status = await aiProviderStatus();
+        if (runRef.current !== myRun) return;
+        if (!status.has_cloud_key && !status.local_configured) {
+          setAiError("no AI model is linked yet");
+          return;
+        }
+        await proposeMetadata((event) => {
+          if (runRef.current !== myRun) return; // superseded run or unmounted
+          if (event.type !== "proposed") return;
+          // Publishing updates the shared cache and notifies the subscription, which owns the
+          // state updates — so background and foreground runs paint through one path.
+          publishProposal(event.document_id, event.proposal);
+        }, ids);
+      });
     } catch (e) {
       if (runRef.current === myRun) setAiError(String(e));
     } finally {
@@ -434,7 +457,7 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
         <div className="flex items-center gap-2">
           <Button
             variant="tertiary"
-            onClick={repropose}
+            onClick={() => void repropose()}
             disabled={
               proposing || committing || committingIds.size > 0 || queue.length === 0 || !aiEnabled
             }

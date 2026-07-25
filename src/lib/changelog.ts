@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.71.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Filing suggestions are ready before you open Review. When a Drive, OneDrive, or folder sync finishes, PM now works out its suggestions for the new files straight away in the background, so opening Review shows them already there instead of starting the job while you wait. If Review is already open, they appear as they arrive. This only happens when AI suggestions are switched on, and it never asks about a document twice -- so it costs nothing extra, it just happens sooner.",
+    ],
+  },
+  {
     version: "3.70.0-alpha",
     date: "2026-07-25",
     highlights: [
