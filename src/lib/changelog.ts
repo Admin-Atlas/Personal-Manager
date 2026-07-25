@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.72.4-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Answers in chat are now formatted properly. Bold text, bullet points, headings, tables and code all read the way the assistant meant them to, instead of showing the raw markers around them. Clicking a [1] still jumps to the source it came from. What you type stays exactly as you typed it.",
+      "The same fix reaches the other places PM writes for you: your daily briefing on the Focus tab, the summary of what got condensed when a long chat is compressed, and the retrieval advice in Developer mode.",
+    ],
+  },
+  {
     version: "3.72.3-alpha",
     date: "2026-07-25",
     highlights: [

@@ -15,6 +15,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { chatContextStatus, compressChat, revertCompress } from "../lib/ipc";
 import type { CompressResult, ContextStatus } from "../lib/types";
 import { useDepth } from "../theme/depth";
+import { Markdown } from "../lib/markdown";
 import { Button, Modal } from "./ui";
 import { Popover } from "./ui";
 
@@ -258,8 +259,8 @@ export function ContextMeter({ conversationId, refreshKey, onUpgrade }: Props) {
             . Your full conversation is still kept word-for-word in your vault.
           </p>
           {preview?.condensed_bullets && (
-            <div className="mt-3 max-h-60 overflow-y-auto whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-panel p-3 text-sm text-ink2">
-              {preview.condensed_bullets}
+            <div className="pm-inline-md mt-3 max-h-60 overflow-y-auto rounded-[var(--radius-sm)] border border-border bg-panel p-3 text-sm text-ink2">
+              <Markdown>{preview.condensed_bullets}</Markdown>
             </div>
           )}
           <div className="mt-5 flex justify-end gap-2">
