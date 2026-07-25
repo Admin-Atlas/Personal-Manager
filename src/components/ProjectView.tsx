@@ -287,6 +287,15 @@ export function ProjectView({
               key={d.id}
               data-doc-id={d.id}
               onClick={() => openReader(d)}
+              // Keyboard access without role="button" — the item can contain its own controls (the
+              // triage inputs below), so open on Enter/Space only when the item itself has focus.
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+                  e.preventDefault();
+                  openReader(d);
+                }
+              }}
               className={`cursor-pointer rounded-[var(--radius-sm)] px-2 py-1.5 transition-colors hover:bg-surface ${
                 flashId === d.id
                   ? "bg-surface ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]"

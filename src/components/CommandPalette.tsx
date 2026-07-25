@@ -244,16 +244,28 @@ export function CommandPalette({
             setActive(0);
           }}
           onKeyDown={onKeyDown}
+          role="combobox"
+          aria-label="Search projects, files and conversations"
+          aria-expanded={flat.length > 0}
+          aria-controls="pm-cmdk-listbox"
+          aria-autocomplete="list"
+          aria-activedescendant={flat.length > 0 ? `pm-cmdk-opt-${active}` : undefined}
           placeholder="Jump to a project, file, conversation…"
           className="w-full border-b border-border bg-transparent px-4 py-3 text-sm text-ink placeholder:text-ink4 focus:outline-none"
         />
 
-        <div ref={listRef} className="flex-1 overflow-y-auto py-1">
+        <div
+          ref={listRef}
+          role="listbox"
+          id="pm-cmdk-listbox"
+          aria-label="Results"
+          className="flex-1 overflow-y-auto py-1"
+        >
           {flat.length === 0 ? (
             <p className="px-4 py-6 text-center text-sm text-ink4">No matches.</p>
           ) : (
             groups.map((group) => (
-              <div key={group.kind}>
+              <div key={group.kind} role="group" aria-label={KIND_HEADING[group.kind]}>
                 <p className="px-3 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-ink4">
                   {KIND_HEADING[group.kind]}
                 </p>
@@ -264,6 +276,12 @@ export function CommandPalette({
                     <button
                       key={item.id}
                       data-palette-index={idx}
+                      id={`pm-cmdk-opt-${idx}`}
+                      role="option"
+                      aria-selected={idx === active}
+                      // Arrow keys drive selection from the input via aria-activedescendant, so the
+                      // options aren't separate tab stops; mouse click still activates.
+                      tabIndex={-1}
                       onMouseMove={() => setActive(idx)}
                       onClick={item.activate}
                       className={`flex w-full items-center gap-3 px-3 py-2 text-left ${

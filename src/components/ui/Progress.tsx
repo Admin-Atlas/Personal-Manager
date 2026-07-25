@@ -16,6 +16,9 @@ export interface ProgressProps {
   className?: string;
   /** Accessible label for the progressbar. */
   label?: string;
+  /** Spoken form of the current value (e.g. "3 of 10"), so a screen reader announces the count
+   *  rather than a bare percentage. Ignored while indeterminate. */
+  valueText?: string;
 }
 
 const SWEEP: CSSProperties = {
@@ -24,7 +27,7 @@ const SWEEP: CSSProperties = {
   animation: "pm-shimmer 1.4s linear infinite",
 };
 
-export function Progress({ value, className, label = "Loading" }: ProgressProps) {
+export function Progress({ value, className, label = "Loading", valueText }: ProgressProps) {
   const determinate = typeof value === "number";
   const pct = determinate ? Math.max(0, Math.min(1, value as number)) * 100 : undefined;
   return (
@@ -34,6 +37,7 @@ export function Progress({ value, className, label = "Loading" }: ProgressProps)
       aria-valuemin={determinate ? 0 : undefined}
       aria-valuemax={determinate ? 100 : undefined}
       aria-valuenow={determinate ? Math.round(pct as number) : undefined}
+      aria-valuetext={determinate ? valueText : undefined}
       className={cn("h-1 w-full overflow-hidden rounded-[var(--radius-sm)] bg-border", className)}
     >
       {determinate ? (

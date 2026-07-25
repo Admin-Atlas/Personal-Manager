@@ -11,7 +11,7 @@ import { useState } from "react";
 import { detachFromSharedVault, unlockVault, vaultFaultOf } from "../lib/ipc";
 import type { VaultStatus } from "../lib/types";
 import { paddedPassphraseHint } from "../lib/vaultPassphrase";
-import { Button, Input } from "./ui";
+import { Button, Input, useFieldA11y } from "./ui";
 import { DetachConfirm, RepairAccessButton } from "./VaultRecovery";
 
 export function VaultUnlock({
@@ -29,6 +29,9 @@ export function VaultUnlock({
   // the classified code, never on message text, and lead with Repair instead.
   const [deniedPath, setDeniedPath] = useState<string | null>(null);
   const [confirmDetach, setConfirmDetach] = useState(false);
+  // Name the passphrase field (placeholder is not an accessible name) and tie the error to it so it's
+  // both associated and announced — with a visually-hidden label, so the centered gate looks unchanged.
+  const field = useFieldA11y({ error });
 
   async function unlock() {
     if (busy || pass.trim().length === 0) return;
@@ -112,6 +115,9 @@ export function VaultUnlock({
         }}
         className="flex w-full max-w-xs flex-col gap-2"
       >
+        <label className="sr-only" {...field.labelProps}>
+          Passphrase
+        </label>
         <Input
           type="password"
           autoComplete="current-password"
@@ -120,9 +126,11 @@ export function VaultUnlock({
           value={pass}
           onChange={(e) => setPass(e.target.value)}
           disabled={busy}
+          {...field.controlProps}
         />
         {error && (
           <p
+            {...field.errorProps}
             className="rounded-[var(--radius)] px-3 py-2 text-xs text-st-due"
             style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
           >
