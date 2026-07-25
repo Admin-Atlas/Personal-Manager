@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.81.1-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "The big one: Review's AI suggestions now actually fill in the fields. If PM suggested a project, an importance and some tags while the Review tab was closed -- which is what happens after a cloud or folder sync -- or if you closed the app and reopened it, you'd come back to the AI's written reasoning sitting above a row that still said Unsorted, with no tags and no importance, and the only way to get them back was to press Re-propose and pay for the suggestion twice. The suggestions were there all along; the row just never read them. It does now, and anything you'd edited by hand still wins over them.",
+      "That one is worth a second sentence, because it was quietly costing you more than a repaint. Approving a row in that blank state filed the document as Unsorted -- and recorded it as you overruling the AI on all three fields, which is meant to be how PM learns your filing habits. If you approved things this way, those documents are in Unsorted and can be re-sorted from the Review tab.",
+      "Progress bars now count from when the job really started. Leaving a tab mid-sync, mid-rebuild or mid-backup and coming back used to restart the elapsed timer at zero, so a twenty-minute index could read as one minute old. The timer now comes from the job itself, so it keeps counting no matter which screen you're on. (Visible at the Power depth setting.)",
+      "The Projects and Global chats sections in the sidebar stay how you leave them. Folding one away now survives both switching tabs and restarting PM, instead of springing back open.",
+      "The Focus tab's project column has a heading again -- the empty corner beside the Sort control now reads Projects, matching Today and Upcoming above it.",
+      "Settings > General > Appearance: the “What these settings do” note was one short line that only told you the settings were saved. It now explains what each of System, Mode, Depth, Accent and Text size actually changes -- particularly Depth, which had no explanation anywhere in the app.",
+    ],
+  },
+  {
     version: "3.81.0-alpha",
     date: "2026-07-25",
     highlights: [

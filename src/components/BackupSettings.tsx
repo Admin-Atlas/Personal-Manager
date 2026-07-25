@@ -81,6 +81,10 @@ export function BackupSettings() {
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState<BackupPhase | null>(null);
   const [fraction, setFraction] = useState(0);
+  // Epoch ms the running backup/restore began, restored from the backend snapshot so leaving and
+  // reopening this panel mid-op doesn't restart the elapsed timer. The backend stamps it
+  // edge-triggered on idle -> running, so it survives every phase transition.
+  const [startedAt, setStartedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   // Non-blocking "backed up, but some destinations failed" banner (F-22): distinct from `error`
@@ -265,6 +269,7 @@ export function BackupSettings() {
         setRunning(s.running);
         setPhase(s.phase);
         setFraction(s.fraction);
+        setStartedAt(s.started_at_ms);
         if (s.last_error) setError(s.last_error);
         // Re-surface a partial-failure banner from the last finished run (F-22), so navigating
         // away and back doesn't lose "backed up, but Google Drive failed".
@@ -281,17 +286,23 @@ export function BackupSettings() {
         setRunning(true);
         setPhase(e.phase);
         setFraction(e.fraction);
+        // Only seeds when we have nothing: every phase transition emits one of these, so assigning
+        // unconditionally would restart the timer at snapshot -> pack -> upload. The authoritative
+        // stamp comes from the snapshot fetch above; this just covers a mount that beat it.
+        setStartedAt((prev) => prev ?? Date.now());
         setWarning(null); // a fresh run started — drop any stale partial-failure banner
       } else if (e.type === "finished") {
         setRunning(false);
         setPhase(null);
         setFraction(1);
+        setStartedAt(null);
         // F-22: some destinations may have failed while others succeeded (a partial success the
         // backend still reports as "finished"). Surface them non-blockingly; null clears cleanly.
         setWarning(describeFailures(e.report.failed_destinations));
       } else if (e.type === "failed") {
         setRunning(false);
         setPhase(null);
+        setStartedAt(null);
         setError(e.message);
       }
     });
@@ -762,6 +773,7 @@ export function BackupSettings() {
             // for a single target), not real byte-progress — so shimmer (total=null) instead of a
             // bar frozen at 0% through a minutes-long transfer.
             total={isOpaquePhase(phase) ? null : 100}
+            startedAt={startedAt ?? undefined}
             mode="percent"
             label={phase ? PHASE_LABEL[phase] : "Working"}
           />

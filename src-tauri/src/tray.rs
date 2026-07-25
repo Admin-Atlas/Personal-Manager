@@ -26,6 +26,28 @@
 //! [`on_window_event`] exits EXPLICITLY when the main window closes with the tray off. That, not lazy
 //! creation, is what stops PM running on headless after you close it.
 //!
+//! # Two harmless lines on the dev console at quit
+//!
+//! Both were investigated in the 25-07-2026 live-test round and are **deliberately not fixed**;
+//! neither reaches a user, because release builds are `windows_subsystem = "windows"` (main.rs) and
+//! have no console at all.
+//!
+//! * `Error removing system tray icon` — an `eprintln!` inside `tray-icon` 0.24.1, whose `Drop`
+//!   calls `Shell_NotifyIconW(NIM_DELETE)` unconditionally. With the tray OFF (the default) the
+//!   `set_visible(false)` above has ALREADY deleted the icon — that is how the crate implements
+//!   hiding — so the drop is a second delete of something no longer registered and the shell returns
+//!   FALSE. The icon is genuinely gone either way; only the redundant second call complains. Fixing
+//!   it means never creating the icon until the tray is switched on, which trades a cosmetic log line
+//!   for a lazily-built tray on Linux, where a missing StatusNotifierItem host is a live failure mode.
+//! * `Failed to unregister class Chrome_WidgetWin_0. Error = 1412` — WebView2's own
+//!   `ui::gfx::WindowImpl` class registrar, running at CRT exit. 1412 is `ERROR_CLASS_HAS_WINDOWS`
+//!   ("class still has open windows"), NOT "class does not exist" — so it is telling us webview HWNDs
+//!   were still alive when the process ended. They always are: tao ends the process with
+//!   `std::process::exit` from inside its event loop, and Tauri's `cleanup_before_exit` only HIDES
+//!   windows on Windows. Destroying the briefing window before `app.exit(0)` would not silence it —
+//!   the main window's HWNDs are alive at that moment too, by construction. The OS reclaims both
+//!   classes and windows at process death.
+//!
 //! It deliberately holds NO capability entry. PM's own `#[tauri::command]`s are not ACL-gated (the
 //! app ships no `permissions/` directory, so there is no `__app-acl__` manifest and the reject arm
 //! in tauri's `on_message` is never taken), which means the popover can call `get_daily_briefing`

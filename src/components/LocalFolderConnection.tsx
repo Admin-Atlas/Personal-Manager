@@ -164,6 +164,7 @@ export function LocalFolderConnection() {
 
       {syncing && progress && (
         <SyncProgress
+          startedAt={ds.startedAt}
           processed={progress.processed}
           total={progress.total}
           label={syncKey ? "Indexing folder" : "Indexing your folders"}

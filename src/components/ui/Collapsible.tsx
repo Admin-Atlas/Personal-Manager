@@ -12,6 +12,10 @@
 // bodies of *controls*; a body of pure explanation goes through `SectionInfo`, which starts
 // closed at every depth and takes no `defaultOpen` at all. The body animates via the grid
 // 0fr↔1fr trick (no height measurement); the transition is dropped under prefers-reduced-motion.
+//
+// A caller that needs the fold to OUTLIVE the mount passes `open` + `onOpenChange` and keeps the
+// state itself (the Chats-tab sections do, via lib/chatPrefs). Persistence stays out here on
+// purpose: nothing in ui/ touches localStorage, so the primitive has no idea where its state lives.
 
 import { useState, type ReactNode } from "react";
 import { useTheme } from "../../theme";
@@ -21,6 +25,10 @@ export interface CollapsibleProps {
   title: ReactNode;
   /** Initial open state (callers usually derive this from useDepth). Default open. */
   defaultOpen?: boolean;
+  /** Drive the open state from outside (with `onOpenChange`) — for a caller that persists the fold.
+   *  Omit both and the section stays uncontrolled, seeded from `defaultOpen`. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   /** Trailing header slot — e.g. a count or a status. */
   meta?: ReactNode;
   children: ReactNode;
@@ -30,18 +38,26 @@ export interface CollapsibleProps {
 export function Collapsible({
   title,
   defaultOpen = true,
+  open: controlledOpen,
+  onOpenChange,
   meta,
   children,
   className,
 }: CollapsibleProps) {
-  const [open, setOpen] = useState(defaultOpen);
+  // Standard controlled/uncontrolled pair: the internal state is still kept (so a caller can pass
+  // `onOpenChange` alone just to observe), but `open` wins whenever it is supplied.
+  const [selfOpen, setSelfOpen] = useState(defaultOpen);
+  const open = controlledOpen ?? selfOpen;
   const { system } = useTheme();
   return (
     <div className={cn("flex flex-col", className)}>
       <button
         type="button"
         aria-expanded={open}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          setSelfOpen(!open);
+          onOpenChange?.(!open);
+        }}
         className="flex w-full items-center gap-2 text-left text-sm text-ink2 transition-colors hover:text-ink"
       >
         <span

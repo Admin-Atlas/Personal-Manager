@@ -20,6 +20,8 @@ export interface DetachedSyncSnapshot {
   running: boolean;
   processed: number;
   total: number | null;
+  /** Epoch ms the running pass began, for an elapsed timer that survives this view unmounting. */
+  started_at_ms: number | null;
   last_report: SyncReport | null;
 }
 
@@ -49,6 +51,10 @@ export interface DetachedSync {
   run: (label: string, fn: () => Promise<void>) => Promise<void>;
   /** Live progress of the running sync, or null when idle. */
   progress: { processed: number; total: number | null } | null;
+  /** Epoch ms the running sync began, or null. Kept OUT of `progress` on purpose: the `counted` /
+   *  `item` handlers replace that object wholesale on every file, so a start stamp folded into it
+   *  would be dropped by the next event — the exact class of bug this whole change is fixing. */
+  startedAt: number | null;
   /** `progress != null` — a sync is on screen. */
   syncing: boolean;
   /** The target (account email / folder key) currently syncing, or null for an all-targets pass. */
@@ -76,6 +82,7 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
   const [progress, setProgress] = useState<{ processed: number; total: number | null } | null>(
     null,
   );
+  const [startedAt, setStartedAt] = useState<number | null>(null);
   const [target, setTarget] = useState<string | null>(null);
   const [queued, setQueued] = useState<Set<string>>(new Set());
   const [report, setReport] = useState<SyncReport | null>(null);
@@ -108,6 +115,7 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
       else if (ev.type === "item") setProgress({ processed: ev.processed, total: ev.total });
       else if (ev.type === "finished") {
         setProgress(null);
+        setStartedAt(null);
         setTarget(null);
         setQueued(new Set());
         setStopping(false);
@@ -130,6 +138,9 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
         if (!mounted) return;
         if (s.running) {
           setProgress({ processed: s.processed, total: s.total });
+          // The whole point: a bar restored on remount counts from when the BACKEND started, so
+          // leaving Settings mid-sync and coming back no longer restarts the timer at 0:00.
+          setStartedAt(s.started_at_ms);
           setTarget(optsRef.current.targetOf(s));
         } else if (s.last_report) {
           setReport(s.last_report);
@@ -167,6 +178,8 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
       setTarget(tgt);
       setQueued(new Set());
       setProgress({ processed: 0, total: null });
+      // Optimistic — the backend stamps its own on `begin_pass`, and the next remount reads that.
+      setStartedAt(Date.now());
     } else if (tgt != null) {
       setQueued((q) => new Set(q).add(tgt));
     }
@@ -174,6 +187,7 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
       if (startsIt) {
         setError(String(e));
         setProgress(null);
+        setStartedAt(null);
         setTarget(null);
       }
     });
@@ -194,6 +208,7 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
     setError,
     run,
     progress,
+    startedAt,
     syncing: progress != null,
     target,
     queued,

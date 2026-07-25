@@ -15,6 +15,7 @@ export function SyncProgress({
   processed,
   total,
   label,
+  startedAt,
   sizeQuestion = "Changed your mind about the size of this?",
   stopping,
   confirmStop,
@@ -24,6 +25,8 @@ export function SyncProgress({
   processed: number;
   total: number | null;
   label: string;
+  /** Epoch ms the backend started this sync, so the Power-depth elapsed timer survives a remount. */
+  startedAt?: number | null;
   sizeQuestion?: string;
   stopping: boolean;
   confirmStop: boolean;
@@ -33,7 +36,12 @@ export function SyncProgress({
   return (
     <>
       <div className="mt-3">
-        <IngestProgress processed={processed} total={total} label={label} />
+        <IngestProgress
+          processed={processed}
+          total={total}
+          label={label}
+          startedAt={startedAt ?? undefined}
+        />
         <p className="mt-1 text-xs text-ink4">
           Indexing keeps running in the background — you can leave this page and come back later;
           we’ll keep working.

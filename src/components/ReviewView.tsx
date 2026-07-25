@@ -25,6 +25,7 @@ import {
   proposalCache,
   pruneProposalCache,
   publishProposal,
+  seedReviewEdit,
   subscribeToProposals,
   withProposalRun,
 } from "../lib/reviewProposals";
@@ -136,11 +137,7 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
       for (const d of q) {
         const cached = proposalCache.get(d.id);
         if (cached) restored[d.id] = cached;
-        seededEdits[d.id] = editCache.get(d.id) ?? {
-          project: d.project,
-          tags: d.tags,
-          importance: d.importance,
-        };
+        seededEdits[d.id] = seedReviewEdit(editCache.get(d.id), cached, d);
       }
       setProposals(restored);
       setEdits(seededEdits);
@@ -190,10 +187,20 @@ export function ReviewView({ onChanged, onOpenSettings }: Props) {
           return;
         }
         await proposeMetadata((event) => {
-          if (runRef.current !== myRun) return; // superseded run or unmounted
           if (event.type !== "proposed") return;
           // Publishing updates the shared cache and notifies the subscription, which owns the
           // state updates — so background and foreground runs paint through one path.
+          //
+          // Deliberately NOT gated on `runRef`: once the stream is running the model is being paid
+          // for, so every proposal it produces must reach the shared cache. Gating this dropped
+          // them on the floor whenever a second caller bumped the counter mid-stream — including
+          // the common one, where leaving and re-entering the tab makes `load` call `runProposals`
+          // for documents this very run is still streaming, and `withProposalRun` JOINS this run
+          // rather than starting another. The publish path is safe unguarded: the subscription is
+          // torn down on unmount (so no state update lands on a dead view), it already protects
+          // hand-edits via `dirtyRef`, and `repropose` awaits the in-flight run before clearing the
+          // cache — so there is no stale-write window left for the guard to close. It is exactly
+          // what the background run does (`runProposalsAfterSync`).
           publishProposal(event.document_id, event.proposal);
         }, ids);
       });

@@ -2533,6 +2533,7 @@ async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink, pass: String) 
     if let Ok(mut snap) = state.ingest_job.lock() {
         *snap = crate::IngestJobState {
             running: true,
+            started_at_ms: Some(crate::epoch_ms()),
             ..Default::default()
         };
     }
@@ -2573,6 +2574,7 @@ async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink, pass: String) 
     {
         if let Ok(mut snap) = state.ingest_job.lock() {
             snap.running = false;
+            snap.started_at_ms = None;
         }
         if result.is_ok() {
             if let Ok(conn) = state.conn() {
@@ -6852,6 +6854,12 @@ fn emit_backup_progress(app: &AppHandle, ev: BackupEvent) {
     if let Ok(mut snap) = state.backup_state.lock() {
         match &ev {
             BackupEvent::Phase { phase, fraction } => {
+                // Edge-triggered on idle→running: EVERY phase transition arrives as a `Phase` event,
+                // so stamping unconditionally would reset the elapsed timer at snapshot→pack→upload
+                // and read even more wrongly than the mount-time fallback it replaces.
+                if !snap.running {
+                    snap.started_at_ms = Some(crate::epoch_ms());
+                }
                 snap.running = true;
                 snap.phase = Some(*phase);
                 snap.fraction = *fraction;
@@ -6859,12 +6867,14 @@ fn emit_backup_progress(app: &AppHandle, ev: BackupEvent) {
             }
             BackupEvent::Finished { report } => {
                 snap.running = false;
+                snap.started_at_ms = None;
                 snap.phase = None;
                 snap.fraction = 1.0;
                 snap.last_report = Some(report.clone());
             }
             BackupEvent::Failed { message } => {
                 snap.running = false;
+                snap.started_at_ms = None;
                 snap.phase = None;
                 snap.last_error = Some(message.clone());
             }
