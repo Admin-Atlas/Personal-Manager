@@ -77,6 +77,7 @@ for (const f of tracked) {
 const ALLOWED_ROOT = new Set([
   ".claude",
   ".design-sync", // /design-sync skill inputs (claude.ai/design); build output is git-ignored
+  ".gitattributes", // pins the working-tree line endings (see the file's own header)
   ".github",
   ".gitignore",
   ".gitleaks.toml",
