@@ -35,6 +35,9 @@ interface Props {
   /** Already filtered to visible (non-hidden) calendars. */
   events: CalendarEvent[];
   colorOf: (calendarId: string) => string;
+  /** The source's shape slot, for the colour-blind axis's redundant dot shapes. Optional — the dots
+   *  fall back to plain circles without it (and whenever the axis is off). */
+  shapeOf?: (calendarId: string) => number | undefined;
   /** Reports the month filling the view as the user scrolls, so the header label can track it. */
   onFocusDate: (d: Date) => void;
   /** The ticking "now" (device-local) so past chips/bands grey back. Defaults to the render clock. */
@@ -59,7 +62,15 @@ const firstOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth(), 1);
 /** A week's representative month = its Thursday (ISO), so a boundary week picks the majority side. */
 const weekMonthKey = (w: MonthWeekRow) => monthKey(w.cells[3].date);
 
-export function MonthView({ cursor, events, colorOf, onFocusDate, now, onEventClick }: Props) {
+export function MonthView({
+  cursor,
+  events,
+  colorOf,
+  shapeOf,
+  onFocusDate,
+  now,
+  onEventClick,
+}: Props) {
   const { minimal, showMeta, showPower } = useDepth();
   const maxChips = showPower ? 4 : 3;
   const nowDate = now ?? new Date();
@@ -257,6 +268,7 @@ export function MonthView({ cursor, events, colorOf, onFocusDate, now, onEventCl
                           <SourceDot
                             key={ev.id}
                             color={colorOf(ev.calendar_id)}
+                            shapeIndex={shapeOf?.(ev.calendar_id)}
                             className="h-2 w-2"
                           />
                         ))}

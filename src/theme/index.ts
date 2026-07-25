@@ -68,4 +68,10 @@ export type { DepthState } from "./depth";
 
 export { graphColor } from "./graphPalette";
 
-export { sourcePalette, sourceColors, milestoneColor, pinboardColor } from "./sourcePalette";
+export {
+  sourcePalette,
+  sourceColors,
+  sourceShapeIndex,
+  milestoneColor,
+  pinboardColor,
+} from "./sourcePalette";

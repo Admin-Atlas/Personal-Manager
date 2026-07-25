@@ -58,6 +58,18 @@ export function sourceColors(
   return map;
 }
 
+/** The stable slot index for each calendar id — the SAME sorted-slot assignment {@link sourceColors}
+ *  uses, exposed so a surface can pick a redundant SHAPE per source that tracks its colour (the
+ *  colour-blind axis, so a source is distinguishable without relying on hue). Pure function of the id
+ *  SET, like sourceColors, so the shape only shifts when a calendar is connected/removed. Overlays
+ *  (milestones/pinboard) aren't calendars, so they're absent here and fall back to the plain circle. */
+export function sourceShapeIndex(calendarIds: string[]): Map<string, number> {
+  const ordered = [...new Set(calendarIds)].sort();
+  const map = new Map<string, number>();
+  ordered.forEach((id, i) => map.set(id, i));
+  return map;
+}
+
 /** The distinct hue for project-milestone events on the calendar (card 7 overlay) — one per System,
  *  chosen from OUTSIDE that System's accent picker (`ACCENTS`) so it can never land on a source slot
  *  and never reads as the reserved "today/now" accent. A single mid-tone hue (like the source hues),
