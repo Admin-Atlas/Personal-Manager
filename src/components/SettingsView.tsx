@@ -24,6 +24,7 @@ import { AiModelsSettings } from "./settings/AiModelsSettings";
 import { DataSecuritySettings } from "./settings/DataSecuritySettings";
 import { DeveloperSettings } from "./settings/DeveloperSettings";
 import { GeneralSettings } from "./settings/GeneralSettings";
+import { AccessibilitySettings } from "./settings/AccessibilitySettings";
 import { SearchSettings } from "./settings/SearchSettings";
 import { ModelListEditor } from "./ModelListEditor";
 import { OnboardingLocalConnect } from "./onboarding/OnboardingLocalConnect";
@@ -518,6 +519,8 @@ export function SettingsView({ onClose, onboarding, onOpenDev, onOpenTeach }: Pr
             className="min-w-0 flex-1 overflow-y-auto px-6 py-4 [&>*:first-child]:mt-0 [&>*:first-child]:border-t-0 [&>*:first-child]:pt-0"
           >
             {tab === "general" && <GeneralSettings />}
+
+            {tab === "accessibility" && <AccessibilitySettings />}
 
             {tab === "ai" && <AiModelsSettings onOpenTeach={onOpenTeach} />}
 

@@ -74,6 +74,8 @@ export function GeneralSettings() {
     setDepth,
     accent,
     setAccent,
+    fontScale,
+    setFontScale,
     teachVisible,
     setTeachVisible,
     appearanceIsDefault,
@@ -441,6 +443,21 @@ export function GeneralSettings() {
               );
             })}
           </div>
+        </div>
+        {/* Text size — mirrored from the Accessibility tab (one setter). A mainstream comfort control,
+            not only an accessibility need, so it's surfaced here too. */}
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <span className="text-sm text-ink2">Text size</span>
+          <SegmentedControl
+            value={fontScale}
+            onChange={setFontScale}
+            options={[
+              { value: "small", label: "Small", title: "90%" },
+              { value: "default", label: "Default", title: "100%" },
+              { value: "large", label: "Large", title: "115%" },
+              { value: "xlarge", label: "XL", title: "130%" },
+            ]}
+          />
         </div>
         <div
           className="mt-3 flex items-center justify-between gap-3"

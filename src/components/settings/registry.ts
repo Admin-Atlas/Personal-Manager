@@ -17,6 +17,7 @@
 import type { ComponentType, SVGProps } from "react";
 
 import {
+  AccessibilityIcon,
   AiIcon,
   BackupIcon,
   ConnectorsIcon,
@@ -30,6 +31,7 @@ import {
 
 export type SettingsTab =
   | "general"
+  | "accessibility"
   | "ai"
   | "localai"
   | "search"
@@ -73,6 +75,16 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
           { id: "sec-general-map", label: "Memory map" },
           { id: "sec-general-timezone", label: "Time zone" },
           { id: "sec-general-help", label: "Help mode" },
+        ],
+      },
+      {
+        id: "accessibility",
+        label: "Accessibility",
+        Icon: AccessibilityIcon,
+        sections: [
+          { id: "sec-a11y-text", label: "Text size" },
+          { id: "sec-a11y-motion", label: "Motion" },
+          { id: "sec-a11y-font", label: "Legible font" },
         ],
       },
     ],

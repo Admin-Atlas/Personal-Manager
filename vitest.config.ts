@@ -13,7 +13,12 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   test: {
-    include: ["src/lib/**/*.test.ts", "src/lib/**/*.test.tsx", "src/components/**/*.test.tsx"],
+    include: [
+      "src/lib/**/*.test.ts",
+      "src/lib/**/*.test.tsx",
+      "src/components/**/*.test.tsx",
+      "src/theme/**/*.test.ts",
+    ],
     environment: "node",
   },
 });

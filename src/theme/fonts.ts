@@ -22,3 +22,9 @@ import "@fontsource/hanken-grotesk/600.css";
 // JetBrains Mono — numbers/ids/meta (--mono); everything in terminal.
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/500.css";
+
+// Atkinson Hyperlegible — the opt-in legible / dyslexia-friendly UI face (Accessibility settings).
+// Bundled like the others so it stays self-hosted (CSP `default-src 'self'`); only loaded into use
+// when the "Legible font" axis overrides --ui/--head (see applyTheme in tokens.ts).
+import "@fontsource/atkinson-hyperlegible/400.css";
+import "@fontsource/atkinson-hyperlegible/700.css";

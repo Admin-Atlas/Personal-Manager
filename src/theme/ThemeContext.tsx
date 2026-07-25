@@ -64,6 +64,21 @@ export interface ThemeState {
   appearanceIsDefault: boolean;
   /** Restore every appearance axis to its default and forget the per-System accent memory (#445). */
   resetAppearance: () => void;
+
+  // Accessibility axes (opt-in; see the FontScale block above).
+  /** Whole-UI text size. Surfaced in both the Appearance section and the Accessibility tab. */
+  fontScale: FontScale;
+  setFontScale: (v: FontScale) => void;
+  /** Force reduced motion regardless of the OS setting (false = follow the OS). */
+  reduceMotion: boolean;
+  setReduceMotion: (v: boolean) => void;
+  /** Use Atkinson Hyperlegible for UI + heading text. */
+  legibleFont: boolean;
+  setLegibleFont: (v: boolean) => void;
+  /** True when every accessibility axis is at its default — drives the Accessibility tab's "Reset". */
+  accessibilityIsDefault: boolean;
+  /** Restore the accessibility axes (font size, reduce motion, legible font) to their defaults. */
+  resetAccessibility: () => void;
 }
 
 // App defaults. Slate + Dark + its default accent (the Eigengrau monochrome — ACCENTS.slate[0])
@@ -71,6 +86,19 @@ export interface ThemeState {
 const DEFAULT_SYSTEM: System = "slate";
 const DEFAULT_MODE_PREF: ModePref = "dark";
 const DEFAULT_DEPTH: Depth = "standard";
+
+// Accessibility axes (opt-in). Their defaults equal today's behaviour — font size at 100%, motion
+// following the OS, the theme's own fonts — so existing users see no change and no migration is
+// needed. Persisted alongside the visual theme (localStorage + the mirrored `appearance` blob).
+export type FontScale = "small" | "default" | "large" | "xlarge";
+const FONT_SCALE_VALUES: Record<FontScale, number> = {
+  small: 0.9,
+  default: 1,
+  large: 1.15,
+  xlarge: 1.3,
+};
+const FONT_SCALES: readonly FontScale[] = ["small", "default", "large", "xlarge"];
+const DEFAULT_FONT_SCALE: FontScale = "default";
 
 // The Teach-tab visibility override: "auto" follows the Depth preset (hidden for minimalist,
 // shown for standard/power); "show"/"hide" are explicit choices made from Settings.
@@ -87,6 +115,9 @@ const KEY = {
   depth: "pm:theme:depth",
   accentBySystem: "pm:theme:accentBySystem",
   teach: "pm:theme:teach",
+  fontScale: "pm:a11y:fontScale",
+  reduceMotion: "pm:a11y:reduceMotion",
+  legibleFont: "pm:a11y:legibleFont",
 };
 
 // localStorage can throw (locked-down webviews); never let a theme read/write crash the app.
@@ -150,6 +181,13 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const [teachPref, setTeachPrefState] = useState<TeachPref>(() =>
     oneOf(read(KEY.teach), TEACH_PREFS, DEFAULT_TEACH),
   );
+  const [fontScale, setFontScale] = useState<FontScale>(() =>
+    oneOf(read(KEY.fontScale), FONT_SCALES, DEFAULT_FONT_SCALE),
+  );
+  const [reduceMotion, setReduceMotion] = useState<boolean>(
+    () => read(KEY.reduceMotion) === "true",
+  );
+  const [legibleFont, setLegibleFont] = useState<boolean>(() => read(KEY.legibleFont) === "true");
 
   // The resolved Mode (+ how/where it was resolved). Computed synchronously for a themed first
   // paint, then kept live by the effect below (OS changes, sunrise/sunset, focus).
@@ -186,6 +224,13 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         ? b.accent
         : defaultAccentFor(sys),
     );
+    // Accessibility axes — absent from an older blob, which correctly hydrates them to their
+    // (behaviour-preserving) defaults.
+    setFontScale(
+      oneOf(typeof b.fontScale === "string" ? b.fontScale : null, FONT_SCALES, DEFAULT_FONT_SCALE),
+    );
+    setReduceMotion(b.reduceMotion === true);
+    setLegibleFont(b.legibleFont === true);
   }
 
   // One-shot hydration from the store. On a fresh machine (localStorage empty) the
@@ -295,6 +340,14 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     autoLocation === "" &&
     teachPref === DEFAULT_TEACH;
 
+  const accessibilityIsDefault = fontScale === DEFAULT_FONT_SCALE && !reduceMotion && !legibleFont;
+
+  function resetAccessibility(): void {
+    setFontScale(DEFAULT_FONT_SCALE);
+    setReduceMotion(false);
+    setLegibleFont(false);
+  }
+
   // Restore every axis to its default in one go. The persist effect below mirrors the axis changes to
   // localStorage + the stored `appearance` blob; teach and the per-System accent memory aren't in that
   // effect, so they're written here directly. `setSystemState` (not the public `setSystem`) avoids
@@ -314,12 +367,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // first paint). localStorage is the fast path; the store is mirrored once hydration has run so the
   // theme survives a folder backup/transfer. We persist the *preference*, not the resolved Mode.
   useEffect(() => {
-    applyTheme(document.documentElement, system, mode, accent, depth);
+    applyTheme(document.documentElement, system, mode, accent, depth, {
+      fontScale: FONT_SCALE_VALUES[fontScale],
+      reduceMotion,
+      legibleFont,
+    });
     write(KEY.system, system);
     write(KEY.modePref, modePref);
     write(KEY.autoLocation, autoLocation);
     write(KEY.accent, accent);
     write(KEY.depth, depth);
+    write(KEY.fontScale, fontScale);
+    write(KEY.reduceMotion, String(reduceMotion));
+    write(KEY.legibleFont, String(legibleFont));
     if (hydrated) {
       const blob = {
         system,
@@ -328,12 +388,26 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         accent,
         depth,
         accentBySystem: readAccentBySystem(),
+        fontScale,
+        reduceMotion,
+        legibleFont,
       };
       setPref(PREF_KEY, JSON.stringify(blob)).catch(() => {
         /* fire-and-forget — localStorage already holds the value */
       });
     }
-  }, [system, mode, modePref, autoLocation, accent, depth, hydrated]);
+  }, [
+    system,
+    mode,
+    modePref,
+    autoLocation,
+    accent,
+    depth,
+    fontScale,
+    reduceMotion,
+    legibleFont,
+    hydrated,
+  ]);
 
   const value: ThemeState = {
     system,
@@ -354,6 +428,14 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setTeachVisible,
     appearanceIsDefault,
     resetAppearance,
+    fontScale,
+    setFontScale,
+    reduceMotion,
+    setReduceMotion,
+    legibleFont,
+    setLegibleFont,
+    accessibilityIsDefault,
+    resetAccessibility,
   };
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
