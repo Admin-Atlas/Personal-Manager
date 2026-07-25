@@ -23,8 +23,8 @@ import {
 } from "../../lib/mapPrefs";
 import {
   clampFocusUpcomingDays,
-  FOCUS_UPCOMING_MAX_DAYS,
-  FOCUS_UPCOMING_MIN_DAYS,
+  FOCUS_UPCOMING_DAY_CHOICES,
+  FOCUS_UPCOMING_RANGES,
   readFocusLayout,
   readFocusUpcomingDays,
   readFocusUpcomingMode,
@@ -649,11 +649,7 @@ export function GeneralSettings() {
               <SegmentedControl
                 value={focusUpcomingRange}
                 onChange={changeFocusUpcomingRange}
-                options={[
-                  { value: "work", label: "Work" },
-                  { value: "day", label: "Day" },
-                  { value: "full", label: "24h" },
-                ]}
+                options={FOCUS_UPCOMING_RANGES}
               />
             </div>
             <div className="mt-3 flex items-center justify-between gap-3">
@@ -661,13 +657,10 @@ export function GeneralSettings() {
               <SegmentedControl
                 value={String(focusUpcomingDays)}
                 onChange={(v) => changeFocusUpcomingDays(Number(v))}
-                options={Array.from(
-                  { length: FOCUS_UPCOMING_MAX_DAYS - FOCUS_UPCOMING_MIN_DAYS + 1 },
-                  (_, i) => {
-                    const n = FOCUS_UPCOMING_MIN_DAYS + i;
-                    return { value: String(n), label: String(n) };
-                  },
-                )}
+                options={FOCUS_UPCOMING_DAY_CHOICES.map((n) => ({
+                  value: String(n),
+                  label: String(n),
+                }))}
               />
             </div>
           </>

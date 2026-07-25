@@ -7,8 +7,14 @@
 //   • "week"  — a compact few-day time grid, reusing the exact Calendar Week engine (TimeGridView),
 //               capped to 1–4 days so it fits the Focus column at the same width. ‹ / › step the
 //               window one day at a time; the window starts at today each time the tab opens and holds
-//               where you leave it while you're there (a "Today" chip snaps back). Work / Day / 24h
-//               frame the visible hours, exactly like the calendar.
+//               where you leave it while you're there (a "Today" chip snaps back). Work / Day frame
+//               the visible hours, and the day count sits beside them — both mirrored in Settings.
+//
+// Two things this card does NOT share with the Calendar tab, both because it is a ~26rem pane rather
+// than a full page: it offers no 24h range (at this height a whole day's rows can't hold a legible
+// event card — the grid still scrolls the full 24h, so nothing is out of reach), and it hands
+// TimeGridView a much lower row-height floor, so the range it IS showing fills the pane instead of
+// bottoming out on the calendar's floor and rendering every wide window identically.
 //
 // The list uses the focus agenda feed the parent already loads; the grid lazily pulls the full mirror
 // (listAllCalendarEvents) so days either side of today are populated. Synced events only — the same
@@ -25,16 +31,23 @@ import { formatEventWhen } from "../lib/format";
 import { Card, SegmentedControl } from "./ui";
 import { TimeGridView } from "./calendar/views/TimeGridView";
 import {
+  FOCUS_UPCOMING_DAY_CHOICES,
+  FOCUS_UPCOMING_RANGES,
   clampFocusUpcomingDays,
   readFocusUpcomingDays,
   readFocusUpcomingMode,
   readFocusUpcomingRange,
+  writeFocusUpcomingDays,
   writeFocusUpcomingMode,
   writeFocusUpcomingRange,
   type FocusUpcomingMode,
 } from "../lib/focusPrefs";
 
 const NOOP = () => {};
+
+/** Row-height floor for this pane — well under the calendar's 20px, so the chosen window fills the
+ *  card whole rather than hitting the floor and scrolling. See the header comment. */
+const COMPACT_MIN_ROW_H = 12;
 
 // Last-good full mirror for the grid, kept in module scope so switching to Week (or back to the tab)
 // doesn't flash an empty grid before the read lands — mirrors FocusView's other caches.
@@ -52,8 +65,8 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
   const { coords } = useUserTime();
   const [mode, setMode] = useState<FocusUpcomingMode>(readFocusUpcomingMode);
   const [range, setRange] = useState<CalendarRange>(readFocusUpcomingRange);
-  // 1–4 (Settings owns changing it); read once on mount like the other prefs.
-  const [days] = useState<number>(() => clampFocusUpcomingDays(readFocusUpcomingDays()));
+  // 1–4, from the header control here or its mirror in Settings; read once on mount like the others.
+  const [days, setDays] = useState<number>(() => clampFocusUpcomingDays(readFocusUpcomingDays()));
   // The leftmost visible day. Starts at today each open; ‹ / › move it, "Today" snaps back. Kept as
   // component state (not persisted) so the window never jumps under you mid-session, and "Upcoming"
   // always opens on today.
@@ -67,6 +80,11 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
   function changeRange(next: CalendarRange) {
     setRange(next);
     writeFocusUpcomingRange(next);
+  }
+  function changeDays(next: number) {
+    const clamped = clampFocusUpcomingDays(next);
+    setDays(clamped);
+    writeFocusUpcomingDays(clamped); // shared with the Settings mirror
   }
 
   // Lazily load the full mirror only while the grid is on (List mode needs nothing extra). Refresh on
@@ -184,15 +202,22 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
                 </button>
               )}
             </div>
-            <SegmentedControl
-              value={range}
-              onChange={changeRange}
-              options={[
-                { value: "work", label: "Work", title: "Business hours" },
-                { value: "day", label: "Day", title: "Daylight hours" },
-                { value: "full", label: "24h", title: "The whole day" },
-              ]}
-            />
+            <div className="flex items-center gap-1.5">
+              <SegmentedControl
+                value={String(days)}
+                onChange={(v) => changeDays(Number(v))}
+                options={FOCUS_UPCOMING_DAY_CHOICES.map((n) => ({
+                  value: String(n),
+                  label: String(n),
+                  title: n === 1 ? "One day" : `${n} days`,
+                }))}
+              />
+              <SegmentedControl
+                value={range}
+                onChange={changeRange}
+                options={FOCUS_UPCOMING_RANGES}
+              />
+            </div>
           </div>
           <div className="h-[26rem]">
             <TimeGridView
@@ -204,6 +229,7 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
               zones={[]}
               onZonesChange={NOOP}
               allowZones={false}
+              minRowHeight={COMPACT_MIN_ROW_H}
             />
           </div>
         </>

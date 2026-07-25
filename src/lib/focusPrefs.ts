@@ -67,11 +67,22 @@ export function writeFocusUpcomingMode(mode: FocusUpcomingMode): void {
   }
 }
 
-/** The hour-window preset for the Upcoming grid (Work / Day / 24h). Defaults to the everyday Day. */
+/** The hour windows the Upcoming grid offers, shared by its header control and the Settings mirror.
+ *  The calendar's 24h is deliberately absent: this pane is ~26rem tall, so a whole day's rows can't
+ *  hold a legible event card. Nothing becomes unreachable — the grid always spans the full 24h and
+ *  scrolls to the rest. */
+export const FOCUS_UPCOMING_RANGES: { value: CalendarRange; label: string; title: string }[] = [
+  { value: "work", label: "Work", title: "Business hours" },
+  { value: "day", label: "Day", title: "Daylight hours" },
+];
+
+/** The hour-window preset for the Upcoming grid (Work / Day). Defaults to the everyday Day — as does
+ *  a stored "full" from when this pane still offered 24h, so an existing choice lands somewhere
+ *  sensible instead of on a control with nothing selected. */
 export function readFocusUpcomingRange(): CalendarRange {
   try {
     const raw = localStorage.getItem(UPCOMING_RANGE_KEY);
-    if (raw === "work" || raw === "day" || raw === "full") return raw;
+    if (FOCUS_UPCOMING_RANGES.some((r) => r.value === raw)) return raw as CalendarRange;
   } catch {
     /* fall through to the default */
   }
@@ -85,6 +96,13 @@ export function writeFocusUpcomingRange(range: CalendarRange): void {
     /* best-effort */
   }
 }
+
+/** Every day-count the Upcoming grid offers, in order — shared by its header control and the Settings
+ *  mirror so the two can never drift. */
+export const FOCUS_UPCOMING_DAY_CHOICES: number[] = Array.from(
+  { length: FOCUS_UPCOMING_MAX_DAYS - FOCUS_UPCOMING_MIN_DAYS + 1 },
+  (_, i) => FOCUS_UPCOMING_MIN_DAYS + i,
+);
 
 /** Clamp a candidate day-count into the supported 1–4 window. */
 export function clampFocusUpcomingDays(days: number): number {

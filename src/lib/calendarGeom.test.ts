@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { resolveRangeBounds, sunriseSunsetBounds } from "./calendarGeom";
+import { hourRowHeight, resolveRangeBounds, sunriseSunsetBounds } from "./calendarGeom";
 import {
   DAY_FALLBACK,
   FULL_BOUNDS,
@@ -78,5 +78,36 @@ describe("sunriseSunsetBounds", () => {
       expect(Number.isInteger(b.endHour)).toBe(true);
       expect(b.endHour).toBeGreaterThan(b.startHour);
     }
+  });
+});
+
+describe("hourRowHeight", () => {
+  it("stretches the framed window to fill the pane exactly", () => {
+    // The point of the Work/Day/24h choice: a narrower window means taller rows.
+    expect(hourRowHeight(360, 9, 20)).toBe(40);
+    expect(hourRowHeight(360, 12, 20)).toBe(30);
+  });
+
+  it("never returns a row thinner than the floor", () => {
+    expect(hourRowHeight(240, 24, 20)).toBe(20); // 10px would fit; the grid scrolls instead
+  });
+
+  it("keeps two wide windows apart in a short pane once the floor is lowered", () => {
+    // The bug this fixes. In a ~26rem card the calendar's 20px floor swallows the difference
+    // between a 17h daylight window and a 24h one — both bottom out, so the toggle looks like it
+    // only re-aims the scroll. A floor the embed can actually reach keeps them distinct.
+    const shortPane = 340;
+    expect(hourRowHeight(shortPane, 17, 20)).toBe(hourRowHeight(shortPane, 24, 20));
+    expect(hourRowHeight(shortPane, 17, 12)).toBeGreaterThan(hourRowHeight(shortPane, 24, 12));
+  });
+
+  it("falls back to a legible height before the pane has been measured", () => {
+    expect(hourRowHeight(0, 9, 20)).toBe(40);
+    expect(hourRowHeight(Number.NaN, 9, 12)).toBe(24);
+  });
+
+  it("never divides by a degenerate window", () => {
+    expect(Number.isFinite(hourRowHeight(360, 0, 20))).toBe(true);
+    expect(hourRowHeight(360, 0, 20)).toBe(360);
   });
 });

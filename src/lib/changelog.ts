@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.77.2-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Switching the Upcoming grid between Work and Day hours on the Focus tab now really does re-scale it. It was meant to all along -- a narrower window means taller hour rows -- but the rows had a minimum height chosen for the full-size Calendar tab, and in a card that small both windows bottomed out at it and came out looking the same, so switching seemed to do nothing but jump the scroll. The rows now stretch to fill the card.",
+      "The 24h option has gone from that grid: in a card that size a whole day cannot show a readable event. Nothing is out of reach -- the grid still scrolls through every hour -- and the Calendar tab keeps all three windows.",
+      "How many days Upcoming shows now sits right beside those buttons, instead of only in Settings where it was easy to miss. Both places still work and stay in step.",
+      "The Accessibility tab now carries the familiar ringed figure with open arms rather than a seated one. That tab is text size, motion, contrast and spacing -- things anyone might want -- and the symbol should say so.",
+    ],
+  },
+  {
     version: "3.77.1-alpha",
     date: "2026-07-25",
     highlights: [

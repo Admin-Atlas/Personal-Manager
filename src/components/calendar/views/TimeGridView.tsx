@@ -26,6 +26,7 @@ import {
   startOfDay,
   type TimedInput,
 } from "../../../lib/calendar-layout";
+import { hourRowHeight } from "../../../lib/calendarGeom";
 import { formatClock } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
@@ -51,6 +52,12 @@ interface Props {
   /** When false, hides the add-zone control — for a compact embed (the Focus Upcoming grid) that runs
    *  with no extra zones and has no room for them. Defaults to true. */
   allowZones?: boolean;
+  /** Legibility floor for an hour row, in px. The framed window stretches to fill the pane, but never
+   *  thinner than this — past it the grid scrolls instead. Defaults to the full-height calendar's
+   *  {@link MIN_ROW_H}; a short embed passes a lower floor so its window still fits whole (with the
+   *  default, a tall window in a short pane hits the floor and every wide range renders identically —
+   *  the toggle then looks like it only moves the scroll). */
+  minRowHeight?: number;
   /** The ticking "now" (device-local) so past events grey and the now-line tracks the minute. Defaults
    *  to the render-time clock for embeds that don't thread a tick. */
   now?: Date;
@@ -61,8 +68,7 @@ interface Props {
 const LOCAL_COL = 54; // width of the local hour column (px)
 const ZONE_COL = 46; // width of each extra-zone column (px)
 const HOURS = 24;
-const MIN_ROW_H = 20; // never scrunch a row below this
-const MIN_WINDOW = 1; // guard divide-by-tiny in the row-height fill
+const MIN_ROW_H = 20; // never scrunch a row below this (the full-height calendar's floor)
 
 /** The 24 hour labels for `zone`, formatting the same absolute instants the local column marks on
  *  `refDay` — DST-safe, and shows fractional offsets (Kolkata :30, Kathmandu :45) natively. */
@@ -109,6 +115,7 @@ export function TimeGridView({
   zones,
   onZonesChange,
   allowZones = true,
+  minRowHeight = MIN_ROW_H,
   now,
   onEventClick,
 }: Props) {
@@ -116,7 +123,7 @@ export function TimeGridView({
   const nowDate = now ?? new Date();
   // Derived from the framed window: scroll to its start on mount, stretch rows so the window fills
   // the body exactly. The grid itself always spans the full 24h; scrolling reaches the rest.
-  const windowHours = Math.max(bounds.endHour - bounds.startHour, MIN_WINDOW);
+  const windowHours = bounds.endHour - bounds.startHour;
   const scrollHour = bounds.startHour;
   const gutterPx = LOCAL_COL + zones.length * ZONE_COL;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -127,7 +134,13 @@ export function TimeGridView({
   // into the header row's paddingRight and the AllDayBand end gutter below.
   const [scrollbarW, setScrollbarW] = useState(0);
 
-  // The body's visible height, independent of content — the flex layout sizes it, not the grid.
+  // The body's visible height, independent of content — the flex layout sizes it, not the grid. Read
+  // synchronously first: the observer only fires after a paint, and until it does the grid would draw
+  // at the placeholder height, which is the "range toggle changes nothing" look this pane is prone to.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el) setBodyHeight((prev) => (prev === el.clientHeight ? prev : el.clientHeight));
+  }, []);
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -139,11 +152,11 @@ export function TimeGridView({
     return () => ro.disconnect();
   }, []);
 
-  // Stretch rows so the framed window fills the body exactly. A narrow window (e.g. Work's ~9h) makes
-  // tall rows and the full-24h grid scrolls; a wide one is floored at MIN_ROW_H so a short pane can't
-  // crush rows below legibility (it scrolls instead). The grid always spans the full 24h — scrolling
-  // reaches whatever sits outside the framed window.
-  const rowH = bodyHeight > 0 ? Math.max(MIN_ROW_H, bodyHeight / windowHours) : MIN_ROW_H * 2;
+  // Stretch rows so the framed window fills the body exactly — a narrow window (Work's ~9h) makes tall
+  // rows, a wide one thin ones, floored at `minRowHeight` so a short pane can't crush rows below
+  // legibility (it scrolls instead). The grid always spans the full 24h either way; scrolling reaches
+  // whatever sits outside the framed window.
+  const rowH = hourRowHeight(bodyHeight, windowHours, minRowHeight);
 
   // Measure the body scrollbar so the non-scrolling header/all-day reserve a matching gutter.
   // useLayoutEffect, not useEffect: a passive effect would paint one frame at 0 then correct it — a
