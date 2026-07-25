@@ -35,3 +35,28 @@ export function hexA(hex: string, a: number): string {
   const h = hex.replace("#", "");
   return `rgba(${parseInt(h.slice(0, 2), 16)},${parseInt(h.slice(2, 4), 16)},${parseInt(h.slice(4, 6), 16)},${a})`;
 }
+
+// WCAG relative luminance of an oklch(L C H) colour: the inverse of oklabLCH's forward transform
+// (OKLab → linear-light sRGB, matrices from DESIGN_TOKENS.md §5) followed by the 0.2126/0.7152/0.0722
+// weighting. Lets the contrast-audit test measure the token ramps as the browser would render them.
+// Load-bearing colour maths — do not "simplify" the constants.
+export function oklchLuminance(L: number, C: number, Hdeg: number): number {
+  const a = C * Math.cos((Hdeg * Math.PI) / 180);
+  const b = C * Math.sin((Hdeg * Math.PI) / 180);
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.291485548 * b;
+  const l = l_ ** 3,
+    m = m_ ** 3,
+    s = s_ ** 3;
+  const R = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+  const G = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+  const B = -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s;
+  const cl = (x: number): number => Math.max(0, Math.min(1, x));
+  return 0.2126 * cl(R) + 0.7152 * cl(G) + 0.0722 * cl(B);
+}
+
+/** WCAG 2.x contrast ratio between two relative luminances (order-independent, 1–21). */
+export function contrastRatio(y1: number, y2: number): number {
+  return (Math.max(y1, y2) + 0.05) / (Math.min(y1, y2) + 0.05);
+}

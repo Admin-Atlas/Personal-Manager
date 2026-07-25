@@ -21,7 +21,17 @@ export {
   MONO_RAMP,
   EIGENGRAU,
 } from "./profiles";
-export type { System, Mode, ModePref, Depth, Density, Role, StatusKey, Fonts } from "./profiles";
+export type {
+  System,
+  Mode,
+  ModePref,
+  Depth,
+  Density,
+  Contrast,
+  Role,
+  StatusKey,
+  Fonts,
+} from "./profiles";
 
 export { oklabLCH, hexA } from "./oklab";
 export type { OkLCH } from "./oklab";
