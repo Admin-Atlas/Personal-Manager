@@ -1,44 +1,59 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The one-time legacy-pin migration shared by the two axes whose compliant default differs from
-// today (density → `standard`/WCAG 2.5.8, contrast → `aa`/WCAG 1.4.3). A fresh install gets the
-// compliant default; an existing install is pinned to the legacy value so the update disturbs
-// nothing, and the user can Reset (or pick) their way up. See initialDensity / initialContrast.
+// How density and contrast resolve a stored value. Both axes briefly offered a below-baseline level
+// (`compact` / `legacy`) carrying PM's original sizing and ramps, pinned onto existing installs so
+// the accessibility epic wouldn't change their look under them. Those levels are withdrawn, and
+// dropping them from DENSITIES/CONTRASTS *is* the migration: a stored one is no longer in the
+// allow-list, so it falls back to the compliant default. These tests pin exactly that — a stored
+// `compact`/`legacy` must land on `standard`/`aa`, never survive as a value the picker can't show.
 
 import { describe, expect, it } from "vitest";
-import { initialDensity, initialContrast } from "./ThemeContext";
+import { storedDensity, storedContrast } from "./ThemeContext";
+import { CONTRASTS, DENSITIES } from "./profiles";
 
-describe("initialDensity — the density legacy pin", () => {
-  it("gives a genuinely fresh install the compliant default (standard)", () => {
-    expect(initialDensity(null, false)).toBe("standard");
+describe("storedDensity", () => {
+  it("defaults an install with nothing stored to the compliant standard", () => {
+    expect(storedDensity(null)).toBe("standard");
   });
 
-  it("pins an existing install (theme state present, no density stored) to legacy compact", () => {
-    expect(initialDensity(null, true)).toBe("compact");
+  it("migrates a stored `compact` (the withdrawn level) up to standard", () => {
+    expect(storedDensity("compact")).toBe("standard");
   });
 
-  it("lets a stored density win over the migration, on either kind of install", () => {
-    expect(initialDensity("comfortable", true)).toBe("comfortable");
-    expect(initialDensity("compact", false)).toBe("compact");
-    expect(initialDensity("standard", true)).toBe("standard");
+  it("keeps a still-offered stored value", () => {
+    expect(storedDensity("comfortable")).toBe("comfortable");
+    expect(storedDensity("standard")).toBe("standard");
   });
 
   it("falls back to the default for a corrupt stored value", () => {
-    expect(initialDensity("enormous", true)).toBe("standard");
-    expect(initialDensity("", false)).toBe("standard");
+    expect(storedDensity("enormous")).toBe("standard");
+    expect(storedDensity("")).toBe("standard");
   });
 });
 
-describe("initialContrast — the contrast legacy pin", () => {
-  it("gives a fresh install the compliant default (aa) and pins an existing install to legacy", () => {
-    expect(initialContrast(null, false)).toBe("aa");
-    expect(initialContrast(null, true)).toBe("legacy");
+describe("storedContrast", () => {
+  it("defaults an install with nothing stored to the compliant AA", () => {
+    expect(storedContrast(null)).toBe("aa");
   });
 
-  it("lets a stored value win, and falls back to the default when corrupt", () => {
-    expect(initialContrast("high", true)).toBe("high");
-    expect(initialContrast("legacy", false)).toBe("legacy");
-    expect(initialContrast("ultra", true)).toBe("aa");
+  it("migrates a stored `legacy` (the withdrawn level) up to AA", () => {
+    expect(storedContrast("legacy")).toBe("aa");
+  });
+
+  it("keeps a still-offered stored value, and falls back when corrupt", () => {
+    expect(storedContrast("high")).toBe("high");
+    expect(storedContrast("aa")).toBe("aa");
+    expect(storedContrast("ultra")).toBe("aa");
+  });
+});
+
+describe("the withdrawn levels are really gone", () => {
+  it("no longer lists compact / legacy, so nothing can select them", () => {
+    expect(DENSITIES).not.toContain("compact");
+    expect(CONTRASTS).not.toContain("legacy");
+    // Both axes still offer a real choice — this isn't a collapse to one value.
+    expect(DENSITIES.length).toBeGreaterThan(1);
+    expect(CONTRASTS.length).toBeGreaterThan(1);
   });
 });

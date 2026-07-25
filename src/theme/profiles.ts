@@ -15,16 +15,21 @@ export type Mode = "dark" | "light";
  *  reaches tokens/components — this preference is what's persisted and shown in Settings. */
 export type ModePref = Mode | "system" | "auto";
 export type Depth = "min" | "standard" | "power";
-/** Control density / touch-target size (Accessibility). `compact` is today's tight sizing (pinned
- *  for existing installs); `standard` meets WCAG 2.5.8 (24px) and is the fresh-install default;
- *  `comfortable` reaches the 44px AAA (2.5.5) target for lower motor precision. See {@link DENSITIES}
- *  and the density vars in tokens.ts. */
-export type Density = "compact" | "standard" | "comfortable";
-/** Contrast level (Accessibility). `legacy` is today's ramps (pinned for existing installs); `aa`
- *  is the fresh-install default and lifts the lowest text tier to WCAG 1.4.3 AA (4.5:1); `high`
- *  reaches AAA (7:1) for body text and firms up the faint text + borders. Applied by boost() in
- *  tokens.ts. See {@link CONTRASTS}. */
-export type Contrast = "legacy" | "aa" | "high";
+/** Control density / touch-target size (Accessibility). `standard` meets WCAG 2.5.8 (24px) and is the
+ *  default; `comfortable` reaches the 44px AAA (2.5.5) target for lower motor precision. See
+ *  {@link DENSITIES} and the density vars in tokens.ts.
+ *
+ *  A third level, `compact`, held PM's original tighter sizing so the accessibility epic wouldn't
+ *  change an existing install's look under it. It is gone: it was a below-baseline default nobody
+ *  chose on purpose, so the migration is simply to drop it — `oneOf` coerces a stored `compact` to
+ *  `standard` on the next read (see ThemeContext). */
+export type Density = "standard" | "comfortable";
+/** Contrast level (Accessibility). `aa` is the default and lifts the lowest text tier to WCAG 1.4.3
+ *  AA (4.5:1); `high` reaches AAA (7:1) for body text and firms up the faint text + borders. Applied
+ *  by boost() in tokens.ts. See {@link CONTRASTS}.
+ *
+ *  `legacy` (PM's original, softer ramp) is gone for the same reason `compact` is — see above. */
+export type Contrast = "aa" | "high";
 export type Role =
   | "bg"
   | "panel"
@@ -44,8 +49,8 @@ export const MODES: readonly Mode[] = ["dark", "light"];
 // The four Mode *preferences* offered in Settings (see {@link ModePref}). Order is the picker order.
 export const MODE_PREFS: readonly ModePref[] = ["light", "dark", "system", "auto"];
 export const DEPTHS: readonly Depth[] = ["min", "standard", "power"];
-export const DENSITIES: readonly Density[] = ["compact", "standard", "comfortable"];
-export const CONTRASTS: readonly Contrast[] = ["legacy", "aa", "high"];
+export const DENSITIES: readonly Density[] = ["standard", "comfortable"];
+export const CONTRASTS: readonly Contrast[] = ["aa", "high"];
 
 // Order is load-bearing: themeVars maps these positionally onto each ramp / status row.
 export const ROLES: readonly Role[] = [

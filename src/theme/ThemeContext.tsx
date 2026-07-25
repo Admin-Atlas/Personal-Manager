@@ -83,23 +83,20 @@ export interface ThemeState {
   /** Use Atkinson Hyperlegible for UI + heading text. */
   legibleFont: boolean;
   setLegibleFont: (v: boolean) => void;
-  /** Control density / touch-target size. `standard` (WCAG 2.5.8) is the fresh-install default;
-   *  existing installs are pinned to `compact` (today's sizing) by a one-time migration, so their
-   *  look is undisturbed until they choose otherwise or Reset. */
+  /** Control density / touch-target size. `standard` (WCAG 2.5.8's 24px target) is the default. */
   density: Density;
   setDensity: (v: Density) => void;
   /** Swap the categorical palettes (graph nodes, calendar sources) and semantic status colours for a
    *  colour-blind-safe (Okabe–Ito) set. Off by default (= today), so it needs no migration. */
   colorblind: boolean;
   setColorblind: (v: boolean) => void;
-  /** Contrast level. `aa` (WCAG 1.4.3) is the fresh-install default; existing installs are pinned to
-   *  `legacy` (today's ramps) by the same one-time migration as density; `high` reaches AAA. */
+  /** Contrast level. `aa` (WCAG 1.4.3's 4.5:1 body text) is the default; `high` reaches AAA. */
   contrast: Contrast;
   setContrast: (v: Contrast) => void;
   /** True when every accessibility axis is at its default — drives the Accessibility tab's "Reset". */
   accessibilityIsDefault: boolean;
   /** Restore every accessibility axis (text size, contrast, density, motion, legible font, colour-
-   *  blind palette) to its default — including the compliant baseline for the legacy-pinned axes. */
+   *  blind palette) to its default. */
   resetAccessibility: () => void;
 }
 
@@ -122,38 +119,29 @@ const FONT_SCALE_VALUES: Record<FontScale, number> = {
 const FONT_SCALES: readonly FontScale[] = ["small", "default", "large", "xlarge"];
 const DEFAULT_FONT_SCALE: FontScale = "default";
 
-// Density is the one accessibility axis whose compliant default differs from today's behaviour, so
-// it carries a one-time legacy pin: a *fresh* install gets `standard` (meets WCAG 2.5.8's 24px target
-// out of the box), while an *existing* install is pinned to `compact` (today's tight sizing) so the
-// update disturbs nothing. The pin needs no dedicated flag — a first launch that already has theme
-// state in localStorage (KEY.system) is by definition an existing user (see the density useState).
-// Once persisted the stored value always wins. Because a pinned user then reads density !== default,
-// the Accessibility tab surfaces its Reset, which restores the compliant `standard` — the "keep my
-// look, or reset to the compliant baseline" contract.
+// Density and contrast are the two accessibility axes with no "leave it alone" value — every install
+// is at some density and some contrast, so their defaults ARE the compliant baseline: `standard`
+// (WCAG 2.5.8's 24px target) and `aa` (WCAG 1.4.3's 4.5:1 body text).
+//
+// Both briefly offered a below-baseline third level (`compact` / `legacy`) holding PM's original
+// sizing and ramps, pinned onto existing installs by a one-time migration so the accessibility epic
+// wouldn't change anyone's look under them. Those levels are gone, and with them the pin: an install
+// carrying a stored `compact`/`legacy` lands on the compliant default at its next read, because
+// `oneOf` falls back whenever the stored string isn't in the current allow-list. No dedicated
+// migration — deleting the value from DENSITIES/CONTRASTS *is* the migration.
 const DEFAULT_DENSITY: Density = "standard";
-const LEGACY_DENSITY: Density = "compact";
+const DEFAULT_CONTRAST: Contrast = "aa";
 
-/** The density a fresh mount starts at. A stored value always wins; otherwise an install that
- *  already carries theme state (`hasThemeState`, i.e. a `pm:theme:system` value is present) is an
- *  existing user and is pinned to the legacy sizing, while a genuinely fresh install gets the
- *  compliant default. Pure + exported so the one-time migration is unit-testable without mounting
- *  the provider. */
-export function initialDensity(stored: string | null, hasThemeState: boolean): Density {
-  if (stored !== null) return oneOf(stored, DENSITIES, DEFAULT_DENSITY);
-  return hasThemeState ? LEGACY_DENSITY : DEFAULT_DENSITY;
+/** The density a mount starts at: the stored value when it is still an offered level, else the
+ *  compliant default. Pure + exported so the migration off `compact` is unit-testable without
+ *  mounting the provider. */
+export function storedDensity(stored: string | null): Density {
+  return oneOf(stored, DENSITIES, DEFAULT_DENSITY);
 }
 
-// Contrast is the second axis with a compliant default that differs from today, so it carries the
-// same one-time legacy pin as density (see initialDensity): a fresh install gets `aa` (WCAG 1.4.3),
-// an existing install is pinned to `legacy` (today's ramps) and can Reset up to the compliant baseline.
-const DEFAULT_CONTRAST: Contrast = "aa";
-const LEGACY_CONTRAST: Contrast = "legacy";
-
-/** The contrast a fresh mount starts at — the density legacy-pin, applied to the contrast axis. Pure
- *  + exported for the same migration unit test. */
-export function initialContrast(stored: string | null, hasThemeState: boolean): Contrast {
-  if (stored !== null) return oneOf(stored, CONTRASTS, DEFAULT_CONTRAST);
-  return hasThemeState ? LEGACY_CONTRAST : DEFAULT_CONTRAST;
+/** The contrast a mount starts at — the same rule, applied to the contrast axis (`legacy` → `aa`). */
+export function storedContrast(stored: string | null): Contrast {
+  return oneOf(stored, CONTRASTS, DEFAULT_CONTRAST);
 }
 
 // The Teach-tab visibility override: "auto" follows the Depth preset (hidden for minimalist,
@@ -259,15 +247,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     () => read(KEY.reduceMotion) === "true",
   );
   const [legibleFont, setLegibleFont] = useState<boolean>(() => read(KEY.legibleFont) === "true");
-  // Reads KEY.system to tell an existing install from a fresh one — safe here because the persist
-  // effect (which writes KEY.system) only runs after mount, so it still reflects the pre-upgrade state.
-  const [density, setDensity] = useState<Density>(() =>
-    initialDensity(read(KEY.density), read(KEY.system) !== null),
-  );
+  // A stored `compact`/`legacy` from the withdrawn below-baseline levels isn't in DENSITIES/CONTRASTS
+  // any more, so oneOf lands it on the compliant default — see the DEFAULT_* block above.
+  const [density, setDensity] = useState<Density>(() => storedDensity(read(KEY.density)));
   const [colorblind, setColorblind] = useState<boolean>(() => read(KEY.colorblind) === "true");
-  const [contrast, setContrast] = useState<Contrast>(() =>
-    initialContrast(read(KEY.contrast), read(KEY.system) !== null),
-  );
+  const [contrast, setContrast] = useState<Contrast>(() => storedContrast(read(KEY.contrast)));
 
   // The resolved Mode (+ how/where it was resolved). Computed synchronously for a themed first
   // paint, then kept live by the effect below (OS changes, sunrise/sunset, focus).
@@ -311,14 +295,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     );
     setReduceMotion(b.reduceMotion === true);
     setLegibleFont(b.legibleFont === true);
-    // A blob without `density` predates this axis, so it belongs to an existing user whose folder was
-    // restored on a fresh machine → pin the legacy sizing, matching the localStorage migration above.
-    setDensity(oneOf(typeof b.density === "string" ? b.density : null, DENSITIES, LEGACY_DENSITY));
+    // A blob predating these axes — or carrying a withdrawn `compact`/`legacy` — lands on the
+    // compliant default, exactly as the localStorage read above does.
+    setDensity(storedDensity(typeof b.density === "string" ? b.density : null));
     setColorblind(b.colorblind === true);
-    // A blob without `contrast` predates the axis → an existing user's folder → pin legacy, as above.
-    setContrast(
-      oneOf(typeof b.contrast === "string" ? b.contrast : null, CONTRASTS, LEGACY_CONTRAST),
-    );
+    setContrast(storedContrast(typeof b.contrast === "string" ? b.contrast : null));
   }
 
   // One-shot hydration from the store. On a fresh machine (localStorage empty) the

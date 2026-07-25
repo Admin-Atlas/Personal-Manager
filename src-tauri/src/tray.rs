@@ -10,8 +10,14 @@
 //!
 //! A second `WebviewWindow` labelled `briefing`, pointed at `index.html?window=briefing` so
 //! `main.tsx` can mount a tiny popover root instead of a second full `<App/>` (which would duplicate
-//! the boot IPC, the calendar poll and every resume effect). It is created ONCE at startup and then
-//! only shown/hidden — creating it lazily would mean paying webview startup on every toggle.
+//! the boot IPC, the calendar poll and every resume effect). It is created on FIRST SHOW and then
+//! only shown/hidden, so the toggle pays webview startup once rather than on every flip.
+//!
+//! It is deliberately NOT created at startup. Tauri only exits once every window is *destroyed*, and
+//! this one refuses close (it hides instead, being a panel), so an eagerly-built hidden window left
+//! PM running headless after the user closed the main window with the tray off — plus a second
+//! webview's memory for everyone who never opens it. [`on_window_event`] now also exits explicitly on
+//! that path, so neither half alone can strand the process.
 //!
 //! It deliberately holds NO capability entry. PM's own `#[tauri::command]`s are not ACL-gated (the
 //! app ships no `permissions/` directory, so there is no `__app-acl__` manifest and the reject arm
@@ -36,7 +42,7 @@
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconEvent},
-    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
 use crate::db;
@@ -51,6 +57,10 @@ use crate::AppState;
 
 /// Window label for the briefing popover. Also matched in `on_window_event`.
 pub const BRIEFING_LABEL: &str = "briefing";
+/// Emitted when the briefing window is dismissed by the user, so the main window can put the
+/// "Floating briefing" setting back to Off. (The briefing webview itself can't listen — no
+/// capability entry — but it also has no reason to; a broadcast is harmless there.)
+pub const BRIEFING_CLOSED_EVENT: &str = "briefing://closed";
 /// The tray icon declared in `tauri.conf.json` (`app.trayIcon.id`).
 const TRAY_ID: &str = "main";
 
@@ -70,12 +80,13 @@ pub fn tray_enabled(app: &AppHandle) -> bool {
     db::get_bool(&conn, TRAY_ENABLED_KEY, false).unwrap_or(false)
 }
 
-/// Create the briefing window, hidden. Called once during setup.
+/// Create the briefing window, hidden. Idempotent, and called lazily on the first show (never from
+/// startup — see the module docs).
 ///
 /// `always_on_top` + `skip_taskbar` make it read as a floating utility panel rather than a second
 /// application window; `decorations(false)` matches the main window's custom chrome, and the popover
-/// root draws its own drag strip.
-pub fn build_briefing_window(app: &AppHandle) -> Result<()> {
+/// root draws its own title/drag strip.
+fn build_briefing_window(app: &AppHandle) -> Result<()> {
     if app.get_webview_window(BRIEFING_LABEL).is_some() {
         return Ok(());
     }
@@ -84,7 +95,9 @@ pub fn build_briefing_window(app: &AppHandle) -> Result<()> {
         BRIEFING_LABEL,
         WebviewUrl::App("index.html?window=briefing".into()),
     )
-    .title("Today's briefing")
+    // Matches the strip the popover root draws (and the in-app floating panel's), so the window
+    // manager's name for it and the one on screen agree.
+    .title("Briefing — Today")
     .inner_size(360.0, 440.0)
     .min_inner_size(280.0, 200.0)
     .decorations(false)
@@ -96,20 +109,47 @@ pub fn build_briefing_window(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Show or hide the briefing window. The single entry point, reached from the tray menu, the tray
-/// left click and the frontend command, so the three can never drift apart.
-pub fn toggle_briefing_window(app: &AppHandle, force_show: bool) -> Result<()> {
-    build_briefing_window(app)?;
-    let Some(win) = app.get_webview_window(BRIEFING_LABEL) else {
+/// Put the briefing window into an explicit state. This is what a *setting* wants: "always on top"
+/// means show, every other level means hide, whatever the window happens to be doing now.
+///
+/// Kept separate from [`toggle_briefing_window`] on purpose. Asking the toggle for "not on top" by
+/// passing `force_show: false` used to SHOW an already-hidden window (the toggle's else arm), which
+/// is how picking "inside PM" in Settings opened the OS window as well.
+pub fn set_briefing_window_visible(app: &AppHandle, visible: bool) -> Result<()> {
+    if !visible {
+        // Never build the window just to hide it — if it doesn't exist there is nothing to do.
+        if let Some(win) = app.get_webview_window(BRIEFING_LABEL) {
+            let _ = win.hide();
+        }
         return Ok(());
-    };
-    let visible = win.is_visible().unwrap_or(false);
-    if visible && !force_show {
-        let _ = win.hide();
-    } else {
+    }
+    build_briefing_window(app)?;
+    if let Some(win) = app.get_webview_window(BRIEFING_LABEL) {
         let _ = win.show();
         let _ = win.set_focus();
     }
+    Ok(())
+}
+
+/// Flip the briefing window between shown and hidden — the tray's affordance (menu item + left
+/// click), where "toggle" is exactly the intent. Settings uses [`set_briefing_window_visible`].
+pub fn toggle_briefing_window(app: &AppHandle) -> Result<()> {
+    let showing = app
+        .get_webview_window(BRIEFING_LABEL)
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    set_briefing_window_visible(app, !showing)
+}
+
+/// Hide the briefing window at the user's request (its own ✕, or the tray closing it) and tell the
+/// main window, so the "Floating briefing → Always on top" setting follows it back to Off instead of
+/// claiming a window that isn't there.
+///
+/// The briefing webview holds no capability entry and so cannot `listen()` or hide itself — Rust owns
+/// this, which is why the close button is a command rather than a `getCurrentWindow().hide()`.
+pub fn close_briefing_window(app: &AppHandle) -> Result<()> {
+    set_briefing_window_visible(app, false)?;
+    let _ = app.emit(BRIEFING_CLOSED_EVENT, ());
     Ok(())
 }
 
@@ -123,11 +163,10 @@ pub fn set_tray_enabled(app: &AppHandle, enabled: bool) -> Result<()> {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_visible(enabled);
     }
-    // Switching the tray off must not leave an orphaned floating window with no way back to it.
+    // Switching the tray off must not leave an orphaned floating window with no way back to it —
+    // and the frontend setting has to follow it down, so this goes through the close path.
     if !enabled {
-        if let Some(win) = app.get_webview_window(BRIEFING_LABEL) {
-            let _ = win.hide();
-        }
+        close_briefing_window(app)?;
     }
     Ok(())
 }
@@ -164,7 +203,7 @@ fn wire_tray(app: &AppHandle) -> Result<()> {
 
     tray.on_menu_event(|app, event| match event.id.as_ref() {
         "briefing" => {
-            let _ = toggle_briefing_window(app, false);
+            let _ = toggle_briefing_window(app);
         }
         "open" => {
             if let Some(win) = app.get_webview_window("main") {
@@ -185,7 +224,7 @@ fn wire_tray(app: &AppHandle) -> Result<()> {
             ..
         } = event
         {
-            let _ = toggle_briefing_window(tray.app_handle(), false);
+            let _ = toggle_briefing_window(tray.app_handle());
         }
     });
 
@@ -197,10 +236,17 @@ fn wire_tray(app: &AppHandle) -> Result<()> {
 ///
 /// With the tray ON, closing the main window HIDES it and PM keeps running in the tray (Quit lives
 /// in the tray menu) — the standard tray-app contract, and the only way the icon can outlive the
-/// window. With the tray OFF, close quits exactly as it always has, so a user who never opts in sees
+/// window. With the tray OFF, close QUITS exactly as it always has, so a user who never opts in sees
 /// no behaviour change at all.
 ///
-/// The briefing window's own close button always just hides it; it is a panel, not a document.
+/// That last part needs saying explicitly rather than falling through to Tauri's default. Tauri exits
+/// when every window is *destroyed*, and the briefing window refuses to be destroyed (it hides — it's
+/// a panel, not a document). So once the briefing window exists, letting the main window close on its
+/// own would leave PM alive with nothing on screen and no tray icon to reach it by. `app.exit(0)` is
+/// the honest expression of "close means quit here".
+///
+/// The briefing window's own close goes through [`close_briefing_window`], which hides it and tells
+/// the main window so the setting follows.
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
     let WindowEvent::CloseRequested { api, .. } = event else {
         return;
@@ -208,11 +254,15 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
     let app = window.app_handle();
     if window.label() == BRIEFING_LABEL {
         api.prevent_close();
-        let _ = window.hide();
+        let _ = close_briefing_window(app);
         return;
     }
-    if window.label() == "main" && tray_enabled(app) {
-        api.prevent_close();
-        let _ = window.hide();
+    if window.label() == "main" {
+        if tray_enabled(app) {
+            api.prevent_close();
+            let _ = window.hide();
+        } else {
+            app.exit(0);
+        }
     }
 }

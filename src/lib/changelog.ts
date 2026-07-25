@@ -24,6 +24,24 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.78.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Closing PM's window really does close PM again. A recent change added the little always-on-top briefing window behind the scenes, and because that window is built to hide rather than close, it quietly kept PM running in the background after you shut the main window -- with no tray icon to get back to it. PM now quits properly, and the briefing window is only created the first time you actually open it.",
+      'Google Drive can be ingested again. Choosing folders, picking from "Shared with me", or simply syncing was failing with a 400 from Google about an "invalid field selection". PM had been asking Drive for two details by their older names, and Drive rejects the entire request over one unrecognised name rather than just skipping it. Fixed -- nothing about what PM stores or how it is organised changes.',
+      'Setting the floating briefing to "Inside PM" no longer opens the always-on-top window as well. Both would appear at once until you changed the setting again.',
+      'Both floating briefings now say "Briefing -- Today" at the top, and the always-on-top one has a close button. Closing it also switches the setting off, so it stays gone rather than reappearing next time PM starts.',
+      "The Focus box appears when you switch it on, even before you have any projects. It was hidden until at least one project existed, which made the toggle look broken on a fresh install -- though asking a question or saving a preference has always worked from an empty PM.",
+      'Long event names in Upcoming wrap onto a second line instead of being cut off with a "...". In a card that narrow, most real meeting titles were losing the part that told you what they were.',
+      "Upcoming's Work and Day buttons each carry a small arrow now, exactly like the Calendar tab's, so you can set which hours they frame. These hours are Upcoming's own -- narrowing Work here to suit the small card leaves the full Calendar tab alone.",
+      'The Focus tab\'s settings have moved out of Settings, because they were already on the Focus tab itself, next to what they change. The Layout and Upcoming controls in Settings > General > Focus are gone; the ones in the Focus tab header do the job (and the Layout one there always worked, which its Settings twin did not). "Reset Focus" still puts everything back.',
+      'An event that is not linked to anything no longer offers to "Open in Pinboard". That button appeared on every event you clicked in the calendar, and went to the Pinboard whether or not the event had anything to do with it.',
+      'Contrast and Density each drop their old below-standard option. "Legacy" contrast and "Compact" spacing existed only so an earlier update would not change the look of PM under anyone; nobody was choosing them on purpose, and they sat below the readability and target-size levels PM aims for. Everyone is now on AA contrast and Standard spacing, with High and Comfortable still there if you want more.',
+      'Importing the same AI memory twice no longer files everything a second time. PM now tells the import what it already knows so it can skip it, and separately compares meaning rather than exact wording -- so "based in Guildford" and "Based in Guildford." are recognised as one thing, not two.',
+      "The Colour-blind-safe palette explains itself better. It re-colours the things that carry meaning -- status badges, Map nodes, calendar colours -- and deliberately leaves your chosen theme alone, which is why switching it on can look like nothing happened.",
+    ],
+  },
+  {
     version: "3.77.2-alpha",
     date: "2026-07-25",
     highlights: [

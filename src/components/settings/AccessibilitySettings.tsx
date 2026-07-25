@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The Accessibility settings tab. Opt-in axes that change how PM presents itself — text size,
-// contrast, density / touch-target size, motion, a legible font, and a colour-blind-safe palette —
-// persisted with the rest of the theme (so they travel with the vault) and applied instantly. Most
-// defaults equal PM's normal behaviour; the two whose compliant default differs (density → `standard`,
-// contrast → `aa`) are pinned to their legacy value (`compact` / `legacy`) for existing installs by a
-// one-time migration, so nothing shifts until you choose otherwise or Reset. This tab now covers the
-// full accessibility epic (#502).
+// The Accessibility settings tab. Axes that change how PM presents itself — text size, contrast,
+// density / touch-target size, motion, a legible font, and a colour-blind-safe palette — persisted
+// with the rest of the theme (so they travel with the vault) and applied instantly. This tab covers
+// the full accessibility epic (#502).
+//
+// Contrast and density each briefly offered a below-baseline level ("Legacy" / "Compact") holding
+// PM's original ramps and sizing, so the epic wouldn't change an existing install's look under it.
+// Both are withdrawn: they were a sub-AA default nobody was choosing on purpose, and keeping them on
+// the picker only invited someone to pick one. Everyone lands on AA / Standard (see ThemeContext for
+// how a stored value migrates), and the copy below no longer mentions the levels that are gone.
 
 import { SectionInfo, SegmentedControl, Toggle } from "../ui";
 import { useTheme, type FontScale, type Density, type Contrast } from "../../theme";
@@ -23,17 +26,15 @@ const FONT_SIZE_OPTIONS: ReadonlyArray<{ value: FontScale; label: string; title:
 ];
 
 const DENSITY_OPTIONS: ReadonlyArray<{ value: Density; label: string; title: string }> = [
-  { value: "compact", label: "Compact", title: "Today's tight spacing — smaller targets" },
-  { value: "standard", label: "Standard", title: "Roomier, 24px touch targets (WCAG 2.5.8)" },
+  { value: "standard", label: "Standard", title: "24px touch targets (WCAG 2.5.8)" },
   {
     value: "comfortable",
     label: "Comfortable",
-    title: "Largest, 44px targets for lower precision",
+    title: "Larger, 44px targets for lower precision",
   },
 ];
 
 const CONTRAST_OPTIONS: ReadonlyArray<{ value: Contrast; label: string; title: string }> = [
-  { value: "legacy", label: "Legacy", title: "PM's original ramps" },
   { value: "aa", label: "AA", title: "Meets WCAG 1.4.3 (4.5:1 body text)" },
   { value: "high", label: "High", title: "AAA — 7:1 body text, firmer borders" },
 ];
@@ -94,9 +95,10 @@ export function AccessibilitySettings() {
         </div>
         <SectionInfo helpId="settings-a11y-contrast">
           <p>
-            Sets how strongly PM's text and edges stand out from the background. “AA” meets the
-            recommended 4.5:1 for body text; “High” goes further (AAA, 7:1) and firms up the
-            faintest text and the borders. “Legacy” is PM's original, softer ramp.
+            Sets how strongly PM's text and edges stand out from the background. “AA” is the default
+            and meets the recommended 4.5:1 for body text. “High” goes further (AAA, 7:1) and firms
+            up the faintest text and the borders — worth choosing in a bright room, or on a dim
+            screen.
           </p>
         </SectionInfo>
       </div>
@@ -112,9 +114,9 @@ export function AccessibilitySettings() {
         </div>
         <SectionInfo helpId="settings-a11y-density">
           <p>
-            Sets how large PM's controls and their tap/click targets are. “Standard” meets the
-            recommended 24px minimum; “Comfortable” grows them to 44px, which helps when precise
-            clicking is hard. “Compact” keeps PM's original, tighter spacing.
+            Sets how large PM's controls and their tap/click targets are. “Standard” is the default
+            and meets the recommended 24px minimum. “Comfortable” grows them to 44px, which helps a
+            lot when precise clicking is hard, or on a touchscreen.
           </p>
         </SectionInfo>
       </div>
@@ -180,9 +182,16 @@ export function AccessibilitySettings() {
         </div>
         <SectionInfo helpId="settings-a11y-color">
           <p>
-            Swaps the colours PM uses to tell things apart — project graph nodes, calendar sources,
-            and status colours — for a colour-blind-safe (Okabe–Ito) set chosen to stay distinct
-            under the common types of colour vision. Text labels and icons are unaffected.
+            Swaps the colours PM uses to tell things apart — status badges (Due soon, Blocked, Quick
+            win…), Map nodes, and the per-calendar colours on the Calendar and Upcoming grids — for
+            a colour-blind-safe (Okabe–Ito) set chosen to stay distinct under the common types of
+            colour vision.
+          </p>
+          <p>
+            It deliberately leaves your <em>theme</em> alone: System, Mode and Accent under
+            Appearance are a matter of taste, not of telling two things apart, so PM keeps the look
+            you chose and only re-colours the things that carry meaning. Text labels and icons are
+            unaffected too — nothing here has ever relied on colour alone.
           </p>
         </SectionInfo>
       </div>

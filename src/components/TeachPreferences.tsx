@@ -235,7 +235,16 @@ function PreferenceRow({
               </span>
             )}
             {showPower && (
-              <span className="font-mono text-ink4">
+              <span
+                className="font-mono text-ink4"
+                title={
+                  `Where it came from, how sure PM is of it, and its row id.\n\n` +
+                  `${Math.round(pref.confidence * 100)}% is the confidence. A preference you typed ` +
+                  `in — or one you've since Kept — sits at 100% and is used in prompts. One PM ` +
+                  `distilled from a chat or an AI-memory import starts at 60% and is withheld from ` +
+                  `prompts until you Keep it.`
+                }
+              >
                 {pref.source} · {Math.round(pref.confidence * 100)}% · id {pref.id}
               </span>
             )}

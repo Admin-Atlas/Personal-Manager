@@ -22,6 +22,7 @@
 
 import { BriefingProvider } from "./lib/briefing";
 import { Briefing } from "./components/Briefing";
+import { closeBriefingWindow } from "./lib/ipc";
 import { ThemeProvider, UserTimeProvider } from "./theme";
 
 export function PopoverRoot() {
@@ -35,7 +36,9 @@ export function PopoverRoot() {
         <BriefingProvider autoRefresh={false}>
           <div className="flex h-full flex-col bg-panel text-ink">
             {/* The window is frameless, so this strip is what drags it. `data-tauri-drag-region` is
-                the one plugin-backed thing this root uses; capabilities/briefing.json grants it. */}
+                the one plugin-backed thing this root uses; capabilities/briefing.json grants it. The
+                title matches the in-app floating panel's word-for-word — same content, same name,
+                wherever it's shown. */}
             <div
               data-tauri-drag-region
               className="flex shrink-0 cursor-grab items-center justify-between gap-2 border-b border-border px-3 py-1.5 active:cursor-grabbing"
@@ -44,8 +47,20 @@ export function PopoverRoot() {
                 data-tauri-drag-region
                 className="font-mono text-[11px] uppercase tracking-wide text-faint"
               >
-                Today
+                Briefing — Today
               </span>
+              {/* Closing hides the window AND switches the setting off, so it doesn't come back on
+                  the next launch claiming to be on top. Rust owns both halves: this root can't hide
+                  its own window (no capability) and the main window can't see this click. */}
+              <button
+                type="button"
+                onClick={() => void closeBriefingWindow().catch(() => {})}
+                title="Close the briefing window"
+                aria-label="Close the briefing window"
+                className="rounded-[var(--radius-sm)] px-1.5 text-xs text-ink4 hover:bg-surface hover:text-ink"
+              >
+                <span aria-hidden="true">✕</span>
+              </button>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
               <Briefing variant="panel" />

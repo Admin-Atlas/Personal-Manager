@@ -1120,10 +1120,11 @@ pub fn run() {
             // no-op until a folder is tracked. Observer-only — takes no vault lock.
             localfolder::spawn_local_watcher(handle.clone());
 
-            // The tray icon and the always-on-top briefing window. Both start hidden; the tray is
-            // shown only if the user has switched it on. Best-effort: a desktop with no
-            // StatusNotifierItem host (or no appindicator library at all) must not block startup.
-            let _ = tray::build_briefing_window(handle);
+            // The tray icon, shown only if the user has switched it on. Best-effort: a desktop with
+            // no StatusNotifierItem host (or no appindicator library at all) must not block startup.
+            // The always-on-top briefing window is NOT built here — it is created on first show, so a
+            // window that refuses to close can't outlive the main one and keep PM running headless
+            // (see tray.rs).
             tray::init(handle);
             Ok(())
         })
@@ -1319,7 +1320,8 @@ pub fn run() {
             commands::open_url,
             commands::get_tray_enabled,
             commands::set_tray_enabled,
-            commands::toggle_briefing_window,
+            commands::set_briefing_window_visible,
+            commands::close_briefing_window,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::resolve_flag,

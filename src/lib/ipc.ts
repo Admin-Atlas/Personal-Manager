@@ -1113,9 +1113,21 @@ export const refreshDailyBriefing = () => invoke<DailyBriefing>("refresh_daily_b
 export const getTrayEnabled = () => invoke<boolean>("get_tray_enabled");
 export const setTrayEnabled = (enabled: boolean) => invoke<void>("set_tray_enabled", { enabled });
 
-/** Show or hide the always-on-top briefing window. `forceShow` opens it without toggling. */
-export const toggleBriefingWindow = (forceShow: boolean) =>
-  invoke<void>("toggle_briefing_window", { forceShow });
+/** Put the always-on-top briefing window into an explicit state. Deliberately not a toggle: the
+ *  Settings control means "on top ⇒ show, anything else ⇒ hide", and asking a toggle for the latter
+ *  opened the window instead. */
+export const setBriefingWindowVisible = (visible: boolean) =>
+  invoke<void>("set_briefing_window_visible", { visible });
+
+/** Dismiss the always-on-top briefing window from its own ✕. Rust hides it and emits
+ *  `briefing://closed` so the setting follows — see {@link onBriefingWindowClosed}. */
+export const closeBriefingWindow = () => invoke<void>("close_briefing_window");
+
+/** Subscribe to `briefing://closed` (the event name is `tray.rs`'s `BRIEFING_CLOSED_EVENT`) — the
+ *  always-on-top window was dismissed (its ✕, or the tray going off), so "Floating briefing" should
+ *  stop claiming to be on top. */
+export const onBriefingWindowClosed = (handler: () => void): Promise<UnlistenFn> =>
+  listen("briefing://closed", () => handler());
 
 /** Mark a structured flag done (board card 9) — a deliberate user assertion that outranks detection,
  *  removing it from the rendered set. Optionally names the satisfying artifact by its

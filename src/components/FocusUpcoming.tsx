@@ -1,20 +1,23 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The Focus tab's "Upcoming" card. Two display modes, chosen from the header toggle (and mirrored in
-// Settings → General → Focus):
+// The Focus tab's "Upcoming" card. Two display modes, chosen from the header toggle:
 //   • "list"  — the plain agenda: the next handful of events, one per row (the long-standing default).
 //   • "week"  — a compact few-day time grid, reusing the exact Calendar Week engine (TimeGridView),
 //               capped to 1–4 days so it fits the Focus column at the same width. ‹ / › step the
 //               window one day at a time; the window starts at today each time the tab opens and holds
 //               where you leave it while you're there (a "Today" chip snaps back). Work / Day frame
-//               the visible hours, and the day count sits beside them — both mirrored in Settings.
+//               the visible hours, and the day count sits beside them.
 //
-// Two things this card does NOT share with the Calendar tab, both because it is a ~26rem pane rather
+// Every one of those controls lives HERE, beside what it changes; Settings no longer mirrors them.
+//
+// Three things this card does NOT share with the Calendar tab, all because it is a ~26rem pane rather
 // than a full page: it offers no 24h range (at this height a whole day's rows can't hold a legible
-// event card — the grid still scrolls the full 24h, so nothing is out of reach), and it hands
+// event card — the grid still scrolls the full 24h, so nothing is out of reach); it hands
 // TimeGridView a much lower row-height floor, so the range it IS showing fills the pane instead of
-// bottoming out on the calendar's floor and rendering every wide window identically.
+// bottoming out on the calendar's floor and rendering every wide window identically; and its Work/Day
+// hour windows are its OWN (readFocusUpcomingBounds), so tightening Work to suit this pane doesn't
+// tighten the full-page week grid. The editor itself is the Calendar tab's RangeControl, reused.
 //
 // The list uses the focus agenda feed the parent already loads; the grid lazily pulls the full mirror
 // (listAllCalendarEvents) so days either side of today are populated. Synced events only — the same
@@ -24,19 +27,22 @@ import { useEffect, useMemo, useState } from "react";
 import type { AgendaEvent, CalendarEvent } from "../lib/types";
 import { listAllCalendarEvents } from "../lib/ipc";
 import { resolveRangeBounds } from "../lib/calendarGeom";
-import type { CalendarRange } from "../lib/calendarPrefs";
+import type { CalendarRange, RangeBounds } from "../lib/calendarPrefs";
 import { addDays, dayKey, startOfDay } from "../lib/calendar-layout";
 import { sourceColors, useTheme, useUserTime } from "../theme";
 import { formatEventWhen } from "../lib/format";
 import { Card, SegmentedControl } from "./ui";
 import { TimeGridView } from "./calendar/views/TimeGridView";
+import { RangeControl } from "./calendar/RangeControl";
 import {
   FOCUS_UPCOMING_DAY_CHOICES,
   FOCUS_UPCOMING_RANGES,
   clampFocusUpcomingDays,
+  readFocusUpcomingBounds,
   readFocusUpcomingDays,
   readFocusUpcomingMode,
   readFocusUpcomingRange,
+  writeFocusUpcomingBounds,
   writeFocusUpcomingDays,
   writeFocusUpcomingMode,
   writeFocusUpcomingRange,
@@ -65,7 +71,11 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
   const { coords } = useUserTime();
   const [mode, setMode] = useState<FocusUpcomingMode>(readFocusUpcomingMode);
   const [range, setRange] = useState<CalendarRange>(readFocusUpcomingRange);
-  // 1–4, from the header control here or its mirror in Settings; read once on mount like the others.
+  // This pane's own Work/Day hour windows (empty ⇒ the computed defaults). Edited from the ▾ on the
+  // Work/Day control, exactly as on the Calendar tab — but stored separately, see the header comment.
+  const [bounds, setBounds] =
+    useState<Partial<Record<CalendarRange, RangeBounds>>>(readFocusUpcomingBounds);
+  // 1–4, from the header control below; read once on mount like the others.
   const [days, setDays] = useState<number>(() => clampFocusUpcomingDays(readFocusUpcomingDays()));
   // The leftmost visible day. Starts at today each open; ‹ / › move it, "Today" snaps back. Kept as
   // component state (not persisted) so the window never jumps under you mid-session, and "Upcoming"
@@ -84,7 +94,17 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
   function changeDays(next: number) {
     const clamped = clampFocusUpcomingDays(next);
     setDays(clamped);
-    writeFocusUpcomingDays(clamped); // shared with the Settings mirror
+    writeFocusUpcomingDays(clamped);
+  }
+  /** Set (or clear, with `null`) one range's custom window. */
+  function changeBounds(which: CalendarRange, next: RangeBounds | null) {
+    setBounds((prev) => {
+      const map = { ...prev };
+      if (next) map[which] = next;
+      else delete map[which];
+      writeFocusUpcomingBounds(map);
+      return map;
+    });
   }
 
   // Lazily load the full mirror only while the grid is on (List mode needs nothing extra). Refresh on
@@ -136,9 +156,9 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
     return (calendarId: string) => map.get(calendarId) ?? "var(--ink4)";
   }, [calendarIds, system, accent, colorblind]);
 
-  const bounds = useMemo(
-    () => resolveRangeBounds(range, {}, coords, anchor),
-    [range, coords, anchor],
+  const visibleBounds = useMemo(
+    () => resolveRangeBounds(range, bounds, coords, anchor),
+    [range, bounds, coords, anchor],
   );
 
   const anchoredToday = dayKey(anchor) === dayKey(startOfDay(new Date()));
@@ -212,10 +232,16 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
                   title: n === 1 ? "One day" : `${n} days`,
                 }))}
               />
-              <SegmentedControl
-                value={range}
-                onChange={changeRange}
-                options={FOCUS_UPCOMING_RANGES}
+              {/* The Calendar tab's control, narrowed to Work/Day: each carries a ▾ that sets the
+                  hours it frames. */}
+              <RangeControl
+                range={range}
+                onRangeChange={changeRange}
+                customBounds={bounds}
+                onBoundsChange={changeBounds}
+                coords={coords}
+                cursor={anchor}
+                ranges={FOCUS_UPCOMING_RANGES}
               />
             </div>
           </div>
@@ -225,7 +251,7 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
               events={gridEvents}
               colorOf={colorOf}
               range={range}
-              bounds={bounds}
+              bounds={visibleBounds}
               zones={[]}
               onZonesChange={NOOP}
               allowZones={false}
@@ -239,23 +265,30 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
 }
 
 /** The agenda list — the next handful of events, one per row. An event that already ended today stays
- *  listed (a real day stays visible until its own midnight) but greyed. Moved verbatim from FocusView. */
+ *  listed (a real day stays visible until its own midnight) but greyed.
+ *
+ *  The name WRAPS rather than truncating. This card is ~22rem wide next to a 8rem time column, so
+ *  "…" swallowed most real meeting titles — and a title you can't read is the one thing the row is
+ *  for. The time stays on one line as a fixed gutter, and the name/location column wraps under it. */
 function AgendaList({ events }: { events: AgendaEvent[] }) {
   const shown = events.slice(0, 8);
   return (
     <>
       <ul className="flex flex-col gap-1.5">
         {shown.map((e) => (
-          <li
-            key={e.id}
-            className={`flex items-baseline gap-3 text-sm${e.ended ? " opacity-45" : ""}`}
-          >
-            <span className="w-32 shrink-0 font-mono text-xs text-ink3">
+          <li key={e.id} className={`flex gap-3 text-sm${e.ended ? " opacity-45" : ""}`}>
+            <span className="w-32 shrink-0 font-mono text-xs leading-5 text-ink3">
               {formatEventWhen(e.start, e.all_day)}
             </span>
-            <span className="truncate text-ink2">{e.summary}</span>
-            {e.location && <span className="truncate text-xs text-ink4">{e.location}</span>}
-            {e.ended && <span className="shrink-0 text-xs text-ink4">ended</span>}
+            <span className="min-w-0 flex-1">
+              {/* `break-words` so a single unbroken token (a long URL-ish title) still folds rather
+                  than forcing the card to scroll sideways. */}
+              <span className="break-words text-ink2">{e.summary}</span>
+              {e.location && (
+                <span className="ml-2 break-words text-xs text-ink4">{e.location}</span>
+              )}
+              {e.ended && <span className="ml-2 whitespace-nowrap text-xs text-ink4">ended</span>}
+            </span>
           </li>
         ))}
       </ul>

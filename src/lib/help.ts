@@ -114,6 +114,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Tray / menu bar icon",
     body: "Puts a small PM icon in your system tray (Windows), menu bar (Mac) or panel (Linux). Click it — or right-click and choose 'Today's briefing' — to pop the briefing up without going to find PM's window. While this is on, closing PM's window leaves it running behind the icon instead of quitting, and 'Quit PM' moves to the icon's menu; switch it off and closing the window quits as it always has. On Linux a left click does nothing (the desktop never tells applications about it), so use the right-click menu — and the icon only appears if your desktop shows tray icons at all: KDE Plasma, XFCE, Cinnamon and MATE do, while GNOME needs its AppIndicator extension installed.",
   },
+  "settings-focus": {
+    title: "Focus",
+    body: "What this section covers is where today's briefing shows up outside the Focus tab — pinned in the sidebar, floating inside PM, or in its own always-on-top window — plus the tray icon. The Focus tab's own controls (Split/Stacked, the Upcoming list-or-days toggle and its hours, and which panels the tab shows) live on that tab, in its header, beside the thing they change; there is nothing to mirror here. 'Reset Focus' still puts all of it back, the tab's controls included.",
+  },
   "settings-map-tab": {
     title: "Map tab",
     body: "Show or hide the Map — the semantic picture of everything you've filed, laid out so related things sit near each other. Like the learning tools above, it follows your preset by default: on for Standard and Power, off for Minimal, since a pared-back setup rarely wants an exploratory view. Overriding here wins either way. Hiding it changes nothing about your data or the search behind it; the Map is still there the moment you switch it back on.",
@@ -127,11 +131,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-a11y-contrast": {
     title: "Text & edge contrast",
-    body: "Sets how strongly PM's text and edges stand out from the background. 'AA' meets the recommended 4.5:1 for body text and is the default on a new install. 'High' goes further (AAA, 7:1) and firms up the faintest text and the borders — useful in bright rooms or on a dim screen. 'Legacy' is PM's original, softer ramp, kept so an existing install's look isn't changed underneath you.",
+    body: "Sets how strongly PM's text and edges stand out from the background. 'AA' is the default and meets the recommended 4.5:1 for body text — enough that nothing in PM is a strain to read. 'High' goes further (AAA, 7:1) and firms up the faintest text and the borders, which is worth choosing in a bright room or on a dim screen. It changes contrast only: your theme's colours, spacing and layout stay exactly as they were.",
   },
   "settings-a11y-density": {
     title: "Density",
-    body: "Sets how large PM's controls are, and with them how big a target you have to hit. 'Standard' meets the recommended 24px minimum and is the default on a new install. 'Comfortable' grows targets to 44px, which helps a lot if precise clicking is hard or you're on a touchscreen. 'Compact' keeps PM's original tighter spacing and fits more on screen.",
+    body: "Sets how large PM's controls are, and with them how big a target you have to hit. 'Standard' is the default and meets the recommended 24px minimum. 'Comfortable' grows targets to 44px, which helps a lot if precise clicking is hard or you're on a touchscreen. It sizes controls only — text has its own setting above.",
   },
   "settings-a11y-motion": {
     title: "Animations",
@@ -143,7 +147,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-a11y-color": {
     title: "Colour-blind-safe palette",
-    body: "Swaps the colours PM uses to tell things apart — Map nodes, calendar sources, and the project status colours — for an Okabe–Ito set chosen to stay distinguishable under the common types of colour vision. Text labels and icons are unaffected, so nothing is ever carried by colour alone.",
+    body: "Swaps the colours PM uses to TELL THINGS APART — the project status badges (Due soon, Blocked, Quick win…), Map nodes, and the per-calendar colours on the Calendar and Upcoming grids — for an Okabe–Ito set chosen to stay distinguishable under the common types of colour vision. It deliberately leaves your theme alone: System, Mode and Accent under Appearance are taste rather than meaning, so the look you picked stays, and only the colours that carry information change. If you switch this on and the app looks much the same, that's the point — look at a status badge or the Map to see it. Text labels and icons are unaffected either way, so nothing is ever carried by colour alone.",
   },
 
   // Command palette (Step 5b)

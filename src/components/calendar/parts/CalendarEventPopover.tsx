@@ -4,10 +4,16 @@
 // The click-to-open detail popup for a calendar event (card 6 follow-up). PM is the calendar
 // aggregator, so this surfaces everything the mirror holds — source calendar, when, busy/free,
 // location, attendees + organiser, conferencing, recurrence, description, and any linked milestone /
-// project / PM flag — plus buttons to open the event in its source calendar, its project, or the
-// Pinboard. It's an in-place floating panel (the pinboard folder-popup pattern): fixed-position,
-// clamped to the viewport, dismissed by click-outside or Escape. The description is the one piece of
-// untrusted provider text, so it renders ONLY through the sanitising Markdown boundary.
+// project / PM flag — plus buttons to open the event in its source calendar or its project. It's an
+// in-place floating panel (the pinboard folder-popup pattern): fixed-position, clamped to the
+// viewport, dismissed by click-outside or Escape. The description is the one piece of untrusted
+// provider text, so it renders ONLY through the sanitising Markdown boundary.
+//
+// Every action here is conditional on the event actually having somewhere to go: "Open in Project"
+// only with a linked milestone, the source link only with an `html_link`. There is deliberately no
+// "Open in Pinboard" — this popup opens for SYNCED events only (CalendarView routes its two
+// first-party overlays, milestones and pinboard entries, straight to their own destination on click),
+// so that button pointed at the Pinboard from every event that had nothing to do with it.
 
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { Calendar, CalendarEvent, Flag, Milestone } from "../../../lib/types";
@@ -30,7 +36,6 @@ interface Props {
   milestone: Milestone | null;
   onClose: () => void;
   onOpenProject?: (project: string) => void;
-  onOpenPinboard?: () => void;
 }
 
 const MARGIN = 8;
@@ -120,7 +125,6 @@ export function CalendarEventPopover({
   milestone,
   onClose,
   onOpenProject,
-  onOpenPinboard,
 }: Props) {
   const { showPower } = useDepth();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -311,11 +315,6 @@ export function CalendarEventPopover({
             onClick={() => onOpenProject(milestone.project_name)}
           >
             Open in Project
-          </Button>
-        )}
-        {onOpenPinboard && (
-          <Button variant="tertiary" className="text-xs" onClick={onOpenPinboard}>
-            Open in Pinboard
           </Button>
         )}
       </div>

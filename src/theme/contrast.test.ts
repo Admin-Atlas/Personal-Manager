@@ -5,11 +5,11 @@
 // for every System × Mode at each contrast level, converts the emitted oklch()/hex token values back
 // to WCAG relative luminance, and asserts the level's targets: AA (1.4.3) lifts all body text to
 // 4.5:1; High reaches AAA (7:1) for ink..ink3 and firms up ink4/faint (4.5:1) and the border edges
-// (3:1, 1.4.11); Legacy is a no-op. Body text is checked against every background it sits on
-// (bg/panel/surface) — the worst case. If a token ramp regresses, this fails in CI.
+// (3:1, 1.4.11). Body text is checked against every background it sits on (bg/panel/surface) — the
+// worst case. If a token ramp regresses, this fails in CI.
 
 import { describe, expect, it } from "vitest";
-import { themeVars, type ThemeVars } from "./tokens";
+import { boost, themeVars, type ThemeVars } from "./tokens";
 import { oklabLCH, oklchLuminance, contrastRatio } from "./oklab";
 import { SYSTEMS, MODES, ACCENTS } from "./profiles";
 
@@ -60,11 +60,23 @@ describe("contrast axis — WCAG targets across every system × mode", () => {
     }
   }
 
-  it("Legacy is a no-op (today's ramp) and AA genuinely changes ink4", () => {
-    const legacy = themeVars("slate", "dark", "mono", false, "legacy");
-    const untouched = themeVars("slate", "dark", "mono", false); // default param is legacy
-    expect(legacy).toEqual(untouched);
+  it("defaults to AA, and High lifts strictly more of the ramp than AA does", () => {
+    const implicit = themeVars("slate", "dark", "mono", false);
     const aa = themeVars("slate", "dark", "mono", false, "aa");
-    expect(aa["--ink4"]).not.toBe(legacy["--ink4"]);
+    // The default param is the compliant baseline — no caller can land below AA by omitting it.
+    expect(implicit).toEqual(aa);
+
+    // AA moves ONLY the lowest text tier; High also firms up ink3, faint and the borders. Pinning
+    // both halves keeps "AA is the light touch, High is the firm one" true rather than assumed.
+    // (ink4 is deliberately NOT in this list — both levels lift it by the same calibrated amount,
+    // because 4.5:1 is where that tier needs to land either way.)
+    const high = themeVars("slate", "dark", "mono", false, "high");
+    for (const role of ["ink3", "faint", "border", "border2"]) {
+      expect(high[`--${role}`]).not.toBe(aa[`--${role}`]);
+    }
+    // …and AA leaves those roles exactly where the System's ramp put them (boost is identity there).
+    const lc: readonly [number, number] = [0.62, 0.01];
+    expect(boost(lc, "ink3", "dark", "aa")).toEqual([...lc]);
+    expect(boost(lc, "ink4", "dark", "aa")).not.toEqual([...lc]);
   });
 });

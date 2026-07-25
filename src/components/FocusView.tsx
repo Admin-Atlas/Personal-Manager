@@ -295,7 +295,12 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   const briefingAndActions = (
     <>
       {shown("briefing") && <Briefing />}
-      {shown("actions") && !loading && projects.length > 0 && (
+      {/* Not gated on having projects. The focus box routes four ways and only one of them (edit)
+          needs a project — asking a flag-grounded question, capturing a preference and marking a
+          flag done all work on an empty install. Gating it on `projects.length > 0` made switching
+          the "Focus box" panel on look like a dead toggle for anyone who hadn't sorted anything yet.
+          Still gated on `loading` so it doesn't flash in beside the skeletons. */}
+      {shown("actions") && !loading && (
         <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
       )}
       {shown("upcoming") && events.length > 0 && (
