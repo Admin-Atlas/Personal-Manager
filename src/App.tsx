@@ -164,15 +164,16 @@ export default function App() {
   // per-message provenance). One instance, shared down — the "subscribe once" rule (#297 PR6).
   const localAi = useLocalLlmStatus();
   const update = useUpdater();
-  const { teachVisible } = useTheme();
+  const { teachVisible, mapVisible } = useTheme();
   const { devMode } = useDevMode();
-  // If the Review/Teach (learning tools) or Dev tab gets hidden — a preset change, or the toggle
-  // turned off in Settings — while it's open, fall back to Focus so the user is never stranded on a
-  // view with no nav entry.
+  // If the Review/Teach (learning tools), Map or Dev tab gets hidden — a preset change, or the
+  // toggle turned off in Settings — while it's open, fall back to Focus so the user is never
+  // stranded on a view with no nav entry and no palette destination.
   useEffect(() => {
     if ((view === "teach" || view === "review") && !teachVisible) setView("focus");
+    if (view === "graph" && !mapVisible) setView("focus");
     if (view === "dev" && !devMode) setView("focus");
-  }, [view, teachVisible, devMode]);
+  }, [view, teachVisible, mapVisible, devMode]);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [showWhatsNew, setShowWhatsNew] = useState(false);
   const [helpMode, setHelpModeState] = useState(false);

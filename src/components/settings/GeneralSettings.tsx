@@ -78,6 +78,8 @@ export function GeneralSettings() {
     setFontScale,
     teachVisible,
     setTeachVisible,
+    mapVisible,
+    setMapVisible,
     appearanceIsDefault,
     resetAppearance,
   } = useTheme();
@@ -486,6 +488,10 @@ export function GeneralSettings() {
             onChange={setTeachVisible}
             ariaLabel="Show the Review and Teach tabs"
           />
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-3" data-help="settings-map-tab">
+          <span className="text-sm text-ink2">Map tab</span>
+          <Toggle checked={mapVisible} onChange={setMapVisible} ariaLabel="Show the Map tab" />
         </div>
         {/* Both of Appearance's paragraphs — the "it saves itself" reassurance and the
             Location field's format + privacy note — fold into this one disclosure at the
