@@ -49,7 +49,7 @@ export function ConnectorItemRow({
             {reachable ? (
               <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--st-quick)]" />
             ) : (
-              <span className="shrink-0 text-[10px] uppercase tracking-wide text-st-due">
+              <span className="shrink-0 text-[0.625rem] uppercase tracking-wide text-st-due">
                 {badgeLabel}
               </span>
             )}

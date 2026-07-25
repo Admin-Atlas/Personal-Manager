@@ -73,11 +73,11 @@ export function ModelListEditor({
               {id}
             </span>
             {i === 0 ? (
-              <span className="shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent-text">
+              <span className="shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 text-[0.625rem] font-medium text-accent-text">
                 Primary
               </span>
             ) : (
-              <span className="shrink-0 text-[10px] text-faint">fallback {i}</span>
+              <span className="shrink-0 text-[0.625rem] text-faint">fallback {i}</span>
             )}
             <div className="flex shrink-0 items-center">
               <Button

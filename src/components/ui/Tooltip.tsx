@@ -49,7 +49,7 @@ export function Tooltip({ label, children }: TooltipProps) {
           <span
             role="tooltip"
             style={{ left: pos.x, top: pos.y }}
-            className="pointer-events-none fixed z-[60] -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-[var(--radius-sm)] border border-border2 bg-panel px-1.5 py-0.5 text-[10px] text-ink2 shadow-md"
+            className="pointer-events-none fixed z-[60] -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-[var(--radius-sm)] border border-border2 bg-panel px-1.5 py-0.5 text-[0.625rem] text-ink2 shadow-md"
           >
             {label}
           </span>,

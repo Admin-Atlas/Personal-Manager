@@ -1199,7 +1199,7 @@ function SourceBadge({ doc }: { doc: Document }) {
         : "Indexed by pointer — body fetched live on demand, summary readable offline";
   return (
     <span
-      className="shrink-0 rounded-full border border-border bg-surface px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ink3"
+      className="shrink-0 rounded-full border border-border bg-surface px-1.5 py-0.5 text-[0.625rem] font-medium uppercase tracking-wide text-ink3"
       style={
         warn
           ? {
@@ -1243,7 +1243,7 @@ function SortHeader({
         title={`Sort by ${label.toLowerCase()}`}
       >
         {label}
-        <span aria-hidden className="text-[9px] leading-none">
+        <span aria-hidden className="text-[0.5625rem] leading-none">
           {active && sort ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}
         </span>
       </button>

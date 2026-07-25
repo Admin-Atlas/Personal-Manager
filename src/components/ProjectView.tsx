@@ -265,7 +265,7 @@ export function ProjectView({
       <div className="flex items-center justify-between gap-2 px-4 pb-1 pt-3">
         <span className="font-mono text-xs uppercase tracking-wide text-ink4">Files</span>
         {documents.length > 1 && (
-          <div className="flex items-center gap-2 text-[10px] text-ink4">
+          <div className="flex items-center gap-2 text-[0.625rem] text-ink4">
             <SortToggle label="Name" sortKey="name" sort={sort} onSort={toggleSort} />
             <SortToggle label="Importance" sortKey="importance" sort={sort} onSort={toggleSort} />
           </div>
@@ -363,7 +363,7 @@ export function ProjectView({
       <div className="flex items-center justify-between gap-2">
         <span className="font-mono text-xs uppercase tracking-wide text-ink4">Milestones</span>
         {showMeta && milestones.length > 1 && (
-          <div className="flex items-center gap-2 text-[10px] text-ink4">
+          <div className="flex items-center gap-2 text-[0.625rem] text-ink4">
             {msSort.key !== "manual" && hasMetMilestones && (
               <label
                 className="flex cursor-pointer items-center gap-1"
@@ -576,7 +576,7 @@ function SortToggle<K extends string>({
     >
       {label}
       {directional && (
-        <span aria-hidden className="text-[8px] leading-none">
+        <span aria-hidden className="text-[0.5rem] leading-none">
           {active ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}
         </span>
       )}

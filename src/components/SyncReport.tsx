@@ -57,7 +57,7 @@ export function SyncReport({
           <button
             type="button"
             onClick={() => setShowIssues((v) => !v)}
-            className="font-mono text-[10px] uppercase tracking-wide text-ink3 hover:text-ink"
+            className="font-mono text-[0.625rem] uppercase tracking-wide text-ink3 hover:text-ink"
           >
             {showIssues ? "▾" : "▸"} {issueCount}
             {report.issues_truncated ? "+" : ""} file
@@ -66,7 +66,7 @@ export function SyncReport({
           {showIssues && (
             <ul className="mt-1.5 max-h-40 space-y-1 overflow-auto">
               {report.issues.map((iss, i) => (
-                <li key={i} className="text-[11px] leading-tight">
+                <li key={i} className="text-[0.6875rem] leading-tight">
                   <span className="text-ink2">{iss.name}</span>
                   <span className="text-ink4"> — {iss.reason}</span>
                 </li>
@@ -76,7 +76,7 @@ export function SyncReport({
         </div>
       )}
 
-      <p className="mt-2 text-[11px] text-ink4">
+      <p className="mt-2 text-[0.6875rem] text-ink4">
         Indexed files are searchable and appear in Documents.
       </p>
     </div>

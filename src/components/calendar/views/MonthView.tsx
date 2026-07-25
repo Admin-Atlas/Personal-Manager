@@ -199,7 +199,7 @@ export function MonthView({
         {labels.map((w, i) => (
           <div
             key={i}
-            className="px-2 py-1 text-center font-head text-[11px] uppercase tracking-wide text-ink3"
+            className="px-2 py-1 text-center font-head text-[0.6875rem] uppercase tracking-wide text-ink3"
           >
             {w}
           </div>
@@ -238,7 +238,7 @@ export function MonthView({
                     >
                       <span className="flex items-center gap-1 overflow-hidden">
                         {firstOfM && (
-                          <span className="truncate font-head text-[10px] uppercase tracking-wide text-accent-text">
+                          <span className="truncate font-head text-[0.625rem] uppercase tracking-wide text-accent-text">
                             {cell.date.toLocaleDateString(undefined, { month: "short" })}
                             {cell.date.getMonth() === 0 ? ` ${cell.date.getFullYear()}` : ""}
                           </span>
@@ -255,7 +255,9 @@ export function MonthView({
                         </span>
                       </span>
                       {showPower && cell.chips.length > 0 && (
-                        <span className="font-mono text-[10px] text-ink4">{cell.chips.length}</span>
+                        <span className="font-mono text-[0.625rem] text-ink4">
+                          {cell.chips.length}
+                        </span>
                       )}
                     </div>
 
@@ -273,7 +275,9 @@ export function MonthView({
                           />
                         ))}
                         {dotsHidden > 0 && (
-                          <span className="font-mono text-[9px] text-ink4">+{dotsHidden}</span>
+                          <span className="font-mono text-[0.5625rem] text-ink4">
+                            +{dotsHidden}
+                          </span>
                         )}
                       </div>
                     ) : (
@@ -290,7 +294,7 @@ export function MonthView({
                           />
                         ))}
                         {hidden > 0 && (
-                          <span className="pl-1 font-mono text-[10px] text-ink4">
+                          <span className="pl-1 font-mono text-[0.625rem] text-ink4">
                             +{hidden} more
                           </span>
                         )}
@@ -315,7 +319,7 @@ export function MonthView({
                       className={cn(
                         // The band overlay is pointer-events-none so day cells stay clickable; a band
                         // re-enables its own pointer events to open the event popup.
-                        "absolute overflow-hidden px-1.5 text-[11px] leading-[14px]",
+                        "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[0.875rem]",
                         onEventClick && "pointer-events-auto cursor-pointer hover:brightness-110",
                         isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
                       )}

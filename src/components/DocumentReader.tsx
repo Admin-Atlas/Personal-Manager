@@ -11,6 +11,7 @@ import {
   useState,
 } from "react";
 import type { ChunkSpan, Document, ImageData } from "../lib/types";
+import { IconButton } from "./ui";
 import {
   documentChunkSpans,
   fetchIndexOnlyBody,
@@ -322,14 +323,9 @@ export function DocumentReader({ doc, stale, onClose, onOpenProject }: Props) {
             {showChunks ? "Hide chunks" : "Show chunks"}
           </button>
         )}
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close reader"
-          className="shrink-0 text-ink4 hover:text-ink"
-        >
+        <IconButton label="Close reader" variant="subtle" onClick={onClose} className="shrink-0">
           ✕
-        </button>
+        </IconButton>
       </div>
 
       <div className="flex-1 overflow-auto px-4 py-3">

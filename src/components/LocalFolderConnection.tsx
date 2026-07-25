@@ -139,7 +139,7 @@ export function LocalFolderConnection() {
                 <div className="mt-1 pl-8">
                   <button
                     type="button"
-                    className="text-[11px] text-ink4 underline hover:text-ink2"
+                    className="text-[0.6875rem] text-ink4 underline hover:text-ink2"
                     onClick={() => setPickerKey((k) => (k === f.key ? null : f.key))}
                   >
                     {pickerKey === f.key ? "Hide subfolders" : "Choose subfolders"}
@@ -277,7 +277,7 @@ function LocalFolderExcludes({ folder, onSaved }: { folder: LocalFolder; onSaved
         onChange={(next) => commit(next.excluded)}
       />
       {error && <p className="mt-1 text-xs text-st-due">{error}</p>}
-      <p className="mt-1 text-[11px] text-ink4">
+      <p className="mt-1 text-[0.6875rem] text-ink4">
         {excluded.length === 0 ? "Indexing the whole folder." : `${excluded.length} excluded`}
         {saving ? " · saving…" : ""} — applied on this folder’s next{" "}
         <span className="text-ink3">Sync</span>.

@@ -424,7 +424,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
               ? "Ascending — click for descending"
               : "Descending — click for ascending"
           }
-          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 hover:bg-surface hover:text-ink2"
+          className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-1.5 py-0.5 hover:bg-surface hover:text-ink2"
         >
           {sort.dir === "asc" ? "↑" : "↓"}
         </button>

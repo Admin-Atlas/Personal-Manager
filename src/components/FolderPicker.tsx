@@ -59,7 +59,7 @@ export function FolderPicker({
         ancestorExcluded={false}
         depth={0}
       />
-      <p className="px-1 pt-1 text-[10px] text-ink4">
+      <p className="px-1 pt-1 text-[0.625rem] text-ink4">
         {rootIncluded
           ? "The whole folder is indexed — uncheck a subfolder to skip it."
           : "Checking a folder indexes everything inside it; uncheck a subfolder to skip it."}
@@ -175,7 +175,7 @@ function FolderNode({
           type="button"
           aria-label={open ? "Collapse folder" : "Expand folder"}
           onClick={() => setOpen((o) => !o)}
-          className="w-4 shrink-0 text-ink4 hover:text-ink2"
+          className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center text-ink4 hover:text-ink2"
         >
           {open ? "▾" : "▸"}
         </button>

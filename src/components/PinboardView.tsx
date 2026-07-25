@@ -189,7 +189,7 @@ function WidgetTile({
       {/* A note shows its size inline in its own footer (see NoteBody); timeline/folder keep the
           compact coords strip. */}
       {showPower && widget.kind !== "note" && (
-        <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[9px] text-faint">
+        <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[0.5625rem] text-faint">
           {widget.rect.x},{widget.rect.y} · {widget.rect.w}×{widget.rect.h}
         </div>
       )}
@@ -495,7 +495,7 @@ export function PinboardView() {
         </div>
         <div className="flex items-center gap-2">
           {showPower && board.widgets.length > 0 && (
-            <span className="mr-1 font-mono text-[10px] uppercase tracking-wide text-faint">
+            <span className="mr-1 font-mono text-[0.625rem] uppercase tracking-wide text-faint">
               {board.widgets.length} item{board.widgets.length === 1 ? "" : "s"}
             </span>
           )}
@@ -745,21 +745,21 @@ const FORMAT_ACTIONS: FormatAction[] = [
     key: "bold",
     label: "Bold",
     hint: `${MOD}B`,
-    icon: <span className="text-[11px] font-bold leading-none">B</span>,
+    icon: <span className="text-[0.6875rem] font-bold leading-none">B</span>,
     apply: (v, s, e) => toggleWrap(v, s, e, "**"),
   },
   {
     key: "italic",
     label: "Italic",
     hint: `${MOD}I`,
-    icon: <span className="font-serif text-[11px] italic leading-none">I</span>,
+    icon: <span className="font-serif text-[0.6875rem] italic leading-none">I</span>,
     apply: (v, s, e) => toggleWrap(v, s, e, "*"),
   },
   {
     key: "heading",
     label: "Heading",
     hint: `${MOD}${SHIFT}H`,
-    icon: <span className="text-[11px] font-bold leading-none">H</span>,
+    icon: <span className="text-[0.6875rem] font-bold leading-none">H</span>,
     apply: (v, s, e) => applyLineMarker(v, s, e, "heading"),
   },
   {
@@ -853,7 +853,7 @@ function WidgetHeader({
           onClick={onDelete}
           aria-label={deleteLabel}
           title={deleteLabel}
-          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-xs text-ink4 hover:bg-surface hover:text-st-due"
+          className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center rounded-[var(--radius-sm)] text-xs text-ink4 hover:bg-surface hover:text-st-due"
         >
           ✕
         </button>
@@ -871,7 +871,7 @@ function PopOutButton({ onClick }: { onClick: () => void }) {
       onClick={onClick}
       title="Move out to the board"
       aria-label="Move out to the board"
-      className="shrink-0 rounded-[var(--radius-sm)] px-1 text-xs text-ink4 hover:bg-surface hover:text-ink2"
+      className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center rounded-[var(--radius-sm)] text-xs text-ink4 hover:bg-surface hover:text-ink2"
     >
       ⤴
     </button>
@@ -1064,7 +1064,7 @@ const NoteBody = memo(function NoteBody({
       onPointerDown={(e) => e.stopPropagation()}
       onClick={ingest}
       disabled={ingesting || !text.trim()}
-      className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
+      className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[0.625rem] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
       title="Save this note to your vault as a document (it goes through Review)"
     >
       {ingesting ? "Saving…" : "Ingest"}
@@ -1075,7 +1075,7 @@ const NoteBody = memo(function NoteBody({
         // Shrinkable and capped short: this span is the widest thing in the bar on an ingested note
         // ("Filed · <project>"), and on a folder-panel card it would otherwise push the ✕ out. The
         // full text is on the tooltip, so truncating hard costs nothing.
-        className="min-w-0 shrink truncate text-[10px] text-ink4"
+        className="min-w-0 shrink truncate text-[0.625rem] text-ink4"
         title={
           status
             ? status.reviewed
@@ -1092,7 +1092,7 @@ const NoteBody = memo(function NoteBody({
           onPointerDown={(e) => e.stopPropagation()}
           onClick={ingest}
           disabled={ingesting}
-          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[0.625rem] uppercase tracking-wide text-accent-text hover:bg-surface disabled:opacity-40"
           title="Update the saved document with your latest edits"
         >
           {ingesting ? "…" : "Re-ingest"}
@@ -1116,7 +1116,7 @@ const NoteBody = memo(function NoteBody({
           </>
         }
       />
-      {ingestErr && <p className="shrink-0 px-2 pt-1 text-[10px] text-st-due">{ingestErr}</p>}
+      {ingestErr && <p className="shrink-0 px-2 pt-1 text-[0.625rem] text-st-due">{ingestErr}</p>}
       {showEditor ? (
         <Textarea
           ref={taRef}
@@ -1164,7 +1164,7 @@ const NoteBody = memo(function NoteBody({
                     // the caret is.
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => applyEdit(a.apply)}
-                    className="flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] text-ink4 hover:bg-surface hover:text-ink2"
+                    className="flex h-5 w-5 min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] text-ink4 hover:bg-surface hover:text-ink2"
                   >
                     {a.icon}
                   </button>
@@ -1200,7 +1200,7 @@ const NoteBody = memo(function NoteBody({
               </div>
             )}
             {showPower && (
-              <span className="font-mono text-[9px] text-faint">
+              <span className="font-mono text-[0.5625rem] text-faint">
                 {widget.rect.w}×{widget.rect.h}
               </span>
             )}
@@ -1339,7 +1339,7 @@ function TimelineViewToggle({
       aria-pressed={value === v}
       aria-label={label}
       title={label}
-      className={`flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] ${
+      className={`flex h-5 w-5 min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] ${
         value === v ? "bg-accent text-accent-ink" : "text-ink4 hover:bg-surface hover:text-ink2"
       }`}
     >
@@ -1439,7 +1439,7 @@ function FolderTile({
         className="flex min-h-0 flex-1 flex-col items-center justify-center gap-0.5 text-ink3 hover:bg-surface"
       >
         <FolderGlyph />
-        <span className="font-mono text-[10px]">
+        <span className="font-mono text-[0.625rem]">
           {n} item{n === 1 ? "" : "s"}
         </span>
       </button>
@@ -1497,7 +1497,7 @@ function FolderPanelHeader({
         onClick={onClose}
         title="Close folder"
         aria-label="Close folder"
-        className="shrink-0 rounded-[var(--radius-sm)] px-1 text-sm text-ink4 hover:bg-surface hover:text-ink2"
+        className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center rounded-[var(--radius-sm)] text-sm text-ink4 hover:bg-surface hover:text-ink2"
       >
         ✕
       </button>
@@ -1800,16 +1800,16 @@ function BoundTimeline({
           onClick={onUnlink}
           title="Unlink this project (its milestones stay in the project)"
           data-help="pinboard-timeline-unlink"
-          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[10px] uppercase tracking-wide text-ink4 hover:text-ink2"
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[0.625rem] uppercase tracking-wide text-ink4 hover:text-ink2"
         >
           Unlink
         </button>
       </div>
 
       {loading ? (
-        <p className="text-[11px] text-ink4">Loading…</p>
+        <p className="text-[0.6875rem] text-ink4">Loading…</p>
       ) : ordered.length === 0 ? (
-        <p className="text-[11px] text-ink4">No milestones yet — add one below.</p>
+        <p className="text-[0.6875rem] text-ink4">No milestones yet — add one below.</p>
       ) : view === "row" ? (
         <TimelineTrack>
           {ordered.map((m) => (
@@ -1838,12 +1838,12 @@ function BoundTimeline({
 
       <button
         onClick={add}
-        className="mt-1 shrink-0 self-start rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface"
+        className="mt-1 shrink-0 self-start rounded-[var(--radius-sm)] px-1 py-0.5 text-[0.6875rem] text-accent-text hover:bg-surface"
       >
         + Milestone
       </button>
       {error && (
-        <p role="alert" className="mt-1 shrink-0 px-1 text-[10px] text-st-due">
+        <p role="alert" className="mt-1 shrink-0 px-1 text-[0.625rem] text-st-due">
           {error}
         </p>
       )}
@@ -1905,7 +1905,7 @@ function MilestoneDot({ met, onToggle }: { met: boolean; onToggle: () => void })
       onClick={onToggle}
       title={met ? "Mark not done" : "Mark done"}
       aria-label={met ? "Mark not done" : "Mark done"}
-      className="h-2.5 w-2.5 shrink-0 rounded-full border"
+      className="relative h-2.5 w-2.5 shrink-0 rounded-full border before:absolute before:-inset-[7px] before:content-['']"
       style={{ background: met ? "var(--st-track)" : "var(--accent)", borderColor: "var(--panel)" }}
     />
   );
@@ -1923,7 +1923,7 @@ function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProp
     <div className="flex w-[5.5rem] shrink-0 flex-col items-center gap-1 text-center">
       {m.calendar_linked ? (
         <span
-          className="flex h-6 items-center font-mono text-[9px] text-accent-text"
+          className="flex h-6 items-center font-mono text-[0.5625rem] text-accent-text"
           title={
             m.event_missing ? "Linked event not found in your calendars" : "Synced from calendar"
           }
@@ -1936,7 +1936,7 @@ function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProp
           value={date}
           onChange={(e) => setDate(e.target.value)}
           onBlur={persist}
-          className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[9px] text-ink3 focus:border-accent focus:outline-none"
+          className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[0.5625rem] text-ink3 focus:border-accent focus:outline-none"
         />
       )}
       <MilestoneDot met={met} onToggle={toggleDone} />
@@ -1945,18 +1945,20 @@ function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProp
         onChange={(e) => setLabel(e.target.value)}
         onBlur={persist}
         placeholder="label"
-        className={`w-full rounded-[var(--radius-sm)] bg-transparent px-0.5 text-center text-[10px] text-ink2 focus:outline-none ${
+        className={`w-full rounded-[var(--radius-sm)] bg-transparent px-0.5 text-center text-[0.625rem] text-ink2 focus:outline-none ${
           met ? "text-ink4 line-through" : ""
         }`}
       />
       <button
         onClick={remove}
         aria-label="Remove milestone"
-        className="text-[10px] text-ink4 hover:text-st-due"
+        className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center text-[0.625rem] text-ink4 hover:text-st-due"
       >
         ✕
       </button>
-      {showPower && m.event_missing && <span className="text-[9px] text-st-due">⚠ unsynced</span>}
+      {showPower && m.event_missing && (
+        <span className="text-[0.5625rem] text-st-due">⚠ unsynced</span>
+      )}
     </div>
   );
 }
@@ -1974,7 +1976,7 @@ function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) 
       <MilestoneDot met={met} onToggle={toggleDone} />
       {m.calendar_linked ? (
         <span
-          className="flex h-6 w-[6.25rem] shrink-0 items-center gap-0.5 font-mono text-[9px] text-accent-text"
+          className="flex h-6 w-[6.25rem] shrink-0 items-center gap-0.5 font-mono text-[0.5625rem] text-accent-text"
           title={
             m.event_missing ? "Linked event not found in your calendars" : "Synced from calendar"
           }
@@ -1987,7 +1989,7 @@ function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) 
           value={date}
           onChange={(e) => setDate(e.target.value)}
           onBlur={persist}
-          className="w-[6.25rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[10px] text-ink3 focus:border-accent focus:outline-none"
+          className="w-[6.25rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[0.625rem] text-ink3 focus:border-accent focus:outline-none"
         />
       )}
       <input
@@ -2000,14 +2002,14 @@ function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) 
         }`}
       />
       {showPower && m.event_missing && (
-        <span className="shrink-0 text-[9px] text-st-due" title="Linked event not found">
+        <span className="shrink-0 text-[0.5625rem] text-st-due" title="Linked event not found">
           ⚠
         </span>
       )}
       <button
         onClick={remove}
         aria-label="Remove milestone"
-        className="shrink-0 px-0.5 text-[11px] text-ink4 hover:text-st-due"
+        className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center text-[0.6875rem] text-ink4 hover:text-st-due"
       >
         ✕
       </button>
@@ -2075,7 +2077,7 @@ function FreeformTimeline({
     <div className="flex h-full flex-col px-2 py-1">
       {items.length === 0 ? (
         <div className="min-h-0 flex-1">
-          <p className="text-[11px] text-ink4">No milestones yet.</p>
+          <p className="text-[0.6875rem] text-ink4">No milestones yet.</p>
         </div>
       ) : view === "row" ? (
         <TimelineTrack>
@@ -2098,7 +2100,7 @@ function FreeformTimeline({
                 value={it.date ?? ""}
                 onChange={(e) => onUpdateItem(widget.id, it.id, { date: e.target.value })}
                 title={it.date ? formatDateOnly(it.date) : "Set a date"}
-                className="w-[6.25rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[10px] text-ink3 focus:border-accent focus:outline-none"
+                className="w-[6.25rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[0.625rem] text-ink3 focus:border-accent focus:outline-none"
               />
               <input
                 value={it.label ?? ""}
@@ -2109,7 +2111,7 @@ function FreeformTimeline({
               <button
                 onClick={() => onRemoveItem(widget.id, it.id)}
                 aria-label="Remove milestone"
-                className="shrink-0 px-0.5 text-[11px] text-ink4 hover:text-st-due"
+                className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center text-[0.6875rem] text-ink4 hover:text-st-due"
               >
                 ✕
               </button>
@@ -2124,7 +2126,7 @@ function FreeformTimeline({
       <div className="mt-1 flex shrink-0 items-center gap-1" data-help="pinboard-timeline-project">
         <button
           onClick={() => onAddItem(widget.id)}
-          className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface"
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-[0.6875rem] text-accent-text hover:bg-surface"
         >
           + Milestone
         </button>
@@ -2133,7 +2135,7 @@ function FreeformTimeline({
           value={projDraft}
           onChange={(e) => setProjDraft(e.target.value)}
           placeholder="Link a project…"
-          className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 text-[11px] text-ink3 focus:border-accent focus:outline-none"
+          className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 text-[0.6875rem] text-ink3 focus:border-accent focus:outline-none"
         />
         <datalist id={listId}>
           {projects.map((p) => (
@@ -2143,7 +2145,7 @@ function FreeformTimeline({
         <button
           onClick={() => projDraft.trim() && void linkProject(projDraft.trim())}
           disabled={!projDraft.trim()}
-          className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-[11px] text-accent-text hover:bg-surface disabled:opacity-40"
+          className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-[0.6875rem] text-accent-text hover:bg-surface disabled:opacity-40"
         >
           Link
         </button>
@@ -2152,7 +2154,7 @@ function FreeformTimeline({
           Deliberately freeform-only: once a timeline is linked to a project its entries are real
           milestones, and the calendar's own Milestones toggle governs them — so a second, conflicting
           switch here would just be a lie. */}
-      <label className="mt-1 flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-ink4">
+      <label className="mt-1 flex shrink-0 cursor-pointer items-center gap-1 text-[0.625rem] text-ink4">
         <input
           type="checkbox"
           checked={widget.showOnCalendar !== false}
@@ -2161,7 +2163,7 @@ function FreeformTimeline({
         />
         Show on calendar
       </label>
-      {linkErr && <p className="mt-1 shrink-0 text-[10px] text-st-due">{linkErr}</p>}
+      {linkErr && <p className="mt-1 shrink-0 text-[0.625rem] text-st-due">{linkErr}</p>}
     </div>
   );
 }
@@ -2186,7 +2188,7 @@ function FreeformColumn({
         value={item.date ?? ""}
         onChange={(e) => onUpdateItem(widgetId, item.id, { date: e.target.value })}
         title={item.date ? formatDateOnly(item.date) : "Set a date"}
-        className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[9px] text-ink3 focus:border-accent focus:outline-none"
+        className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[0.5625rem] text-ink3 focus:border-accent focus:outline-none"
       />
       <span
         className="h-2.5 w-2.5 shrink-0 rounded-full border"
@@ -2196,12 +2198,12 @@ function FreeformColumn({
         value={item.label ?? ""}
         onChange={(e) => onUpdateItem(widgetId, item.id, { label: e.target.value })}
         placeholder="what happens"
-        className="w-full rounded-[var(--radius-sm)] bg-transparent px-0.5 text-center text-[10px] text-ink2 focus:outline-none"
+        className="w-full rounded-[var(--radius-sm)] bg-transparent px-0.5 text-center text-[0.625rem] text-ink2 focus:outline-none"
       />
       <button
         onClick={() => onRemoveItem(widgetId, item.id)}
         aria-label="Remove milestone"
-        className="text-[10px] text-ink4 hover:text-st-due"
+        className="inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center text-[0.625rem] text-ink4 hover:text-st-due"
       >
         ✕
       </button>

@@ -23,7 +23,7 @@ export function ProviderChip({ status }: { status: LocalLlmStatus | null }) {
 
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[10px] font-medium"
+      className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[0.625rem] font-medium"
       style={{
         color: `var(${token})`,
         background: `color-mix(in oklab, var(${token}) 15%, transparent)`,

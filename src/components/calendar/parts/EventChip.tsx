@@ -27,7 +27,7 @@ export function EventChip({ summary, color, timeLabel, showTime, isPast, onClick
   return (
     <div
       className={cn(
-        "flex items-center gap-1 overflow-hidden rounded-[var(--radius-sm)] border-l-[2px] px-1 py-px text-[11px] leading-tight",
+        "flex items-center gap-1 overflow-hidden rounded-[var(--radius-sm)] border-l-[2px] px-1 py-px text-[0.6875rem] leading-tight",
         onClick && "cursor-pointer hover:brightness-110",
         isPast && PAST_EVENT_CLASS,
       )}
@@ -52,7 +52,7 @@ export function EventChip({ summary, color, timeLabel, showTime, isPast, onClick
       }
     >
       {showTime && timeLabel && (
-        <span className="shrink-0 font-mono text-[9px] text-ink4">{timeLabel}</span>
+        <span className="shrink-0 font-mono text-[0.5625rem] text-ink4">{timeLabel}</span>
       )}
       <span className="truncate font-head text-ink">{summary}</span>
     </div>

@@ -74,7 +74,7 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
                 {formatDateLocal(g.day)}
               </div>
               {isToday && showMeta && (
-                <div className="font-mono text-[10px] text-accent-text">today</div>
+                <div className="font-mono text-[0.625rem] text-accent-text">today</div>
               )}
             </div>
             <ul className="flex flex-1 flex-col gap-1">

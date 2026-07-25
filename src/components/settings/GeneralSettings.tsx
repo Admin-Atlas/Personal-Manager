@@ -460,7 +460,7 @@ export function GeneralSettings() {
                     // signals the "white accents" treatment.
                     border: isMono ? "1px solid rgba(255,255,255,0.55)" : undefined,
                   }}
-                  className={`h-5 w-5 rounded-full transition ${
+                  className={`relative h-5 w-5 rounded-full transition before:absolute before:-inset-[2px] before:content-[''] ${
                     accent === hex
                       ? "ring-2 ring-ink ring-offset-2 ring-offset-[var(--surface)]"
                       : ""

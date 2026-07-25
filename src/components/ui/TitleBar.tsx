@@ -33,7 +33,7 @@ function SystemLabel() {
   return (
     <span className="pointer-events-none">
       <span className="font-head text-sm text-ink2">PM</span>{" "}
-      <span className="font-mono text-[10px] uppercase tracking-wide text-ink4">alpha</span>
+      <span className="font-mono text-[0.625rem] uppercase tracking-wide text-ink4">alpha</span>
     </span>
   );
 }

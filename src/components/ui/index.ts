@@ -6,6 +6,7 @@
 
 export { cn } from "./cn";
 export { Button, type ButtonProps, type ButtonVariant } from "./Button";
+export { IconButton, type IconButtonProps, type IconButtonVariant } from "./IconButton";
 export { Input } from "./Input";
 export { Textarea } from "./Textarea";
 export { Select } from "./Select";

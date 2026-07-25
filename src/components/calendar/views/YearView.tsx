@@ -204,9 +204,9 @@ export function YearView({ cursor, events, onSelectDay, onFocusDate }: Props) {
                   style={{ height: `${TITLE_PX}px` }}
                 >
                   {m.toLocaleDateString(undefined, { month: "long" })}
-                  <span className="font-mono text-[11px] text-ink4">{m.getFullYear()}</span>
+                  <span className="font-mono text-[0.6875rem] text-ink4">{m.getFullYear()}</span>
                   {isCurrent && (
-                    <span className="font-mono text-[10px] text-accent-text">this month</span>
+                    <span className="font-mono text-[0.625rem] text-accent-text">this month</span>
                   )}
                 </div>
                 <MiniMonth

@@ -238,7 +238,7 @@ function MilestoneRow({
                 }, onError)
               }
               title="Unlink from calendar — the date becomes editable, but it can't be re-linked"
-              className="shrink-0 px-1 py-0.5 text-[10px]"
+              className="shrink-0 px-1 py-0.5 text-[0.625rem]"
             >
               Unlink
             </Button>
@@ -283,7 +283,7 @@ function MilestoneRow({
 function DonePill() {
   return (
     <span
-      className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+      className="shrink-0 rounded-full px-1.5 py-0.5 text-[0.625rem] font-medium"
       style={{
         color: "var(--st-track)",
         background: "color-mix(in oklab, var(--st-track) 16%, transparent)",

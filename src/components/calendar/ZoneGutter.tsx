@@ -39,7 +39,7 @@ export function ZoneGutter({ zones, onChange, zoneCol, localCol, allowAdd = true
       {zones.map((z) => (
         <div
           key={z}
-          className="group relative flex items-end justify-end border-l border-rule px-1 pb-0.5 font-mono text-[9px] uppercase tracking-tight text-ink4"
+          className="group relative flex items-end justify-end border-l border-rule px-1 pb-0.5 font-mono text-[0.5625rem] uppercase tracking-tight text-ink4"
           style={{ width: `${zoneCol}px` }}
           title={z}
         >
@@ -49,7 +49,7 @@ export function ZoneGutter({ zones, onChange, zoneCol, localCol, allowAdd = true
             onClick={() => onChange(zones.filter((x) => x !== z))}
             aria-label={`Remove ${z}`}
             title={`Remove ${zoneShort(z)}`}
-            className="absolute right-0 top-0 rounded-[var(--radius-sm)] px-0.5 leading-none text-ink4 opacity-0 transition hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
+            className="absolute right-0 top-0 inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] leading-none text-ink4 opacity-0 transition hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
           >
             ✕
           </button>
@@ -64,7 +64,7 @@ export function ZoneGutter({ zones, onChange, zoneCol, localCol, allowAdd = true
         )}
         {zones.length > 0 && (
           <span
-            className="truncate font-mono text-[9px] uppercase tracking-tight text-ink4"
+            className="truncate font-mono text-[0.5625rem] uppercase tracking-tight text-ink4"
             title={deviceTimeZone()}
           >
             {zoneShort(deviceTimeZone())}
@@ -104,7 +104,7 @@ function AddZone({
           aria-label="Add a timezone"
           title="Add a timezone"
           className={cn(
-            "shrink-0 rounded-[var(--radius-sm)] font-mono text-[10px] uppercase leading-none tracking-tight text-ink4 transition hover:text-ink",
+            "inline-flex min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] shrink-0 items-center justify-center rounded-[var(--radius-sm)] font-mono text-[0.625rem] uppercase leading-none tracking-tight text-ink4 transition hover:text-ink",
             compact ? "px-0.5 py-0.5" : "border border-border2 px-1 py-0.5",
           )}
         >
@@ -136,12 +136,12 @@ function AddZone({
                   className="flex w-full items-center justify-between gap-2 rounded-[var(--radius-sm)] px-2 py-1 text-left text-xs text-ink3 hover:bg-surface hover:text-ink"
                 >
                   <span className="truncate">{o.label}</span>
-                  <span className="shrink-0 font-mono text-[10px] text-ink4">{o.code}</span>
+                  <span className="shrink-0 font-mono text-[0.625rem] text-ink4">{o.code}</span>
                 </button>
               </li>
             ))}
             {matches.length === 0 && q && (
-              <li className="px-2 py-1 text-[11px] text-ink4">No match.</li>
+              <li className="px-2 py-1 text-[0.6875rem] text-ink4">No match.</li>
             )}
           </ul>
         </div>

@@ -408,7 +408,7 @@ function ComingSoonRow({ name, detail }: { name: string; detail?: string }) {
         <div className="text-sm text-ink2">{name}</div>
         {detail && <p className="mt-0.5 text-xs text-ink4">{detail}</p>}
       </div>
-      <span className="shrink-0 rounded-[var(--radius-sm)] border border-border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink4">
+      <span className="shrink-0 rounded-[var(--radius-sm)] border border-border px-1.5 py-0.5 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
         coming soon
       </span>
     </div>

@@ -442,7 +442,7 @@ export function AiModelsSettings({ onOpenTeach }: { onOpenTeach?: () => void }) 
           </div>
           {cost.all_time.length > 0 ? (
             <div className="mt-3">
-              <p className="pb-1 font-mono text-[10px] uppercase tracking-wide text-ink4">
+              <p className="pb-1 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
                 By model · most expensive first (all time)
               </p>
               <table className="w-full text-left text-xs">

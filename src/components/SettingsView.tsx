@@ -240,7 +240,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev, onOpenTeach }: Pr
             <h1 className="font-head text-lg font-semibold text-ink">Welcome to PM</h1>
             <span
               title="PM is in alpha — under active development; expect rough edges and changes between updates."
-              className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wide text-accent-text"
+              className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[0.625rem] font-medium uppercase tracking-wide text-accent-text"
             >
               Alpha
             </span>
@@ -461,7 +461,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev, onOpenTeach }: Pr
                   {group.header && (
                     <div
                       id={headerId}
-                      className="px-3 pb-1 font-mono text-[10px] font-medium uppercase tracking-wider text-ink4"
+                      className="px-3 pb-1 font-mono text-[0.625rem] font-medium uppercase tracking-wider text-ink4"
                     >
                       {group.header}
                     </div>
