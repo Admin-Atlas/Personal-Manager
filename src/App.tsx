@@ -339,6 +339,9 @@ export default function App() {
         setLoading(false);
       }
     })();
+    // The boot sequence: `chat` and `refreshConversations` get fresh identities every render, so
+    // listing them would re-run the whole vault-gate + AI-readiness load on each one.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once, at boot
   }, []);
 
   // Once the vault is unlocked, load what the locked boot deferred.

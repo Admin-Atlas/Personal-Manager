@@ -309,6 +309,12 @@ export function DocumentsView({ onReviewClick }: Props) {
     return () => {
       void unlisten.then((fn) => fn());
     };
+    // Registered once: re-subscribing on every render would drop OS drop events during the swap.
+    // The consequence is that `runIngest` is captured from the FIRST render, so the
+    // `busy || installingOcr` guard INSIDE it reads first-render values and is dead on this path.
+    // The live check is the `busyRef` / `installingOcrRef` test above — keep it there. Do not
+    // delete it on the assumption that `runIngest` guards itself; on this call path it does not.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- subscribe once for the view's life
   }, []);
 
   // Live progress for the one-time OCR download (mirrors the t-SNE install bar in Settings).

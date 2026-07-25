@@ -69,7 +69,18 @@ export default tseslint.config(
     },
     rules: {
       "react-hooks/rules-of-hooks": "error",
-      "react-hooks/exhaustive-deps": "warn",
+      // ERROR, not warn: `just check` runs `npx eslint .` with no `--max-warnings`, so a warning
+      // can never fail the gate — a stale-closure regression would ride into a green PR unnoticed,
+      // which is exactly what happened once. Promoting the rule (rather than adding
+      // `--max-warnings N`) keeps the gate honest without a ratchet number to maintain, and costs
+      // nothing: intentional mount-once effects already opt out one at a time with an
+      // `eslint-disable-next-line` carrying a reason, an idiom this codebase established long
+      // before this rule changed severity. If you reach for that comment, write the WHY beside it.
+      "react-hooks/exhaustive-deps": "error",
+      // Deliberately left at warn. Every hit is a context/provider file exporting a provider
+      // alongside its hooks — clearing them means splitting ~12 files to satisfy a dev-only Fast
+      // Refresh nicety with no production or correctness effect, and the churn would bury the next
+      // real finding. Kept visible, not enforced.
       "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
       "@typescript-eslint/no-floating-promises": "error",
       "@typescript-eslint/no-misused-promises": [
