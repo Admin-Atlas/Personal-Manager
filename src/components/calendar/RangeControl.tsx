@@ -6,6 +6,9 @@
 // it has no chevron). Editing a range also selects it, so the grid reflects the change live. Values
 // are decimal hours; the <input type="time"> exchange is locale-independent (its value is always
 // 24h HH:MM). Token-driven; no colours of its own.
+//
+// The Focus tab's "Upcoming" grid renders this too, narrowed to Work/Day (`ranges`) and pointed at
+// its own bounds store — same editor, same vocabulary, independent windows.
 
 import { sanitizeBounds, type CalendarRange, type RangeBounds } from "../../lib/calendarPrefs";
 import { resolveRangeBounds } from "../../lib/calendarGeom";
@@ -44,6 +47,9 @@ interface Props {
   coords: Coords | null;
   /** The anchor day, so the Day default reflects sunrise/sunset for the shown date. */
   cursor: Date;
+  /** Which ranges to offer, in order. Defaults to all three; the Focus tab's Upcoming pane passes
+   *  `["work", "day"]` because at ~26rem tall a 24h grid can't hold a legible event card. */
+  ranges?: readonly CalendarRange[];
 }
 
 export function RangeControl({
@@ -53,14 +59,16 @@ export function RangeControl({
   onBoundsChange,
   coords,
   cursor,
+  ranges,
 }: Props) {
+  const items = ranges ? ITEMS.filter((it) => ranges.includes(it.value)) : ITEMS;
   return (
     <div
       className="inline-flex items-center gap-0.5 rounded-[var(--radius-sm)] border border-border2 p-0.5"
       role="group"
       aria-label="Time-grid hours"
     >
-      {ITEMS.map((it) => {
+      {items.map((it) => {
         const active = it.value === range;
         return (
           <div

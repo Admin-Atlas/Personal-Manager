@@ -165,11 +165,14 @@ export function sanitizeBounds(b: { startHour: unknown; endHour: unknown }): Ran
   return { startHour, endHour };
 }
 
-/** The user's custom bounds per range. Only `work`/`day` are honoured (24h is fixed); absent keys
- *  fall back to the computed defaults (see calendarGeom.resolveRangeBounds). */
-export function readRangeBounds(): Partial<Record<CalendarRange, RangeBounds>> {
+/** Validate a stored bounds blob into a per-range map. Only `work`/`day` are honoured (24h is fixed);
+ *  anything unparseable, missing or nonsensical is simply absent, and an absent key falls back to the
+ *  computed default (see calendarGeom.resolveRangeBounds).
+ *
+ *  Key-free so the Focus tab's Upcoming grid can reuse the validator while keeping its OWN windows
+ *  under its own key — one definition of "a valid hour window", two independent stores. */
+export function parseRangeBounds(raw: string | null): Partial<Record<CalendarRange, RangeBounds>> {
   try {
-    const raw = localStorage.getItem(RANGE_BOUNDS_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const out: Partial<Record<CalendarRange, RangeBounds>> = {};
@@ -181,6 +184,15 @@ export function readRangeBounds(): Partial<Record<CalendarRange, RangeBounds>> {
       }
     }
     return out;
+  } catch {
+    return {};
+  }
+}
+
+/** The Calendar tab's custom bounds per range. */
+export function readRangeBounds(): Partial<Record<CalendarRange, RangeBounds>> {
+  try {
+    return parseRangeBounds(localStorage.getItem(RANGE_BOUNDS_KEY));
   } catch {
     return {};
   }

@@ -725,14 +725,6 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
                 }
               : undefined
           }
-          onOpenPinboard={
-            onOpenPinboard
-              ? () => {
-                  setEventPopup(null);
-                  onOpenPinboard();
-                }
-              : undefined
-          }
         />
       )}
     </div>

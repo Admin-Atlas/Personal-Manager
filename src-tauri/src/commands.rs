@@ -5788,7 +5788,9 @@ async fn migrate_preferences_once(app: AppHandle) -> Result<()> {
         return Ok(());
     };
 
-    let drafts = preferences::distill_blob(&app, &plan, &blob).await?;
+    // A one-shot migration of the legacy blob: nothing else has written records yet, so there is
+    // nothing to tell the distiller not to restate.
+    let drafts = preferences::distill_blob(&app, &plan, &blob, &[]).await?;
 
     let state = app.state::<AppState>();
     let conn = state.conn()?;
@@ -5930,9 +5932,15 @@ pub async fn parse_preference_statement(
 /// Import a memory/preferences export pasted from another AI (ChatGPT / Gemini / Claude): distil it
 /// into structured records and stage each as an UNCONFIRMED, `imported`-sourced preference the user
 /// reviews and keeps in Teach -> Preferences (withheld from live prompts until kept). The pasted text
-/// is untrusted DATA (the distil prompt hardens this). Returns how many NEW records were staged (dedup
-/// skips ones already present). Distillation yields global/context records only, so there is no project
-/// to resolve — this is general "how I like things", not PM-project-specific.
+/// is untrusted DATA (the distil prompt hardens this). Returns how many NEW records were staged.
+/// Distillation yields global/context records only, so there is no project to resolve — this is
+/// general "how I like things", not PM-project-specific.
+///
+/// Re-importing the same export must stage nothing, and that takes two guards, because a second run
+/// is a fresh model call that words the same facts differently. The prompt is TOLD what is already on
+/// record so it can skip it; then every draft that survives is checked with `near_duplicate_exists`,
+/// which compares meaning-bearing tokens rather than characters. The prompt hint catches the heavy
+/// rewrites; the pure guard is the backstop, since the model's cooperation is never assumed.
 #[tauri::command]
 pub async fn import_ai_memory(app: AppHandle, text: String) -> Result<usize> {
     // Bound the paste so a huge export can't balloon the model call.
@@ -5944,7 +5952,14 @@ pub async fn import_ai_memory(app: AppHandle, text: String) -> Result<usize> {
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
-    let drafts = preferences::distill_blob(&app, &plan, &text).await?;
+    // Read the known values and DROP the connection before awaiting — never hold the DB lock across
+    // an .await (the model call is a network round-trip).
+    let known = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        preferences::all_preference_values(&conn)?
+    };
+    let drafts = preferences::distill_blob(&app, &plan, &text, &known).await?;
 
     let state = app.state::<AppState>();
     let conn = state.conn()?;
@@ -5952,7 +5967,15 @@ pub async fn import_ai_memory(app: AppHandle, text: String) -> Result<usize> {
     let mut imported = 0usize;
     for d in &drafts {
         // distill_blob emits only global/context records (no project scope), so entity_id is None.
-        if preferences::pref_exists(&tx, &d.scope, None, d.condition.as_deref(), &d.value)? {
+        // Checked against the transaction, so two drafts that paraphrase EACH OTHER within one
+        // import also collapse to one — the second sees the first already inserted.
+        if preferences::near_duplicate_exists(
+            &tx,
+            &d.scope,
+            None,
+            d.condition.as_deref(),
+            &d.value,
+        )? {
             continue;
         }
         preferences::add_preference(
@@ -5989,11 +6012,19 @@ pub fn set_tray_enabled(app: AppHandle, enabled: bool) -> Result<()> {
     tray::set_tray_enabled(&app, enabled)
 }
 
-/// Show or hide the always-on-top briefing window. `forceShow` opens it without toggling, which is
-/// what the Settings control wants when the user picks "Always on top".
+/// Put the always-on-top briefing window into an explicit state — what the Settings control wants,
+/// since "Floating briefing = inside PM" must HIDE the OS window rather than flip it.
 #[tauri::command]
-pub fn toggle_briefing_window(app: AppHandle, force_show: bool) -> Result<()> {
-    tray::toggle_briefing_window(&app, force_show)
+pub fn set_briefing_window_visible(app: AppHandle, visible: bool) -> Result<()> {
+    tray::set_briefing_window_visible(&app, visible)
+}
+
+/// Dismiss the always-on-top briefing window from its own ✕. Hides it and emits `briefing://closed`
+/// so the main window puts the "Floating briefing" setting back to Off. The briefing webview holds no
+/// capability entry, so it can neither hide itself nor listen — Rust owns both halves.
+#[tauri::command]
+pub fn close_briefing_window(app: AppHandle) -> Result<()> {
+    tray::close_briefing_window(&app)
 }
 
 #[tauri::command]

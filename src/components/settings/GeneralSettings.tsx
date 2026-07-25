@@ -21,34 +21,18 @@ import {
   readMapMode,
   type MapLayoutMode,
 } from "../../lib/mapPrefs";
-import {
-  clampFocusUpcomingDays,
-  FOCUS_UPCOMING_DAY_CHOICES,
-  FOCUS_UPCOMING_RANGES,
-  readFocusLayout,
-  readFocusUpcomingDays,
-  readFocusUpcomingMode,
-  readFocusUpcomingRange,
-  focusPanelsAreDefault,
-  resetFocusPanels,
-  writeFocusLayout,
-  writeFocusUpcomingDays,
-  writeFocusUpcomingMode,
-  writeFocusUpcomingRange,
-  type FocusLayout,
-  type FocusUpcomingMode,
-} from "../../lib/focusPrefs";
+import { focusViewPrefsAreDefault, resetFocusViewPrefs } from "../../lib/focusPrefs";
 import {
   briefingPrefsAreDefault,
   readBriefingFloat,
   readBriefingInSidebar,
   resetBriefingPrefs,
+  subscribeBriefingPrefs,
   writeBriefingFloat,
   writeBriefingInSidebar,
   type BriefingFloat,
 } from "../../lib/briefingPrefs";
-import { getTrayEnabled, setTrayEnabled, toggleBriefingWindow } from "../../lib/ipc";
-import type { CalendarRange } from "../../lib/calendarPrefs";
+import { getTrayEnabled, setBriefingWindowVisible, setTrayEnabled } from "../../lib/ipc";
 import { readConfirmDelete, writeConfirmDelete } from "../../lib/pinboard/prefs";
 import {
   ACCENTS,
@@ -99,11 +83,19 @@ export function GeneralSettings() {
   // Seeded from localStorage rather than watched: the toggle is the only writer here, and the
   // Pinboard reads the pref fresh at the moment you click delete (see pinboard/prefs.ts).
   const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
-  // The Focus tab's default layout (split | stacked). Shared with the Focus header toggle; this is the
-  // only other writer, seeded from localStorage like confirmDelete above.
-  // Where the briefing shows, beyond the Focus tab. Both off by default.
+  // Where the briefing shows, beyond the Focus tab. Both off by default. SUBSCRIBED, not read once:
+  // the always-on-top window can be dismissed from its own ✕ or by the tray going off, and both of
+  // those write the pref from outside this component (see the briefing://closed listener in App).
   const [briefingSidebar, setBriefingSidebar] = useState(readBriefingInSidebar);
   const [briefingFloat, setBriefingFloat] = useState<BriefingFloat>(readBriefingFloat);
+  useEffect(
+    () =>
+      subscribeBriefingPrefs(() => {
+        setBriefingSidebar(readBriefingInSidebar());
+        setBriefingFloat(readBriefingFloat());
+      }),
+    [],
+  );
   // The tray icon is backend-owned (Rust reads it at boot), so it loads asynchronously rather than
   // seeding from localStorage like its neighbours.
   const [trayOn, setTrayOn] = useState(false);
@@ -125,8 +117,10 @@ export function GeneralSettings() {
   function changeBriefingFloat(mode: BriefingFloat) {
     setBriefingFloat(mode);
     writeBriefingFloat(mode);
-    // The "always on top" level is a real OS window the Rust side owns, so ask it to show or hide.
-    void toggleBriefingWindow(mode === "onTop").catch(() => {
+    // The "always on top" level is a real OS window the Rust side owns, so tell it the state we
+    // want. Explicitly SET, never toggle — a toggle asked to be "not on top" showed the hidden
+    // window instead, which is how picking "inside PM" used to open both at once.
+    void setBriefingWindowVisible(mode === "onTop").catch(() => {
       /* best-effort: the in-app levels don't need it and a failure must not block the setting */
     });
   }
@@ -134,16 +128,6 @@ export function GeneralSettings() {
     setTrayOn(on);
     void setTrayEnabled(on).catch(() => setTrayOn(!on));
   }
-  const [focusLayout, setFocusLayout] = useState<FocusLayout>(readFocusLayout);
-  // The Focus "Upcoming" section: agenda list vs the few-day grid, plus the grid's hour window and how
-  // many days it shows. Shared with the Upcoming header controls (same keys), seeded from localStorage.
-  const [focusUpcomingMode, setFocusUpcomingMode] =
-    useState<FocusUpcomingMode>(readFocusUpcomingMode);
-  const [focusUpcomingRange, setFocusUpcomingRange] =
-    useState<CalendarRange>(readFocusUpcomingRange);
-  const [focusUpcomingDays, setFocusUpcomingDays] = useState<number>(() =>
-    clampFocusUpcomingDays(readFocusUpcomingDays()),
-  );
   // Memory map (the Map tab): the default grouping, cohesion blend, node cap, and the optional t-SNE
   // component's install/enable state.
   const [mapGrouping, setMapGrouping] = useState<MapLayoutMode>(readMapMode);
@@ -207,24 +191,6 @@ export function GeneralSettings() {
     };
   }, []);
 
-  function changeFocusLayout(next: FocusLayout) {
-    setFocusLayout(next);
-    writeFocusLayout(next); // shared with the Focus header toggle
-  }
-  function changeFocusUpcomingMode(next: FocusUpcomingMode) {
-    setFocusUpcomingMode(next);
-    writeFocusUpcomingMode(next); // shared with the Upcoming header toggle
-  }
-  function changeFocusUpcomingRange(next: CalendarRange) {
-    setFocusUpcomingRange(next);
-    writeFocusUpcomingRange(next);
-  }
-  function changeFocusUpcomingDays(next: number) {
-    const clamped = clampFocusUpcomingDays(next);
-    setFocusUpcomingDays(clamped);
-    writeFocusUpcomingDays(clamped);
-  }
-
   function changeMapGrouping(next: MapLayoutMode) {
     setMapGrouping(next);
     localStorage.setItem(MAP_MODE_KEY, next); // shared with the Map header toggle
@@ -284,15 +250,19 @@ export function GeneralSettings() {
   const mapIsDefault =
     mapGrouping === "project" && mapCohesion === 0 && mapNodeCap === 1000 && mapTsneEnabled;
   const confirmDeleteIsDefault = confirmDelete;
-  const focusLayoutIsDefault = focusLayout === "split";
-  const focusUpcomingIsDefault =
-    focusUpcomingMode === "list" && focusUpcomingRange === "day" && focusUpcomingDays === 3;
   const briefingIsDefault =
     !briefingSidebar && briefingFloat === "off" && briefingPrefsAreDefault();
-  // Panel visibility is set on the Focus tab itself, but "Reset Focus" must still restore it.
-  const [panelsDefault, setPanelsDefault] = useState(focusPanelsAreDefault);
-  const focusIsDefault =
-    focusLayoutIsDefault && focusUpcomingIsDefault && briefingIsDefault && panelsDefault;
+  // The Focus tab's view prefs (layout, Upcoming, panels) are set on the tab, not here — but "Reset
+  // Focus" still restores them, so this section has to know whether there is anything to reset.
+  // Subscribed: the Focus tab stays mounted and live behind the Settings overlay, so a read taken at
+  // mount would go stale the moment the user changed something there and came back.
+  const [focusViewDefault, setFocusViewDefault] = useState(focusViewPrefsAreDefault);
+  useEffect(() => {
+    const onChanged = () => setFocusViewDefault(focusViewPrefsAreDefault());
+    window.addEventListener("pm:settings-changed", onChanged);
+    return () => window.removeEventListener("pm:settings-changed", onChanged);
+  }, []);
+  const focusIsDefault = briefingIsDefault && focusViewDefault;
   const helpIsDefault = !help.enabled;
   // The whole tab, minus the deliberately-excluded time zone (device-derived, not a preference).
   const generalIsDefault =
@@ -314,16 +284,14 @@ export function GeneralSettings() {
     writeConfirmDelete(true);
   }
   function resetFocus() {
-    resetFocusPanels();
-    setPanelsDefault(true);
+    // Everything the Focus tab owns (layout, Upcoming mode / hours / days, panel visibility) —
+    // the defaults live in focusPrefs beside the readers, so this never re-lists them.
+    resetFocusViewPrefs();
+    setFocusViewDefault(true);
     setBriefingSidebar(false);
     setBriefingFloat("off");
     resetBriefingPrefs();
-    void toggleBriefingWindow(false).catch(() => {});
-    changeFocusLayout("split");
-    changeFocusUpcomingMode("list");
-    changeFocusUpcomingRange("day");
-    changeFocusUpcomingDays(3);
+    void setBriefingWindowVisible(false).catch(() => {});
   }
   function resetGeneral() {
     resetAppearance();
@@ -620,51 +588,14 @@ export function GeneralSettings() {
           <span className="text-sm text-ink2">Tray / menu bar icon</span>
           <Toggle checked={trayOn} onChange={changeTray} ariaLabel="Show a tray or menu bar icon" />
         </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Layout</span>
-          <SegmentedControl
-            value={focusLayout}
-            onChange={changeFocusLayout}
-            options={[
-              { value: "split", label: "Split" },
-              { value: "vertical", label: "Stacked" },
-            ]}
-          />
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-sm text-ink2">Upcoming</span>
-          <SegmentedControl
-            value={focusUpcomingMode}
-            onChange={changeFocusUpcomingMode}
-            options={[
-              { value: "list", label: "List" },
-              { value: "week", label: "Days" },
-            ]}
-          />
-        </div>
-        {focusUpcomingMode === "week" && (
-          <>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <span className="text-sm text-ink2">Upcoming hours</span>
-              <SegmentedControl
-                value={focusUpcomingRange}
-                onChange={changeFocusUpcomingRange}
-                options={FOCUS_UPCOMING_RANGES}
-              />
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <span className="text-sm text-ink2">Days shown</span>
-              <SegmentedControl
-                value={String(focusUpcomingDays)}
-                onChange={(v) => changeFocusUpcomingDays(Number(v))}
-                options={FOCUS_UPCOMING_DAY_CHOICES.map((n) => ({
-                  value: String(n),
-                  label: String(n),
-                }))}
-              />
-            </div>
-          </>
-        )}
+        <SectionInfo helpId="settings-focus">
+          <p>
+            The Focus tab&rsquo;s own layout, Upcoming and panel controls live on the tab itself,
+            beside the thing they change — nothing here mirrors them. What this section covers is
+            where the briefing shows up <em>outside</em> that tab. &ldquo;Reset Focus&rdquo; puts
+            all of it back, the tab&rsquo;s controls included.
+          </p>
+        </SectionInfo>
       </div>
 
       <div

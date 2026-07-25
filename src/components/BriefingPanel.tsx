@@ -113,7 +113,10 @@ export function BriefingPanel() {
         onPointerDown={(e) => startGesture(e, "move")}
         className="flex shrink-0 cursor-grab touch-none items-center justify-between gap-2 border-b border-border px-2 py-1 active:cursor-grabbing"
       >
-        <span className="font-mono text-[11px] uppercase tracking-wide text-faint">Briefing</span>
+        {/* Same title as the always-on-top window's strip (PopoverRoot) — one briefing, one name. */}
+        <span className="font-mono text-[11px] uppercase tracking-wide text-faint">
+          Briefing — Today
+        </span>
         <button
           type="button"
           onPointerDown={(e) => e.stopPropagation()}

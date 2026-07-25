@@ -41,10 +41,16 @@ import {
 } from "./ui";
 import {
   FOCUS_PANELS,
+  FOCUS_SPLIT_MAX,
+  FOCUS_SPLIT_MIN,
+  FOCUS_SPLIT_MIN_PX,
+  clampFocusSplit,
   readFocusHiddenPanels,
   readFocusLayout,
+  readFocusSplit,
   writeFocusHiddenPanels,
   writeFocusLayout,
+  writeFocusSplit,
   type FocusLayout,
   type FocusPanel,
 } from "../lib/focusPrefs";
@@ -265,11 +271,72 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     );
   }, [projects, sort]);
 
-  // Split (side-by-side) vs stacked layout — per-device, shared with the Settings → General toggle.
+  // Split (side-by-side) vs stacked layout — per-device, set from this header.
   const [layout, setLayout] = useState<FocusLayout>(readFocusLayout);
   function changeLayout(next: FocusLayout) {
     setLayout(next);
     writeFocusLayout(next);
+  }
+
+  // How the split layout divides its width, as the LEFT column's share. Dragged from the divider
+  // between the columns, persisted per-device (see focusPrefs), and reset by "Reset Focus".
+  const [split, setSplit] = useState<number>(readFocusSplit);
+  const [dragging, setDragging] = useState(false);
+  const splitRowRef = useRef<HTMLDivElement>(null);
+  // The two-column template is applied as an INLINE style (it carries a live fraction), and inline
+  // styles beat Tailwind's `grid-cols-1` — so the lg breakpoint has to be evaluated here rather than
+  // left to the class, or a narrow window would keep three tracks instead of collapsing to one.
+  // Matches the `lg:` breakpoint the divider itself is gated on.
+  const [wideScreen, setWideScreen] = useState(
+    () => window.matchMedia("(min-width: 1024px)").matches,
+  );
+  useEffect(() => {
+    const mql = window.matchMedia("(min-width: 1024px)");
+    const onChange = () => setWideScreen(mql.matches);
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, []);
+
+  // One pointer gesture, window-level so a fast drag that outruns the pointer keeps tracking (the
+  // BriefingPanel pattern). The fraction is measured against the ROW, not the window, so it means the
+  // same thing at any window size; the pixel floor is applied here because only the live row width
+  // knows whether a legal fraction would still leave a usable column.
+  function startSplitDrag(e: React.PointerEvent) {
+    e.preventDefault();
+    const row = splitRowRef.current;
+    if (!row) return;
+    setDragging(true);
+    let latest = split;
+    const onMove = (ev: PointerEvent) => {
+      const rect = row.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const raw = (ev.clientX - rect.left) / rect.width;
+      const floor = Math.max(FOCUS_SPLIT_MIN, FOCUS_SPLIT_MIN_PX / rect.width);
+      const ceil = Math.min(FOCUS_SPLIT_MAX, 1 - FOCUS_SPLIT_MIN_PX / rect.width);
+      // A row too narrow to honour both floors at once (a very small window) sits at dead centre
+      // rather than snapping to a bound.
+      latest = floor > ceil ? 0.5 : Math.min(ceil, Math.max(floor, raw));
+      setSplit(latest);
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      window.removeEventListener("blur", finish);
+      setDragging(false);
+      writeFocusSplit(latest);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+    window.addEventListener("blur", finish);
+  }
+
+  /** Keyboard resize + double-click reset, so the divider isn't pointer-only. */
+  function nudgeSplit(delta: number) {
+    const next = clampFocusSplit(split + delta);
+    setSplit(next);
+    writeFocusSplit(next);
   }
 
   async function suggestAll() {
@@ -295,7 +362,12 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   const briefingAndActions = (
     <>
       {shown("briefing") && <Briefing />}
-      {shown("actions") && !loading && projects.length > 0 && (
+      {/* Not gated on having projects. The focus box routes four ways and only one of them (edit)
+          needs a project — asking a flag-grounded question, capturing a preference and marking a
+          flag done all work on an empty install. Gating it on `projects.length > 0` made switching
+          the "Focus box" panel on look like a dead toggle for anyone who hadn't sorted anything yet.
+          Still gated on `loading` so it doesn't flash in beside the skeletons. */}
+      {shown("actions") && !loading && (
         <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
       )}
       {shown("upcoming") && events.length > 0 && (
@@ -303,9 +375,12 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
       )}
     </>
   );
-  // Whether the split layout's left column has anything in it. With all three off, the 22rem track
-  // would otherwise render empty and hold the project list pinned to a dead offset.
+  // Whether the split layout's left column has anything in it. With all three off, its track would
+  // otherwise render empty and hold the project list pinned to a dead offset.
   const leftColumnShown = shown("briefing") || shown("actions") || shown("upcoming");
+  // Only with BOTH columns present is there anything to divide — otherwise the one that's left takes
+  // the full width and the divider would be a handle onto nothing.
+  const bothColumns = leftColumnShown && shown("projects");
   const projectList = loading ? (
     <ul className="flex flex-col gap-2">
       {Array.from({ length: 4 }).map((_, i) => (
@@ -473,14 +548,61 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
             </div>
           )}
           {layout === "split" ? (
-            // Two columns on a wide screen (briefing/actions/agenda | project list); the grid falls
-            // back to one column below lg, so a narrow window reads like the stacked layout.
+            // Two columns on a wide screen (briefing/actions/agenda | project list) with a draggable
+            // divider between them; the grid falls back to ONE column below lg, where the divider is
+            // hidden and the row reads like the stacked layout. `bothColumns` matters because with
+            // only one side showing there is nothing to divide — the single column takes the width.
             <div
-              className={`grid grid-cols-1 gap-6 ${
-                leftColumnShown ? "lg:grid-cols-[minmax(0,22rem)_1fr]" : ""
-              }`}
+              ref={splitRowRef}
+              className={`grid grid-cols-1 gap-6 ${dragging ? "select-none" : ""}`}
+              style={
+                bothColumns
+                  ? {
+                      // Set only at lg+ via the media query below; the inline value is the wide-screen
+                      // template and Tailwind's `grid-cols-1` governs narrow.
+                      gridTemplateColumns: wideScreen
+                        ? `minmax(0, ${split}fr) auto minmax(0, ${1 - split}fr)`
+                        : undefined,
+                    }
+                  : undefined
+              }
             >
               {leftColumnShown && <div className="min-w-0">{briefingAndActions}</div>}
+              {bothColumns && (
+                <div
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="Resize the columns"
+                  aria-valuenow={Math.round(split * 100)}
+                  aria-valuemin={Math.round(FOCUS_SPLIT_MIN * 100)}
+                  aria-valuemax={Math.round(FOCUS_SPLIT_MAX * 100)}
+                  tabIndex={0}
+                  title="Drag to resize · double-click for an even split"
+                  onPointerDown={startSplitDrag}
+                  onDoubleClick={() => {
+                    setSplit(0.5);
+                    writeFocusSplit(0.5);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "ArrowLeft") {
+                      e.preventDefault();
+                      nudgeSplit(-0.02);
+                    } else if (e.key === "ArrowRight") {
+                      e.preventDefault();
+                      nudgeSplit(0.02);
+                    }
+                  }}
+                  // `-mx-3` pulls the 24px hit area back into the gap so the grab zone is generous
+                  // without the columns moving apart; the visible rule is the 1px child.
+                  className="group -mx-3 hidden w-6 cursor-col-resize touch-none items-stretch justify-center focus:outline-none lg:flex"
+                >
+                  <div
+                    className={`w-px transition-colors ${
+                      dragging ? "bg-accent" : "bg-border group-hover:bg-ink4 group-focus:bg-accent"
+                    }`}
+                  />
+                </div>
+              )}
               {shown("projects") && <div className="min-w-0">{projectList}</div>}
             </div>
           ) : (

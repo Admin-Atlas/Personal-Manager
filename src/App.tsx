@@ -36,6 +36,7 @@ import { HelpContext } from "./lib/help";
 import { ReaderProvider } from "./lib/reader";
 import { BriefingProvider } from "./lib/briefing";
 import { BriefingPanel } from "./components/BriefingPanel";
+import { readBriefingFloat, writeBriefingFloat } from "./lib/briefingPrefs";
 import { installAxisScrollNormalizer } from "./lib/scrollAxis";
 import { useResizable } from "./lib/useResizable";
 import { CollapseTab } from "./components/CollapseTab";
@@ -59,6 +60,7 @@ import {
   listConversations,
   listSharedVaults,
   markActivity,
+  onBriefingWindowClosed,
   onDriveSync,
   onLocalSync,
   onOneDriveSync,
@@ -412,6 +414,19 @@ export default function App() {
   useEffect(() => {
     let off: (() => void) | undefined;
     void onVaultFault((fault) => setVaultFaultNotice(fault.message)).then((o) => (off = o));
+    return () => off?.();
+  }, []);
+
+  // The always-on-top briefing is a real OS window Rust owns, and it can be dismissed from places
+  // this webview never sees — its own ✕, or the tray icon being switched off. Follow that back into
+  // the pref, or "Floating briefing" would keep reading "Always on top" with nothing on screen and
+  // would re-open the window on the next launch. App scope, not Settings: the window can be closed
+  // while Settings isn't even open. Mounted here it lives for the app's whole run.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    void onBriefingWindowClosed(() => {
+      if (readBriefingFloat() === "onTop") writeBriefingFloat("off");
+    }).then((o) => (off = o));
     return () => off?.();
   }, []);
 

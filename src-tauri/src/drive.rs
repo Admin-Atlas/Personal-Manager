@@ -62,9 +62,17 @@ const MAX_PAGES: usize = 1000;
 /// The field projection for a Drive file — kept tight (only what the connector needs). `parents` is
 /// requested explicitly (Drive API v3 returns nothing not named here) so a synced file can be tagged
 /// with the folder it was found in; a file usually has one parent, and we keep only the first.
+///
+/// **Every name here must be a real v3 `File` field.** Drive validates the mask and rejects an
+/// unknown name with a 400 (`Invalid field selection <name>`, `location: fields`) — which fails the
+/// whole listing, not just that field, so one bad name breaks every path that shares this constant
+/// (baseline sync, folder picker, shared drives, shared-with-me). Two v2-era names did exactly that
+/// between #481 and this fix: `sharedWithMe` (v3 exposes the timestamp `sharedWithMeTime` instead —
+/// the bare boolean survives only as a `q` search term, which is why `files_url`'s query still uses
+/// it) and `capabilities.canExport` (not a v3 capability at all; `canDownload` is).
 const FILE_FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum,trashed,webViewLink,parents,\
-sharedWithMe,ownedByMe,shortcutDetails(targetId,targetMimeType,targetResourceKey),\
-capabilities(canDownload,canExport),resourceKey";
+sharedWithMeTime,ownedByMe,shortcutDetails(targetId,targetMimeType,targetResourceKey),\
+capabilities(canDownload),resourceKey";
 /// Drive's folder MIME type (folders are containers we walk, never files we index).
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// Drive's shortcut MIME type. Shared items often arrive as shortcuts; a shared-with-me shortcut is
@@ -1051,9 +1059,10 @@ pub struct DriveFile {
     /// human-readable name at sync time and snapshotted onto the document as sorting-review context.
     /// `None` when Drive reports no parent (e.g. a shared-drive root item) or the field was absent.
     pub parent_id: Option<String>,
-    /// Drive's `sharedWithMe` — true iff this file is in the account's "Shared with me" collection.
-    /// Keeps the shared-with-me corpus disjoint from My Drive (`files_url` excludes it; `map_change`
-    /// routes it away from the My-Drive namespace). Not populated for shared-drive items (reads false).
+    /// True iff this file is in the account's "Shared with me" collection — derived from the presence
+    /// of v3's `sharedWithMeTime` (there is no boolean field to read; see [`FILE_FIELDS`]). Keeps the
+    /// shared-with-me corpus disjoint from My Drive (`files_url` excludes it; `map_change` routes it
+    /// away from the My-Drive namespace). Not populated for shared-drive items (reads false).
     pub shared_with_me: bool,
     /// Drive's `ownedByMe` — false for a shared-with-me item, true for an owned My-Drive file. Not
     /// populated for shared-drive items (reads false).
@@ -1063,10 +1072,9 @@ pub struct DriveFile {
     pub shortcut_target_id: Option<String>,
     pub shortcut_target_mime: Option<String>,
     pub shortcut_target_resource_key: Option<String>,
-    /// Per-user capability gates for a body fetch — `canDownload` (blobs) / `canExport` (Google-native
-    /// docs). `None` (field absent) is treated as "allowed"; a genuine block still surfaces as a 403.
+    /// Drive's per-user `capabilities.canDownload` gate for a body fetch. `None` (field absent) is
+    /// treated as "allowed"; a genuine block still surfaces as a 403.
     pub can_download: Option<bool>,
-    pub can_export: Option<bool>,
     /// The `resourceKey` some link-shared items need in the `X-Goog-Drive-Resource-Keys` header to be
     /// read; persisted with the pointer so an on-demand body fetch can replay it. `None` otherwise.
     pub resource_key: Option<String>,
@@ -1229,10 +1237,12 @@ fn parse_file(v: &Value) -> Option<DriveFile> {
             .and_then(|ps| ps.first())
             .and_then(Value::as_str)
             .map(String::from),
+        // v3 reports the *time* the item was shared with this account, not a boolean — its presence
+        // (a non-null value) is the "shared with me" signal. See FILE_FIELDS.
         shared_with_me: v
-            .get("sharedWithMe")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .get("sharedWithMeTime")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !t.is_empty()),
         owned_by_me: v.get("ownedByMe").and_then(Value::as_bool).unwrap_or(false),
         shortcut_target_id: v
             .get("shortcutDetails")
@@ -1252,10 +1262,6 @@ fn parse_file(v: &Value) -> Option<DriveFile> {
         can_download: v
             .get("capabilities")
             .and_then(|c| c.get("canDownload"))
-            .and_then(Value::as_bool),
-        can_export: v
-            .get("capabilities")
-            .and_then(|c| c.get("canExport"))
             .and_then(Value::as_bool),
         resource_key: v
             .get("resourceKey")
@@ -2319,7 +2325,6 @@ mod tests {
             shortcut_target_mime: None,
             shortcut_target_resource_key: None,
             can_download: None,
-            can_export: None,
             resource_key: None,
         }
     }
@@ -2381,6 +2386,43 @@ mod tests {
         let mut sc_to_file = file("S2", SHORTCUT_MIME, None, "t");
         sc_to_file.shortcut_target_mime = Some("application/pdf".into());
         assert!(!root_is_folder(&sc_to_file));
+    }
+
+    #[test]
+    fn file_fields_names_only_real_v3_file_fields() {
+        // Drive rejects the WHOLE listing with a 400 when the mask names a field the v3 `File`
+        // resource doesn't have, so one stale v2-era name breaks every Drive path at once (#481
+        // shipped exactly that). This pins the two that bit us, and the shape of the mask, so a
+        // future edit can't quietly reintroduce a v2 name.
+        assert!(
+            !FILE_FIELDS.contains("sharedWithMe,"),
+            "v3 has no boolean `sharedWithMe` file field — only the `sharedWithMeTime` timestamp \
+             (the bare name is a `q` search term, not a projectable field)"
+        );
+        assert!(FILE_FIELDS.contains("sharedWithMeTime"));
+        assert!(
+            !FILE_FIELDS.contains("canExport"),
+            "`canExport` is not a v3 File capability; only `canDownload` is"
+        );
+        assert!(FILE_FIELDS.contains("capabilities(canDownload)"));
+    }
+
+    #[test]
+    fn parse_file_reads_shared_with_me_from_the_v3_timestamp() {
+        let page = serde_json::json!({
+            "files": [
+                { "id": "own", "name": "a.txt", "mimeType": "text/plain", "ownedByMe": true },
+                { "id": "swm", "name": "b.txt", "mimeType": "text/plain",
+                  "sharedWithMeTime": "2026-07-25T09:00:00.000Z", "ownedByMe": false },
+                // A present-but-empty value is not a share — treat it exactly like an absent one.
+                { "id": "blank", "name": "c.txt", "mimeType": "text/plain", "sharedWithMeTime": "" },
+            ]
+        });
+        let (files, _) = parse_files(&page);
+        assert_eq!(files.len(), 3);
+        assert!(!files[0].shared_with_me);
+        assert!(files[1].shared_with_me);
+        assert!(!files[2].shared_with_me);
     }
 
     #[test]
@@ -2839,7 +2881,6 @@ mod tests {
             shortcut_target_mime: None,
             shortcut_target_resource_key: None,
             can_download: None,
-            can_export: None,
             resource_key: None,
         }
     }

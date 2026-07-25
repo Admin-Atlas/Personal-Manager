@@ -18,7 +18,7 @@ const BASE: A11yTheme = {
   legibleFont: false,
   density: "standard",
   colorblind: false,
-  contrast: "legacy",
+  contrast: "aa",
 };
 
 describe("applyTheme accessibility axes", () => {
@@ -55,11 +55,11 @@ describe("applyTheme accessibility axes", () => {
 
   it("stamps the density vars + data-density and re-derives when the level changes", () => {
     const el = document.createElement("div");
-    applyTheme(el, "slate", "dark", "mono", "standard", { ...BASE, density: "compact" });
-    expect(el.dataset.density).toBe("compact");
+    applyTheme(el, "slate", "dark", "mono", "standard", BASE);
+    expect(el.dataset.density).toBe("standard");
+    // The default level already meets WCAG 2.5.8 on both the hit area and the drawn track.
     expect(el.style.getPropertyValue("--tap-min")).toBe("24px");
-    // compact keeps today's 20px track (an existing install's look is undisturbed)
-    expect(el.style.getPropertyValue("--tg-track-h")).toBe("20px");
+    expect(el.style.getPropertyValue("--tg-track-h")).toBe("24px");
 
     applyTheme(el, "slate", "dark", "mono", "standard", { ...BASE, density: "comfortable" });
     expect(el.dataset.density).toBe("comfortable");

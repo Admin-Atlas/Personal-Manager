@@ -27,10 +27,9 @@ import {
 
 export type ThemeVars = Record<`--${string}`, string>;
 
-/** The opt-in accessibility axes (Accessibility settings). Additive over the visual theme. All but
- *  `density` default to today's behaviour ({ fontScale: 1, reduceMotion: false, legibleFont: false });
- *  `density` defaults to `standard` for fresh installs but is pinned to `compact` (today's sizing)
- *  for existing installs by a one-time migration in ThemeContext — see {@link DENSITY_VARS}. */
+/** The opt-in accessibility axes (Accessibility settings). Additive over the visual theme.
+ *  `fontScale: 1`, `reduceMotion: false` and `legibleFont: false` are "leave it alone"; `density` and
+ *  `contrast` have no such neutral — their defaults are the compliant baseline (`standard` / `aa`). */
 export interface A11yTheme {
   /** Whole-UI text scale (1 = 100%). Multiplies the root font-size, so all rem sizing scales. */
   fontScale: number;
@@ -49,9 +48,9 @@ export interface A11yTheme {
 // Per-level, per-mode OKLCH-Lightness shifts applied to the neutral ramp by boost(). Each value is
 // the minimum shift (calibrated against the worst of bg/panel/surface across all three Systems, incl.
 // the monochrome ramp, plus a small margin) that lifts a role to its WCAG target. Only the roles that
-// actually fall short are listed — so `aa` moves ONLY the lowest text tier (ink4), leaving today's
+// actually fall short are listed — so `aa` moves ONLY the lowest text tier (ink4), leaving PM's
 // look all but untouched, while `high` also firms up ink3 (→7:1 body), faint, and the border edges.
-const CONTRAST_SHIFT: Record<"aa" | "high", Record<Mode, Partial<Record<Role, number>>>> = {
+const CONTRAST_SHIFT: Record<Contrast, Record<Mode, Partial<Record<Role, number>>>> = {
   aa: {
     dark: { ink4: 0.1 },
     light: { ink4: 0.09 },
@@ -64,9 +63,9 @@ const CONTRAST_SHIFT: Record<"aa" | "high", Record<Mode, Partial<Record<Role, nu
 
 /** Apply the contrast axis to one role's [L, C]: push its Lightness toward the contrast extreme
  *  (dark mode → lighter, light mode → darker) by the calibrated per-role shift. Chroma is untouched
- *  (hue/saturation stay put; only luminance separation grows). `legacy` and any unlisted role are
- *  identity, so the ramp is unchanged except where a role genuinely needed lifting. Pure + exported
- *  for the contrast-audit test. */
+ *  (hue/saturation stay put; only luminance separation grows). Any unlisted role is identity, so the
+ *  ramp is unchanged except where a role genuinely needed lifting. Pure + exported for the
+ *  contrast-audit test. */
 export function boost(
   lc: readonly [number, number],
   role: Role,
@@ -74,7 +73,6 @@ export function boost(
   contrast: Contrast,
 ): [number, number] {
   const [L, C] = lc;
-  if (contrast === "legacy") return [L, C];
   const shift = CONTRAST_SHIFT[contrast][mode][role] ?? 0;
   if (shift === 0) return [L, C];
   const dir = mode === "dark" ? 1 : -1;
@@ -86,22 +84,13 @@ export function boost(
 const LEGIBLE_STACK = '"Atkinson Hyperlegible", system-ui, sans-serif';
 
 // Density → control-sizing custom properties, read by the ui/ primitives (never a blunt global
-// `button{}` rule, which would swell calendar chips etc.). The visible switch track is separated
-// from its tap target so `compact` keeps today's 20px LOOK while still flooring a ≥24px HIT area
-// (WCAG 2.5.8 is satisfied by the actionable region, padding included). `standard` grows the visible
-// track to 24px; `comfortable` reaches the 44px AAA target. `--tap-min` also floors Button / Select /
+// `button{}` rule, which would swell calendar chips etc.). The visible switch track is separated from
+// its tap target so `--tap-min` can floor a ≥24px HIT area independently of the drawn size (WCAG
+// 2.5.8 is satisfied by the actionable region, padding included). `standard` draws a 24px track;
+// `comfortable` reaches the 44px AAA target. `--tap-min` also floors Button / Select /
 // SegmentedControl. Components fall back to the `standard` values via var()'s second arg, so the very
 // first paint (before applyTheme runs) is already compliant.
 export const DENSITY_VARS: Record<Density, Record<`--${string}`, string>> = {
-  compact: {
-    "--tap-min": "24px",
-    "--tg-track-h": "20px",
-    "--tg-track-w": "36px",
-    "--tg-knob": "16px",
-    // Knob rests at left:2px; on-travel of 14px lands it at 16px — exactly today's toggle geometry
-    // (h-5 w-9 track, translate-x-0.5 → translate-x-4), so a pinned/legacy install shifts by 0px.
-    "--tg-on": "14px",
-  },
   standard: {
     "--tap-min": "24px",
     "--tg-track-h": "24px",
@@ -123,7 +112,7 @@ export function themeVars(
   mode: Mode,
   accent: string,
   colorblind = false,
-  contrast: Contrast = "legacy",
+  contrast: Contrast = "aa",
 ): ThemeVars {
   // The colour-blind axis swaps the semantic status row for the Okabe–Ito-derived CVD set (one per
   // Mode, System-independent); the categorical graph/source palettes are swapped at their own call
@@ -192,13 +181,7 @@ export function applyTheme(
   depth: Depth,
   a11y?: A11yTheme,
 ): void {
-  const vars = themeVars(
-    system,
-    mode,
-    accent,
-    a11y?.colorblind ?? false,
-    a11y?.contrast ?? "legacy",
-  );
+  const vars = themeVars(system, mode, accent, a11y?.colorblind ?? false, a11y?.contrast ?? "aa");
   for (const key of Object.keys(vars) as Array<keyof ThemeVars>) {
     el.style.setProperty(key, vars[key]);
   }

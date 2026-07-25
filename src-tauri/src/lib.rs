@@ -1123,6 +1123,11 @@ pub fn run() {
             // The tray icon and the always-on-top briefing window. Both start hidden; the tray is
             // shown only if the user has switched it on. Best-effort: a desktop with no
             // StatusNotifierItem host (or no appindicator library at all) must not block startup.
+            //
+            // The window MUST be built here and nowhere else — `WebviewWindowBuilder::build()`
+            // deadlocks Windows when called from a synchronous command or an event handler, which is
+            // what the Settings toggle and the tray menu are (see tray.rs). Quitting properly is
+            // handled by `tray::on_window_event`, which exits explicitly, not by withholding this.
             let _ = tray::build_briefing_window(handle);
             tray::init(handle);
             Ok(())
@@ -1319,7 +1324,8 @@ pub fn run() {
             commands::open_url,
             commands::get_tray_enabled,
             commands::set_tray_enabled,
-            commands::toggle_briefing_window,
+            commands::set_briefing_window_visible,
+            commands::close_briefing_window,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::resolve_flag,

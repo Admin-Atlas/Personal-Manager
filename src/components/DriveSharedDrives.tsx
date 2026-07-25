@@ -388,6 +388,11 @@ function RootFilesToggle({
   );
 }
 
+/** How many rows this picker shows before it becomes its own scroll area. Roughly a screenful of the
+ *  connector card — enough that a handful of shared items needs no scrolling at all, while an account
+ *  with hundreds can't push the rest of the settings (and the Save) off the page. */
+const VISIBLE_ROOTS = 8;
+
 /** The flat picker of "Shared with me" roots — files AND folders (a folder pulls in its whole
  *  subtree; a trailing “/” marks a folder). Roots already indexed by another connected account are
  *  greyed out (de-duplicated like a shared drive). Loads its own roots + owners on mount, so the list
@@ -448,33 +453,53 @@ function SharedWithMeRoots({
     onChange([...next]);
   };
 
+  const chosen = roots.filter((r) => sel.has(r.id) || owners[r.id]).length;
+
   return (
-    <ul className="mt-2 divide-y divide-rule">
-      {roots.map((r) => {
-        const ownedBy = owners[r.id];
-        return (
-          <li key={r.id} className="py-1.5 first:pt-0 last:pb-0">
-            <label className={`flex items-center gap-2 text-xs ${ownedBy ? "opacity-60" : ""}`}>
-              <input
-                type="checkbox"
-                checked={ownedBy ? true : sel.has(r.id)}
-                disabled={!!ownedBy}
-                onChange={(e) => toggle(r.id, e.target.checked)}
-                className={ownedBy ? "cursor-not-allowed" : ""}
-              />
-              <span className="truncate text-ink2">
-                {r.name}
-                {r.is_folder ? "/" : ""}
-              </span>
-            </label>
-            {ownedBy && (
-              <p className="mt-0.5 pl-5 text-[11px] text-ink4">
-                Already synced by <span className="text-ink3">{ownedBy}</span>.
-              </p>
-            )}
-          </li>
-        );
-      })}
-    </ul>
+    <>
+      <p className="mt-2 flex items-center justify-between gap-2 text-[11px] text-ink4">
+        <span>
+          {roots.length} shared item{roots.length === 1 ? "" : "s"}
+          {chosen > 0 ? ` · ${chosen} selected` : ""}
+        </span>
+        {roots.length > VISIBLE_ROOTS && <span>scroll for more</span>}
+      </p>
+      {/* Capped and scrolled past a handful of rows: an account with a lot of shared items otherwise
+          pushed the rest of the connector settings (and its own Save) off the page. The cap is on the
+          LIST, not the page, so the surrounding controls stay put however much is shared. */}
+      <ul
+        className={`mt-1 divide-y divide-rule ${
+          roots.length > VISIBLE_ROOTS
+            ? "max-h-64 overflow-y-auto rounded-[var(--radius-sm)] border border-border px-2"
+            : ""
+        }`}
+      >
+        {roots.map((r) => {
+          const ownedBy = owners[r.id];
+          return (
+            <li key={r.id} className="py-1.5 first:pt-0 last:pb-0">
+              <label className={`flex items-center gap-2 text-xs ${ownedBy ? "opacity-60" : ""}`}>
+                <input
+                  type="checkbox"
+                  checked={ownedBy ? true : sel.has(r.id)}
+                  disabled={!!ownedBy}
+                  onChange={(e) => toggle(r.id, e.target.checked)}
+                  className={`shrink-0 ${ownedBy ? "cursor-not-allowed" : ""}`}
+                />
+                <span className="truncate text-ink2">
+                  {r.name}
+                  {r.is_folder ? "/" : ""}
+                </span>
+              </label>
+              {ownedBy && (
+                <p className="mt-0.5 pl-5 text-[11px] text-ink4">
+                  Already synced by <span className="text-ink3">{ownedBy}</span>.
+                </p>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </>
   );
 }

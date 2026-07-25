@@ -324,6 +324,29 @@ body {
       transform: none;
     }
   }
+  /* "You're looking at this one" — a brief accent wash over a section the user just jumped to from
+   * the Settings sub-nav. Its whole job is to answer "did anything happen?" when the pane had nothing
+   * to scroll, so it must be visible without being a flash: one slow fade in and out, no movement. */
+  @keyframes pm-locate {
+    0% {
+      background-color: transparent;
+    }
+    18% {
+      background-color: var(--accent-soft);
+    }
+    100% {
+      background-color: transparent;
+    }
+  }
+}
+
+/* The class the sub-nav stamps on. Outside the reduced-motion guard so the RULE always exists; the
+ * animation-name simply doesn't resolve when the keyframes above aren't defined, which is exactly the
+ * "rests in its static state" contract the primitives above use. The negative inset + padding let the
+ * wash bleed slightly past the section's own box so it reads as one highlighted block. */
+.pm-locate {
+  animation: pm-locate 1.1s ease-out;
+  border-radius: var(--radius);
 }
 
 /* Accessibility: in-app reduced-motion override. The OS `prefers-reduced-motion` path above is the
