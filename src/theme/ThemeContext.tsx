@@ -23,11 +23,13 @@ import {
   MODE_PREFS,
   DEPTHS,
   DENSITIES,
+  CONTRASTS,
   type System,
   type Mode,
   type ModePref,
   type Depth,
   type Density,
+  type Contrast,
 } from "./profiles";
 import { resolveMode, type ModeResolution, type ModeSource } from "./resolveMode";
 import type { Coords } from "./timezones";
@@ -86,9 +88,14 @@ export interface ThemeState {
    *  colour-blind-safe (Okabe–Ito) set. Off by default (= today), so it needs no migration. */
   colorblind: boolean;
   setColorblind: (v: boolean) => void;
+  /** Contrast level. `aa` (WCAG 1.4.3) is the fresh-install default; existing installs are pinned to
+   *  `legacy` (today's ramps) by the same one-time migration as density; `high` reaches AAA. */
+  contrast: Contrast;
+  setContrast: (v: Contrast) => void;
   /** True when every accessibility axis is at its default — drives the Accessibility tab's "Reset". */
   accessibilityIsDefault: boolean;
-  /** Restore the accessibility axes (font size, reduce motion, legible font) to their defaults. */
+  /** Restore every accessibility axis (text size, contrast, density, motion, legible font, colour-
+   *  blind palette) to its default — including the compliant baseline for the legacy-pinned axes. */
   resetAccessibility: () => void;
 }
 
@@ -132,6 +139,19 @@ export function initialDensity(stored: string | null, hasThemeState: boolean): D
   return hasThemeState ? LEGACY_DENSITY : DEFAULT_DENSITY;
 }
 
+// Contrast is the second axis with a compliant default that differs from today, so it carries the
+// same one-time legacy pin as density (see initialDensity): a fresh install gets `aa` (WCAG 1.4.3),
+// an existing install is pinned to `legacy` (today's ramps) and can Reset up to the compliant baseline.
+const DEFAULT_CONTRAST: Contrast = "aa";
+const LEGACY_CONTRAST: Contrast = "legacy";
+
+/** The contrast a fresh mount starts at — the density legacy-pin, applied to the contrast axis. Pure
+ *  + exported for the same migration unit test. */
+export function initialContrast(stored: string | null, hasThemeState: boolean): Contrast {
+  if (stored !== null) return oneOf(stored, CONTRASTS, DEFAULT_CONTRAST);
+  return hasThemeState ? LEGACY_CONTRAST : DEFAULT_CONTRAST;
+}
+
 // The Teach-tab visibility override: "auto" follows the Depth preset (hidden for minimalist,
 // shown for standard/power); "show"/"hide" are explicit choices made from Settings.
 type TeachPref = "auto" | "show" | "hide";
@@ -152,6 +172,7 @@ const KEY = {
   legibleFont: "pm:a11y:legibleFont",
   density: "pm:a11y:density",
   colorblind: "pm:a11y:colorblind",
+  contrast: "pm:a11y:contrast",
 };
 
 // localStorage can throw (locked-down webviews); never let a theme read/write crash the app.
@@ -228,6 +249,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     initialDensity(read(KEY.density), read(KEY.system) !== null),
   );
   const [colorblind, setColorblind] = useState<boolean>(() => read(KEY.colorblind) === "true");
+  const [contrast, setContrast] = useState<Contrast>(() =>
+    initialContrast(read(KEY.contrast), read(KEY.system) !== null),
+  );
 
   // The resolved Mode (+ how/where it was resolved). Computed synchronously for a themed first
   // paint, then kept live by the effect below (OS changes, sunrise/sunset, focus).
@@ -275,6 +299,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     // restored on a fresh machine → pin the legacy sizing, matching the localStorage migration above.
     setDensity(oneOf(typeof b.density === "string" ? b.density : null, DENSITIES, LEGACY_DENSITY));
     setColorblind(b.colorblind === true);
+    // A blob without `contrast` predates the axis → an existing user's folder → pin legacy, as above.
+    setContrast(
+      oneOf(typeof b.contrast === "string" ? b.contrast : null, CONTRASTS, LEGACY_CONTRAST),
+    );
   }
 
   // One-shot hydration from the store. On a fresh machine (localStorage empty) the
@@ -389,7 +417,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     !reduceMotion &&
     !legibleFont &&
     density === DEFAULT_DENSITY &&
-    !colorblind;
+    !colorblind &&
+    contrast === DEFAULT_CONTRAST;
 
   function resetAccessibility(): void {
     setFontScale(DEFAULT_FONT_SCALE);
@@ -397,6 +426,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setLegibleFont(false);
     setDensity(DEFAULT_DENSITY);
     setColorblind(false);
+    setContrast(DEFAULT_CONTRAST);
   }
 
   // Restore every axis to its default in one go. The persist effect below mirrors the axis changes to
@@ -424,6 +454,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       legibleFont,
       density,
       colorblind,
+      contrast,
     });
     write(KEY.system, system);
     write(KEY.modePref, modePref);
@@ -435,6 +466,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.legibleFont, String(legibleFont));
     write(KEY.density, density);
     write(KEY.colorblind, String(colorblind));
+    write(KEY.contrast, contrast);
     if (hydrated) {
       const blob = {
         system,
@@ -448,6 +480,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         legibleFont,
         density,
         colorblind,
+        contrast,
       };
       setPref(PREF_KEY, JSON.stringify(blob)).catch(() => {
         /* fire-and-forget — localStorage already holds the value */
@@ -465,6 +498,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     legibleFont,
     density,
     colorblind,
+    contrast,
     hydrated,
   ]);
 
@@ -497,6 +531,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setDensity,
     colorblind,
     setColorblind,
+    contrast,
+    setContrast,
     accessibilityIsDefault,
     resetAccessibility,
   };

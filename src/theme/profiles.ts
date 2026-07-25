@@ -20,6 +20,11 @@ export type Depth = "min" | "standard" | "power";
  *  `comfortable` reaches the 44px AAA (2.5.5) target for lower motor precision. See {@link DENSITIES}
  *  and the density vars in tokens.ts. */
 export type Density = "compact" | "standard" | "comfortable";
+/** Contrast level (Accessibility). `legacy` is today's ramps (pinned for existing installs); `aa`
+ *  is the fresh-install default and lifts the lowest text tier to WCAG 1.4.3 AA (4.5:1); `high`
+ *  reaches AAA (7:1) for body text and firms up the faint text + borders. Applied by boost() in
+ *  tokens.ts. See {@link CONTRASTS}. */
+export type Contrast = "legacy" | "aa" | "high";
 export type Role =
   | "bg"
   | "panel"
@@ -40,6 +45,7 @@ export const MODES: readonly Mode[] = ["dark", "light"];
 export const MODE_PREFS: readonly ModePref[] = ["light", "dark", "system", "auto"];
 export const DEPTHS: readonly Depth[] = ["min", "standard", "power"];
 export const DENSITIES: readonly Density[] = ["compact", "standard", "comfortable"];
+export const CONTRASTS: readonly Contrast[] = ["legacy", "aa", "high"];
 
 // Order is load-bearing: themeVars maps these positionally onto each ramp / status row.
 export const ROLES: readonly Role[] = [

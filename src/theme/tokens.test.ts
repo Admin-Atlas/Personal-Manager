@@ -18,6 +18,7 @@ const BASE: A11yTheme = {
   legibleFont: false,
   density: "standard",
   colorblind: false,
+  contrast: "legacy",
 };
 
 describe("applyTheme accessibility axes", () => {

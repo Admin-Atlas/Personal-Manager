@@ -21,6 +21,8 @@ import {
   type Mode,
   type Depth,
   type Density,
+  type Contrast,
+  type Role,
 } from "./profiles";
 
 export type ThemeVars = Record<`--${string}`, string>;
@@ -40,6 +42,43 @@ export interface A11yTheme {
   density: Density;
   /** Use the colour-blind-safe (Okabe–Ito) categorical + status palettes. */
   colorblind: boolean;
+  /** Contrast level applied to the neutral ramp by boost() (WCAG 1.4.3). */
+  contrast: Contrast;
+}
+
+// Per-level, per-mode OKLCH-Lightness shifts applied to the neutral ramp by boost(). Each value is
+// the minimum shift (calibrated against the worst of bg/panel/surface across all three Systems, incl.
+// the monochrome ramp, plus a small margin) that lifts a role to its WCAG target. Only the roles that
+// actually fall short are listed — so `aa` moves ONLY the lowest text tier (ink4), leaving today's
+// look all but untouched, while `high` also firms up ink3 (→7:1 body), faint, and the border edges.
+const CONTRAST_SHIFT: Record<"aa" | "high", Record<Mode, Partial<Record<Role, number>>>> = {
+  aa: {
+    dark: { ink4: 0.1 },
+    light: { ink4: 0.09 },
+  },
+  high: {
+    dark: { ink3: 0.12, ink4: 0.1, faint: 0.25, border: 0.26, border2: 0.2 },
+    light: { ink3: 0.12, ink4: 0.09, faint: 0.2, border: 0.25, border2: 0.18 },
+  },
+};
+
+/** Apply the contrast axis to one role's [L, C]: push its Lightness toward the contrast extreme
+ *  (dark mode → lighter, light mode → darker) by the calibrated per-role shift. Chroma is untouched
+ *  (hue/saturation stay put; only luminance separation grows). `legacy` and any unlisted role are
+ *  identity, so the ramp is unchanged except where a role genuinely needed lifting. Pure + exported
+ *  for the contrast-audit test. */
+export function boost(
+  lc: readonly [number, number],
+  role: Role,
+  mode: Mode,
+  contrast: Contrast,
+): [number, number] {
+  const [L, C] = lc;
+  if (contrast === "legacy") return [L, C];
+  const shift = CONTRAST_SHIFT[contrast][mode][role] ?? 0;
+  if (shift === 0) return [L, C];
+  const dir = mode === "dark" ? 1 : -1;
+  return [Math.max(0, Math.min(1, L + dir * shift)), C];
 }
 
 // Atkinson Hyperlegible — the family name declared by @fontsource/atkinson-hyperlegible (imported in
@@ -84,6 +123,7 @@ export function themeVars(
   mode: Mode,
   accent: string,
   colorblind = false,
+  contrast: Contrast = "legacy",
 ): ThemeVars {
   // The colour-blind axis swaps the semantic status row for the Okabe–Ito-derived CVD set (one per
   // Mode, System-independent); the categorical graph/source palettes are swapped at their own call
@@ -98,7 +138,8 @@ export function themeVars(
     // in colour. --bg is pinned to the exact Eigengrau hex in dark so the base colour is precise.
     const ramp = MONO_RAMP[mode];
     ROLES.forEach((r) => {
-      v[`--${r}`] = `oklch(${ramp[r]} 0 0)`;
+      const [L] = boost([ramp[r], 0], r, mode, contrast);
+      v[`--${r}`] = `oklch(${L} 0 0)`;
     });
     if (mode === "dark") {
       v["--bg"] = EIGENGRAU;
@@ -119,7 +160,7 @@ export function themeVars(
     const { C, H } = oklabLCH(accent);
     const ok = ([L, c]: readonly [number, number]): string => `oklch(${L} ${c} ${H})`;
     ROLES.forEach((r) => {
-      v[`--${r}`] = ok(ramp[r]);
+      v[`--${r}`] = ok(boost(ramp[r], r, mode, contrast));
     });
     v["--accent"] = accent;
     v["--accent-text"] = mode === "light" ? `oklch(0.52 ${Math.min(C, 0.17)} ${H})` : accent;
@@ -151,7 +192,13 @@ export function applyTheme(
   depth: Depth,
   a11y?: A11yTheme,
 ): void {
-  const vars = themeVars(system, mode, accent, a11y?.colorblind ?? false);
+  const vars = themeVars(
+    system,
+    mode,
+    accent,
+    a11y?.colorblind ?? false,
+    a11y?.contrast ?? "legacy",
+  );
   for (const key of Object.keys(vars) as Array<keyof ThemeVars>) {
     el.style.setProperty(key, vars[key]);
   }

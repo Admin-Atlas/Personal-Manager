@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The Accessibility settings tab. Opt-in axes that change how PM presents itself — text size,
-// density / touch-target size, motion, a legible font, and a colour-blind-safe palette — persisted
-// with the rest of the theme (so they travel with the vault) and applied instantly. Most defaults
-// equal PM's normal behaviour; density defaults to the compliant `standard` on fresh installs but is
-// pinned to `compact` (today's look) for existing installs, so nothing shifts until you choose
-// otherwise or Reset. A high-contrast theme is planned as a further axis (epic #502).
+// contrast, density / touch-target size, motion, a legible font, and a colour-blind-safe palette —
+// persisted with the rest of the theme (so they travel with the vault) and applied instantly. Most
+// defaults equal PM's normal behaviour; the two whose compliant default differs (density → `standard`,
+// contrast → `aa`) are pinned to their legacy value (`compact` / `legacy`) for existing installs by a
+// one-time migration, so nothing shifts until you choose otherwise or Reset. This tab now covers the
+// full accessibility epic (#502).
 
 import { SectionInfo, SegmentedControl, Toggle } from "../ui";
-import { useTheme, type FontScale, type Density } from "../../theme";
+import { useTheme, type FontScale, type Density, type Contrast } from "../../theme";
 import { ResetLink, TabResetSection } from "./ResetControls";
 
 // The Text-size steps. Kept here (and mirrored inline in GeneralSettings' Appearance section) rather
@@ -31,6 +32,12 @@ const DENSITY_OPTIONS: ReadonlyArray<{ value: Density; label: string; title: str
   },
 ];
 
+const CONTRAST_OPTIONS: ReadonlyArray<{ value: Contrast; label: string; title: string }> = [
+  { value: "legacy", label: "Legacy", title: "PM's original ramps" },
+  { value: "aa", label: "AA", title: "Meets WCAG 1.4.3 (4.5:1 body text)" },
+  { value: "high", label: "High", title: "AAA — 7:1 body text, firmer borders" },
+];
+
 const SECTION_HEAD = "block font-mono text-xs font-medium uppercase tracking-wide text-ink3";
 const ROW = "mt-3 flex items-center justify-between gap-3";
 
@@ -46,6 +53,8 @@ export function AccessibilitySettings() {
     setLegibleFont,
     colorblind,
     setColorblind,
+    contrast,
+    setContrast,
     accessibilityIsDefault,
     resetAccessibility,
   } = useTheme();
@@ -66,6 +75,28 @@ export function AccessibilitySettings() {
             Scales all of PM's text and spacing together, like your browser's zoom — it's the same
             control as “Text size” under Appearance. Very large sizes may reveal a few spots that
             don't reflow perfectly yet.
+          </p>
+        </SectionInfo>
+      </div>
+
+      <div
+        id="sec-a11y-contrast"
+        data-settings-section
+        className="mt-5 border-t border-border pt-4"
+      >
+        <div className="flex items-center justify-between gap-2">
+          <label className={SECTION_HEAD}>Contrast</label>
+          {contrast !== "aa" && <ResetLink onReset={() => setContrast("aa")} />}
+        </div>
+        <div className={ROW}>
+          <span className="text-sm text-ink2">Text &amp; edge contrast</span>
+          <SegmentedControl value={contrast} onChange={setContrast} options={CONTRAST_OPTIONS} />
+        </div>
+        <SectionInfo helpId="settings-a11y-contrast">
+          <p>
+            Sets how strongly PM's text and edges stand out from the background. “AA” meets the
+            recommended 4.5:1 for body text; “High” goes further (AAA, 7:1) and firms up the
+            faintest text and the borders. “Legacy” is PM's original, softer ramp.
           </p>
         </SectionInfo>
       </div>
@@ -162,8 +193,8 @@ export function AccessibilitySettings() {
         onReset={resetAccessibility}
         confirmBody={
           <p>
-            This sets text size, density, motion, the legible font, and the colour-blind palette
-            back to their defaults. Your theme (system, mode, accent) isn't affected.
+            This sets text size, contrast, density, motion, the legible font, and the colour-blind
+            palette back to their defaults. Your theme (system, mode, accent) isn't affected.
           </p>
         }
       />

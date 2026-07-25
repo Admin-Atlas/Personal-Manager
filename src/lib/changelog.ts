@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.69.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "The Accessibility tab gains a Contrast control -- Legacy, AA, or High -- completing the accessibility set. A fresh install now defaults to AA, which meets the recommended 4.5:1 for body text; in practice PM's text was already almost there, so the only real change is that the very faintest label text is nudged a touch clearer. High goes all the way to AAA (7:1) and also firms up hint text and borders for maximum legibility. As with density, if you've been using PM already you keep the original Legacy ramp untouched -- switch to AA or High whenever you like, or Reset the tab to the compliant default. A built-in audit now checks every theme against these contrast targets so they can't quietly regress.",
+    ],
+  },
+  {
     version: "3.68.0-alpha",
     date: "2026-07-25",
     highlights: [

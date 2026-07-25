@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The one-time density legacy-pin migration (PR: density axis). `standard` (WCAG 2.5.8) is the
-// fresh-install default, but an existing install must be pinned to `compact` so the update disturbs
-// nothing — and the user can Reset (or pick) their way to the compliant sizing. See initialDensity.
+// The one-time legacy-pin migration shared by the two axes whose compliant default differs from
+// today (density → `standard`/WCAG 2.5.8, contrast → `aa`/WCAG 1.4.3). A fresh install gets the
+// compliant default; an existing install is pinned to the legacy value so the update disturbs
+// nothing, and the user can Reset (or pick) their way up. See initialDensity / initialContrast.
 
 import { describe, expect, it } from "vitest";
-import { initialDensity } from "./ThemeContext";
+import { initialDensity, initialContrast } from "./ThemeContext";
 
 describe("initialDensity — the density legacy pin", () => {
   it("gives a genuinely fresh install the compliant default (standard)", () => {
@@ -26,5 +27,18 @@ describe("initialDensity — the density legacy pin", () => {
   it("falls back to the default for a corrupt stored value", () => {
     expect(initialDensity("enormous", true)).toBe("standard");
     expect(initialDensity("", false)).toBe("standard");
+  });
+});
+
+describe("initialContrast — the contrast legacy pin", () => {
+  it("gives a fresh install the compliant default (aa) and pins an existing install to legacy", () => {
+    expect(initialContrast(null, false)).toBe("aa");
+    expect(initialContrast(null, true)).toBe("legacy");
+  });
+
+  it("lets a stored value win, and falls back to the default when corrupt", () => {
+    expect(initialContrast("high", true)).toBe("high");
+    expect(initialContrast("legacy", false)).toBe("legacy");
+    expect(initialContrast("ultra", true)).toBe("aa");
   });
 });
