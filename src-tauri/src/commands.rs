@@ -3077,23 +3077,13 @@ pub fn cached_proposals(state: State<'_, AppState>) -> Result<Vec<CachedProposal
         .collect())
 }
 
-/// Append a document's Drive parent-folder as one plain-text line to the global filing profile — the
-/// preamble seam `review::propose` already reads (§4.5), so folder context arrives with no new
-/// parameter and no numeric prior. Returns the (owned) per-document profile: the folder line appended
-/// under any existing profile, the line alone when there is no profile, or the profile unchanged when
-/// there is no folder. A blank folder/profile is treated as absent.
-fn profile_with_folder(profile: Option<&str>, folder: Option<&str>) -> Option<String> {
-    let base = profile.map(str::trim).filter(|p| !p.is_empty());
-    let folder_line = folder
-        .map(str::trim)
-        .filter(|f| !f.is_empty())
-        .map(|f| format!("This file was found in Drive folder '{f}'."));
-    match (base, folder_line) {
-        (Some(p), Some(line)) => Some(format!("{p}\n{line}")),
-        (Some(p), None) => Some(p.to_string()),
-        (None, Some(line)) => Some(line),
-        (None, None) => None,
-    }
+/// A document's connector parent-folder, as a filing hint — trimmed, with blank treated as absent.
+/// It is passed to `review::propose` as its own argument so it lands in the USER message beside the
+/// document it describes. It used to be folded into the global profile preamble, which put it in the
+/// SYSTEM message: untrusted content in instructions position, and a per-document string inside the
+/// cached prefix that defeated prompt caching (#509).
+fn folder_context(folder: Option<&str>) -> Option<&str> {
+    folder.map(str::trim).filter(|f| !f.is_empty())
 }
 
 /// Propose project/tags/importance for the unreviewed documents, on demand (so a
@@ -3200,18 +3190,19 @@ pub async fn propose_metadata(
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
         Vec::new();
     for p in pending {
-        // Fold this document's Drive folder into its own copy of the profile preamble — the same
-        // plain-text seam that carries the Learning-You preferences. `propose` is called once per
-        // document, so a folder line can never leak into another document's prompt; the folder BIASES
-        // the proposal but never pre-assigns a project (the LLM proposal stays the review checkpoint).
-        let doc_profile = profile_with_folder(profile.as_deref(), p.folder.as_deref());
+        // The global profile and this document's folder go in as separate arguments: the profile is
+        // run-wide and stays in the cached system prefix, the folder is per-document and rides in the
+        // user message as data (#509). `propose` is called once per document, so a folder can never
+        // leak into another document's prompt; it BIASES the proposal but never pre-assigns a project
+        // (the LLM proposal stays the review checkpoint).
         let (mut proposal, usage_info) = review::propose(
             &app,
             &plan,
             &p.title,
             &p.body,
             &projects,
-            doc_profile.as_deref(),
+            profile.as_deref(),
+            folder_context(p.folder.as_deref()),
         )
         .await;
         // The served model, for the proposal cache's `model` column — captured before `usage_info`
@@ -8391,30 +8382,13 @@ mod tests {
     }
 
     #[test]
-    fn profile_with_folder_appends_folder_as_a_plain_line() {
-        // Folder line appends under an existing profile (the Learning-You preamble seam).
-        assert_eq!(
-            profile_with_folder(Some("Files like the user does."), Some("Taxes 2025")).as_deref(),
-            Some("Files like the user does.\nThis file was found in Drive folder 'Taxes 2025'."),
-        );
-        // No profile yet → the folder line stands alone as the whole preamble.
-        assert_eq!(
-            profile_with_folder(None, Some("Taxes 2025")).as_deref(),
-            Some("This file was found in Drive folder 'Taxes 2025'."),
-        );
-        // No folder → the profile is passed through untouched.
-        assert_eq!(
-            profile_with_folder(Some("Keep it."), None).as_deref(),
-            Some("Keep it."),
-        );
-        // Nothing on either side, and blank/whitespace on either side, collapse to None (no empty line).
-        assert_eq!(profile_with_folder(None, None), None);
-        assert_eq!(profile_with_folder(Some("  "), Some("  ")), None);
-        assert_eq!(
-            profile_with_folder(None, Some("  ")),
-            None,
-            "a blank folder adds no line",
-        );
+    fn folder_context_trims_and_drops_blanks() {
+        assert_eq!(folder_context(Some("Taxes 2025")), Some("Taxes 2025"));
+        assert_eq!(folder_context(Some("  Taxes 2025  ")), Some("Taxes 2025"));
+        // A document with no folder concept (vault / chat / photo), and a blank one, add nothing.
+        assert_eq!(folder_context(None), None);
+        assert_eq!(folder_context(Some("   ")), None);
+        assert_eq!(folder_context(Some("")), None);
     }
 
     /// A throwaway encrypted store (also exercises the migration-in-transaction
