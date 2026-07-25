@@ -64,7 +64,7 @@ release remain the open post-v1 work.
     convention: `no-restricted-imports` in `eslint.config.js` bans `@tauri-apps/api/core`
     everywhere but this file, and the `frontend` CI job (pr.yml) runs it.
   - `src/lib/types.ts` — shared types mirroring the Rust structs.
-  - `src/components/` — the nav surfaces (`Sidebar` → Focus / Chat / Documents / Review /
+  - `src/components/` — the nav surfaces (`Sidebar` → Focus / Chats / Documents / Review /
     Map / Calendar / Pinboard, plus the capability-gated Teach + Dev): `FocusView` (status
     cards + triage + milestones + the calendar agenda + the daily briefing), `ProjectView`
     (per-project files + scoped chat), `ChatView` / `Composer` (+ `ContextMeter`,

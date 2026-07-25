@@ -48,7 +48,7 @@ const KIND_ORDER: ItemKind[] = ["project", "file", "conversation", "goto"];
 
 const NAV_DESTS: { label: string; view: View }[] = [
   { label: "Focus", view: "focus" },
-  { label: "Chat", view: "chat" },
+  { label: "Chats", view: "chat" },
   { label: "Calendar", view: "calendar" },
   { label: "Documents", view: "documents" },
   { label: "Review", view: "review" },

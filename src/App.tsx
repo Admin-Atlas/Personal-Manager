@@ -427,15 +427,19 @@ export default function App() {
   async function refreshConversations(selectFirst = false, deferMessages = false) {
     const list = await listConversations();
     setConversations(list);
-    if (selectFirst && list.length > 0) {
+    // Auto-select a GLOBAL chat: the Chats tab's Global-chats section lists only unscoped chats, so
+    // selecting a project-scoped one would open a conversation with no visible row to match it.
+    // Falls back to the newest of anything when there are no global chats at all.
+    const first = list.find((c) => c.project == null || c.project === "") ?? list[0];
+    if (selectFirst && first) {
       if (deferMessages) {
         // Prime the selection (so the title header renders) but skip the getMessages round-trip; the
         // one-shot effect below loads it when chat is first opened (F-09). Every other caller passes
         // deferMessages=false and loads eagerly, exactly as before.
-        setActiveId(list[0].id);
-        primedConvId.current = list[0].id;
+        setActiveId(first.id);
+        primedConvId.current = first.id;
       } else {
-        await selectConversation(list[0].id);
+        await selectConversation(first.id);
       }
     }
   }
@@ -617,9 +621,14 @@ export default function App() {
     await refreshConversations();
   }
 
-  // Move a global-list conversation into a project (or back to global). The global list shows every
-  // chat regardless of scope, so the moved row simply re-labels and stays put — a refresh is enough,
-  // and the on-screen chat (if it's the one moved) re-scopes its retrieval on its next send. Card B.
+  // Move a global-list conversation into a project (or back to global). Card B.
+  //
+  // The Chats tab now splits the roster, so a chat moved INTO a project leaves the Global-chats
+  // section it was listed in. If that chat is the one on screen, clear to a fresh one rather than
+  // leaving the user looking at a conversation with no row anywhere in the sidebar — the same
+  // courtesy `useProjectChat.moveConversation` already does when a chat leaves an open project.
+  // (Before the split every chat appeared in one flat list, so the row simply re-labelled and a
+  // plain refresh was enough.)
   async function handleMoveConversation(id: number, project: string | null) {
     try {
       await setConversationProject(id, project);
@@ -627,6 +636,7 @@ export default function App() {
       chat.setError(String(e));
       return;
     }
+    if (project != null && project !== "" && activeIdRef.current === id) newConversation();
     await refreshConversations();
   }
 
@@ -842,6 +852,7 @@ export default function App() {
                 resizing={leftBar.resizing}
                 view={view}
                 onNavigate={setView}
+                onOpenProject={openProject}
                 conversations={inProject ? projectChat.conversations : conversations}
                 activeId={inProject ? projectChat.convId : activeId}
                 reviewCount={reviewCount}

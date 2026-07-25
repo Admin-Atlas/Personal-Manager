@@ -21,8 +21,8 @@ export const HELP: Record<string, HelpEntry> = {
     body: "Your home screen: every active project on one page, each with a single status that answers 'should I look at this now?' — Due soon, Quick win, Take a look, Blocked, Part of, or On track. Click a project to narrow everything to just it.",
   },
   "nav-chat": {
-    title: "Chat",
-    body: "Ask questions in plain language. PM answers using your own documents and shows which files it drew from, so you can trust and trace every answer.",
+    title: "Chats",
+    body: "Ask questions in plain language. PM answers using your own documents and shows which files it drew from, so you can trust and trace every answer. The tab lists your projects alongside your global chats: open a project to work inside it with its own files and its own history, or start a global chat to search everything at once.",
   },
   "nav-calendar": {
     title: "Calendar",
@@ -53,8 +53,8 @@ export const HELP: Record<string, HelpEntry> = {
     body: "Developer mode's inspection tab: read-only views of PM's internal state — raw tables, row counts, the corrections log, and system & build info. For debugging and watching how PM works; nothing here changes your data. Turn it on or off under Settings → Developer.",
   },
   "conversations-list": {
-    title: "Conversations",
-    body: "Your past chats. Click one to reopen it; '+ New' starts a fresh conversation.",
+    title: "Projects & Global chats",
+    body: "Two foldable lists. 'Projects' is every project PM knows about, with how many chats each one holds — click through to open that project, where its files sit beside a chat that searches only it. 'Global chats' is your chats that belong to no project, which search everything; click one to reopen it, or '+ New' to start another. Moving a chat into a project with the 📁 button takes it out of this list and into that project's own history.",
   },
   "sidebar-models": {
     title: "Models in use",
