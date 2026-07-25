@@ -34,6 +34,8 @@ import { WhatsNew } from "./components/WhatsNew";
 import { Skeleton } from "./components/ui";
 import { HelpContext } from "./lib/help";
 import { ReaderProvider } from "./lib/reader";
+import { BriefingProvider } from "./lib/briefing";
+import { BriefingPanel } from "./components/BriefingPanel";
 import { installAxisScrollNormalizer } from "./lib/scrollAxis";
 import { useResizable } from "./lib/useResizable";
 import { CollapseTab } from "./components/CollapseTab";
@@ -809,238 +811,253 @@ export default function App() {
     <HelpContext.Provider value={{ enabled: helpMode, setEnabled: updateHelpMode }}>
       {/* The document reader mounts once here so any surface — Documents, a project's file list, a
           chat citation — can open it via useReader(). Closes itself when the top-level view changes. */}
-      <ReaderProvider view={view} onOpenProject={openProject}>
-        <div className={`flex h-full flex-col bg-bg text-ink ${helpMode ? "help-mode" : ""}`}>
-          <UpdateBanner update={update} />
-          {metaWarning && (
-            <div
-              role="alert"
-              className="flex items-start justify-between gap-3 border-b border-border bg-accent-soft px-4 py-2 text-sm text-ink2"
-            >
-              <span>{metaWarning}</span>
-              <button
-                className="shrink-0 font-medium text-ink3 underline underline-offset-2 hover:text-ink"
-                onClick={() => setMetaWarning(null)}
+      {/* The daily briefing is loaded once here rather than per-surface: the Focus card, the
+          sidebar panel and the floating panel can all be mounted at once, and the backend's
+          regenerate command has no single-flight guard of its own. */}
+      <BriefingProvider>
+        <ReaderProvider view={view} onOpenProject={openProject}>
+          <div className={`flex h-full flex-col bg-bg text-ink ${helpMode ? "help-mode" : ""}`}>
+            <UpdateBanner update={update} />
+            {metaWarning && (
+              <div
+                role="alert"
+                className="flex items-start justify-between gap-3 border-b border-border bg-accent-soft px-4 py-2 text-sm text-ink2"
               >
-                Dismiss
-              </button>
-            </div>
-          )}
-          {vaultFaultNotice && (
-            <div
-              role="alert"
-              className="flex items-start justify-between gap-3 border-b border-border px-4 py-2 text-sm text-st-due"
-              style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
-            >
-              <span>{vaultFaultNotice} You can fix this from Settings → Vault.</span>
-              <button
-                className="shrink-0 font-medium underline underline-offset-2"
-                onClick={() => setVaultFaultNotice(null)}
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
-          <div
-            className={`relative flex flex-1 overflow-hidden ${leftBar.resizing ? "select-none" : ""}`}
-          >
-            {leftBar.collapsed && <CollapseTab side="left" onExpand={leftBar.expand} />}
-            {!leftBar.collapsed && (
-              <Sidebar
-                width={leftBar.width}
-                onStartResize={leftBar.startResize}
-                resizing={leftBar.resizing}
-                view={view}
-                onNavigate={setView}
-                onOpenProject={openProject}
-                conversations={inProject ? projectChat.conversations : conversations}
-                activeId={inProject ? projectChat.convId : activeId}
-                reviewCount={reviewCount}
-                onSelect={
-                  inProject
-                    ? projectChat.openConversation
-                    : (id) => {
-                        setView("chat");
-                        void selectConversation(id);
-                      }
-                }
-                onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
-                onMove={inProject ? projectChat.moveConversation : handleMoveConversation}
-                onNew={
-                  inProject
-                    ? projectChat.newChat
-                    : () => {
-                        setView("chat");
-                        newConversation();
-                      }
-                }
-                onOpenSettings={() => setShowSettings(true)}
-                onOpenWhatsNew={() => setShowWhatsNew(true)}
-                onOpenPalette={() => setShowPalette(true)}
-                chatModel={settings?.chat_models[0] ?? null}
-                backgroundModel={settings?.background_models[0] ?? null}
-                chatFallbacks={
-                  settings?.chat_auto_switch ? Math.max(0, settings.chat_models.length - 1) : 0
-                }
-                backgroundFallbacks={
-                  settings?.background_auto_switch
-                    ? Math.max(0, settings.background_models.length - 1)
-                    : 0
-                }
-                localAi={localAi}
-              />
-            )}
-
-            {view === "focus" ? (
-              <main className="flex h-full flex-1 flex-col">
-                <FocusView onOpenProject={openProject} onAsk={askInChat} />
-              </main>
-            ) : view === "project" && selectedProject ? (
-              <main className="flex h-full flex-1 flex-col">
-                <ProjectView
-                  project={selectedProject}
-                  chat={projectChat}
-                  localAi={localAi}
-                  focusDocId={selectedDocId}
-                  onOpenChatCitation={openChatCitation}
-                  onUpgrade={handleUpgrade}
-                  onBack={() => setView("focus")}
-                />
-              </main>
-            ) : view === "calendar" ? (
-              <main className="flex h-full flex-1 flex-col">
-                <CalendarView
-                  onOpenProject={openProject}
-                  onOpenPinboard={() => setView("pinboard")}
-                />
-              </main>
-            ) : view === "documents" ? (
-              <main className="flex h-full flex-1 flex-col">
-                {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
-                <DocumentsView onReviewClick={teachVisible ? () => setView("review") : undefined} />
-              </main>
-            ) : view === "review" ? (
-              <main className="flex h-full flex-1 flex-col">
-                <ReviewView
-                  onChanged={refreshReviewCount}
-                  onOpenSettings={() => setShowSettings(true)}
-                />
-              </main>
-            ) : view === "teach" ? (
-              <main className="flex h-full flex-1 flex-col">
-                <TeachView />
-              </main>
-            ) : view === "graph" ? (
-              <main className="flex h-full flex-1 flex-col">
-                <GraphView />
-              </main>
-            ) : view === "pinboard" ? (
-              // min-w-0 lets the oversized pinboard board stay contained in its own
-              // overflow-auto scroller instead of inflating <main> and shoving the board
-              // header's right-aligned buttons off-screen.
-              <main className="flex h-full min-w-0 flex-1 flex-col">
-                <PinboardView />
-              </main>
-            ) : view === "dev" ? (
-              <main className="flex h-full flex-1 flex-col">
-                <DevView />
-              </main>
-            ) : (
-              <main className="flex h-full flex-1 flex-col">
-                {chat.error && (
-                  <div
-                    className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
-                    style={{
-                      background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                    }}
-                  >
-                    {chat.error}
-                  </div>
-                )}
-                {chat.fallback && (
-                  <FallbackStrip fallback={chat.fallback} onDismiss={chat.dismissFallback} />
-                )}
-                {activeConv && (
-                  <div className="flex items-center border-b border-rule px-4 py-2">
-                    <ConversationTitle
-                      conversationId={activeConv.id}
-                      title={activeConv.title}
-                      onRenamed={(title) =>
-                        setConversations((prev) =>
-                          prev.map((c) => (c.id === activeConv.id ? { ...c, title } : c)),
-                        )
-                      }
-                    />
-                  </div>
-                )}
-                <ChatView
-                  messages={chat.messages}
-                  prompts={chat.prompts}
-                  confidences={chat.confidences}
-                  providers={chat.providers}
-                  showProvenance={!!localAi?.configured}
-                  streaming={chat.streaming}
-                  onOpenChatCitation={openChatCitation}
-                  focusTurn={focusTurn}
-                />
-                <Composer
-                  disabled={chat.sending}
-                  onSend={handleSend}
-                  leftTools={
-                    <div className="flex items-center gap-2">
-                      <ContextMeter
-                        conversationId={activeId}
-                        refreshKey={chat.messages.length}
-                        onUpgrade={handleUpgrade}
-                      />
-                      <ProviderChip status={localAi} />
-                    </div>
-                  }
-                  rightTools={<RetrievalExplainPanel messages={chat.messages} />}
-                />
-              </main>
-            )}
-
-            {showSettings && (
-              <div className="absolute inset-0 z-50" style={{ background: "var(--scrim)" }}>
-                <SettingsView
-                  onboarding={false}
-                  onClose={() => {
-                    setShowSettings(false);
-                    refreshSettings();
-                  }}
-                  onOpenDev={() => {
-                    setShowSettings(false);
-                    setView("dev");
-                  }}
-                  onOpenTeach={() => {
-                    setShowSettings(false);
-                    setView("teach");
-                  }}
-                />
+                <span>{metaWarning}</span>
+                <button
+                  className="shrink-0 font-medium text-ink3 underline underline-offset-2 hover:text-ink"
+                  onClick={() => setMetaWarning(null)}
+                >
+                  Dismiss
+                </button>
               </div>
             )}
-
-            {/* WhatsNew renders its own Modal (scrim + centering, kept below the title bar), so it
-                needs no extra wrapper scrim here — that only double-darkened the content. */}
-            {showWhatsNew && <WhatsNew onClose={closeWhatsNew} currentVersion={appVersion} />}
-
-            {showPalette && (
-              <CommandPalette
-                onClose={() => setShowPalette(false)}
-                onOpenProject={openProject}
-                onOpenConversation={(id) => {
-                  setView("chat");
-                  void selectConversation(id);
-                }}
-                onNavigate={setView}
-                onOpenSettings={() => setShowSettings(true)}
-              />
+            {vaultFaultNotice && (
+              <div
+                role="alert"
+                className="flex items-start justify-between gap-3 border-b border-border px-4 py-2 text-sm text-st-due"
+                style={{ background: "color-mix(in oklab, var(--st-due) 15%, transparent)" }}
+              >
+                <span>{vaultFaultNotice} You can fix this from Settings → Vault.</span>
+                <button
+                  className="shrink-0 font-medium underline underline-offset-2"
+                  onClick={() => setVaultFaultNotice(null)}
+                >
+                  Dismiss
+                </button>
+              </div>
             )}
+            <div
+              className={`relative flex flex-1 overflow-hidden ${leftBar.resizing ? "select-none" : ""}`}
+            >
+              {leftBar.collapsed && <CollapseTab side="left" onExpand={leftBar.expand} />}
+              {!leftBar.collapsed && (
+                <Sidebar
+                  width={leftBar.width}
+                  onStartResize={leftBar.startResize}
+                  resizing={leftBar.resizing}
+                  view={view}
+                  onNavigate={setView}
+                  onOpenProject={openProject}
+                  conversations={inProject ? projectChat.conversations : conversations}
+                  activeId={inProject ? projectChat.convId : activeId}
+                  reviewCount={reviewCount}
+                  onSelect={
+                    inProject
+                      ? projectChat.openConversation
+                      : (id) => {
+                          setView("chat");
+                          void selectConversation(id);
+                        }
+                  }
+                  onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
+                  onMove={inProject ? projectChat.moveConversation : handleMoveConversation}
+                  onNew={
+                    inProject
+                      ? projectChat.newChat
+                      : () => {
+                          setView("chat");
+                          newConversation();
+                        }
+                  }
+                  onOpenSettings={() => setShowSettings(true)}
+                  onOpenWhatsNew={() => setShowWhatsNew(true)}
+                  onOpenPalette={() => setShowPalette(true)}
+                  chatModel={settings?.chat_models[0] ?? null}
+                  backgroundModel={settings?.background_models[0] ?? null}
+                  chatFallbacks={
+                    settings?.chat_auto_switch ? Math.max(0, settings.chat_models.length - 1) : 0
+                  }
+                  backgroundFallbacks={
+                    settings?.background_auto_switch
+                      ? Math.max(0, settings.background_models.length - 1)
+                      : 0
+                  }
+                  localAi={localAi}
+                />
+              )}
+
+              {view === "focus" ? (
+                <main className="flex h-full flex-1 flex-col">
+                  <FocusView onOpenProject={openProject} onAsk={askInChat} />
+                </main>
+              ) : view === "project" && selectedProject ? (
+                <main className="flex h-full flex-1 flex-col">
+                  <ProjectView
+                    project={selectedProject}
+                    chat={projectChat}
+                    localAi={localAi}
+                    focusDocId={selectedDocId}
+                    onOpenChatCitation={openChatCitation}
+                    onUpgrade={handleUpgrade}
+                    onBack={() => setView("focus")}
+                  />
+                </main>
+              ) : view === "calendar" ? (
+                <main className="flex h-full flex-1 flex-col">
+                  <CalendarView
+                    onOpenProject={openProject}
+                    onOpenPinboard={() => setView("pinboard")}
+                  />
+                </main>
+              ) : view === "documents" ? (
+                <main className="flex h-full flex-1 flex-col">
+                  {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
+                  <DocumentsView
+                    onReviewClick={teachVisible ? () => setView("review") : undefined}
+                  />
+                </main>
+              ) : view === "review" ? (
+                <main className="flex h-full flex-1 flex-col">
+                  <ReviewView
+                    onChanged={refreshReviewCount}
+                    onOpenSettings={() => setShowSettings(true)}
+                  />
+                </main>
+              ) : view === "teach" ? (
+                <main className="flex h-full flex-1 flex-col">
+                  <TeachView />
+                </main>
+              ) : view === "graph" ? (
+                <main className="flex h-full flex-1 flex-col">
+                  <GraphView />
+                </main>
+              ) : view === "pinboard" ? (
+                // min-w-0 lets the oversized pinboard board stay contained in its own
+                // overflow-auto scroller instead of inflating <main> and shoving the board
+                // header's right-aligned buttons off-screen.
+                <main className="flex h-full min-w-0 flex-1 flex-col">
+                  <PinboardView />
+                </main>
+              ) : view === "dev" ? (
+                <main className="flex h-full flex-1 flex-col">
+                  <DevView />
+                </main>
+              ) : (
+                <main className="flex h-full flex-1 flex-col">
+                  {chat.error && (
+                    <div
+                      className="border-b border-rule px-4 py-2 font-ui text-sm text-[var(--st-due)]"
+                      style={{
+                        background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+                      }}
+                    >
+                      {chat.error}
+                    </div>
+                  )}
+                  {chat.fallback && (
+                    <FallbackStrip fallback={chat.fallback} onDismiss={chat.dismissFallback} />
+                  )}
+                  {activeConv && (
+                    <div className="flex items-center border-b border-rule px-4 py-2">
+                      <ConversationTitle
+                        conversationId={activeConv.id}
+                        title={activeConv.title}
+                        onRenamed={(title) =>
+                          setConversations((prev) =>
+                            prev.map((c) => (c.id === activeConv.id ? { ...c, title } : c)),
+                          )
+                        }
+                      />
+                    </div>
+                  )}
+                  <ChatView
+                    messages={chat.messages}
+                    prompts={chat.prompts}
+                    confidences={chat.confidences}
+                    providers={chat.providers}
+                    showProvenance={!!localAi?.configured}
+                    streaming={chat.streaming}
+                    onOpenChatCitation={openChatCitation}
+                    focusTurn={focusTurn}
+                  />
+                  <Composer
+                    disabled={chat.sending}
+                    onSend={handleSend}
+                    leftTools={
+                      <div className="flex items-center gap-2">
+                        <ContextMeter
+                          conversationId={activeId}
+                          refreshKey={chat.messages.length}
+                          onUpgrade={handleUpgrade}
+                        />
+                        <ProviderChip status={localAi} />
+                      </div>
+                    }
+                    rightTools={<RetrievalExplainPanel messages={chat.messages} />}
+                  />
+                </main>
+              )}
+
+              {showSettings && (
+                <div className="absolute inset-0 z-50" style={{ background: "var(--scrim)" }}>
+                  <SettingsView
+                    onboarding={false}
+                    onClose={() => {
+                      setShowSettings(false);
+                      refreshSettings();
+                    }}
+                    onOpenDev={() => {
+                      setShowSettings(false);
+                      setView("dev");
+                    }}
+                    onOpenTeach={() => {
+                      setShowSettings(false);
+                      setView("teach");
+                    }}
+                  />
+                </div>
+              )}
+
+              {/* WhatsNew renders its own Modal (scrim + centering, kept below the title bar), so it
+                needs no extra wrapper scrim here — that only double-darkened the content. */}
+              {showWhatsNew && <WhatsNew onClose={closeWhatsNew} currentVersion={appVersion} />}
+
+              {showPalette && (
+                <CommandPalette
+                  onClose={() => setShowPalette(false)}
+                  onOpenProject={openProject}
+                  onOpenConversation={(id) => {
+                    setView("chat");
+                    void selectConversation(id);
+                  }}
+                  onNavigate={setView}
+                  onOpenSettings={() => setShowSettings(true)}
+                />
+              )}
+            </div>
+            {/* The floating briefing, mounted beside the help overlay so it outlives every tab switch and
+
+                sits after all the vault / lock / onboarding early returns above. Renders nothing unless the
+
+                user has switched it on. */}
+
+            <BriefingPanel />
+
+            <HelpOverlay />
           </div>
-          <HelpOverlay />
-        </div>
-      </ReaderProvider>
+        </ReaderProvider>
+      </BriefingProvider>
     </HelpContext.Provider>
   );
 }
