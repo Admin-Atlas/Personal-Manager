@@ -547,6 +547,49 @@ pub async fn prioritise_semantic_layout(app: AppHandle) -> Result<()> {
     precompute_semantic_layout(&app, false, true).await
 }
 
+// ---- "by project" layout cache --------------------------------------------
+//
+// The by-project arrangement is computed in the WEBVIEW (d3-force on a worker), unlike the semantic
+// one which is computed here. So the backend's only job is storage: it keeps the frontend's result
+// verbatim, as an opaque JSON string, and never interprets it. It lives in the encrypted store
+// rather than localStorage because coordinates keyed by document id are user data.
+//
+// Deliberately a single `settings` blob rather than rows in `doc_layout`: the force layout also
+// contains project HUB nodes, which are not documents and have no `documents(id)` to key on. One
+// blob keeps hubs and documents together at exact fidelity, needs no migration, and the frontend's
+// fingerprint invalidates the whole thing at once — so a deleted document cannot leave a stale
+// coordinate behind.
+
+/// `settings` key holding the frontend's cached by-project layout (fingerprint + positions).
+const PROJECT_LAYOUT_KEY: &str = "project_layout_cache";
+
+/// Refuse to store an absurd payload. A 1,000-node layout is a few tens of KB; this is far above any
+/// real map and exists so a frontend bug can't grow the settings row without bound.
+const PROJECT_LAYOUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The cached by-project layout as the frontend last wrote it, or `None` when nothing is stored.
+#[tauri::command]
+pub fn project_layout(state: State<'_, AppState>) -> Result<Option<String>> {
+    let conn = state.conn()?;
+    db::get_setting(&conn, PROJECT_LAYOUT_KEY)
+}
+
+/// Store the by-project layout the frontend just computed, so the next launch repaints instead of
+/// re-running the simulation. Passing `None` clears it.
+#[tauri::command]
+pub fn set_project_layout(state: State<'_, AppState>, cache: Option<String>) -> Result<()> {
+    let conn = state.conn()?;
+    match cache {
+        Some(json) => {
+            if json.len() > PROJECT_LAYOUT_MAX_BYTES {
+                return Err(Error::Other("map layout cache too large".into()));
+            }
+            db::set_setting(&conn, PROJECT_LAYOUT_KEY, &json)
+        }
+        None => db::delete_setting(&conn, PROJECT_LAYOUT_KEY),
+    }
+}
+
 /// Whether the optional t-SNE reducer is installed.
 #[tauri::command]
 pub fn optional_tsne_status(state: State<'_, AppState>) -> Result<TsneStatus> {

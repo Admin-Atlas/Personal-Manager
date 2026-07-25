@@ -10,11 +10,18 @@
 //   - getProjectLayout(documents) — what GraphView calls. A cache hit on the same document set returns
 //     the warmed layout immediately; otherwise it computes now (prioritised — no idle wait).
 //
+// Two cache tiers, both keyed on the same document-set fingerprint:
+//   1. in-memory, for the life of the session (leaving and returning to the Map is free);
+//   2. the encrypted store, so a RELAUNCH repaints instead of re-simulating — the cost that used to
+//      be paid on every single launch and that grows with the vault (#515).
+// Only node positions are stored; the rest of a layout is rebuilt from the document list in
+// microseconds. A stale or unreadable cache always falls back to computing, silently.
+//
 // The expensive force run lives in graphLayout.worker.ts (falling back to a synchronous run here if a
 // worker can't be created). This module owns only the cheap parts: building the node/link graph from
 // documents, and turning the returned positions into edges + a fit box for the canvas.
 
-import { listDocuments } from "./ipc";
+import { listDocuments, projectLayout, setProjectLayout } from "./ipc";
 import { simulate, type LayoutRequest, type LayoutResponse } from "./forceLayout";
 import type { Document, SemanticCoord } from "./types";
 
@@ -127,7 +134,22 @@ function docSetHash(documents: Document[]): string {
   return `${parts.length}|${parts.join(",")}`;
 }
 
-async function compute(documents: Document[]): Promise<BaseLayout> {
+/** A node's final coordinate. This — and only this — is what's worth persisting: everything else in
+ *  a `BaseLayout` is rebuilt from the document list in microseconds. */
+export interface NodePosition {
+  id: string;
+  x: number;
+  y: number;
+}
+
+interface Graph {
+  meta: Map<string, Omit<PositionedNode, "x" | "y">>;
+  links: { source: string; target: string }[];
+  projectNames: string[];
+}
+
+/** The node/link graph for a document set. Pure and cheap — the expensive part is positioning it. */
+function buildGraph(documents: Document[]): Graph {
   const projectNames = Array.from(new Set(documents.map((d) => d.project || "Unsorted")));
 
   const meta = new Map<string, Omit<PositionedNode, "x" | "y">>();
@@ -152,27 +174,25 @@ async function compute(documents: Document[]): Promise<BaseLayout> {
     });
   }
 
-  const simNodes = Array.from(meta.values()).map((n) => ({ id: n.id, radius: n.radius }));
   const links = documents.map((d) => ({
     source: `doc:${d.id}`,
     target: `project:${d.project || "Unsorted"}`,
   }));
 
-  const { positions } = await simulateLayout({
-    nodes: simNodes,
-    links,
-    width: MAP_WIDTH,
-    height: MAP_HEIGHT,
-  });
+  return { meta, links, projectNames };
+}
 
+/** Turn positions into the drawable layout: nodes, edges, and the fit box. Shared by a fresh
+ *  simulation and a restored cache, so a remembered layout is pixel-identical to a computed one. */
+function assemble(graph: Graph, positions: NodePosition[]): BaseLayout {
   const pos = new Map(positions.map((p) => [p.id, p]));
-  const nodes: PositionedNode[] = Array.from(meta.values()).map((n) => {
+  const nodes: PositionedNode[] = Array.from(graph.meta.values()).map((n) => {
     const p = pos.get(n.id);
     return { ...n, x: p?.x ?? 0, y: p?.y ?? 0 };
   });
 
   const at = (id: string) => pos.get(id) ?? { x: 0, y: 0 };
-  const edges: Edge[] = links.map((l) => {
+  const edges: Edge[] = graph.links.map((l) => {
     const s = at(l.source);
     const t = at(l.target);
     return { sx: s.x, sy: s.y, tx: t.x, ty: t.y };
@@ -188,7 +208,31 @@ async function compute(documents: Document[]): Promise<BaseLayout> {
   const height = Math.max(...ys) - minY + PAD;
   const bounds: Bounds = { minX, minY, width, height };
 
-  return { nodes, edges, bounds, viewBox: `${minX} ${minY} ${width} ${height}`, projectNames };
+  return {
+    nodes,
+    edges,
+    bounds,
+    viewBox: `${minX} ${minY} ${width} ${height}`,
+    projectNames: graph.projectNames,
+  };
+}
+
+/** Run the force simulation for a document set, returning the drawable layout and the raw positions
+ *  worth caching. */
+async function simulateFor(
+  documents: Document[],
+): Promise<{ layout: BaseLayout; positions: NodePosition[] }> {
+  const graph = buildGraph(documents);
+  const simNodes = Array.from(graph.meta.values()).map((n) => ({ id: n.id, radius: n.radius }));
+
+  const { positions } = await simulateLayout({
+    nodes: simNodes,
+    links: graph.links,
+    width: MAP_WIDTH,
+    height: MAP_HEIGHT,
+  });
+
+  return { layout: assemble(graph, positions), positions };
 }
 
 // ---- cache + public API ---------------------------------------------------
@@ -199,12 +243,60 @@ interface CacheEntry {
 }
 let cached: CacheEntry | null = null;
 
-/** Layout for this document set — the warmed result if the set is unchanged, otherwise computed now. */
+/** Bump to invalidate every stored layout after a change to the simulation or the node/link graph,
+ *  so a remembered layout can never be replayed under different rules. */
+const PERSISTED_VERSION = 1;
+
+/** What's written to the encrypted store: the fingerprint it was computed for, plus positions. */
+interface PersistedLayout {
+  v: number;
+  hash: string;
+  positions: NodePosition[];
+}
+
+/** Save the positions for this document set. Best-effort and silent: failing to persist only means
+ *  the next launch recomputes, which is exactly the old behaviour. */
+async function persist(hash: string, positions: NodePosition[]): Promise<void> {
+  try {
+    const payload: PersistedLayout = { v: PERSISTED_VERSION, hash, positions };
+    await setProjectLayout(JSON.stringify(payload));
+  } catch {
+    /* not worth surfacing — the layout is regenerable by definition */
+  }
+}
+
+/** Positions saved for exactly this document set, or null if there's nothing usable. A stale,
+ *  malformed, or unreadable cache is simply "no cache" — never an error the user sees. */
+async function readPersisted(hash: string): Promise<NodePosition[] | null> {
+  try {
+    const raw = await projectLayout();
+    if (!raw) return null;
+    const saved = JSON.parse(raw) as PersistedLayout;
+    if (saved.v !== PERSISTED_VERSION || saved.hash !== hash) return null;
+    return Array.isArray(saved.positions) ? saved.positions : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Positions for this document set: remembered from a previous launch when the set is unchanged,
+ *  otherwise simulated now and remembered for next time. */
+async function loadOrCompute(documents: Document[], hash: string): Promise<BaseLayout> {
+  const saved = await readPersisted(hash);
+  if (saved) return assemble(buildGraph(documents), saved);
+
+  const { layout, positions } = await simulateFor(documents);
+  void persist(hash, positions);
+  return layout;
+}
+
+/** Layout for this document set — the warmed result if the set is unchanged, otherwise the layout
+ *  remembered from a previous launch, otherwise computed now. */
 export function getProjectLayout(documents: Document[]): Promise<BaseLayout> | null {
   if (documents.length === 0) return null;
   const hash = docSetHash(documents);
   if (cached?.hash === hash) return cached.promise;
-  const promise = compute(documents);
+  const promise = loadOrCompute(documents, hash);
   cached = { hash, promise };
   return promise;
 }
