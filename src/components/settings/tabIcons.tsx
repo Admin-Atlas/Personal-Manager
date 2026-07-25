@@ -127,15 +127,17 @@ export function LocalAiIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
-/** Accessibility — the standing figure. */
+/** Accessibility — the universal access symbol: a figure with open arms inside a ring. Deliberately
+ *  not the seated/wheeled figure it replaced: this tab is text size, motion, contrast and density,
+ *  which is everyone's, and the ringed figure is the symbol that says so. */
 export function AccessibilityIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <Icon {...props}>
-      <circle cx="16" cy="4" r="1" />
-      <path d="m18 19 1-7-6 1" />
-      <path d="m5 8 3-3 5.5 3-2.36 3.5" />
-      <path d="M4.24 14.5a5 5 0 0 0 6.88 6" />
-      <path d="M13.76 17.5a5 5 0 0 0-6.88-6" />
+      <circle cx="12" cy="12" r="10" />
+      <circle cx="12" cy="7.2" r="1" />
+      <path d="M6.9 10.4c3.4.9 6.8.9 10.2 0" />
+      <path d="M12 11 9.4 17.4" />
+      <path d="m12 11 2.6 6.4" />
     </Icon>
   );
 }

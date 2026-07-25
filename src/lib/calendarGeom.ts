@@ -57,3 +57,29 @@ export function resolveRangeBounds(
   if (range === "full") return FULL_BOUNDS;
   return sunriseSunsetBounds(date, coords) ?? DAY_FALLBACK;
 }
+
+/** Never divide by a degenerate window (a bad override, or bounds that resolved to nothing). */
+const MIN_WINDOW_HOURS = 1;
+
+/**
+ * The pixel height of one hour row: stretch the framed window to fill `bodyHeight` exactly, so
+ * changing the range genuinely re-scales the grid rather than only re-aiming the scroll. This is the
+ * whole point of the Work/Day/24h choice — a narrow window makes tall rows, a wide one thin ones.
+ *
+ * `minRowHeight` is the legibility floor. Below it the window stops shrinking to fit and the grid
+ * scrolls instead, which is right for a full-height calendar; a short embedded pane wants a much
+ * lower floor, because there "everything at once" is the reason it was asked for. Kept pure and
+ * here (not in the view) because the floor silently swallowing the difference between two ranges is
+ * exactly the bug this fixes, and arithmetic that subtle deserves a test.
+ */
+export function hourRowHeight(
+  bodyHeight: number,
+  windowHours: number,
+  minRowHeight: number,
+): number {
+  const hours = Math.max(windowHours, MIN_WINDOW_HOURS);
+  // Before the first measurement, fall back to the floor's own comfortable double rather than
+  // painting a collapsed grid for a frame.
+  if (!(bodyHeight > 0)) return minRowHeight * 2;
+  return Math.max(minRowHeight, bodyHeight / hours);
+}
