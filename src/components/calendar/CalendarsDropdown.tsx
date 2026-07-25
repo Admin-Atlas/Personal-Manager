@@ -20,6 +20,10 @@ interface Props {
   hidden: Set<string>;
   onToggle: (calendarId: string) => void;
   colorOf: (calendarId: string) => string;
+  /** Per-source shape slot for the colour-blind axis. This dropdown is the legend, so it shows the
+   *  same shape beside each calendar name that the grid dots use — that mapping is what makes the
+   *  shaped dots readable. */
+  shapeOf?: (calendarId: string) => number | undefined;
 }
 
 interface Group {
@@ -61,7 +65,14 @@ function OverlayRow({
   );
 }
 
-export function CalendarsDropdown({ accounts, calendars, hidden, onToggle, colorOf }: Props) {
+export function CalendarsDropdown({
+  accounts,
+  calendars,
+  hidden,
+  onToggle,
+  colorOf,
+  shapeOf,
+}: Props) {
   const groups = useMemo<Group[]>(() => {
     const labelFor = new Map(accounts.map((a) => [a.id, a.email || a.label] as const));
     const bySource = new Map<string, Calendar[]>();
@@ -141,7 +152,11 @@ export function CalendarsDropdown({ accounts, calendars, hidden, onToggle, color
                         onChange={() => onToggle(c.id)}
                         className="accent-[var(--accent)]"
                       />
-                      <SourceDot color={colorOf(c.id)} className={cn(!shown && "opacity-40")} />
+                      <SourceDot
+                        color={colorOf(c.id)}
+                        shapeIndex={shapeOf?.(c.id)}
+                        className={cn(!shown && "opacity-40")}
+                      />
                       <span className={cn("truncate", !shown && "text-ink4")}>{c.name}</span>
                     </label>
                   </li>

@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.79.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "The colour-blind-safe palette now backs its colours with shapes. When the Accessibility tab's colour-blind option is on, each calendar's dot in the Month grid takes a distinct shape as well as a colour -- a circle, diamond, triangle, square, and so on -- and the calendars menu shows the same shape beside each name, so you can tell sources apart by shape even where two colours look alike (or in greyscale). It only changes those small source dots, and only when the option is on; everything else, including event and project labels, is untouched.",
+    ],
+  },
+  {
     version: "3.78.0-alpha",
     date: "2026-07-25",
     highlights: [

@@ -39,6 +39,8 @@ interface Props {
   hidden: Set<string>;
   onToggleCalendar: (calendarId: string) => void;
   colorOf: (calendarId: string) => string;
+  /** Per-source shape slot for the colour-blind axis (forwarded to the legend). */
+  shapeOf?: (calendarId: string) => number | undefined;
   onRefresh: () => void;
   syncing: boolean;
   lastSync: string | null;
@@ -72,6 +74,7 @@ export function CalendarHeader({
   hidden,
   onToggleCalendar,
   colorOf,
+  shapeOf,
   onRefresh,
   syncing,
   lastSync,
@@ -131,6 +134,7 @@ export function CalendarHeader({
             hidden={hidden}
             onToggle={onToggleCalendar}
             colorOf={colorOf}
+            shapeOf={shapeOf}
           />
         </div>
         <Button variant="secondary" onClick={onRefresh} disabled={syncing} title="Refresh now">

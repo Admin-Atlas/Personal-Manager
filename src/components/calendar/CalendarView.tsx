@@ -51,7 +51,14 @@ import {
 } from "../../lib/calendar-layout";
 import { pinboardEntries, type PinboardEntry } from "../../lib/pinboard/calendarEntries";
 import { PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
-import { milestoneColor, pinboardColor, sourceColors, useTheme, useUserTime } from "../../theme";
+import {
+  milestoneColor,
+  pinboardColor,
+  sourceColors,
+  sourceShapeIndex,
+  useTheme,
+  useUserTime,
+} from "../../theme";
 import { Skeleton } from "../ui";
 import { useNowTick } from "../../lib/useNowTick";
 import { CalendarEventPopover } from "./parts/CalendarEventPopover";
@@ -353,6 +360,14 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     };
   }, [overview, system, accent, colorblind]);
 
+  // The per-source SHAPE slot, parallel to colorOf, for the colour-blind axis's redundant dot shapes.
+  // Only real calendars get a slot; overlays (milestones/pinboard) return undefined → plain circle,
+  // and they already carry their own distinct hues. Keyed only on the calendar set (like sourceColors).
+  const shapeOf = useMemo(() => {
+    const slots = sourceShapeIndex(overview?.calendars.map((c) => c.id) ?? []);
+    return (calendarId: string) => slots.get(calendarId);
+  }, [overview]);
+
   // Project milestones as synthetic all-day events — a first-party overlay, not synced. Only draw a
   // milestone that ISN'T already on the calendar as a real event: PM-native (unlinked) ones, plus
   // linked ones whose event is `event_missing` (out of the mirror band / deselected / deleted), which
@@ -592,6 +607,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             cursor={cursor}
             events={visibleEvents}
             colorOf={colorOf}
+            shapeOf={shapeOf}
             onFocusDate={onFocusDate}
             now={now}
             onEventClick={onEventClick}
@@ -647,6 +663,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         hidden={hidden}
         onToggleCalendar={onToggleCalendar}
         colorOf={colorOf}
+        shapeOf={shapeOf}
         onRefresh={onRefresh}
         syncing={syncing}
         lastSync={overview?.last_sync ?? null}
