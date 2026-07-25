@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.75.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Today's briefing can now follow you around. Two new switches in Settings > General > Focus put it at the bottom of the sidebar, or in a small floating panel you can drag and resize that stays put as you move between tabs. Both are off unless you turn them on, and wherever it appears it is the same briefing -- refreshing any one of them updates them all.",
+      "Every copy of the briefing now has a refresh button, and PM only ever generates one at a time, so two of them on screen can no longer both start the assistant writing at once.",
+    ],
+  },
+  {
     version: "3.74.0-alpha",
     date: "2026-07-25",
     highlights: [

@@ -10,6 +10,8 @@ import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme } from "../theme";
 import { Button, Collapsible, ConfirmDialog, Modal, NavItem, Select } from "./ui";
 import { globalChats, projectChats } from "../lib/chatNav";
+import { Briefing } from "./Briefing";
+import { readBriefingInSidebar, subscribeBriefingPrefs } from "../lib/briefingPrefs";
 
 export type View =
   | "focus"
@@ -196,6 +198,10 @@ export function Sidebar({
     [conversations, knownProjects],
   );
   const unscoped = useMemo(() => globalChats(conversations), [conversations]);
+  // Settings renders as an overlay over a still-mounted Sidebar, so a read-at-mount would leave the
+  // toggle looking broken until the user navigated away and back. Subscribe instead.
+  const [briefingInSidebar, setBriefingInSidebar] = useState(readBriefingInSidebar);
+  useEffect(() => subscribeBriefingPrefs(() => setBriefingInSidebar(readBriefingInSidebar())), []);
   return (
     <aside
       style={{ width }}
@@ -431,6 +437,16 @@ export function Sidebar({
       )}
 
       <div className="shrink-0 border-t border-border p-2">
+        {/* Today's briefing, off by default and switched on in Settings. It sits at the top of the
+            footer — above the model rows at Standard/Power, above What's New at Minimal — so it is
+            pinned outside the scroller above and stays put whichever tab is open. `Briefing` renders
+            nothing at all when there's no briefing yet, so an enabled-but-empty store leaves no
+            stray box or divider behind. */}
+        {briefingInSidebar && (
+          <div className="mb-1 border-b border-border px-1 pb-2">
+            <Briefing variant="panel" />
+          </div>
+        )}
         {/* The model footer is an optional feature reveal — hidden whole in Minimal mode. Gate the
             entire button (not just the rows) so no empty, hover-highlighting ghost box is left
             behind and the divider sits directly above "What's New". */}

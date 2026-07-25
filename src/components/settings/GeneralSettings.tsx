@@ -36,6 +36,14 @@ import {
   type FocusLayout,
   type FocusUpcomingMode,
 } from "../../lib/focusPrefs";
+import {
+  briefingPrefsAreDefault,
+  readBriefingInSidebar,
+  readBriefingWindow,
+  resetBriefingPrefs,
+  writeBriefingInSidebar,
+  writeBriefingWindow,
+} from "../../lib/briefingPrefs";
 import type { CalendarRange } from "../../lib/calendarPrefs";
 import { readConfirmDelete, writeConfirmDelete } from "../../lib/pinboard/prefs";
 import {
@@ -89,6 +97,17 @@ export function GeneralSettings() {
   const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
   // The Focus tab's default layout (split | stacked). Shared with the Focus header toggle; this is the
   // only other writer, seeded from localStorage like confirmDelete above.
+  // Where the briefing shows, beyond the Focus tab. Both off by default.
+  const [briefingSidebar, setBriefingSidebar] = useState(readBriefingInSidebar);
+  const [briefingWindow, setBriefingWindow] = useState(readBriefingWindow);
+  function changeBriefingSidebar(on: boolean) {
+    setBriefingSidebar(on);
+    writeBriefingInSidebar(on);
+  }
+  function changeBriefingWindow(on: boolean) {
+    setBriefingWindow(on);
+    writeBriefingWindow(on);
+  }
   const [focusLayout, setFocusLayout] = useState<FocusLayout>(readFocusLayout);
   // The Focus "Upcoming" section: agenda list vs the few-day grid, plus the grid's hour window and how
   // many days it shows. Shared with the Upcoming header controls (same keys), seeded from localStorage.
@@ -242,7 +261,8 @@ export function GeneralSettings() {
   const focusLayoutIsDefault = focusLayout === "split";
   const focusUpcomingIsDefault =
     focusUpcomingMode === "list" && focusUpcomingRange === "day" && focusUpcomingDays === 3;
-  const focusIsDefault = focusLayoutIsDefault && focusUpcomingIsDefault;
+  const briefingIsDefault = !briefingSidebar && !briefingWindow && briefingPrefsAreDefault();
+  const focusIsDefault = focusLayoutIsDefault && focusUpcomingIsDefault && briefingIsDefault;
   const helpIsDefault = !help.enabled;
   // The whole tab, minus the deliberately-excluded time zone (device-derived, not a preference).
   const generalIsDefault =
@@ -264,6 +284,9 @@ export function GeneralSettings() {
     writeConfirmDelete(true);
   }
   function resetFocus() {
+    setBriefingSidebar(false);
+    setBriefingWindow(false);
+    resetBriefingPrefs();
     changeFocusLayout("split");
     changeFocusUpcomingMode("list");
     changeFocusUpcomingRange("day");
@@ -527,6 +550,28 @@ export function GeneralSettings() {
           </label>
           {!focusIsDefault && <ResetLink onReset={resetFocus} label="Reset Focus" />}
         </div>
+        <div
+          className="mt-3 flex items-center justify-between gap-3"
+          data-help="settings-briefing-sidebar"
+        >
+          <span className="text-sm text-ink2">Show today&rsquo;s briefing in the sidebar</span>
+          <Toggle
+            checked={briefingSidebar}
+            onChange={changeBriefingSidebar}
+            ariaLabel="Show today's briefing in the sidebar"
+          />
+        </div>
+        <div
+          className="mt-3 flex items-center justify-between gap-3"
+          data-help="settings-briefing-window"
+        >
+          <span className="text-sm text-ink2">Show today&rsquo;s briefing in a floating panel</span>
+          <Toggle
+            checked={briefingWindow}
+            onChange={changeBriefingWindow}
+            ariaLabel="Show today's briefing in a floating panel"
+          />
+        </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           <span className="text-sm text-ink2">Layout</span>
           <SegmentedControl
@@ -744,8 +789,8 @@ export function GeneralSettings() {
         confirmBody={
           <>
             Restores appearance (System, Mode, Accent, Depth, Location), the memory-map view, the
-            pinboard delete confirmation, and help mode to their defaults. Your time zone is left
-            as-is.
+            pinboard delete confirmation, the Focus tab (including where the briefing shows), and
+            help mode to their defaults. Your time zone is left as-is.
           </>
         }
       />

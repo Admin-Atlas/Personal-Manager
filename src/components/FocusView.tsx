@@ -6,11 +6,9 @@ import {
   addMilestone,
   addPreference,
   calendarOverview,
-  getDailyBriefing,
   listCalendarEvents,
   listProjectOverviews,
   proposeProjectMetadata,
-  refreshDailyBriefing,
   resolveFlag,
   routeFocusInput,
   setProjectMetadata,
@@ -18,9 +16,9 @@ import {
 } from "../lib/ipc";
 import { MilestoneList } from "./MilestoneList";
 import { FocusUpcoming } from "./FocusUpcoming";
+import { Briefing } from "./Briefing";
 import type {
   AgendaEvent,
-  DailyBriefing,
   FocusRoute,
   Importance,
   ProjectOverview,
@@ -34,7 +32,7 @@ import { rankImportance } from "../lib/importance";
 import { Button, Card, Input, Skeleton, StatusBadge, Select, SegmentedControl } from "./ui";
 import { readFocusLayout, writeFocusLayout, type FocusLayout } from "../lib/focusPrefs";
 import { useDepth } from "../theme";
-import { Markdown } from "../lib/markdown";
+import { useBriefing } from "../lib/briefing";
 
 interface Props {
   /** Open the per-project scoped view. */
@@ -126,7 +124,6 @@ function readSort(): Sort {
 // background. Memory-only (cleared on app reload), so the first open still loads.
 let cachedProjects: ProjectOverview[] | null = null;
 let cachedEvents: AgendaEvent[] = [];
-let cachedBriefing: DailyBriefing | null = null;
 // The focus box's in-progress text and any staged suggestion (a pending confirm / a note) must outlive a
 // tab switch too — the whole view unmounts, so component-local state would be dropped. Same lifetime as
 // the loads above: remembered until the app reloads, so a suggestion you haven't acted on is still there
@@ -151,9 +148,9 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   const [events, setEvents] = useState<AgendaEvent[]>(() => cachedEvents);
   /** Connected-calendar ids, for colouring the Upcoming grid's events (Week display mode). */
   const [calendarIds, setCalendarIds] = useState<string[]>([]);
-  /** The daily briefing (Step 7); null until loaded, then refreshed when stale. */
-  const [briefing, setBriefing] = useState<DailyBriefing | null>(() => cachedBriefing);
-  const [briefingBusy, setBriefingBusy] = useState(false);
+  // The briefing is owned by the app-scope provider (it has up to three surfaces mounted at once);
+  // this view only needs to re-trigger it when a flag is resolved.
+  const { refresh: regenerateBriefing } = useBriefing();
   // Sequence guard so a stale in-flight refresh can't overwrite a newer one — the
   // initial pre-sync load and the post-sync reload can resolve out of order.
   const refreshSeqRef = useRef(0);
@@ -183,42 +180,11 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     }
   }
 
-  // Regenerate the briefing from the current focus state. Best-effort: a missing key
-  // or a model hiccup just leaves the previous briefing in place.
-  async function regenerateBriefing() {
-    setBriefingBusy(true);
-    try {
-      const b = await refreshDailyBriefing();
-      if (aliveRef.current) {
-        setBriefing(b);
-        cachedBriefing = b;
-      }
-    } catch {
-      /* keep whatever we have */
-    } finally {
-      if (aliveRef.current) setBriefingBusy(false);
-    }
-  }
-
   // After a flag is asserted done in the focus box: regenerate the briefing (the resolved flag drops
   // out) AND reload the project overviews — a milestone-anchored flag also ticks its milestone `met`
   // on the backend, which changes that project's governing status, so the cards must re-derive.
   async function onFlagResolved() {
     await Promise.all([regenerateBriefing(), refresh()]);
-  }
-
-  // Load the stored briefing, and silently regenerate it when stale (older than the
-  // freshness window) so it refreshes ~once a day on open, not on every mount.
-  async function loadBriefing() {
-    try {
-      const b = await getDailyBriefing();
-      if (!aliveRef.current) return;
-      setBriefing(b);
-      cachedBriefing = b;
-      if (b.stale) void regenerateBriefing();
-    } catch {
-      /* briefing is optional — focus view works without it */
-    }
   }
 
   // On landing: paint the project cards and today's briefing IMMEDIATELY (Steps 6-7). The old code
@@ -229,7 +195,6 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   // and post-sync loads resolve out of order; aliveRef still guards setEvents.
   useEffect(() => {
     void refresh();
-    void loadBriefing();
     void (async () => {
       try {
         const overview = await calendarOverview();
@@ -291,7 +256,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   // duplicating it. In stacked mode they render one after another exactly as before.
   const briefingAndActions = (
     <>
-      <Briefing briefing={briefing} busy={briefingBusy} onRefresh={regenerateBriefing} />
+      <Briefing />
       {!loading && projects.length > 0 && (
         <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
       )}
@@ -726,49 +691,6 @@ function ProjectSelect({
         </option>
       ))}
     </Select>
-  );
-}
-
-/** The daily briefing — a short "here's your picture today" synthesis (Step 7). Hidden
- *  until there's something to show; shows a generating state while the model writes it. */
-function Briefing({
-  briefing,
-  busy,
-  onRefresh,
-}: {
-  briefing: DailyBriefing | null;
-  busy: boolean;
-  onRefresh: () => void;
-}) {
-  const text = briefing?.briefing.trim() ?? "";
-  // Nothing yet and not generating → don't take up space (e.g. an empty store).
-  if (!text && !busy) return null;
-
-  return (
-    <Card className="mb-5 px-4 py-3" data-help="focus-briefing">
-      <div className="mb-2 flex items-center justify-between">
-        <h2 className="font-mono text-xs font-semibold uppercase tracking-wide text-ink3">Today</h2>
-        <Button
-          variant="tertiary"
-          onClick={onRefresh}
-          disabled={busy}
-          title="Regenerate today's briefing from your current projects and calendar"
-          className="px-2 py-0.5 text-xs"
-        >
-          {busy ? "Refreshing…" : "Refresh"}
-        </Button>
-      </div>
-      {text ? (
-        <div className="pm-inline-md text-sm leading-relaxed text-ink2">
-          <Markdown>{text}</Markdown>
-        </div>
-      ) : (
-        <p className="text-sm text-ink4">Putting together your briefing…</p>
-      )}
-      {text && briefing?.updated_at && (
-        <p className="mt-2 text-xs text-ink4">Updated {formatDate(briefing.updated_at)}</p>
-      )}
-    </Card>
   );
 }
 

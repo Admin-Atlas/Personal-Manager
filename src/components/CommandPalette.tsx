@@ -175,7 +175,7 @@ export function CommandPalette({
     ];
 
     return [...projectItems, ...fileItems, ...convItems, ...gotoItems];
-  }, [projects, docs, convs, teachVisible]);
+  }, [projects, docs, convs, teachVisible, mapVisible]);
 
   // Filter + rank against the query, then regroup in display order. With a query,
   // each group is ordered by match score (best first); empty query keeps the

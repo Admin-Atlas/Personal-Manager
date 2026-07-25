@@ -98,6 +98,14 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Review & Teach tabs",
     body: "Show or hide the two 'learning tools' — Review (approve the assistant's filing of new items) and Teach (correct its naming rules and preferences) — together in the sidebar. They're on for the Standard and Power presets and off for Minimal, but you can override that here. Turn them off once the assistant files things well enough on its own that you no longer want to curate; nothing is lost — new items still index and auto-file, and PM keeps applying what you've already taught it. Turn them back on any time.",
   },
+  "settings-briefing-sidebar": {
+    title: "Today's briefing in the sidebar",
+    body: "Pins today's briefing to the bottom of the left sidebar, so what needs doing today stays visible whichever tab you're on. It's the same briefing as the one on the Focus tab — same text, and refreshing either one updates both. Off by default. If you'd rather see it only here, turn the Focus tab's briefing card off from the Panels control on that tab.",
+  },
+  "settings-briefing-window": {
+    title: "Today's briefing in a floating panel",
+    body: "Floats today's briefing over whatever you're doing, in a small panel you can drag by its header and resize from its bottom-right corner. It stays put as you move between tabs, and remembers where you left it. It floats above PM's own views but below dialogs, so a pop-up is never hidden behind it — and it floats within PM's window, not over other applications. Off by default; the ✕ on the panel hides it again.",
+  },
   "settings-map-tab": {
     title: "Map tab",
     body: "Show or hide the Map — the semantic picture of everything you've filed, laid out so related things sit near each other. Like the learning tools above, it follows your preset by default: on for Standard and Power, off for Minimal, since a pared-back setup rarely wants an exploratory view. Overriding here wins either way. Hiding it changes nothing about your data or the search behind it; the Map is still there the moment you switch it back on.",
