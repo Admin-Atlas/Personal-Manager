@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.77.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "PM can now sit in your system tray, menu bar or panel. Switch it on in Settings > General > Focus and a small PM icon appears; click it (or right-click and pick \"Today's briefing\") to pop today up without hunting for PM's window. While the icon is on, closing PM's window leaves it running behind the icon rather than quitting, and Quit moves to the icon's menu -- switch the icon off and closing quits exactly as before.",
+      'The floating briefing now has two strengths. "Inside PM" is the panel you already had; "Always on top" is a separate little window that floats over your other applications, so today stays in view while you work somewhere else. Both are still off unless you turn them on.',
+      "A note for Linux: a left click on the tray icon does nothing, because desktops do not pass that click on to applications -- use the right-click menu. The icon itself shows on KDE Plasma, XFCE, Cinnamon and MATE; GNOME needs its AppIndicator extension installed first.",
+    ],
+  },
+  {
     version: "3.76.0-alpha",
     date: "2026-07-25",
     highlights: [

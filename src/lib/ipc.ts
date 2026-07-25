@@ -1108,6 +1108,15 @@ export const getDailyBriefing = () => invoke<DailyBriefing>("get_daily_briefing"
 /** Regenerate the briefing from the current focus-view state; returns the new one. */
 export const refreshDailyBriefing = () => invoke<DailyBriefing>("refresh_daily_briefing");
 
+/** Whether the tray / menu-bar icon is on. Backend-owned: Rust reads it at boot to decide the
+ *  icon's visibility and whether closing the main window quits or hides (see tray.rs). */
+export const getTrayEnabled = () => invoke<boolean>("get_tray_enabled");
+export const setTrayEnabled = (enabled: boolean) => invoke<void>("set_tray_enabled", { enabled });
+
+/** Show or hide the always-on-top briefing window. `forceShow` opens it without toggling. */
+export const toggleBriefingWindow = (forceShow: boolean) =>
+  invoke<void>("toggle_briefing_window", { forceShow });
+
 /** Mark a structured flag done (board card 9) — a deliberate user assertion that outranks detection,
  *  removing it from the rendered set. Optionally names the satisfying artifact by its
  *  `documents.source_id` so a happening-today on the same anchor can show "you're prepared, file's
