@@ -93,11 +93,20 @@ export function SettingsView({ onClose, onboarding, onOpenDev, onOpenTeach }: Pr
     sectionsFor(tab).map((s) => s.id),
   );
 
+  // Jump to a section AND say so. Scrolling alone is invisible feedback on a tab short enough to fit
+  // — the click "did nothing", which is how this control read on most tabs. The wash fires either
+  // way, so the sub-nav always answers "which one is that?" and doubles as a locator rather than
+  // being purely a scroll shortcut. Re-triggering on an already-washed section needs the class
+  // removed and the layout flushed first, or the browser reuses the running animation.
   function scrollToSection(id: string) {
     const el = contentRef.current?.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
     if (!el) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     el.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+    el.classList.remove("pm-locate");
+    void el.offsetWidth; // force a reflow so the re-added class restarts the animation
+    el.classList.add("pm-locate");
+    el.addEventListener("animationend", () => el.classList.remove("pm-locate"), { once: true });
   }
 
   useEffect(() => {

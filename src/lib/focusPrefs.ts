@@ -49,6 +49,48 @@ export function writeFocusLayout(layout: FocusLayout): void {
   announce();
 }
 
+// --- the split layout's column balance ------------------------------------------------------------
+// How the split layout divides its width between the left column (briefing / focus box / Upcoming)
+// and the project list, as the LEFT column's share. Stored as a fraction of the row rather than a
+// pixel width so it stays proportional when the window resizes (the same reasoning as useResizable).
+//
+// The bounds are a fraction AND a pixel floor, applied at drag time: a fraction alone would let a
+// narrow window squeeze a column down to nothing, and a pixel floor alone would stop making sense on
+// a very wide one.
+
+const FOCUS_SPLIT_KEY = "pm.focus.split";
+/** Neither column may take less than this share of the row. */
+export const FOCUS_SPLIT_MIN = 0.25;
+export const FOCUS_SPLIT_MAX = 0.75;
+/** …nor be drawn narrower than this, whatever the fraction says. */
+export const FOCUS_SPLIT_MIN_PX = 260;
+const FOCUS_SPLIT_DEFAULT = 0.5;
+
+export function clampFocusSplit(frac: number): number {
+  if (!Number.isFinite(frac)) return FOCUS_SPLIT_DEFAULT;
+  return Math.min(FOCUS_SPLIT_MAX, Math.max(FOCUS_SPLIT_MIN, frac));
+}
+
+/** The left column's share of the split row (0.25–0.75). Defaults to an even 50/50. */
+export function readFocusSplit(): number {
+  try {
+    const raw = localStorage.getItem(FOCUS_SPLIT_KEY);
+    if (raw !== null) return clampFocusSplit(Number(raw));
+  } catch {
+    /* fall through to the default */
+  }
+  return FOCUS_SPLIT_DEFAULT;
+}
+
+export function writeFocusSplit(frac: number): void {
+  try {
+    localStorage.setItem(FOCUS_SPLIT_KEY, String(clampFocusSplit(frac)));
+  } catch {
+    /* best-effort */
+  }
+  announce();
+}
+
 // --- "Upcoming" section: agenda list vs a small few-day calendar grid ----------------------------
 // The Focus "Upcoming" card can render either the plain agenda list (the default) or a compact
 // day-by-day time grid — the same engine the Calendar tab's Week view uses, capped to a few days so
@@ -242,6 +284,7 @@ export function resetFocusPanels(): void {
 export function focusViewPrefsAreDefault(): boolean {
   return (
     readFocusLayout() === "split" &&
+    readFocusSplit() === FOCUS_SPLIT_DEFAULT &&
     readFocusUpcomingMode() === "list" &&
     readFocusUpcomingRange() === "day" &&
     readFocusUpcomingDays() === FOCUS_UPCOMING_DEFAULT_DAYS &&
@@ -253,6 +296,7 @@ export function focusViewPrefsAreDefault(): boolean {
 /** Put every Focus-tab view pref back to its default. */
 export function resetFocusViewPrefs(): void {
   writeFocusLayout("split");
+  writeFocusSplit(FOCUS_SPLIT_DEFAULT);
   writeFocusUpcomingMode("list");
   writeFocusUpcomingRange("day");
   writeFocusUpcomingDays(FOCUS_UPCOMING_DEFAULT_DAYS);

@@ -10,14 +10,21 @@
 //!
 //! A second `WebviewWindow` labelled `briefing`, pointed at `index.html?window=briefing` so
 //! `main.tsx` can mount a tiny popover root instead of a second full `<App/>` (which would duplicate
-//! the boot IPC, the calendar poll and every resume effect). It is created on FIRST SHOW and then
-//! only shown/hidden, so the toggle pays webview startup once rather than on every flip.
+//! the boot IPC, the calendar poll and every resume effect).
 //!
-//! It is deliberately NOT created at startup. Tauri only exits once every window is *destroyed*, and
-//! this one refuses close (it hides instead, being a panel), so an eagerly-built hidden window left
-//! PM running headless after the user closed the main window with the tray off — plus a second
-//! webview's memory for everyone who never opens it. [`on_window_event`] now also exits explicitly on
-//! that path, so neither half alone can strand the process.
+//! **It is created ONCE during `setup()`, and every later call only shows/hides it.** That placement
+//! is load-bearing, not an optimisation: `WebviewWindowBuilder::build()` documents that on Windows it
+//! **deadlocks when called from a synchronous command or an event handler** (tauri 2.11.5,
+//! `webview/webview_window.rs`) — which is exactly what the Settings toggle and the tray menu are.
+//! Building it lazily on first show wedged Tauri's main thread, and because WebView2 renders out of
+//! process the UI kept painting while every IPC call, the window chrome and the tray icon went dead:
+//! it reads as "the app looks fine but nothing works", not as a freeze. **Do not move this out of
+//! `setup()`** without first moving it onto a thread of its own.
+//!
+//! Creating it eagerly means a window that outlives the main one — it refuses close (it hides
+//! instead, being a panel) and Tauri only exits once every window is *destroyed*. So
+//! [`on_window_event`] exits EXPLICITLY when the main window closes with the tray off. That, not lazy
+//! creation, is what stops PM running on headless after you close it.
 //!
 //! It deliberately holds NO capability entry. PM's own `#[tauri::command]`s are not ACL-gated (the
 //! app ships no `permissions/` directory, so there is no `__app-acl__` manifest and the reject arm
@@ -80,13 +87,13 @@ pub fn tray_enabled(app: &AppHandle) -> bool {
     db::get_bool(&conn, TRAY_ENABLED_KEY, false).unwrap_or(false)
 }
 
-/// Create the briefing window, hidden. Idempotent, and called lazily on the first show (never from
-/// startup — see the module docs).
+/// Create the briefing window, hidden. Idempotent, and called ONLY from `setup()` — see the module
+/// docs for why building it anywhere else deadlocks Windows.
 ///
 /// `always_on_top` + `skip_taskbar` make it read as a floating utility panel rather than a second
 /// application window; `decorations(false)` matches the main window's custom chrome, and the popover
 /// root draws its own title/drag strip.
-fn build_briefing_window(app: &AppHandle) -> Result<()> {
+pub fn build_briefing_window(app: &AppHandle) -> Result<()> {
     if app.get_webview_window(BRIEFING_LABEL).is_some() {
         return Ok(());
     }
@@ -115,18 +122,18 @@ fn build_briefing_window(app: &AppHandle) -> Result<()> {
 /// Kept separate from [`toggle_briefing_window`] on purpose. Asking the toggle for "not on top" by
 /// passing `force_show: false` used to SHOW an already-hidden window (the toggle's else arm), which
 /// is how picking "inside PM" in Settings opened the OS window as well.
+///
+/// Never builds: the window already exists (created in `setup()`), and building from a command would
+/// deadlock Windows — see the module docs. If it is somehow absent, this is a no-op, never a hang.
 pub fn set_briefing_window_visible(app: &AppHandle, visible: bool) -> Result<()> {
-    if !visible {
-        // Never build the window just to hide it — if it doesn't exist there is nothing to do.
-        if let Some(win) = app.get_webview_window(BRIEFING_LABEL) {
-            let _ = win.hide();
-        }
+    let Some(win) = app.get_webview_window(BRIEFING_LABEL) else {
         return Ok(());
-    }
-    build_briefing_window(app)?;
-    if let Some(win) = app.get_webview_window(BRIEFING_LABEL) {
+    };
+    if visible {
         let _ = win.show();
         let _ = win.set_focus();
+    } else {
+        let _ = win.hide();
     }
     Ok(())
 }

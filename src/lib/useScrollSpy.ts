@@ -14,7 +14,12 @@ import { useEffect, useState, type RefObject } from "react";
  *  up the moment it appears, and ids not yet in the DOM are simply skipped. The current section is the
  *  last one whose top has crossed a line just below the pane's top edge; scrolling to the very bottom
  *  always resolves to the last present section, so a short trailing section that can't reach that line
- *  still lights up. */
+ *  still lights up.
+ *
+ *  That bottom rule is gated on the pane ACTUALLY SCROLLING. A tab short enough to fit is trivially
+ *  "at the bottom" (`scrollTop + clientHeight >= scrollHeight`), so applying it unconditionally lit
+ *  the LAST sub-nav item on every short tab — reading as a selection the user never made, on a rail
+ *  where nothing had scrolled at all. When there is nothing to scroll, the first section is current. */
 export function useScrollSpy(
   containerRef: RefObject<HTMLElement | null>,
   sectionIds: readonly string[],
@@ -34,7 +39,10 @@ export function useScrollSpy(
       raf = 0;
       // A section becomes current once its top crosses this line, just below the pane's top edge.
       const line = root.getBoundingClientRect().top + 24;
-      const atBottom = root.scrollTop + root.clientHeight >= root.scrollHeight - 2;
+      // `scrollable` first: an unscrollable pane is always "at the bottom" by arithmetic, and the
+      // bottom rule would then pin the last section on every short tab (see the doc comment).
+      const scrollable = root.scrollHeight > root.clientHeight + 2;
+      const atBottom = scrollable && root.scrollTop + root.clientHeight >= root.scrollHeight - 2;
       let current: string | null = null;
       let lastPresent: string | null = null;
       for (const id of sectionIds) {
