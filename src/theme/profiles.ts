@@ -287,3 +287,13 @@ export const STATUS: Record<System, Record<Mode, readonly string[]>> = {
     light: ["#c23a52", "#7a52c0", "#4a8a2a", "#9a6a1a", "#2a6a9a", "#5a5e57"],
   },
 };
+
+// Colour-blind-safe semantic status colours (Okabe–Ito-derived), swapped in by themeVars when the
+// colour-blind axis is on. One set per Mode — System-independent, because CVD distinctness is
+// universal — with order matching STATUS_KEYS (due, blocked, quick, look, part, track). The classic
+// red/green confusion (due vs quick) is broken by pairing vermillion-orange with bluish-green, and
+// each entry is tuned to read as text on the mode's --bg. Not accent-tied, like STATUS above.
+export const STATUS_CVD: Record<Mode, readonly string[]> = {
+  dark: ["#ef8a5c", "#e58fc4", "#3fc99b", "#eab44e", "#63abe6", "#a6adba"],
+  light: ["#c24e12", "#a2497f", "#0e7c58", "#8a5a00", "#1f6fb5", "#5f6470"],
+};

@@ -12,11 +12,27 @@
 
 import { ACCENTS, MONO_ACCENT, type System } from "./profiles";
 
+// Colour-blind-safe (Okabe–Ito) source hues, used when the colour-blind axis is on in place of the
+// accent-derived set. System/accent-independent — under the axis, CVD distinctness matters more than
+// re-tinting with the accent. Six mutually distinguishable chromatic hues that read on both the light
+// and dark --bg (Okabe–Ito's yellow is dropped, being invisible in light mode); the milestone and
+// pinboard overlays keep their own distinct hues (they're single, labelled overlays, not sources).
+const CVD_SOURCES: readonly string[] = [
+  "#56b4e9",
+  "#e69f00",
+  "#009e73",
+  "#0072b2",
+  "#d55e00",
+  "#cc79a7",
+];
+
 /** The categorical source hues for a System: its accent picker palette minus the `accent` currently
  *  reserved for chrome (~5 hues). The monochrome sentinel is never a source hue (it's not a colour),
  *  so it's always dropped too. If the active accent isn't one of the picker hues (a custom accent),
- *  the full palette stands — there's nothing to reserve-and-remove. */
-export function sourcePalette(system: System, accent: string): string[] {
+ *  the full palette stands — there's nothing to reserve-and-remove. When the colour-blind axis is on,
+ *  the CVD-safe set above replaces all of it. */
+export function sourcePalette(system: System, accent: string, colorblind = false): string[] {
+  if (colorblind) return [...CVD_SOURCES];
   const active = accent.trim().toLowerCase();
   const hues = ACCENTS[system].filter((h) => h !== MONO_ACCENT);
   const rest = hues.filter((h) => h.toLowerCase() !== active);
@@ -33,8 +49,9 @@ export function sourceColors(
   calendarIds: string[],
   system: System,
   accent: string,
+  colorblind = false,
 ): Map<string, string> {
-  const palette = sourcePalette(system, accent);
+  const palette = sourcePalette(system, accent, colorblind);
   const ordered = [...new Set(calendarIds)].sort();
   const map = new Map<string, string>();
   ordered.forEach((id, i) => map.set(id, palette[i % palette.length]));

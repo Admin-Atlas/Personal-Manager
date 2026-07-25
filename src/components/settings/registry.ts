@@ -86,6 +86,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
           { id: "sec-a11y-density", label: "Density" },
           { id: "sec-a11y-motion", label: "Motion" },
           { id: "sec-a11y-font", label: "Legible font" },
+          { id: "sec-a11y-color", label: "Colour" },
         ],
       },
     ],

@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The Accessibility settings tab. Opt-in axes that change how PM presents itself — text size,
-// density / touch-target size, motion, and a legible font — persisted with the rest of the theme (so
-// they travel with the vault) and applied instantly. Text/motion/font defaults equal PM's normal
-// behaviour; density defaults to the compliant `standard` on fresh installs but is pinned to
-// `compact` (today's look) for existing installs, so nothing shifts until you choose otherwise or
-// Reset. Colour-blind-safe palettes and a high-contrast theme are planned as further axes (epic #502).
+// density / touch-target size, motion, a legible font, and a colour-blind-safe palette — persisted
+// with the rest of the theme (so they travel with the vault) and applied instantly. Most defaults
+// equal PM's normal behaviour; density defaults to the compliant `standard` on fresh installs but is
+// pinned to `compact` (today's look) for existing installs, so nothing shifts until you choose
+// otherwise or Reset. A high-contrast theme is planned as a further axis (epic #502).
 
 import { SectionInfo, SegmentedControl, Toggle } from "../ui";
 import { useTheme, type FontScale, type Density } from "../../theme";
@@ -44,6 +44,8 @@ export function AccessibilitySettings() {
     setReduceMotion,
     legibleFont,
     setLegibleFont,
+    colorblind,
+    setColorblind,
     accessibilityIsDefault,
     resetAccessibility,
   } = useTheme();
@@ -132,14 +134,36 @@ export function AccessibilitySettings() {
         </SectionInfo>
       </div>
 
+      <div id="sec-a11y-color" data-settings-section className="mt-5 border-t border-border pt-4">
+        <div className="flex items-center justify-between gap-2">
+          <label className={SECTION_HEAD}>Colour</label>
+          {colorblind && <ResetLink onReset={() => setColorblind(false)} />}
+        </div>
+        <div className={ROW}>
+          <span className="text-sm text-ink2">Colour-blind-safe palette</span>
+          <Toggle
+            checked={colorblind}
+            onChange={setColorblind}
+            ariaLabel="Use the colour-blind-safe palette"
+          />
+        </div>
+        <SectionInfo helpId="settings-a11y-color">
+          <p>
+            Swaps the colours PM uses to tell things apart — project graph nodes, calendar sources,
+            and status colours — for a colour-blind-safe (Okabe–Ito) set chosen to stay distinct
+            under the common types of colour vision. Text labels and icons are unaffected.
+          </p>
+        </SectionInfo>
+      </div>
+
       <TabResetSection
         tabName="Accessibility"
         isDefault={accessibilityIsDefault}
         onReset={resetAccessibility}
         confirmBody={
           <p>
-            This sets text size, density, motion, and the legible font back to their defaults. Your
-            theme (system, mode, accent) isn't affected.
+            This sets text size, density, motion, the legible font, and the colour-blind palette
+            back to their defaults. Your theme (system, mode, accent) isn't affected.
           </p>
         }
       />

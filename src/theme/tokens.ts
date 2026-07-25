@@ -16,6 +16,7 @@ import {
   MONO_ACCENT,
   MONO_RAMP,
   EIGENGRAU,
+  STATUS_CVD,
   type System,
   type Mode,
   type Depth,
@@ -37,6 +38,8 @@ export interface A11yTheme {
   legibleFont: boolean;
   /** Control density / touch-target size (WCAG 2.5.8 / 2.5.5). */
   density: Density;
+  /** Use the colour-blind-safe (Okabe–Ito) categorical + status palettes. */
+  colorblind: boolean;
 }
 
 // Atkinson Hyperlegible — the family name declared by @fontsource/atkinson-hyperlegible (imported in
@@ -76,8 +79,16 @@ export const DENSITY_VARS: Record<Density, Record<`--${string}`, string>> = {
   },
 };
 
-export function themeVars(system: System, mode: Mode, accent: string): ThemeVars {
-  const stat = STATUS[system][mode];
+export function themeVars(
+  system: System,
+  mode: Mode,
+  accent: string,
+  colorblind = false,
+): ThemeVars {
+  // The colour-blind axis swaps the semantic status row for the Okabe–Ito-derived CVD set (one per
+  // Mode, System-independent); the categorical graph/source palettes are swapped at their own call
+  // sites (graphColor / sourceColors) since they're consumed as JS values, not CSS vars.
+  const stat = colorblind ? STATUS_CVD[mode] : STATUS[system][mode];
   const v: ThemeVars = {};
 
   if (accent === MONO_ACCENT) {
@@ -140,7 +151,7 @@ export function applyTheme(
   depth: Depth,
   a11y?: A11yTheme,
 ): void {
-  const vars = themeVars(system, mode, accent);
+  const vars = themeVars(system, mode, accent, a11y?.colorblind ?? false);
   for (const key of Object.keys(vars) as Array<keyof ThemeVars>) {
     el.style.setProperty(key, vars[key]);
   }

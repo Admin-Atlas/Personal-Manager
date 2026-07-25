@@ -116,7 +116,7 @@ function fitTransform(bounds: Bounds, w: number, h: number): Transform {
 const isDashed = (doc?: Document) => !!doc && (!doc.reviewed || doc.source_type === "index_only");
 
 export function GraphView() {
-  const { mode, system, accent } = useTheme();
+  const { mode, system, accent, colorblind } = useTheme();
   // Clicking a node opens the shared document reader (the same one the Documents tab uses); the
   // reader's project name links back to the project. GraphView is mounted inside <ReaderProvider>.
   const { openReader } = useReader();
@@ -276,8 +276,8 @@ export function GraphView() {
     return m;
   }, [base]);
   const colorFor = useCallback(
-    (project: string) => graphColor(projectIndex.get(project) ?? 0, mode),
-    [projectIndex, mode],
+    (project: string) => graphColor(projectIndex.get(project) ?? 0, mode, colorblind),
+    [projectIndex, mode, colorblind],
   );
   const legend = useMemo(
     () => base?.projectNames.map((name) => ({ name, color: colorFor(name) })) ?? [],
