@@ -57,6 +57,7 @@ import type {
   LocalFolderSyncState,
   LocalSubfolder,
   Message,
+  ChatIdentityReport,
   IngestJobState,
   MetadataProposal,
   ModelInfo,
@@ -845,6 +846,11 @@ export const stopDriveSync = () => invoke<void>("stop_drive_sync");
  *  wasn't there when the rebuild started still shows its progress — the rebuild is detached from
  *  whoever started it, so the per-call channel below only reaches a listener that stayed mounted. */
 export const rebuildStatus = () => invoke<IngestJobState>("rebuild_status");
+
+/** Chat-identity integrity: how many chats there are, how many are correctly typed, plus the last
+ *  automatic repair pass and a fresh one taken now. The check IS the repair — it runs the same
+ *  idempotent pass — so looking can never leave damage behind. */
+export const chatIdentityReport = () => invoke<ChatIdentityReport>("chat_identity_report");
 
 /** Resume a rebuild interrupted by a previous app close/crash. Called once on launch; resolves true
  *  if one was started. It genuinely CONTINUES the interrupted pass: every document that pass had

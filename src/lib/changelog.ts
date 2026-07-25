@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.81.2-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "An important fix for anyone who has chats saved. Filing a chat -- approving it in Review, changing its project, or renaming or merging a project that owns chats -- was quietly stripping the markers that tell PM “this file is a conversation”. Nothing looked wrong at the time, and nothing was: the damage only showed up the next time you re-indexed, when the conversation would come back as an ordinary document. Its citations would stop reopening the chat at the right message, and PM's own past answers would start being treated as source material -- which is exactly what its answers are not.",
+      "That is fixed at the root, so it can't happen again from any of those actions. PM also repairs itself: when it opens your vault it checks every chat and puts back anything that went missing, and it does the same check again before any re-index, so there is no window where re-indexing could make old damage permanent. Your conversations themselves were never at risk -- the messages are the real record and they were untouched throughout -- so nothing is lost, and there is nothing for you to do. No re-index, no re-sync, no prompt.",
+      "If a chat had already been through a re-index, PM rebuilds its index entry properly this time, so jump-to-a-message citations come back on their own. That happens quietly in the background and costs nothing -- the work is done on your machine.",
+      "Curious whether it found anything? Turn on Developer mode and use “Check chat identity” under the sidecar panel: it reports how many chats are intact, and repairs any that aren't.",
+    ],
+  },
+  {
     version: "3.81.1-alpha",
     date: "2026-07-25",
     highlights: [

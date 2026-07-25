@@ -1249,6 +1249,25 @@ export interface IngestJobState {
   last_report: IngestReport | null;
 }
 
+/** What one automatic chat-identity repair pass did; mirrors `chat::ChatIdentityHeal`. */
+export interface ChatIdentityHeal {
+  scanned: number;
+  restamped: number;
+  rows_restored: number;
+  reindex_queued: number;
+  relinked: number;
+  unrepaired: string[];
+}
+
+/** The chat-identity integrity readout; mirrors `commands::ChatIdentityReport`. `stored` is the last
+ *  automatic pass (vault open, or the Rebuild precondition); `live` is a fresh scan taken on request. */
+export interface ChatIdentityReport {
+  total_sessions: number;
+  intact: number;
+  stored: ChatIdentityHeal | null;
+  live: ChatIdentityHeal;
+}
+
 /** The counts a finished rebuild reports; mirrors `IngestReport`. */
 export interface IngestReport {
   ingested: number;

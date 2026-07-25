@@ -475,6 +475,203 @@ pub(crate) fn rewrite_chat_classification(
     Ok(())
 }
 
+/// What one [`reconcile_vault_identity`] pass did. Returned, logged and persisted rather than kept
+/// silent: this repairs a defect whose whole character was that it left no trace, so "it worked" has
+/// to be something you can read, not something you infer from the absence of an error.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ChatIdentityHeal {
+    /// Sessions with a vault file that were examined.
+    pub scanned: usize,
+    /// Files whose front-matter had lost `source_type: chat` and was restamped.
+    pub restamped: usize,
+    /// `documents` rows a prior Rebuild had already flipped to 'vault', put back to 'chat'.
+    pub rows_restored: usize,
+    /// Chats whose mis-derived chunks were dropped so the incremental indexer re-indexes them.
+    pub reindex_queued: usize,
+    /// Sessions whose `document_id` link was re-attached by `vault_path` after a wipe-arm Rebuild.
+    pub relinked: usize,
+    /// Sessions that could not be repaired (file missing/unreadable), with a short reason each.
+    pub unrepaired: Vec<String>,
+}
+
+impl ChatIdentityHeal {
+    /// Whether this pass changed anything — the gate for logging and for surfacing it to the user.
+    pub fn touched_anything(&self) -> bool {
+        self.restamped > 0 || self.rows_restored > 0 || self.relinked > 0
+    }
+}
+
+/// Insert the chat-identity lines back into a stripped front-matter fence, in place.
+///
+/// Mirrors [`rewrite_chat_classification`]'s discipline — walk the leading fence and touch nothing
+/// else — rather than re-rendering the file, because the body is a transcript and everything outside
+/// these four lines is already correct. Returns `None` when the file already carries `source_type`
+/// (nothing to do) or has no front-matter fence at all (not ours to repair).
+fn restamp_chat_identity(text: &str, conversation_id: i64, scope: &str) -> Option<String> {
+    let mut fence = 0u8;
+    let mut has_source_type = false;
+    for line in text.split_inclusive('\n') {
+        let key = line.trim_end_matches(['\n', '\r']);
+        if key == "---" {
+            fence = if fence == 0 { 1 } else { 2 };
+            if fence == 2 {
+                break;
+            }
+        } else if fence == 1 && key.starts_with("source_type:") {
+            has_source_type = true;
+            break;
+        }
+    }
+    if has_source_type || fence == 0 {
+        return None;
+    }
+    // Re-insert immediately after the opening fence. Field order is irrelevant to the flat parser,
+    // and the front position matches where `render_chat_frontmatter` writes them at birth.
+    let mut out = String::with_capacity(text.len() + 96);
+    let mut seen_open = false;
+    for line in text.split_inclusive('\n') {
+        out.push_str(line);
+        if !seen_open && line.trim_end_matches(['\n', '\r']) == "---" {
+            seen_open = true;
+            out.push_str(&format!(
+                "source_type: chat\nchat_conversation_id: {}\nchat_scope: {}\nchat_source_id: {}\n",
+                conversation_id,
+                scope,
+                source_id(conversation_id),
+            ));
+        }
+    }
+    Some(out)
+}
+
+/// Repair chat vault files that an organisation write stripped of their identity, and any damage a
+/// Rebuild has already done on top of that.
+///
+/// Until 3.81.2 every path that wrote a document's organisation metadata — approving a chat in
+/// Review, editing its project, renaming or merging the project that owns it — rebuilt the vault file
+/// through `ingest::rewrite_vault_metadata`, which had no chat arm and therefore dropped
+/// `source_type: chat` + the `chat_*` lines. That is fixed at the source now; this repairs stores that
+/// already took the hit.
+///
+/// Three states, all handled:
+///   1. **Stripped, not yet rebuilt** — restamp the file from `chat_sessions`. Nothing else is wrong
+///      yet, so this is a pure, lossless repair.
+///   2. **Stripped and since rebuilt** — the file was re-ingested as an ordinary document, so the row
+///      says `source_type = 'vault'` and its chunks were re-derived from the WHOLE transcript
+///      (including PM's own answers, which the chat indexer deliberately never indexes) with NULL turn
+///      pointers. Restore the row, drop those chunks and reset `last_indexed_turn_id` so the
+///      incremental chat indexer re-indexes the session properly on its next sweep.
+///      `clear_document_chunks` is safe: chunks are derived data, re-derivable from the transcript.
+///   3. **Wipe-arm Rebuild in between** — a vector-width change DELETEs every `documents` row, and
+///      `chat_sessions.document_id` is `ON DELETE SET NULL`, so the link dangles while a stray 'vault'
+///      row now owns the `vault_path`. Re-attach by `vault_path` before doing (2), otherwise the
+///      re-index would collide on that UNIQUE column.
+///
+/// Idempotent and cheap — one front-matter read per session with a vault file, and writes only where
+/// something is actually wrong — so it is safe to call on every vault open AND as a precondition of
+/// Rebuild. That pairing is deliberate: it means there is no window in which a user who updates and
+/// immediately rebuilds can make the damage permanent.
+///
+/// Never touches `conversations` or `messages`: the authored turns are the truth and survive all three
+/// states untouched. Best-effort per session — one unreadable file is recorded in `unrepaired` and the
+/// pass continues.
+pub fn reconcile_vault_identity(
+    conn: &mut Connection,
+    vault: &Path,
+    cipher: &MarkdownCipher,
+) -> Result<ChatIdentityHeal> {
+    let mut report = ChatIdentityHeal::default();
+    let sessions: Vec<(i64, String, String, Option<i64>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, vault_path, scope, document_id FROM chat_sessions \
+             WHERE vault_path IS NOT NULL AND vault_path <> ''",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    for (conversation_id, vault_path, scope, document_id) in sessions {
+        report.scanned += 1;
+        let file = vault.join(&vault_path);
+        let text = match cipher.read(&file) {
+            Ok(t) => t,
+            Err(e) => {
+                // A missing file is ordinary (the chat was deleted, or never had substance); anything
+                // else is worth naming. Either way the pass continues.
+                report
+                    .unrepaired
+                    .push(format!("conversation {conversation_id}: {e}"));
+                continue;
+            }
+        };
+
+        let restamped = match restamp_chat_identity(&text, conversation_id, &scope) {
+            Some(fixed) => {
+                cipher.write_to(&file, &fixed)?;
+                report.restamped += 1;
+                true
+            }
+            None => false,
+        };
+
+        // Re-attach a link a wipe-arm Rebuild severed, so the row work below has a row to act on.
+        let doc_id = match document_id {
+            Some(id) => Some(id),
+            None => {
+                let found: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM documents WHERE vault_path = ?1",
+                        params![vault_path],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = found {
+                    conn.execute(
+                        "UPDATE chat_sessions SET document_id = ?2 WHERE conversation_id = ?1",
+                        params![conversation_id, id],
+                    )?;
+                    report.relinked += 1;
+                }
+                found
+            }
+        };
+
+        let Some(doc_id) = doc_id else { continue };
+        let source_type: Option<String> = conn
+            .query_row(
+                "SELECT source_type FROM documents WHERE id = ?1",
+                params![doc_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // Only act when the row actually disagrees. A healthy chat (the overwhelming common case)
+        // costs one front-matter read and one indexed lookup, and writes nothing at all.
+        if source_type.as_deref() == Some(ingest::SOURCE_TYPE_CHAT) {
+            continue;
+        }
+        if !restamped && source_type.is_none() {
+            continue;
+        }
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE documents SET source_type = ?2, source_id = ?3 WHERE id = ?1",
+            params![doc_id, ingest::SOURCE_TYPE_CHAT, source_id(conversation_id)],
+        )?;
+        // The chunks were derived from the wrong body by the wrong splitter; drop them and rewind the
+        // cursor so `chat_index` re-indexes authored turns only, with turn pointers restored.
+        ingest::clear_document_chunks(&tx, doc_id)?;
+        tx.execute(
+            "UPDATE chat_sessions SET last_indexed_turn_id = NULL WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        tx.commit()?;
+        report.rows_restored += 1;
+        report.reindex_queued += 1;
+    }
+
+    Ok(report)
+}
+
 /// `YYYY-MM-DD…` → `DD-MM-YYYY` (house date style). Defensive: any non-conforming head yields `unknown`
 /// rather than panicking — PM's own timestamps always conform, so this only guards malformed input.
 fn ddmmyyyy(iso: &str) -> String {
@@ -1057,5 +1254,237 @@ mod tests {
             "ok but actually I changed my mind, let's ship on Friday instead of Monday",
             "Sure."
         ));
+    }
+
+    // --- chat vault identity: the strip repair (3.81.2) ---------------------------------------
+
+    /// Seed a session whose vault file exists, plus the `documents` row card B would have created.
+    fn seed_chat_session(
+        conn: &Connection,
+        dir: &Path,
+        cipher: &MarkdownCipher,
+        conv: i64,
+        scope: &str,
+        source_type: &str,
+    ) -> (i64, String) {
+        let vault_path = format!("chat-01-01-2026-{conv}.md");
+        let file = dir.join(&vault_path);
+        cipher
+            .write_to(
+                &file,
+                &render_chat_frontmatter(
+                    "A chat",
+                    conv,
+                    scope,
+                    "Atlas",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type, source_id) \
+             VALUES (?1, 'A chat', ?2, ?3, ?4)",
+            params![vault_path, content_hash(conv), source_type, source_id(conv)],
+        )
+        .unwrap();
+        let doc_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, document_id, scope, vault_path, last_indexed_turn_id) \
+             VALUES (?1, ?2, ?3, ?4, 99)",
+            params![conv, doc_id, scope, vault_path],
+        )
+        .unwrap();
+        (doc_id, vault_path)
+    }
+
+    /// Reproduce the bug: drop every identity line the way the generic front-matter rewriter used to.
+    fn strip_identity(cipher: &MarkdownCipher, file: &Path) {
+        let text = cipher.read(file).unwrap();
+        let stripped: String = text
+            .lines()
+            .filter(|l| !l.starts_with("source_type:") && !l.starts_with("chat_"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        cipher.write_to(file, &stripped).unwrap();
+    }
+
+    #[test]
+    fn restamp_puts_back_exactly_the_identity_lines_a_strip_removed() {
+        let born = render_chat_frontmatter("T", 7, "project", "Atlas", "2026-01-01", "2026-01-01");
+        let stripped: String = born
+            .lines()
+            .filter(|l| !l.starts_with("source_type:") && !l.starts_with("chat_"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(!stripped.contains("source_type: chat"));
+
+        let fixed = restamp_chat_identity(&stripped, 7, "project").expect("a strip is repairable");
+        assert!(fixed.contains("source_type: chat"));
+        assert!(fixed.contains("chat_conversation_id: 7"));
+        assert!(fixed.contains("chat_scope: project"));
+        assert!(fixed.contains(&format!("chat_source_id: {}", source_id(7))));
+        // Everything else survives untouched — this repairs identity, it does not re-render the file.
+        assert!(fixed.contains(r#"title: "T""#));
+        assert!(fixed.contains(&format!("content_hash: {}", content_hash(7))));
+    }
+
+    #[test]
+    fn restamp_is_a_no_op_on_a_healthy_file_and_on_a_non_frontmatter_file() {
+        let born =
+            render_chat_frontmatter("T", 7, "general", "Unsorted", "2026-01-01", "2026-01-01");
+        assert!(restamp_chat_identity(&born, 7, "general").is_none());
+        // No fence at all: not ours to repair, and must never be mangled into one.
+        assert!(restamp_chat_identity("just a body, no front-matter\n", 7, "general").is_none());
+    }
+
+    #[test]
+    fn heal_restamps_a_stripped_file_and_leaves_a_healthy_store_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let cipher = MarkdownCipher::plaintext("vault-test");
+        let conv = new_conversation(&conn);
+        let (_doc, vault_path) =
+            seed_chat_session(&conn, dir.path(), &cipher, conv, "project", "chat");
+
+        // Healthy store: the pass changes nothing.
+        let clean = reconcile_vault_identity(&mut conn, dir.path(), &cipher).unwrap();
+        assert_eq!(clean.scanned, 1);
+        assert_eq!(clean.restamped, 0);
+        assert!(!clean.touched_anything());
+
+        // State 1 — stripped, not yet rebuilt.
+        strip_identity(&cipher, &dir.path().join(&vault_path));
+        let healed = reconcile_vault_identity(&mut conn, dir.path(), &cipher).unwrap();
+        assert_eq!(healed.restamped, 1);
+        assert!(healed.touched_anything());
+        let text = cipher.read(&dir.path().join(&vault_path)).unwrap();
+        assert!(text.contains("source_type: chat"));
+        assert!(text.contains(&format!("chat_conversation_id: {conv}")));
+
+        // Idempotent: a second pass finds nothing left to do.
+        let again = reconcile_vault_identity(&mut conn, dir.path(), &cipher).unwrap();
+        assert_eq!(again.restamped, 0);
+        assert!(!again.touched_anything());
+    }
+
+    #[test]
+    fn heal_restores_a_row_a_rebuild_already_demoted_and_rewinds_the_index_cursor() {
+        // State 2 — the strip happened, then a Rebuild re-ingested the chat as an ordinary document:
+        // the row says 'vault', and its chunks were derived from the whole transcript (PM's own
+        // answers included) with NULL turn pointers.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let cipher = MarkdownCipher::plaintext("vault-test");
+        let conv = new_conversation(&conn);
+        let (doc_id, vault_path) =
+            seed_chat_session(&conn, dir.path(), &cipher, conv, "general", "vault");
+        strip_identity(&cipher, &dir.path().join(&vault_path));
+        conn.execute(
+            "INSERT INTO chunks(document_id, ordinal, content, char_count) \n             VALUES (?1, 0, 'PM: a hallucinated answer', 26)",
+            params![doc_id],
+        )
+        .unwrap();
+
+        let healed = reconcile_vault_identity(&mut conn, dir.path(), &cipher).unwrap();
+        assert_eq!(healed.restamped, 1);
+        assert_eq!(healed.rows_restored, 1);
+        assert_eq!(healed.reindex_queued, 1);
+
+        let (st, sid): (String, Option<String>) = conn
+            .query_row(
+                "SELECT source_type, source_id FROM documents WHERE id = ?1",
+                params![doc_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(st, ingest::SOURCE_TYPE_CHAT);
+        assert_eq!(sid.as_deref(), Some(source_id(conv).as_str()));
+
+        // The mis-derived chunks are gone and the cursor is rewound, so the chat indexer re-indexes
+        // authored turns only, with turn pointers restored.
+        let chunks: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE document_id = ?1",
+                params![doc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunks, 0);
+        let cursor: Option<i64> = conn
+            .query_row(
+                "SELECT last_indexed_turn_id FROM chat_sessions WHERE conversation_id = ?1",
+                params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, None);
+
+        // The authored truth is never touched — that is what makes every state recoverable.
+        let convs: i64 = conn
+            .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(convs, 1);
+    }
+
+    #[test]
+    fn heal_relinks_a_session_a_wipe_arm_rebuild_unlinked() {
+        // State 3 — a vector-width Rebuild DELETEd every `documents` row, so `document_id` was set
+        // NULL by the FK and a stray row now owns the vault_path. Re-attach before repairing, or the
+        // re-index collides on that UNIQUE column.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let cipher = MarkdownCipher::plaintext("vault-test");
+        let conv = new_conversation(&conn);
+        let (doc_id, vault_path) =
+            seed_chat_session(&conn, dir.path(), &cipher, conv, "general", "vault");
+        strip_identity(&cipher, &dir.path().join(&vault_path));
+        conn.execute(
+            "UPDATE chat_sessions SET document_id = NULL WHERE conversation_id = ?1",
+            params![conv],
+        )
+        .unwrap();
+
+        let healed = reconcile_vault_identity(&mut conn, dir.path(), &cipher).unwrap();
+        assert_eq!(healed.relinked, 1);
+        assert_eq!(healed.rows_restored, 1);
+        let linked: Option<i64> = conn
+            .query_row(
+                "SELECT document_id FROM chat_sessions WHERE conversation_id = ?1",
+                params![conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, Some(doc_id));
+    }
+
+    #[test]
+    fn heal_records_an_unreadable_session_and_keeps_going() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let cipher = MarkdownCipher::plaintext("vault-test");
+        let gone = new_conversation(&conn);
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope, vault_path) \
+             VALUES (?1, 'general', 'missing.md')",
+            params![gone],
+        )
+        .unwrap();
+        let conv = new_conversation(&conn);
+        let (_d, vault_path) =
+            seed_chat_session(&conn, dir.path(), &cipher, conv, "project", "chat");
+        strip_identity(&cipher, &dir.path().join(&vault_path));
+
+        let healed = reconcile_vault_identity(&mut conn, dir.path(), &cipher).unwrap();
+        assert_eq!(healed.scanned, 2);
+        assert_eq!(
+            healed.unrepaired.len(),
+            1,
+            "the missing file is reported, not swallowed"
+        );
+        assert_eq!(
+            healed.restamped, 1,
+            "the readable session is still repaired"
+        );
     }
 }
