@@ -1290,6 +1290,8 @@ pub fn run() {
             layout::semantic_layout,
             layout::start_semantic_layout,
             layout::prioritise_semantic_layout,
+            layout::project_layout,
+            layout::set_project_layout,
             layout::optional_tsne_status,
             layout::install_optional_tsne,
             photos::optional_ocr_status,

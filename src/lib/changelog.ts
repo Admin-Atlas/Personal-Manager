@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.72.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      'The Map remembers where it put things. The "by project" arrangement was worked out from scratch every time you started PM -- the same documents, shuffled into the same shape, all over again. PM now saves the arrangement and reuses it, so the Map opens instantly and your documents are exactly where you left them. It re-works the layout only when something actually changes, like a document moving to a different project. (The "by meaning" arrangement already did this.)',
+    ],
+  },
+  {
     version: "3.71.0-alpha",
     date: "2026-07-25",
     highlights: [

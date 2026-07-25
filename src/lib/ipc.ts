@@ -1019,6 +1019,15 @@ export const startSemanticLayout = () => invoke<boolean>("start_semantic_layout"
 /** Recompute the layout now if stale, jumping ahead of a Drive sync (called when the Map opens). */
 export const prioritiseSemanticLayout = () => invoke<void>("prioritise_semantic_layout");
 
+/** The cached "by project" map layout as `lib/mapLayout` last wrote it — an opaque JSON string the
+ *  backend only stores, never interprets. `null` when nothing is cached yet. */
+export const projectLayout = () => invoke<string | null>("project_layout");
+
+/** Persist the "by project" layout so the next launch repaints instead of re-running the force
+ *  simulation. Pass `null` to clear it. */
+export const setProjectLayout = (cache: string | null) =>
+  invoke<void>("set_project_layout", { cache });
+
 /** Whether the optional t-SNE reducer (an on-demand download) is installed. */
 export const optionalTsneStatus = () => invoke<TsneStatus>("optional_tsne_status");
 
