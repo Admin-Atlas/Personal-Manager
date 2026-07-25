@@ -19,17 +19,29 @@ use crate::secret::Secret;
 // two in step: renaming this orphans every existing keychain entry (including the
 // DB key, which makes the old encrypted store unreadable).
 const SERVICE: &str = "org.itsatlas.pm";
-/// The single keychain item that holds **every** PM secret as one JSON `{name: value}` map. macOS
-/// shows one keychain-consent dialog per keychain *item*, so collapsing the ~dozen per-secret items
-/// into this one means a single "Always Allow" covers all of PM's secrets at once — interim relief
-/// for the unsigned-build prompt storm (one dialog per item, features loading in behind each) until
-/// Developer-ID signing lands (`docs/MACOS-SIGNING.md`; the storm's real cause is an unsigned build's
-/// unstable code identity, not this storage shape). **Honest trade-off, stated plainly:** that one
-/// grant is coarser than the old per-item grants — any code running *as PM*, once the user allows it,
-/// can read every secret, not just the one it asked for. Windows Credential Manager never prompts, so
-/// this only changes anything on macOS. The `<name>` constants below are the *logical* keys inside
-/// the map (and the *legacy* per-item entries, read once and folded into the bundle on first access).
+/// The single keychain item that holds **every** PM secret as one JSON `{name: value}` map, on the
+/// platforms that [bundle](BUNDLED). macOS shows one keychain-consent dialog per keychain *item*, so
+/// collapsing the ~dozen per-secret items into this one means a single "Always Allow" covers all of
+/// PM's secrets at once — interim relief for the unsigned-build prompt storm (one dialog per item,
+/// features loading in behind each) until Developer-ID signing lands (`docs/MACOS-SIGNING.md`; the
+/// storm's real cause is an unsigned build's unstable code identity, not this storage shape).
+/// **Honest trade-off, stated plainly:** that one grant is coarser than the old per-item grants — any
+/// code running *as PM*, once the user allows it, can read every secret, not just the one it asked
+/// for. The `<name>` constants below are the *logical* keys inside the map — and, off macOS, the
+/// names of the individual keychain items.
 const BUNDLE_KEY: &str = "pm_secrets";
+/// Whether secrets share one keychain item (see [`BUNDLE_KEY`]) or get one item each.
+///
+/// **macOS only.** The bundle exists solely to collapse that platform's per-item consent prompts, and
+/// it is actively harmful elsewhere: Windows Credential Manager caps a credential blob at
+/// `CRED_MAX_CREDENTIAL_BLOB_SIZE` = 2560 bytes — 1280 UTF-16 characters — for the *whole item*. The
+/// DB key, a Google client id/secret and two OAuth token blobs together run past that, so the write
+/// is refused ("Attribute 'password encoded as UTF-16' is longer than platform limit of 2560 chars")
+/// and connecting the account that tipped it over fails outright. Worse, every OAuth *refresh*
+/// re-writes its token, so a full bundle breaks connections that already worked. Per-item, each
+/// secret is measured on its own and no single one comes close. Windows never prompts and the Linux
+/// secret service prompts per *keyring*, not per item, so neither loses anything by unbundling.
+const BUNDLED: bool = cfg!(target_os = "macos");
 const OPENROUTER_KEY: &str = "openrouter_api_key";
 /// A separate key for non-interactive background work (sorting-review proposals,
 /// the Learning-You profile distillation), so the user can see at a glance which
@@ -99,17 +111,24 @@ fn kc_delete(name: &str) -> Result<()> {
     }
 }
 
-// --- The bundle: all secrets in one keychain item, cached in memory for the process ----------
+// --- Storage shape: one item or many, cached in memory for the process ------------------------
 //
-// Every secret lives in ONE keychain item ([`BUNDLE_KEY`]) as a JSON `{name: value}` map, read
-// exactly once per process into [`CACHE`] and served from memory thereafter — which is what collapses
-// the macOS "one keychain prompt per item" storm to a single grant. `get`/`set`/`delete` keep the
-// exact signatures the typed accessors already call, so the whole change hides behind this seam.
+// Reads are served from [`CACHE`] after the first keychain hit, whichever shape is in use, so the
+// typed accessors below never pay for the same secret twice. `get`/`set`/`delete` keep the exact
+// signatures those accessors call, so both shapes hide behind this one seam.
 //
-// Legacy per-item entries (the old on-keychain shape) are folded in LAZILY and additively: a cache
-// miss reads the matching legacy item once, writes it into the bundle, VERIFIES the bundle persisted,
-// and only then deletes the legacy item — so a failed bundle write can never orphan a value (the DB
-// key most of all). No value is ever re-keyed; a fresh install simply starts with an empty bundle.
+// On macOS ([`BUNDLED`]) every secret lives in ONE keychain item ([`BUNDLE_KEY`]) as a JSON
+// `{name: value}` map, read once per process — which is what collapses the "one keychain prompt per
+// item" storm to a single grant. Per-item entries (the old on-keychain shape) are folded in LAZILY
+// and additively: a cache miss reads the matching item once, writes it into the bundle, VERIFIES the
+// bundle persisted, and only then deletes the item — so a failed bundle write can never orphan a
+// value (the DB key most of all).
+//
+// Everywhere else each secret is its own keychain item, because a bundle cannot fit inside a Windows
+// credential (see [`BUNDLED`]). A bundle left behind by an earlier build is adopted once at first
+// access — every value written back out to its own item and verified before the bundle is dropped —
+// after which the bundle plays no part. No value is ever re-keyed on either path; a fresh install
+// simply starts with nothing stored.
 
 /// Serialise the in-memory map to the bundle's on-keychain JSON. `BTreeMap` for deterministic output
 /// (stable across writes, and unit-testable). Wrapped in `Zeroizing` so the transient
@@ -133,6 +152,32 @@ fn decode_bundle(raw: &str) -> HashMap<String, Secret> {
         .collect()
 }
 
+/// Fold a bundle written by an earlier build back out into one keychain item per secret, returning
+/// whether every value it held is now readable on its own (i.e. whether the bundle item may go).
+///
+/// Gap-filling, never overwriting: a name that already has its own item keeps it, because that entry
+/// is by definition the newer of the two — the bundle is only ever a leftover. Each write is read
+/// back before it counts, and the caller drops the bundle only on a clean sweep, so a keychain that
+/// fails mid-migration simply keeps the bundle to retry at next launch. No secret — the DB key above
+/// all — can be orphaned by an interrupted run.
+fn adopt_bundle(bundled: &HashMap<String, Secret>) -> bool {
+    let mut all_recovered = true;
+    for (name, value) in bundled {
+        match kc_get(name) {
+            Ok(Some(_)) => continue, // a standalone entry already holds this one
+            Ok(None) => {}
+            Err(_) => {
+                all_recovered = false;
+                continue;
+            }
+        }
+        if kc_set(name, value.expose()).is_err() || !matches!(kc_get(name), Ok(Some(_))) {
+            all_recovered = false;
+        }
+    }
+    all_recovered
+}
+
 #[derive(Default)]
 struct SecretCache {
     loaded: bool,
@@ -145,19 +190,31 @@ struct SecretCache {
 
 impl SecretCache {
     /// Read the bundle item once. Errors only if the keychain itself is unreachable.
+    ///
+    /// Where secrets are NOT bundled this is also the one-shot migration off an older build's
+    /// bundle — and note what it deliberately does not do: the bundle's values never seed
+    /// [`Self::present`] there. Per-item entries are the sole source of truth off macOS, so a stale
+    /// bundled copy can never shadow a fresher standalone one (an OAuth token refreshed after the
+    /// bundle was written, say).
     fn load(&mut self) -> Result<()> {
         if self.loaded {
             return Ok(());
         }
         if let Some(raw) = kc_get(BUNDLE_KEY)? {
             let raw = Zeroizing::new(raw);
-            self.present = decode_bundle(&raw);
+            let bundled = decode_bundle(&raw);
+            if BUNDLED {
+                self.present = bundled;
+            } else if adopt_bundle(&bundled) {
+                let _ = kc_delete(BUNDLE_KEY);
+            }
         }
         self.loaded = true;
         Ok(())
     }
 
-    /// Write the whole map back to the single bundle item.
+    /// Write the whole map back to the single bundle item. Bundled platforms only — calling this
+    /// elsewhere would re-create the very item [`load`](Self::load) just retired.
     fn persist(&self) -> Result<()> {
         let json = encode_bundle(&self.present);
         kc_set(BUNDLE_KEY, json.as_str())
@@ -177,15 +234,18 @@ impl SecretCache {
         if self.absent.contains(name) {
             return Ok(None);
         }
-        // First miss: fold a legacy per-item entry into the bundle, if one exists.
+        // First miss: read the key's own keychain item — the live entry off macOS, a not-yet-folded
+        // legacy one on it.
         match kc_get(name)? {
             Some(value) => {
                 self.present
                     .insert(name.to_string(), Secret::from(value.clone()));
-                // Persist + verify BEFORE removing the legacy item, so a write failure keeps the
-                // legacy copy as the fallback — never orphan a value (the DB key above all).
-                if self.persist().is_ok() && self.bundle_has(name) {
-                    let _ = kc_delete(name);
+                if BUNDLED {
+                    // Persist + verify BEFORE removing the per-item entry, so a write failure keeps
+                    // that copy as the fallback — never orphan a value (the DB key above all).
+                    if self.persist().is_ok() && self.bundle_has(name) {
+                        let _ = kc_delete(name);
+                    }
                 }
                 Ok(Some(value))
             }
@@ -200,7 +260,14 @@ impl SecretCache {
         self.load()?;
         let previous = self.present.insert(name.to_string(), Secret::from(value));
         self.absent.remove(name);
-        if let Err(e) = self.persist() {
+        // Bundled: rewrite the whole map. Otherwise: write this one item, which is why a Windows
+        // credential now only ever has to hold ONE secret.
+        let written = if BUNDLED {
+            self.persist()
+        } else {
+            kc_set(name, value)
+        };
+        if let Err(e) = written {
             // Roll back so the cache never claims a value the keychain doesn't hold.
             match previous {
                 Some(old) => {
@@ -212,8 +279,10 @@ impl SecretCache {
             }
             return Err(e);
         }
-        // A value written before the bundle existed may also sit in a legacy item; clear it.
-        let _ = kc_delete(name);
+        if BUNDLED {
+            // A value written before the bundle existed may also sit in its own item; clear it.
+            let _ = kc_delete(name);
+        }
         Ok(())
     }
 
@@ -221,17 +290,29 @@ impl SecretCache {
         self.load()?;
         let removed = self.present.remove(name);
         self.absent.insert(name.to_string());
-        if removed.is_some() {
-            if let Err(e) = self.persist() {
-                if let Some(v) = removed {
-                    self.present.insert(name.to_string(), v); // roll back
+        if BUNDLED {
+            if removed.is_some() {
+                if let Err(e) = self.persist() {
+                    if let Some(v) = removed {
+                        self.present.insert(name.to_string(), v); // roll back
+                    }
+                    self.absent.remove(name);
+                    return Err(e);
                 }
-                self.absent.remove(name);
-                return Err(e);
             }
+            // Remove any legacy item too (idempotent — absent is success).
+            let _ = kc_delete(name);
+            return Ok(());
         }
-        // Remove any legacy item too (idempotent — absent is success).
-        let _ = kc_delete(name);
+        // Unbundled, the item IS the secret, so a failure to remove it is the caller's business —
+        // "forget this token" must not report success while the keychain still holds it.
+        if let Err(e) = kc_delete(name) {
+            if let Some(v) = removed {
+                self.present.insert(name.to_string(), v); // roll back
+            }
+            self.absent.remove(name);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -706,9 +787,9 @@ pub fn wipe_all_secrets(
             }
         };
 
-        // The single bundle item now holds every migrated secret, so this one delete erases them
-        // all; the per-key deletes below then mop up any legacy items not yet folded into it (a
-        // partial install, or a key never read this session). Absent = success throughout.
+        // Both storage shapes in one pass: the bundle item (every secret at once where PM bundles,
+        // or an un-adopted leftover where it doesn't), then every named key on its own. Absent =
+        // success throughout, so whichever shape this install uses, the other costs one no-op.
         wipe(BUNDLE_KEY);
         for key in all_secret_keys(token_keys, google_client_emails, vault_ids) {
             wipe(&key);
@@ -857,6 +938,66 @@ mod tests {
         let empty: HashMap<String, Secret> = HashMap::new();
         assert_eq!(encode_bundle(&empty).as_str(), "{}");
         assert!(decode_bundle(&encode_bundle(&empty)).is_empty());
+    }
+
+    #[test]
+    fn a_realistic_bundle_cannot_fit_in_a_windows_credential() {
+        // Why [`BUNDLED`] is macOS-only, pinned as arithmetic rather than a comment. Windows caps a
+        // credential blob at CRED_MAX_CREDENTIAL_BLOB_SIZE = 2560 bytes, and the keyring crate stores
+        // a password as UTF-16 — so the ceiling is 1280 characters for the WHOLE item. The set below
+        // is an ordinary install (a key for the AI, one Google account, calendar and Drive) and it
+        // lands around 1360: past the limit, and not by a comfortable margin either — every further
+        // account only adds. That is the write Windows refused, taking connecting a Drive account
+        // with it.
+        //
+        // Filler values, sized like the real thing but meaningless (so the repo's secret scanners
+        // have nothing to find).
+        const WINDOWS_MAX_UTF16: usize = 2560 / 2;
+        let token = |scope: &str| {
+            format!(
+                r#"{{"access_token":"{}","refresh_token":"{}","expiry":1900000000,"scope":"{scope}"}}"#,
+                "a".repeat(220),
+                "b".repeat(103),
+            )
+        };
+        let mut m = HashMap::new();
+        m.insert(
+            "db_encryption_key".to_string(),
+            Secret::from("0".repeat(64)),
+        );
+        m.insert(
+            "openrouter_api_key".to_string(),
+            Secret::from("e".repeat(73)),
+        );
+        m.insert(
+            "google_oauth_client_id".to_string(),
+            Secret::from("c".repeat(72)),
+        );
+        m.insert(
+            "google_oauth_client_secret".to_string(),
+            Secret::from("d".repeat(35)),
+        );
+        m.insert(
+            "google_oauth_token_calendar::someone@example.com".to_string(),
+            Secret::from(token("https://www.googleapis.com/auth/calendar.readonly")),
+        );
+        m.insert(
+            "google_oauth_token_drive::someone@example.com".to_string(),
+            Secret::from(token("https://www.googleapis.com/auth/drive.readonly")),
+        );
+
+        let bundled = encode_bundle(&m);
+        assert!(
+            bundled.encode_utf16().count() > WINDOWS_MAX_UTF16,
+            "a bundle of everyday secrets must be shown to overflow a Windows credential"
+        );
+        // Per-item, nothing comes close — each secret is measured on its own.
+        for (name, value) in &m {
+            assert!(
+                value.expose().encode_utf16().count() < WINDOWS_MAX_UTF16,
+                "{name} must fit a Windows credential on its own"
+            );
+        }
     }
 
     #[test]
