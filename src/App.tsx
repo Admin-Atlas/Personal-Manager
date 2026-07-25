@@ -57,6 +57,9 @@ import {
   listConversations,
   listSharedVaults,
   markActivity,
+  onDriveSync,
+  onLocalSync,
+  onOneDriveSync,
   onVaultAcquired,
   onVaultCurtain,
   onVaultFault,
@@ -79,9 +82,12 @@ import type {
   Conversation,
   Settings,
   SharedVaultAd,
+  SyncEvent,
   VaultLockStatus,
   VaultStatus,
 } from "./lib/types";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { runProposalsAfterSync } from "./lib/reviewProposals";
 import { VaultJoin } from "./components/VaultJoin";
 import { markJustJoinedVault } from "./lib/joinedVault";
 
@@ -542,6 +548,32 @@ export default function App() {
       warmMapLayout();
       void startSemanticLayout().catch(() => {});
     }
+  }, [aiReady]);
+
+  // When a connector sync finishes, propose filings for whatever it brought in — so the Review tab
+  // is ready when it's opened instead of starting its work then (#513). Triggered here rather than
+  // in the backend because the AI-suggestions switch is a localStorage preference with no backend
+  // consumer (see reviewPrefs.ts); `runProposalsAfterSync` re-reads it, so this listener costs
+  // nothing when suggestions are off. Silent and best-effort — it's a convenience the user didn't
+  // explicitly ask for, so it never raises an error of its own.
+  useEffect(() => {
+    if (!aiReady) return;
+    let cancelled = false;
+    const unlisteners: UnlistenFn[] = [];
+    const onSync = (e: SyncEvent) => {
+      if (e.type === "finished") void runProposalsAfterSync();
+    };
+    for (const subscribe of [onDriveSync, onOneDriveSync, onLocalSync]) {
+      void subscribe(onSync).then((un) => {
+        // Unsubscribe immediately if the effect was torn down before this resolved.
+        if (cancelled) un();
+        else unlisteners.push(un);
+      });
+    }
+    return () => {
+      cancelled = true;
+      for (const un of unlisteners) un();
+    };
   }, [aiReady]);
 
   async function selectConversation(id: number) {
