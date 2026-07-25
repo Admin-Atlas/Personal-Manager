@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.76.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "You can now choose what the Focus tab shows. A new Panels button in its header lets you switch today's briefing, the focus box, Upcoming and the projects list on or off, so the tab holds what you actually use. One panel always stays visible so the page can never end up blank, and Reset Focus in Settings brings them all back.",
+    ],
+  },
+  {
     version: "3.75.0-alpha",
     date: "2026-07-25",
     highlights: [

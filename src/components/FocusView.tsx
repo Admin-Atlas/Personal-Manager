@@ -29,8 +29,25 @@ import type {
 import { formatDate, formatDateOnly, formatEventWhen } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
 import { rankImportance } from "../lib/importance";
-import { Button, Card, Input, Skeleton, StatusBadge, Select, SegmentedControl } from "./ui";
-import { readFocusLayout, writeFocusLayout, type FocusLayout } from "../lib/focusPrefs";
+import {
+  Button,
+  Card,
+  Input,
+  Popover,
+  Skeleton,
+  StatusBadge,
+  Select,
+  SegmentedControl,
+} from "./ui";
+import {
+  FOCUS_PANELS,
+  readFocusHiddenPanels,
+  readFocusLayout,
+  writeFocusHiddenPanels,
+  writeFocusLayout,
+  type FocusLayout,
+  type FocusPanel,
+} from "../lib/focusPrefs";
 import { useDepth } from "../theme";
 import { useBriefing } from "../lib/briefing";
 
@@ -217,6 +234,27 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   const names = useMemo(() => projects.map((p) => p.name), [projects]);
   // How the project list is ordered. Defaults to "Smart" (status precedence); remembered per-device.
   const [sort, setSort] = useState<Sort>(() => readSort());
+  // Which panels the user has switched off. Subscribed rather than read-once: Settings' "Reset
+  // Focus" renders as an overlay over this still-mounted view, so a read-at-mount would leave a
+  // reset looking like it had done nothing until the tab remounted.
+  const [hiddenPanels, setHiddenPanels] = useState<Set<FocusPanel>>(readFocusHiddenPanels);
+  useEffect(() => {
+    const onChanged = () => setHiddenPanels(readFocusHiddenPanels());
+    window.addEventListener("pm:settings-changed", onChanged);
+    return () => window.removeEventListener("pm:settings-changed", onChanged);
+  }, []);
+  const shown = (id: FocusPanel) => !hiddenPanels.has(id);
+  // The body must never be able to go completely blank, so the last visible panel can't be switched
+  // off — its checkbox is disabled rather than silently ignoring the click.
+  const visibleCount = FOCUS_PANELS.length - hiddenPanels.size;
+  function togglePanel(id: FocusPanel) {
+    const next = new Set(hiddenPanels);
+    if (next.has(id)) next.delete(id);
+    else if (visibleCount > 1) next.add(id);
+    else return;
+    setHiddenPanels(next);
+    writeFocusHiddenPanels(next);
+  }
   useEffect(() => {
     localStorage.setItem(SORT_LS_KEY, JSON.stringify(sort));
   }, [sort]);
@@ -256,13 +294,18 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   // duplicating it. In stacked mode they render one after another exactly as before.
   const briefingAndActions = (
     <>
-      <Briefing />
-      {!loading && projects.length > 0 && (
+      {shown("briefing") && <Briefing />}
+      {shown("actions") && !loading && projects.length > 0 && (
         <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
       )}
-      {events.length > 0 && <FocusUpcoming listEvents={events} calendarIds={calendarIds} />}
+      {shown("upcoming") && events.length > 0 && (
+        <FocusUpcoming listEvents={events} calendarIds={calendarIds} />
+      )}
     </>
   );
+  // Whether the split layout's left column has anything in it. With all three off, the 22rem track
+  // would otherwise render empty and hold the project list pinned to a dead offset.
+  const leftColumnShown = shown("briefing") || shown("actions") || shown("upcoming");
   const projectList = loading ? (
     <ul className="flex flex-col gap-2">
       {Array.from({ length: 4 }).map((_, i) => (
@@ -357,6 +400,53 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
               { value: "vertical", label: "Stacked", title: "Everything in one column" },
             ]}
           />
+          {/* Which panels this tab shows. It lives in the header — the one part that is never
+              hideable — because it is the way back for anything switched off. */}
+          <Popover
+            align="right"
+            ariaLabel="Panels to show"
+            trigger={({ open, toggle }) => (
+              <Button
+                variant="secondary"
+                onClick={toggle}
+                aria-expanded={open}
+                data-help="focus-panels"
+                title="Choose which panels this tab shows"
+              >
+                Panels
+                <span className="font-mono text-xs text-ink4">
+                  {visibleCount}/{FOCUS_PANELS.length}
+                </span>
+              </Button>
+            )}
+          >
+            <ul>
+              {FOCUS_PANELS.map((p) => {
+                const on = shown(p.id);
+                // The last one standing can't be switched off, or the tab body would be empty.
+                const locked = on && visibleCount === 1;
+                return (
+                  <li key={p.id}>
+                    <label
+                      className={`flex items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1 text-sm text-ink ${
+                        locked ? "cursor-default opacity-60" : "cursor-pointer hover:bg-surface"
+                      }`}
+                      title={locked ? "At least one panel has to stay visible" : undefined}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        disabled={locked}
+                        onChange={() => togglePanel(p.id)}
+                        className="accent-[var(--accent)]"
+                      />
+                      <span className={on ? "" : "text-ink4"}>{p.label}</span>
+                    </label>
+                  </li>
+                );
+              })}
+            </ul>
+          </Popover>
           <Button
             variant="secondary"
             onClick={suggestAll}
@@ -385,14 +475,18 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
           {layout === "split" ? (
             // Two columns on a wide screen (briefing/actions/agenda | project list); the grid falls
             // back to one column below lg, so a narrow window reads like the stacked layout.
-            <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,22rem)_1fr]">
-              <div className="min-w-0">{briefingAndActions}</div>
-              <div className="min-w-0">{projectList}</div>
+            <div
+              className={`grid grid-cols-1 gap-6 ${
+                leftColumnShown ? "lg:grid-cols-[minmax(0,22rem)_1fr]" : ""
+              }`}
+            >
+              {leftColumnShown && <div className="min-w-0">{briefingAndActions}</div>}
+              {shown("projects") && <div className="min-w-0">{projectList}</div>}
             </div>
           ) : (
             <>
               {briefingAndActions}
-              {projectList}
+              {shown("projects") && projectList}
             </>
           )}
         </div>
