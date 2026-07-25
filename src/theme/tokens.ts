@@ -23,6 +23,21 @@ import {
 
 export type ThemeVars = Record<`--${string}`, string>;
 
+/** The opt-in accessibility axes (Accessibility settings). Additive over the visual theme: their
+ *  defaults ({ fontScale: 1, reduceMotion: false, legibleFont: false }) equal today's behaviour. */
+export interface A11yTheme {
+  /** Whole-UI text scale (1 = 100%). Multiplies the root font-size, so all rem sizing scales. */
+  fontScale: number;
+  /** Force motion off regardless of the OS `prefers-reduced-motion` setting. */
+  reduceMotion: boolean;
+  /** Swap the UI + heading faces for Atkinson Hyperlegible (a legible / dyslexia-friendly face). */
+  legibleFont: boolean;
+}
+
+// Atkinson Hyperlegible — the family name declared by @fontsource/atkinson-hyperlegible (imported in
+// fonts.ts). Overrides --ui/--head only; --mono (numbers/code) is left untouched.
+const LEGIBLE_STACK = '"Atkinson Hyperlegible", system-ui, sans-serif';
+
 export function themeVars(system: System, mode: Mode, accent: string): ThemeVars {
   const stat = STATUS[system][mode];
   const v: ThemeVars = {};
@@ -85,6 +100,7 @@ export function applyTheme(
   mode: Mode,
   accent: string,
   depth: Depth,
+  a11y?: A11yTheme,
 ): void {
   const vars = themeVars(system, mode, accent);
   for (const key of Object.keys(vars) as Array<keyof ThemeVars>) {
@@ -94,4 +110,17 @@ export function applyTheme(
   el.dataset.mode = mode;
   el.dataset.depth = depth;
   el.style.colorScheme = mode; // native controls + scrollbars follow light/dark
+
+  // Accessibility axes — applied AFTER the token loop so the legible-font override wins over the
+  // system faces themeVars just wrote. Re-derived on every call, so toggling an axis off restores
+  // the theme default (the loop above already re-set --ui/--head from FONTS).
+  if (a11y) {
+    el.style.setProperty("--font-scale", String(a11y.fontScale));
+    if (a11y.legibleFont) {
+      el.style.setProperty("--ui", LEGIBLE_STACK);
+      el.style.setProperty("--head", LEGIBLE_STACK);
+    }
+    if (a11y.reduceMotion) el.dataset.reducedMotion = "on";
+    else delete el.dataset.reducedMotion;
+  }
 }

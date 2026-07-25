@@ -48,7 +48,7 @@ export {
 export type { Coords } from "./timezones";
 
 export { ThemeProvider, useTheme } from "./ThemeContext";
-export type { ThemeState } from "./ThemeContext";
+export type { ThemeState, FontScale } from "./ThemeContext";
 
 export { UserTimeProvider, useUserTime } from "./UserTimeContext";
 export type { UserTime } from "./UserTimeContext";

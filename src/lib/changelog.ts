@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.66.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "PM has a new Accessibility tab in Settings, with its first set of options. You can scale all of PM's text up or down (Small to XL) -- the same “Text size” control also sits under Appearance, since it's handy for everyone. You can turn animations off regardless of your device's motion setting. And you can switch the whole interface to Atkinson Hyperlegible, a typeface designed to be easy to read and to tell letters apart (numbers and code keep their usual font). These are opt-in and travel with your data -- nothing changes until you turn something on, and each has a Reset. More options are on the way to this tab: larger touch targets, colour-blind-friendly palettes, and a high-contrast theme.",
+    ],
+  },
+  {
     version: "3.65.0-alpha",
     date: "2026-07-25",
     highlights: [

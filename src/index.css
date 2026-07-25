@@ -91,6 +91,13 @@ body,
   height: 100%;
 }
 
+/* Accessibility: whole-UI text size. applyTheme() sets --font-scale (1 = 100%); scaling the root
+ * font-size scales every rem-based size (type AND spacing) together, like the browser's own zoom.
+ * Default 1 → the browser's 16px, so nothing changes until the user picks a larger size. */
+html {
+  font-size: calc(100% * var(--font-scale, 1));
+}
+
 body {
   margin: 0;
   background-color: var(--bg);
@@ -289,6 +296,19 @@ body {
       transform: none;
     }
   }
+}
+
+/* Accessibility: in-app reduced-motion override. The OS `prefers-reduced-motion` path above is the
+ * default; when the user forces "Reduced" in Settings, applyTheme() stamps data-reduced-motion="on"
+ * and we near-eliminate every animation/transition regardless of the OS setting. This also catches
+ * the `motion-reduce:` Tailwind utilities, which follow the OS query alone. */
+:root[data-reduced-motion="on"] *,
+:root[data-reduced-motion="on"] *::before,
+:root[data-reduced-motion="on"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
 }
 
 /* Help mode (Step 4b): when enabled, sections annotated with `data-help` get a
