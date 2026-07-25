@@ -36,8 +36,39 @@ const LIGHT: readonly string[] = [
   "#9333ea",
 ];
 
-export function graphColor(index: number, mode: Mode): string {
-  const palette = mode === "light" ? LIGHT : DARK;
+// Colour-blind-safe (Okabe–Ito) categorical sets, used when the colour-blind axis is on. Mode-tuned
+// at the two extremes the base palette can't share: yellow is invisible on the light --bg (→ a dark
+// gold) and pure black is invisible on the dark --bg (→ a light neutral); the six chromatic hues
+// carry unchanged. Eight distinct entries, mutually distinguishable under the common CVD types.
+const CVD_DARK: readonly string[] = [
+  "#56b4e9",
+  "#e69f00",
+  "#009e73",
+  "#f0e442",
+  "#0072b2",
+  "#d55e00",
+  "#cc79a7",
+  "#bbbbbb",
+];
+const CVD_LIGHT: readonly string[] = [
+  "#0072b2",
+  "#e69f00",
+  "#009e73",
+  "#cc79a7",
+  "#d55e00",
+  "#56b4e9",
+  "#8a6d00",
+  "#000000",
+];
+
+export function graphColor(index: number, mode: Mode, colorblind = false): string {
+  const palette = colorblind
+    ? mode === "light"
+      ? CVD_LIGHT
+      : CVD_DARK
+    : mode === "light"
+      ? LIGHT
+      : DARK;
   const i = ((index % palette.length) + palette.length) % palette.length;
   return palette[i];
 }

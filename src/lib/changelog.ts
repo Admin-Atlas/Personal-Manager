@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.68.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "The Accessibility tab gains a colour-blind-safe palette. Turn it on and the colours PM uses to tell things apart -- project graph nodes, calendar sources, and the status colours (due, blocked, and so on) -- switch to an Okabe-Ito set chosen to stay distinct under the common types of colour vision, including the usual red/green confusion. It's opt-in and changes only those category colours; your theme, text, and icons are untouched. (Distinct dot shapes to back up the colours are coming next.)",
+    ],
+  },
+  {
     version: "3.67.0-alpha",
     date: "2026-07-25",
     highlights: [

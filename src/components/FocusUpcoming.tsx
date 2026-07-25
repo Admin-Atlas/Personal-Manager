@@ -48,7 +48,7 @@ interface Props {
 }
 
 export function FocusUpcoming({ listEvents, calendarIds }: Props) {
-  const { system, accent } = useTheme();
+  const { system, accent, colorblind } = useTheme();
   const { coords } = useUserTime();
   const [mode, setMode] = useState<FocusUpcomingMode>(readFocusUpcomingMode);
   const [range, setRange] = useState<CalendarRange>(readFocusUpcomingRange);
@@ -114,9 +114,9 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
   }, [allEvents]);
 
   const colorOf = useMemo(() => {
-    const map = sourceColors(calendarIds, system, accent);
+    const map = sourceColors(calendarIds, system, accent, colorblind);
     return (calendarId: string) => map.get(calendarId) ?? "var(--ink4)";
-  }, [calendarIds, system, accent]);
+  }, [calendarIds, system, accent, colorblind]);
 
   const bounds = useMemo(
     () => resolveRangeBounds(range, {}, coords, anchor),

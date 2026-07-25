@@ -149,7 +149,7 @@ interface CalendarViewProps {
 }
 
 export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProps) {
-  const { system, accent } = useTheme();
+  const { system, accent, colorblind } = useTheme();
   const { coords } = useUserTime();
   const [overview, setOverview] = useState<CalendarOverview | null>(() => cachedOverview);
   const [events, setEvents] = useState<CalendarEvent[]>(() => cachedEvents);
@@ -345,13 +345,13 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
 
   const colorOf = useMemo(() => {
     const ids = overview?.calendars.map((c) => c.id) ?? [];
-    const map = sourceColors(ids, system, accent);
+    const map = sourceColors(ids, system, accent, colorblind);
     return (calendarId: string) => {
       if (calendarId === MILESTONE_CALENDAR_ID) return milestoneColor(system);
       if (calendarId === PINBOARD_CALENDAR_ID) return pinboardColor(system);
       return map.get(calendarId) ?? "var(--ink4)";
     };
-  }, [overview, system, accent]);
+  }, [overview, system, accent, colorblind]);
 
   // Project milestones as synthetic all-day events — a first-party overlay, not synced. Only draw a
   // milestone that ISN'T already on the calendar as a real event: PM-native (unlinked) ones, plus

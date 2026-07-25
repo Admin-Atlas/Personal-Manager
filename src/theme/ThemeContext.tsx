@@ -82,6 +82,10 @@ export interface ThemeState {
    *  look is undisturbed until they choose otherwise or Reset. */
   density: Density;
   setDensity: (v: Density) => void;
+  /** Swap the categorical palettes (graph nodes, calendar sources) and semantic status colours for a
+   *  colour-blind-safe (Okabe–Ito) set. Off by default (= today), so it needs no migration. */
+  colorblind: boolean;
+  setColorblind: (v: boolean) => void;
   /** True when every accessibility axis is at its default — drives the Accessibility tab's "Reset". */
   accessibilityIsDefault: boolean;
   /** Restore the accessibility axes (font size, reduce motion, legible font) to their defaults. */
@@ -147,6 +151,7 @@ const KEY = {
   reduceMotion: "pm:a11y:reduceMotion",
   legibleFont: "pm:a11y:legibleFont",
   density: "pm:a11y:density",
+  colorblind: "pm:a11y:colorblind",
 };
 
 // localStorage can throw (locked-down webviews); never let a theme read/write crash the app.
@@ -222,6 +227,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const [density, setDensity] = useState<Density>(() =>
     initialDensity(read(KEY.density), read(KEY.system) !== null),
   );
+  const [colorblind, setColorblind] = useState<boolean>(() => read(KEY.colorblind) === "true");
 
   // The resolved Mode (+ how/where it was resolved). Computed synchronously for a themed first
   // paint, then kept live by the effect below (OS changes, sunrise/sunset, focus).
@@ -268,6 +274,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     // A blob without `density` predates this axis, so it belongs to an existing user whose folder was
     // restored on a fresh machine → pin the legacy sizing, matching the localStorage migration above.
     setDensity(oneOf(typeof b.density === "string" ? b.density : null, DENSITIES, LEGACY_DENSITY));
+    setColorblind(b.colorblind === true);
   }
 
   // One-shot hydration from the store. On a fresh machine (localStorage empty) the
@@ -381,13 +388,15 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     fontScale === DEFAULT_FONT_SCALE &&
     !reduceMotion &&
     !legibleFont &&
-    density === DEFAULT_DENSITY;
+    density === DEFAULT_DENSITY &&
+    !colorblind;
 
   function resetAccessibility(): void {
     setFontScale(DEFAULT_FONT_SCALE);
     setReduceMotion(false);
     setLegibleFont(false);
     setDensity(DEFAULT_DENSITY);
+    setColorblind(false);
   }
 
   // Restore every axis to its default in one go. The persist effect below mirrors the axis changes to
@@ -414,6 +423,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       reduceMotion,
       legibleFont,
       density,
+      colorblind,
     });
     write(KEY.system, system);
     write(KEY.modePref, modePref);
@@ -424,6 +434,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.reduceMotion, String(reduceMotion));
     write(KEY.legibleFont, String(legibleFont));
     write(KEY.density, density);
+    write(KEY.colorblind, String(colorblind));
     if (hydrated) {
       const blob = {
         system,
@@ -436,6 +447,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         reduceMotion,
         legibleFont,
         density,
+        colorblind,
       };
       setPref(PREF_KEY, JSON.stringify(blob)).catch(() => {
         /* fire-and-forget — localStorage already holds the value */
@@ -452,6 +464,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     reduceMotion,
     legibleFont,
     density,
+    colorblind,
     hydrated,
   ]);
 
@@ -482,6 +495,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setLegibleFont,
     density,
     setDensity,
+    colorblind,
+    setColorblind,
     accessibilityIsDefault,
     resetAccessibility,
   };
