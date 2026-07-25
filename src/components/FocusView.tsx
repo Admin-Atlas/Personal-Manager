@@ -34,6 +34,7 @@ import { rankImportance } from "../lib/importance";
 import { Button, Card, Input, Skeleton, StatusBadge, Select, SegmentedControl } from "./ui";
 import { readFocusLayout, writeFocusLayout, type FocusLayout } from "../lib/focusPrefs";
 import { useDepth } from "../theme";
+import { Markdown } from "../lib/markdown";
 
 interface Props {
   /** Open the per-project scoped view. */
@@ -758,7 +759,9 @@ function Briefing({
         </Button>
       </div>
       {text ? (
-        <div className="whitespace-pre-wrap text-sm leading-relaxed text-ink2">{text}</div>
+        <div className="pm-inline-md text-sm leading-relaxed text-ink2">
+          <Markdown>{text}</Markdown>
+        </div>
       ) : (
         <p className="text-sm text-ink4">Putting together your briefing…</p>
       )}

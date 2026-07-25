@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DevRetrievalExplain, Message } from "../lib/types";
 import { getSettings, retrievalDiagnose, retrievalExplain, setRetrievalK } from "../lib/ipc";
 import { useDevMode } from "../lib/capabilities";
+import { Markdown } from "../lib/markdown";
 import { RetrievalScoreTable } from "./RetrievalScoreTable";
 import { Popover } from "./ui";
 import { Button } from "./ui";
@@ -276,8 +277,8 @@ export function RetrievalExplainPanel({ messages, project }: Props) {
           </div>
           {diagErr && <p className="mt-2 text-xs text-[var(--st-due)]">{diagErr}</p>}
           {advice && (
-            <div className="mt-2 whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border bg-surface px-3 py-2 text-xs leading-relaxed text-ink2">
-              {advice}
+            <div className="pm-inline-md mt-2 rounded-[var(--radius-sm)] border border-border bg-surface px-3 py-2 text-xs leading-relaxed text-ink2">
+              <Markdown>{advice}</Markdown>
             </div>
           )}
         </div>

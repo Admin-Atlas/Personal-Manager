@@ -4,16 +4,19 @@
 import {
   memo,
   useCallback,
+  useDeferredValue,
   useEffect,
   useRef,
   useState,
-  type ReactNode,
+  type MouseEvent,
   type RefObject,
 } from "react";
 import type { Citation, GroundingConfidence, Message, PromptMessage } from "../lib/types";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
+import { Markdown } from "../lib/markdown";
+import { citationTarget, linkCitations } from "../lib/chatMarkdown";
 import { formatDate, formatDateLocal, shortModel } from "../lib/format";
 import { getSettings, ingestNote, setRetrievalConfidenceThreshold } from "../lib/ipc";
 import { VisuallyHidden } from "./ui";
@@ -60,56 +63,58 @@ function resumeMarkerDate(messages: Message[], now: number): string | null {
   return formatDate(last.created_at);
 }
 
-/** Render assistant text with inline `[n]` citation markers turned into buttons that
- *  jump to the matching source (the grounding prompt asks the model to cite as
- *  [1], [2], …). A marker outside the citation range stays plain text. */
-function renderWithCitations(
-  content: string,
-  count: number,
-  onCite: (n: number) => void,
-): ReactNode {
-  return content.split(/(\[\d+\])/g).map((part, i) => {
-    const m = /^\[(\d+)\]$/.exec(part);
-    const n = m ? Number(m[1]) : 0;
-    if (n >= 1 && n <= count) {
-      return (
-        <button
-          key={i}
-          type="button"
-          onClick={() => onCite(n)}
-          title={`Jump to source ${n}`}
-          className="border-0 bg-transparent p-0 align-baseline font-medium text-accent-text underline decoration-dotted underline-offset-2 transition hover:brightness-110 motion-reduce:transition-none"
-        >
-          {part}
-        </button>
-      );
-    }
-    return <span key={i}>{part}</span>;
-  });
-}
-
 function Bubble({
   role,
   content,
   citationCount = 0,
   onCite,
+  markdown = false,
 }: {
   role: string;
   content: string;
   citationCount?: number;
   onCite?: (n: number) => void;
+  /** Render the body as Markdown through the sanitizing boundary. Set for the model's answers, not
+   *  for the user's own message — what someone typed should never be reinterpreted. */
+  markdown?: boolean;
 }) {
   const isUser = role === "user";
-  const body =
-    onCite && citationCount > 0
-      ? renderWithCitations(content, citationCount, onCite)
-      : content || <span className="text-ink4">…</span>;
+  // A streaming reply sets `content` to the whole accumulated answer on EVERY token, and a Markdown
+  // render of a ~2 KB answer measures ~8 ms — landing on each token that would be ~1 s of main-thread
+  // work across one reply, on top of the parse growing as the answer does. Deferring lets React run
+  // it at low priority and drop superseded intermediates, so the token feed and scrolling stay
+  // smooth and the formatting still updates live. Settled turns are unaffected: their content never
+  // changes, so the deferred value equals it immediately.
+  const deferred = useDeferredValue(content);
+  const text = markdown ? deferred : content;
+
+  // One delegated listener instead of a handler per marker: the citation links are produced by the
+  // Markdown renderer, so there is nothing to attach to individually. A real `<a href>` also fires
+  // click on Enter, which keeps the citations keyboard-operable exactly as the old buttons were.
+  const onCiteClick = (e: MouseEvent<HTMLDivElement>) => {
+    if (!onCite) return;
+    const href = (e.target as HTMLElement).closest?.("a[href]")?.getAttribute("href");
+    const n = citationTarget(href, citationCount);
+    if (n === null) return;
+    e.preventDefault();
+    onCite(n);
+  };
+
+  const body = !text ? (
+    <span className="text-ink4">…</span>
+  ) : markdown ? (
+    <Markdown>{linkCitations(text, citationCount)}</Markdown>
+  ) : (
+    text
+  );
+
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
-        className={`max-w-[80%] whitespace-pre-wrap rounded-[var(--radius)] px-4 py-2.5 text-sm leading-relaxed ${
-          isUser ? "bg-accent text-accent-ink" : "bg-surface text-ink"
-        }`}
+        onClick={markdown && onCite ? onCiteClick : undefined}
+        className={`max-w-[80%] rounded-[var(--radius)] px-4 py-2.5 text-sm leading-relaxed ${
+          markdown ? "pm-inline-md" : "whitespace-pre-wrap"
+        } ${isUser ? "bg-accent text-accent-ink" : "bg-surface text-ink"}`}
       >
         {/* Author, for screen readers only: sighted users read it from left/right alignment + colour. */}
         <VisuallyHidden>{isUser ? "You said: " : "Assistant said: "}</VisuallyHidden>
@@ -418,6 +423,7 @@ const MessageBlock = memo(function MessageBlock({
       <Bubble
         role={message.role}
         content={message.content}
+        markdown={message.role === "assistant"}
         citationCount={showSources ? citations.length : 0}
         onCite={showSources ? jumpToSource : undefined}
       />
@@ -550,7 +556,7 @@ export function ChatView({
             registerBlock={registerBlock}
           />
         ))}
-        {streaming !== null && <Bubble role="assistant" content={streaming} />}
+        {streaming !== null && <Bubble role="assistant" content={streaming} markdown />}
         <StreamAnnouncer streaming={streaming} />
         <div ref={endRef} />
       </div>

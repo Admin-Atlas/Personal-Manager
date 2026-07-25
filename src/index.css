@@ -259,6 +259,34 @@ body {
   font-weight: 600;
 }
 
+/* Model-written prose rendered inline inside a host that already owns its type scale and colour —
+   a chat bubble, the briefing card, the context meter, the retrieval-explain panel. `.pm-markdown`
+   sets its own `--ink2`/0.875rem for the full-width reader; inside a bubble that would visibly dim
+   the answer and fight the host's `text-sm`/`leading-relaxed`, so hand those back to the host. */
+.pm-inline-md .pm-markdown {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+.pm-inline-md .pm-markdown p {
+  margin: 0.4rem 0;
+}
+/* These surfaces previously rendered as `whitespace-pre-wrap`, so a model's single newlines showed
+   as line breaks. GFM folds a single newline into a space, which would silently reflow every answer
+   the model laid out by hand — `pre-line` keeps those breaks while still collapsing runs of spaces.
+   Scoped here so the document reader keeps CommonMark's folding, as `.pm-note-md` does above. */
+.pm-inline-md .pm-markdown p,
+.pm-inline-md .pm-markdown li {
+  white-space: pre-line;
+}
+/* Citation links, styled as the pre-Markdown `[n]` buttons were: dotted, so they read as a jump to
+   a source rather than a link out to the web. */
+.pm-inline-md .pm-markdown a[href^="#pm-cite-"] {
+  font-weight: 500;
+  text-decoration-style: dotted;
+  cursor: pointer;
+}
+
 /* Motion primitives — skeleton shimmer, typewriter caret, spinner, view fade-up.
  * Defined only when the user hasn't requested reduced motion; under
  * prefers-reduced-motion the animation-name doesn't resolve, so elements rest in their
