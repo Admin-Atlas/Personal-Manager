@@ -1,0 +1,29 @@
+# Line endings are decided here, not by whatever `core.autocrlf` each machine
+# happens to have.
+#
+# Two problems this solves:
+#
+#   1. Phantom "modified" files. Git for Windows sets `core.autocrlf=true`
+#      system-wide, so the working tree is checked out with CRLF. Any tool that
+#      rewrites a file with LF then leaves it permanently modified in
+#      `git status` while `git diff` reports nothing -- a confusing state to
+#      land in mid-task. The Tauri CLI does exactly this to
+#      src-tauri/Cargo.toml on `npm run tauri dev`.
+#
+#   2. A CRLF file reaching history. Nothing above stops a contributor whose
+#      Git has `core.autocrlf=false` from committing CRLF, and this repo has
+#      places that need LF either way: the shell script the sidecar uses, and
+#      the Linux clippy/CI leg. Declaring the policy in-tree makes it hold for
+#      every clone rather than depending on how each one is configured.
+#
+# The index is already LF throughout, so this changes no stored content -- only
+# what Git writes into, and expects to find in, a working tree.
+
+* text=auto eol=lf
+
+# Binaries: never line-ending-converted, never diffed as text. `text=auto`
+# already classifies these correctly today; naming them means a future icon
+# can't come down to a content guess.
+*.png  binary
+*.ico  binary
+*.icns binary

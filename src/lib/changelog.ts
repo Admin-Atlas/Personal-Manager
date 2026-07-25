@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.72.3-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "A developer-workshop tidy-up with no effect on the app: PM's own source code now states how its files should be stored, instead of leaving it to each computer's settings. Nothing about PM looks or behaves differently.",
+    ],
+  },
+  {
     version: "3.72.2-alpha",
     date: "2026-07-25",
     highlights: [
