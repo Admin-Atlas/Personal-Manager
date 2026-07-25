@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.77.1-alpha",
+    date: "2026-07-25",
+    highlights: [
+      'Connecting a Google account on Windows could fail with a "keychain error" about a 2560-character limit. PM had recently moved to keeping all of its secrets inside a single Windows credential, and Windows caps how much one credential can hold -- so once the pile outgrew that cap, saving anything new was simply refused, and a signed-in account could have stopped refreshing too. On Windows and Linux each secret goes back to its own credential, comfortably inside the limit; anything already saved is moved across for you the next time PM starts, and you should not have to reconnect. Macs keep the single-credential layout, which is what stops them asking for keychain permission over and over.',
+    ],
+  },
+  {
     version: "3.77.0-alpha",
     date: "2026-07-25",
     highlights: [
