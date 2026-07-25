@@ -148,6 +148,35 @@ pub fn write_manifest(
     Ok(prior)
 }
 
+/// Re-encrypt the manifest from `old` to `new` after a vault rekey. A passphrase change moves the
+/// master, and with it this file's subkey, so without this the file stops decrypting — and
+/// [`reconcile_on_open`]'s heal then rewrites it from the DB mirror ALONE, because the union in
+/// [`merged_manifest`] that would have preserved file-only items works by reading the very file it
+/// cannot read. The items that union exists to protect (classified, awaiting a Rebuild) are exactly
+/// the ones a rekey would destroy, and the old file is overwritten, so they are gone for good
+/// (#517). Converting here means that heal never has to run.
+///
+/// Idempotent and best-effort. Absent, or already readable under `new` (an interrupted migration
+/// re-running), is a no-op; unreadable under BOTH keys is left to the heal, which is the only thing
+/// left to do with it. Returns whether the file was rewritten.
+pub fn reencrypt_manifest(
+    vault_root: &Path,
+    old: &ManifestCipher,
+    new: &ManifestCipher,
+) -> Result<bool> {
+    if !manifest_path(vault_root).exists() {
+        return Ok(false);
+    }
+    if read_manifest(vault_root, new).is_ok() {
+        return Ok(false);
+    }
+    let Ok(Some(manifest)) = read_manifest(vault_root, old) else {
+        return Ok(false);
+    };
+    write_manifest(vault_root, new, &manifest)?;
+    Ok(true)
+}
+
 // --- mirror <-> file reconciliation ---
 
 /// Whether the store has any index-only documents (so a no-op vault never grows an empty manifest).
@@ -1748,6 +1777,104 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// Build a vault whose manifest holds "s1" (mirrored in the DB) and "s2" (file ONLY — the
+    /// classified-but-awaiting-a-Rebuild case [`merged_manifest`]'s union exists to protect).
+    /// Returns the temp dir, its connection, and the old/new ciphers spanning a passphrase change.
+    fn rekey_fixture() -> (
+        tempfile::TempDir,
+        Connection,
+        ManifestCipher,
+        ManifestCipher,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        insert_index_only(&conn, "s1", "Taxes");
+
+        let old = ManifestCipher::from_master(VAULT_ID, &MASTER);
+        write_manifest(
+            dir.path(),
+            &old,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("s1", "Taxes"), item("s2", "Project Falcon")],
+            },
+        )
+        .unwrap();
+
+        // A passphrase change re-derives the master, so the subkey — and with it the file's
+        // readability — moves.
+        let new = ManifestCipher::from_master(VAULT_ID, &[9u8; 32]);
+        assert!(
+            read_manifest(dir.path(), &new).is_err(),
+            "precondition: a rekeyed cipher must not read the old file",
+        );
+        (dir, conn, old, new)
+    }
+
+    /// The fix (#517): the migration re-encrypts the manifest under the new master, so the boot-time
+    /// heal never runs and every classification survives a passphrase change.
+    #[test]
+    fn a_rekey_reencrypts_the_manifest_so_no_classification_is_lost() {
+        let (dir, conn, old, new) = rekey_fixture();
+
+        assert!(
+            reencrypt_manifest(dir.path(), &old, &new).unwrap(),
+            "the manifest was unreadable under the new key, so it must have been rewritten",
+        );
+        reconcile_on_open(&conn, dir.path(), &new).unwrap();
+
+        let after = read_manifest(dir.path(), &new).unwrap().expect("manifest");
+        let ids: Vec<&str> = after.items.iter().map(|i| i.source_id.as_str()).collect();
+        assert!(ids.contains(&"s1"), "the mirrored item survives");
+        assert!(
+            ids.contains(&"s2"),
+            "a classification the file held but the DB didn't must survive a rekey; got {ids:?}",
+        );
+    }
+
+    /// Why the re-encrypt above is REQUIRED rather than a tidy-up: the heal on its own cannot
+    /// preserve a file-only item, because the union that would have preserved it works by reading
+    /// the very file it cannot decrypt. This pins the hazard, so if the re-encrypt is ever removed
+    /// the test above fails and this one explains what was lost.
+    #[test]
+    fn the_heal_alone_cannot_preserve_a_file_only_item() {
+        let (dir, conn, _old, new) = rekey_fixture();
+
+        // No re-encrypt — straight to the heal, as it behaved before #517.
+        reconcile_on_open(&conn, dir.path(), &new).unwrap();
+
+        let healed = read_manifest(dir.path(), &new).unwrap().expect("manifest");
+        let ids: Vec<&str> = healed.items.iter().map(|i| i.source_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["s1"],
+            "the heal can only rebuild what the DB mirror holds — the file-only item is lost",
+        );
+    }
+
+    /// Idempotent: re-running an interrupted migration must not rewrite an already-converted file,
+    /// and a file readable under the new key is left exactly as it is.
+    #[test]
+    fn reencrypting_an_already_converted_manifest_is_a_no_op() {
+        let (dir, _conn, old, new) = rekey_fixture();
+
+        assert!(reencrypt_manifest(dir.path(), &old, &new).unwrap());
+        let after_first = std::fs::read(manifest_path(dir.path())).unwrap();
+        assert!(
+            !reencrypt_manifest(dir.path(), &old, &new).unwrap(),
+            "a manifest already readable under the new key must not be rewritten",
+        );
+        assert_eq!(
+            after_first,
+            std::fs::read(manifest_path(dir.path())).unwrap(),
+            "the bytes must be untouched by the second pass",
+        );
+
+        // A vault with no manifest at all is also a no-op (never mints an empty file).
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!reencrypt_manifest(empty.path(), &old, &new).unwrap());
     }
 
     #[test]

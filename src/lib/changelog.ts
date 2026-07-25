@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.72.1-alpha",
+    date: "2026-07-25",
+    highlights: [
+      "Changing your vault passphrase can no longer lose how a cloud file was filed. PM keeps a small encrypted file alongside your vault listing every cloud file it has indexed and where you filed it. That file is locked with a key derived from your passphrase, so changing the passphrase left it unreadable, and PM rebuilt it from the database -- which meant anything the list knew about but the database didn't was quietly dropped, permanently. PM now re-locks that list (and your project-name rules) with the new passphrase as part of the change, so nothing is rebuilt and nothing is lost. If you've never changed your passphrase, you were never affected.",
+    ],
+  },
+  {
     version: "3.72.0-alpha",
     date: "2026-07-25",
     highlights: [

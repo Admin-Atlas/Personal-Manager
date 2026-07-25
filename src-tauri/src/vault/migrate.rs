@@ -576,12 +576,20 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
         if meta_src.exists() {
             copy_file_verified(&meta_src, &meta_path(&backup))?;
         }
-        // Back up the linked-accounts sidecar too, so a rollback (which restores from this backup
-        // and first clears the destination via delete_vault_artifacts — now including the sidecar)
-        // doesn't lose the linked principals.
-        let access_src = resolved.vault_root.join(access::ACCESS_FILENAME);
-        if access_src.exists() {
-            copy_file_verified(&access_src, &backup.join(access::ACCESS_FILENAME))?;
+        // Back up the encrypted sidecars too, so a rollback (which restores from this backup and
+        // first clears the destination via delete_vault_artifacts — which includes them) doesn't
+        // lose the linked principals, the entity rules, or the index-only classifications. The last
+        // two are re-encrypted below, so without them here a rollback would restore a vault on the
+        // OLD key beside sidecars written under the NEW one.
+        for name in [
+            access::ACCESS_FILENAME,
+            crate::entities::RULES_FILENAME,
+            crate::index_only::MANIFEST_FILENAME,
+        ] {
+            let src = resolved.vault_root.join(name);
+            if src.exists() {
+                copy_file_verified(&src, &backup.join(name))?;
+            }
         }
         let mut journal = MigrationJournal {
             stage: MigrationStage::Rekeying,
@@ -611,6 +619,22 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
             ingest::convert_vault_files(&tx, &resolved.markdown_dir, &old_cipher, &new_cipher)?;
             tx.commit()?;
         }
+
+        // The two portable sidecars move with the key as well. They are encrypted under a subkey of
+        // the vault master, so a key change leaves them unreadable, and the boot-time heal would then
+        // rewrite the manifest from the DB mirror alone — silently dropping any classification the
+        // file holds that the mirror doesn't (#517). Converting them here means that heal never has
+        // to run. Both helpers are idempotent, so an interrupted migration re-runs cleanly.
+        crate::entities::reencrypt_rules_file(
+            &resolved.vault_root,
+            &crate::entities::RulesCipher::from_master(&old_meta.vault_id, &old_master),
+            &crate::entities::RulesCipher::from_master(&new_meta.vault_id, &new_master),
+        )?;
+        crate::index_only::reencrypt_manifest(
+            &resolved.vault_root,
+            &crate::index_only::ManifestCipher::from_master(&old_meta.vault_id, &old_master),
+            &crate::index_only::ManifestCipher::from_master(&new_meta.vault_id, &new_master),
+        )?;
 
         // Commit the in-place phase. Write the new on-disk identity, then swap the live session onto
         // the new key BEFORE the two best-effort cleanups below — so a failure in either can't leave
