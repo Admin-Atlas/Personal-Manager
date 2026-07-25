@@ -508,6 +508,34 @@ pub fn write_rules_file(vault_root: &Path, cipher: &RulesCipher, rules: &Rules) 
     Ok(prior)
 }
 
+/// Re-encrypt the rules file from `old` to `new` after a vault rekey. A passphrase change moves the
+/// master, and with it this file's subkey, so without this the file stops decrypting and
+/// `reconcile_on_open` heals it by rewriting from the DB mirror. That is survivable here (the rules
+/// mirror is complete) but the identical pattern silently DROPS data for the index-only manifest
+/// (#517), so both sidecars are converted together, in the same phase as the Markdown, and for the
+/// same reason: the heal should never have to run.
+///
+/// Idempotent and best-effort. Absent, or already readable under `new` (an interrupted migration
+/// re-running), is a no-op; unreadable under BOTH keys is left to the heal, which is the only thing
+/// left to do with it. Returns whether the file was rewritten.
+pub fn reencrypt_rules_file(
+    vault_root: &Path,
+    old: &RulesCipher,
+    new: &RulesCipher,
+) -> Result<bool> {
+    if !rules_path(vault_root).exists() {
+        return Ok(false);
+    }
+    if read_rules_file(vault_root, new).is_ok() {
+        return Ok(false);
+    }
+    let Ok(Some(rules)) = read_rules_file(vault_root, old) else {
+        return Ok(false);
+    };
+    write_rules_file(vault_root, new, &rules)?;
+    Ok(true)
+}
+
 /// Restore the rules file to prior bytes (or remove it if there were none) — the file half of
 /// rolling back an abandoned mutation, mirroring [`crate::ingest::restore_vault_files`].
 pub fn restore_rules_file(vault_root: &Path, prior: &[u8]) {
@@ -915,6 +943,70 @@ mod tests {
         // No file yet → None.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(read_rules_file(empty.path(), &cipher).unwrap(), None);
+    }
+
+    /// A passphrase change moves the master, so the rules file must be re-encrypted with it (#517)
+    /// — otherwise it stops decrypting and is rebuilt from the DB mirror. Also asserts the
+    /// idempotence an interrupted migration relies on.
+    #[test]
+    fn a_rekey_reencrypts_the_rules_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = RulesCipher::from_master("vault-xyz", &[7u8; 32]);
+        let new = RulesCipher::from_master("vault-xyz", &[9u8; 32]);
+        let rules = Rules {
+            schema: RULES_SCHEMA,
+            entities: vec![RuleEntity {
+                kind: TYPE_PROJECT.into(),
+                canonical_name: "Medical".into(),
+                aliases: vec!["Medical".into(), "Health".into()],
+                user_confirmed: true,
+            }],
+        };
+        write_rules_file(dir.path(), &old, &rules).unwrap();
+        assert!(read_rules_file(dir.path(), &new).is_err(), "precondition");
+
+        assert!(reencrypt_rules_file(dir.path(), &old, &new).unwrap());
+        assert_eq!(
+            read_rules_file(dir.path(), &new).unwrap(),
+            Some(rules),
+            "the rules survive the rekey intact, under the new key",
+        );
+
+        // Idempotent: already converted, and no file at all, are both no-ops.
+        assert!(!reencrypt_rules_file(dir.path(), &old, &new).unwrap());
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!reencrypt_rules_file(empty.path(), &old, &new).unwrap());
+    }
+
+    /// The symmetric half of `index_only::manifest_stem_is_distinct_from_the_rules_file`, which
+    /// claims "(and vice-versa)" in its comment but only asserts one direction. Both files share the
+    /// vault subkey and id, so the AAD stem is the only thing keeping them apart — assert it holds
+    /// from this side too.
+    #[test]
+    fn rules_bytes_do_not_authenticate_under_the_manifest_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = [7u8; 32];
+        let cipher = RulesCipher::from_master("vault-xyz", &master);
+        write_rules_file(
+            dir.path(),
+            &cipher,
+            &Rules {
+                schema: RULES_SCHEMA,
+                entities: vec![],
+            },
+        )
+        .unwrap();
+        let raw = std::fs::read(rules_path(dir.path())).unwrap();
+
+        let subkey = crate::vault::markdown_subkey(&master);
+        assert!(
+            crypto::decrypt(&raw, &subkey, "vault-xyz", "index_only").is_err(),
+            "the manifest stem must not authenticate the rules file",
+        );
+        assert!(
+            crypto::decrypt(&raw, &subkey, "vault-xyz", RULES_AAD_STEM).is_ok(),
+            "the rules stem must authenticate the rules file",
+        );
     }
 
     #[test]
