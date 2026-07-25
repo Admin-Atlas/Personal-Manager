@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import type { Conversation, LocalLlmStatus } from "../lib/types";
 import { listProjects } from "../lib/ipc";
 import { shortModel } from "../lib/format";
 import { localEndpointState, LOCAL_STATE_TOKEN } from "../lib/localStatus";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme } from "../theme";
-import { Button, ConfirmDialog, Modal, NavItem, Select } from "./ui";
+import { Button, Collapsible, ConfirmDialog, Modal, NavItem, Select } from "./ui";
+import { globalChats, projectChats } from "../lib/chatNav";
 
 export type View =
   | "focus"
@@ -26,6 +27,81 @@ export type View =
 const SHORTCUT_HINT =
   typeof navigator !== "undefined" && /mac/i.test(navigator.platform) ? "⌘K" : "Ctrl K";
 
+/** One foldable section of the Chats tab's sidebar, with a count and its own empty state. The
+ *  heading keeps the mono/uppercase/faint treatment the single "Conversations" label had, so the
+ *  two sections read as the same furniture rather than a new kind of thing. */
+function ChatSection({
+  title,
+  count,
+  empty,
+  defaultOpen,
+  children,
+}: {
+  title: string;
+  count: number;
+  empty: string;
+  defaultOpen: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <Collapsible
+      className="pt-2"
+      defaultOpen={defaultOpen}
+      meta={count > 0 ? count : undefined}
+      title={<span className="font-mono text-xs uppercase tracking-wide text-faint">{title}</span>}
+    >
+      {count === 0 ? <p className="px-2 py-2 text-xs text-faint">{empty}</p> : children}
+    </Collapsible>
+  );
+}
+
+/** One conversation row: the title, plus hover-revealed move/delete controls.
+ *
+ *  The controls sit OUTSIDE the NavItem (itself a <button>) — a button can't nest a button. They're
+ *  hover-revealed siblings overlaid on the row's right edge; `pr-14` on the NavItem keeps a long
+ *  title from sliding under them. */
+function ConversationRow({
+  conversation: c,
+  active,
+  onSelect,
+  onMove,
+  onDelete,
+}: {
+  conversation: Conversation;
+  active: boolean;
+  onSelect: (id: number) => void;
+  onMove: (c: Conversation) => void;
+  onDelete: (c: Conversation) => void;
+}) {
+  return (
+    <div className="group relative">
+      <NavItem active={active} onClick={() => onSelect(c.id)} className="mb-1 pr-14">
+        <span title={c.title}>{c.title}</span>
+      </NavItem>
+      <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
+        <button
+          type="button"
+          onClick={() => onMove(c)}
+          title="Move to a project"
+          aria-label={`Move conversation “${c.title}” to a project`}
+          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+        >
+          <span aria-hidden="true">📁</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onDelete(c)}
+          title="Delete chat"
+          aria-label={`Delete conversation “${c.title}”`}
+          className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
+        >
+          <span aria-hidden="true">🗑</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 interface Props {
   view: View;
   onNavigate: (view: View) => void;
@@ -39,6 +115,9 @@ interface Props {
    *  mutation + list refresh (and, in a project pane, resetting if the open chat leaves the project). */
   onMove: (id: number, project: string | null) => void;
   onNew: () => void;
+  /** Open a project's scoped view from the Chats tab's Projects section. App owns the navigation
+   *  (the same `openProject` the Focus cards and the command palette use). */
+  onOpenProject: (project: string) => void;
   onOpenSettings: () => void;
   onOpenWhatsNew: () => void;
   onOpenPalette: () => void;
@@ -68,6 +147,7 @@ export function Sidebar({
   onDelete,
   onMove,
   onNew,
+  onOpenProject,
   onOpenSettings,
   onOpenWhatsNew,
   onOpenPalette,
@@ -80,7 +160,7 @@ export function Sidebar({
   onStartResize,
   resizing,
 }: Props) {
-  const { showMeta } = useDepth();
+  const { showMeta, minimal } = useDepth();
   // The Teach tab is a Depth-keyed feature reveal (hidden for the minimalist preset), overridable
   // in Settings. Hiding it hides only the editor — deterministic alias resolution keeps running.
   const { teachVisible, mapVisible } = useTheme();
@@ -95,6 +175,27 @@ export function Sidebar({
   // row's hover control and the picker modal stay local; the actual reassignment is `onMove` (the parent
   // owns the mutation + list refresh).
   const [pendingMove, setPendingMove] = useState<Conversation | null>(null);
+  // The Projects section needs every project, not just those with chats: `list_projects` is
+  // DISTINCT over documents, so the two inputs each cover a gap in the other (see chatNav.ts).
+  // Loaded once and refreshed whenever the roster changes, which is when a new project can appear.
+  const [knownProjects, setKnownProjects] = useState<string[]>([]);
+  useEffect(() => {
+    if (view !== "chat") return;
+    let alive = true;
+    listProjects()
+      .then((p) => alive && setKnownProjects(p))
+      .catch(() => {
+        /* best-effort: the union still covers every project that has a chat */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [view, conversations]);
+  const projectGroups = useMemo(
+    () => projectChats(conversations, knownProjects),
+    [conversations, knownProjects],
+  );
+  const unscoped = useMemo(() => globalChats(conversations), [conversations]);
   return (
     <aside
       style={{ width }}
@@ -159,7 +260,7 @@ export function Sidebar({
             Focus
           </NavItem>
           <NavItem active={view === "chat"} onClick={() => onNavigate("chat")} helpId="nav-chat">
-            Chat
+            Chats
           </NavItem>
           <NavItem
             active={view === "calendar"}
@@ -219,9 +320,62 @@ export function Sidebar({
         </nav>
 
         <div className="px-2">
-          {/* The global chat lists all conversations; an open project lists just its own (fed from
-            App's project chat session), so a project's history sits here like the global chat's. */}
-          {(view === "chat" || view === "project") && (
+          {/* The Chats tab shows two sections — your projects, and the chats that belong to no
+              project. An OPEN project keeps the old single flat list, fed from App's project chat
+              session: in there the sidebar is that project's own history, and a Projects section
+              listing every other project would just be a way to leave. */}
+          {view === "chat" && (
+            <div data-help="conversations-list">
+              <ChatSection
+                title="Projects"
+                count={projectGroups.length}
+                empty="No projects yet."
+                defaultOpen={!minimal}
+              >
+                {projectGroups.map((g) => (
+                  <NavItem
+                    key={g.project}
+                    active={false}
+                    onClick={() => onOpenProject(g.project)}
+                    className="mb-1"
+                  >
+                    <span className="flex items-center justify-between gap-2">
+                      <span className="truncate" title={g.project}>
+                        {g.project}
+                      </span>
+                      {g.chats.length > 0 && (
+                        <span
+                          className="shrink-0 font-mono text-xs text-ink4"
+                          title={`${g.chats.length} chat${g.chats.length === 1 ? "" : "s"} in this project`}
+                        >
+                          {g.chats.length}
+                        </span>
+                      )}
+                    </span>
+                  </NavItem>
+                ))}
+              </ChatSection>
+
+              <ChatSection
+                title="Global chats"
+                count={unscoped.length}
+                empty="No global chats yet."
+                defaultOpen
+              >
+                {unscoped.map((c) => (
+                  <ConversationRow
+                    key={c.id}
+                    conversation={c}
+                    active={c.id === activeId}
+                    onSelect={onSelect}
+                    onMove={setPendingMove}
+                    onDelete={setPendingDelete}
+                  />
+                ))}
+              </ChatSection>
+            </div>
+          )}
+          {view === "project" && (
             <div data-help="conversations-list">
               <p className="px-2 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-faint">
                 Conversations
@@ -230,38 +384,14 @@ export function Sidebar({
                 <p className="px-2 py-2 text-xs text-faint">No conversations yet.</p>
               )}
               {conversations.map((c) => (
-                // The row controls sit OUTSIDE the NavItem (itself a <button>) — a button can't nest a
-                // button. They're hover-revealed siblings overlaid on the row's right edge; `pr-14` on
-                // the NavItem keeps a long title from sliding under them.
-                <div key={c.id} className="group relative">
-                  <NavItem
-                    active={c.id === activeId}
-                    onClick={() => onSelect(c.id)}
-                    className="mb-1 pr-14"
-                  >
-                    <span title={c.title}>{c.title}</span>
-                  </NavItem>
-                  <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
-                    <button
-                      type="button"
-                      onClick={() => setPendingMove(c)}
-                      title="Move to a project"
-                      aria-label={`Move conversation “${c.title}” to a project`}
-                      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
-                    >
-                      <span aria-hidden="true">📁</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setPendingDelete(c)}
-                      title="Delete chat"
-                      aria-label={`Delete conversation “${c.title}”`}
-                      className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 opacity-0 transition hover:bg-surface hover:text-st-due focus-visible:opacity-100 group-hover:opacity-100"
-                    >
-                      <span aria-hidden="true">🗑</span>
-                    </button>
-                  </div>
-                </div>
+                <ConversationRow
+                  key={c.id}
+                  conversation={c}
+                  active={c.id === activeId}
+                  onSelect={onSelect}
+                  onMove={setPendingMove}
+                  onDelete={setPendingDelete}
+                />
               ))}
             </div>
           )}

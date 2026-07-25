@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.74.0-alpha",
+    date: "2026-07-25",
+    highlights: [
+      'The Chat tab is now "Chats", and it shows your projects too. Two foldable lists sit in the sidebar: Projects, with the number of chats each one holds -- click through to open it -- and Global chats, the ones that belong to no project and search everything. Opening a project still works exactly as before.',
+    ],
+  },
+  {
     version: "3.73.0-alpha",
     date: "2026-07-25",
     highlights: [
