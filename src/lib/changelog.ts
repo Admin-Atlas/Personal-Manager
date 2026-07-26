@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.82.0-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "If you run PM on Linux with an Intel Arc graphics card, Settings > Local AI can now see how much memory that card actually has. Until now PM could read the memory of NVIDIA and AMD cards but not Intel ones, so an Arc card fell back to being sized against your system RAM. That was honest, but it meant PM never offered you the faster “runs entirely on the graphics card” option -- even when your card had plenty of room for it. PM now asks the graphics driver directly, so a discrete Arc gets sized on its own memory like every other card.",
+      "Nothing changes on Windows or a Mac, or on a machine with built-in Intel graphics: a built-in chip shares your system memory rather than having its own, and PM keeps saying so rather than inventing a number. As always, if the reading can't be taken for any reason, PM sizes on system RAM exactly as it did before -- it never guesses.",
+      "One piece of honesty about this one: it is written from the Linux graphics driver's own documentation, not tested against a real Arc-on-Linux machine, because there isn't one to test on here. It's built so that if anything goes wrong it simply falls back to the old behaviour. If you have that setup and PM still doesn't pick your card up, that's worth reporting.",
+    ],
+  },
+  {
     version: "3.81.3-alpha",
     date: "2026-07-26",
     highlights: [

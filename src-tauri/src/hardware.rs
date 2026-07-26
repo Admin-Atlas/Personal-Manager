@@ -8,8 +8,8 @@
 //! hood). It has no GPU/VRAM/battery, so those are hand-rolled per-OS: on Windows a CIM query for the
 //! video controller, `nvidia-smi`, and a DXGI enumeration for a discrete card's true VRAM (the CIM
 //! `AdapterRAM` field saturates at 4 GB); on Apple Silicon the unified-memory fraction; on Linux
-//! `nvidia-smi` plus the AMD sysfs node. **No battery/AC here** — that's the deferred power-aware
-//! routing card (#432).
+//! `nvidia-smi`, the AMD sysfs node, and the Intel DRM memory-regions query for a discrete Arc
+//! (#461). **No battery/AC here** — that's the deferred power-aware routing card (#432).
 //!
 //! The contract every probe honours: **a failure nulls its field, it never errors.** A machine with
 //! no GPU, no `nvidia-smi`, or a driver that lies about VRAM still gets a complete, honest scan — the
@@ -51,7 +51,8 @@ pub struct Hardware {
     pub gpu_name: Option<String>,
     pub gpu_vendor: Option<String>,
     pub vram_gb: Option<f64>,
-    /// How VRAM was read: `nvidia-smi` | `dxgi` | `adapter_ram` | `apple_unified` | `amd_sysfs`.
+    /// How VRAM was read: `nvidia-smi` | `dxgi` | `adapter_ram` | `apple_unified` | `amd_sysfs` |
+    /// `drm_i915` | `drm_xe`.
     pub vram_source: Option<String>,
     /// The GPU's peak memory bandwidth (GB/s), matched from its name against a curated table, when
     /// recognised. `None` = an unlisted card (or a probe that only reports a generic name, e.g. Linux
@@ -300,7 +301,7 @@ fn probe_gpu() -> GpuProbe {
             .push("Running under WSL — GPU passthrough may vary.".to_string());
     }
 
-    // NVIDIA first (authoritative), then the AMD sysfs node.
+    // NVIDIA first (authoritative), then the AMD sysfs node, then the Intel DRM query (#461).
     if let Some(mib) =
         run_capture("nvidia-smi", &NVIDIA_SMI_ARGS).and_then(|s| parse_nvidia_smi_csv(&s))
     {
@@ -308,20 +309,48 @@ fn probe_gpu() -> GpuProbe {
         probe.vendor = Some("NVIDIA".to_string());
         probe.vram_gb = Some(round1(mib / 1024.0));
         probe.source = Some("nvidia-smi".to_string());
-    } else if let Some((bytes, card)) = read_amd_sysfs_vram() {
-        probe.name = Some("AMD GPU".to_string());
-        probe.vendor = Some("AMD".to_string());
-        probe.vram_gb = Some(round1(bytes as f64 / GIB));
-        probe.source = Some("amd_sysfs".to_string());
-        // Integrated (APU) → the "VRAM" is a shared-RAM carve-out, not a distinct faster pool: no Split.
-        probe.unified = amd_is_integrated(card);
+    } else if let Some(read) = pick_linux_non_nvidia_gpu() {
+        probe.name = Some(format!("{} GPU", read.vendor));
+        probe.vendor = Some(read.vendor.to_string());
+        probe.vram_gb = Some(round1(read.bytes as f64 / GIB));
+        probe.source = Some(read.source.to_string());
+        // Integrated → the "VRAM" is a shared-RAM carve-out, not a distinct faster pool: no Split.
+        probe.unified = read.unified;
     }
-    // Discrete Intel Arc (i915 / xe) has no VRAM-size sysfs node in mainline — `mem_info_vram_total`
-    // is amdgpu-only. Reading it needs a DRM query ioctl on the render node
-    // (`DRM_I915_QUERY_MEMORY_REGIONS` / `DRM_XE_DEVICE_QUERY_MEM_REGIONS`), deferred on #461 as it
-    // can't be exercised without an Arc-on-Linux box. Until then a discrete Arc on Linux sizes on
-    // system RAM — the same honest fallback as any card whose VRAM we can't read.
     probe
+}
+
+/// A non-NVIDIA GPU memory reading on Linux, before it's folded into the probe.
+#[cfg(target_os = "linux")]
+struct LinuxVramReading {
+    bytes: u64,
+    /// `AMD` | `Intel` — also the display name's prefix.
+    vendor: &'static str,
+    /// The `vram_source` label: `amd_sysfs` | `drm_i915` | `drm_xe`.
+    source: &'static str,
+    /// Shared-memory (integrated) part, so there's no distinct faster pool to offer.
+    unified: bool,
+}
+
+/// The AMD sysfs node and the Intel DRM query, resolved to whichever describes a **discrete** card.
+/// Both are read because the two can coexist: an AMD APU always publishes a `mem_info_vram_total`
+/// carve-out, so on a Ryzen-APU box with an Arc card installed, taking the first answer would report
+/// the shared-RAM slice and miss the card that actually has a distinct, faster pool. An Intel reading
+/// is discrete by construction (see [`read_intel_drm_vram`]), so it wins over an integrated AMD one
+/// and never over a discrete one.
+#[cfg(target_os = "linux")]
+fn pick_linux_non_nvidia_gpu() -> Option<LinuxVramReading> {
+    let amd = read_amd_sysfs_vram().map(|(bytes, card)| LinuxVramReading {
+        bytes,
+        vendor: "AMD",
+        source: "amd_sysfs",
+        unified: amd_is_integrated(card),
+    });
+    match amd {
+        Some(a) if !a.unified => Some(a),
+        Some(a) => read_intel_drm_vram().or(Some(a)),
+        None => read_intel_drm_vram(),
+    }
 }
 
 // Fallback for any other target: no GPU probe.
@@ -395,6 +424,222 @@ fn is_wsl_now() -> bool {
     std::fs::read_to_string("/proc/version")
         .map(|v| detect_wsl(&v))
         .unwrap_or(false)
+}
+
+// --- Linux: discrete Intel VRAM via the DRM query ioctl (#461) ----------------------------------
+//
+// Mainline exposes no VRAM-size sysfs node for Intel — `mem_info_vram_total` is amdgpu-only — so a
+// discrete Arc's memory can only be read through the driver's query ioctl. The two Intel drivers
+// answer the same question with a different ioctl number and a different blob layout, so the node's
+// driver name picks the path:
+//   * **i915** — `DRM_IOCTL_I915_QUERY` / `DRM_I915_QUERY_MEMORY_REGIONS`, summing `probed_size` over
+//     regions whose class is `I915_MEMORY_CLASS_DEVICE` (1).
+//   * **xe** — `DRM_IOCTL_XE_DEVICE_QUERY` / `DRM_XE_DEVICE_QUERY_MEM_REGIONS`, summing `total_size`
+//     over regions whose class is `DRM_XE_MEM_REGION_CLASS_VRAM` (1).
+// Both queries are `DRM_RENDER_ALLOW`, so an `O_RDONLY` open of a render node is enough: no root, no
+// DRM master, no chance of disturbing the display. Render nodes are also world-readable on virtually
+// every distro, where `card*` needs the `video` group.
+//
+// **An integrated Intel GPU reports no device-local region at all** — only system memory — which is
+// precisely the discrete gate we want. No class-1 region ⇒ `None` ⇒ the scan sizes on system RAM
+// exactly as it did before, so this can only ever add a reading, never change an existing one.
+//
+// HONEST LIMIT: the parsers and the ioctl-number encoding below are unit-tested on every platform,
+// but the syscall path itself has never run on a discrete-Arc-on-Linux machine — there is no such
+// machine here and no CI runner has one. Every failure nulls the reading, so an untested box degrades
+// to the pre-#461 behaviour rather than reporting something wrong.
+
+/// The Intel DRM driver bound to a node. They share no ABI, so this picks the query path.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntelDrmDriver {
+    I915,
+    Xe,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl IntelDrmDriver {
+    /// The `vram_source` label a reading from this driver carries.
+    fn source_label(self) -> &'static str {
+        match self {
+            IntelDrmDriver::I915 => "drm_i915",
+            IntelDrmDriver::Xe => "drm_xe",
+        }
+    }
+}
+
+/// Dedicated VRAM on a discrete Intel card, by querying every Intel render node and taking the
+/// largest device-local total. Enumerating rather than assuming `renderD128` matters on a hybrid
+/// laptop, where 128 is routinely the integrated GPU and the discrete card is 129.
+#[cfg(target_os = "linux")]
+fn read_intel_drm_vram() -> Option<LinuxVramReading> {
+    let mut best: Option<(u64, IntelDrmDriver)> = None;
+    for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let node = entry.file_name();
+        let Some(node) = node.to_str() else { continue };
+        if !node.starts_with("renderD") {
+            continue;
+        }
+        let device = format!("/sys/class/drm/{node}/device");
+        // PCI vendor 0x8086 = Intel. Anything else is another vendor's render node.
+        if !std::fs::read_to_string(format!("{device}/vendor"))
+            .is_ok_and(|v| is_intel_pci_vendor(&v))
+        {
+            continue;
+        }
+        let Some(driver) = std::fs::read_link(format!("{device}/driver"))
+            .ok()
+            .and_then(|p| p.to_str().and_then(intel_drm_driver_from_link))
+        else {
+            continue;
+        };
+        if let Some(bytes) = query_intel_vram(&format!("/dev/dri/{node}"), driver) {
+            if best.is_none_or(|(b, _)| bytes > b) {
+                best = Some((bytes, driver));
+            }
+        }
+    }
+    best.map(|(bytes, driver)| LinuxVramReading {
+        bytes,
+        vendor: "Intel",
+        source: driver.source_label(),
+        // A device-local region only exists on a discrete card, so a reading is never unified.
+        unified: false,
+    })
+}
+
+/// Open one render node read-only and run the driver's memory-regions query. Best-effort: any
+/// failure — a permission denial, an older kernel without the query, a driver that answers `ENOTTY` —
+/// yields `None`.
+#[cfg(target_os = "linux")]
+fn query_intel_vram(node_path: &str, driver: IntelDrmDriver) -> Option<u64> {
+    let path = std::ffi::CString::new(node_path).ok()?;
+    // SAFETY: `path` is a valid NUL-terminated C string that outlives the call. `open` returns -1 on
+    // failure and never takes ownership of the pointer. O_EXCL is deliberately NOT passed — the DRM
+    // open path rejects it outright.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let guard = OwnedFd(fd);
+    let blob = match driver {
+        IntelDrmDriver::I915 => i915_query_memory_regions(guard.0),
+        IntelDrmDriver::Xe => xe_query_mem_regions(guard.0),
+    }?;
+    let bytes = match driver {
+        IntelDrmDriver::I915 => parse_i915_vram_bytes(&blob),
+        IntelDrmDriver::Xe => parse_xe_vram_bytes(&blob),
+    }?;
+    (bytes > 0).then_some(bytes)
+}
+
+/// Closes its file descriptor on drop, so every early return from the query path releases the node.
+#[cfg(target_os = "linux")]
+struct OwnedFd(libc::c_int);
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from a successful `open` and is closed exactly once, here.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// Run the i915 two-pass memory-regions query, returning the raw reply blob.
+///
+/// Pass 1 sets `length = 0`, which asks the kernel for the byte count and leaves `data_ptr` alone;
+/// the count comes back **in the item**, not as the ioctl's return value. Pass 2 replays the same
+/// item with `data_ptr` pointing at a zeroed buffer of exactly that size.
+///
+/// Two details are load-bearing and easy to get wrong. `length` is **signed**: a per-item failure is
+/// reported as a negative `-errno` while the ioctl itself still returns 0, so an unsigned read of a
+/// `-EINVAL` from a pre-5.14 kernel would turn into a 4 GiB allocation. And the buffer must be
+/// **zeroed**: the kernel reads the 16-byte header back out of it and rejects the whole query if the
+/// must-be-zero fields aren't.
+#[cfg(target_os = "linux")]
+fn i915_query_memory_regions(fd: libc::c_int) -> Option<Vec<u8>> {
+    let mut item = DrmI915QueryItem {
+        query_id: u64::from(DRM_I915_QUERY_MEMORY_REGIONS),
+        ..Default::default()
+    };
+    let mut query = DrmI915Query {
+        num_items: 1,
+        flags: 0,
+        items_ptr: std::ptr::addr_of_mut!(item) as u64,
+    };
+
+    // SAFETY: `fd` is an open DRM render node. The request word is built from `size_of` of the very
+    // struct we pass, so the kernel's `_IOC_SIZE` bound matches our allocation exactly. `items_ptr`
+    // points at a live, correctly-sized `DrmI915QueryItem` that outlives the call.
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_I915_QUERY as _, std::ptr::addr_of_mut!(query)) } < 0 {
+        return None;
+    }
+    let len = i915_blob_len(item.length)?;
+
+    // `Vec<u64>` for the allocation so the buffer is 8-aligned as the ABI expects (both blob layouts
+    // are whole multiples of 8), and zeroed so the header's must-be-zero fields pass validation.
+    let mut buf = vec![0u64; len / 8];
+    item.data_ptr = buf.as_mut_ptr() as u64;
+    query.items_ptr = std::ptr::addr_of_mut!(item) as u64;
+
+    // SAFETY: as above; `data_ptr` now points at `len` zeroed, 8-aligned bytes we own, and `length`
+    // still holds the exact count the kernel asked for.
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_I915_QUERY as _, std::ptr::addr_of_mut!(query)) } < 0 {
+        return None;
+    }
+    // Re-read the length: the kernel revises it down if we over-asked.
+    let filled = i915_blob_len(item.length).unwrap_or(len).min(len);
+    Some(words_to_bytes(&buf, filled))
+}
+
+/// Run the xe two-pass memory-regions query, returning the raw reply blob. Pass 1 sets `size = 0` and
+/// the kernel writes the required byte count back into that same field; pass 2 must replay it
+/// **unchanged** (any other non-zero size is rejected) with `data` pointing at the buffer.
+#[cfg(target_os = "linux")]
+fn xe_query_mem_regions(fd: libc::c_int) -> Option<Vec<u8>> {
+    let mut query = DrmXeDeviceQuery {
+        query: DRM_XE_DEVICE_QUERY_MEM_REGIONS,
+        ..Default::default()
+    };
+
+    // SAFETY: `fd` is an open DRM render node; the request word encodes `size_of::<DrmXeDeviceQuery>()`,
+    // matching the struct we hand over. `extensions` and `reserved` are zero, which the driver requires.
+    if unsafe {
+        libc::ioctl(
+            fd,
+            DRM_IOCTL_XE_DEVICE_QUERY as _,
+            std::ptr::addr_of_mut!(query),
+        )
+    } < 0
+    {
+        return None;
+    }
+    let len = xe_blob_len(query.size)?;
+
+    let mut buf = vec![0u64; len / 8];
+    query.data = buf.as_mut_ptr() as u64;
+
+    // SAFETY: as above; `data` points at `len` zeroed, 8-aligned bytes we own, and `size` is exactly
+    // the value the kernel wrote back on the probe pass.
+    if unsafe {
+        libc::ioctl(
+            fd,
+            DRM_IOCTL_XE_DEVICE_QUERY as _,
+            std::ptr::addr_of_mut!(query),
+        )
+    } < 0
+    {
+        return None;
+    }
+    Some(words_to_bytes(&buf, len))
+}
+
+/// Reinterpret the `u64` reply buffer as its first `len` bytes, in native order — the encoding the
+/// kernel wrote. A plain copy of a few hundred bytes, which keeps the parsers safe `&[u8]` functions
+/// testable on every platform.
+#[cfg(target_os = "linux")]
+fn words_to_bytes(buf: &[u64], len: usize) -> Vec<u8> {
+    buf.iter().flat_map(|w| w.to_ne_bytes()).take(len).collect()
 }
 
 // --- pure parse helpers (unit-tested; the live probes above are not) -----------------------------
@@ -620,6 +865,184 @@ fn pci_bus_is_integrated(link_target: &str) -> bool {
         .next()
         .and_then(|addr| addr.split(':').nth(1)) // "0000:BB:DD.F" → "BB"
         .is_some_and(|bus| bus == "00")
+}
+
+// --- Intel DRM query: ABI transcription + pure blob parsing (#461) ------------------------------
+//
+// Everything below is `#[cfg(any(target_os = "linux", test))]` rather than Linux-only on purpose: it
+// is the part of the ioctl path that CAN be checked without a discrete Arc, so it is compiled and
+// unit-tested on every platform's `just check`, not just CI's Linux job.
+
+/// `_IOWR(type, nr, argtype)` from `asm-generic/ioctl.h`: `dir(2) | size(14) | type(8) | nr(8)`.
+/// Derived from `size_of` rather than hardcoded so a request word can never drift from the struct it
+/// describes — a mismatch would make the kernel copy the wrong number of bytes. (The legacy
+/// alpha/mips/parisc/powerpc/sparc encoding differs, but no discrete Intel GPU ships on those.)
+#[cfg(any(target_os = "linux", test))]
+const fn drm_iowr(nr: u32, arg_size: usize) -> u32 {
+    const DIR_READ_WRITE: u32 = 3; // _IOC_READ | _IOC_WRITE
+    const DRM_IOCTL_BASE: u32 = 0x64; // 'd'
+    (DIR_READ_WRITE << 30) | ((arg_size as u32) << 16) | (DRM_IOCTL_BASE << 8) | nr
+}
+
+/// Driver-private ioctls start here (`drm.h`); each driver's command offset is added to it.
+#[cfg(any(target_os = "linux", test))]
+const DRM_COMMAND_BASE: u32 = 0x40;
+/// i915's `DRM_I915_QUERY` command offset. xe's `DRM_XE_DEVICE_QUERY` offset is `0x00`, so its ioctl
+/// nr is `DRM_COMMAND_BASE` itself — written that way below because adding a zero is a clippy error.
+#[cfg(any(target_os = "linux", test))]
+const DRM_I915_QUERY_CMD: u32 = 0x39;
+
+#[cfg(any(target_os = "linux", test))]
+const DRM_IOCTL_I915_QUERY: u32 = drm_iowr(
+    DRM_COMMAND_BASE + DRM_I915_QUERY_CMD,
+    std::mem::size_of::<DrmI915Query>(),
+);
+#[cfg(any(target_os = "linux", test))]
+const DRM_IOCTL_XE_DEVICE_QUERY: u32 =
+    drm_iowr(DRM_COMMAND_BASE, std::mem::size_of::<DrmXeDeviceQuery>());
+
+/// `DRM_I915_QUERY_MEMORY_REGIONS`. Added in Linux 5.14; an older kernel answers `-EINVAL` as a
+/// negative item length while the ioctl itself succeeds, which [`i915_blob_len`] rejects.
+#[cfg(any(target_os = "linux", test))]
+const DRM_I915_QUERY_MEMORY_REGIONS: u32 = 4;
+/// `DRM_XE_DEVICE_QUERY_MEM_REGIONS`.
+#[cfg(any(target_os = "linux", test))]
+const DRM_XE_DEVICE_QUERY_MEM_REGIONS: u32 = 1;
+
+/// `struct drm_i915_query` — the outer request. Its `size_of` is what the ioctl number encodes.
+#[cfg(any(target_os = "linux", test))]
+#[repr(C)]
+#[derive(Default)]
+#[allow(dead_code)] // Every field is read by the KERNEL across the ioctl, which rustc can't see.
+struct DrmI915Query {
+    num_items: u32,
+    flags: u32,
+    items_ptr: u64,
+}
+
+/// `struct drm_i915_query_item`. `length` is **signed**: the ioctl reports per-item failures as a
+/// negative `-errno` here while itself returning 0, so it must never be read as unsigned.
+#[cfg(any(target_os = "linux", test))]
+#[repr(C)]
+#[derive(Default)]
+#[allow(dead_code)] // As above — `query_id` / `flags` / `data_ptr` are read across the syscall.
+struct DrmI915QueryItem {
+    query_id: u64,
+    length: i32,
+    flags: u32,
+    data_ptr: u64,
+}
+
+/// `struct drm_xe_device_query` — the outer request, doubling as the length probe's reply (the
+/// kernel writes the required byte count back into `size`).
+#[cfg(any(target_os = "linux", test))]
+#[repr(C)]
+#[derive(Default)]
+#[allow(dead_code)] // As above — `extensions` / `query` / `data` / `reserved` cross the syscall.
+struct DrmXeDeviceQuery {
+    extensions: u64,
+    query: u32,
+    size: u32,
+    data: u64,
+    reserved: [u64; 2],
+}
+
+/// `sizeof(struct drm_i915_query_memory_regions)` — the flexible-array header before the records.
+#[cfg(any(target_os = "linux", test))]
+const I915_REGIONS_HEADER: usize = 16;
+/// `sizeof(struct drm_xe_query_mem_regions)` — ditto for xe (a `__u32` count plus a `__u32` pad).
+#[cfg(any(target_os = "linux", test))]
+const XE_REGIONS_HEADER: usize = 8;
+/// Both drivers' per-region record happens to be 88 bytes with the class at +0 and the size at +8.
+/// They are still independent ABIs — the shared constant is a convenience, never a guarantee, which
+/// is why each driver keeps its own parser and its own fixture test.
+#[cfg(any(target_os = "linux", test))]
+const DRM_REGION_RECORD: usize = 88;
+/// The device-local class in both enums (`I915_MEMORY_CLASS_DEVICE` / `DRM_XE_MEM_REGION_CLASS_VRAM`);
+/// 0 is system memory in both. An integrated part reports no record of this class at all.
+#[cfg(any(target_os = "linux", test))]
+const DRM_MEMORY_CLASS_DEVICE: u16 = 1;
+/// A generous ceiling on the region count, so a nonsense length can't drive a large allocation. Real
+/// parts report 1 (integrated) to a handful (one per tile).
+#[cfg(any(target_os = "linux", test))]
+const MAX_DRM_REGIONS: usize = 64;
+
+/// Validate the byte count i915 reported in `item.length`. Rejects the negative `-errno` an older
+/// kernel returns, and any length that isn't a whole header-plus-records blob of plausible size.
+#[cfg(any(target_os = "linux", test))]
+fn i915_blob_len(reported: i32) -> Option<usize> {
+    let len = usize::try_from(reported).ok()?; // negative ⇒ -errno ⇒ not a length
+    drm_blob_len_ok(len, I915_REGIONS_HEADER).then_some(len)
+}
+
+/// Validate the byte count xe wrote back into `query.size`.
+#[cfg(any(target_os = "linux", test))]
+fn xe_blob_len(reported: u32) -> Option<usize> {
+    let len = reported as usize;
+    drm_blob_len_ok(len, XE_REGIONS_HEADER).then_some(len)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn drm_blob_len_ok(len: usize, header: usize) -> bool {
+    len >= header
+        && (len - header).is_multiple_of(DRM_REGION_RECORD)
+        && len <= header + DRM_REGION_RECORD * MAX_DRM_REGIONS
+}
+
+/// Total `probed_size` across i915's device-local regions, or `None` when there are none (an
+/// integrated GPU, which is the signal that there's no discrete pool to report).
+#[cfg(any(target_os = "linux", test))]
+fn parse_i915_vram_bytes(blob: &[u8]) -> Option<u64> {
+    sum_device_local_regions(blob, I915_REGIONS_HEADER)
+}
+
+/// Total `total_size` across xe's VRAM regions, or `None` when there are none.
+#[cfg(any(target_os = "linux", test))]
+fn parse_xe_vram_bytes(blob: &[u8]) -> Option<u64> {
+    sum_device_local_regions(blob, XE_REGIONS_HEADER)
+}
+
+/// Sum the device-local regions of a memory-regions reply blob. The record count is read from the
+/// header but **clamped to what the blob can actually hold**, so a kernel (or a fixture) claiming
+/// more records than it sent can't read past the end. Summed rather than first-wins: a multi-tile
+/// part exposes one device-local region per tile. Values are native-endian, as the kernel wrote them.
+#[cfg(any(target_os = "linux", test))]
+fn sum_device_local_regions(blob: &[u8], header: usize) -> Option<u64> {
+    if blob.len() < header {
+        return None;
+    }
+    let claimed = u32::from_ne_bytes(blob[0..4].try_into().ok()?) as usize;
+    let capacity = (blob.len() - header) / DRM_REGION_RECORD;
+    let mut total: u64 = 0;
+    let mut found = false;
+    for i in 0..claimed.min(capacity) {
+        let rec = &blob[header + i * DRM_REGION_RECORD..][..DRM_REGION_RECORD];
+        let class = u16::from_ne_bytes(rec[0..2].try_into().ok()?);
+        if class != DRM_MEMORY_CLASS_DEVICE {
+            continue;
+        }
+        found = true;
+        total = total.saturating_add(u64::from_ne_bytes(rec[8..16].try_into().ok()?));
+    }
+    (found && total > 0).then_some(total)
+}
+
+/// `0x8086` is Intel's PCI vendor id, as sysfs renders it (`0x8086\n`).
+#[cfg(any(target_os = "linux", test))]
+fn is_intel_pci_vendor(sysfs_value: &str) -> bool {
+    sysfs_value.trim().eq_ignore_ascii_case("0x8086")
+}
+
+/// Which Intel driver a `/sys/class/drm/<node>/device/driver` symlink target names. Anything else —
+/// `i915_bpo`, a vendor out-of-tree module, another vendor entirely — is `None`, so we never issue a
+/// driver-specific ioctl at a driver whose ABI we don't know.
+#[cfg(any(target_os = "linux", test))]
+fn intel_drm_driver_from_link(link_target: &str) -> Option<IntelDrmDriver> {
+    match link_target.trim_end_matches('/').rsplit('/').next()? {
+        "i915" => Some(IntelDrmDriver::I915),
+        "xe" => Some(IntelDrmDriver::Xe),
+        _ => None,
+    }
 }
 
 // --- GPU memory bandwidth: name (+ VRAM) → GB/s, for the tok/s speed estimate ------------------
@@ -1069,6 +1492,179 @@ mod tests {
             gpu_bandwidth_gbps("Intel(R) Arc(TM) Graphics", Some(2.0)),
             None
         ); // Core-Ultra iGPU
+    }
+
+    // --- Intel DRM query (#461) ---------------------------------------------------------------
+    //
+    // The ioctl path itself can't be exercised without a discrete-Arc-on-Linux machine, so these
+    // pin everything that CAN be checked: the transcribed struct layout, the request words derived
+    // from it, the length validation that stands between a kernel reply and an allocation, and the
+    // blob parsing. Each request-word constant is asserted against the value independently computed
+    // from the kernel headers — if a field type or order below ever drifts, `size_of` changes and
+    // these fail rather than silently making the kernel copy the wrong number of bytes.
+
+    /// One memory-regions reply blob, laid out as the kernel writes it: a `header`-byte head whose
+    /// first `u32` is the record count, then one 88-byte record per `(class, size_bytes)` pair.
+    fn drm_regions_blob(header: usize, regions: &[(u16, u64)]) -> Vec<u8> {
+        let mut blob = vec![0u8; header + regions.len() * DRM_REGION_RECORD];
+        blob[0..4].copy_from_slice(&(regions.len() as u32).to_ne_bytes());
+        for (i, &(class, bytes)) in regions.iter().enumerate() {
+            let at = header + i * DRM_REGION_RECORD;
+            blob[at..at + 2].copy_from_slice(&class.to_ne_bytes());
+            blob[at + 8..at + 16].copy_from_slice(&bytes.to_ne_bytes());
+        }
+        blob
+    }
+
+    #[test]
+    fn drm_request_words_match_the_kernel_headers() {
+        // _IOWR('d', 0x40 + 0x39, struct drm_i915_query)      → dir 3, size 16, type 0x64, nr 0x79
+        assert_eq!(DRM_IOCTL_I915_QUERY, 0xC010_6479);
+        // _IOWR('d', 0x40 + 0x00, struct drm_xe_device_query) → dir 3, size 40, type 0x64, nr 0x40
+        assert_eq!(DRM_IOCTL_XE_DEVICE_QUERY, 0xC028_6440);
+        // The encoding itself, independent of our structs: dir<<30 | size<<16 | type<<8 | nr.
+        assert_eq!(
+            drm_iowr(0x79, 16),
+            (3 << 30) | (16 << 16) | (0x64 << 8) | 0x79
+        );
+        // The query ids those requests carry, from the same headers. Asserted here rather than left
+        // to the Linux-only call sites so that every platform's test run pins them.
+        assert_eq!(DRM_I915_QUERY_MEMORY_REGIONS, 4);
+        assert_eq!(DRM_XE_DEVICE_QUERY_MEM_REGIONS, 1);
+    }
+
+    #[test]
+    fn drm_structs_match_the_uapi_layout() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(size_of::<DrmI915Query>(), 16);
+        assert_eq!(offset_of!(DrmI915Query, num_items), 0);
+        assert_eq!(offset_of!(DrmI915Query, flags), 4);
+        assert_eq!(offset_of!(DrmI915Query, items_ptr), 8);
+
+        assert_eq!(size_of::<DrmI915QueryItem>(), 24);
+        assert_eq!(offset_of!(DrmI915QueryItem, query_id), 0);
+        assert_eq!(offset_of!(DrmI915QueryItem, length), 8);
+        assert_eq!(offset_of!(DrmI915QueryItem, flags), 12);
+        assert_eq!(offset_of!(DrmI915QueryItem, data_ptr), 16);
+
+        assert_eq!(size_of::<DrmXeDeviceQuery>(), 40);
+        assert_eq!(offset_of!(DrmXeDeviceQuery, extensions), 0);
+        assert_eq!(offset_of!(DrmXeDeviceQuery, query), 8);
+        assert_eq!(offset_of!(DrmXeDeviceQuery, size), 12);
+        assert_eq!(offset_of!(DrmXeDeviceQuery, data), 16);
+        assert_eq!(offset_of!(DrmXeDeviceQuery, reserved), 24);
+
+        // The reply buffers are allocated as `u64` words, which is only sound if every blob length
+        // is a whole number of them — true of 16 + 88N and 8 + 88N alike.
+        assert_eq!(align_of::<u64>(), 8);
+        assert_eq!(I915_REGIONS_HEADER % 8, 0);
+        assert_eq!(XE_REGIONS_HEADER % 8, 0);
+        assert_eq!(DRM_REGION_RECORD % 8, 0);
+    }
+
+    #[test]
+    fn i915_blob_len_rejects_the_negative_errno_and_nonsense() {
+        // A pre-5.14 kernel has no memory-regions query and reports -EINVAL *as the length*, while
+        // the ioctl itself returns 0. Read unsigned, that becomes 4294967274 — a 4 GiB allocation.
+        assert_eq!(i915_blob_len(-22), None);
+        assert_eq!(i915_blob_len(-1), None);
+        // Real shapes: header + N records.
+        assert_eq!(i915_blob_len(16), Some(16)); // zero regions is a well-formed (if empty) blob
+        assert_eq!(i915_blob_len(16 + 88), Some(104)); // integrated: system memory only
+        assert_eq!(i915_blob_len(16 + 88 * 2), Some(192)); // discrete: system + device-local
+                                                           // Not a whole number of records, or implausibly large.
+        assert_eq!(i915_blob_len(100), None);
+        assert_eq!(i915_blob_len(8), None);
+        assert_eq!(i915_blob_len(16 + 88 * 65), None);
+    }
+
+    #[test]
+    fn xe_blob_len_validates_the_kernels_reported_size() {
+        assert_eq!(xe_blob_len(8), Some(8));
+        assert_eq!(xe_blob_len(96), Some(96)); // integrated: SYSMEM only
+        assert_eq!(xe_blob_len(184), Some(184)); // single-tile discrete: SYSMEM + VRAM
+        assert_eq!(xe_blob_len(272), Some(272)); // two-tile
+        assert_eq!(xe_blob_len(0), None);
+        assert_eq!(xe_blob_len(100), None);
+        assert_eq!(xe_blob_len(8 + 88 * 65), None);
+    }
+
+    #[test]
+    fn drm_parsers_sum_device_local_regions_only() {
+        // A discrete card reports system memory (class 0) alongside its VRAM (class 1); only the
+        // latter is a distinct pool. 16 GiB, as an Arc A770 16 GB or a B580 would report.
+        const VRAM: u64 = 16 * 1_073_741_824;
+        let i915 = drm_regions_blob(I915_REGIONS_HEADER, &[(0, 34_000_000_000), (1, VRAM)]);
+        assert_eq!(parse_i915_vram_bytes(&i915), Some(VRAM));
+        let xe = drm_regions_blob(XE_REGIONS_HEADER, &[(0, 34_000_000_000), (1, VRAM)]);
+        assert_eq!(parse_xe_vram_bytes(&xe), Some(VRAM));
+
+        // Multi-tile: one device-local region per tile, summed rather than first-wins.
+        let two_tile = drm_regions_blob(XE_REGIONS_HEADER, &[(0, 8_000_000_000), (1, 4), (1, 6)]);
+        assert_eq!(parse_xe_vram_bytes(&two_tile), Some(10));
+    }
+
+    #[test]
+    fn an_integrated_intel_gpu_reports_no_device_local_region() {
+        // This is the discrete gate: an iGPU answers with system memory only, so there is nothing to
+        // report and the scan falls back to sizing on system RAM — never a fabricated "VRAM".
+        let igpu = drm_regions_blob(I915_REGIONS_HEADER, &[(0, 34_000_000_000)]);
+        assert_eq!(parse_i915_vram_bytes(&igpu), None);
+        assert_eq!(
+            parse_xe_vram_bytes(&drm_regions_blob(XE_REGIONS_HEADER, &[(0, 34_000_000_000)])),
+            None
+        );
+        // A device-local region that reports zero bytes is not a usable reading either.
+        assert_eq!(
+            parse_i915_vram_bytes(&drm_regions_blob(I915_REGIONS_HEADER, &[(1, 0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn drm_parsers_refuse_to_read_past_a_lying_region_count() {
+        // The count is the kernel's claim; the blob length is the fact. Clamp to the fact.
+        let mut blob = drm_regions_blob(I915_REGIONS_HEADER, &[(1, 512)]);
+        blob[0..4].copy_from_slice(&99u32.to_ne_bytes());
+        assert_eq!(parse_i915_vram_bytes(&blob), Some(512));
+
+        // Truncated or absent headers yield nothing rather than panicking.
+        assert_eq!(parse_i915_vram_bytes(&[]), None);
+        assert_eq!(parse_i915_vram_bytes(&[0u8; 8]), None);
+        assert_eq!(parse_xe_vram_bytes(&[0u8; 4]), None);
+        // A header promising a record the blob doesn't contain.
+        let mut short = vec![0u8; XE_REGIONS_HEADER];
+        short[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        assert_eq!(parse_xe_vram_bytes(&short), None);
+    }
+
+    #[test]
+    fn intel_drm_nodes_are_matched_by_vendor_and_driver() {
+        assert!(is_intel_pci_vendor("0x8086\n"));
+        assert!(is_intel_pci_vendor(" 0X8086 "));
+        assert!(!is_intel_pci_vendor("0x10de")); // NVIDIA
+        assert!(!is_intel_pci_vendor("0x1002")); // AMD
+        assert!(!is_intel_pci_vendor(""));
+
+        assert_eq!(
+            intel_drm_driver_from_link("../../../../bus/pci/drivers/i915"),
+            Some(IntelDrmDriver::I915)
+        );
+        assert_eq!(
+            intel_drm_driver_from_link("../../../../bus/pci/drivers/xe"),
+            Some(IntelDrmDriver::Xe)
+        );
+        // An unknown driver is never issued a driver-specific ioctl.
+        assert_eq!(
+            intel_drm_driver_from_link("/sys/bus/pci/drivers/amdgpu"),
+            None
+        );
+        assert_eq!(intel_drm_driver_from_link("i915_bpo"), None);
+        assert_eq!(intel_drm_driver_from_link(""), None);
+
+        assert_eq!(IntelDrmDriver::I915.source_label(), "drm_i915");
+        assert_eq!(IntelDrmDriver::Xe.source_label(), "drm_xe");
     }
 
     #[test]
