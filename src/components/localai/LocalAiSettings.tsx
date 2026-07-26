@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 
 import {
@@ -17,14 +18,17 @@ import {
   setLocalLlmRoleModel,
   setLocalLlmRouting,
   setLocalLlmToken,
+  setLocalModelScanDir,
 } from "../../lib/ipc";
 import type {
   DetectedEndpoint,
   EndpointCheck,
+  LocalDiskSource,
   LocalFitResult,
   LocalFitVerdict,
   LocalLlmConfig,
   LocalLlmStatus,
+  LocalOnDiskModel,
   LocalRecommendation,
   LocalRecommendations,
   PullProgress,
@@ -127,6 +131,27 @@ export function LocalAiSettings() {
       clearInterval(id);
     };
   }, [configured]);
+
+  /** Point the on-disk crawl at an extra folder (or change the one it uses), then reload. */
+  async function pickScanFolder() {
+    const picked = await openDialog({ directory: true, multiple: false });
+    if (typeof picked !== "string") return;
+    await applyScanDir(picked);
+  }
+
+  async function clearScanFolder() {
+    await applyScanDir(null);
+  }
+
+  async function applyScanDir(dir: string | null) {
+    setError(null);
+    try {
+      await setLocalModelScanDir(dir);
+      setRecs(await localModelRecommendations());
+    } catch (e) {
+      setError(String(e));
+    }
+  }
 
   async function rescan() {
     setRescanning(true);
@@ -328,6 +353,48 @@ export function LocalAiSettings() {
         </p>
       </div>
 
+      {/* ── Already downloaded ───────────────────────────────────────────────────────────── */}
+      <div
+        id="sec-localai-downloaded"
+        data-settings-section
+        data-help="settings-localai-downloaded"
+        className="mt-5 border-t border-border pt-4"
+      >
+        <div className="flex items-baseline justify-between gap-2">
+          <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+            Already downloaded
+          </label>
+          {!loading && recs && recs.on_disk.length > 0 && (
+            <span className="shrink-0 text-[0.6875rem] text-ink4">
+              {recs.on_disk.length} on this device
+            </span>
+          )}
+        </div>
+        {loading ? (
+          <p className="mt-2 text-xs text-ink4">Looking for downloaded models…</p>
+        ) : recs ? (
+          <DownloadedModels
+            recs={recs}
+            onPickFolder={pickScanFolder}
+            onClearFolder={clearScanFolder}
+          />
+        ) : (
+          <p className="mt-2 text-xs text-ink4">Couldn't check for downloaded models.</p>
+        )}
+        <SectionInfo title="Where PM looks, and what it reads">
+          <p>
+            PM checks the folders {SUPPORTED_RUNTIMES} keep their models in, so a model you've
+            downloaded but aren't currently running still gets sized against your machine.
+          </p>
+          <p>
+            It reads <span className="text-ink2">file names and sizes only</span> — never the
+            contents of a model file — it writes nothing, and none of it leaves this device. Models
+            it doesn't recognise are listed with an honest “can't estimate this” rather than a
+            guess.
+          </p>
+        </SectionInfo>
+      </div>
+
       {/* ── Connect an endpoint ──────────────────────────────────────────────────────────── */}
       <div
         id="sec-localai-endpoint"
@@ -341,6 +408,15 @@ export function LocalAiSettings() {
           </label>
           {configured && <StatusChip status={status} />}
         </div>
+        {/* Which runners PM supports, stated up front and in BOTH states — this is a gating fact
+            (what you need to have installed), not prose to fold away. */}
+        <p className="mt-1.5 text-xs text-ink4">
+          Works with <span className="text-ink2">Ollama</span> (port 11434),{" "}
+          <span className="text-ink2">LM Studio</span> (1234) and{" "}
+          <span className="text-ink2">llama-server</span> (8080) — and any other server that speaks
+          the OpenAI API, at whatever address you give it. PM connects to a server{" "}
+          <span className="text-ink2">you</span> run; it never bundles, installs, or starts one.
+        </p>
 
         {configured ? (
           <div className="mt-2">
@@ -505,6 +581,106 @@ export function LocalAiSettings() {
       </div>
     </>
   );
+}
+
+// ── Already downloaded (#449) ─────────────────────────────────────────────────────────────────
+
+/** The runners PM can find models for, named in one place so the copy can't drift from the crawl. */
+const SUPPORTED_RUNTIMES = "Ollama, LM Studio and Hugging Face";
+
+const DISK_SOURCE_LABEL: Record<LocalDiskSource, string> = {
+  ollama: "Ollama",
+  hugging_face: "Hugging Face",
+  lm_studio: "LM Studio",
+  folder: "Your folder",
+};
+
+/** Models found on disk that no endpoint is serving. Distinguishes "we looked and this runner has
+ *  nothing" from "this runner isn't on this machine" — an empty list means different things. */
+function DownloadedModels({
+  recs,
+  onPickFolder,
+  onClearFolder,
+}: {
+  recs: LocalRecommendations;
+  onPickFolder: () => void;
+  onClearFolder: () => void;
+}) {
+  const found = recs.disk_sources_present
+    .filter((s) => s !== "folder")
+    .map((s) => DISK_SOURCE_LABEL[s]);
+
+  return (
+    <div className="mt-2">
+      {recs.on_disk.length === 0 ? (
+        <p className="text-xs text-ink4">
+          {found.length > 0
+            ? `Found ${listJoin(found)} on this device, with nothing downloaded that isn't already being served.`
+            : `No model folder found for ${SUPPORTED_RUNTIMES}. If your models live somewhere else, point PM at that folder below.`}
+        </p>
+      ) : (
+        <>
+          <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+            {recs.on_disk.map((m) => (
+              <OnDiskCard key={`${m.source}:${m.path}:${m.name}`} model={m} />
+            ))}
+          </div>
+          {found.length > 0 && (
+            <p className="mt-2 text-xs text-faint">Found via {listJoin(found)}.</p>
+          )}
+        </>
+      )}
+
+      {recs.disk_truncated && (
+        <p className="mt-2 text-xs text-ink4">
+          PM stopped after the first few hundred models, so this list isn't everything on your
+          device.
+        </p>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <Button variant="tertiary" onClick={onPickFolder} className="px-2 py-0.5 text-xs">
+          {recs.scan_dir ? "Change folder…" : "Also look in a folder…"}
+        </Button>
+        {recs.scan_dir && (
+          <>
+            <span className="min-w-0 break-all text-xs text-ink4">{recs.scan_dir}</span>
+            <Button variant="tertiary" onClick={onClearFolder} className="px-2 py-0.5 text-xs">
+              Stop looking there
+            </Button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function OnDiskCard({ model }: { model: LocalOnDiskModel }) {
+  return (
+    <div className="rounded-[var(--radius-sm)] border border-border px-3 py-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <span className="min-w-0 break-all text-sm text-ink2">{model.name}</span>
+        <FitBadge verdict={model.fit.verdict} />
+      </div>
+      <p className="mt-0.5 text-xs text-ink4">
+        {DISK_SOURCE_LABEL[model.source]} · {fmtGb(model.size_gb)}
+        {model.quant ? ` · ${model.quant}` : ""}
+        {model.shards > 1 ? ` · ${model.shards} files` : ""}
+      </p>
+      <ConfigRow label="In system memory" fit={model.fit} />
+      {model.fit.notes.map((n, i) => (
+        <p key={i} className="mt-1 text-xs text-faint">
+          {n}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+/** "a, b and c" — the Oxford-free list join the rest of PM's copy uses. */
+function listJoin(items: string[]): string {
+  if (items.length <= 1) return items[0] ?? "";
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
 }
 
 // ── Small pieces ──────────────────────────────────────────────────────────────────────────────

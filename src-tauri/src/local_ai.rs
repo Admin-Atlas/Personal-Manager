@@ -23,7 +23,9 @@ use crate::llm_gateway::{
     LOCAL_CHAT_MODEL_KEY,
 };
 use crate::local_slot::{classify_ip, posture_for, EndpointClass, PostureVerdict};
-use crate::{db, fit, hardware, local_catalog, openai_compat, paths, secrets, AppState};
+use crate::{
+    db, fit, hardware, local_catalog, local_disk, openai_compat, paths, secrets, AppState,
+};
 
 /// The three servers PM knows how to auto-detect, by their default loopback port.
 const KNOWN_PORTS: &[(u16, &str)] = &[
@@ -31,6 +33,11 @@ const KNOWN_PORTS: &[(u16, &str)] = &[
     (1234, "LM Studio"),
     (8080, "llama-server"),
 ];
+
+/// Settings key: an extra folder to include in the on-disk model crawl (#449), for weights kept
+/// somewhere PM wouldn't think to look (a `--local-dir` download, a shared model library on another
+/// drive). Absent = crawl only the runners' own locations.
+pub const LOCAL_MODEL_SCAN_DIR_KEY: &str = "local_model_scan_dir";
 
 // ---------------------------------------------------------------------------------------------
 // Auto-detect
@@ -556,8 +563,26 @@ pub async fn local_hardware_scan(app: AppHandle, force: bool) -> Result<hardware
             return Ok(hw);
         }
     }
+    // The Workbench has one "Re-scan" button covering everything it reads about this machine, so a
+    // forced scan also drops the on-disk model crawl — otherwise a model downloaded since the tab
+    // opened would stay invisible until restart.
+    app.state::<AppState>().local_ai.clear_disk_models();
     let hw = scan_hardware(&app).await?;
     Ok(hw)
+}
+
+/// Point the on-disk crawl (#449) at an extra folder, or clear it with `None`. Persisted, and drops
+/// the cached crawl so the next recommendations call reflects the change.
+#[tauri::command]
+pub fn set_local_model_scan_dir(state: State<'_, AppState>, dir: Option<String>) -> Result<()> {
+    let conn = state.conn()?;
+    match dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(d) => db::set_setting(&conn, LOCAL_MODEL_SCAN_DIR_KEY, d)?,
+        None => db::set_setting(&conn, LOCAL_MODEL_SCAN_DIR_KEY, "")?,
+    }
+    drop(conn);
+    state.local_ai.clear_disk_models();
+    Ok(())
 }
 
 /// Score every curated catalog model — and any model the configured endpoint already serves — against
@@ -658,6 +683,35 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         }
     }
 
+    // Models sitting on disk that no endpoint currently serves (#449). Scored on their REAL on-disk
+    // size rather than the catalog's figure for that quant — the point of the card is to describe the
+    // file you actually have. De-duplicated against the served list so a model that is both
+    // downloaded and loaded appears once, under the endpoint that serves it.
+    let served_keys: Vec<String> = installed
+        .iter()
+        .map(|m| m.matched_repo.clone().unwrap_or_else(|| m.id.clone()))
+        .collect();
+    let disk = disk_scan(&app).await;
+    let on_disk: Vec<OnDiskModel> = disk
+        .models
+        .iter()
+        .filter(|m| !already_served(m, &served_keys))
+        .map(|m| {
+            let matched = local_catalog::match_installed(&m.name);
+            let fit = score_on_disk(m, matched, &fit_hw);
+            OnDiskModel {
+                name: m.name.clone(),
+                source: m.source,
+                path: m.path.clone(),
+                size_gb: m.size_gb,
+                quant: m.quant.clone(),
+                shards: m.shards,
+                matched_repo: matched.map(|e| e.repo.clone()),
+                fit,
+            }
+        })
+        .collect();
+
     // Rescan cadence — read-only in PR4 (the Local AI tab sets it and stamps the seen version in PR5).
     let (cadence, rescan_due) = {
         let state = app.state::<AppState>();
@@ -690,7 +744,90 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
         rescan_due,
         curated,
         installed,
+        on_disk,
+        disk_sources_present: disk.sources_present.clone(),
+        disk_truncated: disk.truncated,
+        scan_dir: scan_dir_setting(&app),
     })
+}
+
+/// The extra crawl folder as stored, or `None` when unset (an empty string is how clearing it is
+/// recorded, since settings are additive).
+fn scan_dir_setting(app: &AppHandle) -> Option<String> {
+    let state = app.state::<AppState>();
+    let conn = state.conn().ok()?;
+    db::get_setting(&conn, LOCAL_MODEL_SCAN_DIR_KEY)
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The on-disk crawl (#449), cached on the runtime like the hardware scan. Failure is not an error:
+/// an unreadable home directory yields an empty scan and the Workbench simply shows nothing for it.
+async fn disk_scan(app: &AppHandle) -> local_disk::DiskScan {
+    if let Some(cached) = app.state::<AppState>().local_ai.cached_disk_models() {
+        return cached;
+    }
+    let home = app.path().home_dir().ok();
+    // Read the setting BEFORE the await — the DB guard must never be held across one.
+    let extra = scan_dir_setting(app).map(std::path::PathBuf::from);
+    let Some(home) = home else {
+        return local_disk::DiskScan::default();
+    };
+    let scan =
+        tauri::async_runtime::spawn_blocking(move || local_disk::scan(&home, extra.as_deref()))
+            .await
+            .unwrap_or_default();
+    app.state::<AppState>()
+        .local_ai
+        .cache_disk_models(scan.clone());
+    scan
+}
+
+/// Whether an on-disk model is the same thing the endpoint already serves. Compared on the catalog
+/// repo when both matched, else on the runner's own name — an Ollama tag round-trips exactly, and a
+/// file-based runner's `owner/repo/file.gguf` contains what the endpoint reports.
+fn already_served(model: &local_disk::DiskModel, served_keys: &[String]) -> bool {
+    let matched = local_catalog::match_installed(&model.name).map(|e| e.repo.as_str());
+    served_keys.iter().any(|key| {
+        if let Some(repo) = matched {
+            if key.eq_ignore_ascii_case(repo) {
+                return true;
+            }
+        }
+        key.eq_ignore_ascii_case(&model.name)
+    })
+}
+
+/// Score an on-disk model against this machine, using the REAL file size on disk as the weight term.
+///
+/// Per #449's rules a file PM can't characterise is never guessed at: a name that matches no catalog
+/// entry, or a quant label that isn't one PM knows, comes back `unknown` with the reason said plainly.
+/// When both are known the catalog supplies the architecture, active-parameter count and context
+/// window, while the single quant candidate carries the measured on-disk size.
+fn score_on_disk(
+    model: &local_disk::DiskModel,
+    matched: Option<&local_catalog::CatalogEntry>,
+    hw: &fit::FitHardware,
+) -> fit::FitResult {
+    let Some(entry) = matched else {
+        return fit::unknown(
+            "This model isn't in PM's catalog, so its fit can't be estimated.".to_string(),
+        );
+    };
+    let Some(quant) = model.quant.as_deref().and_then(fit::Quant::from_label) else {
+        return fit::unknown(
+            "PM couldn't tell which quantization this file is, so its fit can't be estimated."
+                .to_string(),
+        );
+    };
+    let mut spec = local_catalog::entry_to_spec(entry);
+    spec.candidates = vec![fit::QuantCandidate {
+        quant,
+        weight_gb: model.size_gb,
+    }];
+    fit::fit(&spec, hw)
 }
 
 /// Run a fresh hardware scan off the async runtime and cache it. Shared by both commands.
@@ -742,6 +879,19 @@ pub struct InstalledModel {
     pub fit: fit::FitResult,
 }
 
+/// A model found on disk that no endpoint is currently serving (#449), scored on its real file size.
+#[derive(Serialize)]
+pub struct OnDiskModel {
+    pub name: String,
+    pub source: local_disk::DiskSource,
+    pub path: String,
+    pub size_gb: f64,
+    pub quant: Option<String>,
+    pub shards: u32,
+    pub matched_repo: Option<String>,
+    pub fit: fit::FitResult,
+}
+
 /// The Workbench recommendations payload.
 #[derive(Serialize)]
 pub struct Recommendations {
@@ -760,6 +910,15 @@ pub struct Recommendations {
     pub rescan_due: bool,
     pub curated: Vec<Recommendation>,
     pub installed: Vec<InstalledModel>,
+    /// Downloaded but not currently served (#449) — de-duplicated against `installed`.
+    pub on_disk: Vec<OnDiskModel>,
+    /// Which runners' model folders exist on this machine, so the UI can say "Ollama is here with
+    /// nothing downloaded" rather than implying it isn't installed.
+    pub disk_sources_present: Vec<local_disk::DiskSource>,
+    /// The crawl hit its bound, so `on_disk` is a prefix rather than everything on disk.
+    pub disk_truncated: bool,
+    /// The extra folder the crawl includes, when one is set.
+    pub scan_dir: Option<String>,
 }
 
 #[cfg(test)]

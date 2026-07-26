@@ -1410,7 +1410,8 @@ export interface LocalHardware {
   gpu_name: string | null;
   gpu_vendor: string | null;
   vram_gb: number | null;
-  /** "nvidia-smi" | "dxgi" | "adapter_ram" | "apple_unified" | "amd_sysfs" — how VRAM was read. */
+  /** "nvidia-smi" | "dxgi" | "adapter_ram" | "apple_unified" | "amd_sysfs" | "drm_i915" | "drm_xe" —
+   *  how VRAM was read. */
   vram_source: string | null;
   /** The GPU's peak memory bandwidth (GB/s) when its model is recognised, else null (the speed
    *  estimate then uses a flat default). Sharpens the tok/s figure only, never the fit verdict. */
@@ -1458,8 +1459,26 @@ export interface LocalInstalledModel {
   fit: LocalFitResult;
 }
 
-/** The Workbench payload: the hardware scan + the fit-scored catalog + installed models
- *  (local_ai.rs Recommendations). */
+/** Which runner a model found on disk belongs to (local_disk.rs DiskSource). */
+export type LocalDiskSource = "ollama" | "hugging_face" | "lm_studio" | "folder";
+
+/** A model downloaded to this machine that no endpoint is currently serving (local_ai.rs
+ *  OnDiskModel, #449). Scored on its REAL on-disk size, not the catalog's figure for that quant. */
+export interface LocalOnDiskModel {
+  name: string;
+  source: LocalDiskSource;
+  path: string;
+  size_gb: number;
+  /** null when PM couldn't tell which quantization the file is — the fit is then `unknown`. */
+  quant: string | null;
+  /** 1, or the shard count for a split GGUF. */
+  shards: number;
+  matched_repo: string | null;
+  fit: LocalFitResult;
+}
+
+/** The Workbench payload: the hardware scan + the fit-scored catalog + installed models + models
+ *  found on disk (local_ai.rs Recommendations). */
 export interface LocalRecommendations {
   hardware: LocalHardware;
   reserve_gb: number;
@@ -1471,6 +1490,15 @@ export interface LocalRecommendations {
   rescan_due: boolean;
   curated: LocalRecommendation[];
   installed: LocalInstalledModel[];
+  /** Downloaded but not currently served (#449), de-duplicated against `installed`. */
+  on_disk: LocalOnDiskModel[];
+  /** Which runners' model folders exist on this machine — so "Ollama is here with nothing
+   *  downloaded" can be said differently from "Ollama isn't installed". */
+  disk_sources_present: LocalDiskSource[];
+  /** The crawl hit its bound, so `on_disk` is a prefix rather than everything on disk. */
+  disk_truncated: boolean;
+  /** The extra folder the crawl includes, when one is set. */
+  scan_dir: string | null;
 }
 
 /** An auto-detected local server (local_ai.rs DetectedEndpoint). */
