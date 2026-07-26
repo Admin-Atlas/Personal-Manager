@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.84.1-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "The “Already downloaded” list in Settings > Local AI now says what you can actually do with what it found. Everything in that list is, by definition, a model nothing is currently running -- which also means PM can't use it yet. That was never said anywhere, so a model could sit there looking ready while never turning up in the Assign roles dropdown just above it. The list now explains it up front: load one in the app you downloaded it with, and it appears as something you can assign. If you haven't connected a server at all yet, it tells you to do that first instead.",
+    ],
+  },
+  {
     version: "3.84.0-alpha",
     date: "2026-07-26",
     highlights: [

@@ -460,6 +460,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
         ) : recs ? (
           <DownloadedModels
             recs={recs}
+            configured={configured}
             onPickFolder={pickScanFolder}
             onClearFolder={clearScanFolder}
           />
@@ -681,13 +682,19 @@ const DISK_SOURCE_LABEL: Record<LocalDiskSource, string> = {
 };
 
 /** Models found on disk that no endpoint is serving. Distinguishes "we looked and this runner has
- *  nothing" from "this runner isn't on this machine" — an empty list means different things. */
-function DownloadedModels({
+ *  nothing" from "this runner isn't on this machine" — an empty list means different things.
+ *
+ *  Exported for its test: the "you can't pick these yet" line is a GATING hint, not prose, so the
+ *  settings doctrine keeps it unfolded — a test pins it rather than trusting it not to drift. */
+export function DownloadedModels({
   recs,
+  configured,
   onPickFolder,
   onClearFolder,
 }: {
   recs: LocalRecommendations;
+  /** An endpoint is saved. Decides which half of the gating hint applies. */
+  configured: boolean;
   onPickFolder: () => void;
   onClearFolder: () => void;
 }) {
@@ -705,6 +712,11 @@ function DownloadedModels({
         </p>
       ) : (
         <>
+          <p className="mb-2 text-xs text-ink4">
+            {configured
+              ? "None of these can be assigned yet — PM can only use a model your endpoint is actually serving. Load one in the app you downloaded it with and it appears under Assign roles above."
+              : "This is what's on your device, not what PM can use yet. Connect an endpoint above, then load the model in the app you downloaded it with, and it appears under Assign roles."}
+          </p>
           <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
             {recs.on_disk.map((m) => (
               <OnDiskCard key={`${m.source}:${m.path}:${m.name}`} model={m} />
