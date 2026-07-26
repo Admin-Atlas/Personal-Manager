@@ -4,10 +4,12 @@
 import { describe, it, expect } from "vitest";
 import {
   caretForRestore,
+  countTasks,
   indentLines,
   listIndentBeforeCaret,
   outdentLines,
   toRenderMarkdown,
+  toggleTaskAt,
 } from "./notesMarkdown";
 
 // F-52 regression: promoting a pinboard note to a real vault document ingests
@@ -16,6 +18,49 @@ import {
 // and the dialect markers ("[]", "." bullets, roman labels) don't get indexed as noise. These
 // tests lock in that normalisation: the transform must actually change dialect notes (or the
 // wiring would be a no-op) while leaving native markers and prose byte-for-byte.
+describe("toggleTaskAt / countTasks — ticking a box in the RENDERED note", () => {
+  it("flips the note dialect's own marker", () => {
+    expect(toggleTaskAt("[] buy milk", 0)).toBe("[x] buy milk");
+    expect(toggleTaskAt("[x] buy milk", 0)).toBe("[] buy milk");
+    expect(toggleTaskAt("[ ] buy milk", 0)).toBe("[x] buy milk");
+    expect(toggleTaskAt("[X] buy milk", 0)).toBe("[] buy milk");
+  });
+
+  it("flips a literal GFM task item too — it renders as a checkbox, so it must be tickable", () => {
+    // `-` wins the marker alternation, so toRenderMarkdown passes "- [x] foo" through untouched and
+    // the renderer makes a real task item out of it. Counting only the note dialect would map the
+    // Nth rendered box to the wrong source line.
+    expect(toggleTaskAt("- [ ] ship it", 0)).toBe("- [x] ship it");
+    expect(toggleTaskAt("- [x] ship it", 0)).toBe("- [ ] ship it");
+    expect(toggleTaskAt("* [ ] ship it", 0)).toBe("* [x] ship it");
+  });
+
+  it("indexes in rendered order across both dialects and skips non-task lines", () => {
+    const note = "heading\n[] one\n- a bullet\n- [ ] two\n\n[x] three";
+    expect(countTasks(note)).toBe(3);
+    expect(toggleTaskAt(note, 1)).toContain("- [x] two");
+    expect(toggleTaskAt(note, 1)).toContain("[] one"); // untouched
+    expect(toggleTaskAt(note, 2)).toContain("[] three");
+  });
+
+  it("keeps indentation, content and every other line byte-for-byte", () => {
+    expect(toggleTaskAt("  [] nested", 0)).toBe("  [x] nested");
+    expect(toggleTaskAt("a\n[] b\nc", 0)).toBe("a\n[x] b\nc");
+  });
+
+  it("can force a state rather than flipping — the DOM event already knows the new value", () => {
+    expect(toggleTaskAt("[x] done", 0, true)).toBe("[x] done");
+    expect(toggleTaskAt("[] todo", 0, false)).toBe("[] todo");
+  });
+
+  it("returns null for an index that names no checkbox, so a stale click is a no-op", () => {
+    expect(toggleTaskAt("[] only one", 1)).toBeNull();
+    expect(toggleTaskAt("no boxes here", 0)).toBeNull();
+    expect(toggleTaskAt("[] x", -1)).toBeNull();
+    expect(countTasks("no boxes here")).toBe(0);
+  });
+});
+
 describe("toRenderMarkdown — shorthand dialect → GFM (F-52)", () => {
   it("normalises checkbox markers to GFM task-list items", () => {
     expect(toRenderMarkdown("[] buy milk")).toBe("- [ ] buy milk");

@@ -52,14 +52,42 @@ describe("reflowToWidth — fixed-width board wraps overflow to new rows", () =>
     expect(reflowToWidth(ws, 10, 20)).toEqual(ws);
   });
 
-  it("re-flows a widget that overhangs the right edge into a free slot on the same row", () => {
+  it("leaves a widget sitting FLUSH with the right edge alone", () => {
+    const ws = [note("a", { x: 6, y: 0, w: 4, h: 3 })];
+    expect(reflowToWidth(ws, 10, 20)).toEqual(ws);
+  });
+
+  it("slides a partly-overhanging widget left instead of teleporting it", () => {
+    // The measured board width comes from a scroller's clientWidth, which EXCLUDES a vertical
+    // scrollbar — so a tab switch that adds or removes one can report a width a cell different.
+    // This used to send a card the user had deliberately placed at the right edge off to the first
+    // free slot near the top-left. Sliding keeps the placement and the size.
     const out = reflowToWidth(
       [note("a", { x: 0, y: 0, w: 4, h: 3 }), note("b", { x: 8, y: 0, w: 4, h: 3 })],
       10,
       20,
     );
     expect(out[0].rect).toEqual({ x: 0, y: 0, w: 4, h: 3 }); // fitter untouched
-    expect(out[1].rect).toEqual({ x: 4, y: 0, w: 4, h: 3 }); // pulled in beside it
+    expect(out[1].rect).toEqual({ x: 6, y: 0, w: 4, h: 3 }); // slid flush, NOT re-slotted
+  });
+
+  it("slides even when that overlaps a neighbour — this board allows overlap", () => {
+    const out = reflowToWidth(
+      [note("a", { x: 4, y: 0, w: 4, h: 3 }), note("b", { x: 7, y: 0, w: 4, h: 3 })],
+      9,
+      20,
+    );
+    expect(out[1].rect).toEqual({ x: 5, y: 0, w: 4, h: 3 });
+  });
+
+  it("still wraps a widget whose LEFT edge is off-screen — that one is genuinely lost", () => {
+    const out = reflowToWidth([note("a", { x: 30, y: 0, w: 4, h: 3 })], 10, 20);
+    expect(out[0].rect).toEqual({ x: 0, y: 0, w: 4, h: 3 });
+  });
+
+  it("still re-slots a widget wider than the whole board", () => {
+    const out = reflowToWidth([note("a", { x: 2, y: 0, w: 20, h: 3 })], 10, 20);
+    expect(out[0].rect).toEqual({ x: 0, y: 0, w: 10, h: 3 });
   });
 
   it("wraps an overflowing widget onto a new row when the first row is full", () => {

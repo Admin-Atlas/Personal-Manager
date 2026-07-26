@@ -145,6 +145,9 @@ export function DevView() {
   // Retrieval explain (issue #81): button-triggered so the sidecar embed never fires on its own.
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(6);
+  // The text the user is typing, kept apart from the committed `topK` so a half-typed or momentarily
+  // empty value never becomes the query's k (see the input's onBlur).
+  const [topKDraft, setTopKDraft] = useState("6");
   const [explain, setExplain] = useState<DevRetrievalExplain | null>(null);
   const [explaining, setExplaining] = useState(false);
   const [explainErr, setExplainErr] = useState<string | null>(null);
@@ -375,10 +378,18 @@ export function DevView() {
                   type="number"
                   min={1}
                   max={50}
-                  value={topK}
-                  onChange={(e) =>
-                    setTopK(Math.max(1, Math.min(50, Math.trunc(Number(e.target.value)) || 6)))
-                  }
+                  value={topKDraft}
+                  // Draft-then-commit, like the other numeric fields in the app. Clamping on every
+                  // keystroke made the field untypable: clearing it read as 0 and snapped back to 6,
+                  // so you could never replace "6" with "25" — the same reject-mid-typing shape that
+                  // made the Linux work-day hour field impossible to use (#555).
+                  onChange={(e) => setTopKDraft(e.target.value)}
+                  onBlur={() => {
+                    const n = Math.trunc(Number(topKDraft.trim()));
+                    const next = Number.isFinite(n) && n > 0 ? Math.max(1, Math.min(50, n)) : topK;
+                    setTopK(next);
+                    setTopKDraft(String(next));
+                  }}
                   className="w-14 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-sm text-ink"
                 />
               </label>

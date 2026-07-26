@@ -6,9 +6,8 @@
 // navigational — it moves the view, it never edits an event. Reuses the Popover primitive and the
 // shared MiniMonth; no colour of its own.
 
-import { useState } from "react";
 import { Popover } from "../ui";
-import { MiniMonth } from "./parts/MiniMonth";
+import { MonthPicker } from "./parts/MonthPicker";
 
 interface Props {
   /** The current period label shown in the header (e.g. "July 2026"). */
@@ -17,42 +16,6 @@ interface Props {
   cursor: Date;
   /** Jump the view to a day. */
   onPick: (d: Date) => void;
-}
-
-function PickerBody({ cursor, onPick }: { cursor: Date; onPick: (d: Date) => void }) {
-  const [view, setView] = useState(() => new Date(cursor.getFullYear(), cursor.getMonth(), 1));
-  const monthLabel = view.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-  return (
-    <div className="w-60 p-1">
-      <div className="mb-1 flex items-center justify-between">
-        <button
-          type="button"
-          onClick={() => setView((v) => new Date(v.getFullYear(), v.getMonth() - 1, 1))}
-          className="rounded-[var(--radius-sm)] px-2 py-0.5 text-ink3 hover:bg-surface"
-          aria-label="Previous month"
-        >
-          ‹
-        </button>
-        <span className="font-head text-sm text-ink">{monthLabel}</span>
-        <button
-          type="button"
-          onClick={() => setView((v) => new Date(v.getFullYear(), v.getMonth() + 1, 1))}
-          className="rounded-[var(--radius-sm)] px-2 py-0.5 text-ink3 hover:bg-surface"
-          aria-label="Next month"
-        >
-          ›
-        </button>
-      </div>
-      <MiniMonth
-        year={view.getFullYear()}
-        month={view.getMonth()}
-        today={new Date()}
-        selected={cursor}
-        onSelectDay={onPick}
-        showWeekdays
-      />
-    </div>
-  );
 }
 
 export function MiniCalendarPopover({ label, cursor, onPick }: Props) {
@@ -74,8 +37,8 @@ export function MiniCalendarPopover({ label, cursor, onPick }: Props) {
       )}
     >
       {({ close }) => (
-        <PickerBody
-          cursor={cursor}
+        <MonthPicker
+          selected={cursor}
           onPick={(d) => {
             onPick(d);
             close();

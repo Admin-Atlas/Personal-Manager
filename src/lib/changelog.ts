@@ -24,6 +24,20 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.87.0-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "Dates are typed, not fought with. Every date box in PM — milestones on a project, on the Focus card, and on a pinboard note or timeline — used to be your web engine's own date control. On Linux that meant a popup that wouldn't close when you clicked away, leaving Escape as the only exit. They're now PM's own field: type the date in plain DD-MM-YYYY, or pick it from a small calendar with Today and Clear. It's forgiving about how you type — 4/8, 14.08.2026 and a pasted 2026-08-14 all work, and leaving the year off means this year — and it finally shows dates in the same format as the rest of the app, rather than whatever your operating system happened to prefer.",
+      "Checkboxes in a note can be ticked. A checklist on a pinboard note rendered as real checkboxes but they did nothing — the only way to tick one was to open the note and retype the marker by hand. Now you click the box. Clicking anywhere else in the note still opens it for editing, as before.",
+      "Notes keep the line breaks you typed. Writing a line of ordinary text underneath a bullet or a checklist quietly folded it into the item above, so two lines became one run-on line. Notes pasted from another app with Windows line endings were being mangled too. Both are fixed, and your existing notes will simply start rendering the way you wrote them.",
+      "Checklists line up properly. A checklist item long enough to wrap now continues under its own text instead of sliding back beneath the checkbox. And on Linux the whole list could appear pushed strangely far in — twice as far when nested — because the rule holding it flush relied on a stylesheet feature some Linux web engines don't support. It no longer does.",
+      "Cards have a grip. Widget headers on the pinboard now show a small dot grid where you can reliably grab the card to drag it — beside the ingest button on a note, beside the pop-out on a card inside a folder. The whole header always dragged; there was just nothing showing you where to aim.",
+      "Timelines can hide what's already passed. A “Past” checkbox on each timeline card tucks away entries whose date has gone by, the way the project panel's “Completed” checkbox hides finished milestones. Off means hidden, and the choice is remembered.",
+      "Cards at the right edge stay where you put them. Switching away from the Pinboard and back could fling a card that sat flush against the right edge off to a default spot near the top-left. The board re-measures its width on every visit, and a scrollbar appearing or disappearing was enough to make that card look like it no longer fitted. Now it slides in by the cell or two it needs, keeping its place and its size.",
+      "A few dropdowns now match everywhere else. Four menus — the backup account and frequency, the map's cohesion, and Teach's merge target — had been built by hand and missed a fix that keeps dropdown text from being clipped on Linux. They now use the same control as the rest of the app.",
+    ],
+  },
+  {
     version: "3.86.0-alpha",
     date: "2026-07-26",
     highlights: [

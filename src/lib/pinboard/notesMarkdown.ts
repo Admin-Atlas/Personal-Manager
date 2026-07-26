@@ -134,6 +134,17 @@ export function continueList(value: string, caret: number): ListEdit | null {
   };
 }
 
+/** Whether a source line renders as a CONTAINER block — a list item or a blockquote — as opposed to
+ *  inline text. The distinction matters for lazy continuation: CommonMark folds an unmarked line that
+ *  follows one of these INTO it, so the author's line break disappears. Roman items are deliberately
+ *  excluded: they render as ordinary paragraph text (GFM has no roman list), so a following prose
+ *  line is already joined by the hard break the roman branch emits. */
+function opensContainer(line: string): boolean {
+  const m = matchMarker(line);
+  if (!m) return false;
+  return m.token === ">" || !isRomanToken(m.token);
+}
+
 /**
  * Normalise a note's shorthand marker dialect to GFM for the shared <Markdown> renderer:
  *  - "[]" / "[x]" → GFM task-list items ("- [ ]" / "- [x]");
@@ -145,34 +156,124 @@ export function continueList(value: string, caret: number): ListEdit | null {
  *    survive rendering (GFM otherwise folds a single newline into a space, merging the lines).
  *    Blank lines stay blank (paragraph breaks) and an already-broken line isn't doubled, so the
  *    pass stays idempotent.
+ *  - a plain prose line that FOLLOWS a list item or quote gets a blank line inserted before it, so
+ *    it ends the list instead of being swallowed by the last item (see below).
+ *
+ * Line endings are normalised first. A pasted CRLF note would otherwise put the `\r` between the
+ * text and the two-space hard break — `"line one\r  \n"` — which stops being a hard break and turns
+ * the pair into two separate paragraphs.
  */
 export function toRenderMarkdown(raw: string): string {
-  return raw
-    .split("\n")
-    .map((line) => {
-      const m = matchMarker(line);
-      if (!m) {
-        // Plain prose: keep the author's own line breaks. A bare single newline is a GFM soft
-        // break (renders as a space), so a note typed across several lines would collapse into
-        // one. Two trailing spaces make it a hard break — the same rule the roman branch uses.
-        // Leave blank lines and already-broken lines alone so re-running is a no-op.
-        if (line.trim() === "" || line.endsWith("  ")) return line;
-        return `${line}  `;
+  const lines = raw.replace(/\r\n?/g, "\n").split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = matchMarker(line);
+    if (!m) {
+      // Plain prose: keep the author's own line breaks. A bare single newline is a GFM soft
+      // break (renders as a space), so a note typed across several lines would collapse into
+      // one. Two trailing spaces make it a hard break — the same rule the roman branch uses.
+      // Leave blank lines and already-broken lines alone so re-running is a no-op.
+      if (line.trim() === "") {
+        out.push(line);
+        continue;
       }
-      const { indent, token, content } = m;
+      // A marker-less line after a list item or quote is a LAZY CONTINUATION in CommonMark: it is
+      // folded into that item and the line break vanishes ("- item\nplain" → one bullet reading
+      // "item plain"). In this dialect a marker is explicit, so an unmarked line is unambiguously
+      // the author leaving the list — close it with a blank line. Two trailing spaces cannot save
+      // this one: the problem is block-level, not a soft break inside a paragraph.
+      if (i > 0 && opensContainer(lines[i - 1])) out.push("");
+      out.push(line.endsWith("  ") ? line : `${line}  `);
+      continue;
+    }
+    const { indent, token, content } = m;
 
-      const cb = /^\[([ xX]?)\]$/.exec(token);
-      if (cb) return `${indent}- [${cb[1].toLowerCase() === "x" ? "x" : " "}] ${content}`;
+    const cb = /^\[([ xX]?)\]$/.exec(token);
+    if (cb) {
+      out.push(`${indent}- [${cb[1].toLowerCase() === "x" ? "x" : " "}] ${content}`);
+      continue;
+    }
 
-      if (token === ".") return `${indent}- ${content}`;
+    if (token === ".") {
+      out.push(`${indent}- ${content}`);
+      continue;
+    }
 
-      // Two trailing spaces = a Markdown hard break, so consecutive roman items each keep their
-      // own line (and their exact "i."/"ii." labels) instead of merging.
-      if (isRomanToken(token)) return `${indent}${token} ${content}  `;
+    // Two trailing spaces = a Markdown hard break, so consecutive roman items each keep their
+    // own line (and their exact "i."/"ii." labels) instead of merging. `content` is right-trimmed
+    // first: the marker regex's `(.*)` swallows any trailing spaces, so re-running the pass would
+    // otherwise append another pair every time. Harmless to the renderer, but this output is what
+    // gets ingested into the vault (F-52), so a repeatedly-promoted note would grow whitespace.
+    if (isRomanToken(token)) {
+      out.push(`${indent}${token} ${content.replace(/[ \t]+$/, "")}  `);
+      continue;
+    }
 
-      return line;
-    })
-    .join("\n");
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+// --- ticking a checkbox in the RENDERED note (pure) ------------------------------------------
+// A rendered note's checkboxes used to be inert: the sanitizer forces `disabled` on every `<input>`
+// it emits, so the only way to tick one was to open the editor and retype the marker. Rather than
+// relax that (SCHEMA is the boundary for INGESTED content too — a Drive document must never render
+// live controls), the note widget catches the click, works out which task item was hit, and calls
+// this. So the checkbox stays disabled in the DOM and the toggle is a source edit, like every other
+// note change.
+//
+// Two dialects render as a task item and both have to be counted, in line order, or the Nth
+// rendered box would map to the wrong line: the note's own `[] foo` shorthand, and a literal GFM
+// `- [x] foo` (which `toRenderMarkdown` passes through untouched, since `-` wins the marker
+// alternation and the brackets survive as content).
+
+/** The note dialect: `[]` / `[ ]` / `[x]` as the line's own marker. */
+const NOTE_TASK_RE = /^(\s*)\[([ xX]?)\](\s+)(.*)$/;
+/** Literal GFM: a bullet whose content starts with a checkbox. */
+const GFM_TASK_RE = /^(\s*[-*+]\s+)\[([ xX])\](\s+)(.*)$/;
+
+/** Whether a line renders as a tickable task item, and its checked state. */
+function matchTask(line: string): { checked: boolean } | null {
+  const m = NOTE_TASK_RE.exec(line) ?? GFM_TASK_RE.exec(line);
+  return m ? { checked: m[2].toLowerCase() === "x" } : null;
+}
+
+/** How many tickable checkboxes the rendered note has — the bound the caller's index must respect. */
+export function countTasks(raw: string): number {
+  return raw.split("\n").reduce((n, line) => n + (matchTask(line) ? 1 : 0), 0);
+}
+
+/**
+ * Flip the `index`-th checkbox (0-based, in rendered order) and return the new note text, or `null`
+ * when the index names no checkbox — so a stale click after an edit is a no-op rather than a write
+ * that ticks the wrong line.
+ *
+ * `checked` forces a state instead of flipping, which is what the DOM event actually carries: the
+ * browser has already painted the input's new value by the time we hear about it, so echoing that
+ * value keeps the source and the pixels in agreement even if two clicks land in one frame.
+ */
+export function toggleTaskAt(raw: string, index: number, checked?: boolean): string | null {
+  if (!Number.isInteger(index) || index < 0) return null;
+  const lines = raw.split("\n");
+  let seen = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const hit = matchTask(lines[i]);
+    if (!hit) continue;
+    if (++seen !== index) continue;
+    const next = checked ?? !hit.checked;
+    // Each dialect keeps its own canonical unchecked form: the note shorthand writes a bare `[]`
+    // (what continueList emits), GFM writes `[ ]` (what the spec requires).
+    lines[i] = NOTE_TASK_RE.test(lines[i])
+      ? lines[i].replace(NOTE_TASK_RE, (_all, ind, _st, gap, rest) =>
+          next ? `${ind}[x]${gap}${rest}` : `${ind}[]${gap}${rest}`,
+        )
+      : lines[i].replace(GFM_TASK_RE, (_all, lead, _st, gap, rest) =>
+          next ? `${lead}[x]${gap}${rest}` : `${lead}[ ]${gap}${rest}`,
+        );
+    return lines.join("\n");
+  }
+  return null;
 }
 
 // --- toolbar / keyboard formatting helpers (pure) -------------------------------------------
