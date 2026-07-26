@@ -1224,13 +1224,19 @@ export type SandboxReport =
 
 /** The worker's answer to the dev-only network-block self-test (issue #286): whether the OS refused a
  *  direct outbound socket AND out-of-process DNS resolution (the macOS mDNSResponder exfil path), each
- *  with a human detail, plus the socket errno. Mirrors `NetSelftest` in commands_dev.rs. */
+ *  with a human detail, plus the socket errno. Mirrors `NetSelftest` in commands_dev.rs.
+ *
+ *  The DNS fields are `snake_case` because that is what actually arrives: Tauri auto-maps casing for
+ *  command ARGUMENTS, never for the fields of a returned struct, and `NetSelftest` carries no serde
+ *  `rename_all`. Declaring them `dnsBlocked`/`dnsDetail` (as this did until 3.81.3) type-checked fine
+ *  and read `undefined` at runtime, so the panel reported "DNS: not blocked" on every platform whatever
+ *  the worker found — a security readout that could only ever fail one way. */
 export interface NetSelftest {
   blocked: boolean;
   detail: string;
   errno: number | null;
-  dnsBlocked: boolean;
-  dnsDetail: string;
+  dns_blocked: boolean;
+  dns_detail: string;
 }
 
 /** A snapshot of the rebuild currently running (if any) — mirrors `IngestJobState`. The rebuild

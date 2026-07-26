@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.81.3-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "A safety readout in Developer mode was lying, and it could only ever lie in the reassuring-to-alarming direction. PM processes files you feed it inside a sealed-off worker that is meant to have no way onto the network, and Developer mode has a self-test that proves it: one line for direct connections, one for DNS lookups. The DNS line was reading a result that never actually reached it, so it announced “not blocked” on every machine, every time, no matter what the test found. It now reports what the worker really came back with -- which, checked on Windows, is that both are properly blocked.",
+      "In the same panel, the Confinement line no longer contradicts the test sitting underneath it. The worker only starts when there's work to do, so before then the line honestly reads “worker not started yet” -- but running the self-test is itself work, and the line used to keep saying that afterwards, directly above proof the worker had started and been refused a connection. It now re-reads once the test finishes.",
+      "Both of these live under Settings > Developer mode, so if you've never turned that on, nothing you use has changed.",
+    ],
+  },
+  {
     version: "3.81.2-alpha",
     date: "2026-07-26",
     highlights: [
