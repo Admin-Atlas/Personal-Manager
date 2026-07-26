@@ -1,4 +1,4 @@
-PM desktop release — **v3.44.1-alpha**.
+PM desktop release — **v3.85.2-alpha**.
 
 ## Install
 
@@ -45,51 +45,57 @@ install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "
 update" note when a new version lands; download the new package (see the Linux guide below) and
 run the same install command. Your notes, projects and settings are kept.
 
-## What's new in 3.44.1-alpha
+## What's new in 3.85.2-alpha
 
-This release rolls up everything since v3.17.1 — here's the tour at a glance:
+This release rolls up everything since v3.44.1 — here's the tour at a glance:
 
-- **One optional thing after updating: if you chatted with PM before this update, open the
-  Documents tab and click Rebuild, once.** PM no longer treats its own past answers as source
-  material when it searches your notes — that closes a subtle loop where an older, imperfect
-  answer could quietly shape a new one — and that single **Rebuild** clears the older answers
-  out of search. New to PM? There's nothing you need to do.
-- **Run AI on your own machine — free, and private.** A new **Settings › Local AI** tab scans
-  your computer, recommends on-device models it can actually run (and roughly how fast),
-  connects to a local model server like **Ollama** or **LM Studio**, and lets you send your
-  chats — or just the behind-the-scenes work — to it, falling back to the cloud only when the
-  local model isn't reachable. A model on your own machine means **nothing leaves your
-  device** — and PM now shows you **which model answered**, and says so honestly when a reply
-  came from the cloud instead. If you use Ollama, PM can download a recommended model straight
-  into it.
-- **You can now start PM without an API key.** On first run, choose a cloud provider, a model
-  on your own device, or **"set up AI later"** — PM works either way, and tells you plainly
-  when a feature needs an AI provider you haven't set up yet. Already using PM? Nothing changes.
-- **PM grounds its answers more carefully.** It now measures how strong the best match to your
-  question really is, and when nothing fits well it **says so** and answers from general
-  knowledge rather than dressing up a weak guess as a fact from your notes. It also weighs the
-  **whole** shortlist of passages (not just a rough top few) and reads each one's section
-  heading, so the passage you actually meant is likelier to surface — and there's a **"Save as
-  note"** under each answer to keep a good reply as a real, searchable note in your vault.
-- **The file-reader is now sealed off on every system.** The helper that opens and converts
-  your files runs with **no way to reach the internet** and can only see the file it's working
-  on — not your vault, not the rest of your computer — first on Windows, and now on **Linux and
-  macOS** too. So even a booby-trapped document can't use it to phone home or snoop around.
-  It's an extra wall, not a gate: if the sandbox can't fully start, PM keeps working and
-  reports a short code (like `SBX-3101`) you can quote in a bug report.
-- **Settings got a big tidy.** Changes now **save the moment you make them** — the Save button
-  is gone — the tabs are grouped and icon-labelled down the side with their sub-sections listed
-  to jump straight to, and a small **"Reset"** appears next to anything you've moved off its
-  default (with a **"Reset to defaults"** on each tab). Your API keys, search language and time
-  zone are deliberately left untouched.
-- **Steadier under the hood.** A rebuild now **resumes** where it left off instead of starting
-  over, and search keeps working the whole way through; your **passphrase** is taken exactly as
-  you type it; photos saved into a vault survive a passphrase change and come out in a
-  plain-files export; **"Remove PM data"** now clears every vault key PM had cached, not just
-  the current one; one corrupt photo can no longer freeze the document engine; and a chat reply
-  that fails partway through is reported as a **failure** instead of being saved as though it
-  were the answer. Your calendars also keep their list in sync on every sync and decide whether
-  something is **"today"** in your own timezone.
+- **Nothing to do after updating.** Where this release repairs something, PM repairs it itself,
+  quietly, the next time it opens your vault. No rebuild, no re-sync, no prompt.
+- **PM has a proper Accessibility tab.** Scale every piece of text up or down, turn animations
+  off regardless of what your device says, and switch the whole interface to **Atkinson
+  Hyperlegible**, a typeface designed to make letters easy to tell apart. Alongside it: a
+  **Density** control setting how large controls and their click targets are, a **Contrast**
+  control (**AA**, meeting the recommended 4.5:1, or **High** for AAA), and a
+  **colour-blind-safe palette** that re-colours the things carrying meaning — calendar sources,
+  map nodes, status badges — and backs each calendar's dot with a distinct **shape** as well as
+  a colour. Underneath, much more of PM now works from the keyboard and speaks properly to a
+  screen reader.
+- **Today's briefing can follow you around — and keeps itself up to date.** Put it at the bottom
+  of the sidebar, in a floating panel you can drag, or in an **always-on-top** window that stays
+  in view while you work elsewhere; PM can also sit in your **system tray, menu bar or panel**.
+  The briefing re-checks itself when you open PM, once an hour, and within a minute of anything
+  behind it changing — but only spends AI when something genuinely moved, so a quiet hour costs
+  nothing.
+- **The Focus tab is yours to arrange.** It now uses the width of your screen, with a divider you
+  can drag and a **Panels** button to switch the briefing, focus box, Upcoming and projects list
+  on or off. **Upcoming** can show a day-by-day hour grid instead of a list. **Chat** became
+  **Chats**, with your projects and your global chats as two foldable lists.
+- **Every calendar event now opens.** Click any event and a pop-up shows everything PM has
+  synced — which calendar, busy or free, location, guests and organiser, a video-call link,
+  whether it repeats, the full description — with buttons through to Google or Outlook, the
+  linked project, or the Pinboard. Existing calendars fill in the new details on their next sync.
+- **Local AI is much better at sizing your machine.** PM now reads the **real memory** on a
+  dedicated AMD or Intel card (Windows, plus Intel Arc on Linux) instead of falling back to
+  system RAM, looks up your card's actual memory bandwidth for its speed estimates, and sizes
+  each model **two ways** where it helps. It also finds models **you've already downloaded** even
+  when nothing is running them, and tells you when one of them would suit your machine better
+  than what you have assigned.
+- **Sorting a big import is quicker, cheaper, and no longer a queue.** Approve each document the
+  moment its suggestion is ready; file the rest of a folder in one click; and PM works its
+  suggestions out in the background as soon as a sync finishes, asks about several documents per
+  request, and **remembers** them, so closing PM never means paying for the same answer twice.
+  AI suggestions are now something you **turn on**, not a requirement.
+- **Google Drive reaches the files people share with you.** Turn on **"Shared with me"** under a
+  Google account in Connectors and pick the files or folders you want — a folder brings its
+  contents, shortcuts are followed, and a file shared with two of your accounts is indexed once.
+  You can also **back up on demand** to a connected Proton Drive or Google Drive.
+- **Fixes worth naming.** Review's AI suggestions now actually fill the fields in. Filing a chat
+  no longer strips the markers that say "this is a conversation" — and PM repairs any that were
+  damaged. Changing your vault passphrase no longer loses how a cloud file was filed. Google
+  Drive ingestion works again. Closing PM's window really does close PM. Connecting a Google
+  account on **Windows** no longer hits a keychain size limit, and on a **Mac** PM asks for
+  keychain permission once at startup rather than once per secret. **Linux** gets a
+  Debian/Ubuntu **`.deb`** installer.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
