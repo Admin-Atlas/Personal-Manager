@@ -4908,10 +4908,18 @@ pub fn drive_sync_status(state: State<'_, AppState>) -> Result<crate::CloudSyncS
 
 /// Sync one Drive account (or every account when `account` is `None`) into the index-only store. See
 /// [`cloud_sync::drive_sync_core`] for the behaviour; this is the command the UI's "Sync now" calls.
+///
+/// `includeSharedWithMe` defaults to TRUE when omitted, so every existing caller — and any future
+/// one that forgets the argument — keeps syncing the full corpus. Only the background poller's
+/// frequent passes opt out, because that corpus has no delta cursor and must be re-walked in full.
 #[tauri::command]
-pub async fn sync_drive(app: AppHandle, account: Option<String>) -> Result<usize> {
+pub async fn sync_drive(
+    app: AppHandle,
+    account: Option<String>,
+    include_shared_with_me: Option<bool>,
+) -> Result<usize> {
     refuse_if_rebuilding(&app, "a sync would be indexing into a moving target")?;
-    cloud_sync::drive_sync_core(&app, account).await
+    cloud_sync::drive_sync_core(&app, account, include_shared_with_me.unwrap_or(true)).await
 }
 
 /// Ask the running sync to stop after the current file. Already-indexed files are kept; the rest are
@@ -4934,7 +4942,8 @@ pub fn resume_drive_sync(app: AppHandle) -> Result<bool> {
         |st| st.drive_sync.lock().map(|s| s.running).unwrap_or(false),
         |app, account| {
             tauri::async_runtime::spawn(async move {
-                let _ = cloud_sync::drive_sync_core(&app, account).await;
+                // A resume finishes an interrupted pass, which may have been mid-shared-with-me.
+                let _ = cloud_sync::drive_sync_core(&app, account, true).await;
             });
         },
     )

@@ -48,6 +48,8 @@ interface Props {
   onOpenTeach?: () => void;
   /** A better-fitting local model is available (#437) — marks the Local AI tab row. */
   betterFit?: boolean;
+  /** A connected Google account predates the Sheets permission — marks the Connectors tab row. */
+  sheetsNudge?: boolean;
   /** Re-read that suggestion after the Local AI tab acts on or dismisses it, so the dots clear
    *  without waiting for the next navigation. */
   onBetterFitChange?: () => void;
@@ -59,6 +61,7 @@ export function SettingsView({
   onOpenDev,
   onOpenTeach,
   betterFit,
+  sheetsNudge,
   onBetterFitChange,
 }: Props) {
   const [key, setKey] = useState("");
@@ -547,6 +550,8 @@ export function SettingsView({
                               // following one leads to the other rather than to a dead end.
                               betterFit && t.id === "localai" ? (
                                 <AttentionDot label="A better-fitting local model is available" />
+                              ) : sheetsNudge && t.id === "connectors" ? (
+                                <AttentionDot label="A Google account needs reconnecting to index Sheets" />
                               ) : undefined
                             }
                           >

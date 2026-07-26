@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.89.0-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "Your connected accounts keep themselves up to date. Google Drive, OneDrive and your local folders are now checked when you open PM and every 15 minutes after that, the way your calendar already was. Until now nothing refreshed them on its own — a file added to a folder you had indexed stayed invisible until you thought to press Sync, which is not something you think to do about a file you don’t know exists. Sync now is still there for when you don’t want to wait.",
+      "“Shared with me” refreshes too, about once an hour. It gets its own slower rhythm for an honest reason: everything else can ask Google “what changed?” and get a near-empty answer, but there is no such question for shared items — the whole list has to be walked and compared. Once an hour keeps it current without doing that every few minutes.",
+      "Spreadsheets: the reconnect notice is now findable. If you connected a Google account before PM could read Sheets, it needs one reconnect — and the notice saying so sat on a settings page you had no reason to revisit after the first index. It is now a proper callout, and it puts a small dot on Settings and on the Connectors tab so you can find it at all. Accounts connected since then already ask for this permission up front and never see it.",
+    ],
+  },
+  {
     version: "3.88.0-alpha",
     date: "2026-07-26",
     highlights: [

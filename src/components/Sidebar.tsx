@@ -147,6 +147,8 @@ interface Props {
   onOpenPalette: () => void;
   /** A better-fitting local model is available (#437) — marks the Settings row with a quiet dot. */
   betterFit: boolean;
+  /** A connected Google account predates the Sheets permission — same quiet dot, same row. */
+  sheetsNudge: boolean;
   /** Active (primary) models, shown in the footer tag; null → using the default. */
   chatModel: string | null;
   backgroundModel: string | null;
@@ -178,6 +180,7 @@ export function Sidebar({
   onOpenWhatsNew,
   onOpenPalette,
   betterFit,
+  sheetsNudge,
   chatModel,
   backgroundModel,
   chatFallbacks,
@@ -576,6 +579,9 @@ export function Sidebar({
               badge — it points at somewhere worth looking, it doesn't demand anything. It clears
               the moment the suggestion is dismissed. */}
           {betterFit && <AttentionDot label="A better-fitting local model is available" />}
+          {!betterFit && sheetsNudge && (
+            <AttentionDot label="A Google account needs reconnecting to index Sheets" />
+          )}
         </button>
       </div>
     </aside>

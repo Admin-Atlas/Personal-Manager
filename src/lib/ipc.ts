@@ -843,7 +843,11 @@ export const disconnectDrive = (email: string) => invoke<void>("disconnect_drive
  *  keeps going if the user leaves Settings — progress arrives via the global `drive://sync` event
  *  (subscribe with {@link onDriveSync}). The returned promise resolves with the items-touched count
  *  when this call's sync finishes; it's fine to ignore it (the events + status drive the UI). */
-export const syncDrive = (email: string | null) => invoke<number>("sync_drive", { account: email });
+/** Sync Drive. `includeSharedWithMe` defaults to true on the backend when omitted — only the
+ *  background poller's frequent passes set it false, because that corpus has no delta cursor and has
+ *  to be re-walked in full (see lib/connectorPoll.ts). */
+export const syncDrive = (email: string | null, includeSharedWithMe?: boolean) =>
+  invoke<number>("sync_drive", { account: email, includeSharedWithMe });
 
 /** The current background-sync snapshot — used to restore the progress UI on returning to Settings,
  *  and to show the last finished sync's report. */
