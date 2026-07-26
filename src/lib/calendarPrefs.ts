@@ -213,3 +213,88 @@ export function writeRangeBounds(map: Partial<Record<CalendarRange, RangeBounds>
     // Best-effort.
   }
 }
+
+// --- the Day view's width, and where the calendar opens ------------------------------------------
+
+const DAY_COUNT_KEY = "pm.calendar.dayCount";
+const OPEN_ON_KEY = "pm.calendar.openOn";
+const CURSOR_KEY = "pm.calendar.cursor";
+
+/** How many days the Day view may show. Capped at 6 on purpose: 7 IS the Week view, and letting Day
+ *  reach it would give two controls that produce the same picture and disagree about what "Today"
+ *  means. */
+export const DAY_COUNT_MIN = 1;
+export const DAY_COUNT_MAX = 6;
+
+export function clampDayCount(n: number): number {
+  if (!Number.isFinite(n)) return DAY_COUNT_MIN;
+  return Math.max(DAY_COUNT_MIN, Math.min(DAY_COUNT_MAX, Math.trunc(n)));
+}
+
+/** How many days the Day view shows. Defaults to 1 — the view's historical behaviour, so nobody's
+ *  calendar changes shape on upgrade. */
+export function readDayCount(): number {
+  try {
+    const raw = localStorage.getItem(DAY_COUNT_KEY);
+    return raw ? clampDayCount(Number(raw)) : DAY_COUNT_MIN;
+  } catch {
+    return DAY_COUNT_MIN;
+  }
+}
+
+export function writeDayCount(n: number): void {
+  try {
+    localStorage.setItem(DAY_COUNT_KEY, String(clampDayCount(n)));
+  } catch {
+    // Best-effort.
+  }
+}
+
+/** Whether the calendar opens on today or wherever it was left. */
+export type CalendarOpenOn = "today" | "last";
+
+/** Defaults to `today`: opening on a date you last looked at weeks ago, with no memory of having
+ *  left it there, reads as the calendar being broken. Opt in from Settings. */
+export function readOpenOn(): CalendarOpenOn {
+  try {
+    return localStorage.getItem(OPEN_ON_KEY) === "last" ? "last" : "today";
+  } catch {
+    return "today";
+  }
+}
+
+export function writeOpenOn(mode: CalendarOpenOn): void {
+  try {
+    localStorage.setItem(OPEN_ON_KEY, mode);
+  } catch {
+    // Best-effort.
+  }
+}
+
+/** The cursor day, stored as `YYYY-MM-DD`. Written on every move regardless of the `openOn` setting
+ *  — so turning "where I left off" on starts working immediately rather than after the next move. */
+export function readCursorDay(): Date | null {
+  try {
+    const raw = localStorage.getItem(CURSOR_KEY);
+    const m = raw && /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+    if (!m) return null;
+    // Built from components, not `new Date(raw)`, which reads a bare date as UTC midnight and lands
+    // on the previous day west of Greenwich (F-14).
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return Number.isNaN(d.getTime()) ? null : d;
+  } catch {
+    return null;
+  }
+}
+
+export function writeCursorDay(d: Date): void {
+  try {
+    const p2 = (n: number) => String(n).padStart(2, "0");
+    localStorage.setItem(
+      CURSOR_KEY,
+      `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`,
+    );
+  } catch {
+    // Best-effort.
+  }
+}

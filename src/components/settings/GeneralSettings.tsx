@@ -22,6 +22,7 @@ import {
   type MapLayoutMode,
 } from "../../lib/mapPrefs";
 import { focusViewPrefsAreDefault, resetFocusViewPrefs } from "../../lib/focusPrefs";
+import { readOpenOn, writeOpenOn } from "../../lib/calendarPrefs";
 import { chatSectionsAreDefault, resetChatSections } from "../../lib/chatPrefs";
 import {
   briefingPrefsAreDefault,
@@ -86,6 +87,9 @@ export function GeneralSettings() {
   // Seeded from localStorage rather than watched: the toggle is the only writer here, and the
   // Pinboard reads the pref fresh at the moment you click delete (see pinboard/prefs.ts).
   const [confirmDelete, setConfirmDelete] = useState(readConfirmDelete);
+  // Where the Calendar tab opens. Stored as a mode string; surfaced as a plain on/off because
+  // "today" is the default and "where I left it" is the opt-in.
+  const [openOnLast, setOpenOnLast] = useState(() => readOpenOn() === "last");
   // Where the briefing shows, beyond the Focus tab. Both off by default. SUBSCRIBED, not read once:
   // the always-on-top window can be dismissed from its own ✕ or by the tray going off, and both of
   // those write the pref from outside this component (see the briefing://closed listener in App).
@@ -532,6 +536,20 @@ export function GeneralSettings() {
         <div className="mt-3 flex items-center justify-between gap-3" data-help="settings-map-tab">
           <span className="text-sm text-ink2">Map tab</span>
           <Toggle checked={mapVisible} onChange={setMapVisible} ariaLabel="Show the Map tab" />
+        </div>
+        <div
+          className="mt-3 flex items-center justify-between gap-3"
+          data-help="settings-calendar-open-on"
+        >
+          <span className="text-sm text-ink2">Calendar opens where you left it</span>
+          <Toggle
+            checked={openOnLast}
+            onChange={(v) => {
+              setOpenOnLast(v);
+              writeOpenOn(v ? "last" : "today");
+            }}
+            ariaLabel="Open the calendar where you left it instead of on today"
+          />
         </div>
         <div
           className="mt-3 flex items-center justify-between gap-3"

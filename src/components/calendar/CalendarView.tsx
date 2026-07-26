@@ -22,11 +22,17 @@ import {
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
 import {
+  clampDayCount,
+  readCursorDay,
+  readDayCount,
   readHidden,
+  readOpenOn,
   readRange,
   readRangeBounds,
   readView,
   readZones,
+  writeCursorDay,
+  writeDayCount,
   writeRange,
   writeRangeBounds,
   writeView,
@@ -35,6 +41,7 @@ import {
   type CalendarViewMode,
   type RangeBounds,
 } from "../../lib/calendarPrefs";
+import { useHorizontalWheelShift } from "../../lib/useHorizontalWheelShift";
 import { resolveRangeBounds } from "../../lib/calendarGeom";
 import { formatDateLocal } from "../../lib/format";
 import {
@@ -89,11 +96,21 @@ function startOfWeek(d: Date): Date {
   return addDays(startOfDay(d), -dow);
 }
 
-/** Step the cursor by one period in the current view's units. */
-function stepCursor(view: CalendarViewMode, cur: Date, dir: number): Date {
+/** How many days the grid shows for a view. Week is 7 by definition; Day is the user's chosen
+ *  width (1-6). Anything else isn't a day grid. */
+function windowDays(view: CalendarViewMode, dayCount: number): number {
+  if (view === "week") return 7;
+  if (view === "day") return dayCount;
+  return 0;
+}
+
+/** Step the cursor by one period in the current view's units. The day grids move by a WHOLE
+ *  window — 7 for Week, N for an N-day Day view — so the arrows page rather than nudge; the
+ *  sideways swipe is what moves a single day. */
+function stepCursor(view: CalendarViewMode, cur: Date, dir: number, dayCount: number): Date {
   switch (view) {
     case "day":
-      return addDays(cur, dir);
+      return addDays(cur, dir * windowDays(view, dayCount));
     case "week":
       return addDays(cur, 7 * dir);
     case "year":
@@ -104,14 +121,18 @@ function stepCursor(view: CalendarViewMode, cur: Date, dir: number): Date {
 }
 
 /** The period label shown between the nav arrows for each view. */
-function viewLabel(view: CalendarViewMode, cur: Date): string {
+function viewLabel(view: CalendarViewMode, cur: Date, dayCount: number): string {
   switch (view) {
-    case "day":
-      return `${cur.toLocaleDateString(undefined, { weekday: "long" })} ${formatDateLocal(cur)}`;
-    case "week": {
-      const monday = startOfWeek(cur);
-      return `${formatDateLocal(monday)} – ${formatDateLocal(addDays(monday, 6))}`;
+    case "day": {
+      if (dayCount <= 1) {
+        return `${cur.toLocaleDateString(undefined, { weekday: "long" })} ${formatDateLocal(cur)}`;
+      }
+      return `${formatDateLocal(cur)} – ${formatDateLocal(addDays(cur, dayCount - 1))}`;
     }
+    case "week":
+      // The window starts at the cursor, not at its Monday: the week is free to begin on any day
+      // once you have swiped it sideways. "Today" is what snaps it back to a Monday.
+      return `${formatDateLocal(cur)} – ${formatDateLocal(addDays(cur, 6))}`;
     case "year":
       return String(cur.getFullYear());
     default: // month, agenda
@@ -122,15 +143,17 @@ function viewLabel(view: CalendarViewMode, cur: Date): string {
 /** The visible date window for a view, used only to flag paging past the synced band. `end` is
  *  exclusive. Agenda is anchored/open-ended, so its window is just the anchor day — the hint then
  *  fires only when the anchor itself sits outside the mirror, not for a distant future event. */
-function visibleRange(view: CalendarViewMode, cur: Date): { start: Date; end: Date } {
+function visibleRange(
+  view: CalendarViewMode,
+  cur: Date,
+  dayCount: number,
+): { start: Date; end: Date } {
   const day0 = startOfDay(cur);
   switch (view) {
     case "day":
-      return { start: day0, end: addDays(day0, 1) };
-    case "week": {
-      const monday = startOfWeek(cur);
-      return { start: monday, end: addDays(monday, 7) };
-    }
+      return { start: day0, end: addDays(day0, dayCount) };
+    case "week":
+      return { start: day0, end: addDays(day0, 7) };
     case "month":
       return {
         start: new Date(cur.getFullYear(), cur.getMonth(), 1),
@@ -169,7 +192,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   const [customBounds, setCustomBounds] = useState<Partial<Record<CalendarRange, RangeBounds>>>(
     () => readRangeBounds(),
   );
-  const [cursor, setCursor] = useState<Date>(() => new Date());
+  // Where the calendar opens: today, or wherever it was left. Read once at mount — flipping the
+  // setting later should change the NEXT open, not teleport the view out from under you.
+  const [cursor, setCursor] = useState<Date>(() => {
+    if (readOpenOn() === "last") return readCursorDay() ?? new Date();
+    return new Date();
+  });
+  // How wide the Day view is (1-6). Week is always 7.
+  const [dayCount, setDayCount] = useState<number>(readDayCount);
+  // Persist the cursor on every move, whatever the openOn setting says — so turning "where I left
+  // off" on works from that moment rather than only after the next navigation.
+  useEffect(() => writeCursorDay(cursor), [cursor]);
+  // The day grid's swipe target; the wheel hook needs a real element to bind a non-passive listener.
+  const gridRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(cachedOverview === null);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -311,9 +346,27 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     });
   }, []);
 
-  const onPrev = useCallback(() => setCursor((c) => stepCursor(view, c, -1)), [view]);
-  const onNext = useCallback(() => setCursor((c) => stepCursor(view, c, 1)), [view]);
-  const onToday = useCallback(() => setCursor(new Date()), []);
+  const onPrev = useCallback(
+    () => setCursor((c) => stepCursor(view, c, -1, dayCount)),
+    [view, dayCount],
+  );
+  const onNext = useCallback(
+    () => setCursor((c) => stepCursor(view, c, 1, dayCount)),
+    [view, dayCount],
+  );
+  // Today re-snaps as well as re-dates. After swiping the week onto a Wednesday start, "Today"
+  // should give back the ordinary Monday-Sunday week that contains today, not a Wednesday one that
+  // happens to include it — otherwise there is no way back to the conventional grid.
+  const onToday = useCallback(
+    () => setCursor(view === "week" ? startOfWeek(new Date()) : new Date()),
+    [view],
+  );
+  // One day per step, in the direction of travel: a swipe left (positive deltaX) moves forward.
+  useHorizontalWheelShift(
+    gridRef,
+    (days) => setCursor((c) => addDays(c, days)),
+    view === "day" || view === "week",
+  );
   const onPickDate = useCallback((d: Date) => setCursor(d), []);
   // Drilling from the Year view: jump to that day and open the Day view.
   const onSelectYearDay = useCallback(
@@ -461,14 +514,14 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     [milestones, onOpenProject, onOpenPinboard],
   );
 
+  // Both day grids are the same thing now — N consecutive days starting at the cursor. Week is
+  // simply N=7, which is why it can start on a Wednesday after a swipe.
   const gridDays = useMemo<Date[]>(() => {
-    if (view === "day") return [startOfDay(cursor)];
-    if (view === "week") {
-      const monday = startOfWeek(cursor);
-      return Array.from({ length: 7 }, (_, i) => addDays(monday, i));
-    }
-    return [];
-  }, [view, cursor]);
+    const n = windowDays(view, dayCount);
+    if (n === 0) return [];
+    const first = startOfDay(cursor);
+    return Array.from({ length: n }, (_, i) => addDays(first, i));
+  }, [view, cursor, dayCount]);
 
   // The visible-hour window the time grid frames: a custom Work/Day override, else the computed
   // default (Work 08:30–17:30, Day = local sunrise/sunset, 24h = full). Recomputed with the cursor so
@@ -478,7 +531,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     [range, customBounds, coords, cursor],
   );
 
-  const label = viewLabel(view, cursor);
+  const label = viewLabel(view, cursor, dayCount);
   const isTerminal = system === "terminal";
 
   // "Outside the synced range" hint: fires when the visible window falls before mirror_start or after
@@ -493,14 +546,14 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     // window is built from local midnights, so a sub-day tz offset at a band edge would otherwise trip
     // the hint on a month whose every displayed day is actually in-band. `end` is exclusive → last
     // visible day is end−1.
-    const { start, end } = visibleRange(view, cursor);
+    const { start, end } = visibleRange(view, cursor, dayCount);
     const bandStart = startOfDay(ms).getTime();
     const bandEnd = startOfDay(me).getTime();
     const firstVisible = startOfDay(start).getTime();
     const lastVisible = startOfDay(addDays(end, -1)).getTime();
     if (firstVisible >= bandStart && lastVisible <= bandEnd) return null;
     return `Outside the synced range — only ${formatDateLocal(ms)} – ${formatDateLocal(me)} is mirrored.`;
-  }, [overview, view, cursor]);
+  }, [overview, view, cursor, dayCount]);
 
   // The count the Terminal chrome strip shows at Power depth. For the bounded grids it's the events
   // touching the visible period (so it matches what's on screen, not the whole −1..+13-month mirror);
@@ -514,7 +567,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         return span && span.endDay.getTime() >= fromMs;
       }).length;
     }
-    const { start, end } = visibleRange(view, cursor);
+    const { start, end } = visibleRange(view, cursor, dayCount);
     const startMs = start.getTime();
     const endMs = end.getTime(); // exclusive
     return visibleEvents.filter((e) => {
@@ -522,7 +575,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       const span = eventDaySpan(e);
       return span && span.startDay.getTime() < endMs && span.endDay.getTime() >= startMs;
     }).length;
-  }, [visibleEvents, view, cursor]);
+  }, [visibleEvents, view, cursor, dayCount]);
 
   if (loading && !overview) {
     return (
@@ -647,6 +700,11 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onViewChange={onViewChange}
         range={range}
         onRangeChange={onRangeChange}
+        dayCount={dayCount}
+        onDayCountChange={(n) => {
+          setDayCount(clampDayCount(n));
+          writeDayCount(n);
+        }}
         customBounds={customBounds}
         onBoundsChange={onBoundsChange}
         coords={coords}

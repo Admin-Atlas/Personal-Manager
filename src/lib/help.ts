@@ -122,6 +122,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Map tab",
     body: "Show or hide the Map — the semantic picture of everything you've filed, laid out so related things sit near each other. Like the learning tools above, it follows your preset by default: on for Standard and Power, off for Minimal, since a pared-back setup rarely wants an exploratory view. Overriding here wins either way. Hiding it changes nothing about your data or the search behind it; the Map is still there the moment you switch it back on.",
   },
+  "settings-calendar-open-on": {
+    title: "Calendar opens where you left it",
+    body: "By default the Calendar tab opens on today, whichever date you were looking at last time. Turn this on to have it reopen exactly where you left it instead. Either way, the Today button always brings you back — and in Week view it re-snaps to the ordinary Monday-to-Sunday week, which is how you undo a sideways swipe.",
+  },
   "settings-models-footer": {
     title: "Models in use",
     body: "Show or hide the small block at the bottom of the sidebar naming the models currently doing your chat and background work. It follows your preset by default — on for Standard and Power, off for Minimal — and this switch overrides that in either direction, so you can keep an eye on which model is answering even on a pared-back setup, or put it away on a busy one. It is a readout only: hiding it changes nothing about which model runs, and clicking it is still the quickest way into the model settings when it is shown.",

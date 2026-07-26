@@ -56,6 +56,7 @@ import type {
 import { formatDateTime } from "../lib/format";
 import { isOpaquePhase, describeFailures } from "../lib/backup";
 import { readReconcileDismissed, writeReconcileDismissed } from "../lib/backupPrefs";
+import { useRegisterPending } from "../lib/settingsPending";
 import { Button, Input, SectionInfo, Select } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { IngestProgress } from "./IngestProgress";
@@ -349,6 +350,21 @@ export function BackupSettings() {
   const scheduleDirty =
     schedule != null &&
     (freqDraft !== schedule.frequency || retentionDraft !== String(schedule.retention_n));
+  // Register those drafts so leaving the tab, or closing Settings, asks first and names them —
+  // rather than the unmount discarding them in silence. Only the fields that actually differ are
+  // listed, so the dialog reads as a specific warning rather than a generic one.
+  useRegisterPending(
+    "backup-schedule",
+    "backup",
+    scheduleDirty,
+    [
+      schedule && freqDraft !== schedule.frequency ? "Backup frequency" : null,
+      schedule && retentionDraft !== String(schedule.retention_n)
+        ? "How many backups to keep"
+        : null,
+    ].filter((x): x is string => x !== null),
+    doSaveSchedule,
+  );
   const protonOwnCount =
     archivePrefix && protonBackups
       ? protonBackups.filter((b) => b.name.startsWith(archivePrefix)).length

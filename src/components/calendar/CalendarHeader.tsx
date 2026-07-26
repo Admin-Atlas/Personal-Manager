@@ -9,10 +9,16 @@
 // a static, prop-free span nothing derived from, and the calendar has no edit affordances to
 // disambiguate; the fact is still stated in the help card, the empty state and the Connectors copy.
 
-import type { CalendarRange, CalendarViewMode, RangeBounds } from "../../lib/calendarPrefs";
+import {
+  DAY_COUNT_MAX,
+  DAY_COUNT_MIN,
+  type CalendarRange,
+  type CalendarViewMode,
+  type RangeBounds,
+} from "../../lib/calendarPrefs";
 import { formatSyncedShort, formatWhen } from "../../lib/format";
 import { useDepth, useTheme, type Coords } from "../../theme";
-import { Button, SegmentedControl, type SegOption } from "../ui";
+import { Button, SegmentedControl, Select, type SegOption } from "../ui";
 import { MiniCalendarPopover } from "./MiniCalendarPopover";
 import { RangeControl } from "./RangeControl";
 
@@ -23,6 +29,9 @@ interface Props {
   /** Time-grid vertical scale (Week/Day only). */
   range: CalendarRange;
   onRangeChange: (r: CalendarRange) => void;
+  /** How many days the Day view shows (1-6). Week is fixed at 7 and hides this control. */
+  dayCount: number;
+  onDayCountChange: (n: number) => void;
   /** Custom Work/Day hour windows + the setter (null clears back to the computed default). */
   customBounds: Partial<Record<CalendarRange, RangeBounds>>;
   onBoundsChange: (range: CalendarRange, bounds: RangeBounds | null) => void;
@@ -55,6 +64,8 @@ export function CalendarHeader({
   onViewChange,
   range,
   onRangeChange,
+  dayCount,
+  onDayCountChange,
   customBounds,
   onBoundsChange,
   coords,
@@ -101,6 +112,29 @@ export function CalendarHeader({
       <MiniCalendarPopover label={label} cursor={cursor} onPick={onPickDate} />
 
       <div className="ml-auto flex flex-wrap items-center gap-3">
+        {view === "day" && (
+          // Day only: Week IS the 7-day window, so offering a width control there would be two
+          // controls producing the same picture. Sits with the range control because both answer
+          // "how much am I looking at", one across and one down.
+          <label className="flex items-center gap-1.5 text-xs text-ink3">
+            Days
+            <Select
+              compact
+              value={String(dayCount)}
+              onChange={(e) => onDayCountChange(Number(e.currentTarget.value))}
+              aria-label="How many days to show"
+            >
+              {Array.from({ length: DAY_COUNT_MAX - DAY_COUNT_MIN + 1 }, (_, i) => {
+                const n = DAY_COUNT_MIN + i;
+                return (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                );
+              })}
+            </Select>
+          </label>
+        )}
         {showRange && (
           <>
             <RangeControl

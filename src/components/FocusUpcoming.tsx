@@ -23,9 +23,10 @@
 // (listAllCalendarEvents) so days either side of today are populated. Synced events only — the same
 // set the agenda shows — with no first-party overlays (milestones live on the Calendar tab).
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgendaEvent, Calendar, CalendarEvent } from "../lib/types";
 import { listAllCalendarEvents } from "../lib/ipc";
+import { useHorizontalWheelShift } from "../lib/useHorizontalWheelShift";
 import { resolveRangeBounds } from "../lib/calendarGeom";
 import { readHidden, type CalendarRange, type RangeBounds } from "../lib/calendarPrefs";
 import { addDays, dayKey, startOfDay } from "../lib/calendar-layout";
@@ -85,6 +86,10 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
   // component state (not persisted) so the window never jumps under you mid-session, and "Upcoming"
   // always opens on today.
   const [anchor, setAnchor] = useState<Date>(() => startOfDay(new Date()));
+  // The swipe target for the days grid — the hook needs a real element to bind a non-passive
+  // wheel listener to.
+  const gridRef = useRef<HTMLDivElement>(null);
+  useHorizontalWheelShift(gridRef, (d) => setAnchor((a) => addDays(a, d)), mode === "week");
   const [allEvents, setAllEvents] = useState<CalendarEvent[]>(() => cachedAllEvents);
   // The open detail popup, anchored at the clicked row/card (null = closed). Same component and same
   // behaviour as the Calendar tab — but with none of its overlay routing, because this card injects
@@ -211,7 +216,10 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
       {mode === "list" ? (
         <AgendaList events={listEvents} onEventClick={onEventClick} />
       ) : (
-        <>
+        // The days strip isn't a scroll container — it renders a window of N days chosen by state —
+        // so the app-wide wheel normaliser can do nothing here and a trackpad swipe did nothing at
+        // all. Same helper the Calendar tab's grid uses, so the gesture means one day in both.
+        <div ref={gridRef}>
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-ink3">
             <div className="flex items-center gap-1">
               <button
@@ -279,7 +287,7 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
               onEventClick={onEventClick}
             />
           </div>
-        </>
+        </div>
       )}
 
       {eventPopup && (
