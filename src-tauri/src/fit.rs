@@ -86,16 +86,26 @@ pub enum Architecture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[allow(non_camel_case_types)] // GGUF quant labels are the canonical names (Q4_K_M, IQ4_XS, …); serde emits them verbatim.
 pub enum Quant {
+    F16,
     Q8_0,
     Q6_K,
+    Q5_1,
     Q5_K_M,
     Q5_K_S,
+    Q5_0,
+    Q4_1,
     Q4_K_M,
     Q4_K_S,
+    Q4_0,
+    IQ4_NL,
+    Q3_K_L,
     IQ4_XS,
     Q3_K_M,
     IQ3_M,
+    Q3_K_S,
+    IQ3_XS,
     Q2_K,
+    IQ2_M,
     IQ2_XS,
 }
 
@@ -103,34 +113,59 @@ impl Quant {
     /// Approximate bytes per weight for this scheme (bits-per-weight / 8). CALIBRATE.
     pub fn bytes_per_param(self) -> f64 {
         match self {
+            Quant::F16 => 2.00,
             Quant::Q8_0 => 1.06,
             Quant::Q6_K => 0.82,
+            Quant::Q5_1 => 0.75,
             Quant::Q5_K_M => 0.71,
             Quant::Q5_K_S => 0.69,
+            Quant::Q5_0 => 0.685,
+            Quant::Q4_1 => 0.625,
             Quant::Q4_K_M => 0.61,
             Quant::Q4_K_S => 0.58,
+            Quant::Q4_0 => 0.57,
+            Quant::IQ4_NL => 0.56,
+            Quant::Q3_K_L => 0.534,
             Quant::IQ4_XS => 0.53,
             Quant::Q3_K_M => 0.49,
             Quant::IQ3_M => 0.44,
+            Quant::Q3_K_S => 0.43,
+            Quant::IQ3_XS => 0.41,
             Quant::Q2_K => 0.36,
+            Quant::IQ2_M => 0.33,
             Quant::IQ2_XS => 0.30,
         }
     }
 
     /// Parse a GGUF quant label (e.g. `"Q4_K_M"`) into a known scheme, case-insensitively. Unknown
     /// labels return `None` — the caller drops that candidate rather than guessing a size.
+    ///
+    /// The legacy (`Q4_0`, `Q5_1`, …) and full-precision labels matter as much as the K-quants here:
+    /// on the on-disk path the weight is MEASURED from the file, so a label this table doesn't know
+    /// throws away a fit PM could otherwise have worked out. `BF16`/`FP16` fold into `F16` because
+    /// all three are two bytes a weight, which is the only thing this enum models about them.
     pub fn from_label(label: &str) -> Option<Quant> {
         match label.trim().to_ascii_uppercase().as_str() {
+            "F16" | "FP16" | "BF16" => Some(Quant::F16),
             "Q8_0" => Some(Quant::Q8_0),
             "Q6_K" => Some(Quant::Q6_K),
+            "Q5_1" => Some(Quant::Q5_1),
             "Q5_K_M" => Some(Quant::Q5_K_M),
             "Q5_K_S" => Some(Quant::Q5_K_S),
+            "Q5_0" => Some(Quant::Q5_0),
+            "Q4_1" => Some(Quant::Q4_1),
             "Q4_K_M" => Some(Quant::Q4_K_M),
             "Q4_K_S" => Some(Quant::Q4_K_S),
+            "Q4_0" => Some(Quant::Q4_0),
+            "IQ4_NL" => Some(Quant::IQ4_NL),
+            "Q3_K_L" => Some(Quant::Q3_K_L),
             "IQ4_XS" => Some(Quant::IQ4_XS),
             "Q3_K_M" => Some(Quant::Q3_K_M),
             "IQ3_M" => Some(Quant::IQ3_M),
+            "Q3_K_S" => Some(Quant::Q3_K_S),
+            "IQ3_XS" => Some(Quant::IQ3_XS),
             "Q2_K" => Some(Quant::Q2_K),
+            "IQ2_M" => Some(Quant::IQ2_M),
             "IQ2_XS" => Some(Quant::IQ2_XS),
             _ => None,
         }
@@ -555,17 +590,30 @@ mod tests {
 
     #[test]
     fn bytes_per_param_is_monotone_by_quality() {
+        // Every variant, best to worst. The scorer sorts candidates by `bytes_per_param`, so this
+        // ordering is the real quality ladder — a new variant slotted in at the wrong weight would
+        // silently reorder which quant the fit prefers.
         let ladder = [
+            Quant::F16,
             Quant::Q8_0,
             Quant::Q6_K,
+            Quant::Q5_1,
             Quant::Q5_K_M,
             Quant::Q5_K_S,
+            Quant::Q5_0,
+            Quant::Q4_1,
             Quant::Q4_K_M,
             Quant::Q4_K_S,
+            Quant::Q4_0,
+            Quant::IQ4_NL,
+            Quant::Q3_K_L,
             Quant::IQ4_XS,
             Quant::Q3_K_M,
             Quant::IQ3_M,
+            Quant::Q3_K_S,
+            Quant::IQ3_XS,
             Quant::Q2_K,
+            Quant::IQ2_M,
             Quant::IQ2_XS,
         ];
         for pair in ladder.windows(2) {
@@ -582,7 +630,16 @@ mod tests {
     fn from_label_is_case_insensitive_and_rejects_unknown() {
         assert_eq!(Quant::from_label("q4_k_m"), Some(Quant::Q4_K_M));
         assert_eq!(Quant::from_label(" IQ4_XS "), Some(Quant::IQ4_XS));
-        assert_eq!(Quant::from_label("Q4_0"), None);
+        // The legacy and full-precision labels are known now — a file carrying one used to be
+        // discarded as unscoreable even when its size on disk was measured exactly.
+        assert_eq!(Quant::from_label("Q4_0"), Some(Quant::Q4_0));
+        assert_eq!(Quant::from_label("q3_k_l"), Some(Quant::Q3_K_L));
+        assert_eq!(Quant::from_label("IQ4_NL"), Some(Quant::IQ4_NL));
+        // BF16 and FP16 weigh exactly what F16 weighs, which is all this enum claims to model.
+        assert_eq!(Quant::from_label("BF16"), Some(Quant::F16));
+        assert_eq!(Quant::from_label("fp16"), Some(Quant::F16));
+        // Still refused rather than guessed: a real llama.cpp scheme PM has no weight for.
+        assert_eq!(Quant::from_label("TQ1_0"), None);
         assert_eq!(Quant::from_label("garbage"), None);
     }
 

@@ -50,8 +50,15 @@ const IMPORT_PROMPT =
  *  persist the moment you change them; the API keys save when you click away from the field, with a
  *  green confirmation. Errors surface inline. Onboarding has its own key + model inputs (they share a
  *  Get-started button there) — this is the non-onboarding tab. `onOpenTeach` opens the Teach tab so
- *  the user can review freshly-imported preferences. */
-export function AiModelsSettings({ onOpenTeach }: { onOpenTeach?: () => void }) {
+ *  the user can review freshly-imported preferences, and `onOpenLocalAi` the Local AI tab, which owns
+ *  the other half of model choice (see the pointer under the model lists). */
+export function AiModelsSettings({
+  onOpenTeach,
+  onOpenLocalAi,
+}: {
+  onOpenTeach?: () => void;
+  onOpenLocalAi?: () => void;
+}) {
   const [memoryText, setMemoryText] = useState("");
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<string | null>(null);
@@ -332,6 +339,22 @@ export function AiModelsSettings({ onOpenTeach }: { onOpenTeach?: () => void }) 
           onAutoSwitchChange={changeBackgroundAuto}
           onReset={backgroundRoleIsDefault ? undefined : resetBackgroundRole}
         />
+        {/* A pointer, deliberately not a mirror: the local controls keep one home, in the Local AI
+         *  tab. Without this, the two roles above read as the whole of model choice. */}
+        <p className="text-xs text-ink4">
+          These are cloud models, run through OpenRouter. A model on your own machine is chosen
+          separately — same two roles, plus whether each one uses local, cloud, or local with a
+          cloud fallback.{" "}
+          {onOpenLocalAi && (
+            <button
+              type="button"
+              onClick={onOpenLocalAi}
+              className="text-accent-text hover:brightness-110"
+            >
+              Open Local AI →
+            </button>
+          )}
+        </p>
       </div>
 
       <div id="sec-ai-review" data-settings-section className="mt-5 border-t border-border pt-4">

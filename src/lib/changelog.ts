@@ -24,10 +24,12 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
-    version: "3.84.1-alpha",
+    version: "3.85.0-alpha",
     date: "2026-07-26",
     highlights: [
       "The “Already downloaded” list in Settings > Local AI now says what you can actually do with what it found. Everything in that list is, by definition, a model nothing is currently running -- which also means PM can't use it yet. That was never said anywhere, so a model could sit there looking ready while never turning up in the Assign roles dropdown just above it. The list now explains it up front: load one in the app you downloaded it with, and it appears as something you can assign. If you haven't connected a server at all yet, it tells you to do that first instead.",
+      "PM can size a lot more of the models you already have. Its table of quantization formats -- the compression a model file was saved with -- knew eleven of them, so a file in any of the older or less common ones (Q4_0, Q3_K_L, IQ4_NL, or a full-precision F16) came back as “can't estimate this”, even though PM had already measured that exact file's size on your disk. It knows twenty-one now. When it does still meet one it doesn't recognise, it names the format instead of implying it couldn't read your file -- those are two different problems and only one of them is yours.",
+      "Settings > AI Models now says where the other half of the choice lives. The two roles on that page are your cloud models, and the very same roles can run on your own machine instead -- but that's set up in the Local AI tab, and nothing on the page mentioned it. There's now a line under the model lists that says so, with a button that takes you straight there.",
     ],
   },
   {

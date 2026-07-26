@@ -939,6 +939,25 @@ fn already_served(model: &local_disk::DiskModel, served_keys: &[String]) -> bool
 /// entry, or a quant label that isn't one PM knows, comes back `unknown` with the reason said plainly.
 /// When both are known the catalog supplies the architecture, active-parameter count and context
 /// window, while the single quant candidate carries the measured on-disk size.
+/// Said when PM has no usable quantization label at all — as opposed to having one it can't size,
+/// which names the label instead. Shared so the two paths can't drift apart.
+const UNREADABLE_QUANT: &str =
+    "PM couldn't tell which quantization this file is, so its fit can't be estimated.";
+
+/// A quant label is only ever as trustworthy as where it came from. A filename label is gated on
+/// `Quant::from_label` before it gets this far, but Ollama's comes from a `file_type` field inside a
+/// config blob — file content, so untrusted. Bound the length and drop anything that isn't
+/// label-shaped before it reaches the UI. `None` when nothing usable survives, so the caller falls
+/// back to the generic wording rather than printing an empty gap.
+fn safe_quant_label(label: &str) -> Option<String> {
+    let cleaned: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(24)
+        .collect();
+    (!cleaned.is_empty()).then(|| cleaned.to_ascii_uppercase())
+}
+
 fn score_on_disk(
     model: &local_disk::DiskModel,
     matched: Option<&local_catalog::CatalogEntry>,
@@ -949,11 +968,24 @@ fn score_on_disk(
             "This model isn't in PM's catalog, so its fit can't be estimated.".to_string(),
         );
     };
-    let Some(quant) = model.quant.as_deref().and_then(fit::Quant::from_label) else {
-        return fit::unknown(
-            "PM couldn't tell which quantization this file is, so its fit can't be estimated."
-                .to_string(),
-        );
+    // Two different situations, and collapsing them throws away real information. PM may have found
+    // no quantization at all, or know exactly which one the file is and have no weight for it. Only
+    // the first is honestly "couldn't tell" — and since the on-disk weight is MEASURED, the second is
+    // worth naming so it reads as a gap in PM rather than a defect in the file.
+    let quant = match model.quant.as_deref() {
+        None => return fit::unknown(UNREADABLE_QUANT.to_string()),
+        Some(label) => match fit::Quant::from_label(label) {
+            Some(quant) => quant,
+            None => {
+                return match safe_quant_label(label) {
+                    Some(shown) => fit::unknown(format!(
+                        "PM doesn't have a size for the {shown} quantization yet, so its fit can't \
+                         be estimated."
+                    )),
+                    None => fit::unknown(UNREADABLE_QUANT.to_string()),
+                };
+            }
+        },
     };
     let mut spec = local_catalog::entry_to_spec(entry);
     spec.candidates = vec![fit::QuantCandidate {
@@ -1057,6 +1089,24 @@ pub struct Recommendations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quant_labels_from_a_config_blob_are_bounded_before_they_reach_the_ui() {
+        assert_eq!(safe_quant_label("Q4_0").as_deref(), Some("Q4_0"));
+        assert_eq!(safe_quant_label("tq1_0").as_deref(), Some("TQ1_0"));
+        // Ollama's `file_type` is file content, so it is untrusted: a long or markup-ish value must
+        // not reach the message intact.
+        assert_eq!(
+            safe_quant_label("<script>alert(1)</script>").as_deref(),
+            Some("SCRIPTALERT1SCRIPT")
+        );
+        let long = safe_quant_label(&"A".repeat(500)).unwrap();
+        assert_eq!(long.len(), 24, "the label must be length-bounded");
+        // Nothing label-shaped survives, so the caller uses the generic wording instead of a gap.
+        assert_eq!(safe_quant_label("   "), None);
+        assert_eq!(safe_quant_label(""), None);
+        assert_eq!(safe_quant_label("//"), None);
+    }
 
     #[test]
     fn splits_scheme_host_port_across_forms() {
