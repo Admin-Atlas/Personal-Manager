@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.84.0-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "PM now tells you when a local model would suit your machine better than the one you're running, instead of waiting for you to go and look. A small dot appears next to Settings in the sidebar and next to the Local AI tab inside it, and the tab itself explains what it found -- for example that a model you've already downloaded is a better match than the one you have assigned. Dismiss it and every dot disappears at once.",
+      "It is deliberately hard to annoy you. It only speaks up about a model your machine can comfortably run, only when it's a real step up rather than a rounding difference, and it measures against the largest model you already use -- so running a big model for chat and a small one for background work won't get you nagged about the small one. A model you've already got on disk always wins over one you'd have to download.",
+      "You control how often it looks, from the Local AI tab: when PM's model list is updated (the default), weekly, monthly, or never. Choosing “never” turns it off entirely without hiding the setting that turns it back on.",
+      "Under the hood this also fixes a setting that had never actually been saved: PM recorded how often to re-check and which model list it had last looked at, but nothing ever wrote either of them down. Nothing had surfaced those values yet, so nothing was visibly wrong -- but they had to work before any of the above could.",
+    ],
+  },
+  {
     version: "3.83.0-alpha",
     date: "2026-07-26",
     highlights: [

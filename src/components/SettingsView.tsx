@@ -18,6 +18,7 @@ import {
   vaultStatus,
 } from "../lib/ipc";
 import { BackupSettings } from "./BackupSettings";
+import { AttentionDot } from "./Sidebar";
 import { ConnectorsSettings } from "./ConnectorsSettings";
 import { LocalAiSettings } from "./localai/LocalAiSettings";
 import { AiModelsSettings } from "./settings/AiModelsSettings";
@@ -43,9 +44,21 @@ interface Props {
   onOpenDev?: () => void;
   /** Jump to the Teach tab — closes Settings and navigates (after an AI-memory import). */
   onOpenTeach?: () => void;
+  /** A better-fitting local model is available (#437) — marks the Local AI tab row. */
+  betterFit?: boolean;
+  /** Re-read that suggestion after the Local AI tab acts on or dismisses it, so the dots clear
+   *  without waiting for the next navigation. */
+  onBetterFitChange?: () => void;
 }
 
-export function SettingsView({ onClose, onboarding, onOpenDev, onOpenTeach }: Props) {
+export function SettingsView({
+  onClose,
+  onboarding,
+  onOpenDev,
+  onOpenTeach,
+  betterFit,
+  onBetterFitChange,
+}: Props) {
   const [key, setKey] = useState("");
   // First-run AI-provider choice (#295): a cloud key, or a local model on this device. The local
   // pane reports readiness (an endpoint + a chat model configured) up through `localReady`.
@@ -475,6 +488,13 @@ export function SettingsView({ onClose, onboarding, onOpenDev, onOpenTeach }: Pr
                             active={active}
                             onClick={() => selectTab(t.id)}
                             leading={<t.Icon className="h-4 w-4" />}
+                            trailing={
+                              // The same quiet dot the sidebar's Settings row carries (#437), so
+                              // following one leads to the other rather than to a dead end.
+                              betterFit && t.id === "localai" ? (
+                                <AttentionDot label="A better-fitting local model is available" />
+                              ) : undefined
+                            }
                           >
                             {t.label}
                           </NavItem>
@@ -533,7 +553,7 @@ export function SettingsView({ onClose, onboarding, onOpenDev, onOpenTeach }: Pr
 
             {tab === "ai" && <AiModelsSettings onOpenTeach={onOpenTeach} />}
 
-            {tab === "localai" && <LocalAiSettings />}
+            {tab === "localai" && <LocalAiSettings onBetterFitChange={onBetterFitChange} />}
 
             {tab === "search" && <SearchSettings />}
 

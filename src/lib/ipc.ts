@@ -46,10 +46,12 @@ import type {
   InstallProgressEvent,
   DetectedEndpoint,
   EndpointCheck,
+  LocalBetterFit,
   LocalHardware,
   LocalLlmConfig,
   LocalLlmStatus,
   LocalRecommendations,
+  LocalRescanCadence,
   PullProgress,
   LanguageOptions,
   LayoutProgressEvent,
@@ -1336,6 +1338,18 @@ export const localModelRecommendations = () =>
  *  cached crawl, so the next {@link localModelRecommendations} reflects the change. */
 export const setLocalModelScanDir = (dir: string | null) =>
   invoke<void>("set_local_model_scan_dir", { dir });
+
+/** Whether a better-fitting local model is worth mentioning right now (#437), or `null`. Cheap
+ *  enough for the shell to call as the user navigates — it reuses the cached hardware scan and
+ *  on-disk crawl and is otherwise pure. */
+export const localBetterFitNotice = () => invoke<LocalBetterFit | null>("local_better_fit_notice");
+
+/** Acknowledge the better-fit notice: silences it until the rescan cadence says to look again. */
+export const dismissLocalBetterFit = () => invoke<void>("dismiss_local_better_fit");
+
+/** How often PM re-checks for a better-fitting model. `manual` turns the notice off. */
+export const setLocalModelRescanCadence = (cadence: LocalRescanCadence) =>
+  invoke<void>("set_local_model_rescan_cadence", { cadence });
 
 /** Auto-detect the three known local servers (Ollama / LM Studio / llama-server) on their ports. */
 export const probeLocalLlmPorts = () => invoke<DetectedEndpoint[]>("probe_local_llm_ports");

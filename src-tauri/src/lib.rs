@@ -3,6 +3,9 @@
 
 mod applock;
 mod backup;
+// "A model that fits your machine better is available" (#437): the pure, conservative decision about
+// whether any curated model is worth interrupting the user about, given what they already run.
+mod better_fit;
 mod briefing;
 mod calendar;
 mod chat;
@@ -1279,6 +1282,9 @@ pub fn run() {
             local_ai::local_hardware_scan,
             local_ai::local_model_recommendations,
             local_ai::set_local_model_scan_dir,
+            local_ai::local_better_fit_notice,
+            local_ai::dismiss_local_better_fit,
+            local_ai::set_local_model_rescan_cadence,
             settings::get_settings,
             settings::settings_defaults,
             settings::set_indexing_speed,

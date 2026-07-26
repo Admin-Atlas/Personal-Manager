@@ -1501,6 +1501,21 @@ export interface LocalRecommendations {
   scan_dir: string | null;
 }
 
+/** A local model that would fit this machine better than the one in use (better_fit.rs Suggestion,
+ *  #437). Passive information — a flag, never a gate. */
+export interface LocalBetterFit {
+  repo: string;
+  display_name: string;
+  /** The model it improves on, so the copy can name both. */
+  replaces: string;
+  /** Already on this machine (#449), so the suggestion is "use it", not "download it". */
+  already_downloaded: boolean;
+}
+
+/** How often PM re-checks whether a better-fitting model has appeared (local_catalog.rs
+ *  RescanCadence). `manual` turns the notice off. */
+export type LocalRescanCadence = "on-catalog-update" | "weekly" | "monthly" | "manual";
+
 /** An auto-detected local server (local_ai.rs DetectedEndpoint). */
 export interface DetectedEndpoint {
   url: string;

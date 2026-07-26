@@ -143,6 +143,8 @@ interface Props {
   onOpenSettings: () => void;
   onOpenWhatsNew: () => void;
   onOpenPalette: () => void;
+  /** A better-fitting local model is available (#437) — marks the Settings row with a quiet dot. */
+  betterFit: boolean;
   /** Active (primary) models, shown in the footer tag; null → using the default. */
   chatModel: string | null;
   backgroundModel: string | null;
@@ -173,6 +175,7 @@ export function Sidebar({
   onOpenSettings,
   onOpenWhatsNew,
   onOpenPalette,
+  betterFit,
   chatModel,
   backgroundModel,
   chatFallbacks,
@@ -492,9 +495,13 @@ export function Sidebar({
         </button>
         <button
           onClick={onOpenSettings}
-          className="w-full rounded-[var(--radius-sm)] px-3 py-2 text-left text-sm text-ink3 hover:bg-surface hover:text-ink"
+          className="flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-left text-sm text-ink3 hover:bg-surface hover:text-ink"
         >
-          Settings
+          <span className="min-w-0 flex-1 truncate">Settings</span>
+          {/* A better-fitting local model is available (#437). A quiet dot, never a count or a
+              badge — it points at somewhere worth looking, it doesn't demand anything. It clears
+              the moment the suggestion is dismissed. */}
+          {betterFit && <AttentionDot label="A better-fitting local model is available" />}
         </button>
       </div>
     </aside>
@@ -624,6 +631,19 @@ function MoveConversationDialog({
         </div>
       </div>
     </Modal>
+  );
+}
+
+/** A small accent dot marking a row worth visiting — quieter than a count, and carrying no number
+ *  because there is nothing to count. Exported so Settings' own nav can mark the same thing. */
+export function AttentionDot({ label }: { label: string }) {
+  return (
+    <span
+      role="status"
+      aria-label={label}
+      title={label}
+      className="ml-2 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+    />
   );
 }
 

@@ -7,8 +7,10 @@ import { useEffect, useState } from "react";
 import {
   checkLocalLlmEndpoint,
   clearLocalLlmEndpoint,
+  dismissLocalBetterFit,
   getLocalLlmConfig,
   listLocalLlmModels,
+  localBetterFitNotice,
   localHardwareScan,
   localLlmStatus,
   localModelRecommendations,
@@ -18,11 +20,13 @@ import {
   setLocalLlmRoleModel,
   setLocalLlmRouting,
   setLocalLlmToken,
+  setLocalModelRescanCadence,
   setLocalModelScanDir,
 } from "../../lib/ipc";
 import type {
   DetectedEndpoint,
   EndpointCheck,
+  LocalBetterFit,
   LocalDiskSource,
   LocalFitResult,
   LocalFitVerdict,
@@ -31,6 +35,7 @@ import type {
   LocalOnDiskModel,
   LocalRecommendation,
   LocalRecommendations,
+  LocalRescanCadence,
   PullProgress,
 } from "../../lib/types";
 import { ollamaGuide } from "../../lib/workbenchGuide";
@@ -40,8 +45,9 @@ import { Button, Collapsible, Input, SectionInfo, Select } from "../ui";
  *  and turn on the local-endpoint provider (#297) — connect a local server, assign it to the chat /
  *  background roles, with cloud fallback. Self-contained and immediate-persist; errors surface inline.
  *  Frontend-only over existing backend commands, plus the one streaming Ollama pull. */
-export function LocalAiSettings() {
+export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () => void } = {}) {
   const [recs, setRecs] = useState<LocalRecommendations | null>(null);
+  const [betterFit, setBetterFit] = useState<LocalBetterFit | null>(null);
   const [loading, setLoading] = useState(true);
   const [rescanning, setRescanning] = useState(false);
   const [config, setConfig] = useState<LocalLlmConfig | null>(null);
@@ -106,6 +112,14 @@ export function LocalAiSettings() {
       } finally {
         if (!cancelled) setLoading(false);
       }
+      // The better-fit suggestion (#437) is a separate, best-effort read: it must never blank the
+      // rest of the tab, and there being nothing to suggest is the common case.
+      try {
+        const b = await localBetterFitNotice();
+        if (!cancelled) setBetterFit(b);
+      } catch {
+        /* a suggestion is a nicety — stay quiet if it can't be computed */
+      }
     })();
     return () => {
       cancelled = true;
@@ -131,6 +145,30 @@ export function LocalAiSettings() {
       clearInterval(id);
     };
   }, [configured]);
+
+  /** Acknowledge the better-fit suggestion: it stays quiet until the cadence says to look again.
+   *  Clears the dot here and, via the callback, in the sidebar and the settings nav. */
+  async function dismissBetterFit() {
+    setBetterFit(null);
+    try {
+      await dismissLocalBetterFit();
+    } catch (e) {
+      setError(String(e));
+    }
+    onBetterFitChange?.();
+  }
+
+  /** Change how often PM re-checks. `manual` turns the notice off without hiding the way back. */
+  async function changeCadence(cadence: string) {
+    setRecs((r) => (r ? { ...r, cadence } : r));
+    try {
+      await setLocalModelRescanCadence(cadence as LocalRescanCadence);
+      if (cadence === "manual") setBetterFit(null);
+    } catch (e) {
+      setError(String(e));
+    }
+    onBetterFitChange?.();
+  }
 
   /** Point the on-disk crawl at an extra folder (or change the one it uses), then reload. */
   async function pickScanFolder() {
@@ -270,6 +308,35 @@ export function LocalAiSettings() {
         </div>
       )}
 
+      {/* A better-fitting model is available (#437). A passive strip at the top of the tab — the
+          quiet counterpart to the dots on the sidebar and the settings nav, and the thing they
+          lead to. Never a modal, never a gate: dismissing it is always enough. */}
+      {betterFit && (
+        <div
+          role="status"
+          className="mt-4 flex flex-wrap items-center gap-2 rounded-[var(--radius-sm)] border px-3 py-2 text-xs"
+          style={{
+            borderColor: "color-mix(in oklab, var(--accent) 40%, transparent)",
+            background: "color-mix(in oklab, var(--accent) 10%, transparent)",
+          }}
+        >
+          <span className="min-w-0 flex-1 text-ink2">
+            <span className="text-ink">{betterFit.display_name}</span>{" "}
+            {betterFit.already_downloaded
+              ? "is already on this device and fits your machine better than"
+              : "would fit your machine better than"}{" "}
+            {betterFit.replaces}.
+          </span>
+          <Button
+            variant="tertiary"
+            onClick={() => void dismissBetterFit()}
+            className="px-2 py-0.5 text-xs"
+          >
+            Dismiss
+          </Button>
+        </div>
+      )}
+
       {/* ── Your machine ─────────────────────────────────────────────────────────────────── */}
       <div
         id="sec-localai-machine"
@@ -351,6 +418,24 @@ export function LocalAiSettings() {
           tracks only your paid cloud (OpenRouter) calls. Running a model on your own machine has no
           per-use cost to count.
         </p>
+        {recs && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <label className="text-xs text-ink3" htmlFor="localai-cadence">
+              Tell me when a better-fitting model appears
+            </label>
+            <Select
+              id="localai-cadence"
+              value={recs.cadence}
+              onChange={(e) => void changeCadence(e.target.value)}
+              className="w-auto text-xs"
+            >
+              <option value="on-catalog-update">When PM's model list is updated</option>
+              <option value="weekly">Weekly</option>
+              <option value="monthly">Monthly</option>
+              <option value="manual">Never — I'll check myself</option>
+            </Select>
+          </div>
+        )}
       </div>
 
       {/* ── Already downloaded ───────────────────────────────────────────────────────────── */}
