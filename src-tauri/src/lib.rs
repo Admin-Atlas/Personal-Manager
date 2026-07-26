@@ -606,6 +606,11 @@ impl AppState {
         // the rebuilt aliases).
         self.reconcile_entity_rules();
         self.reconcile_index_only();
+        // Repair chat vault files stripped by the pre-3.81.2 organisation-write bug. Runs on every
+        // open path (retry, unlock, adopt, repair, curtain take-over) so an affected store is healed
+        // during ordinary use, well before anyone reaches for Rebuild — which is also independently
+        // guarded (`rebuild_core` calls this first).
+        self.reconcile_chat_identity();
         Ok(())
     }
 
@@ -713,6 +718,57 @@ impl AppState {
         };
         if let Err(e) = entities::reconcile_on_open(&conn, &vault_root, &rules_cipher) {
             eprintln!("entities: rules reconcile skipped ({e})");
+        }
+    }
+
+    /// The setting key holding the most recent [`chat::ChatIdentityHeal`] as JSON, so the Developer
+    /// readout can answer "did the repair actually run, and what did it find?" without re-scanning.
+    pub const CHAT_HEAL_KEY: &'static str = "chat_identity_heal";
+
+    /// Repair chat vault files stripped of their identity by the pre-3.81.2 organisation-write bug,
+    /// and any damage a Rebuild has since done on top (see [`chat::reconcile_vault_identity`]).
+    ///
+    /// Called on vault open AND as a precondition of a Rebuild. Both, deliberately: the open-time run
+    /// repairs a store during ordinary use, and the Rebuild-time run closes the one window that would
+    /// otherwise turn recoverable damage into permanent damage — a user who updates and immediately
+    /// hits Rebuild. It is idempotent and writes only where something is wrong, so the second call is
+    /// free on a healthy store.
+    ///
+    /// A no-op when the vault is locked. Best-effort: a failure is logged, never propagated, because
+    /// blocking vault open (or a Rebuild) over a repair would be worse than the defect it repairs.
+    pub fn reconcile_chat_identity(&self) -> chat::ChatIdentityHeal {
+        let (vault, cipher) = match self.markdown_io() {
+            Ok(v) => v,
+            Err(_) => return chat::ChatIdentityHeal::default(),
+        };
+        let mut conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return chat::ChatIdentityHeal::default(),
+        };
+        match chat::reconcile_vault_identity(&mut conn, &vault, &cipher) {
+            Ok(report) => {
+                if report.touched_anything() {
+                    eprintln!(
+                        "chat: repaired vault identity — {} file(s) restamped, {} row(s) restored, \
+                         {} re-link(s), {} queued for re-index (of {} scanned)",
+                        report.restamped,
+                        report.rows_restored,
+                        report.relinked,
+                        report.reindex_queued,
+                        report.scanned,
+                    );
+                }
+                // Persisted even on a clean pass, so the readout can distinguish "checked, all well"
+                // from "never ran" — the distinction that makes this verifiable rather than assumed.
+                if let Ok(json) = serde_json::to_string(&report) {
+                    let _ = db::set_setting(&conn, Self::CHAT_HEAL_KEY, &json);
+                }
+                report
+            }
+            Err(e) => {
+                eprintln!("chat: vault identity reconcile skipped ({e})");
+                chat::ChatIdentityHeal::default()
+            }
         }
     }
 
@@ -1112,6 +1168,9 @@ pub fn run() {
             // rebuilt aliases).
             app.state::<AppState>().reconcile_entity_rules();
             app.state::<AppState>().reconcile_index_only();
+            // Repair chat vault identity stripped by the pre-3.81.2 organisation-write bug, before
+            // the user can reach any surface that would make the damage permanent.
+            app.state::<AppState>().reconcile_chat_identity();
 
             // One-time: distil the legacy "Learning You" blob into structured preference records
             // (§4.5) so nothing accumulated is lost. Background, idempotent (a settings flag guards
@@ -1336,6 +1395,7 @@ pub fn run() {
             commands::stop_drive_sync,
             commands::resume_drive_sync,
             commands::rebuild_status,
+            commands::chat_identity_report,
             commands::resume_rebuild,
             commands::list_drive_shared_drives,
             commands::drive_shared_owners,

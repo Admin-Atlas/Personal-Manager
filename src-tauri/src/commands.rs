@@ -2518,6 +2518,20 @@ async fn rebuild_core(app: AppHandle, sink: ingest::ProgressSink, pass: String) 
         ));
     };
 
+    // PRECONDITION, not housekeeping: repair any chat vault file the pre-3.81.2 organisation-write
+    // bug stripped of its identity, BEFORE this pass reads a single file.
+    //
+    // A stripped chat is recoverable right up until a Rebuild, and destroyed by one: with
+    // `source_type: chat` gone the walk stops matching `is_chat_vault_file`, re-ingests the
+    // conversation as an ordinary document, NULLs every turn pointer and indexes PM's own answers as
+    // source material. Healing on vault open alone would leave a real window — update, click Rebuild,
+    // lose the chats — so the dangerous path heals first rather than racing the open-time pass. It is
+    // idempotent and writes nothing on a healthy store, so this costs one front-matter read per chat.
+    //
+    // Inside the single-flight guard and before the resume marker, so it cannot interleave with
+    // another rebuild or be skipped by a resumed one.
+    state.reconcile_chat_identity();
+
     // Count reachable index-only items up front so the progress bar's total spans BOTH phases (the
     // vault rebuild AND the full-body re-index). The count is stable because a local rebuild never
     // changes a source's reachability.
@@ -4774,6 +4788,63 @@ pub fn rebuild_status(state: State<'_, AppState>) -> Result<crate::IngestJobStat
         .lock()
         .map(|s| s.clone())
         .map_err(|_| Error::Other("rebuild state poisoned".into()))
+}
+
+/// The state of every chat's vault identity, plus what the last automatic repair pass did.
+///
+/// Exists because the defect it reports on was invisible: chat vault files stripped of
+/// `source_type: chat` looked completely healthy until a Rebuild silently demoted the conversation to
+/// an ordinary document. A fix whose only evidence is the absence of an error would have the same
+/// property, so this makes the answer readable — run it and see "N chats, all identity-intact"
+/// rather than inferring it from silence.
+///
+/// `stored` is the report persisted by the last automatic run (vault open, or the Rebuild
+/// precondition); `live` is a fresh scan taken now, so a stale stored value can never mislead.
+#[tauri::command]
+pub fn chat_identity_report(state: State<'_, AppState>) -> Result<ChatIdentityReport> {
+    let stored = {
+        let conn = state.conn()?;
+        db::get_setting(&conn, AppState::CHAT_HEAL_KEY)?
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::from_str::<chat::ChatIdentityHeal>(&s).ok())
+    };
+    // A fresh pass. Idempotent and write-free on a healthy store, so "check it" and "fix it" are the
+    // same operation — there is no way to look without also repairing anything found.
+    let live = state.reconcile_chat_identity();
+    let (total_sessions, intact) = {
+        let conn = state.conn()?;
+        let total: i64 = conn.query_row(
+            "SELECT count(*) FROM chat_sessions WHERE vault_path IS NOT NULL AND vault_path <> ''",
+            [],
+            |r| r.get(0),
+        )?;
+        let intact: i64 = conn.query_row(
+            "SELECT count(*) FROM chat_sessions s JOIN documents d ON d.id = s.document_id \
+             WHERE d.source_type = ?1",
+            params![ingest::SOURCE_TYPE_CHAT],
+            |r| r.get(0),
+        )?;
+        (total as usize, intact as usize)
+    };
+    Ok(ChatIdentityReport {
+        total_sessions,
+        intact,
+        stored,
+        live,
+    })
+}
+
+/// What [`chat_identity_report`] returns — see that command for why this is surfaced at all.
+#[derive(serde::Serialize)]
+pub struct ChatIdentityReport {
+    /// Chat sessions that have a vault file (the population the repair walks).
+    pub total_sessions: usize,
+    /// Of those, how many have a `documents` row still correctly typed as a chat.
+    pub intact: usize,
+    /// The last automatic pass's result, or `None` if one has never run on this store.
+    pub stored: Option<chat::ChatIdentityHeal>,
+    /// A fresh pass taken just now.
+    pub live: chat::ChatIdentityHeal,
 }
 
 /// Resume a rebuild a previous app session started but didn't finish (the app was closed/crashed

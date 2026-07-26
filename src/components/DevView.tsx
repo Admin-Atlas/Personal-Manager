@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import {
   devRetrievalExplain,
+  chatIdentityReport,
   devSidecarNetSelftest,
   devSidecarSandboxReport,
   devSystemInfo,
@@ -20,6 +21,7 @@ import {
   sidecarStatus,
 } from "../lib/ipc";
 import type {
+  ChatIdentityReport,
   DevRetrievalExplain,
   DevSystemInfo,
   DevTableCount,
@@ -93,6 +95,26 @@ export function DevView() {
   const [netTest, setNetTest] = useState<NetSelftest | null>(null);
   const [netTesting, setNetTesting] = useState(false);
   const [netErr, setNetErr] = useState<string | null>(null);
+
+  // Chat-identity integrity (3.81.2). Surfaced because the defect it reports on was invisible:
+  // a stripped chat vault file looked perfectly healthy right up until a Rebuild demoted the
+  // conversation to an ordinary document. Running the check also runs the repair — they are the
+  // same idempotent pass — so there is no way to look without fixing anything found.
+  const [chatId, setChatId] = useState<ChatIdentityReport | null>(null);
+  const [chatIdBusy, setChatIdBusy] = useState(false);
+  const [chatIdErr, setChatIdErr] = useState<string | null>(null);
+
+  const runChatIdentity = useCallback(() => {
+    setChatIdBusy(true);
+    setChatIdErr(null);
+    chatIdentityReport()
+      .then(setChatId)
+      .catch((e) => {
+        setChatId(null);
+        setChatIdErr(String(e));
+      })
+      .finally(() => setChatIdBusy(false));
+  }, []);
 
   const runNetTest = useCallback(() => {
     setNetTesting(true);
@@ -267,6 +289,54 @@ export function DevView() {
                 )}
               </div>
             )}
+
+            <div className="mt-4 border-t border-rule pt-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Button onClick={runChatIdentity} disabled={chatIdBusy}>
+                  {chatIdBusy ? "Checking…" : "Check chat identity"}
+                </Button>
+                <span className="text-xs text-ink4">
+                  Verifies every chat still carries its vault identity, and repairs any that lost
+                  it. Runs automatically on unlock and before every Rebuild.
+                </span>
+              </div>
+              {chatIdErr && <p className="mt-2 text-xs text-[var(--st-due)]">{chatIdErr}</p>}
+              {chatId && (
+                <>
+                  <p className="mt-2 text-xs">
+                    <span className="text-ink4">chats: </span>
+                    <span
+                      className={
+                        chatId.intact === chatId.total_sessions ? "text-st-quick" : "text-st-due"
+                      }
+                    >
+                      {chatId.intact === chatId.total_sessions
+                        ? `✓ ${chatId.total_sessions} of ${chatId.total_sessions} identity-intact`
+                        : `${chatId.intact} of ${chatId.total_sessions} identity-intact`}
+                    </span>
+                  </p>
+                  <p className="mt-1 text-xs text-ink3">
+                    <span className="text-ink4">this run: </span>
+                    {chatId.live.restamped} file(s) restamped, {chatId.live.rows_restored} row(s)
+                    restored, {chatId.live.relinked} re-linked, {chatId.live.reindex_queued} queued
+                    for re-index (of {chatId.live.scanned} scanned)
+                  </p>
+                  {chatId.stored && (
+                    <p className="mt-1 text-xs text-ink4">
+                      last automatic pass: {chatId.stored.restamped} restamped,{" "}
+                      {chatId.stored.rows_restored} restored, of {chatId.stored.scanned} scanned
+                    </p>
+                  )}
+                  {chatId.live.unrepaired.length > 0 && (
+                    <ul className="mt-1 text-xs text-[var(--st-due)]">
+                      {chatId.live.unrepaired.map((u) => (
+                        <li key={u}>{u}</li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              )}
+            </div>
           </DevPanel>
 
           <DevPanel

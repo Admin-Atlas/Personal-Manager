@@ -414,6 +414,7 @@ fn ingest_one(
         reviewed: false,
         photo: None,
         spreadsheet: None,
+        chat: None,
         source_id: None,
         external_ref: None,
     };
@@ -562,6 +563,7 @@ fn ingest_photo(
         reviewed: false,
         photo: Some(&photo),
         spreadsheet: None,
+        chat: None,
         source_id: None,
         external_ref: None,
     };
@@ -660,6 +662,7 @@ fn ingest_spreadsheet(
         reviewed: false,
         photo: None,
         spreadsheet: Some(&record),
+        chat: None,
         source_id: None,
         external_ref: None,
     };
@@ -851,6 +854,7 @@ pub fn promote_spreadsheet(
         reviewed,
         photo: None,
         spreadsheet: Some(&record),
+        chat: None,
         source_id: Some(&source_id),
         external_ref: external_ref.as_deref(),
     };
@@ -1084,6 +1088,7 @@ pub fn ingest_note_document(
         reviewed,
         photo: None,
         spreadsheet: None,
+        chat: None,
         source_id: Some(&source_id),
         external_ref: None,
     };
@@ -2765,11 +2770,52 @@ fn rewrite_photo_vault_block(
             .unwrap_or(false),
         photo: Some(&photo),
         spreadsheet: None, // mutually exclusive with `photo`, and this file is a photo
+        chat: None,
         source_id: fields.get("source_id").map(String::as_str),
         external_ref: fields.get("external_ref").map(String::as_str),
     };
     cipher.write_to(&file, &render_markdown(&front, body))?;
     Ok(())
+}
+
+/// A chat vault file's identity lines, carried across an organisation edit.
+///
+/// These four fields ARE the chat: `is_chat_vault_file` routes a Rebuild on `source_type`, and
+/// `rebuild_chat` reads `chat_conversation_id` to find the session. Losing them doesn't fail loudly —
+/// the file stops matching the chat predicate, so the Rebuild quietly re-ingests a conversation as an
+/// ordinary document, NULLing every chunk's turn pointer and indexing PM's own answers as if they
+/// were source material.
+pub(crate) struct ChatIdentity {
+    pub conversation_id: String,
+    pub scope: String,
+    pub source_id: String,
+}
+
+/// Reconstruct a chat's identity block from parsed front-matter fields, or `None` if this isn't a
+/// chat document — the same shape as [`photo_from_fields`] / [`spreadsheet_from_fields`], and for the
+/// same reason: every writer that rebuilds a vault file from a `Frontmatter` must round-trip the
+/// source-type block rather than dropping it.
+pub(crate) fn chat_from_fields(
+    fields: &std::collections::HashMap<String, String>,
+) -> Option<ChatIdentity> {
+    if fields.get("source_type").map(String::as_str) != Some(SOURCE_TYPE_CHAT) {
+        return None;
+    }
+    // `chat_conversation_id` is the load-bearing one (rebuild_chat errors without it); scope and
+    // source_id are recorded as-is. A file missing them is already damaged, so preserve what is there
+    // rather than inventing values — the on-open heal (`chat::reconcile_vault_identity`) is what
+    // repairs a file that has lost them, from `chat_sessions`.
+    Some(ChatIdentity {
+        conversation_id: fields.get("chat_conversation_id")?.trim().to_string(),
+        scope: fields
+            .get("chat_scope")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "general".into()),
+        source_id: fields
+            .get("chat_source_id")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default(),
+    })
 }
 
 /// Reconstruct a spreadsheet's satellite record from parsed front-matter fields, or `None` if this
@@ -2830,11 +2876,18 @@ fn rewrite_vault_metadata(
     let (fields, body) = parse_frontmatter(&decoded)
         .ok_or_else(|| Error::Other("vault file missing front-matter".into()))?;
 
-    // Preserve a photo's or spreadsheet's block across an organisation edit, so a later Rebuild still
-    // reconstructs its satellite row (a plain document has neither → `None`, unchanged behaviour).
+    // Preserve a photo's, spreadsheet's or chat's block across an organisation edit, so a later
+    // Rebuild still routes the file correctly and reconstructs its satellite row (a plain document has
+    // none of the three → `None`, unchanged behaviour).
+    //
+    // The chat arm is not symmetry for its own sake. Every organisation write funnels through here —
+    // approving a chat in Review, editing its project, or renaming/merging the project that owns it —
+    // and dropping the block demoted the conversation to an ordinary document at the next Rebuild,
+    // silently. Anything added to a source-type block from here on must be round-tripped here too.
     let content_hash = fields.get("content_hash").map(String::as_str).unwrap_or("");
     let photo = photo_from_fields(&fields, content_hash, body);
     let spreadsheet = spreadsheet_from_fields(&fields);
+    let chat = chat_from_fields(&fields);
     let front = Frontmatter {
         title: fields
             .get("title")
@@ -2855,6 +2908,7 @@ fn rewrite_vault_metadata(
         reviewed,
         photo: photo.as_ref(),
         spreadsheet: spreadsheet.as_ref(),
+        chat: chat.as_ref(),
         // Preserve a promoted document's remote pointer across an organisation edit, so filing it into a
         // project doesn't strip the `source_id`/`external_ref` a later Rebuild needs (a plain vault
         // document has neither line → both `None`, unchanged behaviour).
@@ -2959,6 +3013,11 @@ struct Frontmatter<'a> {
     /// Present only for a spreadsheet: appends `source_type: spreadsheet` + the satellite counts so a
     /// Rebuild reconstructs the `spreadsheets` row. Mutually exclusive with `photo`; `None` otherwise.
     spreadsheet: Option<&'a SpreadsheetRecord>,
+    /// Present only for a chat: appends `source_type: chat` + the `chat_*` identity lines so a Rebuild
+    /// still routes the file through the chat engine. Mutually exclusive with `photo`/`spreadsheet`.
+    /// Omitting it is not cosmetic — it silently demotes a conversation to an ordinary document on the
+    /// next Rebuild (see [`ChatIdentity`]).
+    chat: Option<&'a ChatIdentity>,
     /// The remote source id + link a **promoted** index-only document keeps, so the claim survives a
     /// Rebuild: without it the rebuilt row would drop the `source_id` and the next connector sync would
     /// re-index the (still-present) source as a duplicate index-only pointer. `None` for every ordinary
@@ -2985,7 +3044,7 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
          importance: {}\n\
          last_activity: {}\n\
          reviewed: {}\n\
-         {}{}{}---\n\n{}\n",
+         {}{}{}{}---\n\n{}\n",
         yaml_quote(f.title),
         yaml_quote(f.source_path),
         f.ext.unwrap_or(""),
@@ -3002,8 +3061,26 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
         f.spreadsheet
             .map(render_spreadsheet_block)
             .unwrap_or_default(),
+        f.chat.map(render_chat_block).unwrap_or_default(),
         body,
     )
+}
+
+/// The chat-identity front-matter lines (only present for a chat). `source_type: chat` is the marker
+/// `is_chat_vault_file` routes on; `chat_conversation_id` is what `rebuild_chat` needs to find the
+/// session. Matches the field names `chat::render_chat_frontmatter` writes at creation, so a rewritten
+/// file round-trips through the same parser.
+fn render_chat_block(c: &ChatIdentity) -> String {
+    let mut s = format!(
+        "source_type: chat\n\
+         chat_conversation_id: {}\n\
+         chat_scope: {}\n",
+        c.conversation_id, c.scope,
+    );
+    if !c.source_id.is_empty() {
+        s.push_str(&format!("chat_source_id: {}\n", c.source_id));
+    }
+    s
 }
 
 /// The remote-pointer front-matter lines a promoted index-only document carries (`source_id` +
@@ -4322,6 +4399,7 @@ mod tests {
             reviewed: true,
             photo: None,
             spreadsheet: None,
+            chat: None,
             source_id: None,
             external_ref: None,
         };
@@ -4376,6 +4454,7 @@ mod tests {
             reviewed: false,
             photo: Some(&rec),
             spreadsheet: None,
+            chat: None,
             source_id: None,
             external_ref: None,
         };
@@ -4404,6 +4483,7 @@ mod tests {
                 reviewed: false,
                 photo: None,
                 spreadsheet: None,
+                chat: None,
                 source_id: None,
                 external_ref: None,
             },
@@ -4438,6 +4518,7 @@ mod tests {
             reviewed: false,
             photo: None,
             spreadsheet: Some(&rec),
+            chat: None,
             source_id: None,
             external_ref: None,
         };
@@ -4471,6 +4552,7 @@ mod tests {
                 reviewed: false,
                 photo: None,
                 spreadsheet: None,
+                chat: None,
                 source_id: None,
                 external_ref: None,
             },
@@ -4504,6 +4586,7 @@ mod tests {
             reviewed: true,
             photo: None,
             spreadsheet: Some(&rec),
+            chat: None,
             source_id: Some("gdrive:a@b.com:F1"),
             external_ref: Some("https://docs.google.com/spreadsheets/d/F1/edit"),
         };
@@ -4659,6 +4742,7 @@ mod tests {
             reviewed: true,
             photo: Some(&rec),
             spreadsheet: None,
+            chat: None,
             source_id: None,
             external_ref: None,
         };
@@ -4817,6 +4901,7 @@ mod tests {
             reviewed: false,
             photo: None,
             spreadsheet: None,
+            chat: None,
             source_id: None,
             external_ref: None,
         };
@@ -4825,6 +4910,82 @@ mod tests {
         assert!(parse_yaml_list(fields.get("tags").unwrap()).is_empty());
         assert_eq!(nullable(fields.get("importance")), None);
         assert_eq!(fields.get("reviewed").map(|s| s.trim()), Some("false"));
+    }
+
+    #[test]
+    fn rewrite_vault_metadata_preserves_a_chat_s_identity() {
+        // THE regression pin for the 3.81.2 fix. Every organisation write — approving a chat in
+        // Review, editing its project, renaming/merging the project that owns it — funnels through
+        // here. Before the fix this rebuilt the file from a `Frontmatter` with no chat arm, silently
+        // deleting `source_type: chat` + the `chat_*` lines; the next Rebuild then stopped matching
+        // `is_chat_vault_file` and re-ingested the conversation as an ordinary document.
+        let dir = tempfile::tempdir().unwrap();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut conn = crate::db::open(&dir.path().join("t.sqlite"), key).unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let cipher = MarkdownCipher::plaintext("test-vault");
+
+        // A chat file exactly as `chat::render_chat_frontmatter` writes it at birth.
+        let born = "---\ntitle: A chat\ncontent_hash: h\nsource_type: chat\n\
+                    chat_conversation_id: 42\nchat_scope: project\nchat_source_id: chat:42\n\
+                    project: Atlas\ntags: []\nimportance: high\nreviewed: true\n\
+                    created_at: 2026-01-01\ningested_at: 2026-01-01\nlast_activity: 2026-01-01\n\
+                    ---\n\n**You:** hi\n\n**PM:** hello\n";
+        cipher.write_to(&vault.join("chat.md"), born).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash, project, tags, reviewed, source_type) \
+             VALUES (1, 'chat.md', 'A chat', 'h', 'Atlas', '[]', 1, 'chat')",
+            [],
+        )
+        .unwrap();
+
+        {
+            let tx = conn.transaction().unwrap();
+            rewrite_vault_metadata(
+                &tx,
+                &vault,
+                &cipher,
+                1,
+                "Renamed Project",
+                &["notes".into()],
+                Some("high"),
+                true,
+                "2026-06-20",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let after = cipher.read(&vault.join("chat.md")).unwrap();
+        let (fields, body) = parse_frontmatter(&after).unwrap();
+        // The organisation edit landed...
+        assert_eq!(
+            fields.get("project").map(String::as_str),
+            Some("Renamed Project")
+        );
+        // ...and the identity survived it.
+        assert_eq!(
+            fields.get("source_type").map(String::as_str),
+            Some(SOURCE_TYPE_CHAT),
+            "the rewrite must not demote a chat to an ordinary document"
+        );
+        assert_eq!(
+            fields.get("chat_conversation_id").map(String::as_str),
+            Some("42"),
+            "rebuild_chat cannot find the session without this"
+        );
+        assert_eq!(
+            fields.get("chat_scope").map(String::as_str),
+            Some("project")
+        );
+        assert_eq!(
+            fields.get("chat_source_id").map(String::as_str),
+            Some("chat:42")
+        );
+        // The transcript itself is untouched.
+        assert!(body.contains("**You:** hi"));
+        assert!(body.contains("**PM:** hello"));
     }
 
     #[test]
@@ -4851,6 +5012,7 @@ mod tests {
             reviewed: false,
             photo: None,
             spreadsheet: None,
+            chat: None,
             source_id: None,
             external_ref: None,
         };
@@ -4928,6 +5090,7 @@ mod tests {
             reviewed: false,
             photo: None,
             spreadsheet: None,
+            chat: None,
             source_id: None,
             external_ref: None,
         };
