@@ -3,6 +3,7 @@
 
 import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { announceSettingSaved, isSettingWrite } from "./settingsSaved";
 import type { RepairOutcome, VaultFault } from "./types";
 import type {
   AiProviderStatus,
@@ -132,10 +133,17 @@ function isVaultFaultShaped(e: unknown): e is VaultFault {
 /** The one invoke used by every wrapper below: passes results and string rejections
  *  through untouched, and normalizes the single structured rejection shape into a
  *  `VaultError` — so no caller can ever see `[object Object]`, and no vault-path command
- *  can be missed by a per-wrapper list. */
+ *  can be missed by a per-wrapper list.
+ *
+ *  It is also where a successful settings write announces itself, for that same reason: the
+ *  Settings footer's "Saved ✓" is fed from here rather than from a list of wrappers someone has to
+ *  remember to extend (see lib/settingsSaved.ts). Only on success — a rejected write must never
+ *  claim to have saved — and never for a `Channel`-streaming command, none of which are settings. */
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   try {
-    return await tauriInvoke<T>(cmd, args);
+    const out = await tauriInvoke<T>(cmd, args);
+    if (isSettingWrite(cmd)) announceSettingSaved();
+    return out;
   } catch (e) {
     throw isVaultFaultShaped(e) ? new VaultError(e) : e;
   }

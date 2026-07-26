@@ -24,6 +24,19 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.88.0-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "Settings tells you when it saved. The footer used to carry a standing sentence saying changes save as you make them — true, but it said the same thing whether or not anything had happened. It now shows a brief “Saved ✓” each time a setting is written, wherever in Settings you changed it. There is a Save button again too; almost nothing needs it, but it commits anything still waiting and always acknowledges, so pressing it is never a no-op.",
+      "Settings won't lose an edit you haven't saved. The backup schedule is the one place that holds a draft rather than saving as you type — committing a “keep the last 1” on the way to typing 15 would be its own kind of accident. Switching tabs or closing Settings with one of those outstanding now asks first, and names exactly what would be discarded instead of showing a vague warning.",
+      "Clicking outside Settings closes it. As it always did for What’s New and every other dialog. Anything unsaved still stops and asks.",
+      "The Day view can show up to six days. Pick the width next to the range control. Week stays seven, and both grids now start wherever you have scrolled them to rather than snapping to a Monday — so you can look at the six days from yesterday, or a week that begins on Wednesday. Today puts it back, and in Week view it restores the ordinary Monday-to-Sunday shape.",
+      "Swipe the calendar sideways. A horizontal trackpad swipe or a tilt wheel moves the day window one day at a time, on both the Calendar tab and the Focus tab’s Upcoming grid — neither of which responded to sideways scrolling at all before, because neither is a scrolling area. The ‹ › arrows page by the whole window instead: seven days in Week, however many days you have chosen in Day.",
+      "The window chrome shows your version. The title bar now reads “PM alpha 3.88.0” rather than just “alpha”, so you can tell which build you are on without opening anything. The matching PM/Alpha badge at the top of the left sidebar is gone — it sat a few pixels below the one in the chrome and said less.",
+      "The calendar can reopen where you left it. Off by default — it opens on today — with a switch in Settings → General if you would rather it kept your place.",
+    ],
+  },
+  {
     version: "3.87.0-alpha",
     date: "2026-07-26",
     highlights: [

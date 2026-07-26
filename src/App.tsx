@@ -25,6 +25,7 @@ import { ReviewView } from "./components/ReviewView";
 import { TeachView } from "./components/TeachView";
 import { Sidebar, type View } from "./components/Sidebar";
 import { SettingsView } from "./components/SettingsView";
+import { SettingsPendingProvider } from "./lib/settingsPending";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { VaultCurtain } from "./components/VaultCurtain";
 import { VaultOpenError } from "./components/VaultOpenError";
@@ -1048,23 +1049,29 @@ export default function App() {
 
               {showSettings && (
                 <div className="absolute inset-0 z-50" style={{ background: "var(--scrim)" }}>
-                  <SettingsView
-                    onboarding={false}
-                    onClose={() => {
-                      setShowSettings(false);
-                      refreshSettings();
-                    }}
-                    onOpenDev={() => {
-                      setShowSettings(false);
-                      setView("dev");
-                    }}
-                    onOpenTeach={() => {
-                      setShowSettings(false);
-                      setView("teach");
-                    }}
-                    betterFit={betterFit}
-                    onBetterFitChange={() => void refreshBetterFit()}
-                  />
+                  {/* The provider sits ABOVE SettingsView, not inside it: the controls that defer
+                      their write are several levels down (a tab's own component) while the thing
+                      that acts on them — the footer's Save and the leave guard — is SettingsView
+                      itself, so both sides need a context neither of them owns. */}
+                  <SettingsPendingProvider>
+                    <SettingsView
+                      onboarding={false}
+                      onClose={() => {
+                        setShowSettings(false);
+                        refreshSettings();
+                      }}
+                      onOpenDev={() => {
+                        setShowSettings(false);
+                        setView("dev");
+                      }}
+                      onOpenTeach={() => {
+                        setShowSettings(false);
+                        setView("teach");
+                      }}
+                      betterFit={betterFit}
+                      onBetterFitChange={() => void refreshBetterFit()}
+                    />
+                  </SettingsPendingProvider>
                 </div>
               )}
 

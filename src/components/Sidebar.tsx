@@ -289,16 +289,11 @@ export function Sidebar({
           resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
         }`}
       />
-      <div className="flex shrink-0 items-center justify-between px-4 py-3">
-        <div className="flex items-center gap-2">
-          <span className="font-head text-sm font-semibold tracking-wide text-ink">PM</span>
-          <span
-            title="PM is in alpha — under active development; expect rough edges and changes between updates."
-            className="rounded-[var(--radius-sm)] bg-accent-soft px-1.5 py-0.5 font-mono text-[0.625rem] font-medium uppercase tracking-wide text-accent-text"
-          >
-            Alpha
-          </span>
-        </div>
+      {/* The name-and-Alpha badge that used to sit here is gone: the window chrome carries both a
+          few pixels above it, now with the version number attached, and two of them side by side
+          was the same fact stated twice. The row stays as the New button's home and as the gap
+          between the chrome and the nav. */}
+      <div className="flex shrink-0 items-center justify-end px-4 py-3">
         {(view === "chat" || view === "project") && (
           <button
             onClick={onNew}

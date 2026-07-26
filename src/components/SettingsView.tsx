@@ -34,7 +34,9 @@ import type { LanguageOptions } from "../lib/types";
 import { useScrollSpy } from "../lib/useScrollSpy";
 import { deviceTimeZone } from "../theme";
 import { SETTINGS_GROUPS, sectionsFor, type SettingsTab } from "./settings/registry";
-import { Button, cn, Collapsible, Input, NavItem, SegmentedControl } from "./ui";
+import { useSettingsPending } from "../lib/settingsPending";
+import { SavedTick } from "./settings/SavedTick";
+import { Button, cn, Collapsible, ConfirmDialog, Input, NavItem, SegmentedControl } from "./ui";
 
 interface Props {
   onClose: () => void;
@@ -92,10 +94,52 @@ export function SettingsView({
   // tab change so each tab opens from its first section.
   const [tab, setTab] = useState<SettingsTab>("general");
   const contentRef = useRef<HTMLDivElement>(null);
+  // Uncommitted edits on the current tab, registered by the controls that defer their write.
+  const pending = useSettingsPending();
+  // A pending navigation held up by that guard: what is at stake, and where we were going.
+  const [leaveGuard, setLeaveGuard] = useState<{ labels: string[]; go: () => void } | null>(null);
+  // When the last settings write landed. Drives the transient "Saved" tick in the footer.
+  const [savedAt, setSavedAt] = useState<number | null>(null);
 
-  function selectTab(next: SettingsTab) {
+  function applyTab(next: SettingsTab) {
     setTab(next);
     contentRef.current?.scrollTo({ top: 0 });
+  }
+
+  /** Switch tabs, but stop first if this tab holds an edit that hasn't been committed. Almost every
+   *  control here writes on change and registers nothing; the ones that defer (the backup schedule)
+   *  would otherwise have their draft silently discarded by the unmount. The dialog NAMES what is
+   *  pending rather than saying "unsaved changes" — the point is to let you recognise whether you
+   *  care, not to make you anxious. */
+  function selectTab(next: SettingsTab) {
+    const labels = pending?.labelsForTab(tab) ?? [];
+    if (labels.length > 0) {
+      setLeaveGuard({ labels, go: () => applyTab(next) });
+      return;
+    }
+    applyTab(next);
+  }
+
+  /** Done / clicking outside. Same guard: closing is just a tab switch that lands nowhere. */
+  function requestClose() {
+    const labels = pending?.labelsForTab(tab) ?? [];
+    if (labels.length > 0) {
+      setLeaveGuard({ labels, go: onClose });
+      return;
+    }
+    onClose();
+  }
+
+  /** The explicit Save. It commits anything pending on this tab, but it ALWAYS flashes the tick,
+   *  even when there was nothing to commit — the button exists so there is something to press, and
+   *  a press that appears to do nothing is worse than no button. */
+  async function saveNow() {
+    try {
+      await pending?.saveTab(tab);
+      setSavedAt(Date.now());
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   // The active tab's in-rail sub-nav: scroll-spy lights the section currently in view; clicking a
@@ -449,7 +493,17 @@ export function SettingsView({
 
   // ── Settings: a left-rail, tabbed surface. State + Save are shared across all tabs. ──────────
   return (
-    <div className="flex h-full items-center justify-center p-6">
+    // Clicking the backdrop closes Settings, through the same guard as Done. mouseDOWN, not click:
+    // a click fires on the element the pointer is released over, so releasing outside after
+    // starting a text selection or a slider drag INSIDE the panel would otherwise close the window
+    // mid-gesture. The target check keeps it to the backdrop itself, never a click that merely
+    // bubbled up from the panel.
+    <div
+      className="flex h-full items-center justify-center p-6"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) requestClose();
+      }}
+    >
       <div className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-[var(--radius)] border border-border bg-panel shadow-xl">
         {/* The window header carries the title only. Its old subtitle ("your API key lives in the
             OS keychain…") was AI-tab material shown on every tab; it now sits in that tab's
@@ -592,17 +646,50 @@ export function SettingsView({
               {error}
             </p>
           )}
-          {/* A standing statement rather than a transient "Saved ✓": every tab here writes on
-              change, so there is nothing to batch and a flash would be a lie on most renders.
-              Deferred writes get their own confirmation next to the control that defers them. */}
+          {/* Save sits beside Done deliberately. Almost nothing here needs it — the tabs write on
+              change — but a settings window with no Save reads as a settings window that hasn't
+              saved, and the button is also the one place a deferred draft (the backup schedule) can
+              be committed without hunting for its own control. Pressing it always acknowledges,
+              even with nothing to commit. */}
           <div className="flex items-center justify-between gap-3">
-            <p className="text-xs text-ink4">Changes are saved as you make them.</p>
-            <Button variant="primary" onClick={onClose}>
-              Done
-            </Button>
+            <SavedTick pendingLabels={pending?.labelsForTab(tab) ?? []} savedAt={savedAt} />
+            <div className="flex shrink-0 items-center gap-2">
+              <Button variant="secondary" onClick={() => void saveNow()}>
+                Save
+              </Button>
+              <Button variant="primary" onClick={requestClose}>
+                Done
+              </Button>
+            </div>
           </div>
         </div>
       </div>
+
+      {/* Two choices, not three, and Save is not one of them. The Save button is right there in the
+          footer the dialog is covering, so offering "save and continue" here would duplicate it and
+          make the destructive path the quiet one. Cancel puts you back on the tab with the draft
+          intact and the button in front of you. */}
+      <ConfirmDialog
+        open={leaveGuard !== null}
+        title="This tab has changes you haven't saved"
+        confirmLabel="Discard and continue"
+        cancelLabel="Stay here"
+        danger
+        onConfirm={() => {
+          const go = leaveGuard?.go;
+          setLeaveGuard(null);
+          go?.();
+        }}
+        onClose={() => setLeaveGuard(null)}
+      >
+        <p>These would be discarded:</p>
+        <ul className="mt-1 list-disc pl-5">
+          {(leaveGuard?.labels ?? []).map((l) => (
+            <li key={l}>{l}</li>
+          ))}
+        </ul>
+        <p className="mt-2">Stay here and press Save to keep them.</p>
+      </ConfirmDialog>
     </div>
   );
 }

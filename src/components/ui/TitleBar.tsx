@@ -15,25 +15,50 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { useTheme } from "../../theme";
 import { cn } from "./cn";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
+/** The running build, e.g. "3.88.0-alpha". Read once — it cannot change while the app is open.
+ *  Rendered beside the stage word so "which version am I on?" is answerable without opening
+ *  Settings, which is the whole reason the sidebar's duplicate badge could go. */
+function useAppVersion(): string | null {
+  const [version, setVersion] = useState<string | null>(null);
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => {});
+  }, []);
+  return version;
+}
+
+/** The version with any `-alpha`/`-beta` suffix removed: the stage is already spelled out beside
+ *  it, and "3.88.0-alpha alpha" reads as a mistake. */
+function baseVersion(v: string): string {
+  const dash = v.indexOf("-");
+  return dash === -1 ? v : v.slice(0, dash);
+}
+
 function SystemLabel() {
   const { system } = useTheme();
+  const version = useAppVersion();
+  const num = version ? baseVersion(version) : null;
   if (system === "terminal") {
     return (
       <span className="pointer-events-none font-mono text-xs text-ink3">
         <span style={{ color: "var(--accent)" }}>●</span> pm{" "}
-        <span className="text-ink4">[alpha]</span>
+        <span className="text-ink4">[alpha{num ? ` ${num}` : ""}]</span>
       </span>
     );
   }
   return (
     <span className="pointer-events-none">
       <span className="font-head text-sm text-ink2">PM</span>{" "}
-      <span className="font-mono text-[0.625rem] uppercase tracking-wide text-ink4">alpha</span>
+      <span className="font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
+        alpha{num ? ` ${num}` : ""}
+      </span>
     </span>
   );
 }
