@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { CONNECTOR_POLL_MS, shouldIncludeSharedWithMe } from "./lib/connectorPoll";
 import { CalendarView } from "./components/calendar/CalendarView";
 import { ChatView } from "./components/ChatView";
 import { ProviderChip } from "./components/ProviderChip";
@@ -71,7 +72,11 @@ import {
   localBetterFitNotice,
   onVaultMetaWarning,
   openUrl,
+  driveStatus,
   resumeDriveSync,
+  syncDrive,
+  syncLocalFolder,
+  syncOneDrive,
   resumeRebuild,
   resumeLocalFolderSync,
   resumeOneDriveSync,
@@ -139,6 +144,7 @@ export default function App() {
   /** A better-fitting local model is available (#437). Drives the quiet dot on the sidebar's
    *  Settings row and on Settings' own Local AI tab; cleared the moment it's dismissed. */
   const [betterFit, setBetterFit] = useState(false);
+  const [sheetsNudge, setSheetsNudge] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
 
   function openProject(project: string, focusDocId?: number) {
@@ -490,11 +496,28 @@ export default function App() {
     }
   }, []);
 
+  // Whether any connected Google account predates the Sheets permission. Drive accounts linked since
+  // it shipped request it in the FIRST consent, so this only ever fires for older ones — and for them
+  // the notice lived on a Connectors row you had no reason to revisit after the initial index. It
+  // carries the same quiet dot as the local-model suggestion, so it can be noticed from the sidebar.
+  const refreshSheetsNudge = useCallback(async () => {
+    try {
+      const st = await driveStatus();
+      setSheetsNudge(st.accounts.some((a) => !a.has_sheets_scope));
+    } catch {
+      /* the dot is a nicety; a failure just means no dot */
+    }
+  }, []);
+
   // Same cadence as the review badge: re-read as the user moves around, so the dot appears without
   // needing a restart and disappears as soon as the suggestion is acted on or dismissed.
   useEffect(() => {
     if (aiReady) void refreshBetterFit();
   }, [aiReady, view, refreshBetterFit]);
+
+  useEffect(() => {
+    if (aiReady) void refreshSheetsNudge();
+  }, [aiReady, view, refreshSheetsNudge]);
 
   // Resume a Drive sync interrupted by a previous close/crash mid-index. Runs once the vault is open
   // (aiReady implies an unlocked store), detached in the backend — already-indexed files survive, so
@@ -521,6 +544,46 @@ export default function App() {
   // watcher is spawned separately at app setup; this just finishes any walk left mid-index by a close.
   useEffect(() => {
     if (aiReady) void resumeLocalFolderSync().catch(() => {});
+  }, [aiReady]);
+
+  // Keep the CLOUD CONNECTORS fresh the same way the calendar mirror is: one pass shortly after
+  // unlock, then every 15 minutes. Before this, nothing refreshed a connector on its own — the resume
+  // effects above only FINISH an interrupted walk — so a file someone added to an indexed folder
+  // stayed invisible until you thought to press Sync, which is not a thing you think to do about a
+  // file you don't know exists.
+  //
+  // Push isn't an option: Drive's `changes.watch` and Graph's subscriptions both deliver to a public
+  // HTTPS webhook, which a local-first desktop app doesn't have. Polling is cheap regardless, because
+  // My Drive / shared drives / OneDrive all ride a delta cursor — an idle poll is one request that
+  // returns an empty page. Shared-with-me is the exception (no cursor, a real re-walk), so it rides
+  // its own hourly cadence and the frequent passes skip it.
+  //
+  // Errors are swallowed on purpose: a connector that is unreachable, or a sync refused because a
+  // rebuild is running, is already reported in Connectors. A background tick must not raise anything.
+  useEffect(() => {
+    if (!aiReady) return;
+    let running = false;
+    let lastSwmAt: number | null = null;
+    const pass = async () => {
+      if (running) return; // a slow pass must not stack on the next tick
+      running = true;
+      const withSwm = shouldIncludeSharedWithMe(lastSwmAt, Date.now());
+      try {
+        // Sequential, not Promise.all: these share one DB and one sidecar, and three concurrent
+        // index passes would contend for both to no benefit — nobody is waiting on this.
+        await syncDrive(null, withSwm).catch(() => {});
+        await syncOneDrive(null).catch(() => {});
+        await syncLocalFolder(null).catch(() => {});
+        // Stamped only after the pass that actually asked for it, so a failed or skipped run doesn't
+        // start the hour over and delay the next real re-walk.
+        if (withSwm) lastSwmAt = Date.now();
+      } finally {
+        running = false;
+      }
+    };
+    void pass();
+    const id = setInterval(() => void pass(), CONNECTOR_POLL_MS);
+    return () => clearInterval(id);
   }, [aiReady]);
 
   // Keep the read-only calendar mirror fresh in the background: one poll shortly after unlock, then
@@ -900,6 +963,7 @@ export default function App() {
                   activeId={inProject ? projectChat.convId : activeId}
                   reviewCount={reviewCount}
                   betterFit={betterFit}
+                  sheetsNudge={sheetsNudge}
                   onSelect={
                     inProject
                       ? projectChat.openConversation
@@ -1069,6 +1133,7 @@ export default function App() {
                         setView("teach");
                       }}
                       betterFit={betterFit}
+                      sheetsNudge={sheetsNudge}
                       onBetterFitChange={() => void refreshBetterFit()}
                     />
                   </SettingsPendingProvider>

@@ -312,19 +312,35 @@ export function CloudDriveConnection({
                     onAction={() => setConfirmEmail(a.email)}
                   >
                     {meta.sheets && "has_sheets_scope" in a && !a.has_sheets_scope && (
-                      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
-                        <span className="text-xs text-ink4">
-                          Google Sheets are indexed by name only. Google can&rsquo;t add a
-                          permission to a sign-in you&rsquo;ve already given, so this is a one-time
-                          reconnect.
-                        </span>
+                      // A tinted callout, not a grey line with a tertiary button after it. This
+                      // appears once the first index has finished, on a settings page nobody has a
+                      // reason to revisit — so on the one visit where it IS on screen it has to read
+                      // as something to act on. The same condition puts a dot on the Connectors tab
+                      // and the sidebar's Settings row, so it can be found at all.
+                      <div
+                        className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-[var(--radius-sm)] border px-2.5 py-2"
+                        style={{
+                          borderColor: "color-mix(in oklab, var(--accent) 35%, transparent)",
+                          background: "color-mix(in oklab, var(--accent) 10%, transparent)",
+                        }}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-medium text-ink2">
+                            Spreadsheets are indexed by name only
+                          </p>
+                          <p className="mt-0.5 text-xs text-ink3">
+                            This account was connected before PM could read Sheets. Google
+                            can&rsquo;t add a permission to a sign-in you&rsquo;ve already given, so
+                            it takes one reconnect — nothing is re-indexed and nothing is lost.
+                          </p>
+                        </div>
                         {/* Reconnect re-runs consent, which requests the Sheets scope and unions it onto
                             the existing Drive grant (prompt=select_account → pick this email). */}
                         <Button
-                          variant="tertiary"
+                          variant="secondary"
                           onClick={connect}
                           disabled={anyBusy}
-                          className="px-1.5 py-0.5 text-xs"
+                          className="shrink-0 text-xs"
                         >
                           Reconnect for Sheets
                         </Button>

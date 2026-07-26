@@ -1062,7 +1062,18 @@ async fn gather_shared_with_me(
 /// uses the efficient delta cursor (first sync enumerates everything, later syncs the changes feed);
 /// **shared drives** the account opted into are re-enumerated + reconciled each pass (whole drive, or
 /// selected folders), de-duplicated across accounts via `claim_or_skip_shared_drive`.
-struct DriveDriver;
+struct DriveDriver {
+    /// Whether this pass also re-walks "Shared with me".
+    ///
+    /// Every other Drive corpus rides a `changes.list` delta cursor: one cheap call that returns an
+    /// empty page when nothing moved, so polling it often costs almost nothing. Shared-with-me has
+    /// no cursor — Google exposes no delta for it — so each pass RE-ENUMERATES every picked root and
+    /// reconciles it. That is fine on the sync button and too heavy to repeat every few minutes, so
+    /// the background poller runs it on a much longer cadence and asks for it explicitly.
+    ///
+    /// A manual sync always passes true: someone who pressed the button wants everything looked at.
+    include_shared_with_me: bool,
+}
 
 impl CloudDriver for DriveDriver {
     type File = drive::DriveFile;
@@ -1273,7 +1284,7 @@ impl CloudDriver for DriveDriver {
         // account-independent `gdrive:swm:<rootId>:` namespace and de-duplicated across accounts via
         // `claim_or_skip_swm_root` (the same ownership model as shared drives). Re-enumerated +
         // reconciled per picked root each pass, no cursor. Skipped if the account already auth-failed. ---
-        if scope.shared_with_me && !auth_failed {
+        if scope.shared_with_me && self.include_shared_with_me && !auth_failed {
             match gather_shared_with_me(
                 app,
                 &token_key,
@@ -1681,8 +1692,22 @@ impl CloudDriver for OneDriveDriver {
 // --- thin entry points the IPC-layer command wrappers call ---------------------------------------
 
 /// The sync engine behind [`crate::commands::sync_drive`] / [`crate::commands::resume_drive_sync`].
-pub(crate) async fn drive_sync_core(app: &AppHandle, account: Option<String>) -> Result<usize> {
-    run_cloud_sync(app, DriveDriver, account).await
+///
+/// `include_shared_with_me` is false only for the background poller's frequent passes — see
+/// [`DriveDriver::include_shared_with_me`]. Every user-initiated sync passes true.
+pub(crate) async fn drive_sync_core(
+    app: &AppHandle,
+    account: Option<String>,
+    include_shared_with_me: bool,
+) -> Result<usize> {
+    run_cloud_sync(
+        app,
+        DriveDriver {
+            include_shared_with_me,
+        },
+        account,
+    )
+    .await
 }
 
 /// The sync engine behind [`crate::commands::sync_onedrive`] / [`crate::commands::resume_onedrive_sync`].
