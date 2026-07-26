@@ -24,15 +24,16 @@
 // set the agenda shows — with no first-party overlays (milestones live on the Calendar tab).
 
 import { useEffect, useMemo, useState } from "react";
-import type { AgendaEvent, CalendarEvent } from "../lib/types";
+import type { AgendaEvent, Calendar, CalendarEvent } from "../lib/types";
 import { listAllCalendarEvents } from "../lib/ipc";
 import { resolveRangeBounds } from "../lib/calendarGeom";
-import type { CalendarRange, RangeBounds } from "../lib/calendarPrefs";
+import { readHidden, type CalendarRange, type RangeBounds } from "../lib/calendarPrefs";
 import { addDays, dayKey, startOfDay } from "../lib/calendar-layout";
 import { sourceColors, useTheme, useUserTime } from "../theme";
 import { formatEventWhen } from "../lib/format";
 import { Card, SegmentedControl } from "./ui";
 import { TimeGridView } from "./calendar/views/TimeGridView";
+import { CalendarEventPopover } from "./calendar/parts/CalendarEventPopover";
 import { RangeControl } from "./calendar/RangeControl";
 import {
   FOCUS_UPCOMING_DAY_CHOICES,
@@ -62,11 +63,14 @@ let cachedAllEvents: CalendarEvent[] = [];
 interface Props {
   /** The focus agenda feed (upcoming synced events, incl. today's already-ended). Used by List mode. */
   listEvents: AgendaEvent[];
-  /** Ids of the connected calendars, for colouring the grid's events. */
-  calendarIds: string[];
+  /** The connected calendars — for colouring the grid, naming the owning calendar in the detail
+   *  popover, and applying the same `quiet`/hidden exclusions the agenda feed already applies. */
+  calendars: Calendar[];
+  /** Threaded to the popover so an event linked to a milestone can jump to its project. */
+  onOpenProject?: (project: string) => void;
 }
 
-export function FocusUpcoming({ listEvents, calendarIds }: Props) {
+export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
   const { system, accent, colorblind } = useTheme();
   const { coords } = useUserTime();
   const [mode, setMode] = useState<FocusUpcomingMode>(readFocusUpcomingMode);
@@ -82,6 +86,11 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
   // always opens on today.
   const [anchor, setAnchor] = useState<Date>(() => startOfDay(new Date()));
   const [allEvents, setAllEvents] = useState<CalendarEvent[]>(() => cachedAllEvents);
+  // The open detail popup, anchored at the clicked row/card (null = closed). Same component and same
+  // behaviour as the Calendar tab — but with none of its overlay routing, because this card injects
+  // no milestone/pinboard pseudo-events, so every event here is a real synced one.
+  const [eventPopup, setEventPopup] = useState<{ ev: CalendarEvent; anchor: DOMRect } | null>(null);
+  const onEventClick = (ev: CalendarEvent, anchor: DOMRect) => setEventPopup({ ev, anchor });
 
   function changeMode(next: FocusUpcomingMode) {
     setMode(next);
@@ -136,12 +145,23 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
     [anchor, days],
   );
 
-  // Dedup the same physical event mirrored on two calendars (same iCal UID), keeping the first — the
-  // grid buckets by day itself, so events outside the window simply aren't placed.
+  const calendarIds = useMemo(() => calendars.map((c) => c.id), [calendars]);
+
+  // Filter, then dedup the same physical event mirrored on two calendars (same iCal UID), keeping the
+  // first — the grid buckets by day itself, so events outside the window simply aren't placed.
+  //
+  // The two exclusions matter because this grid reads the RAW mirror (listAllCalendarEvents), which is
+  // deliberately unfiltered, whereas List mode is fed the backend agenda query, which filters quiet.
+  // Without them a calendar marked quiet stayed out of the list but kept showing here — against the
+  // documented promise that quiet excludes a calendar from focus upcoming — and a calendar hidden on
+  // the Calendar tab reappeared in Focus.
   const gridEvents = useMemo(() => {
+    const quiet = new Set(calendars.filter((c) => c.quiet).map((c) => c.id));
+    const hiddenIds = readHidden();
     const seen = new Set<string>();
     const out: CalendarEvent[] = [];
     for (const e of allEvents) {
+      if (quiet.has(e.calendar_id) || hiddenIds.has(e.calendar_id)) continue;
       if (e.uid) {
         if (seen.has(e.uid)) continue;
         seen.add(e.uid);
@@ -149,7 +169,7 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
       out.push(e);
     }
     return out;
-  }, [allEvents]);
+  }, [allEvents, calendars]);
 
   const colorOf = useMemo(() => {
     const map = sourceColors(calendarIds, system, accent, colorblind);
@@ -189,7 +209,7 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
       </div>
 
       {mode === "list" ? (
-        <AgendaList events={listEvents} />
+        <AgendaList events={listEvents} onEventClick={onEventClick} />
       ) : (
         <>
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-ink3">
@@ -256,9 +276,31 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
               onZonesChange={NOOP}
               allowZones={false}
               minRowHeight={COMPACT_MIN_ROW_H}
+              onEventClick={onEventClick}
             />
           </div>
         </>
+      )}
+
+      {eventPopup && (
+        <CalendarEventPopover
+          event={eventPopup.ev}
+          anchor={eventPopup.anchor}
+          calendar={calendars.find((c) => c.id === eventPopup.ev.calendar_id) ?? null}
+          color={colorOf(eventPopup.ev.calendar_id)}
+          // No milestone lookup here: this card shows synced events only, and loading every
+          // milestone to resolve a link would be a read the Focus tab has no other use for.
+          milestone={null}
+          onClose={() => setEventPopup(null)}
+          onOpenProject={
+            onOpenProject
+              ? (p) => {
+                  setEventPopup(null);
+                  onOpenProject(p);
+                }
+              : undefined
+          }
+        />
       )}
     </Card>
   );
@@ -270,13 +312,34 @@ export function FocusUpcoming({ listEvents, calendarIds }: Props) {
  *  The name WRAPS rather than truncating. This card is ~22rem wide next to a 8rem time column, so
  *  "…" swallowed most real meeting titles — and a title you can't read is the one thing the row is
  *  for. The time stays on one line as a fixed gutter, and the name/location column wraps under it. */
-function AgendaList({ events }: { events: AgendaEvent[] }) {
+function AgendaList({
+  events,
+  onEventClick,
+}: {
+  events: AgendaEvent[];
+  onEventClick: (ev: CalendarEvent, anchor: DOMRect) => void;
+}) {
   const shown = events.slice(0, 8);
   return (
     <>
       <ul className="flex flex-col gap-1.5">
         {shown.map((e) => (
-          <li key={e.id} className={`flex gap-3 text-sm${e.ended ? " opacity-45" : ""}`}>
+          // AgendaEvent extends CalendarEvent, so a row passes straight to the popover. Its v40
+          // detail columns (organiser, attendees, conferencing, recurrence) come back defaulted from
+          // the agenda query, so a list-mode popover shows the core detail and simply omits those.
+          <li
+            key={e.id}
+            className={`flex cursor-pointer gap-3 rounded-[var(--radius-sm)] text-sm hover:bg-surface${e.ended ? " opacity-45" : ""}`}
+            role="button"
+            tabIndex={0}
+            onClick={(ev) => onEventClick(e, ev.currentTarget.getBoundingClientRect())}
+            onKeyDown={(ev) => {
+              if (ev.key === "Enter" || ev.key === " ") {
+                ev.preventDefault();
+                onEventClick(e, ev.currentTarget.getBoundingClientRect());
+              }
+            }}
+          >
             <span className="w-32 shrink-0 font-mono text-xs leading-5 text-ink3">
               {formatEventWhen(e.start, e.all_day)}
             </span>

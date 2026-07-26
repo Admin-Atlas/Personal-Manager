@@ -24,6 +24,23 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.85.3-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "On Linux, you can set your working hours again. The start and end times on the calendar's Work and Day buttons were built on a control your web engine doesn't provide, so on Linux they fell back to a plain text box that undid every keystroke — you could never get a second digit in, and there was no way to step the value either. They're now half-hour dropdowns that behave the same on every system, and they only offer times that leave a sensible window, so a choice can't quietly do nothing.",
+      "Events in Focus open like events in the calendar. Clicking one in the Upcoming card — in either the list or the day grid — now brings up the same detail panel the Calendar tab shows. That grid also honours the calendars you've hidden and the ones you've marked quiet, which it was ignoring, so a calendar you've silenced everywhere no longer keeps turning up there.",
+      "Long event titles wrap instead of being cut off. In the agenda lists and on the Focus project cards a title now folds onto a second line rather than ending in an ellipsis. The day and month grids still trim, because there a card is only as tall as the event is long.",
+      "Settings remember things they were forgetting. “Save a copy of dropped photos in the vault” now stays ticked — it was being reset every time you left the Documents tab, which also meant photos dropped afterwards were quietly not copied. Settings also say plainly that changes save as you make them, and the one control that doesn't — the backup schedule — now tells you when it's holding something unsaved.",
+      "Importing your AI memory shows you what's happening. The Import button used to dim to a ghost of itself and change its own label, which read as a second, greyed-out button. It's now replaced by a progress bar while the work runs, the paste box is tall enough to read what you pasted, and screen readers are told when it starts and finishes.",
+      "Trimming old backups tells you what it did. “Delete oldest, keep 5” did its job but said nothing at all — success was silent and failures appeared far up the page, out of sight. It now reports how many it moved to the trash, right where you clicked, and says so when there was nothing to trim.",
+      "A rebuild no longer looks dead when you come back to it. Leaving the Documents tab mid-rebuild used to empty the activity list and blank the whole panel for several seconds, even though the timer kept running. The recent files are kept now, and the progress bar reappears immediately. If a rebuild finished while you were away, you'll see how it went.",
+      "Google Drive stops crying wolf. An account whose last sync didn't finish was labelled “unreachable”, as though it were gone, and hiding the very controls you'd use to narrow down what was failing. It now says the sync failed, explains that Sync now retries, and leaves the folder and shared-drive chooser available. A failure listing shared drives no longer takes the My Drive controls down with it.",
+      "Google Sheets: clearer about what it actually needs. Reconnecting for Sheets is a one-time thing — Google can't add a permission to a sign-in you've already given — and PM now says so instead of leaving it looking like a recurring chore. It also no longer tells you to reconnect when the real problem is that the Sheets API was never switched on for your Google Cloud project, which reconnecting can't fix; the setup guide now lists that step. And a routine token refresh can no longer make PM forget a permission you'd already granted.",
+      "The briefing fills its window. Making the always-on-top briefing window or the floating panel taller grew the frame but not the text, leaving a blank strip below “Updated”. The text now takes the room you give it.",
+      "Removing an alternative name in Teach is something you can see. The × on each “also known as” was invisible until you happened to hover exactly over it, so it looked like clicking did nothing. It's always visible now, with a proper click target. (The removal itself was working.)",
+    ],
+  },
+  {
     version: "3.85.2-alpha",
     release: true,
     date: "2026-07-26",

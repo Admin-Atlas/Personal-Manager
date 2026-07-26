@@ -1253,6 +1253,19 @@ export interface IngestJobState {
   prep: string | null;
   /** The last finished rebuild's counts, so returning after it completed still shows the result. */
   last_report: IngestReport | null;
+  /** The tail of the Activity list (capped backend-side), so returning to the tab restores the rows
+   *  instead of showing an empty card until the next file finishes. */
+  recent: IngestItem[];
+  /** True when older rows have been dropped from `recent`. */
+  recent_truncated: boolean;
+}
+
+/** One Activity row carried in the rebuild snapshot; mirrors `IngestItem`. Same shape the view
+ *  builds from live events, so a restored row and a live one are indistinguishable. */
+export interface IngestItem {
+  name: string;
+  status: "working" | "done" | "skipped" | "failed";
+  detail: string | null;
 }
 
 /** What one automatic chat-identity repair pass did; mirrors `chat::ChatIdentityHeal`. */

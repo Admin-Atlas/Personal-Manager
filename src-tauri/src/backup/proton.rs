@@ -683,11 +683,44 @@ pub(crate) fn list_archives(cli: &Path) -> Result<Vec<BackupEntry>> {
 
 // --- Retention (keep last N, trash oldest) ------------------------------------------
 
+/// Inspect a `filesystem trash --json` payload for reported failures.
+///
+/// The CLI can exit 0 having done nothing — the same hazard [`check_transfer`] exists for — so a
+/// silent trash must not be reported as a successful trim. Unlike upload/download, the exact
+/// success shape of `trash --json` has not been captured from a live CLI yet, so this is
+/// deliberately asymmetric: any recognisable failure signal is an error, and a payload we cannot
+/// read is NOT treated as proof of success — it returns `None`, and the caller falls back to
+/// reporting the intended count rather than inventing a confirmed one.
+fn check_trash(stdout: &str) -> Result<Option<u64>> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return Ok(None);
+    };
+    let failed = v
+        .get("failedItems")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            v.get("failures")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.len() as u64)
+                .unwrap_or(0),
+        );
+    if failed > 0 {
+        return Err(Error::Other(format!(
+            "Proton Drive reported that {failed} backup(s) could not be moved to Trash"
+        )));
+    }
+    Ok(v.get("trashedItems")
+        .or_else(|| v.get("transferredItems"))
+        .and_then(serde_json::Value::as_u64))
+}
+
 /// Move the given archives (by bare name) to Proton Trash — recoverable, never a hard delete.
-/// One `filesystem trash` call with every path. No-op on an empty list.
-fn trash_archives(cli: &Path, names: &[String]) -> Result<()> {
+/// One `filesystem trash` call with every path. No-op on an empty list. Returns the count the CLI
+/// confirmed, or `None` when its payload carries no count we recognise.
+fn trash_archives(cli: &Path, names: &[String]) -> Result<Option<u64>> {
     if names.is_empty() {
-        return Ok(());
+        return Ok(Some(0));
     }
     let paths: Vec<String> = names
         .iter()
@@ -696,7 +729,8 @@ fn trash_archives(cli: &Path, names: &[String]) -> Result<()> {
     let mut args = vec!["filesystem", "trash"];
     args.extend(paths.iter().map(String::as_str));
     args.push("--json");
-    run_proton(cli, &args).map(|_| ())
+    let out = run_proton(cli, &args)?;
+    check_trash(&out)
 }
 
 /// Keep-last-N retention **for one vault**: list PM's archives, keep the newest `keep_n` whose
@@ -712,9 +746,9 @@ pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result
         .filter(|n| n.starts_with(prefix) && naming::valid_archive_name(n))
         .collect();
     let doomed = naming::select_for_deletion(&names, keep_n);
-    let count = doomed.len();
-    trash_archives(cli, &doomed)?;
-    Ok(count)
+    // Prefer the count the CLI confirmed; fall back to what we asked for when it reports none.
+    let confirmed = trash_archives(cli, &doomed)?;
+    Ok(confirmed.map_or(doomed.len(), |n| n as usize))
 }
 
 #[cfg(test)]
@@ -783,6 +817,23 @@ mod tests {
                 "pm-backup-20260101T000000Z.pmbackup",
             ]
         );
+    }
+
+    #[test]
+    fn trash_result_flags_failures_and_reads_a_count() {
+        // A populated `failures[]` is an error even when failedItems claims zero — the same
+        // belt-and-braces rule check_transfer applies, because the CLI can exit 0 on a no-op.
+        assert!(check_trash(r#"{"failedItems":0,"failures":[{"path":"x"}]}"#).is_err());
+        assert!(check_trash(r#"{"failedItems":2,"failures":[]}"#).is_err());
+        // A recognisable count is passed through so the UI can report what actually happened.
+        assert_eq!(
+            check_trash(r#"{"trashedItems":3,"failedItems":0}"#).unwrap(),
+            Some(3)
+        );
+        // Unreadable / countless payloads are not proof of success — None, never a fabricated count.
+        assert_eq!(check_trash("").unwrap(), None);
+        assert_eq!(check_trash("not json").unwrap(), None);
+        assert_eq!(check_trash(r#"{"ok":true}"#).unwrap(), None);
     }
 
     #[test]

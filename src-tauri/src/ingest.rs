@@ -164,6 +164,7 @@ pub(crate) fn apply_event(snap: &mut crate::IngestJobState, ev: &IngestEvent) {
         // `Started` — matching how the views count. Counting `Started` too would double-count.
         IngestEvent::Done { .. } | IngestEvent::Failed { .. } | IngestEvent::Skipped { .. } => {
             snap.processed += 1;
+            finish_recent(snap, ev);
         }
         IngestEvent::Finished {
             ingested,
@@ -176,7 +177,56 @@ pub(crate) fn apply_event(snap: &mut crate::IngestJobState, ev: &IngestEvent) {
                 failed: *failed,
             });
         }
-        IngestEvent::Started { .. } => {}
+        IngestEvent::Started { name, .. } => push_recent(
+            snap,
+            crate::IngestItem {
+                name: name.clone(),
+                status: "working".into(),
+                detail: None,
+            },
+        ),
+    }
+}
+
+/// Append a row, dropping the oldest once the cap is reached.
+fn push_recent(snap: &mut crate::IngestJobState, item: crate::IngestItem) {
+    if snap.recent.len() >= crate::RECENT_ITEMS_CAP {
+        snap.recent.remove(0);
+        snap.recent_truncated = true;
+    }
+    snap.recent.push(item);
+}
+
+/// Resolve the open `working` row with a terminal event's outcome.
+///
+/// Amending the last working row (rather than appending) is what keeps one row per file. Doing this
+/// in the BACKEND also fixes a bug the frontend could not: a view that mounted mid-file received a
+/// terminal event whose `Started` it never heard, so it had no name to amend and pushed a nameless
+/// "failed — …" row. Here the preceding `Started` is always in hand.
+fn finish_recent(snap: &mut crate::IngestJobState, ev: &IngestEvent) {
+    // Mirrors the view's own folding exactly, so a row restored from the snapshot is indistinguishable
+    // from one the view built live: `done` adopts the indexed title + chunk count, the other two keep
+    // the name from `Started` and carry the reason/error.
+    let (status, name, detail) = match ev {
+        IngestEvent::Done { document } => (
+            "done",
+            Some(document.title.clone()),
+            Some(format!(
+                "{} chunk{}",
+                document.chunk_count,
+                if document.chunk_count == 1 { "" } else { "s" }
+            )),
+        ),
+        IngestEvent::Skipped { reason, .. } => ("skipped", None, Some(reason.clone())),
+        IngestEvent::Failed { error, .. } => ("failed", None, Some(error.clone())),
+        _ => return,
+    };
+    if let Some(row) = snap.recent.iter_mut().rev().find(|r| r.status == "working") {
+        row.status = status.into();
+        if let Some(n) = name {
+            row.name = n;
+        }
+        row.detail = detail;
     }
 }
 
@@ -3816,6 +3866,60 @@ mod tests {
         );
         let report = snap.last_report.expect("a finished run reports its counts");
         assert_eq!((report.ingested, report.skipped, report.failed), (5, 1, 2));
+    }
+
+    #[test]
+    fn snapshot_keeps_one_activity_row_per_file_and_amends_it_in_place() {
+        // The rows a returning tab renders. `Started` opens a row; the terminal event amends that
+        // same row rather than appending, so one file is one line — and because the backend always
+        // has the preceding `Started` in hand, a skip/failure can never produce a nameless row (the
+        // frontend, mounting mid-file, had no name to amend and pushed "failed — …" with none).
+        let mut snap = crate::IngestJobState::default();
+        apply_event(
+            &mut snap,
+            &IngestEvent::Started {
+                path: "a".into(),
+                name: "notes.md".into(),
+            },
+        );
+        assert_eq!(snap.recent.len(), 1);
+        assert_eq!(snap.recent[0].status, "working");
+
+        apply_event(
+            &mut snap,
+            &IngestEvent::Skipped {
+                path: "a".into(),
+                reason: "already indexed".into(),
+            },
+        );
+        assert_eq!(snap.recent.len(), 1, "the row is amended, not appended");
+        assert_eq!(snap.recent[0].name, "notes.md");
+        assert_eq!(snap.recent[0].status, "skipped");
+        assert_eq!(snap.recent[0].detail.as_deref(), Some("already indexed"));
+        assert!(!snap.recent_truncated);
+    }
+
+    #[test]
+    fn activity_rows_are_capped_keeping_the_tail() {
+        // A 10k-file rebuild must not grow the snapshot without bound. The TAIL is what someone
+        // returning is looking for, so the oldest rows go first and the truncation is flagged.
+        let mut snap = crate::IngestJobState::default();
+        for i in 0..(crate::RECENT_ITEMS_CAP + 5) {
+            apply_event(
+                &mut snap,
+                &IngestEvent::Started {
+                    path: format!("f{i}"),
+                    name: format!("f{i}"),
+                },
+            );
+        }
+        assert_eq!(snap.recent.len(), crate::RECENT_ITEMS_CAP);
+        assert!(snap.recent_truncated);
+        assert_eq!(snap.recent[0].name, "f5", "the oldest rows are dropped");
+        assert_eq!(
+            snap.recent[crate::RECENT_ITEMS_CAP - 1].name,
+            format!("f{}", crate::RECENT_ITEMS_CAP + 4)
+        );
     }
 
     #[test]

@@ -427,6 +427,14 @@ async fn do_refresh(
     if token.refresh_token.is_none() {
         token.refresh_token = Some(refresh);
     }
+    // Carry the granted scopes forward too, exactly as the refresh token is. Google normally echoes
+    // `scope` on a refresh, but it is not obliged to — and if it ever omits it, the stored blob loses
+    // the field, `token_has_scope` reads false, and an account that genuinely HOLDS the Sheets grant
+    // starts being nagged to reconnect for it. A refresh can never narrow a grant, so inheriting the
+    // previous value is always at least as accurate as dropping it.
+    if token.scope.is_none() {
+        token.scope = current.scope.clone();
+    }
     save_token(token_key, &token)?;
     Ok(token)
 }

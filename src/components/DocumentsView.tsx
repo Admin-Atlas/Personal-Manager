@@ -24,6 +24,7 @@ import {
 } from "../lib/ipc";
 import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
+import { readCopyPhotosToVault, writeCopyPhotosToVault } from "../lib/documentPrefs";
 import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { interactiveProps } from "../lib/interactiveProps";
@@ -88,6 +89,8 @@ export function DocumentsView({ onReviewClick }: Props) {
   // restarting the timer at 0:00.
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [items, setItems] = useState<ProgressItem[]>([]);
+  // True when the restored Activity list is only the tail of a longer run.
+  const [truncated, setTruncated] = useState(false);
   // Determinate-bar inputs: `total` from the `counted` event, `processed` counted up as
   // each file lands. Null total (setup / model download) keeps the bar an indeterminate sweep.
   const [total, setTotal] = useState<number | null>(null);
@@ -101,7 +104,9 @@ export function DocumentsView({ onReviewClick }: Props) {
   // folder (off by default — references like documents). When OCR isn't installed and a photo is
   // dropped, `photoPrompt` holds the paths awaiting the install decision (install, or skip → EXIF
   // only); `installingOcr`/`ocrFrac` drive the one-time download progress.
-  const [copyPhotosToVault, setCopyPhotosToVault] = useState(false);
+  // Seeded from localStorage, not `false` — switching tabs unmounts us (see the mount effect below),
+  // so component state alone silently reverted the choice and stopped copying.
+  const [copyPhotosToVault, setCopyPhotosToVault] = useState(readCopyPhotosToVault);
   const [photoPrompt, setPhotoPrompt] = useState<string[] | null>(null);
   const [installingOcr, setInstallingOcr] = useState(false);
   const [ocrFrac, setOcrFrac] = useState(0);
@@ -235,15 +240,22 @@ export function DocumentsView({ onReviewClick }: Props) {
 
     rebuildStatus()
       .then((job) => {
-        if (cancelled || !job.running) return;
+        if (cancelled) return;
+        if (!job.running) {
+          // A rebuild that finished while we were away still has a result worth showing — the
+          // `finished` event only ever reached a listener that was mounted at the time.
+          if (job.last_report) setSummary(job.last_report);
+          return;
+        }
         setBusy(true);
         setTotal(job.total);
         setProcessed(job.processed);
         setPrep(job.prep);
         setStartedAt(job.started_at_ms);
-        // Per-file rows aren't kept in the snapshot (they're transient and unbounded), so a
-        // restored run shows the bar and counts, then fills the list as new files land.
-        setItems([]);
+        // Restored from the backend's capped tail, not emptied. An ASSIGNMENT, never an append —
+        // that is what keeps this safe under StrictMode's double-invoked effects.
+        setItems(job.recent.map((r) => ({ ...r, detail: r.detail ?? undefined })));
+        setTruncated(job.recent_truncated);
         setSummary(null);
         setError(null);
       })
@@ -737,7 +749,10 @@ export function DocumentsView({ onReviewClick }: Props) {
             <input
               type="checkbox"
               checked={copyPhotosToVault}
-              onChange={(e) => setCopyPhotosToVault(e.target.checked)}
+              onChange={(e) => {
+                setCopyPhotosToVault(e.target.checked);
+                writeCopyPhotosToVault(e.target.checked);
+              }}
               className="mt-0.5 accent-[var(--accent)]"
             />
             <span>
@@ -824,7 +839,12 @@ export function DocumentsView({ onReviewClick }: Props) {
             </Card>
           )}
 
-          {(prep || items.length > 0 || summary) && (
+          {/* `busy` leads the gate: on a remount mid-rebuild `prep` is already null (the backend
+              clears it once counting starts), `items` has only just been restored and `summary` is
+              null, so without it the whole card — bar, timer and Activity — rendered nothing until
+              the next file finished. That wait is a full embed, i.e. the "few seconds" of apparent
+              death. `busy` is set the instant the status read resolves, which is immediate. */}
+          {(busy || prep || items.length > 0 || summary) && (
             <Card className="mt-4 p-3">
               {busy && (
                 <IngestProgress
@@ -839,6 +859,11 @@ export function DocumentsView({ onReviewClick }: Props) {
               {items.length > 0 && (
                 <Collapsible title="Activity" meta={`${items.length}`}>
                   <ul className="flex flex-col gap-1 pt-1">
+                    {truncated && (
+                      <li className="px-1 py-0.5 text-xs text-ink4">
+                        Showing the most recent files — earlier ones aren&rsquo;t kept.
+                      </li>
+                    )}
                     {items.map((item, i) => (
                       <li
                         key={i}

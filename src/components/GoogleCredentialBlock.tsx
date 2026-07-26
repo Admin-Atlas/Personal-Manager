@@ -163,7 +163,7 @@ function ClientSetupGuide() {
         >
           Google Drive API
         </a>{" "}
-        and/or{" "}
+        ,{" "}
         <a
           href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"
           target="_blank"
@@ -172,8 +172,18 @@ function ClientSetupGuide() {
         >
           Google Calendar API
         </a>{" "}
-        (select your project, then <span className="text-ink2">Enable</span>). Skipping this is what
-        causes the “this API has not been used / is disabled” error.
+        and/or{" "}
+        <a
+          href="https://console.cloud.google.com/apis/library/sheets.googleapis.com"
+          target="_blank"
+          rel="noreferrer"
+          className={link}
+        >
+          Google Sheets API
+        </a>{" "}
+        (select your project, then <span className="text-ink2">Enable</span>). Sheets is what lets
+        Drive read a spreadsheet’s tab names and column headers rather than just its filename.
+        Skipping this is what causes the “this API has not been used / is disabled” error.
       </li>
       <li>
         3. Configure the{" "}

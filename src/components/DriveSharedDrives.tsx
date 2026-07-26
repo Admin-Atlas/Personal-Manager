@@ -43,19 +43,26 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
   const saveSeq = useRef(0);
   const saveChain = useRef<Promise<void>>(Promise.resolve());
 
+  // The scope is a plain DB read and is what the My Drive checkbox and folder chooser need; the other
+  // two are live Drive calls. They used to share one Promise.all, so a single network failure left
+  // `scope` null and replaced the ENTIRE editor — including the controls that need no network at all
+  // — with one error line. Load the local half first and let the remote half fail on its own.
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [sc, dr, ow] = await Promise.all([
-        getDriveScope(email),
-        listDriveSharedDrives(email),
-        driveSharedOwners(email),
-      ]);
-      setScope(sc);
+      setScope(await getDriveScope(email));
+    } catch (e) {
+      setError(String(e));
+      setLoading(false);
+      return;
+    }
+    try {
+      const [dr, ow] = await Promise.all([listDriveSharedDrives(email), driveSharedOwners(email)]);
       setDrives(dr);
       setOwners(ow);
     } catch (e) {
+      // Non-fatal: the shared-drive list carries its own inline error + Retry below.
       setError(String(e));
     } finally {
       setLoading(false);
@@ -214,7 +221,16 @@ export function SharedDrivesManager({ email, onSaved }: { email: string; onSaved
         <div className="font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
           Shared drives
         </div>
-        {drives && drives.length === 0 ? (
+        {drives == null && error ? (
+          // The live half failed while the scope read succeeded — say so here, next to the list that
+          // is missing, instead of blanking the whole editor.
+          <p className="mt-1 break-words text-xs text-st-due">
+            Couldn&rsquo;t list shared drives: {error}
+            <button type="button" onClick={() => void load()} className="ml-2 underline">
+              Retry
+            </button>
+          </p>
+        ) : drives && drives.length === 0 ? (
           <p className="mt-1 text-xs text-ink4">No shared drives are available on this account.</p>
         ) : (
           <ul className="mt-2 divide-y divide-rule">

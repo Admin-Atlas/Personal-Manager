@@ -65,9 +65,16 @@ function RefreshButton({ busy, onRefresh }: { busy: boolean; onRefresh: () => vo
 export function Briefing({
   variant = "card",
   className = "",
+  fill = false,
 }: {
   variant?: BriefingVariant;
   className?: string;
+  /** Panel variant only: grow the text to the host's height instead of stopping at `max-h-48`.
+   *  For hosts the USER can resize — the OS briefing window and the in-app floating panel — where a
+   *  fixed cap left the window growing while the text stayed pinned, i.e. dead space below
+   *  "Updated …". The sidebar must NOT pass it: there the cap is load-bearing, keeping a long
+   *  briefing from pushing the nav out of reach. */
+  fill?: boolean;
 }) {
   const { briefing, busy, refresh } = useBriefing();
   const text = briefing?.briefing.trim() ?? "";
@@ -100,18 +107,24 @@ export function Briefing({
     );
   }
 
-  // Panel: no Card chrome (the host supplies its own), a smaller heading, and the text scrolls inside
-  // a bounded box rather than growing — in the sidebar it would otherwise push the nav out of reach,
-  // and in the floating panel it would outgrow the window.
+  // Panel: no Card chrome (the host supplies its own) and a smaller heading. The text scrolls inside
+  // a bounded box in the sidebar, where growing would push the nav out of reach — but in a
+  // user-resizable host (`fill`) it takes the height it is given, so the window and its content grow
+  // together instead of leaving a black gap under "Updated …".
   return (
-    <div className={className} data-help="focus-briefing">
-      <div className="mb-1 flex items-center justify-between gap-2">
+    <div
+      className={`${fill ? "flex h-full min-h-0 flex-col" : ""} ${className}`}
+      data-help="focus-briefing"
+    >
+      <div className="mb-1 flex shrink-0 items-center justify-between gap-2">
         <h2 className="font-mono text-[0.6875rem] font-semibold uppercase tracking-wide text-faint">
           Today
         </h2>
         <RefreshButton busy={busy} onRefresh={onRefresh} />
       </div>
-      <div className="max-h-48 overflow-y-auto">{body}</div>
+      <div className={fill ? "min-h-0 flex-1 overflow-y-auto" : "max-h-48 overflow-y-auto"}>
+        {body}
+      </div>
       {updated}
     </div>
   );

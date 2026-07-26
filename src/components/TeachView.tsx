@@ -448,7 +448,10 @@ function EntityCard({
                   disabled={busy}
                   aria-label={`Remove the name ${alias}`}
                   title={`Remove “${alias}” — it stops resolving to ${entity.canonical_name}`}
-                  className="opacity-0 transition hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+                  // Persistently visible, not hover-revealed. The removal itself works, but a fully
+                  // transparent ~10px glyph with no hit padding meant people clicked the chip body
+                  // (which has no handler) and reported that removing a name did nothing.
+                  className="-mr-0.5 px-1 text-accent-text/60 transition hover:text-ink"
                 >
                   ×
                 </button>

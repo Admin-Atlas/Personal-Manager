@@ -132,10 +132,11 @@ export function BriefingPanel() {
         </IconButton>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-        {/* `panel` bounds its own body height; here the flex parent already scrolls, so the extra
-            cap is harmless and keeps the two panel surfaces identical. */}
-        <Briefing variant="panel" />
+      <div className="min-h-0 flex-1 overflow-hidden px-3 py-2">
+        {/* `fill`, because this panel has a resize grip: the old bounded body meant dragging it
+            taller grew the frame while the text stopped dead at 12rem. The body owns the scroller
+            now, so there is only one. */}
+        <Briefing variant="panel" fill />
       </div>
 
       {/* Bottom-right resize grip. */}
