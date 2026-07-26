@@ -67,6 +67,7 @@ import {
   onVaultAcquired,
   onVaultCurtain,
   onVaultFault,
+  localBetterFitNotice,
   onVaultMetaWarning,
   openUrl,
   resumeDriveSync,
@@ -134,6 +135,9 @@ export default function App() {
    *  `nonce` bumps on every click so re-clicking the same citation re-fires the jump. */
   const [focusTurn, setFocusTurn] = useState<{ id: number; nonce: number } | null>(null);
   const [reviewCount, setReviewCount] = useState(0);
+  /** A better-fitting local model is available (#437). Drives the quiet dot on the sidebar's
+   *  Settings row and on Settings' own Local AI tab; cleared the moment it's dismissed. */
+  const [betterFit, setBetterFit] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
 
   function openProject(project: string, focusDocId?: number) {
@@ -476,6 +480,20 @@ export default function App() {
   useEffect(() => {
     if (aiReady) void refreshReviewCount();
   }, [aiReady, view, refreshReviewCount]);
+
+  const refreshBetterFit = useCallback(async () => {
+    try {
+      setBetterFit((await localBetterFitNotice()) !== null);
+    } catch {
+      /* a suggestion is a nicety; a failure just means no dot */
+    }
+  }, []);
+
+  // Same cadence as the review badge: re-read as the user moves around, so the dot appears without
+  // needing a restart and disappears as soon as the suggestion is acted on or dismissed.
+  useEffect(() => {
+    if (aiReady) void refreshBetterFit();
+  }, [aiReady, view, refreshBetterFit]);
 
   // Resume a Drive sync interrupted by a previous close/crash mid-index. Runs once the vault is open
   // (aiReady implies an unlocked store), detached in the backend — already-indexed files survive, so
@@ -880,6 +898,7 @@ export default function App() {
                   conversations={inProject ? projectChat.conversations : conversations}
                   activeId={inProject ? projectChat.convId : activeId}
                   reviewCount={reviewCount}
+                  betterFit={betterFit}
                   onSelect={
                     inProject
                       ? projectChat.openConversation
@@ -1043,6 +1062,8 @@ export default function App() {
                       setShowSettings(false);
                       setView("teach");
                     }}
+                    betterFit={betterFit}
+                    onBetterFitChange={() => void refreshBetterFit()}
                   />
                 </div>
               )}

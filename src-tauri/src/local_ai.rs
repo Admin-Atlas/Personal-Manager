@@ -24,7 +24,8 @@ use crate::llm_gateway::{
 };
 use crate::local_slot::{classify_ip, posture_for, EndpointClass, PostureVerdict};
 use crate::{
-    db, fit, hardware, local_catalog, local_disk, openai_compat, paths, secrets, AppState,
+    better_fit, db, fit, hardware, local_catalog, local_disk, openai_compat, paths, secrets,
+    AppState,
 };
 
 /// The three servers PM knows how to auto-detect, by their default loopback port.
@@ -569,6 +570,138 @@ pub async fn local_hardware_scan(app: AppHandle, force: bool) -> Result<hardware
     app.state::<AppState>().local_ai.clear_disk_models();
     let hw = scan_hardware(&app).await?;
     Ok(hw)
+}
+
+// ---------------------------------------------------------------------------------------------
+// "A better-fitting model is available" (#437)
+// ---------------------------------------------------------------------------------------------
+
+/// Whether there is a better-fitting local model worth mentioning right now, and what it is.
+///
+/// Two independent questions, deliberately kept apart: **is it time to look** — the user's rescan
+/// cadence ([`local_catalog::rescan_due`]) — and **is there anything worth saying** — the pure
+/// comparison in [`better_fit::suggest`]. Both must say yes.
+///
+/// Cheap enough for the app shell to poll as the user moves around: it reuses the cached hardware
+/// scan and on-disk crawl (running each at most once per session), and everything after that is pure.
+#[tauri::command]
+pub async fn local_better_fit_notice(app: AppHandle) -> Result<Option<better_fit::Suggestion>> {
+    let cat = local_catalog::catalog();
+
+    // Is it even time to look? `manual` never fires; the default only fires when a shipped update
+    // brought a newer catalog than the one the user last acknowledged.
+    let (base_url, chat_model, background_model, due) = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let cadence = local_catalog::RescanCadence::from_setting(
+            db::get_setting(&conn, local_catalog::RESCAN_CADENCE_KEY)?.as_deref(),
+        );
+        let seen = db::get_setting(&conn, local_catalog::CATALOG_VERSION_SEEN_KEY)?
+            .and_then(|s| s.parse::<u32>().ok());
+        let last =
+            db::get_setting_time(&conn, local_catalog::LAST_RESCAN_KEY).map(|t| t.timestamp());
+        let due = local_catalog::rescan_due(
+            cadence,
+            seen,
+            cat.catalog_version,
+            last,
+            chrono::Utc::now().timestamp(),
+        );
+        (
+            db::get_setting(&conn, LOCAL_BASE_URL_KEY)?,
+            db::get_setting(&conn, LOCAL_CHAT_MODEL_KEY)?,
+            db::get_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?,
+            due,
+        )
+    };
+    if !due || base_url.is_none() {
+        return Ok(None);
+    }
+
+    let hardware = match app.state::<AppState>().local_ai.cached_hardware() {
+        Some(hw) => hw,
+        None => scan_hardware(&app).await?,
+    };
+    let fit_hw = fit::FitHardware {
+        available_ram_gb: hardware.available_ram_gb,
+        vram_gb: hardware.vram_gb,
+        gpu_bandwidth_gbps: hardware.gpu_bandwidth_gbps,
+        unified_memory: hardware.unified_memory,
+    };
+
+    // Which curated models are already downloaded (#449) — a suggestion the user can act on for free.
+    let on_disk: Vec<String> = disk_scan(&app)
+        .await
+        .models
+        .iter()
+        .filter_map(|m| local_catalog::match_installed(&m.name).map(|e| e.repo.clone()))
+        .collect();
+
+    let candidates: Vec<better_fit::Candidate> = cat
+        .entries
+        .iter()
+        .filter(|e| e.fit == local_catalog::FitClass::Computed)
+        .map(|e| better_fit::Candidate {
+            repo: e.repo.clone(),
+            display_name: e.display_name.clone(),
+            parameters_b: e.parameters_b,
+            verdict: fit::fit(&local_catalog::entry_to_spec(e), &fit_hw).verdict,
+            on_disk: on_disk.iter().any(|r| r == &e.repo),
+        })
+        .collect();
+
+    // The baseline is whatever the user already runs — the BEST of it, so someone with a large chat
+    // model isn't nagged about something that only beats their small background one.
+    let assigned: Vec<better_fit::Candidate> = [chat_model, background_model]
+        .into_iter()
+        .flatten()
+        .filter(|m| !m.trim().is_empty())
+        .filter_map(|m| local_catalog::match_installed(&m).map(|e| e.repo.clone()))
+        .filter_map(|repo| candidates.iter().find(|c| c.repo == repo).cloned())
+        .collect();
+
+    Ok(better_fit::suggest(
+        better_fit::baseline(assigned.iter()),
+        &candidates,
+    ))
+}
+
+/// Acknowledge the better-fit notice: record that the user has seen this catalog's evaluation, which
+/// silences it until their cadence says to look again (a newer catalog on the default setting, or the
+/// next week/month on the timed ones).
+///
+/// This is the write side of three settings that PR4 defined and read but nothing ever wrote — so
+/// `rescan_due` was permanently true for every user. Nothing surfaced it before this card, which is
+/// why it was invisible rather than noisy.
+#[tauri::command]
+pub fn dismiss_local_better_fit(state: State<'_, AppState>) -> Result<()> {
+    let conn = state.conn()?;
+    db::set_setting(
+        &conn,
+        local_catalog::CATALOG_VERSION_SEEN_KEY,
+        &local_catalog::catalog().catalog_version.to_string(),
+    )?;
+    db::set_setting(
+        &conn,
+        local_catalog::LAST_RESCAN_KEY,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+    Ok(())
+}
+
+/// How often PM re-checks whether a better-fitting model has appeared. `manual` turns the notice off
+/// without hiding the control that would bring it back.
+#[tauri::command]
+pub fn set_local_model_rescan_cadence(state: State<'_, AppState>, cadence: String) -> Result<()> {
+    // Round-trip through the enum so an unknown string can't be persisted — it parses to the default.
+    let parsed = local_catalog::RescanCadence::from_setting(Some(cadence.as_str()));
+    let conn = state.conn()?;
+    db::set_setting(
+        &conn,
+        local_catalog::RESCAN_CADENCE_KEY,
+        parsed.as_setting(),
+    )?;
+    Ok(())
 }
 
 /// Point the on-disk crawl (#449) at an extra folder, or clear it with `None`. Persisted, and drops
