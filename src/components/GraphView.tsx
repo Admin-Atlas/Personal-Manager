@@ -29,7 +29,7 @@ import {
   type PositionedNode,
 } from "../lib/mapLayout";
 import { IngestProgress } from "./IngestProgress";
-import { Skeleton } from "./ui";
+import { Select, Skeleton } from "./ui";
 import type { Document, SemanticLayout } from "../lib/types";
 import { useReader } from "../lib/reader";
 import { graphColor, useTheme, useDepth } from "../theme";
@@ -656,16 +656,16 @@ export function GraphView() {
                 data-help="map-cohesion"
               >
                 <span>Cohesion</span>
-                <select
+                <Select
+                  compact
                   value={String(cohesion)}
                   onChange={(e) => setCohesion(Number(e.target.value))}
-                  className="rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 text-xs text-ink2 outline-none transition focus:border-accent"
                 >
                   <option value="0">Off</option>
                   <option value="0.15">Low</option>
                   <option value="0.3">Medium</option>
                   <option value="0.5">High</option>
-                </select>
+                </Select>
               </label>
             )}
             <button

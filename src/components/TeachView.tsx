@@ -23,7 +23,7 @@ import { useDevMode } from "../lib/capabilities";
 import { useDepth } from "../theme";
 import { TeachPreferences } from "./TeachPreferences";
 import { DevRaw } from "./dev/DevRaw";
-import { Button, Card, Input, Modal, Skeleton } from "./ui";
+import { Button, Card, Input, Modal, Select, Skeleton } from "./ui";
 
 /** The always-present fallback bucket; we don't nudge merges for it. */
 const UNSORTED = "Unsorted";
@@ -269,10 +269,10 @@ export function TeachView() {
             )}
 
             <label className="mt-4 block text-xs text-ink3">Keep this project</label>
-            <select
+            <Select
               value={mergeTargetId ?? ""}
               onChange={(e) => setMergeTargetId(e.target.value ? Number(e.target.value) : null)}
-              className="mt-1 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-3 py-2 text-sm text-ink2 outline-none focus:border-accent"
+              className="mt-1 w-full"
             >
               <option value="">Choose a project…</option>
               {entities
@@ -282,7 +282,7 @@ export function TeachView() {
                     {e.canonical_name}
                   </option>
                 ))}
-            </select>
+            </Select>
 
             <div className="mt-5 flex justify-end gap-2">
               <Button variant="tertiary" onClick={() => setMergeSource(null)} disabled={busy}>

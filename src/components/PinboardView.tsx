@@ -37,11 +37,19 @@ import {
   listIndentBeforeCaret,
   outdentLines,
   toRenderMarkdown,
+  toggleTaskAt,
   toggleWrap,
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
 import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinboard/useBoardDrag";
-import { readConfirmDelete, writeConfirmDelete } from "../lib/pinboard/prefs";
+import {
+  isPastTimelineDate,
+  readConfirmDelete,
+  readShowPastTimelineItems,
+  writeConfirmDelete,
+  writeShowPastTimelineItems,
+} from "../lib/pinboard/prefs";
+import { todayIso } from "../lib/dateField";
 import { usePinboard } from "../lib/pinboard/usePinboard";
 // The tint set + names live in one place (src/lib/pinboard/palette.ts) so the board's colours
 // stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
@@ -49,6 +57,7 @@ import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
 import type { CellPoint, Rect, TimelineItem, Widget } from "../lib/pinboard/types";
 import type { Milestone } from "../lib/types";
 import { useDepth } from "../theme";
+import { DateField } from "./DateField";
 import { Button, ConfirmDialog, Modal, SegmentedControl, Textarea, Tooltip } from "./ui";
 
 /** The live filing state of a note's ingested document, keyed by `note:<widgetId>`. */
@@ -842,8 +851,11 @@ function WidgetHeader({
       />
       {/* A drag grip so a long title still leaves somewhere to grab the header — only where the
           header IS a handle. Folder-panel cards aren't draggable, so the spacer was 24px of a narrow
-          card's budget spent on nothing. */}
-      {onStartDrag && <div className="w-6 shrink-0 self-stretch" aria-hidden="true" />}
+          card's budget spent on nothing. It used to be blank space: the whole bar drags, but with
+          nothing drawn there you had to hunt for a spot that wasn't the title or a button. The dots
+          just SHOW where the reliable grab point is — the handler still lives on the bar, so this
+          needs no pointer logic of its own. */}
+      {onStartDrag && <DragGrip />}
       {/* min-w-0 shrink, not shrink-0: the actions must be able to give, or they overflow the card
           (which is overflow-hidden) and the ✕ on the end is what gets clipped away. */}
       <div className="flex min-w-0 shrink items-center gap-1">
@@ -862,6 +874,56 @@ function WidgetHeader({
   );
 }
 
+/** "Past" — the timeline card's counterpart to the project panel's "Completed" checkbox. Writes
+ *  through on change so every timeline card on the board agrees, and so the choice survives a
+ *  remount (a tab switch unmounts the whole board). */
+function ShowPastToggle({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label
+      className="flex shrink-0 items-center gap-1 text-[0.625rem] uppercase tracking-wide text-ink4"
+      title="Show entries whose date has already passed"
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => {
+          const next = e.currentTarget.checked;
+          onChange(next);
+          writeShowPastTimelineItems(next);
+        }}
+        className="accent-[var(--accent)]"
+      />
+      Past
+    </label>
+  );
+}
+
+/** The 2×3 dot grip drawn in a draggable widget header, immediately left of the header's actions —
+ *  so on a note it sits beside the ingest control, and on a folder-overlay child beside its pop-out.
+ *  Purely a visual affordance: `aria-hidden` and `pointer-events-none` so it neither appears to
+ *  assistive tech as a control nor intercepts the pointerdown the header itself is listening for. */
+function DragGrip() {
+  return (
+    <svg
+      viewBox="0 0 6 10"
+      aria-hidden="true"
+      className="pointer-events-none w-1.5 shrink-0 self-center text-ink4"
+      fill="currentColor"
+    >
+      {[1, 5].map((cx) =>
+        [1, 5, 9].map((cy) => <circle key={`${cx}-${cy}`} cx={cx} cy={cy} r="1" />),
+      )}
+    </svg>
+  );
+}
+
 /** "Move this card out of the folder, back onto the board" — shown on folder-panel children. */
 function PopOutButton({ onClick }: { onClick: () => void }) {
   return (
@@ -876,6 +938,30 @@ function PopOutButton({ onClick }: { onClick: () => void }) {
       ⤴
     </button>
   );
+}
+
+/** Which rendered task checkbox (if any) a click at these viewport coordinates landed on.
+ *
+ *  Hit-tested against each box's own rect rather than by walking up to the `<li>`, because the whole
+ *  list item is also the click target for "open the editor" — only the box itself should tick. The
+ *  boxes are in document order, which is the order `toggleTaskAt` counts markers in, so the array
+ *  index IS the marker index. `PAD` gives the ~13px native box a forgiving target without letting it
+ *  reach the text. */
+function taskIndexAt(container: HTMLElement, clientX: number, clientY: number): number | null {
+  const PAD = 4;
+  const boxes = container.querySelectorAll<HTMLInputElement>('li input[type="checkbox"]');
+  for (let i = 0; i < boxes.length; i++) {
+    const r = boxes[i].getBoundingClientRect();
+    if (
+      clientX >= r.left - PAD &&
+      clientX <= r.right + PAD &&
+      clientY >= r.top - PAD &&
+      clientY <= r.bottom + PAD
+    ) {
+      return i;
+    }
+  }
+  return null;
 }
 
 // Memoised: a drag/resize sets state on every pointermove, re-rendering the whole board — without
@@ -1133,7 +1219,21 @@ const NoteBody = memo(function NoteBody({
         <div
           // pm-note-md scopes the flush-checkbox rule to notes (index.css) without touching chat/reader.
           className="pm-note-md min-h-0 flex-1 cursor-text overflow-auto px-2 text-sm"
-          onClick={() => setEditing(true)}
+          // A click on a rendered checkbox ticks it; a click anywhere else opens the editor. The
+          // boxes carry `pointer-events: none` (index.css) so the click lands here rather than being
+          // swallowed by the disabled input, and the hit test is by COORDINATES against each box's
+          // rect — not "did you hit the <li>" — so clicking a task's TEXT still opens the editor.
+          onClick={(e) => {
+            const idx = taskIndexAt(e.currentTarget, e.clientX, e.clientY);
+            if (idx !== null) {
+              const next = toggleTaskAt(text, idx);
+              if (next !== null) {
+                editText(next);
+                return;
+              }
+            }
+            setEditing(true);
+          }}
           // Keyboard path into edit mode. No role/aria-label — it's the note's content region, so its
           // text stays the accessible name; Enter only edits when the region itself (not a link inside) is focused.
           tabIndex={0}
@@ -1754,6 +1854,8 @@ function BoundTimeline({
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [showPast, setShowPast] = useState(readShowPastTimelineItems);
+  const today = todayIso();
 
   const refresh = useCallback(() => {
     let cancelled = false;
@@ -1775,13 +1877,15 @@ function BoundTimeline({
   }, [refresh]);
 
   // Earliest→latest by effective date; undated sink to the end.
-  const ordered = [...milestones].sort((a, b) => {
+  const sorted = [...milestones].sort((a, b) => {
     const da = msDate(a);
     const db = msDate(b);
     if (!da) return 1;
     if (!db) return -1;
     return da.localeCompare(db);
   });
+  const hasPast = sorted.some((m) => isPastTimelineDate(msDate(m), today));
+  const ordered = showPast ? sorted : sorted.filter((m) => !isPastTimelineDate(msDate(m), today));
 
   async function add() {
     await runMutation(async () => {
@@ -1796,6 +1900,9 @@ function BoundTimeline({
         <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink2" title={project}>
           {project}
         </span>
+        {/* Only offered when there is something to hide — on a card this size an always-present
+            checkbox that does nothing is worse than no checkbox. */}
+        {hasPast && <ShowPastToggle checked={showPast} onChange={setShowPast} />}
         <button
           onClick={onUnlink}
           title="Unlink this project (its milestones stay in the project)"
@@ -1809,7 +1916,11 @@ function BoundTimeline({
       {loading ? (
         <p className="text-[0.6875rem] text-ink4">Loading…</p>
       ) : ordered.length === 0 ? (
-        <p className="text-[0.6875rem] text-ink4">No milestones yet — add one below.</p>
+        <p className="text-[0.6875rem] text-ink4">
+          {milestones.length === 0
+            ? "No milestones yet — add one below."
+            : "Everything here has already passed — tick “Past” to see it."}
+        </p>
       ) : view === "row" ? (
         <TimelineTrack>
           {ordered.map((m) => (
@@ -1867,9 +1978,12 @@ function useMilestoneEditor(
   useEffect(() => setLabel(m.label), [m.label]);
   useEffect(() => setDate(m.due_date?.slice(0, 10) ?? ""), [m.due_date]);
 
-  const persist = async () => {
+  // `dateOverride` is how DateField commits — it hands the new value straight in, because reading
+  // `date` right after a `setDate` in the same tick still sees the previous render's value.
+  const persist = async (dateOverride?: string) => {
     const nextLabel = label.trim() || "deadline";
-    const nextDate = m.calendar_linked ? null : date || null;
+    const effectiveDate = dateOverride ?? date;
+    const nextDate = m.calendar_linked ? null : effectiveDate || null;
     const curDate = m.calendar_linked ? null : msDate(m) || null;
     if (nextLabel === m.label && nextDate === curDate) return;
     await runMutation(async () => {
@@ -1931,19 +2045,22 @@ function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProp
           📅 {m.due_date ? formatDateOnly(msDate(m)) : "—"}
         </span>
       ) : (
-        <input
-          type="date"
+        <DateField
           value={date}
-          onChange={(e) => setDate(e.target.value)}
-          onBlur={persist}
-          className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[0.5625rem] text-ink3 focus:border-accent focus:outline-none"
+          onCommit={(iso) => {
+            setDate(iso);
+            void persist(iso);
+          }}
+          ariaLabel="Milestone deadline"
+          wrapperClassName="w-full"
+          className="h-6 px-0.5 font-mono text-[0.5625rem] text-ink3"
         />
       )}
       <MilestoneDot met={met} onToggle={toggleDone} />
       <input
         value={label}
         onChange={(e) => setLabel(e.target.value)}
-        onBlur={persist}
+        onBlur={() => void persist()}
         placeholder="label"
         className={`w-full rounded-[var(--radius-sm)] bg-transparent px-0.5 text-center text-[0.625rem] text-ink2 focus:outline-none ${
           met ? "text-ink4 line-through" : ""
@@ -1984,18 +2101,21 @@ function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) 
           📅 {m.due_date ? formatDateOnly(msDate(m)) : "—"}
         </span>
       ) : (
-        <input
-          type="date"
+        <DateField
           value={date}
-          onChange={(e) => setDate(e.target.value)}
-          onBlur={persist}
-          className="w-[6.25rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[0.625rem] text-ink3 focus:border-accent focus:outline-none"
+          onCommit={(iso) => {
+            setDate(iso);
+            void persist(iso);
+          }}
+          ariaLabel="Milestone deadline"
+          wrapperClassName="w-[7.5rem] shrink-0"
+          className="px-1 py-0.5 font-mono text-[0.625rem] text-ink3"
         />
       )}
       <input
         value={label}
         onChange={(e) => setLabel(e.target.value)}
-        onBlur={persist}
+        onBlur={() => void persist()}
         placeholder="label"
         className={`min-w-0 flex-1 rounded-[var(--radius-sm)] border border-transparent bg-transparent px-1 py-0.5 text-xs text-ink2 focus:border-accent focus:outline-none ${
           met ? "text-ink4 line-through" : ""
@@ -2031,6 +2151,8 @@ function FreeformTimeline({
   const [projects, setProjects] = useState<string[]>([]);
   const [projDraft, setProjDraft] = useState("");
   const [linkErr, setLinkErr] = useState<string | null>(null);
+  const [showPast, setShowPast] = useState(readShowPastTimelineItems);
+  const today = todayIso();
   useEffect(() => {
     listProjects()
       .then(setProjects)
@@ -2039,11 +2161,15 @@ function FreeformTimeline({
   const listId = `pm-projects-${widget.id}`;
 
   // Show items in date order; undated items sink to the bottom.
-  const items = [...(widget.items ?? [])].sort((a, b) => {
+  const sortedItems = [...(widget.items ?? [])].sort((a, b) => {
     if (!a.date) return 1;
     if (!b.date) return -1;
     return a.date.localeCompare(b.date);
   });
+  const hasPast = sortedItems.some((it) => isPastTimelineDate(it.date, today));
+  const items = showPast
+    ? sortedItems
+    : sortedItems.filter((it) => !isPastTimelineDate(it.date, today));
 
   // Bind to a project — but first MERGE the freeform entries into that project's real milestones, so
   // what you typed becomes the project's milestones instead of vanishing behind the bound view. Dedup
@@ -2075,9 +2201,18 @@ function FreeformTimeline({
 
   return (
     <div className="flex h-full flex-col px-2 py-1">
+      {hasPast && (
+        <div className="mb-1 flex shrink-0 justify-end">
+          <ShowPastToggle checked={showPast} onChange={setShowPast} />
+        </div>
+      )}
       {items.length === 0 ? (
         <div className="min-h-0 flex-1">
-          <p className="text-[0.6875rem] text-ink4">No milestones yet.</p>
+          <p className="text-[0.6875rem] text-ink4">
+            {sortedItems.length === 0
+              ? "No milestones yet."
+              : "Everything here has already passed — tick “Past” to see it."}
+          </p>
         </div>
       ) : view === "row" ? (
         <TimelineTrack>
@@ -2095,12 +2230,13 @@ function FreeformTimeline({
         <TimelineList>
           {items.map((it) => (
             <div key={it.id} className="flex items-center gap-1">
-              <input
-                type="date"
+              <DateField
                 value={it.date ?? ""}
-                onChange={(e) => onUpdateItem(widget.id, it.id, { date: e.target.value })}
+                onCommit={(iso) => onUpdateItem(widget.id, it.id, { date: iso })}
+                ariaLabel="Timeline date"
                 title={it.date ? formatDateOnly(it.date) : "Set a date"}
-                className="w-[6.25rem] shrink-0 rounded-[var(--radius-sm)] border border-border2 bg-surface px-1 py-0.5 font-mono text-[0.625rem] text-ink3 focus:border-accent focus:outline-none"
+                wrapperClassName="w-[7.5rem] shrink-0"
+                className="px-1 py-0.5 font-mono text-[0.625rem] text-ink3"
               />
               <input
                 value={it.label ?? ""}
@@ -2183,12 +2319,13 @@ function FreeformColumn({
 }) {
   return (
     <div className="flex w-[5.5rem] shrink-0 flex-col items-center gap-1 text-center">
-      <input
-        type="date"
+      <DateField
         value={item.date ?? ""}
-        onChange={(e) => onUpdateItem(widgetId, item.id, { date: e.target.value })}
+        onCommit={(iso) => onUpdateItem(widgetId, item.id, { date: iso })}
+        ariaLabel="Timeline date"
         title={item.date ? formatDateOnly(item.date) : "Set a date"}
-        className="h-6 w-full rounded-[var(--radius-sm)] border border-border2 bg-surface px-0.5 font-mono text-[0.5625rem] text-ink3 focus:border-accent focus:outline-none"
+        wrapperClassName="w-full"
+        className="h-6 px-0.5 font-mono text-[0.5625rem] text-ink3"
       />
       <span
         className="h-2.5 w-2.5 shrink-0 rounded-full border"

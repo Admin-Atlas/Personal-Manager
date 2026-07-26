@@ -56,7 +56,7 @@ import type {
 import { formatDateTime } from "../lib/format";
 import { isOpaquePhase, describeFailures } from "../lib/backup";
 import { readReconcileDismissed, writeReconcileDismissed } from "../lib/backupPrefs";
-import { Button, Input, SectionInfo } from "./ui";
+import { Button, Input, SectionInfo, Select } from "./ui";
 import { PassphraseStrengthMeter } from "./PassphraseStrengthMeter";
 import { IngestProgress } from "./IngestProgress";
 
@@ -1209,8 +1209,9 @@ export function BackupSettings() {
             {gdrive.accounts.length > 0 && (
               <label className="flex items-center justify-between gap-2 text-xs text-ink3">
                 <span>Account</span>
-                <select
-                  className="min-w-0 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
+                <Select
+                  compact
+                  className="min-w-0"
                   value={gdriveAccountChoice || gdrive.accounts[0]?.email || ""}
                   onChange={(e) => setGdriveAccountChoice(e.currentTarget.value)}
                   disabled={busy}
@@ -1220,7 +1221,7 @@ export function BackupSettings() {
                       {a.email}
                     </option>
                   ))}
-                </select>
+                </Select>
               </label>
             )}
             <div>
@@ -1401,8 +1402,8 @@ export function BackupSettings() {
 
             <label className="flex items-center justify-between gap-2 text-xs text-ink3">
               <span>Frequency</span>
-              <select
-                className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
+              <Select
+                compact
                 value={freqDraft}
                 onChange={(e) => setFreqDraft(e.currentTarget.value as BackupSchedule["frequency"])}
                 disabled={savingSchedule || busy}
@@ -1411,7 +1412,7 @@ export function BackupSettings() {
                 <option value="daily">Daily</option>
                 <option value="weekly">Weekly</option>
                 <option value="monthly">Monthly</option>
-              </select>
+              </Select>
             </label>
 
             {freqDraft !== "off" && (

@@ -13,6 +13,7 @@ import {
 } from "../lib/ipc";
 import { formatDateOnly } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
+import { DateField } from "./DateField";
 import { Button, Input } from "./ui";
 
 interface Props {
@@ -155,9 +156,13 @@ function MilestoneRow({
   const met = m.state === "met";
 
   // Persist label (+ PM-native date) on blur, skipping a no-op so we don't refetch needlessly.
-  async function persist() {
+  // `dateOverride` is how DateField commits: it hands us the new value directly, because reading
+  // `date` here right after a `setDate` in the same tick would see the PREVIOUS render's value and
+  // silently persist the old day.
+  async function persist(dateOverride?: string) {
     const nextLabel = label.trim() || "deadline";
-    const nextDate = m.calendar_linked ? null : date || null;
+    const effectiveDate = dateOverride ?? date;
+    const nextDate = m.calendar_linked ? null : effectiveDate || null;
     const curDate = m.calendar_linked ? null : (m.due_date?.slice(0, 10) ?? null);
     if (nextLabel === m.label && nextDate === curDate) return;
     await runMutation(async () => {
@@ -193,7 +198,7 @@ function MilestoneRow({
         <Input
           value={label}
           onChange={(e) => setLabel(e.target.value)}
-          onBlur={persist}
+          onBlur={() => void persist()}
           placeholder="label"
           className={`h-7 min-w-0 flex-1 text-xs ${met ? "line-through" : ""}`}
         />
@@ -244,12 +249,15 @@ function MilestoneRow({
             </Button>
           </span>
         ) : (
-          <Input
-            type="date"
+          <DateField
             value={date}
-            onChange={(e) => setDate(e.target.value)}
-            onBlur={persist}
-            className={`h-7 min-w-0 flex-1 text-xs ${met ? "line-through" : ""}`}
+            onCommit={(iso) => {
+              setDate(iso);
+              void persist(iso);
+            }}
+            ariaLabel="Milestone deadline"
+            wrapperClassName="min-w-0 flex-1"
+            className={`h-7 px-1.5 text-xs ${met ? "line-through" : ""}`}
           />
         )}
         {onMove && (
@@ -334,12 +342,12 @@ function AddMilestone({
         placeholder="New milestone (e.g. pitch)"
         className="h-7 min-w-0 flex-1 basis-28 text-xs"
       />
-      <Input
-        type="date"
+      <DateField
         value={date}
-        onChange={(e) => setDate(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && void add()}
-        className="h-7 min-w-0 flex-1 basis-28 text-xs"
+        onCommit={setDate}
+        ariaLabel="New milestone deadline"
+        wrapperClassName="min-w-0 flex-1 basis-28"
+        className="h-7 px-1.5 text-xs"
       />
       <Button
         variant="secondary"

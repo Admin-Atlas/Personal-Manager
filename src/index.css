@@ -176,9 +176,17 @@ body {
   margin: 0.125rem 0;
 }
 /* GFM task lists (from a note's `[]` / `[x]` markers): drop the redundant bullet beside the
-   checkbox and give the box a little breathing room. :has covers the item whether or not the
-   sanitizer keeps the task-list class. The checkbox is disabled in rendered Markdown — toggle it
-   by editing the note's `[]`/`[x]`. */
+   checkbox and give the box a little breathing room.
+
+   EVERY task-list rule below is written twice — once against remark-gfm's own `task-list-item` /
+   `contains-task-list` classes (which survive sanitization: the default schema allows `className`
+   on `li` and `ul`) and once against `:has()`. They are NOT redundant. `:has()` is unsupported on
+   older WebKitGTK, and when the selector fails to match, the flush rules below silently don't
+   apply — so a Linux user gets the browser default indent on top-level checklists and DOUBLE that
+   on nested ones, which is exactly the "checkboxes are really far in" report. The class selectors
+   carry the styling on any engine; `:has()` stays as the fallback for the reverse case, a renderer
+   that drops the classes. */
+.pm-markdown li.task-list-item,
 .pm-markdown li:has(input[type="checkbox"]) {
   list-style: none;
 }
@@ -189,13 +197,36 @@ body {
 /* Pinboard notes only (scoped via `.pm-note-md`, so chat / the document reader keep their
    indented lists): a top-level checklist sits FLUSH with the note's left edge — a lone
    checkbox shouldn't look pre-indented. A Tab-nested checklist (rendered as a task list
-   inside a parent list item) keeps its indentation; the nested selector's higher specificity
-   wins over the flush rule above it. `:has` is already relied on for task lists here. */
+   inside a parent list item) keeps its indentation; the nested selectors' higher specificity
+   wins over the flush rules above them. */
+.pm-note-md .pm-markdown ul.contains-task-list,
 .pm-note-md .pm-markdown ul:has(> li > input[type="checkbox"]) {
   padding-left: 0;
 }
+.pm-note-md .pm-markdown li ul.contains-task-list,
 .pm-note-md .pm-markdown li ul:has(> li > input[type="checkbox"]) {
   padding-left: 1.25rem;
+}
+/* In a note, the box is a real control: clicking it ticks the item (PinboardView maps the click
+   back to the source marker). The sanitizer forces `disabled` on every rendered input — which is
+   right, since the same boundary renders ingested documents — and a disabled input swallows the
+   click instead of letting it reach the note's handler. `pointer-events: none` makes it
+   transparent to hit-testing so the note sees the click and does the toggle itself. Notes only:
+   a checkbox inside an ingested document stays inert. */
+.pm-note-md .pm-markdown li input[type="checkbox"] {
+  pointer-events: none;
+}
+/* Hanging indent on a checklist item, so a line long enough to wrap continues UNDER ITS OWN TEXT
+   rather than sliding back beneath the checkbox. A plain `ul` gets this free — its disc is a real
+   list marker, drawn outside the content box — but a task item's "marker" is an inline <input> that
+   sits in the text flow, so the second line has nothing holding it out. The negative text-indent
+   pulls the first line (the one carrying the box) back to the edge while the padding holds the rest
+   in. 1.35rem ≈ the box (13px) plus its 0.4rem margin; engines size the native box a little
+   differently, so this is a close fit rather than an exact one. */
+.pm-note-md .pm-markdown li.task-list-item,
+.pm-note-md .pm-markdown li:has(> input[type="checkbox"]) {
+  padding-left: 1.35rem;
+  text-indent: -1.35rem;
 }
 .pm-markdown strong {
   color: var(--ink);

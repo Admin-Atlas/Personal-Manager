@@ -107,17 +107,36 @@ export function findFreeRect(
 }
 
 /**
- * Keep the board a FIXED width of `cols` (the window): widgets already within the width stay exactly
- * where they are, and any that overhang the right edge re-flow into a free slot — scanned row-major,
- * so they wrap onto a new row rather than sitting off-screen. Only top-level x/w matter (folder
- * children aren't board-positioned). Used on load so a board authored on a wider window, or before
- * the fixed-width model, tidies itself into the current window.
+ * Keep the board a FIXED width of `cols` (the window). Only top-level x/w matter (folder children
+ * aren't board-positioned). Used on load so a board authored on a wider window, or before the
+ * fixed-width model, tidies itself into the current window.
+ *
+ * Three cases, in order:
+ *   1. Already inside the width → untouched.
+ *   2. Overhangs, but its LEFT edge is still on screen and it fits at its own size → slid left to sit
+ *      flush with the right edge.
+ *   3. Genuinely off-screen (or wider than the board) → re-flowed into a free slot, scanned
+ *      row-major, so it wraps onto a new row rather than hiding past the edge.
+ *
+ * Case 2 is the important one and it used to be missing — everything that overhung by even a single
+ * cell went through case 3 and teleported to the first free slot near the top-left. The measured
+ * width is not perfectly stable across a remount: it comes from the scroller's `clientWidth`, which
+ * *excludes* a vertical scrollbar, so a board that gains or loses one across a tab switch can report
+ * a width one cell different. A card the user had placed flush against the right edge then read as
+ * overhanging and was flung away — losing a deliberate placement to a rounding difference. Sliding
+ * keeps it where it was put, at the size it was given.
+ *
+ * Sliding may land it on top of a neighbour. That is fine and deliberate: this board lets widgets
+ * overlap (findFreeRect's own fallback does the same when the board is full), and a card an inch
+ * from where you left it is better than a card across the room.
  */
 export function reflowToWidth(widgets: Widget[], cols: number, rows: number): Widget[] {
   const placed: Widget[] = [];
   for (const w of widgets) {
     if (w.rect.x + w.rect.w <= cols) {
       placed.push(w);
+    } else if (w.rect.x < cols && w.rect.w <= cols) {
+      placed.push({ ...w, rect: { ...w.rect, x: cols - w.rect.w } });
     } else {
       const rect = findFreeRect(placed, Math.min(w.rect.w, cols), w.rect.h, cols, rows);
       placed.push({ ...w, rect });
