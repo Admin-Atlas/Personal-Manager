@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
-import type { Conversation, LocalLlmStatus } from "../lib/types";
-import { listProjects } from "../lib/ipc";
+import type { CalendarOverview, Conversation, LocalLlmStatus } from "../lib/types";
+import { calendarOverview, listProjects } from "../lib/ipc";
 import { shortModel } from "../lib/format";
+import { readHidden, writeHidden } from "../lib/calendarPrefs";
 import { localEndpointState, LOCAL_STATE_TOKEN } from "../lib/localStatus";
 import { useDevMode } from "../lib/capabilities";
-import { useDepth, useTheme } from "../theme";
+import { useDepth, useTheme, sourceColors, sourceShapeIndex } from "../theme";
+import { CalendarSourceList } from "./calendar/CalendarSourceList";
 import { Button, Collapsible, ConfirmDialog, Modal, NavItem, Select } from "./ui";
 import { globalChats, projectChats } from "../lib/chatNav";
 import { Briefing } from "./Briefing";
@@ -185,10 +187,10 @@ export function Sidebar({
   onStartResize,
   resizing,
 }: Props) {
-  const { showMeta, minimal } = useDepth();
+  const { minimal } = useDepth();
   // The Teach tab is a Depth-keyed feature reveal (hidden for the minimalist preset), overridable
   // in Settings. Hiding it hides only the editor — deterministic alias resolution keeps running.
-  const { teachVisible, mapVisible } = useTheme();
+  const { teachVisible, mapVisible, modelsVisible, system, accent, colorblind } = useTheme();
   // The Dev tab is an orthogonal capability reveal (issue #78) — independent of Depth, shown only
   // when the user turns Developer mode on in Settings.
   const { devMode } = useDevMode();
@@ -225,6 +227,52 @@ export function Sidebar({
   // toggle looking broken until the user navigated away and back. Subscribe instead.
   const [briefingInSidebar, setBriefingInSidebar] = useState(readBriefingInSidebar);
   useEffect(() => subscribeBriefingPrefs(() => setBriefingInSidebar(readBriefingInSidebar())), []);
+
+  // --- the calendar roster (was a "Calendars x/x" dropdown in the calendar header) --------------
+  //
+  // The sidebar reads the roster itself rather than having CalendarView lift `overview`/`hidden` up
+  // through App and back down — structurally the same shape as the `listProjects()` effect above, and
+  // it keeps the calendar's state where it already lives. Only while the Calendar tab is open: the
+  // sidebar never unmounts, so rendering it always would make it a permanent app-wide widget.
+  const [calOverview, setCalOverview] = useState<CalendarOverview | null>(null);
+  const [calHidden, setCalHidden] = useState<Set<string>>(readHidden);
+  useEffect(() => {
+    if (view !== "calendar") return;
+    let alive = true;
+    calendarOverview()
+      .then((o) => alive && setCalOverview(o))
+      .catch(() => {
+        /* best-effort: no roster simply means no block */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [view]);
+  // The grid writes the same set, and this sidebar is mounted alongside it, so follow the app-wide
+  // signal writeHidden emits — otherwise the two lists would disagree until a remount.
+  useEffect(() => {
+    const sync = () => setCalHidden(readHidden());
+    window.addEventListener("pm:settings-changed", sync);
+    return () => window.removeEventListener("pm:settings-changed", sync);
+  }, []);
+  function toggleCalendar(id: string) {
+    const next = new Set(calHidden);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setCalHidden(next);
+    writeHidden(next); // announces, so the grid follows
+  }
+  // Pure functions of the id SET (sorted internally), so this map provably matches the grid's without
+  // any plumbing between them.
+  const calColorOf = useMemo(() => {
+    const ids = calOverview?.calendars.map((c) => c.id) ?? [];
+    const map = sourceColors(ids, system, accent, colorblind);
+    return (id: string) => map.get(id) ?? "var(--ink4)";
+  }, [calOverview, system, accent, colorblind]);
+  const calShapeOf = useMemo(() => {
+    const slots = sourceShapeIndex(calOverview?.calendars.map((c) => c.id) ?? []);
+    return (id: string) => slots.get(id);
+  }, [calOverview]);
   return (
     <aside
       style={{ width }}
@@ -462,6 +510,35 @@ export function Sidebar({
       )}
 
       <div className="shrink-0 border-t border-border p-2">
+        {/* The calendar roster, above the briefing. Collapsible and capped with its own scroller:
+            `calendar_overview` returns EVERY registered calendar for every connected source with no
+            `selected` filter, so a couple of Google accounts plus a feed is comfortably 15-25 rows —
+            enough to push the model rows, What's New and Settings off the bottom of a fixed-height
+            footer. Unselected calendars are filtered out: they mirror no events and can never show
+            one, which is far more conspicuous inline than it was inside a popover. */}
+        {view === "calendar" && calOverview && (
+          <div className="mb-1 border-b border-border pb-2" data-help="calendar-filter">
+            <Collapsible
+              title="Calendars"
+              meta={`${calOverview.calendars.filter((c) => c.selected && !calHidden.has(c.id)).length}/${
+                calOverview.calendars.filter((c) => c.selected).length
+              }`}
+              defaultOpen
+            >
+              <div className="max-h-64 overflow-y-auto">
+                <CalendarSourceList
+                  accounts={calOverview.accounts}
+                  calendars={calOverview.calendars}
+                  hidden={calHidden}
+                  onToggle={toggleCalendar}
+                  colorOf={calColorOf}
+                  shapeOf={calShapeOf}
+                  hideUnselected
+                />
+              </div>
+            </Collapsible>
+          </div>
+        )}
         {/* Today's briefing, off by default and switched on in Settings. It sits at the top of the
             footer — above the model rows at Standard/Power, above What's New at Minimal — so it is
             pinned outside the scroller above and stays put whichever tab is open. `Briefing` renders
@@ -472,10 +549,12 @@ export function Sidebar({
             <Briefing variant="panel" />
           </div>
         )}
-        {/* The model footer is an optional feature reveal — hidden whole in Minimal mode. Gate the
-            entire button (not just the rows) so no empty, hover-highlighting ghost box is left
-            behind and the divider sits directly above "What's New". */}
-        {showMeta && (
+        {/* The model footer is an optional feature reveal. It follows the Depth preset by default,
+            but is now a switch of its own in Settings → General → Appearance — so you can see which
+            model is answering on Minimal, or hide it on Power. Gate the entire button (not just the
+            rows) so no empty, hover-highlighting ghost box is left behind and the divider sits
+            directly above "What's New". */}
+        {modelsVisible && (
           <button
             onClick={onOpenSettings}
             data-help="sidebar-models"

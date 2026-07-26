@@ -685,7 +685,7 @@ pub fn owned_swm_roots(conn: &Connection, email: &str) -> Result<Vec<String>> {
 /// Release `email`'s access to shared-with-me root `root_id` (it fell out of scope): drop its access
 /// row and, if that leaves the root reachable by no account, soft-flag the root's items. Dropping the
 /// OWNER leaves the root owner-less, re-claimed on another account's next sync.
-fn release_swm_root(conn: &Connection, email: &str, root_id: &str) -> Result<()> {
+pub(crate) fn release_swm_root(conn: &Connection, email: &str, root_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM shared_with_me_access WHERE root_id = ?1 AND account_id = ?2",
         params![root_id, account_id(email)],
@@ -1064,6 +1064,13 @@ pub struct DriveFile {
     /// shared-with-me corpus disjoint from My Drive (`files_url` excludes it; `map_change` routes it
     /// away from the My-Drive namespace). Not populated for shared-drive items (reads false).
     pub shared_with_me: bool,
+    /// The raw `sharedWithMeTime` the bool above is derived from, kept so the picker can offer a
+    /// "recently shared with you" order. Already in the baseline mask — it was simply discarded.
+    pub shared_with_me_time: Option<String>,
+    /// Who shared the item: `sharingUser.displayName`, else the first owner's. Only populated by the
+    /// shared-with-me ROOT listing, which asks for those fields; `None` everywhere else. Drive reports
+    /// `sharingUser` on the directly-shared root only, not on descendants inside a shared folder.
+    pub shared_by: Option<String>,
     /// Drive's `ownedByMe` — false for a shared-with-me item, true for an owned My-Drive file. Not
     /// populated for shared-drive items (reads false).
     pub owned_by_me: bool,
@@ -1243,6 +1250,24 @@ fn parse_file(v: &Value) -> Option<DriveFile> {
             .get("sharedWithMeTime")
             .and_then(Value::as_str)
             .is_some_and(|t| !t.is_empty()),
+        shared_with_me_time: v
+            .get("sharedWithMeTime")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(String::from),
+        shared_by: v
+            .get("sharingUser")
+            .and_then(|u| u.get("displayName"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                v.get("owners")
+                    .and_then(Value::as_array)
+                    .and_then(|o| o.first())
+                    .and_then(|u| u.get("displayName"))
+                    .and_then(Value::as_str)
+            })
+            .filter(|s| !s.is_empty())
+            .map(String::from),
         owned_by_me: v.get("ownedByMe").and_then(Value::as_bool).unwrap_or(false),
         shortcut_target_id: v
             .get("shortcutDetails")
@@ -1729,6 +1754,27 @@ pub async fn enumerate_root_files(
 /// shared drive, so `includeItemsFromAllDrives`/`supportsAllDrives` are needed for a `'<id>' in parents`
 /// walk to reach descendants; the `sharedWithMe = true` filter (roots) or the parent filter scopes it.
 fn swm_files_url(q: &str, page: Option<&str>) -> Result<String> {
+    swm_url_with_fields(q, page, FILE_FIELDS)
+}
+
+/// The ROOT listing's mask: the baseline plus who shared the item.
+///
+/// Deliberately its own constant used by ONE call site. The mask is fail-closed — an unknown name
+/// 400s the entire listing, not just that field — so widening the shared `FILE_FIELDS` would put the
+/// My-Drive baseline, the changes feed, the folder picker and the shared-drive listing at risk for a
+/// column only the picker renders. Confined here, a mistake can at worst break the swm picker.
+///
+/// `sharingUser` is the account that shared the item with you; `owners` is the fallback, since Drive
+/// documents `sharingUser` as present only "if applicable" and omits `owners` for items living in a
+/// shared drive. Both are real v3 `File` fields, sub-selected in the same style as the baseline.
+const SWM_ROOT_EXTRA_FIELDS: &str =
+    "sharingUser(displayName,emailAddress),owners(displayName,emailAddress)";
+
+fn swm_root_files_url(q: &str, page: Option<&str>) -> Result<String> {
+    swm_url_with_fields(q, page, &format!("{FILE_FIELDS},{SWM_ROOT_EXTRA_FIELDS}"))
+}
+
+fn swm_url_with_fields(q: &str, page: Option<&str>, fields: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(&format!("{DRIVE_API}/files"))
         .map_err(|e| Error::Other(e.to_string()))?;
     {
@@ -1738,7 +1784,7 @@ fn swm_files_url(q: &str, page: Option<&str>) -> Result<String> {
         qp.append_pair("spaces", "drive");
         qp.append_pair("includeItemsFromAllDrives", "true");
         qp.append_pair("supportsAllDrives", "true");
-        qp.append_pair("fields", &format!("nextPageToken,files({FILE_FIELDS})"));
+        qp.append_pair("fields", &format!("nextPageToken,files({fields})"));
         if let Some(t) = page {
             qp.append_pair("pageToken", t);
         }
@@ -1754,6 +1800,12 @@ pub struct SwmRoot {
     pub id: String,
     pub name: String,
     pub is_folder: bool,
+    /// Who shared it with you — `sharingUser`, else the first owner. `None` when Drive reports
+    /// neither, which the picker renders as simply no sub-line.
+    pub shared_by: Option<String>,
+    /// When it was shared with you (v3 `sharedWithMeTime`), for the "Recent" sort. ISO-8601, so a
+    /// plain string comparison is chronological.
+    pub shared_with_me_time: Option<String>,
 }
 
 /// Whether a shared-with-me root (or a shortcut's target) is a folder — choosing it walks a whole
@@ -1770,7 +1822,8 @@ fn root_is_folder(root: &DriveFile) -> bool {
 /// flag from the pagination guard.
 pub async fn list_swm_roots(token_key: &str) -> Result<(Vec<DriveFile>, bool)> {
     connector_sync::paginate(MAX_PAGES, |page| async move {
-        let url = swm_files_url("sharedWithMe = true and trashed = false", page.as_deref())?;
+        // The widened mask (see SWM_ROOT_EXTRA_FIELDS) — roots only, never the descendant walk.
+        let url = swm_root_files_url("sharedWithMe = true and trashed = false", page.as_deref())?;
         let v = google::authorized_get(token_key, &url).await?;
         Ok(parse_files(&v))
     })
@@ -1787,6 +1840,8 @@ pub async fn list_swm_root_choices(token_key: &str) -> Result<Vec<SwmRoot>> {
             id: r.id.clone(),
             name: r.name.clone(),
             is_folder: root_is_folder(r),
+            shared_by: r.shared_by.clone(),
+            shared_with_me_time: r.shared_with_me_time.clone(),
         })
         .collect())
 }
@@ -2346,6 +2401,8 @@ mod tests {
             web_view_link: Some(format!("https://drive/{id}")),
             parent_id: None,
             shared_with_me: false,
+            shared_with_me_time: None,
+            shared_by: None,
             owned_by_me: true,
             shortcut_target_id: None,
             shortcut_target_mime: None,
@@ -2353,6 +2410,46 @@ mod tests {
             can_download: None,
             resource_key: None,
         }
+    }
+
+    #[test]
+    fn swm_root_mask_widens_only_the_root_listing() {
+        // The fields mask is FAIL-CLOSED: one unknown name 400s the WHOLE listing, which is how #481
+        // killed every Drive path. So pin two things — that the sharer fields use their real v3
+        // spellings, and that the widening did NOT leak into the shared mask that the My-Drive
+        // baseline, the changes feed, the folder picker and the descendant walk all depend on.
+        let root = swm_root_files_url("sharedWithMe = true", None).unwrap();
+        assert!(
+            root.contains("sharingUser"),
+            "the sharer field must be asked for"
+        );
+        assert!(
+            root.contains("owners"),
+            "the fallback owner field must be asked for"
+        );
+
+        // Sub-selected, never bare: `sharingUser` alone is valid but returns the whole User object,
+        // and the neighbouring names must not be misspelled singulars.
+        assert!(SWM_ROOT_EXTRA_FIELDS.contains("sharingUser(displayName,emailAddress)"));
+        assert!(SWM_ROOT_EXTRA_FIELDS.contains("owners(displayName,emailAddress)"));
+        assert!(
+            !SWM_ROOT_EXTRA_FIELDS.contains("owner("),
+            "v3 has `owners`, not `owner`"
+        );
+        assert!(
+            !SWM_ROOT_EXTRA_FIELDS.contains("sharingUsers"),
+            "v3 has `sharingUser`, singular"
+        );
+
+        assert!(
+            !FILE_FIELDS.contains("sharingUser") && !FILE_FIELDS.contains("owners"),
+            "the baseline mask is shared by every other Drive path — it must not be widened"
+        );
+        let descendants = swm_files_url("'x' in parents", None).unwrap();
+        assert!(
+            !descendants.contains("sharingUser"),
+            "the descendant walk keeps the baseline mask; Drive reports no sharingUser there anyway"
+        );
     }
 
     #[test]
@@ -2902,6 +2999,8 @@ mod tests {
             web_view_link: Some("https://docs.google.com/spreadsheets/d/sid".into()),
             parent_id: None,
             shared_with_me: false,
+            shared_with_me_time: None,
+            shared_by: None,
             owned_by_me: true,
             shortcut_target_id: None,
             shortcut_target_mime: None,

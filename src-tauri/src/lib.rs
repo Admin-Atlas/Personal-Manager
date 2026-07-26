@@ -947,13 +947,7 @@ pub fn run() {
         // and exits, so two processes can't race to create the encrypted store
         // with different keys and orphan one of them (rule #2).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                // `show` + `unminimize` first: with the tray on, closing the main window only hides
-                // it, so a second launch must bring it back rather than focusing something invisible.
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            tray::show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1481,6 +1475,7 @@ pub fn run() {
             commands::set_tray_enabled,
             commands::set_briefing_window_visible,
             commands::close_briefing_window,
+            commands::show_main_window,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::sync_daily_briefing,

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   driveSharedOwners,
   driveSwmRootOwners,
@@ -427,6 +427,9 @@ function SharedWithMeRoots({
   const [roots, setRoots] = useState<SwmRoot[] | null>(null);
   const [owners, setOwners] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  /** Drive returns no order at all, so the picker picks one. Session-only — a picker's ordering is
+   *  not worth a stored preference. */
+  const [rootSort, setRootSort] = useState<"recent" | "name">("recent");
 
   const load = useCallback(async () => {
     setError(null);
@@ -445,6 +448,20 @@ function SharedWithMeRoots({
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Drive returns these in no particular order (the listing sets no `orderBy`), which is fine for a
+  // handful and useless for fifty. "Recent" is when it was shared WITH YOU, not when the file was last
+  // modified — for finding the thing someone just sent you, that is the order you actually want.
+  // ISO-8601 sorts lexically, so no parsing; an item with no timestamp sinks rather than jumping.
+  //
+  // Above the early returns below: hooks must run in the same order on every render.
+  const sortedRoots = useMemo(() => {
+    const copy = [...(roots ?? [])];
+    if (rootSort === "name") copy.sort((a, b) => a.name.localeCompare(b.name));
+    else
+      copy.sort((a, b) => (b.shared_with_me_time ?? "").localeCompare(a.shared_with_me_time ?? ""));
+    return copy;
+  }, [roots, rootSort]);
 
   if (error) {
     return (
@@ -480,7 +497,17 @@ function SharedWithMeRoots({
           {roots.length} shared item{roots.length === 1 ? "" : "s"}
           {chosen > 0 ? ` · ${chosen} selected` : ""}
         </span>
-        {roots.length > VISIBLE_ROOTS && <span>scroll for more</span>}
+        <span className="flex items-center gap-2">
+          {roots.length > VISIBLE_ROOTS && <span>scroll for more</span>}
+          <SegmentedControl
+            value={rootSort}
+            onChange={setRootSort}
+            options={[
+              { value: "recent", label: "Recent", title: "Most recently shared with you first" },
+              { value: "name", label: "Name", title: "A to Z" },
+            ]}
+          />
+        </span>
       </p>
       {/* Capped and scrolled past a handful of rows: an account with a lot of shared items otherwise
           pushed the rest of the connector settings (and its own Save) off the page. The cap is on the
@@ -492,7 +519,7 @@ function SharedWithMeRoots({
             : ""
         }`}
       >
-        {roots.map((r) => {
+        {sortedRoots.map((r) => {
           const ownedBy = owners[r.id];
           return (
             <li key={r.id} className="py-1.5 first:pt-0 last:pb-0">
@@ -509,6 +536,14 @@ function SharedWithMeRoots({
                   {r.is_folder ? "/" : ""}
                 </span>
               </label>
+              {/* Who sent it. Rendered only when Drive reported someone: it names the sharer on a
+                  directly-shared root, and a name-only row degrades silently rather than showing an
+                  empty "Shared by". Distinct from "Already synced by", which is one of YOUR accounts. */}
+              {r.shared_by && (
+                <p className="mt-0.5 pl-5 text-[0.6875rem] text-ink4">
+                  Shared by <span className="text-ink3">{r.shared_by}</span>
+                </p>
+              )}
               {ownedBy && (
                 <p className="mt-0.5 pl-5 text-[0.6875rem] text-ink4">
                   Already synced by <span className="text-ink3">{ownedBy}</span>.

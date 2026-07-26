@@ -6109,6 +6109,18 @@ pub fn close_briefing_window(app: AppHandle) -> Result<()> {
     tray::close_briefing_window(&app)
 }
 
+/// Bring the main window to the front — the briefing window's "Open PM" button.
+///
+/// It has to be a PM command rather than `getCurrentWindow()`/`getAllWebviewWindows()` from
+/// `@tauri-apps/api/window`: those are `plugin:`-prefixed and ACL-gated, and the briefing webview's
+/// capability grants only dragging and event listen/unlisten. A plugin call from there would fail at
+/// runtime with nothing in `just check` catching it. PM's own commands are not ACL-gated.
+#[tauri::command]
+pub fn show_main_window(app: AppHandle) -> Result<()> {
+    tray::show_main_window(&app);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_daily_briefing(state: State<'_, AppState>) -> Result<briefing::DailyBriefing> {
     let conn = state.conn()?;

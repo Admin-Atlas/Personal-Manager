@@ -88,10 +88,16 @@ export function ProjectView({
   const { openReader, current: readerDoc } = useReader();
   // How the Files panel is ordered. Name A→Z by default; clicking a key again reverses it.
   const [sort, setSort] = useState<FileSort>({ key: "name", dir: "asc" });
-  // How the Milestones panel is ordered — deadline (soonest first) by default now, remembered per
-  // device across projects. Display-only: the backend sort_order is untouched (governing() reads it).
-  const [msSort, setMsSort] = useState<MsSort>(readMilestoneSort);
-  useEffect(() => writeMilestoneSort(msSort), [msSort]);
+  // How the Milestones panel is ordered — deadline (soonest first) by default, remembered per device
+  // FOR THIS PROJECT. Display-only: the backend sort_order is untouched (governing() reads it).
+  //
+  // App renders <ProjectView> without a `key`, so switching from project A to project B does NOT
+  // remount this component — a lazy useState initialiser would never re-run and B would inherit A's
+  // sort. Hence the explicit re-read on `project`. And the write lives in the toggle rather than in a
+  // `[msSort]` effect: an effect would fire AFTER the project changed and stamp the previous
+  // project's sort under the new project's name.
+  const [msSort, setMsSort] = useState<MsSort>(() => readMilestoneSort(project));
+  useEffect(() => setMsSort(readMilestoneSort(project)), [project]);
   // Whether completed ("met") milestones are shown; default true — the scroll-to-next below tucks
   // them above the fold rather than hiding history. Ignored under Manual sort, where the ↑/↓ reorder
   // needs every row.
@@ -131,9 +137,14 @@ export function ProjectView({
   }
 
   function toggleMsSort(key: MsSortKey) {
-    setMsSort((cur) =>
-      cur.key === key ? { key, dir: cur.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" },
-    );
+    // Computed from `msSort` rather than via a functional updater, so the persist is a plain
+    // side-effect that can't double-fire under StrictMode.
+    const next: MsSort =
+      msSort.key === key
+        ? { key, dir: msSort.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: "asc" };
+    setMsSort(next);
+    writeMilestoneSort(project, next);
   }
 
   const sortedDocs = useMemo(() => {

@@ -25,11 +25,19 @@ import type {
   ProjectOverview,
   ProjectProposal,
   ProjectSize,
-  ProjectStatus,
 } from "../lib/types";
 import { formatDate, formatDateOnly, formatEventWhen } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
-import { rankImportance } from "../lib/importance";
+import {
+  DEFAULT_DIR,
+  SORT_LABELS,
+  effectiveImportance,
+  readSort,
+  sortProjects,
+  writeSort,
+  type Sort,
+  type SortKey,
+} from "../lib/focusSort";
 import {
   Button,
   Card,
@@ -65,83 +73,6 @@ interface Props {
   onAsk: (text: string) => void;
 }
 
-/** Surface the most action-worthy first, mirroring the backend status precedence. */
-const STATUS_ORDER: ProjectStatus[] = [
-  "due_soon",
-  "blocked",
-  "quick_win",
-  "take_a_look",
-  "part_of",
-  "on_track",
-];
-
-// --- focus-view sorting (Step 5 follow-up) ---
-// "Smart" is the default — the status precedence above, the same one the focus view always
-// used. The other keys let the user re-rank by one explicit attribute, in either direction.
-type SortKey = "smart" | "deadline" | "importance" | "size" | "recent";
-interface Sort {
-  key: SortKey;
-  dir: "asc" | "desc";
-}
-const SORT_LABELS: Record<SortKey, string> = {
-  smart: "Smart",
-  deadline: "Deadline",
-  importance: "Importance",
-  size: "Size",
-  recent: "Recent active",
-};
-/** The natural direction for each key when it's first chosen (the ↑/↓ toggle flips it). */
-const DEFAULT_DIR: Record<SortKey, "asc" | "desc"> = {
-  smart: "asc", // most pressing first
-  deadline: "asc", // soonest first
-  importance: "desc", // highest first
-  size: "desc", // largest first
-  recent: "desc", // most recently active first
-};
-const SIZE_RANK: Record<string, number> = { quick: 1, standard: 2, large: 3 };
-const SORT_LS_KEY = "pm.focus.sort";
-
-/** The date a deadline-sort ranks on: the governing milestone, else a name-matched calendar
- *  event, else a far-future sentinel so undated projects sort last (ascending). */
-function deadlineKey(p: ProjectOverview): string {
-  return (p.governing_milestone?.due_date ?? p.calendar_event?.start ?? "9999-12-31").slice(0, 10);
-}
-
-/** The priority tag a project shows: the manual override, falling back to the computed
- *  structural auto-importance (the "Auto" value) when no override is set. */
-function effectiveImportance(p: ProjectOverview): Importance {
-  return p.importance ?? p.auto_importance;
-}
-
-/** Ascending comparison for one sort key (the ↑/↓ toggle applies the direction outside). */
-function ascCompare(a: ProjectOverview, b: ProjectOverview, key: SortKey): number {
-  switch (key) {
-    case "smart":
-      return STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status);
-    case "deadline":
-      return deadlineKey(a).localeCompare(deadlineKey(b));
-    case "importance":
-      return rankImportance(effectiveImportance(a)) - rankImportance(effectiveImportance(b));
-    case "size":
-      return (SIZE_RANK[a.size ?? ""] ?? 0) - (SIZE_RANK[b.size ?? ""] ?? 0);
-    case "recent":
-      return (a.last_activity ?? "").localeCompare(b.last_activity ?? "");
-  }
-}
-
-function readSort(): Sort {
-  try {
-    const raw = localStorage.getItem(SORT_LS_KEY);
-    if (raw) {
-      const s = JSON.parse(raw);
-      if (s && s.key in SORT_LABELS && (s.dir === "asc" || s.dir === "desc")) return s;
-    }
-  } catch {
-    /* fall through to the default */
-  }
-  return { key: "smart", dir: "asc" };
-}
-
 // Switching tabs unmounts this view, so without a cache every return refetches and
 // flashes the skeleton. Remember the last good load at module scope and seed state
 // from it: revisits render instantly, then the mount effect revalidates in the
@@ -166,7 +97,8 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   const [editing, setEditing] = useState<string | null>(null);
   /** AI proposals keyed by project name, populated by "Suggest attributes". */
   const [proposals, setProposals] = useState<Record<string, ProjectProposal>>({});
-  const [proposing, setProposing] = useState(false);
+  /** The project whose suggestion is in flight, or null. */
+  const [proposing, setProposing] = useState<string | null>(null);
   /** Focus-agenda events (empty when not connected). Includes events that ended earlier today, tagged
    *  `ended` — the Agenda greys those rather than hiding them. */
   const [events, setEvents] = useState<AgendaEvent[]>(() => cachedEvents);
@@ -265,14 +197,9 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     writeFocusHiddenPanels(next);
   }
   useEffect(() => {
-    localStorage.setItem(SORT_LS_KEY, JSON.stringify(sort));
+    writeSort(sort);
   }, [sort]);
-  const sorted = useMemo(() => {
-    const factor = sort.dir === "asc" ? 1 : -1;
-    return [...projects].sort(
-      (a, b) => ascCompare(a, b, sort.key) * factor || a.name.localeCompare(b.name),
-    );
-  }, [projects, sort]);
+  const sorted = useMemo(() => sortProjects(projects, sort), [projects, sort]);
 
   // Split (side-by-side) vs stacked layout — per-device, set from this header.
   const [layout, setLayout] = useState<FocusLayout>(readFocusLayout);
@@ -342,21 +269,30 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     writeFocusSplit(next);
   }
 
-  async function suggestAll() {
-    if (proposing || projects.length === 0) return;
-    setProposing(true);
+  /** Ask the AI to propose triage metadata for ONE project.
+   *
+   *  This used to be a header button covering the whole list, which meant one click fanned out to a
+   *  model call per project — bounded only at 2000 — with no confirmation and no way to want it for
+   *  just the project in front of you. Scoped to the project whose Triage panel is open, it is one
+   *  click, one call, beside the fields it fills in. The command already took a `names` filter. */
+  async function suggestOne(name: string) {
+    if (proposing) return;
+    setProposing(name);
     setError(null);
     try {
-      await proposeProjectMetadata((event) => {
-        if (!aliveRef.current) return; // view gone — drop late proposals
-        if (event.type === "proposed") {
-          setProposals((prev) => ({ ...prev, [event.project]: event.proposal }));
-        }
-      });
+      await proposeProjectMetadata(
+        (event) => {
+          if (!aliveRef.current) return; // view gone — drop late proposals
+          if (event.type === "proposed") {
+            setProposals((prev) => ({ ...prev, [event.project]: event.proposal }));
+          }
+        },
+        [name],
+      );
     } catch (e) {
       if (aliveRef.current) setError(String(e));
     } finally {
-      if (aliveRef.current) setProposing(false);
+      if (aliveRef.current) setProposing(null);
     }
   }
 
@@ -450,6 +386,9 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
               project={p}
               otherProjects={names.filter((n) => n !== p.name)}
               proposal={proposals[p.name]}
+              suggesting={proposing === p.name}
+              suggestDisabled={proposing !== null}
+              onSuggest={() => void suggestOne(p.name)}
               editing={editing === p.name}
               onEdit={() => setEditing(editing === p.name ? null : p.name)}
               onOpen={() => onOpenProject(p.name)}
@@ -537,20 +476,20 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
               })}
             </ul>
           </Popover>
-          <Button
-            variant="secondary"
-            onClick={suggestAll}
-            disabled={proposing || projects.length === 0}
-            data-help="focus-suggest"
-            title="Let the AI propose a size, parent, blocker and deadline for each project"
-          >
-            {proposing ? "Suggesting…" : "Suggest attributes (AI)"}
-          </Button>
         </div>
       </header>
 
       <div className="flex-1 overflow-y-auto">
-        <div className={`mx-auto px-6 py-6 ${layout === "split" ? "max-w-6xl" : "max-w-3xl"}`}>
+        {/* Split goes full-bleed, like Calendar / Documents / Pinboard. The old max-w-6xl cap left
+            ~220px of dead gutter each side on a 1920 screen — #471 raised the cap to fix exactly
+            that symptom but kept one. Stacked KEEPS max-w-3xl: a single column of prose is a reading
+            measure, and removing it there would make the layout worse, not better.
+            `flex min-h-full flex-col` so the grid below can claim the viewport height. */}
+        <div
+          className={`mx-auto flex min-h-full flex-col px-6 py-6 ${
+            layout === "split" ? "" : "max-w-3xl"
+          }`}
+        >
           {error && (
             <div
               className="mb-4 rounded-[var(--radius-sm)] border px-3 py-2 text-sm text-st-due"
@@ -569,7 +508,10 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
             // only one side showing there is nothing to divide — the single column takes the width.
             <div
               ref={splitRowRef}
-              className={`grid grid-cols-1 gap-6 ${dragging ? "select-none" : ""}`}
+              // `min-h-0 flex-1` so the row spans the remaining height: the divider rule then runs
+              // full height instead of stopping at the tallest card, which was the most visible tell
+              // that the panels weren't using the screen.
+              className={`grid min-h-0 flex-1 grid-cols-1 gap-6 ${dragging ? "select-none" : ""}`}
               style={
                 bothColumns
                   ? {
@@ -636,6 +578,9 @@ function ProjectCard({
   project,
   otherProjects,
   proposal,
+  suggesting,
+  suggestDisabled,
+  onSuggest,
   editing,
   onEdit,
   onOpen,
@@ -645,6 +590,10 @@ function ProjectCard({
   project: ProjectOverview;
   otherProjects: string[];
   proposal?: ProjectProposal;
+  suggesting: boolean;
+  /** True while ANY project's suggestion is in flight — they share one backend call. */
+  suggestDisabled: boolean;
+  onSuggest: () => void;
   editing: boolean;
   onEdit: () => void;
   onOpen: () => void;
@@ -687,7 +636,11 @@ function ProjectCard({
                     {!project.importance && project.auto_importance ? " (auto)" : ""}
                   </span>
                 )}
-                {project.size && <span>{project.size}</span>}
+                {/* No size chip: `quick` is already carried by the Quick win badge to the left, and
+                    the other two values told you nothing the card didn't. The FIELD stays — it is
+                    still editable in Triage and still a sort key, so no stored sort gets coerced.
+                    The milestone chip below stays too: it is the only place the governing date
+                    shows, and Smart now sorts on that date first. */}
                 {project.governing_milestone?.due_date && (
                   <span>
                     {project.governing_milestone.label}{" "}
@@ -719,6 +672,9 @@ function ProjectCard({
             project={project}
             otherProjects={otherProjects}
             proposal={proposal}
+            suggesting={suggesting}
+            suggestDisabled={suggestDisabled}
+            onSuggest={onSuggest}
             onChanged={onChanged}
             onSaved={onSaved}
           />
@@ -734,12 +690,18 @@ function MetaEditor({
   project,
   otherProjects,
   proposal,
+  suggesting,
+  suggestDisabled,
+  onSuggest,
   onChanged,
   onSaved,
 }: {
   project: ProjectOverview;
   otherProjects: string[];
   proposal?: ProjectProposal;
+  suggesting: boolean;
+  suggestDisabled: boolean;
+  onSuggest: () => void;
   onChanged: () => void;
   onSaved: () => void;
 }) {
@@ -794,6 +756,22 @@ function MetaEditor({
 
   return (
     <div className="border-t border-border px-4 py-3" data-help="focus-triage">
+      {/* One project, one model call, beside the fields it fills in — this used to be a header
+          button that fanned out across every project at once. */}
+      {!proposal && (
+        <div className="mb-3">
+          <Button
+            variant="tertiary"
+            onClick={onSuggest}
+            disabled={suggestDisabled}
+            data-help="focus-suggest"
+            className="text-xs"
+            title="Let the AI propose a size, parent, blocker and deadline for this project"
+          >
+            {suggesting ? "Suggesting…" : "Suggest attributes (AI)"}
+          </Button>
+        </div>
+      )}
       {proposal && (
         <div
           className="mb-3 rounded-[var(--radius-sm)] border px-3 py-2 text-xs text-accent-text"

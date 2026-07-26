@@ -1029,6 +1029,31 @@ async fn gather_shared_with_me(
             .collect();
         items.append(&mut recon);
     }
+
+    // Heal roots whose share was REVOKED. A revoked root simply vanishes from `list_swm_roots`, so
+    // the loop above never visits it, no reconcile runs for it, and its documents sat at
+    // `source_state = 'ok'` with stale content forever — a later body fetch would just 403. Diff what
+    // this account owns against what the listing actually returned and release the difference;
+    // `release_swm_root` already drops the access row and soft-flags the items `unreachable` when no
+    // other connected account can still reach them. Soft only: nothing is deleted, and re-sharing
+    // restores it on the next sync.
+    //
+    // Gated on `!truncated` — the F-30 rule. A partial listing (a page guard trip, a tolerated
+    // 403/404 mid-walk) is NOT evidence that the missing roots are gone, and acting on one would
+    // mass-flag a perfectly healthy corpus.
+    if !truncated {
+        let live: std::collections::HashSet<&str> = roots.iter().map(|r| r.id.as_str()).collect();
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        for owned in drive::owned_swm_roots(&conn, email)? {
+            // A root the user simply unpicked is handled by `set_scope`; only act on ones this
+            // account still believes it indexes but Drive no longer offers at all.
+            if !live.contains(owned.as_str()) {
+                drive::release_swm_root(&conn, email, &owned)?;
+            }
+        }
+    }
+
     Ok((items, truncated))
 }
 

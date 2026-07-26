@@ -101,6 +101,22 @@ export function formatWhen(iso: string): string {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
+/**
+ * A last-synced stamp for a compact control: the clock time if the sync happened today, else the
+ * DD-MM date. Day-aware on purpose — a bare `HH:MM` for a sync that last succeeded yesterday reads as
+ * today. That is harmless as a faint meta line off to one side, but actively misleading once it is
+ * the label on the very button you press to refresh. `now` is injectable so the boundary is testable.
+ */
+export function formatSyncedShort(iso: string, now: Date = new Date()): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  return sameDay ? formatClock(d) : formatDateLocal(d);
+}
+
 /** A model id trimmed to its bare name for compact display ("meta-llama/Llama-3-8B" → "Llama-3-8B"):
  *  drops the provider/namespace prefix before the first slash. Shared by the sidebar model rows and
  *  the chat provenance footer / fallback strip. */

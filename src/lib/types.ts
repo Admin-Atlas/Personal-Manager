@@ -743,6 +743,11 @@ export interface SwmRoot {
   id: string;
   name: string;
   is_folder: boolean;
+  /** Who shared it with you (Drive's `sharingUser`, else the first owner). Null when Drive reports
+   *  neither — it names the directly-shared root only, not items inside a shared folder. */
+  shared_by: string | null;
+  /** When it was shared with you (`sharedWithMeTime`), for the "Recent" order. ISO-8601. */
+  shared_with_me_time: string | null;
 }
 
 /** What one account indexes: the personal My Drive plus any opted-in shared drives. Default scope is

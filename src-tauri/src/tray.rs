@@ -200,6 +200,23 @@ pub fn set_tray_enabled(app: &AppHandle, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Bring the main window to the front: show, unminimize, focus — in that order.
+///
+/// `show` + `unminimize` FIRST because with the tray on, closing the main window only hides it, so a
+/// caller must bring it back rather than focus something invisible. The one definition of "open PM",
+/// shared by the tray menu, the second-launch handler, and the briefing window's own button — it was
+/// written out three times before, which is two chances for the order to drift.
+///
+/// A pure lookup: it never builds a window, so it is safe to call from a sync command. Building one
+/// (`WebviewWindowBuilder::build`) deadlocks on Windows outside `setup()`.
+pub fn show_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
 /// Wire the tray menu + click handler and apply the stored visibility.
 ///
 /// Best-effort by design: on a Linux box with no appindicator library, `libappindicator-sys` panics
@@ -234,13 +251,7 @@ fn wire_tray(app: &AppHandle) -> Result<()> {
         "briefing" => {
             let _ = toggle_briefing_window(app);
         }
-        "open" => {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.unminimize();
-                let _ = win.set_focus();
-            }
-        }
+        "open" => show_main_window(app),
         "quit" => app.exit(0),
         _ => {}
     });

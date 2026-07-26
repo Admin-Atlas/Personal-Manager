@@ -72,6 +72,14 @@ export function writeHidden(hidden: Set<string>): void {
   } catch {
     // Best-effort.
   }
+  // Two surfaces render this set at once — the sidebar block and the calendar grid — and the sidebar
+  // never unmounts, so a tick in one has to reach the other. The repo's established cross-surface
+  // signal rather than a second bespoke one (mirrors focusPrefs / briefingPrefs).
+  try {
+    window.dispatchEvent(new Event("pm:settings-changed"));
+  } catch {
+    /* non-browser context (tests) */
+  }
 }
 
 /** The last time-grid range the user chose (Week/Day). Defaults to the everyday whole-day grid. */

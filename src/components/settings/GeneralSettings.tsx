@@ -77,6 +77,8 @@ export function GeneralSettings() {
     setTeachVisible,
     mapVisible,
     setMapVisible,
+    modelsVisible,
+    setModelsVisible,
     appearanceIsDefault,
     resetAppearance,
   } = useTheme();
@@ -530,6 +532,17 @@ export function GeneralSettings() {
         <div className="mt-3 flex items-center justify-between gap-3" data-help="settings-map-tab">
           <span className="text-sm text-ink2">Map tab</span>
           <Toggle checked={mapVisible} onChange={setMapVisible} ariaLabel="Show the Map tab" />
+        </div>
+        <div
+          className="mt-3 flex items-center justify-between gap-3"
+          data-help="settings-models-footer"
+        >
+          <span className="text-sm text-ink2">Models in use</span>
+          <Toggle
+            checked={modelsVisible}
+            onChange={setModelsVisible}
+            ariaLabel="Show which AI models are in use"
+          />
         </div>
         {/* Appearance's explanation folds into this one disclosure at the foot. The auto-mode status
             line and its "couldn't find your location" fallback stay inline above: they're a readout
