@@ -1396,6 +1396,7 @@ pub fn run() {
             commands::update_milestone,
             commands::set_milestone_event,
             commands::set_milestone_state,
+            commands::set_milestone_status,
             commands::delete_milestone,
             commands::reorder_milestones,
             commands::calendar_overview,

@@ -574,6 +574,9 @@ mod tests {
             calendar_linked: false,
             event_missing: false,
             state: Some("unmet".into()),
+            status: Some("in_progress".into()),
+            source_type: None,
+            external_id: None,
             sort_order: id,
         }
     }

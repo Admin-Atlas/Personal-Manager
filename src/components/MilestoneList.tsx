@@ -2,19 +2,34 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef, useState, type Ref } from "react";
-import type { Milestone } from "../lib/types";
+import type { Milestone, MilestoneStatus } from "../lib/types";
 import {
   addMilestone,
   deleteMilestone,
   reorderMilestones,
   setMilestoneEvent,
   setMilestoneState,
+  setMilestoneStatus,
   updateMilestone,
 } from "../lib/ipc";
 import { formatDateOnly } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
 import { DateField } from "./DateField";
-import { Button, Input } from "./ui";
+import { Button, Input, Select } from "./ui";
+
+/** Display order + labels for the progress control, coarsest-first (mirrors `milestones::STATUSES`). */
+export const MILESTONE_STATUSES: readonly { value: MilestoneStatus; label: string }[] = [
+  { value: "not_started", label: "Not started" },
+  { value: "in_progress", label: "In progress" },
+  { value: "almost_done", label: "Almost done" },
+  { value: "done", label: "Done" },
+];
+
+/** A milestone's effective status: its stored value, or — for a row predating the status column —
+ *  the one implied by whether it's been ticked off, so an old row never renders blank. */
+export function milestoneStatus(m: Milestone): MilestoneStatus {
+  return m.status ?? (m.state === "met" ? "done" : "not_started");
+}
 
 interface Props {
   project: string;
@@ -121,13 +136,23 @@ function MilestoneSummary({ milestones }: { milestones: Milestone[] }) {
   if (milestones.length === 0) return null;
   return (
     <ul className="flex flex-col gap-0.5 font-mono text-xs text-ink4">
-      {milestones.map((m) => (
-        <li key={m.id} className={m.state === "met" ? "line-through opacity-60" : ""}>
-          {m.label}
-          {m.due_date ? ` · ${formatDateOnly(m.due_date.slice(0, 10))}` : ""}
-          {m.calendar_linked ? " 📅" : ""}
-        </li>
-      ))}
+      {milestones.map((m) => {
+        // Only the in-between values add anything here: "not started" is the default and "done" is
+        // already carried by the strike-through, so naming either would just be noise.
+        const status = milestoneStatus(m);
+        const progress =
+          status === "in_progress" || status === "almost_done"
+            ? MILESTONE_STATUSES.find((s) => s.value === status)?.label
+            : null;
+        return (
+          <li key={m.id} className={m.state === "met" ? "line-through opacity-60" : ""}>
+            {m.label}
+            {m.due_date ? ` · ${formatDateOnly(m.due_date.slice(0, 10))}` : ""}
+            {progress ? ` · ${progress}` : ""}
+            {m.calendar_linked ? " 📅" : ""}
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -154,6 +179,7 @@ function MilestoneRow({
   const [label, setLabel] = useState(m.label);
   const [date, setDate] = useState(m.due_date?.slice(0, 10) ?? "");
   const met = m.state === "met";
+  const status = milestoneStatus(m);
 
   // Persist label (+ PM-native date) on blur, skipping a no-op so we don't refetch needlessly.
   // `dateOverride` is how DateField commits: it hands us the new value directly, because reading
@@ -202,7 +228,6 @@ function MilestoneRow({
           placeholder="label"
           className={`h-7 min-w-0 flex-1 text-xs ${met ? "line-through" : ""}`}
         />
-        {met && <DonePill />}
         <Button
           variant="tertiary"
           onClick={() =>
@@ -218,7 +243,7 @@ function MilestoneRow({
         </Button>
       </div>
 
-      <div className="mt-1.5 flex items-center gap-2 pl-6">
+      <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-6">
         {m.calendar_linked ? (
           <span
             className={`flex min-w-0 flex-1 items-center gap-1 text-xs text-accent-text ${
@@ -260,6 +285,25 @@ function MilestoneRow({
             className={`h-7 px-1.5 text-xs ${met ? "line-through" : ""}`}
           />
         )}
+        <Select
+          compact
+          value={status}
+          aria-label="Milestone progress"
+          title="How far along this milestone is"
+          onChange={(e) =>
+            void runMutation(async () => {
+              await setMilestoneStatus(m.id, e.target.value as MilestoneStatus);
+              onChanged();
+            }, onError)
+          }
+          className="shrink-0"
+        >
+          {MILESTONE_STATUSES.map((s) => (
+            <option key={s.value} value={s.value}>
+              {s.label}
+            </option>
+          ))}
+        </Select>
         {onMove && (
           <div className="flex shrink-0 items-center">
             <Button
@@ -284,21 +328,6 @@ function MilestoneRow({
         )}
       </div>
     </div>
-  );
-}
-
-/** A calm "ticked off" tag, shown on a met milestone next to its struck-through label. */
-function DonePill() {
-  return (
-    <span
-      className="shrink-0 rounded-full px-1.5 py-0.5 text-[0.625rem] font-medium"
-      style={{
-        color: "var(--st-track)",
-        background: "color-mix(in oklab, var(--st-track) 16%, transparent)",
-      }}
-    >
-      Done
-    </span>
   );
 }
 

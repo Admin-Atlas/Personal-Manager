@@ -1144,6 +1144,39 @@ const MIGRATIONS: &[&str] = &[
      WHERE type = 'table' AND name = 'preferences';
     PRAGMA writable_schema = OFF;
     "#,
+    // v42 (Stage-4 card 8): three additive columns beside the shipped milestones feature — a richer
+    // progress `status`, and a generic `source_type`/`external_id` durable anchor for milestones that
+    // originate OUTSIDE PM (a tracked spreadsheet row, a Notion DB row), mirroring the `event_uid`
+    // UID-anchor pattern the calendar already uses.
+    //
+    // `status` does NOT replace `state` (met|unmet): `Milestone::is_met` — and therefore
+    // `governing()` and every deadline flag — keeps reading `state`, so no shipped derivation moves.
+    // The two are kept from ever contradicting each other by writing BOTH in one statement at each
+    // setter (`milestones::set_status` / `set_state`), and by the backfill below stamping `done` on
+    // rows already marked met. NULL `status` = the user has never set one (a pre-v42 row); the UI
+    // renders it from `state` rather than showing a blank.
+    //
+    // The partial UNIQUE index is the card's "upsert-by-external_id, NEVER delete-and-recreate"
+    // invariant made STRUCTURAL rather than merely documented: flags anchor on
+    // `project_milestones.id`, so a sync that dropped and re-inserted its rows would mint new ids and
+    // silently orphan every flag hanging off them. With the index in place, a delete-and-recreate
+    // sync collides on its own second insert instead of corrupting the anchor space. It is partial
+    // (`WHERE … IS NOT NULL`) so the many PM-native rows — which carry NULL for both columns — are
+    // unconstrained; SQLite treats NULLs in a UNIQUE index as distinct anyway, but stating it keeps
+    // the intent legible and the index small.
+    r#"
+    ALTER TABLE project_milestones ADD COLUMN status      TEXT
+        CHECK (status IN ('not_started','in_progress','almost_done','done') OR status IS NULL);
+    ALTER TABLE project_milestones ADD COLUMN source_type TEXT;  -- 'sheets' | 'notion' | …; NULL = PM-native
+    ALTER TABLE project_milestones ADD COLUMN external_id TEXT;  -- the source's own stable row id
+
+    CREATE UNIQUE INDEX idx_project_milestones_external
+        ON project_milestones(source_type, external_id)
+     WHERE source_type IS NOT NULL AND external_id IS NOT NULL;
+
+    -- guard:allow — preserving backfill: fills the freshly-added, all-NULL status; overwrites nothing.
+    UPDATE project_milestones SET status = 'done' WHERE state = 'met';
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1199,7 +1232,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 41,
+            version, 42,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1217,7 +1250,8 @@ mod tests {
              Drive shared-with-me access relation is v38; \
              Review AI-proposal cache is v39; \
              calendar event popup detail columns is v40; \
-             preferences.source admits 'imported' is v41)"
+             preferences.source admits 'imported' is v41; \
+             project_milestones status + source_type/external_id is v42)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

@@ -3947,6 +3947,24 @@ pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Re
     Ok(())
 }
 
+/// Set a milestone's progress status (v42) — the four-level counterpart to the met/unmet tick-box.
+/// `milestones::set_status` carries `state` along, so this goes through exactly the same
+/// flag-reopening step `set_milestone_state` does: moving OFF `done` is the same "I made a mistake"
+/// undo as un-ticking the box, and must clear a user-asserted completion so detection can surface
+/// the deadline again. Skipping that here would make the two controls behave differently on the
+/// same transition.
+#[tauri::command]
+pub fn set_milestone_status(state: State<'_, AppState>, id: i64, status: String) -> Result<()> {
+    let conn = state.conn()?;
+    milestones::set_status(&conn, id, &status)?;
+    if status != milestones::STATUS_DONE {
+        flags::reopen_milestone(&conn, id)?;
+    }
+    touch_milestone_project(&conn, id)?;
+    briefing::nudge(&state);
+    Ok(())
+}
+
 /// Delete a milestone by id.
 #[tauri::command]
 pub fn delete_milestone(state: State<'_, AppState>, id: i64) -> Result<()> {
