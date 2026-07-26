@@ -116,6 +116,17 @@ export function DevView() {
       .finally(() => setChatIdBusy(false));
   }, []);
 
+  // The worker spawns LAZILY, so the confinement report reads `not_spawned` until something first asks
+  // it to do work — and the self-test below is exactly such a thing. Re-read it whenever that could
+  // have moved, or the panel goes on reporting "worker not started yet" directly above a probe that
+  // just proved the worker started and had its socket refused. Also on the error path: a self-test that
+  // fails partway may still have spawned (and confined) the worker before failing.
+  const readSandbox = useCallback(() => {
+    devSidecarSandboxReport()
+      .then(setSandbox)
+      .catch(() => {});
+  }, []);
+
   const runNetTest = useCallback(() => {
     setNetTesting(true);
     setNetErr(null);
@@ -125,8 +136,11 @@ export function DevView() {
         setNetTest(null);
         setNetErr(String(e));
       })
-      .finally(() => setNetTesting(false));
-  }, []);
+      .finally(() => {
+        setNetTesting(false);
+        readSandbox();
+      });
+  }, [readSandbox]);
 
   // Retrieval explain (issue #81): button-triggered so the sidecar embed never fires on its own.
   const [query, setQuery] = useState("");
@@ -157,16 +171,14 @@ export function DevView() {
     sidecarStatus()
       .then(setSidecar)
       .catch(() => {});
-    devSidecarSandboxReport()
-      .then(setSandbox)
-      .catch(() => {});
+    readSandbox();
     devTableCounts()
       .then(setCounts)
       .catch(() => {});
     devTableRows("corrections", PAGE, 0)
       .then(setCorrections)
       .catch(() => {});
-  }, []);
+  }, [readSandbox]);
 
   useEffect(() => {
     getVersion()
@@ -280,10 +292,10 @@ export function DevView() {
                     </p>
                     <p className="mt-1 text-xs">
                       <span className="text-ink4">DNS: </span>
-                      <span className={netTest.dnsBlocked ? "text-st-quick" : "text-st-due"}>
-                        {netTest.dnsBlocked ? "✓ blocked" : "✗ not blocked"}
+                      <span className={netTest.dns_blocked ? "text-st-quick" : "text-st-due"}>
+                        {netTest.dns_blocked ? "✓ blocked" : "✗ not blocked"}
                       </span>
-                      <span className="text-ink3"> — {netTest.dnsDetail}</span>
+                      <span className="text-ink3"> — {netTest.dns_detail}</span>
                     </p>
                   </>
                 )}
