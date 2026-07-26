@@ -24,6 +24,21 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.86.0-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "Smart sort is finally smart. Sorting your Focus projects by “Smart” now ranks them the way you'd actually triage: what's due soon first — and within that, by the actual date, so something due today can no longer sit below something due next week — then by priority, then by whatever you touched most recently. Priority was never being considered at all before.",
+      "The Focus tab uses your whole screen. The side-by-side layout no longer stops short at a fixed width, so the two columns fill the window instead of leaving wide empty margins, and the divider between them runs the full height. The stacked layout keeps its comfortable reading width.",
+      "Each project remembers how you like its milestones ordered. The sort was one shared choice across every project, which suited none of them — a hand-ordered plan and a deadline-driven one want opposite things. Whatever you'd already chosen carries over as the starting point.",
+      "Project cards are quieter, and “Suggest attributes” is where it belongs. The size chip is gone — the Quick win badge already says it — and the AI suggestion has moved from a button covering your whole project list into each project's own Triage panel. One click now asks about one project instead of quietly starting a request for every project you have.",
+      "Your calendars are listed in the sidebar. Instead of hiding behind a “Calendars 5/9” button in the header, every calendar is shown inline at the bottom of the left sidebar while the Calendar tab is open, grouped by account and foldable, sitting just above today's briefing. Calendars you haven't chosen to sync are left out, since they can never show an event anyway.",
+      "The Refresh button says when it last worked. The calendar's last sync time now rides on the button itself — a clock time if it synced today, the date if it was earlier, and the exact moment in the tooltip — so you can tell at a glance whether pressing it is worth it. The separate “Read-only” tag is gone; it never told you anything the rest of the page didn't.",
+      "“Shared with me” says who shared it, and can be sorted. Each shared item now shows who sent it, and you can order the list by most-recently-shared or by name — Google returns them in no order at all, which is unhelpful once there are more than a few. PM also notices when someone stops sharing something: those files are kept findable and marked as no longer reachable, instead of sitting there looking current forever.",
+      "An Open PM button on the floating briefing. The always-on-top briefing window can now bring the main window to the front, so you don't have to go hunting for it. The briefing stays where it is.",
+      "You can decide whether to see which AI is in use. The models block at the bottom of the sidebar used to be governed entirely by your Depth preset — invisible on Minimal, always on otherwise. It's now a switch in Settings → General, so you can watch which model is answering on a pared-back setup, or put it away on a busy one. It's a readout only; hiding it changes nothing about which model runs.",
+    ],
+  },
+  {
     version: "3.85.3-alpha",
     date: "2026-07-26",
     highlights: [

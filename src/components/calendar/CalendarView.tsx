@@ -27,7 +27,6 @@ import {
   readRangeBounds,
   readView,
   readZones,
-  writeHidden,
   writeRange,
   writeRangeBounds,
   writeView,
@@ -278,14 +277,13 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     }
   }, [loadEvents, loadOverview, loadMilestones, loadPinboard]);
 
-  const onToggleCalendar = useCallback((calendarId: string) => {
-    setHidden((prev) => {
-      const next = new Set(prev);
-      if (next.has(calendarId)) next.delete(calendarId);
-      else next.add(calendarId);
-      writeHidden(next);
-      return next;
-    });
+  // The visibility TOGGLES moved to the sidebar block (one control, one home), so this view only
+  // reads the set — but the sidebar is mounted right beside it, so a tick there has to land here
+  // without a remount. writeHidden announces on the app-wide signal; follow it.
+  useEffect(() => {
+    const sync = () => setHidden(readHidden());
+    window.addEventListener("pm:settings-changed", sync);
+    return () => window.removeEventListener("pm:settings-changed", sync);
   }, []);
 
   const onViewChange = useCallback((v: CalendarViewMode) => {
@@ -658,12 +656,6 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onPrev={onPrev}
         onNext={onNext}
         onToday={onToday}
-        accounts={overview?.accounts ?? []}
-        calendars={overview?.calendars ?? []}
-        hidden={hidden}
-        onToggleCalendar={onToggleCalendar}
-        colorOf={colorOf}
-        shapeOf={shapeOf}
         onRefresh={onRefresh}
         syncing={syncing}
         lastSync={overview?.last_sync ?? null}

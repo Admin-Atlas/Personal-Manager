@@ -122,6 +122,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Map tab",
     body: "Show or hide the Map — the semantic picture of everything you've filed, laid out so related things sit near each other. Like the learning tools above, it follows your preset by default: on for Standard and Power, off for Minimal, since a pared-back setup rarely wants an exploratory view. Overriding here wins either way. Hiding it changes nothing about your data or the search behind it; the Map is still there the moment you switch it back on.",
   },
+  "settings-models-footer": {
+    title: "Models in use",
+    body: "Show or hide the small block at the bottom of the sidebar naming the models currently doing your chat and background work. It follows your preset by default — on for Standard and Power, off for Minimal — and this switch overrides that in either direction, so you can keep an eye on which model is answering even on a pared-back setup, or put it away on a busy one. It is a readout only: hiding it changes nothing about which model runs, and clicking it is still the quickest way into the model settings when it is shown.",
+  },
 
   // Accessibility tab (each mirrors that section's own folded note, so help mode answers the same
   // question without the reader having to unfold it).
@@ -365,7 +369,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-drive-shared": {
     title: "Shared drives & scope",
-    body: "Choose what each account indexes. Your personal My Drive is indexed whole by default. Shared drives (Team Drives) are opt-in and folder-scoped by default — pick the folders you want (everything inside is indexed) or switch to the entire drive. Saving re-syncs: newly-in-scope files get indexed, and files that fall out of scope are kept findable but marked 'source missing'. Still index-only — the files stay in Drive.",
+    body: "Choose what each account indexes. Your personal My Drive is indexed whole by default. Shared drives (Team Drives) are opt-in and folder-scoped by default — pick the folders you want (everything inside is indexed) or switch to the entire drive. Saving re-syncs: newly-in-scope files get indexed, and files that fall out of scope are kept findable but marked 'source missing'. Still index-only — the files stay in Drive. Nothing refreshes on its own: Drive updates when you press Sync now, not on a schedule. Under 'Shared with me', the contents of anything you've chosen are re-checked on each sync, but an item somebody shares with you later is only picked up automatically if you've chosen 'Everything' — otherwise open this list again and tick it. If someone stops sharing something, its files are kept findable and marked 'source missing' on the next sync.",
   },
   "settings-drive-report": {
     title: "Sync results",

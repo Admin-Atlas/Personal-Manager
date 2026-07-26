@@ -67,6 +67,10 @@ export interface ThemeState {
    *  footing as the learning tools above. */
   mapVisible: boolean;
   setMapVisible: (v: boolean) => void;
+  /** Whether the sidebar footer's **"Models in use"** block is shown. Same Depth-keyed reveal with a
+   *  user override; hiding it changes nothing about which model actually runs. */
+  modelsVisible: boolean;
+  setModelsVisible: (v: boolean) => void;
   /** True when every appearance axis (System, Mode, Accent, Depth, Location, Teach) is at its
    *  out-of-the-box default — drives whether Settings offers an appearance "Reset". */
   appearanceIsDefault: boolean;
@@ -158,6 +162,19 @@ type MapPref = "auto" | "show" | "hide";
 const MAP_PREFS: readonly MapPref[] = ["auto", "show", "hide"];
 const DEFAULT_MAP: MapPref = "auto";
 
+// The sidebar "Models in use" block, same shape again. It was governed by the Depth preset alone,
+// with no way to say otherwise: hidden on `min` even if you specifically want to see which model is
+// answering, and always on at standard/power even if you find it noise. "auto" keeps today's
+// behaviour, so nothing moves for anyone who doesn't touch it.
+//
+// A tri-state, NOT a boolean: a plain on/off cannot express "keep following the preset", which is
+// what the default has to be. And once a value is in this list it can never be REMOVED — `oneOf`
+// coerces an unrecognised stored string to the default, so deleting an arm silently rewrites the
+// choice of everyone who picked it.
+type ModelsPref = "auto" | "show" | "hide";
+const MODELS_PREFS: readonly ModelsPref[] = ["auto", "show", "hide"];
+const DEFAULT_MODELS: ModelsPref = "auto";
+
 const KEY = {
   system: "pm:theme:system",
   mode: "pm:theme:mode", // legacy (pre-2.84): held "dark"|"light"; still read once for migration
@@ -168,6 +185,7 @@ const KEY = {
   accentBySystem: "pm:theme:accentBySystem",
   teach: "pm:theme:teach",
   map: "pm:theme:map",
+  models: "pm:theme:models",
   fontScale: "pm:a11y:fontScale",
   reduceMotion: "pm:a11y:reduceMotion",
   legibleFont: "pm:a11y:legibleFont",
@@ -239,6 +257,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   );
   const [mapPref, setMapPrefState] = useState<MapPref>(() =>
     oneOf(read(KEY.map), MAP_PREFS, DEFAULT_MAP),
+  );
+  const [modelsPref, setModelsPrefState] = useState<ModelsPref>(() =>
+    oneOf(read(KEY.models), MODELS_PREFS, DEFAULT_MODELS),
   );
   const [fontScale, setFontScale] = useState<FontScale>(() =>
     oneOf(read(KEY.fontScale), FONT_SCALES, DEFAULT_FONT_SCALE),
@@ -407,6 +428,14 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.map, pref);
   }
 
+  // The sidebar's "Models in use" block, likewise (see ModelsPref above).
+  const modelsVisible = modelsPref === "auto" ? depth !== "min" : modelsPref === "show";
+  function setModelsVisible(visible: boolean): void {
+    const pref: ModelsPref = visible ? "show" : "hide";
+    setModelsPrefState(pref);
+    write(KEY.models, pref);
+  }
+
   // Whether the appearance is untouched from the defaults (the accent default is System-relative, so
   // it's compared against the default System's default accent). Drives the Settings "Reset" affordance.
   const appearanceIsDefault =
@@ -416,7 +445,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     accent === defaultAccentFor(DEFAULT_SYSTEM) &&
     autoLocation === "" &&
     teachPref === DEFAULT_TEACH &&
-    mapPref === DEFAULT_MAP;
+    mapPref === DEFAULT_MAP &&
+    modelsPref === DEFAULT_MODELS;
 
   const accessibilityIsDefault =
     fontScale === DEFAULT_FONT_SCALE &&
@@ -443,6 +473,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.accentBySystem, "{}");
     write(KEY.teach, DEFAULT_TEACH);
     write(KEY.map, DEFAULT_MAP);
+    write(KEY.models, DEFAULT_MODELS);
     setSystemState(DEFAULT_SYSTEM);
     setModePrefState(DEFAULT_MODE_PREF);
     setDepthState(DEFAULT_DEPTH);
@@ -450,6 +481,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setAutoLocationState("");
     setTeachPrefState(DEFAULT_TEACH);
     setMapPrefState(DEFAULT_MAP);
+    setModelsPrefState(DEFAULT_MODELS);
   }
 
   // Apply + persist whenever an axis (or the resolved Mode) changes (also runs on mount → themed
@@ -529,6 +561,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setTeachVisible,
     mapVisible,
     setMapVisible,
+    modelsVisible,
+    setModelsVisible,
     appearanceIsDefault,
     resetAppearance,
     fontScale,

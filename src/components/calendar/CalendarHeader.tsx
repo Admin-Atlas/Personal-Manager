@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The calendar's shared chrome — one header, no second sidebar. View switcher (active = accent),
-// ‹ Today › nav, the date-range label, the Calendars dropdown, Refresh-now, and a read-only
-// indicator. Meta (sync time) is gated by depth; the layout never forks.
+// ‹ Today › nav, the date-range label, the Calendars dropdown, and Refresh-now.
+//
+// The last-synced time rides ON the Refresh button rather than beside it: it is the one fact that
+// tells you whether pressing Refresh is worth it. The old separate "Read-only" badge is gone — it was
+// a static, prop-free span nothing derived from, and the calendar has no edit affordances to
+// disambiguate; the fact is still stated in the help card, the empty state and the Connectors copy.
 
-import type { Calendar, CalendarAccount } from "../../lib/types";
 import type { CalendarRange, CalendarViewMode, RangeBounds } from "../../lib/calendarPrefs";
-import { formatClockIso } from "../../lib/format";
+import { formatSyncedShort, formatWhen } from "../../lib/format";
 import { useDepth, useTheme, type Coords } from "../../theme";
 import { Button, SegmentedControl, type SegOption } from "../ui";
-import { CalendarsDropdown } from "./CalendarsDropdown";
 import { MiniCalendarPopover } from "./MiniCalendarPopover";
 import { RangeControl } from "./RangeControl";
 
@@ -34,13 +36,6 @@ interface Props {
   onPrev: () => void;
   onNext: () => void;
   onToday: () => void;
-  accounts: CalendarAccount[];
-  calendars: Calendar[];
-  hidden: Set<string>;
-  onToggleCalendar: (calendarId: string) => void;
-  colorOf: (calendarId: string) => string;
-  /** Per-source shape slot for the colour-blind axis (forwarded to the legend). */
-  shapeOf?: (calendarId: string) => number | undefined;
   onRefresh: () => void;
   syncing: boolean;
   lastSync: string | null;
@@ -69,20 +64,14 @@ export function CalendarHeader({
   onPrev,
   onNext,
   onToday,
-  accounts,
-  calendars,
-  hidden,
-  onToggleCalendar,
-  colorOf,
-  shapeOf,
   onRefresh,
   syncing,
   lastSync,
 }: Props) {
   const { showMeta } = useDepth();
   const { system } = useTheme();
-  // Local clock time of the last successful sync; null when unset or unparseable.
-  const synced = lastSync ? formatClockIso(lastSync) || null : null;
+  // The last successful sync: clock time if it was today, else the date. Null when unset/unparseable.
+  const synced = lastSync ? formatSyncedShort(lastSync) || null : null;
   // The Work/Day/24h scale only drives the pixel time-grid (Slate/Editorial). Terminal renders
   // Week/Day as a mono agenda with no vertical scale, so the control has nothing to act on there.
   const showRange = (view === "week" || view === "day") && system !== "terminal";
@@ -127,27 +116,19 @@ export function CalendarHeader({
         {viewOptions.length > 1 && (
           <SegmentedControl options={viewOptions} value={view} onChange={onViewChange} />
         )}
-        <div className="flex items-center" data-help="calendar-filter">
-          <CalendarsDropdown
-            accounts={accounts}
-            calendars={calendars}
-            hidden={hidden}
-            onToggle={onToggleCalendar}
-            colorOf={colorOf}
-            shapeOf={shapeOf}
-          />
-        </div>
-        <Button variant="secondary" onClick={onRefresh} disabled={syncing} title="Refresh now">
-          {syncing ? "Refreshing…" : "Refresh"}
+        {/* The "Calendars x/x" dropdown used to sit here. It now lives in the left sidebar, listing
+            every calendar inline instead of behind a button — one control, one home, so it is NOT
+            mirrored back into the header. */}
+        <Button
+          variant="secondary"
+          onClick={onRefresh}
+          disabled={syncing}
+          // The exact moment always lives in the tooltip, even at Minimal where the inline stamp is
+          // hidden — so the detail is never unreachable, only quieter.
+          title={lastSync ? `Last synced ${formatWhen(lastSync)}` : "Never synced"}
+        >
+          {syncing ? "Refreshing…" : showMeta && synced ? `Refresh · ${synced}` : "Refresh"}
         </Button>
-        <div className="flex items-center gap-2">
-          <span className="rounded-[var(--radius-sm)] border border-border px-1.5 py-0.5 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
-            Read-only
-          </span>
-          {showMeta && synced && (
-            <span className="font-mono text-xs text-ink4">synced {synced}</span>
-          )}
-        </div>
       </div>
     </header>
   );

@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { formatDate, formatDateOnly, formatDateLocal, formatDateTime, formatWhen } from "./format";
+import {
+  formatDate,
+  formatDateOnly,
+  formatDateLocal,
+  formatDateTime,
+  formatSyncedShort,
+  formatWhen,
+} from "./format";
 
 // Dates are round-tripped through a *local* Date so the assertions hold regardless of the runner's
 // timezone: `new Date(y, m, d, 12).toISOString()` names one instant, and parsing it back lands on the
@@ -78,5 +85,25 @@ describe("formatDateTime", () => {
 describe("formatWhen", () => {
   it("returns an unparseable value unchanged", () => {
     expect(formatWhen("garbage")).toBe("garbage");
+  });
+});
+
+describe("formatSyncedShort", () => {
+  // This drives the Refresh button's label, so the day boundary is the whole point: a bare clock
+  // time for yesterday's sync would read as today, on the very control you press to fix that.
+  const now = new Date(2026, 6, 26, 15, 0, 0); // 26 July 2026, 15:00 local
+
+  it("shows a clock time for a sync that happened today", () => {
+    expect(formatSyncedShort(new Date(2026, 6, 26, 9, 30).toISOString(), now)).toMatch(
+      /^\d{2}:\d{2}(\s?[AP]M)?$/i,
+    );
+  });
+
+  it("shows the date once the sync is not from today", () => {
+    expect(formatSyncedShort(new Date(2026, 6, 25, 23, 59).toISOString(), now)).toBe("25-07");
+  });
+
+  it("is empty for an unparseable value", () => {
+    expect(formatSyncedShort("garbage", now)).toBe("");
   });
 });

@@ -22,7 +22,7 @@
 
 import { BriefingProvider } from "./lib/briefing";
 import { Briefing } from "./components/Briefing";
-import { closeBriefingWindow } from "./lib/ipc";
+import { closeBriefingWindow, showMainWindow } from "./lib/ipc";
 import { ThemeProvider, UserTimeProvider } from "./theme";
 
 export function PopoverRoot() {
@@ -50,18 +50,33 @@ export function PopoverRoot() {
               >
                 Briefing — Today
               </span>
-              {/* Closing hides the window AND switches the setting off, so it doesn't come back on
-                  the next launch claiming to be on top. Rust owns both halves: this root can't hide
-                  its own window (no capability) and the main window can't see this click. */}
-              <button
-                type="button"
-                onClick={() => void closeBriefingWindow().catch(() => {})}
-                title="Close the briefing window"
-                aria-label="Close the briefing window"
-                className="rounded-[var(--radius-sm)] px-1.5 text-xs text-ink4 hover:bg-surface hover:text-ink"
-              >
-                <span aria-hidden="true">✕</span>
-              </button>
+              {/* Both buttons live INSIDE the drag strip and deliberately carry no
+                  `data-tauri-drag-region` — the ✕ already proves a real <button> in here still gets
+                  its clicks. "Open PM" leaves this window where it is: it is a persistent
+                  always-on-top panel, so dismissing it on every use would fight what it is for. */}
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => void showMainWindow().catch(() => {})}
+                  title="Bring the Personal Manager window to the front"
+                  aria-label="Open Personal Manager"
+                  className="rounded-[var(--radius-sm)] px-1.5 text-xs text-ink4 hover:bg-surface hover:text-ink"
+                >
+                  Open PM
+                </button>
+                {/* Closing hides the window AND switches the setting off, so it doesn't come back on
+                    the next launch claiming to be on top. Rust owns both halves: this root can't hide
+                    its own window (no capability) and the main window can't see this click. */}
+                <button
+                  type="button"
+                  onClick={() => void closeBriefingWindow().catch(() => {})}
+                  title="Close the briefing window"
+                  aria-label="Close the briefing window"
+                  className="rounded-[var(--radius-sm)] px-1.5 text-xs text-ink4 hover:bg-surface hover:text-ink"
+                >
+                  <span aria-hidden="true">✕</span>
+                </button>
+              </div>
             </div>
             {/* overflow-hidden, not -y-auto: with `fill` the Briefing owns its own scroller, and
                 nesting two would give this frameless window a second scrollbar. */}
