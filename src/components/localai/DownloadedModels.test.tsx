@@ -1,0 +1,131 @@
+// @vitest-environment jsdom
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// The "Already downloaded" list (#449) only ever contains models NO endpoint is serving — local_ai.rs
+// filters with `!already_served`. That makes "you can't pick these yet" a GATING hint rather than
+// prose, so the settings doctrine keeps it unfolded and visible. These pin that it is actually
+// rendered, that it says the right half depending on whether an endpoint exists, and that it stays
+// out of the way when there is nothing on disk to explain.
+
+import { render } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import type { LocalOnDiskModel, LocalRecommendations } from "../../lib/types";
+import { DownloadedModels } from "./LocalAiSettings";
+
+// `useTheme` is stubbed so the section's <Button>s don't need the full ThemeProvider, matching
+// ConnectorItemRow.test.tsx.
+vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
+  ...(await importOriginal()),
+  useTheme: () => ({
+    system: "slate",
+    mode: "dark",
+    modePref: "system",
+    modeSource: "system",
+    accent: "mono",
+    depth: "standard",
+    autoLocation: "",
+    teachVisible: true,
+    setSystem: () => {},
+    setModePref: () => {},
+    setAccent: () => {},
+    setDepth: () => {},
+    setAutoLocation: () => {},
+    setTeachVisible: () => {},
+  }),
+}));
+
+const MODEL: LocalOnDiskModel = {
+  name: "gemma-3-4b-it-Q4_K_M",
+  source: "lm_studio",
+  path: "/models/gemma-3-4b-it-Q4_K_M.gguf",
+  size_gb: 2.5,
+  quant: "Q4_K_M",
+  shards: 1,
+  matched_repo: "google/gemma-3-4b-it",
+  fit: {
+    verdict: "comfortable",
+    quant: "Q4_K_M",
+    context: 8192,
+    kv: "f16",
+    est_memory_gb: 3.4,
+    est_tokens_per_sec: 40,
+    notes: [],
+  },
+};
+
+function recs(over: Partial<LocalRecommendations> = {}): LocalRecommendations {
+  return {
+    hardware: {
+      platform: "windows",
+      total_ram_gb: 32,
+      available_ram_gb: 20,
+      cpu_brand: null,
+      cpu_cores: null,
+      cpu_threads: null,
+      disk_free_gb: null,
+      gpu_name: null,
+      gpu_vendor: null,
+      vram_gb: null,
+      vram_source: null,
+      gpu_bandwidth_gbps: null,
+      unified_memory: false,
+      is_wsl: false,
+      notes: [],
+    },
+    reserve_gb: 2,
+    gpu_reserve_gb: 1,
+    catalog_version: 1,
+    catalog_generated_at: "2026-07-26",
+    endpoint_configured: true,
+    cadence: "monthly",
+    rescan_due: false,
+    curated: [],
+    installed: [],
+    on_disk: [MODEL],
+    disk_sources_present: ["lm_studio"],
+    disk_truncated: false,
+    scan_dir: null,
+    ...over,
+  };
+}
+
+const noop = () => {};
+
+describe("DownloadedModels — the unserved gating hint", () => {
+  it("says a downloaded model isn't assignable until its server serves it", () => {
+    const { container } = render(
+      <DownloadedModels recs={recs()} configured onPickFolder={noop} onClearFolder={noop} />,
+    );
+    expect(container.textContent).toContain("None of these can be assigned yet");
+    expect(container.textContent).toContain("Assign roles");
+    // The model itself still renders — the hint explains the list, it doesn't replace it.
+    expect(container.textContent).toContain("gemma-3-4b-it-Q4_K_M");
+  });
+
+  it("points at connecting an endpoint first when there isn't one", () => {
+    const { container } = render(
+      <DownloadedModels
+        recs={recs()}
+        configured={false}
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    expect(container.textContent).toContain("Connect an endpoint");
+    expect(container.textContent).not.toContain("None of these can be assigned yet");
+  });
+
+  it("stays silent when nothing was found on disk", () => {
+    const { container } = render(
+      <DownloadedModels
+        recs={recs({ on_disk: [] })}
+        configured
+        onPickFolder={noop}
+        onClearFolder={noop}
+      />,
+    );
+    expect(container.textContent).not.toContain("can be assigned");
+    expect(container.textContent).not.toContain("Connect an endpoint");
+  });
+});

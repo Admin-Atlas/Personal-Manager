@@ -907,8 +907,19 @@ mod tests {
             Some("Q4_K_M")
         );
         assert_eq!(quant_from_name("Model-IQ4_XS").as_deref(), Some("IQ4_XS"));
-        // An unrecognised or absent label is never guessed — the fit becomes `unknown` instead.
-        assert_eq!(quant_from_name("some-model-F16"), None);
+        // Legacy and full-precision labels read too. This gate is `Quant::from_label`, so widening
+        // that table is what makes these files scoreable off a measured size instead of `unknown`.
+        assert_eq!(quant_from_name("some-model-F16").as_deref(), Some("F16"));
+        assert_eq!(quant_from_name("llama-2-7b.Q4_0").as_deref(), Some("Q4_0"));
+        assert_eq!(
+            quant_from_name("Model-bf16").as_deref(),
+            Some("BF16"),
+            "the file's own label is reported, even though it scores as F16"
+        );
+        // An unrecognised or absent label is still never guessed — a trailing word that merely looks
+        // like a token must not become a quant, so this stays gated on the table.
+        assert_eq!(quant_from_name("some-model-TQ1_0"), None);
+        assert_eq!(quant_from_name("qwen3-4b-instruct"), None);
         assert_eq!(quant_from_name("plain-model"), None);
         assert_eq!(quant_from_name(""), None);
     }

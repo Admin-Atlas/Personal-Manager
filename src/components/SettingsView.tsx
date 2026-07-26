@@ -551,7 +551,12 @@ export function SettingsView({
 
             {tab === "accessibility" && <AccessibilitySettings />}
 
-            {tab === "ai" && <AiModelsSettings onOpenTeach={onOpenTeach} />}
+            {tab === "ai" && (
+              <AiModelsSettings
+                onOpenTeach={onOpenTeach}
+                onOpenLocalAi={() => selectTab("localai")}
+              />
+            )}
 
             {tab === "localai" && <LocalAiSettings onBetterFitChange={onBetterFitChange} />}
 
