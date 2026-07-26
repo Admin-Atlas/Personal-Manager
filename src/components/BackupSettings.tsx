@@ -140,6 +140,16 @@ export function BackupSettings() {
   const [retentionDraft, setRetentionDraft] = useState("5");
   const [savingSchedule, setSavingSchedule] = useState(false);
 
+  // Outcome of the banner's "Delete oldest" action, reported per destination and rendered IN the
+  // banner. The action used to discard its count and route failures to the top-level `error` sink,
+  // which renders hundreds of lines above this inside a different panel — scrolled off-screen on any
+  // normal window. Success said nothing and failure said nothing visible, so the click read as
+  // "it did nothing" either way.
+  const [pruneNote, setPruneNote] = useState<{ proton: string | null; gdrive: string | null }>({
+    proton: null,
+    gdrive: null,
+  });
+
   // This vault's archive-name prefix, so we can count only THIS vault's archives at a shared
   // destination for the "you have more backups than keep-last-N" reconciliation banner. Loaded once.
   const [archivePrefix, setArchivePrefix] = useState<string | null>(null);
@@ -333,6 +343,12 @@ export function BackupSettings() {
   // sharing the account/folder, so filter by our prefix). `null` until both the prefix and the
   // listing have loaded. The reconciliation banner fires when a destination holds more than keep-N.
   const keepN = schedule?.retention_n ?? null;
+  // The one control in Settings that holds an unsaved buffer. Done — or merely switching Settings
+  // tabs, which unmounts this panel — throws the drafts away silently, which made the footer's
+  // "changes are saved as you make them" untrue here. Say so instead of pretending.
+  const scheduleDirty =
+    schedule != null &&
+    (freqDraft !== schedule.frequency || retentionDraft !== String(schedule.retention_n));
   const protonOwnCount =
     archivePrefix && protonBackups
       ? protonBackups.filter((b) => b.name.startsWith(archivePrefix)).length
@@ -601,15 +617,22 @@ export function BackupSettings() {
   // Reconciliation banner action: trim this vault's archives at the destination to keep-last-N now
   // (recoverable — Proton/Drive trash).
   async function doPruneOldest(kind: "proton" | "gdrive") {
-    setError(null);
+    setPruneNote((prev) => ({ ...prev, [kind]: null }));
     try {
       if (kind === "proton") setProtonBusy(true);
       else setGdriveBusy(true);
-      await pruneOwnBackups(kind);
+      const n = await pruneOwnBackups(kind);
       if (kind === "proton") await refreshProton();
       else await refreshGdrive();
+      setPruneNote((prev) => ({
+        ...prev,
+        [kind]:
+          n > 0
+            ? `Moved ${n} older backup${n === 1 ? "" : "s"} to the destination's trash.`
+            : "Nothing to trim — none of this vault's archives were over the limit.",
+      }));
     } catch (e) {
-      setError(String(e));
+      setPruneNote((prev) => ({ ...prev, [kind]: String(e) }));
     } finally {
       if (kind === "proton") setProtonBusy(false);
       else setGdriveBusy(false);
@@ -628,8 +651,13 @@ export function BackupSettings() {
   function reconcileBanner(kind: "proton" | "gdrive") {
     const present = kind === "proton" ? protonOwnCount : gdriveOwnCount;
     const over = kind === "proton" ? protonOverLimit : gdriveOverLimit;
-    if (!over || reconcileDismissed[kind] || present == null || keepN == null) return null;
+    const note = pruneNote[kind];
     const destBusy = kind === "proton" ? protonBusy : gdriveBusy;
+    if (!over || reconcileDismissed[kind] || present == null || keepN == null) {
+      // A successful trim clears `over`, which would take the banner — and its outcome line — away
+      // in the same render. Keep the note on screen after the banner it belongs to has gone.
+      return note ? <p className="text-sm text-ink3">{note}</p> : null;
+    }
     return (
       <div
         className="flex flex-col gap-2 rounded-[var(--radius)] border px-3 py-2.5 text-sm text-ink3"
@@ -652,12 +680,13 @@ export function BackupSettings() {
             onClick={() => void doPruneOldest(kind)}
             disabled={busy || destBusy}
           >
-            Delete oldest, keep {keepN}
+            {destBusy ? "Trimming…" : `Delete oldest, keep ${keepN}`}
           </Button>
           <Button variant="tertiary" onClick={() => doDismissReconcile(kind)} disabled={busy}>
             Dismiss
           </Button>
         </div>
+        {note && <p className="text-sm">{note}</p>}
       </div>
     );
   }
@@ -1413,7 +1442,7 @@ export function BackupSettings() {
               </p>
             )}
 
-            <div>
+            <div className="flex items-center gap-2">
               <Button
                 variant="secondary"
                 onClick={doSaveSchedule}
@@ -1421,6 +1450,9 @@ export function BackupSettings() {
               >
                 {savingSchedule ? "Saving…" : "Save schedule"}
               </Button>
+              {scheduleDirty && !savingSchedule && (
+                <span className="text-xs text-st-look">Not saved yet</span>
+              )}
             </div>
 
             {scheduleSaveError && (

@@ -4,8 +4,16 @@
 // The Work / Day / 24h time-grid range control. Replaces the plain SegmentedControl so Work and Day
 // can each carry a ▾ that opens a small popover to edit their visible-hour window (24h is fixed, so
 // it has no chevron). Editing a range also selects it, so the grid reflects the change live. Values
-// are decimal hours; the <input type="time"> exchange is locale-independent (its value is always
-// 24h HH:MM). Token-driven; no colours of its own.
+// are decimal hours, displayed as 24h HH:MM so the vocabulary stays locale-independent.
+//
+// The bounds are picked from half-hour <Select> slots, NOT typed into <input type="time">. Blink
+// implements the native time widget and only ever emits a complete "HH:MM", but WebKitGTK (Linux)
+// has no such widget and degrades it to a plain text box — so every intermediate keystroke failed to
+// parse, the controlled value snapped back, and a two-digit hour could never be entered. A select
+// can only ever hold a whole valid value, so it behaves identically on both engines. The option
+// lists are also cross-filtered to keep at least an hour between the bounds, which is the one window
+// sanitizeBounds refuses: every offered slot is one it will accept, so a pick can never silently
+// no-op. See ui/Select for the matching WebKitGTK sizing note.
 //
 // The Focus tab's "Upcoming" grid renders this too, narrowed to Work/Day (`ranges`) and pointed at
 // its own bounds store — same editor, same vocabulary, independent windows.
@@ -14,7 +22,7 @@ import { sanitizeBounds, type CalendarRange, type RangeBounds } from "../../lib/
 import { resolveRangeBounds } from "../../lib/calendarGeom";
 import type { Coords } from "../../theme";
 import { cn } from "../ui";
-import { Popover } from "../ui";
+import { Popover, Select } from "../ui";
 
 const ITEMS: ReadonlyArray<{ value: CalendarRange; label: string; editable: boolean }> = [
   { value: "work", label: "Work", editable: true },
@@ -22,21 +30,22 @@ const ITEMS: ReadonlyArray<{ value: CalendarRange; label: string; editable: bool
   { value: "full", label: "24h", editable: false },
 ];
 
-/** Decimal hour → "HH:MM" for the time input, capped at 23:30 (the input can't express 24:00). */
+/** Decimal hour → "HH:MM". 24 renders as "24:00" — end-of-day, which a time input can't express. */
 function hoursToHM(h: number): string {
-  const clamped = Math.max(0, Math.min(23.5, h));
-  const hh = Math.floor(clamped);
-  const mm = Math.round((clamped - hh) * 60);
+  const hh = Math.floor(h);
+  const mm = Math.round((h - hh) * 60);
   return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
 }
 
-/** "HH:MM" → decimal hour, or null if unparseable. */
-function hmToHours(v: string): number | null {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(v);
-  if (!m) return null;
-  const h = Number(m[1]) + Number(m[2]) / 60;
-  return Number.isFinite(h) ? h : null;
+/** Half-hour slots over [lo, hi] inclusive — the granularity sanitizeBounds' round05 already pins. */
+function slots(lo: number, hi: number): number[] {
+  const out: number[] = [];
+  for (let h = lo; h <= hi + 1e-9; h += 0.5) out.push(Math.round(h * 2) / 2);
+  return out;
 }
+
+/** The narrowest window the geometry accepts, mirroring sanitizeBounds' `endHour - startHour < 1`. */
+const MIN_WINDOW_H = 1;
 
 interface Props {
   range: CalendarRange;
@@ -125,8 +134,9 @@ function RangeEditor({
   onApply: (b: RangeBounds) => void;
   onReset: () => void;
 }) {
-  const inputCls =
-    "rounded-[var(--radius-sm)] border border-border2 bg-surface px-1.5 py-0.5 font-mono text-xs text-ink2 focus:border-accent focus:outline-none";
+  // Cross-filtered so the pair can never form a window sanitizeBounds would reject.
+  const startSlots = slots(0, 23.5).filter((h) => h <= effective.endHour - MIN_WINDOW_H);
+  const endSlots = slots(0.5, 24).filter((h) => h >= effective.startHour + MIN_WINDOW_H);
   return (
     <Popover
       align="right"
@@ -150,33 +160,45 @@ function RangeEditor({
       <div className="space-y-2">
         <label className="flex items-center justify-between gap-3 text-xs text-ink2">
           <span>Start</span>
-          <input
-            type="time"
-            step={1800}
-            value={hoursToHM(effective.startHour)}
+          <Select
+            compact
+            value={String(effective.startHour)}
             onChange={(e) => {
-              const s = hmToHours(e.target.value);
-              if (s == null) return;
-              const b = sanitizeBounds({ startHour: s, endHour: effective.endHour });
+              const b = sanitizeBounds({
+                startHour: Number(e.target.value),
+                endHour: effective.endHour,
+              });
               if (b) onApply(b);
             }}
-            className={inputCls}
-          />
+            className="font-mono"
+          >
+            {startSlots.map((h) => (
+              <option key={h} value={h}>
+                {hoursToHM(h)}
+              </option>
+            ))}
+          </Select>
         </label>
         <label className="flex items-center justify-between gap-3 text-xs text-ink2">
           <span>End</span>
-          <input
-            type="time"
-            step={1800}
-            value={hoursToHM(effective.endHour)}
+          <Select
+            compact
+            value={String(effective.endHour)}
             onChange={(e) => {
-              const en = hmToHours(e.target.value);
-              if (en == null) return;
-              const b = sanitizeBounds({ startHour: effective.startHour, endHour: en });
+              const b = sanitizeBounds({
+                startHour: effective.startHour,
+                endHour: Number(e.target.value),
+              });
               if (b) onApply(b);
             }}
-            className={inputCls}
-          />
+            className="font-mono"
+          >
+            {endSlots.map((h) => (
+              <option key={h} value={h}>
+                {hoursToHM(h)}
+              </option>
+            ))}
+          </Select>
         </label>
         {isCustom && (
           <button

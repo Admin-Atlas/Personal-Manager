@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { formatWhen } from "../../lib/format";
 import {
@@ -20,8 +20,9 @@ import {
   settingsDefaults,
 } from "../../lib/ipc";
 import type { CostSummary, Settings } from "../../lib/types";
+import { IngestProgress } from "../IngestProgress";
 import { ModelListEditor } from "../ModelListEditor";
-import { Button, Input, SectionInfo, Textarea, Toggle } from "../ui";
+import { Button, Input, SectionInfo, Textarea, Toggle, VisuallyHidden } from "../ui";
 import { TabResetSection } from "./ResetControls";
 import { readReviewAiEnabled, writeReviewAiEnabled } from "../../lib/reviewPrefs";
 
@@ -193,6 +194,8 @@ export function AiModelsSettings({
     });
   }
 
+  const memoryRef = useRef<HTMLTextAreaElement>(null);
+
   async function doImportMemory() {
     if (!memoryText.trim() || importing) return;
     setImporting(true);
@@ -210,6 +213,9 @@ export function AiModelsSettings({
       setImportError(String(e));
     } finally {
       setImporting(false);
+      // The button that had focus is swapped out while the import runs, which would otherwise drop
+      // focus to <body> and lose a keyboard user's place mid-operation.
+      memoryRef.current?.focus();
     }
   }
 
@@ -378,7 +384,10 @@ export function AiModelsSettings({
       </div>
 
       <div id="sec-ai-memory" data-settings-section className="mt-5 border-t border-border pt-4">
-        <label className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3">
+        <label
+          htmlFor="ai-memory-paste"
+          className="block font-mono text-xs font-medium uppercase tracking-wide text-ink3"
+        >
           Import AI memory
         </label>
         <p className="mt-1 text-xs text-ink4">
@@ -397,19 +406,34 @@ export function AiModelsSettings({
         </div>
 
         <Textarea
-          className="mt-2 h-28 w-full text-xs"
+          id="ai-memory-paste"
+          ref={memoryRef}
+          className="mt-2 h-48 w-full text-xs"
           placeholder="Paste the AI's reply here…"
           value={memoryText}
           onChange={(e) => setMemoryText(e.currentTarget.value)}
         />
         <div className="mt-2 flex flex-wrap items-center gap-2">
-          <Button
-            variant="secondary"
-            onClick={() => void doImportMemory()}
-            disabled={importing || !memoryText.trim()}
-          >
-            {importing ? "Importing…" : "Import"}
-          </Button>
+          {/* Swap the button out for the bar rather than dimming it in place — a 40%-opacity button
+              whose label grows to "Importing…" reads as a second, ghosted control. `total={null}` is
+              the honest tier: distilling is one non-streaming model call, so there is no count to
+              report and a percentage would be invented. */}
+          {importing ? (
+            <div className="w-full max-w-xs">
+              <IngestProgress processed={0} total={null} label="Importing AI memory" />
+              <p className="mt-1 text-xs text-ink4">
+                Reading your export with the background model — this usually takes a few seconds.
+              </p>
+            </div>
+          ) : (
+            <Button
+              variant="secondary"
+              onClick={() => void doImportMemory()}
+              disabled={!memoryText.trim()}
+            >
+              Import
+            </Button>
+          )}
           {importError && <span className="text-xs text-st-due">{importError}</span>}
           {importResult && (
             <span className="flex items-center gap-1.5 text-xs text-ink3">
@@ -425,6 +449,11 @@ export function AiModelsSettings({
               )}
             </span>
           )}
+          {/* The visible result/error lines are not announced on their own — this is what a screen
+              reader hears when the import starts and finishes. */}
+          <VisuallyHidden role="status" aria-live="polite">
+            {importing ? "Importing AI memory" : (importError ?? importResult ?? "")}
+          </VisuallyHidden>
         </div>
       </div>
 

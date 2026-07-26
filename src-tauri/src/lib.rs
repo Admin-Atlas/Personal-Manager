@@ -246,6 +246,29 @@ pub struct IngestJobState {
     /// The most recent finished rebuild's counts, so a user returning after it completed still sees
     /// the result — the live event only reaches a listener that was mounted. Cleared on a new run.
     pub last_report: Option<IngestReport>,
+    /// The tail of the per-file Activity list, capped at [`RECENT_ITEMS_CAP`]. Without it a tab
+    /// switch emptied the list outright and the card had nothing to render until the next file
+    /// finished — seconds of apparent death mid-rebuild, while the elapsed timer (restored from
+    /// `started_at_ms`) kept counting, which is what made the gap look like a bug rather than a load.
+    /// Capped-and-flagged like [`crate::cloud_sync::CloudSyncReport::issues`]; the tail is what a
+    /// returning user is looking for, so the front is dropped first.
+    pub recent: Vec<IngestItem>,
+    /// True once `recent` has dropped older rows, so the UI can say the list is partial.
+    pub recent_truncated: bool,
+}
+
+/// How many per-file rows the snapshot keeps. Enough to look continuous on return, small enough that
+/// a 10,000-file rebuild costs nothing to hold.
+pub const RECENT_ITEMS_CAP: usize = 50;
+
+/// One row of the rebuild's Activity list, mirrored into [`IngestJobState`].
+#[derive(Clone, serde::Serialize)]
+pub struct IngestItem {
+    pub name: String,
+    /// "working" | "done" | "skipped" | "failed" — the same vocabulary the UI's own rows use.
+    pub status: String,
+    /// The skip reason or error text; absent for working/done rows.
+    pub detail: Option<String>,
 }
 
 /// The counts a finished rebuild reports, mirrored into [`IngestJobState`] so they survive the

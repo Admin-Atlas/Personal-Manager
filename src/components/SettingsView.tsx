@@ -592,7 +592,11 @@ export function SettingsView({
               {error}
             </p>
           )}
-          <div className="flex justify-end gap-2">
+          {/* A standing statement rather than a transient "Saved ✓": every tab here writes on
+              change, so there is nothing to batch and a flash would be a lie on most renders.
+              Deferred writes get their own confirmation next to the control that defers them. */}
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-xs text-ink4">Changes are saved as you make them.</p>
             <Button variant="primary" onClick={onClose}>
               Done
             </Button>

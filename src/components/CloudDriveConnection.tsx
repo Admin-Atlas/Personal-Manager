@@ -280,6 +280,19 @@ export function CloudDriveConnection({
                   <ConnectorItemRow
                     title={a.email}
                     reachable={a.state === "ok"}
+                    // The only non-'ok' state the Drive connector ever writes is 'error', which means
+                    // "a sync didn't finish, cursor held, retry next pass" — NOT that the account is
+                    // gone. The default badge called that "unreachable", so one failed file out of
+                    // ten thousand painted the whole account dead.
+                    badgeLabel={a.state === "error" ? "sync failed" : "unreachable"}
+                    detail={
+                      a.state === "error" ? (
+                        <p className="mt-0.5 text-xs text-ink4">
+                          The last sync didn&rsquo;t finish. Press Sync now to retry, or narrow what
+                          it covers below.
+                        </p>
+                      ) : undefined
+                    }
                     meta={
                       <>
                         {a.indexed} indexed
@@ -298,36 +311,37 @@ export function CloudDriveConnection({
                     actionDisabled={anyBusy}
                     onAction={() => setConfirmEmail(a.email)}
                   >
-                    {meta.sheets &&
-                      "has_sheets_scope" in a &&
-                      !a.has_sheets_scope &&
-                      a.state === "ok" && (
-                        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
-                          <span className="text-xs text-ink4">
-                            Google Sheets are indexed by name only.
-                          </span>
-                          {/* Reconnect re-runs consent, which requests the Sheets scope and unions it onto
+                    {meta.sheets && "has_sheets_scope" in a && !a.has_sheets_scope && (
+                      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span className="text-xs text-ink4">
+                          Google Sheets are indexed by name only. Google can&rsquo;t add a
+                          permission to a sign-in you&rsquo;ve already given, so this is a one-time
+                          reconnect.
+                        </span>
+                        {/* Reconnect re-runs consent, which requests the Sheets scope and unions it onto
                             the existing Drive grant (prompt=select_account → pick this email). */}
-                          <Button
-                            variant="tertiary"
-                            onClick={connect}
-                            disabled={anyBusy}
-                            className="px-1.5 py-0.5 text-xs"
-                          >
-                            Reconnect for Sheets
-                          </Button>
-                        </div>
-                      )}
+                        <Button
+                          variant="tertiary"
+                          onClick={connect}
+                          disabled={anyBusy}
+                          className="px-1.5 py-0.5 text-xs"
+                        >
+                          Reconnect for Sheets
+                        </Button>
+                      </div>
+                    )}
                   </ConnectorItemRow>
-                  {a.state === "ok" && (
-                    <Collapsible
-                      className="mt-2"
-                      defaultOpen={!a.last_synced_at}
-                      title={<span className="text-xs text-ink3">{meta.scopeTitle}</span>}
-                    >
-                      {meta.scopePicker(a.email, () => void refresh())}
-                    </Collapsible>
-                  )}
+                  {/* Not gated on `state === "ok"`. Hiding the scope picker the moment a sync
+                      half-failed took away the one control that narrows scope away from whatever is
+                      failing, and only a fully clean sync or a disconnect/reconnect brought it back.
+                      CalendarConnection keeps its picker visible when not ok; Drive was the outlier. */}
+                  <Collapsible
+                    className="mt-2"
+                    defaultOpen={!a.last_synced_at}
+                    title={<span className="text-xs text-ink3">{meta.scopeTitle}</span>}
+                  >
+                    {meta.scopePicker(a.email, () => void refresh())}
+                  </Collapsible>
                 </li>
               ))}
             </ul>

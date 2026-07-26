@@ -19,6 +19,7 @@ import { FocusUpcoming } from "./FocusUpcoming";
 import { Briefing } from "./Briefing";
 import type {
   AgendaEvent,
+  Calendar,
   FocusRoute,
   Importance,
   ProjectOverview,
@@ -169,8 +170,10 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   /** Focus-agenda events (empty when not connected). Includes events that ended earlier today, tagged
    *  `ended` — the Agenda greys those rather than hiding them. */
   const [events, setEvents] = useState<AgendaEvent[]>(() => cachedEvents);
-  /** Connected-calendar ids, for colouring the Upcoming grid's events (Week display mode). */
-  const [calendarIds, setCalendarIds] = useState<string[]>([]);
+  /** The connected calendars. Whole objects rather than bare ids: FocusUpcoming colours the grid from
+   *  them, needs `quiet` to honour the same exclusion the agenda feed applies, and the event detail
+   *  popover names the owning calendar. */
+  const [calendars, setCalendars] = useState<Calendar[]>([]);
   // The briefing is owned by the app-scope provider (it has up to three surfaces mounted at once);
   // this view only needs to re-trigger it when a flag is resolved.
   const { refresh: regenerateBriefing } = useBriefing();
@@ -221,7 +224,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
     void (async () => {
       try {
         const overview = await calendarOverview();
-        if (aliveRef.current) setCalendarIds(overview.calendars.map((c) => c.id));
+        if (aliveRef.current) setCalendars(overview.calendars);
         if (overview.accounts.length > 0) {
           await syncCalendar().catch(() => {});
           const evts = await listCalendarEvents();
@@ -371,7 +374,7 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
         <FocusBox onAsk={onAsk} onOpenProject={onOpenProject} onResolved={onFlagResolved} />
       )}
       {shown("upcoming") && events.length > 0 && (
-        <FocusUpcoming listEvents={events} calendarIds={calendarIds} />
+        <FocusUpcoming listEvents={events} calendars={calendars} onOpenProject={onOpenProject} />
       )}
     </>
   );
@@ -697,7 +700,7 @@ function ProjectCard({
               </div>
             )}
             {showMeta && project.calendar_event && (
-              <div className="mt-1 truncate text-xs text-accent-text">
+              <div className="mt-1 break-words text-xs text-accent-text">
                 📅 {project.calendar_event.summary} ·{" "}
                 {formatEventWhen(project.calendar_event.start)}
               </div>

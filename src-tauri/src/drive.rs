@@ -2281,6 +2281,28 @@ fn sheet_offline_body(file: &DriveFile) -> Option<String> {
     Some(format!("Google Sheet \"{}\".", file.name))
 }
 
+/// The fallback body for a Sheet on an account whose Google Cloud project has never had the Sheets
+/// API turned on (a bring-your-own-client setup — the in-app guide lists Drive and Calendar, so this
+/// is easy to miss). Google answers 403 SERVICE_DISABLED, which shares a status code with a revoked
+/// grant but has the opposite fix: reconnecting re-runs consent and changes nothing, so the account
+/// keeps being told to do the one thing that cannot help — and that text is written into the Sheet's
+/// indexed body, where it sticks until the Sheet next changes.
+fn sheet_api_disabled_body(file: &DriveFile) -> Option<String> {
+    Some(format!(
+        "Google Sheet \"{}\". Enable the Google Sheets API in the Google Cloud project behind your \
+         connection to index its tab names and column headers.",
+        file.name
+    ))
+}
+
+/// True when a Drive/Sheets error is Google refusing because the API is not enabled on the project,
+/// rather than because the caller lacks the grant. Matched on the two markers Google's 403 body
+/// carries for this case.
+fn is_api_disabled(err: &Error) -> bool {
+    let s = err.to_string();
+    s.contains("SERVICE_DISABLED") || s.contains("has not been used in project")
+}
+
 /// Choose the fallback body when the Sheets metadata read errored *after* the scope check passed. A
 /// genuine auth failure ([`is_auth_failure`] — a revoked/insufficient grant) keeps the actionable
 /// reconnect prompt; any other error is transient (rate-limit, 5xx, network) and must NOT embed a
@@ -2288,7 +2310,11 @@ fn sheet_offline_body(file: &DriveFile) -> Option<String> {
 /// to a neutral name-only body ([`sheet_offline_body`]). Pure so the transient-vs-auth split is tested
 /// without a live API (F-28).
 fn sheet_error_fallback_body(file: &DriveFile, err: &Error) -> Option<String> {
-    if is_auth_failure(err) {
+    // Order matters: a disabled API is also a 403, so it must be recognised BEFORE is_auth_failure
+    // claims it and prescribes a reconnect that can never work.
+    if is_api_disabled(err) {
+        sheet_api_disabled_body(file)
+    } else if is_auth_failure(err) {
         sheet_reconnect_body(file)
     } else {
         sheet_offline_body(file)
@@ -2967,6 +2993,23 @@ mod tests {
         );
         let body = sheet_error_fallback_body(&sheet_file(), &err).unwrap();
         assert!(body.contains("Reconnect"));
+    }
+
+    #[test]
+    fn disabled_sheets_api_says_enable_it_not_reconnect() {
+        // Google's real 403 for a project that never enabled the Sheets API. It shares a status code
+        // with an insufficient grant, so without an explicit check it fell through to is_auth_failure
+        // and prescribed a reconnect — which re-runs consent and cannot enable an API.
+        let err = Error::Other(
+            "Google API request failed (403): {\"error\":{\"status\":\"SERVICE_DISABLED\",\
+             \"message\":\"Google Sheets API has not been used in project 123 before or it is \
+             disabled.\"}}"
+                .into(),
+        );
+        let body = sheet_error_fallback_body(&sheet_file(), &err).unwrap();
+        assert!(body.contains("Google Sheet \"Q2 Budget\""));
+        assert!(body.contains("Enable the Google Sheets API"));
+        assert!(!body.contains("Reconnect"));
     }
 
     #[test]

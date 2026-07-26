@@ -135,10 +135,14 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventCli
                       <span aria-hidden style={{ color: colorOf(ev.calendar_id) }}>
                         ●
                       </span>
-                      <span className="truncate text-ink">{ev.summary}</span>
-                      {showPower && ev.location && (
-                        <span className="truncate text-ink4">· {ev.location}</span>
-                      )}
+                      {/* Free-height row: wrap rather than clip. Same reasoning as AgendaView —
+                          and in Terminal this component also serves Day and Week. */}
+                      <div className="min-w-0 flex-1">
+                        <span className="break-words text-ink">{ev.summary}</span>
+                        {showPower && ev.location && (
+                          <div className="break-words text-ink4">{ev.location}</div>
+                        )}
+                      </div>
                     </li>
                   );
                 })}
