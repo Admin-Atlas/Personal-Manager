@@ -46,6 +46,9 @@ mod local_ai;
 // The curated local-model catalog (#296): in-repo GGUF table (include_str!), bridged into fit-scoring
 // and the endpoint window ladder's catalog rung.
 mod local_catalog;
+// On-disk installed-model crawl (#449): find GGUF models a runner has downloaded but isn't serving,
+// so the Workbench can size them without you loading them first. Read-only, metadata only.
+mod local_disk;
 mod local_slot;
 // Local-folder indexing (board card 6): a third index-only source on the shared foundation, reading
 // from the filesystem. This first PR reconciles a tracked folder on demand (a filtered walk +
@@ -1275,6 +1278,7 @@ pub fn run() {
             // Workbench (#296): hardware scan + per-machine model recommendations.
             local_ai::local_hardware_scan,
             local_ai::local_model_recommendations,
+            local_ai::set_local_model_scan_dir,
             settings::get_settings,
             settings::settings_defaults,
             settings::set_indexing_speed,

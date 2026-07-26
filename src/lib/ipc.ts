@@ -1328,9 +1328,14 @@ export const localHardwareScan = (force = false) =>
   invoke<LocalHardware>("local_hardware_scan", { force });
 
 /** The Workbench payload: the hardware scan + the curated catalog scored against this machine +
- *  any models the configured endpoint already serves, sorted best-fit first. */
+ *  any models the configured endpoint already serves + any found on disk, sorted best-fit first. */
 export const localModelRecommendations = () =>
   invoke<LocalRecommendations>("local_model_recommendations");
+
+/** Point the on-disk model crawl (#449) at an extra folder, or clear it with `null`. Drops the
+ *  cached crawl, so the next {@link localModelRecommendations} reflects the change. */
+export const setLocalModelScanDir = (dir: string | null) =>
+  invoke<void>("set_local_model_scan_dir", { dir });
 
 /** Auto-detect the three known local servers (Ollama / LM Studio / llama-server) on their ports. */
 export const probeLocalLlmPorts = () => invoke<DetectedEndpoint[]>("probe_local_llm_ports");

@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.83.0-alpha",
+    date: "2026-07-26",
+    highlights: [
+      "Settings > Local AI now finds models you've already downloaded, even when nothing is running them. Until now PM could only see models a connected server was actively serving, so anything you'd downloaded and not loaded was invisible -- and PM would happily suggest you download a model already sitting on your disk. There's a new “Already downloaded” section that lists what it found, sized against your machine like everything else, so you can see at a glance which of them your computer can comfortably run.",
+      "It looks in the places Ollama, LM Studio and Hugging Face actually keep their models, including the non-obvious ones -- a relocated Ollama store, LM Studio's portable-install pointer, the older cache folders. If you keep models somewhere else entirely, there's an “Also look in a folder…” button.",
+      "What it reads is deliberately narrow: file names and sizes, nothing more. PM never opens a model file's contents, never writes anything while looking, and none of it leaves your device. A model it doesn't recognise is listed with an honest “can't estimate this” instead of a guess, and a half-finished download is left out rather than offered as something you can run.",
+      "The Local AI tab is also clearer about what PM works with. The list of supported servers -- Ollama, LM Studio, llama-server, and any other server that speaks the OpenAI API -- is now stated plainly at the top of the endpoint section, whether or not you already have one connected, along with the reminder that PM connects to a server you run and never installs or starts one itself.",
+    ],
+  },
+  {
     version: "3.82.0-alpha",
     date: "2026-07-26",
     highlights: [

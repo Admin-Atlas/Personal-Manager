@@ -493,6 +493,9 @@ pub struct LocalRuntime {
     /// The last hardware scan (#296), cached until a `force` re-scan. Reset on restart with the rest
     /// of this runtime — hardware rarely changes mid-session, and a stale figure is one click away.
     hardware: Mutex<Option<crate::hardware::Hardware>>,
+    /// The last on-disk model crawl (#449), cached on the same terms as the hardware scan: it walks
+    /// real directories, so it is not something to redo on every Workbench repaint.
+    disk_models: Mutex<Option<crate::local_disk::DiskScan>>,
 }
 
 impl LocalRuntime {
@@ -554,6 +557,26 @@ impl LocalRuntime {
     pub fn cache_hardware(&self, hw: crate::hardware::Hardware) {
         if let Ok(mut h) = self.hardware.lock() {
             *h = Some(hw);
+        }
+    }
+
+    /// The last cached on-disk model crawl, if any (poison-tolerant).
+    pub fn cached_disk_models(&self) -> Option<crate::local_disk::DiskScan> {
+        self.disk_models.lock().ok()?.clone()
+    }
+
+    /// Store a fresh on-disk model crawl (poison-tolerant).
+    pub fn cache_disk_models(&self, scan: crate::local_disk::DiskScan) {
+        if let Ok(mut d) = self.disk_models.lock() {
+            *d = Some(scan);
+        }
+    }
+
+    /// Drop the cached crawl so the next read re-walks — after a re-scan, or a change to which
+    /// folders are crawled.
+    pub fn clear_disk_models(&self) {
+        if let Ok(mut d) = self.disk_models.lock() {
+            *d = None;
         }
     }
 }
