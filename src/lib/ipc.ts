@@ -673,13 +673,29 @@ export const commitReview = (decisions: ReviewDecision[]) =>
 /** How many documents a re-tag pass would cover, and how many model calls that is. Read-only. */
 export const retagScope = () => invoke<RetagScope>("retag_scope");
 
-/** Run a re-tag pass: derive one vocabulary for the whole store, then label every document from
- *  it. STAGES proposals only — nothing is written until `commitRetag`. */
-export function proposeRetag(onEvent: (event: RetagEvent) => void): Promise<void> {
+/** Propose a tag vocabulary for the whole library and hand it back UNUSED, so it can be edited
+ *  before anything is labelled from it. Nothing is written or staged. */
+export const proposeRetagVocabulary = () => invoke<string[]>("propose_retag_vocabulary");
+
+/** Label every document from the given (user-approved) vocabulary. STAGES proposals only —
+ *  nothing is written until `commitRetag`. */
+export function applyRetagVocabulary(
+  vocabulary: string[],
+  onEvent: (event: RetagEvent) => void,
+): Promise<void> {
   const channel = new Channel<RetagEvent>();
   channel.onmessage = onEvent;
-  return invoke<void>("propose_retag", { onEvent: channel });
+  return invoke<void>("apply_retag_vocabulary", { vocabulary, onEvent: channel });
 }
+
+/** Remove a free-form tag from every document that carries it — vault, mirror and registry.
+ *  Returns how many documents were rewritten. */
+export const deleteTag = (name: string) => invoke<number>("delete_tag", { name });
+
+/** Rename a free-form tag everywhere, folding into `next` if that tag already exists.
+ *  Returns how many documents were rewritten. */
+export const renameTag = (old: string, next: string) =>
+  invoke<number>("rename_tag", { old, new: next });
 
 /** The staged proposals that would actually change something. */
 export const listTagProposals = () => invoke<TagProposalRow[]>("list_tag_proposals");

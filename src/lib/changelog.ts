@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.101.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "Your tags are now yours to edit. Teach \u2192 Tags lists every label with how many documents carry it: click one to rename it everywhere, or \u00d7 to take it off every document. Both go through your vault, so they stick.",
+      "PM also points out labels that look like the same thing \u2014 tax and taxes, chair and chairs \u2014 and folds one into the other in a click. It keeps whichever spelling more of your documents already use.",
+      "The re-tag pass now asks you first. It suggests a set of tags for your library and stops there; you drop the ones you don\u2019t want and add the ones you know you need, and only then does it label anything. The vocabulary is the one decision the whole pass turns on, and it\u2019s forty words \u2014 far quicker to check than the result of getting it wrong.",
+      "Removing a tag asks first and tells you how many documents it comes off. Nothing else about them changes and no files are deleted.",
+    ],
+  },
+  {
     version: "3.100.0-alpha",
     date: "2026-07-27",
     highlights: [
