@@ -59,8 +59,12 @@ import type {
   LocalFolder,
   LocalFolderSyncState,
   LocalSubfolder,
+  ChatDisposition,
+  DeletePreview,
+  FileDisposition,
   MergePreview,
   Message,
+  NameDisposition,
   ChatIdentityReport,
   IngestJobState,
   MetadataProposal,
@@ -699,6 +703,27 @@ export const mergeProjectPreview = (from: string, into: string) =>
  *  history to the target, then permanently delete the source project. Irreversible. */
 export const mergeProjects = (from: string, into: string) =>
   invoke<void>("merge_projects", { from, into });
+
+/** What deleting `project` would affect — the live counts behind its confirmation ceremony. */
+export const deleteProjectPreview = (project: string) =>
+  invoke<DeletePreview>("delete_project_preview", { project });
+
+/** Delete `project`, disposing of its contents as chosen. Milestones are ALWAYS destroyed.
+ *  Irreversible in every combination. */
+export const deleteProject = (
+  project: string,
+  disposition: {
+    files: FileDisposition;
+    chats: ChatDisposition;
+    name: NameDisposition;
+  },
+) =>
+  invoke<void>("delete_project", {
+    project,
+    files: disposition.files,
+    chats: disposition.chats,
+    name: disposition.name,
+  });
 
 // --- Personal Assistant: focus view & projects (Step 5, spec §4) ---
 

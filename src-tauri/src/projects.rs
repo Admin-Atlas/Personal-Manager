@@ -492,6 +492,88 @@ pub fn rekey_pinboard_project(blob: &str, old: &str, new: &str) -> Option<String
         .flatten()
 }
 
+/// Unbind a pinboard blob's widgets from `project` — set the binding to `null` rather than removing
+/// the widget, so a project delete never silently takes a card the user placed off their board
+/// (#573). Same generic `serde_json::Value` walk as [`rekey_pinboard_project`], so every other
+/// widget field survives; returns `Some(new_json)` only when something changed.
+pub fn unbind_pinboard_project(blob: &str, project: &str) -> Option<String> {
+    fn unbind(widgets: &mut [serde_json::Value], project: &str, changed: &mut bool) {
+        for w in widgets.iter_mut() {
+            if w.get("project").and_then(|p| p.as_str()) == Some(project) {
+                w["project"] = serde_json::Value::Null;
+                *changed = true;
+            }
+            if let Some(children) = w.get_mut("children").and_then(|c| c.as_array_mut()) {
+                unbind(children, project, changed);
+            }
+        }
+    }
+    let mut value: serde_json::Value = serde_json::from_str(blob).ok()?;
+    let widgets = value.get_mut("widgets")?.as_array_mut()?;
+    let mut changed = false;
+    unbind(widgets, project, &mut changed);
+    changed
+        .then(|| serde_json::to_string(&value).ok())
+        .flatten()
+}
+
+/// Tear down every name-keyed satellite of `name` — the delete counterpart to
+/// [`rename_project_satellites`], which MOVES the same set. Milestones, activity history and the
+/// triage row itself are destroyed (Bobby, 2026-07-27: milestones always go, and the UI warns).
+///
+/// **Order is load-bearing, for a different reason than the rename's.** `project_milestones`
+/// cascades off `projects(name)`, so dropping the triage row takes the milestones with it — but
+/// `flags.anchor` holds a milestone id as a bare string with **no FK**, and the detection prune only
+/// touches `state='active' AND user_confirmed=0`. A confirmed flag anchored on a cascade-deleted
+/// milestone would therefore orphan permanently, unreachable and undeletable. So the milestone ids
+/// are read and their flags GC'd *before* anything cascades.
+///
+/// Does NOT touch documents, chats or the entity — those follow the caller's chosen dispositions.
+pub fn delete_project_satellites(conn: &Connection, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    // 1. GC flags anchored on milestones that are about to cascade away (see above).
+    let milestone_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM project_milestones WHERE project_name = ?1")?;
+        let ids = stmt
+            .query_map(params![name], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids
+    };
+    for id in &milestone_ids {
+        conn.execute(
+            "DELETE FROM flags WHERE anchor_kind = 'milestone' AND anchor = ?1",
+            params![id.to_string()],
+        )?;
+    }
+    // 2. Activity history (both the event log and the daily rollup).
+    conn.execute(
+        "DELETE FROM project_activity WHERE project = ?1",
+        params![name],
+    )?;
+    conn.execute(
+        "DELETE FROM project_activity_daily WHERE project = ?1",
+        params![name],
+    )?;
+    // 3. Inbound soft references from OTHER projects. No FK, so nothing cleans these up; left
+    //    behind they'd render as "Blocked by <a project that no longer exists>".
+    conn.execute(
+        "UPDATE projects SET blocked_by = NULL WHERE blocked_by = ?1",
+        params![name],
+    )?;
+    // 4. Unbind pinboard widgets rather than removing them.
+    if let Some(blob) = crate::db::get_setting(conn, "pinboard")? {
+        if let Some(unbound) = unbind_pinboard_project(&blob, name) {
+            crate::db::set_setting(conn, "pinboard", &unbound)?;
+        }
+    }
+    // 5. The triage row last — this is what cascades `project_milestones`.
+    conn.execute("DELETE FROM projects WHERE name = ?1", params![name])?;
+    Ok(())
+}
+
 /// Trim a value and treat blank as absent.
 fn clean(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
@@ -739,6 +821,142 @@ mod tests {
         // No matching binding → None (no write). Malformed blob → None (leave it be).
         assert!(rekey_pinboard_project(blob, "Nonexistent", "X").is_none());
         assert!(rekey_pinboard_project("not json", "Old", "New").is_none());
+    }
+
+    #[test]
+    fn unbind_pinboard_project_nulls_the_binding_and_keeps_the_widget() {
+        let blob = r#"{"version":1,"widgets":[
+            {"id":"w1","kind":"timeline","project":"Doomed","rect":{"x":0},"showOnCalendar":true},
+            {"id":"w2","kind":"note","text":"hi"},
+            {"id":"f1","kind":"folder","children":[
+                {"id":"w3","kind":"timeline","project":"Doomed","view":"list"},
+                {"id":"w4","kind":"timeline","project":"Other"}
+            ]}
+        ]}"#;
+        let out = unbind_pinboard_project(blob, "Doomed").expect("a binding changed");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let widgets = v["widgets"].as_array().unwrap();
+        // Unbound, NOT removed — the user placed this card; a project delete must not take it away.
+        assert!(widgets[0]["project"].is_null());
+        assert_eq!(widgets[0]["kind"], "timeline", "the widget survives");
+        assert_eq!(widgets[0]["showOnCalendar"], true, "other fields preserved");
+        assert_eq!(widgets[1]["text"], "hi", "an unrelated note is intact");
+        let children = widgets[2]["children"].as_array().unwrap();
+        assert!(children[0]["project"].is_null(), "nested child unbound");
+        assert_eq!(children[0]["view"], "list");
+        assert_eq!(children[1]["project"], "Other", "another project untouched");
+
+        assert!(unbind_pinboard_project(blob, "Nonexistent").is_none());
+        assert!(unbind_pinboard_project("not json", "Doomed").is_none());
+    }
+
+    /// The delete counterpart to the rename's satellite move. The load-bearing part is the flag GC:
+    /// `flags.anchor` holds a milestone id as a bare string with NO foreign key, so a flag anchored
+    /// on a milestone that cascades away would otherwise orphan permanently.
+    #[test]
+    fn delete_project_satellites_gcs_flags_before_the_milestone_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite"), DB_KEY).unwrap();
+
+        set_metadata(&conn, "Doomed", None, Some("large".into()), None, None).unwrap();
+        set_metadata(&conn, "Keeper", None, None, Some("Doomed".into()), None).unwrap();
+        let mid = crate::milestones::add(&conn, "Doomed", "ship", Some("2026-08-01".into()), None)
+            .unwrap();
+        let other =
+            crate::milestones::add(&conn, "Keeper", "ship", Some("2026-08-01".into()), None)
+                .unwrap();
+        // One flag on each milestone. The doomed one is user_confirmed, which is precisely the
+        // state the detection prune refuses to touch — so only an explicit GC can reach it.
+        for (anchor, confirmed) in [(mid, 1), (other, 0)] {
+            conn.execute(
+                "INSERT INTO flags(anchor_kind, anchor, type, state, source, user_confirmed) \
+                 VALUES ('milestone', ?1, 'deadline-approaching', 'active', 'detection', ?2)",
+                params![anchor.to_string(), confirmed],
+            )
+            .unwrap();
+        }
+        crate::project_activity::record(&conn, "Doomed", crate::project_activity::Kind::Chat, None);
+        conn.execute(
+            "INSERT INTO project_activity_daily(project,day,kind,count) VALUES ('Doomed',20000,'chat',3)",
+            [],
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &conn,
+            "pinboard",
+            r#"{"widgets":[{"id":"w1","kind":"timeline","project":"Doomed"}]}"#,
+        )
+        .unwrap();
+
+        delete_project_satellites(&conn, "Doomed").unwrap();
+
+        let flags_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flags WHERE anchor = ?1",
+                params![mid.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flags_left, 0, "the confirmed flag was GC'd, not orphaned");
+        let survivor: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flags WHERE anchor = ?1",
+                params![other.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(survivor, 1, "another project's flag is untouched");
+
+        let milestones: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_milestones WHERE project_name = 'Doomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(milestones, 0, "milestones cascaded with the triage row");
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE name = 'Doomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        let activity: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_activity WHERE project = 'Doomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(activity, 0);
+        let daily: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_activity_daily WHERE project = 'Doomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(daily, 0);
+
+        // The inbound "blocked by Doomed" pointer has no FK, so nothing else would clear it — it
+        // would render as "Blocked by <a project that doesn't exist>".
+        let blocked: Option<String> = conn
+            .query_row(
+                "SELECT blocked_by FROM projects WHERE name = 'Keeper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked, None);
+
+        let board = crate::db::get_setting(&conn, "pinboard").unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&board).unwrap();
+        assert!(
+            v["widgets"][0]["project"].is_null(),
+            "widget unbound, not removed"
+        );
     }
 
     fn signals<'a>() -> StatusSignals<'a> {

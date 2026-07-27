@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.96.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "You can now delete a project, and decide what happens to everything in it. Open it in Focus and choose Delete. You pick separately what becomes of its files (move them to Unsorted, or delete them), its chats (keep them as ordinary chats, or delete them), and its name — either anything mentioning that name in future files to your inbox, or the name is freed so it can start a fresh project later. PM counts up exactly what the project holds before you choose, and asks you to type its name to confirm, because none of this can be undone from inside PM.",
+      "Its milestones are always deleted, and PM says so rather than offering a choice — there's nowhere sensible to move a dated milestone whose project no longer exists. Its deadlines, priority and the record of when you worked on it go with it. Reminders hanging off those milestones are cleaned up properly instead of being left behind with nothing to point at, and anything you'd told PM about the project in Teach is kept rather than quietly destroyed.",
+      "Files indexed from Google Drive or OneDrive are only ever unlinked from PM. Choosing to delete them removes PM's copy of the index and nothing else — the original files in your cloud account are never touched.",
+      "Clicking a source in an old answer that has since been deleted now tells you so. It used to do nothing at all, which looked like a broken link; it now says the file has been deleted and that re-ingesting it will bring it back. Past answers still list it because PM records an answer's sources at the moment it writes the answer.",
+      "A project card on the pinboard survives its project being deleted. The card stays where you put it and simply loses its link, rather than vanishing from your board.",
+    ],
+  },
+  {
     version: "3.95.0-alpha",
     date: "2026-07-27",
     highlights: [

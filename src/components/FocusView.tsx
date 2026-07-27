@@ -16,6 +16,7 @@ import {
 } from "../lib/ipc";
 import { MilestoneList } from "./MilestoneList";
 import { MergeProjectDialog } from "./MergeProjectDialog";
+import { DeleteProjectDialog } from "./DeleteProjectDialog";
 import { FocusUpcoming } from "./FocusUpcoming";
 import { Briefing } from "./Briefing";
 import type {
@@ -703,6 +704,7 @@ function MetaEditor({
   const [importance, setImportance] = useState<Importance>(project.importance);
   const [blockedBy, setBlockedBy] = useState(project.blocked_by ?? "");
   const [merging, setMerging] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -831,22 +833,36 @@ function MetaEditor({
       {/* Where the "Part of (parent)" picker used to sit (#278). That field pretended to be
           grouping while actually suppressing this project's status; the one real job it did —
           "this was never its own project" — is now this explicit, irreversible action (#279). */}
-      {otherProjects.length > 0 && (
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-xs text-ink4">
-            Turns out this was always part of another project?
-          </span>
-          <Button variant="tertiary" onClick={() => setMerging(true)}>
-            Merge into…
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <span className="text-xs text-ink4">
+          {otherProjects.length > 0
+            ? "Turns out this was always part of another project?"
+            : "Done with this project?"}
+        </span>
+        <div className="flex shrink-0 gap-2">
+          {otherProjects.length > 0 && (
+            <Button variant="tertiary" onClick={() => setMerging(true)}>
+              Merge into…
+            </Button>
+          )}
+          <Button variant="tertiary" onClick={() => setDeleting(true)}>
+            Delete…
           </Button>
         </div>
-      )}
+      </div>
       {merging && (
         <MergeProjectDialog
           project={project.name}
           otherProjects={otherProjects}
           onClose={() => setMerging(false)}
           onMerged={onSaved}
+        />
+      )}
+      {deleting && (
+        <DeleteProjectDialog
+          project={project.name}
+          onClose={() => setDeleting(false)}
+          onDeleted={onSaved}
         />
       )}
 

@@ -621,6 +621,28 @@ export interface MergePreview {
   into_canonical: string;
 }
 
+/** Where a deleted project's non-chat documents go (#573). `delete` destroys the index rows AND
+ *  the vault Markdown; for an index-only cloud document it removes PM's pointer only and never
+ *  touches the file at the provider. */
+export type FileDisposition = "unsorted" | "delete";
+
+/** Where a deleted project's chats go: un-scoped to general, or destroyed. */
+export type ChatDisposition = "global" | "delete";
+
+/** What happens to a deleted project's NAME. `free` kills the entity and its aliases so the name
+ *  can be used again; `unsorted` keeps it as an alias of the inbox, so anything later naming it
+ *  files to Unsorted instead of silently recreating the project. */
+export type NameDisposition = "free" | "unsorted";
+
+/** What deleting a project would affect, counted from the rows the delete will touch. `files`
+ *  excludes chat documents so a chat isn't counted twice. */
+export interface DeletePreview {
+  files: number;
+  chats: number;
+  milestones: number;
+  canonical: string;
+}
+
 /** The AI's proposed triage metadata for a project (AI-proposes-you-confirm). */
 export interface ProjectProposal {
   size: ProjectSize;
