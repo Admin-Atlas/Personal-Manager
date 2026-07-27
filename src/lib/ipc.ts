@@ -71,6 +71,8 @@ import type {
   OneDriveStatus,
   OneDriveSyncState,
   Preference,
+  AnswerFeedback,
+  AnswerRating,
   Milestone,
   MilestoneStatus,
   PlaintextExportOutcome,
@@ -757,6 +759,23 @@ export const setMilestoneState = (id: number, met: boolean) =>
  *  `setMilestoneState` can't leave the two disagreeing. */
 export const setMilestoneStatus = (id: number, status: MilestoneStatus) =>
   invoke<void>("set_milestone_status", { id, status });
+
+// --- Retrieval-relevance feedback (Stage-4 card 10) ---
+//
+// Capture only — nothing reads these signals yet. They accrue so a learned reranker has a corpus
+// to train on later. An answer that retrieved nothing records nothing; the backend no-ops.
+
+/** Rate a grounded answer, or pass null to clear the rating. */
+export const rateAnswer = (messageId: number, rating: AnswerRating | null) =>
+  invoke<void>("rate_answer", { messageId, rating });
+
+/** Log that the user opened one of the sources an answer cited — an implicit relevance signal. */
+export const recordCitationClick = (messageId: number, documentId: number) =>
+  invoke<void>("record_citation_click", { messageId, documentId });
+
+/** The feedback already recorded for an answer, so its controls render in the right state. */
+export const answerFeedback = (messageId: number) =>
+  invoke<AnswerFeedback>("answer_feedback", { messageId });
 
 /** Delete a milestone. */
 export const deleteMilestone = (id: number) => invoke<void>("delete_milestone", { id });

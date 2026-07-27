@@ -1196,6 +1196,49 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE corrections ADD COLUMN pipeline_version INTEGER;  -- NULL = logged before v43
     CREATE INDEX idx_corrections_pipeline ON corrections(pipeline_version, created_at);
     "#,
+    // v44 (Stage-4 card 10): capture RETRIEVAL-relevance feedback — the signal a learned reranker
+    // would one day train on, and which PM currently records nowhere.
+    //
+    // `corrections` is the wrong shape for this and always was: it logs FILING corrections (this
+    // document belongs to that project), whereas a query-time cross-encoder needs to know whether a
+    // CHUNK answered a QUERY. No table holds that today, so the reranker's gate can never open — not
+    // for want of a model, but for want of a corpus. Capture has to start early and cheaply so the
+    // corpus accrues during beta; nothing here trains anything.
+    //
+    // `messages.retrieved_chunk_ids` records what actually grounded each answer, because at the
+    // moment the user reacts the frontend knows only which message it is — the chunk ids are long
+    // gone. NULL = an ungrounded answer (nothing was retrieved), which is distinct from an empty
+    // array and must stay distinguishable.
+    //
+    // `retrieval_feedback` snapshots the query and chunk ids rather than joining back to them, so a
+    // row is self-contained training data. It still cascades from `messages`: deleting a
+    // conversation must take its feedback with it — PM does not keep a shadow copy of what the user
+    // asked after they've deleted the asking. `config_stamp` records the retrieval configuration in
+    // force, for the same reason v43 stamps the filing pipeline: signal gathered under one chunking
+    // and embedding regime is not comparable with signal gathered under another, and unlabelled
+    // history cannot be separated later.
+    r#"
+    ALTER TABLE messages ADD COLUMN retrieved_chunk_ids TEXT;  -- JSON array; NULL = ungrounded answer
+
+    CREATE TABLE retrieval_feedback (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        query        TEXT NOT NULL,              -- snapshot of the asking turn
+        chunk_ids    TEXT NOT NULL,              -- JSON array: what grounded the answer
+        signal       TEXT NOT NULL CHECK (signal IN ('up','down','citation_click')),
+        document_id  INTEGER,                    -- citation_click: the source the user opened
+        config_stamp TEXT,                       -- retrieval config in force, for windowing
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_retrieval_feedback_message ON retrieval_feedback(message_id);
+    CREATE INDEX idx_retrieval_feedback_created ON retrieval_feedback(created_at);
+    -- One rating per answer (a later thumb replaces the earlier one); citation clicks are deduped
+    -- per document, so re-opening the same source doesn't inflate the corpus with copies.
+    CREATE UNIQUE INDEX idx_retrieval_feedback_rating
+        ON retrieval_feedback(message_id) WHERE signal IN ('up','down');
+    CREATE UNIQUE INDEX idx_retrieval_feedback_click
+        ON retrieval_feedback(message_id, document_id) WHERE signal = 'citation_click';
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1251,7 +1294,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 43,
+            version, 44,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1271,7 +1314,8 @@ mod tests {
              calendar event popup detail columns is v40; \
              preferences.source admits 'imported' is v41; \
              project_milestones status + source_type/external_id is v42; \
-             corrections filing-pipeline version stamp is v43)"
+             corrections filing-pipeline version stamp is v43; \
+             retrieval-relevance feedback capture is v44)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

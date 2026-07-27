@@ -25,6 +25,7 @@ use crate::projects::{self, ProjectOverview, ProjectProposalEvent};
 use crate::retrieval::{self, Citation, RetrievedChunk};
 use crate::retrieval_config::RetrievalConfig;
 use crate::retrieval_diag;
+use crate::retrieval_feedback;
 use crate::review::{self, ReviewDecision, ReviewEvent};
 use crate::settings::{
     effective_models, CHAT_AUTO_SWITCH_KEY, CHAT_MODELS_KEY, DEFAULT_MODEL, TIME_ZONE_KEY,
@@ -1986,6 +1987,15 @@ pub async fn send_message(
             params![conversation_id, reply, used_model, citations_json],
         )?;
         let id = conn.last_insert_rowid();
+        // Record WHAT grounded this answer while the retrieved set is still in scope (card 10). By
+        // the time the user reacts, the frontend knows only the message id — so if the chunk ids
+        // aren't banked here, the relevance signal has nothing to attach to and is lost. An
+        // ungrounded answer records nothing, keeping "retrieved nothing" distinct from "retrieved
+        // an empty set". Best-effort: never fail a delivered answer over a capture write.
+        if !retrieved.is_empty() {
+            let chunk_ids: Vec<i64> = retrieved.iter().map(|c| c.chunk_id).collect();
+            let _ = retrieval_feedback::record_grounding(&conn, id, &chunk_ids);
+        }
         log_usage(&conn, "chat", Some(&used_model), &usage, &meta);
         // Record the exact prompt size OpenRouter just measured as the context-meter's numerator (card 7D).
         // Because it counted the real assembled prompt, this already reflects everything that rode along —
@@ -3945,6 +3955,52 @@ pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Re
     touch_milestone_project(&conn, id)?;
     briefing::nudge(&state);
     Ok(())
+}
+
+// --- retrieval-relevance feedback (Stage-4 card 10) ---
+//
+// Capture only. Nothing reads these signals yet; they accrue so a learned reranker has a corpus to
+// train on when that work lands. See `retrieval_feedback` for why `corrections` can't serve.
+
+/// Rate a grounded answer (`"up"` / `"down"`), or clear the rating with `None`.
+///
+/// Silently no-ops on an answer that retrieved nothing — there is no relevance judgement to record
+/// against an empty grounding, and failing the click would be a worse answer to a harmless action.
+#[tauri::command]
+pub fn rate_answer(
+    state: State<'_, AppState>,
+    message_id: i64,
+    rating: Option<String>,
+) -> Result<()> {
+    let parsed = rating
+        .as_deref()
+        .map(retrieval_feedback::Rating::parse)
+        .transpose()?;
+    let conn = state.conn()?;
+    retrieval_feedback::set_rating(&conn, message_id, parsed)?;
+    Ok(())
+}
+
+/// Log that the user opened one of the sources an answer cited — an implicit relevance signal.
+#[tauri::command]
+pub fn record_citation_click(
+    state: State<'_, AppState>,
+    message_id: i64,
+    document_id: i64,
+) -> Result<()> {
+    let conn = state.conn()?;
+    retrieval_feedback::record_citation_click(&conn, message_id, document_id)?;
+    Ok(())
+}
+
+/// The feedback already recorded for an answer, so its controls render in the right state.
+#[tauri::command]
+pub fn answer_feedback(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> Result<retrieval_feedback::AnswerFeedback> {
+    let conn = state.conn()?;
+    retrieval_feedback::feedback_for(&conn, message_id)
 }
 
 /// Set a milestone's progress status (v42) — the four-level counterpart to the met/unmet tick-box.

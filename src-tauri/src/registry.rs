@@ -41,8 +41,10 @@ pub enum Source {
     /// itself; for a **custom** model (PR 2) it is the repo serving the ONNX export, which may
     /// differ from the model's logical `id` (e.g. an `onnx-community/…` mirror).
     HuggingFace(&'static str),
-    /// A model living on disk (e.g. a locally-trained reranker). Constructed by the Stage-4
-    /// learned-reranker work (and exercised in tests); a deliberate forward seam.
+    /// A model living on disk (e.g. a locally-trained reranker) — the **directory** holding the
+    /// ONNX export and its tokenizer files, not the `.onnx` file itself. `ModelEntry::model_file`
+    /// names the file within it, exactly as it does for a hub model. The directory is what
+    /// fastembed's `specific_model_path` takes; `sidecar::custom_spec` carries it across.
     #[allow(dead_code)]
     LocalPath(PathBuf),
 }
@@ -428,8 +430,10 @@ mod tests {
     #[test]
     fn source_accepts_a_local_path() {
         // The forward dependency for the Stage-4 locally-trained reranker: the registry must
-        // accept an on-disk model, not only a downloadable id.
-        let s = Source::LocalPath(PathBuf::from("/models/reranker.onnx"));
+        // accept an on-disk model, not only a downloadable id. The payload is the model's
+        // DIRECTORY (what fastembed's `specific_model_path` wants) — `model_file` names the ONNX
+        // within it, so a path to the `.onnx` itself would not load.
+        let s = Source::LocalPath(PathBuf::from("/models/reranker"));
         assert!(matches!(s, Source::LocalPath(_)));
     }
 }

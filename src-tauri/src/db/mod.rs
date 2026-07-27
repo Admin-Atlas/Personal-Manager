@@ -935,10 +935,12 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            // v43: `corrections` predates the rewind point, so unlike `project_milestones` (dropped
-            // wholesale below) its added column has to come off explicitly — and its index first,
-            // since SQLite won't drop an indexed column.
-            "DROP INDEX idx_corrections_pipeline; \
+            // v43/v44: `corrections` and `messages` both predate the rewind point, so unlike
+            // `project_milestones` (dropped wholesale below) their added columns have to come off
+            // explicitly — and their indexes first, since SQLite won't drop an indexed column.
+            "DROP TABLE retrieval_feedback; \
+             ALTER TABLE messages DROP COLUMN retrieved_chunk_ids; \
+             DROP INDEX idx_corrections_pipeline; \
              ALTER TABLE corrections DROP COLUMN pipeline_version; \
              ALTER TABLE usage_log DROP COLUMN provider; \
              ALTER TABLE usage_log DROP COLUMN latency_ms; \
@@ -1105,10 +1107,12 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            // v43: `corrections` predates the rewind point, so unlike `project_milestones` (dropped
-            // wholesale below) its added column has to come off explicitly — and its index first,
-            // since SQLite won't drop an indexed column.
-            "DROP INDEX idx_corrections_pipeline; \
+            // v43/v44: `corrections` and `messages` both predate the rewind point, so unlike
+            // `project_milestones` (dropped wholesale below) their added columns have to come off
+            // explicitly — and their indexes first, since SQLite won't drop an indexed column.
+            "DROP TABLE retrieval_feedback; \
+             ALTER TABLE messages DROP COLUMN retrieved_chunk_ids; \
+             DROP INDEX idx_corrections_pipeline; \
              ALTER TABLE corrections DROP COLUMN pipeline_version; \
              ALTER TABLE usage_log DROP COLUMN provider; \
              ALTER TABLE usage_log DROP COLUMN latency_ms; \

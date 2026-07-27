@@ -568,6 +568,15 @@ export interface Milestone {
  *  `milestones::STATUSES` in Rust. */
 export type MilestoneStatus = "not_started" | "in_progress" | "almost_done" | "done";
 
+/** An explicit judgement on a grounded answer (Stage-4 card 10). */
+export type AnswerRating = "up" | "down";
+
+/** Feedback already recorded for one answer. Mirrors `retrieval_feedback::AnswerFeedback`. */
+export interface AnswerFeedback {
+  /** The rating given, or null when the answer hasn't been rated. */
+  rating: AnswerRating | null;
+}
+
 /** The milestone driving a project's status + card line (nearest unmet). */
 export interface GoverningMilestone {
   id: number;

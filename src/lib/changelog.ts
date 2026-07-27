@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.92.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "You can now tell PM when an answer was useful — or wasn’t. A quiet pair of thumbs sits under any answer that drew on your files; click one, or click it again to take it back. Nothing happens immediately, and that’s deliberate: PM is building up a record of which of your documents actually answered which of your questions, because that is the one thing it would need to learn to search your files better and it has never been keeping it. Opening a source from an answer counts too, without you doing anything. It all stays on your machine, and deleting a conversation deletes its feedback with it.",
+      "Under-the-hood tidying: PM can now load a search model stored on this computer rather than only ones it downloads. Nothing uses that yet — it’s the groundwork for a version of PM’s search that has learned from the feedback above.",
+    ],
+  },
+  {
     version: "3.91.0-alpha",
     date: "2026-07-27",
     highlights: [
