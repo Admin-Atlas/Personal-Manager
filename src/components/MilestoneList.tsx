@@ -8,7 +8,6 @@ import {
   deleteMilestone,
   reorderMilestones,
   setMilestoneEvent,
-  setMilestoneState,
   setMilestoneStatus,
   updateMilestone,
 } from "../lib/ipc";
@@ -198,9 +197,19 @@ function MilestoneRow({
   }
 
   // Two explicit lines so the row never has to side-scroll, however narrow the panel: line 1 is
-  // the checkbox + label + Done + remove ×; line 2 is the date (or the synced calendar date) plus
-  // the ↑/↓ reorder arrows — so line 1 leaves the label its full width. Every text field is
-  // `min-w-0 flex-1` so it shrinks rather than forcing horizontal overflow.
+  // the label + remove ×; line 2 is the date (or the synced calendar date) plus the progress
+  // dropdown and the ↑/↓ reorder arrows — so line 1 leaves the label its full width. Every text
+  // field is `min-w-0 flex-1` so it shrinks rather than forcing horizontal overflow.
+  //
+  // The two lines share one left edge. Line 2 used to be indented `pl-6` to clear the done tick-box
+  // that led line 1; with the tick-box gone that indent hung the date field off nothing, which read
+  // as a gap in the card rather than as alignment.
+  //
+  // There is deliberately no done tick-box beside the dropdown. It and the dropdown's "Done" were
+  // two controls writing the same fact, which meant two things to keep in step and two places to
+  // look to learn one answer. The dropdown is the single writer; `set_milestone_status` carries
+  // `state` along with it (and reopens the flag when a milestone moves OFF done, exactly as
+  // un-ticking used to), so nothing downstream can tell the difference.
   return (
     <div
       ref={anchorRef}
@@ -209,18 +218,6 @@ function MilestoneRow({
       }`}
     >
       <div className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          checked={met}
-          title={met ? "Mark not done" : "Mark done"}
-          onChange={() =>
-            void runMutation(async () => {
-              await setMilestoneState(m.id, !met);
-              onChanged();
-            }, onError)
-          }
-          className="shrink-0 accent-[var(--accent)]"
-        />
         <Input
           value={label}
           onChange={(e) => setLabel(e.target.value)}
@@ -243,7 +240,7 @@ function MilestoneRow({
         </Button>
       </div>
 
-      <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-6">
+      <div className="mt-1 flex flex-wrap items-center gap-2">
         {m.calendar_linked ? (
           <span
             className={`flex min-w-0 flex-1 items-center gap-1 text-xs text-accent-text ${

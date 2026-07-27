@@ -752,12 +752,14 @@ export const updateMilestone = (id: number, label: string, dueDate: string | nul
 export const setMilestoneEvent = (id: number, eventUid: string | null, cachedDate: string | null) =>
   invoke<void>("set_milestone_event", { id, eventUid, cachedDate });
 
-/** Mark a milestone met or unmet. */
-export const setMilestoneState = (id: number, met: boolean) =>
-  invoke<void>("set_milestone_state", { id, met });
-
-/** Set a milestone's progress status. The backend carries met/unmet along with it, so this and
- *  `setMilestoneState` can't leave the two disagreeing. */
+/** Set a milestone's progress status — the SINGLE writer for "how far along is this".
+ *
+ *  The backend carries `state` (met/unmet) along with it and reopens the milestone's flag whenever
+ *  the status moves off `done`, so this does everything the old done tick-box did. That tick-box is
+ *  gone: it and the dropdown's "Done" wrote the same fact through two commands, which is one more
+ *  thing to keep in step than the feature needs. `set_milestone_state` still exists in Rust (it is
+ *  the primitive `flags` asserts through), but it is deliberately NOT wrapped here — a wrapper with
+ *  no caller is how the second control finds its way back. */
 export const setMilestoneStatus = (id: number, status: MilestoneStatus) =>
   invoke<void>("set_milestone_status", { id, status });
 

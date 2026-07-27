@@ -24,7 +24,7 @@ import {
   listDocuments,
   listMilestones,
   listProjects,
-  setMilestoneState,
+  setMilestoneStatus,
   updateMilestone,
 } from "../lib/ipc";
 import { Markdown } from "../lib/markdown";
@@ -45,8 +45,10 @@ import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinbo
 import {
   isPastTimelineDate,
   readConfirmDelete,
+  readShowCompletedTimelineItems,
   readShowPastTimelineItems,
   writeConfirmDelete,
+  writeShowCompletedTimelineItems,
   writeShowPastTimelineItems,
 } from "../lib/pinboard/prefs";
 import { todayIso } from "../lib/dateField";
@@ -55,10 +57,13 @@ import { usePinboard } from "../lib/pinboard/usePinboard";
 // stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
 import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
 import type { CellPoint, Rect, TimelineItem, Widget } from "../lib/pinboard/types";
-import type { Milestone } from "../lib/types";
+import type { Milestone, MilestoneStatus } from "../lib/types";
 import { useDepth } from "../theme";
 import { DateField } from "./DateField";
-import { Button, ConfirmDialog, Modal, SegmentedControl, Textarea, Tooltip } from "./ui";
+// The status vocabulary + the "what does a pre-status row read as" fallback live with the project
+// milestone list, so the two surfaces can never drift into offering different options.
+import { MILESTONE_STATUSES, milestoneStatus } from "./MilestoneList";
+import { Button, ConfirmDialog, Modal, SegmentedControl, Select, Textarea, Tooltip } from "./ui";
 
 /** The live filing state of a note's ingested document, keyed by `note:<widgetId>`. */
 type DocStatus = { reviewed: boolean; project: string };
@@ -874,33 +879,36 @@ function WidgetHeader({
   );
 }
 
-/** "Past" — the timeline card's counterpart to the project panel's "Completed" checkbox. Writes
- *  through on change so every timeline card on the board agrees, and so the choice survives a
- *  remount (a tab switch unmounts the whole board). */
-function ShowPastToggle({
+/** One of a timeline card's filter checkboxes — "Past" (by date) or "Done" (by status). One
+ *  component rather than two near-identical ones, so the two read and behave identically; the
+ *  caller owns the pref write, since each answers a different question and they persist separately.
+ *
+ *  `onChange` is expected to write through as well as set state, so every timeline card on the board
+ *  agrees and the choice survives a remount (a tab switch unmounts the whole board). */
+function TimelineFilterToggle({
+  label,
+  title,
   checked,
   onChange,
 }: {
+  label: string;
+  title: string;
   checked: boolean;
   onChange: (v: boolean) => void;
 }) {
   return (
     <label
       className="flex shrink-0 items-center gap-1 text-[0.625rem] uppercase tracking-wide text-ink4"
-      title="Show entries whose date has already passed"
+      title={title}
       onPointerDown={(e) => e.stopPropagation()}
     >
       <input
         type="checkbox"
         checked={checked}
-        onChange={(e) => {
-          const next = e.currentTarget.checked;
-          onChange(next);
-          writeShowPastTimelineItems(next);
-        }}
+        onChange={(e) => onChange(e.currentTarget.checked)}
         className="accent-[var(--accent)]"
       />
-      Past
+      {label}
     </label>
   );
 }
@@ -1855,6 +1863,7 @@ function BoundTimeline({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showPast, setShowPast] = useState(readShowPastTimelineItems);
+  const [showCompleted, setShowCompleted] = useState(readShowCompletedTimelineItems);
   const today = todayIso();
 
   const refresh = useCallback(() => {
@@ -1884,8 +1893,13 @@ function BoundTimeline({
     if (!db) return -1;
     return da.localeCompare(db);
   });
+  // Each filter is offered only when it has something to hide — on a card this size a checkbox that
+  // does nothing is worse than no checkbox (the same rule the Past toggle already followed).
   const hasPast = sorted.some((m) => isPastTimelineDate(msDate(m), today));
-  const ordered = showPast ? sorted : sorted.filter((m) => !isPastTimelineDate(msDate(m), today));
+  const hasCompleted = sorted.some((m) => m.state === "met");
+  const ordered = sorted
+    .filter((m) => showPast || !isPastTimelineDate(msDate(m), today))
+    .filter((m) => showCompleted || m.state !== "met");
 
   async function add() {
     await runMutation(async () => {
@@ -1902,7 +1916,28 @@ function BoundTimeline({
         </span>
         {/* Only offered when there is something to hide — on a card this size an always-present
             checkbox that does nothing is worse than no checkbox. */}
-        {hasPast && <ShowPastToggle checked={showPast} onChange={setShowPast} />}
+        {hasPast && (
+          <TimelineFilterToggle
+            label="Past"
+            title="Show entries whose date has already passed"
+            checked={showPast}
+            onChange={(v) => {
+              setShowPast(v);
+              writeShowPastTimelineItems(v);
+            }}
+          />
+        )}
+        {hasCompleted && (
+          <TimelineFilterToggle
+            label="Done"
+            title="Show milestones already marked Done"
+            checked={showCompleted}
+            onChange={(v) => {
+              setShowCompleted(v);
+              writeShowCompletedTimelineItems(v);
+            }}
+          />
+        )}
         <button
           onClick={onUnlink}
           title="Unlink this project (its milestones stay in the project)"
@@ -1991,9 +2026,9 @@ function useMilestoneEditor(
       onChanged();
     }, onError);
   };
-  const toggleDone = () =>
+  const setStatus = (next: MilestoneStatus) =>
     void runMutation(async () => {
-      await setMilestoneState(m.id, !met);
+      await setMilestoneStatus(m.id, next);
       onChanged();
     }, onError);
   const remove = () =>
@@ -2002,7 +2037,17 @@ function useMilestoneEditor(
       onChanged();
     }, onError);
 
-  return { label, setLabel, date, setDate, met, persist, toggleDone, remove };
+  return {
+    label,
+    setLabel,
+    date,
+    setDate,
+    met,
+    status: milestoneStatus(m),
+    persist,
+    setStatus,
+    remove,
+  };
 }
 
 interface MilestoneItemProps {
@@ -2012,23 +2057,49 @@ interface MilestoneItemProps {
   showPower: boolean;
 }
 
-/** A milestone's done toggle — a dot that reads "done" (st-track) or "open" (accent). */
-function MilestoneDot({ met, onToggle }: { met: boolean; onToggle: () => void }) {
+/** How full a milestone's dot reads at each status. Progress is shown by FILL along one hue rather
+ *  than by four different colours: the `--st-*` tokens already carry project-status meanings, and
+ *  borrowing them here would say something PM doesn't mean. Done alone changes hue, to the same
+ *  muted `--st-track` that has always marked a finished milestone. */
+const DOT_FILL: Record<MilestoneStatus, string> = {
+  not_started: "transparent",
+  in_progress: "color-mix(in oklab, var(--accent) 45%, transparent)",
+  almost_done: "var(--accent)",
+  done: "var(--st-track)",
+};
+
+/** A milestone's status as a dot on the track — a READOUT, not a control.
+ *
+ *  It used to be the done toggle, which made it the second control writing the same fact as the
+ *  progress dropdown. The dot stays because the track view needs a marker ON the line to show where
+ *  a milestone sits; it just no longer does anything when clicked. It carries an accessible label
+ *  because in the track view it is the only place the status is stated. */
+function MilestoneDot({ status }: { status: MilestoneStatus }) {
+  const label = MILESTONE_STATUSES.find((s) => s.value === status)?.label ?? status;
   return (
-    <button
-      onClick={onToggle}
-      title={met ? "Mark not done" : "Mark done"}
-      aria-label={met ? "Mark not done" : "Mark done"}
-      className="relative h-2.5 w-2.5 shrink-0 rounded-full border before:absolute before:-inset-[7px] before:content-['']"
-      style={{ background: met ? "var(--st-track)" : "var(--accent)", borderColor: "var(--panel)" }}
+    <span
+      role="img"
+      aria-label={label}
+      title={label}
+      className="h-2.5 w-2.5 shrink-0 rounded-full border"
+      style={{
+        background: DOT_FILL[status],
+        // Not-started reads as an outline, so its ring has to be the accent rather than the panel
+        // colour it would otherwise vanish against.
+        borderColor: status === "not_started" ? "var(--accent)" : "var(--panel)",
+      }}
     />
   );
 }
 
 /** One milestone as a column on the row/track view: date on top, a dot on the line, its label
- *  below, and a remove ✕. Calendar-linked milestones show their synced date read-only. */
+ *  below, and a remove ✕. Calendar-linked milestones show their synced date read-only.
+ *
+ *  Status is READ-ONLY here. A four-option dropdown does not fit an 5.5rem column, and shortening
+ *  the labels to make it fit would mean the same control reading differently in two places. The
+ *  track is the overview; switch the card to list view to change a status. */
 function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProps) {
-  const { label, setLabel, date, setDate, met, persist, toggleDone, remove } = useMilestoneEditor(
+  const { label, setLabel, date, setDate, met, status, persist, remove } = useMilestoneEditor(
     m,
     onChanged,
     onError,
@@ -2056,7 +2127,7 @@ function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProp
           className="h-6 px-0.5 font-mono text-[0.5625rem] text-ink3"
         />
       )}
-      <MilestoneDot met={met} onToggle={toggleDone} />
+      <MilestoneDot status={status} />
       <input
         value={label}
         onChange={(e) => setLabel(e.target.value)}
@@ -2080,17 +2151,18 @@ function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProp
   );
 }
 
-/** One milestone as a list row: done dot · date · label · remove — the same edits as the column
- *  view, laid out horizontally. */
+/** One milestone as a list row: date · label · progress · remove — the same edits as the column
+ *  view, laid out horizontally, plus the progress dropdown the narrow track can't hold. This is
+ *  where a status is CHANGED.
+ *
+ *  No status dot here. The track view keeps one because it is the marker showing where a milestone
+ *  sits on the line and the only place its status is stated; in a list row the dropdown right there
+ *  already says it in words, so the dot was a second, vaguer copy of the same fact. */
 function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) {
-  const { label, setLabel, date, setDate, met, persist, toggleDone, remove } = useMilestoneEditor(
-    m,
-    onChanged,
-    onError,
-  );
+  const { label, setLabel, date, setDate, met, status, persist, setStatus, remove } =
+    useMilestoneEditor(m, onChanged, onError);
   return (
     <div className="flex items-center gap-1">
-      <MilestoneDot met={met} onToggle={toggleDone} />
       {m.calendar_linked ? (
         <span
           className="flex h-6 w-[6.25rem] shrink-0 items-center gap-0.5 font-mono text-[0.5625rem] text-accent-text"
@@ -2126,6 +2198,20 @@ function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) 
           ⚠
         </span>
       )}
+      <Select
+        compact
+        value={status}
+        aria-label={`Progress for ${m.label || "milestone"}`}
+        title="How far along this milestone is"
+        onChange={(e) => setStatus(e.target.value as MilestoneStatus)}
+        className="shrink-0 text-[0.625rem]"
+      >
+        {MILESTONE_STATUSES.map((s) => (
+          <option key={s.value} value={s.value}>
+            {s.label}
+          </option>
+        ))}
+      </Select>
       <button
         onClick={remove}
         aria-label="Remove milestone"
@@ -2203,7 +2289,16 @@ function FreeformTimeline({
     <div className="flex h-full flex-col px-2 py-1">
       {hasPast && (
         <div className="mb-1 flex shrink-0 justify-end">
-          <ShowPastToggle checked={showPast} onChange={setShowPast} />
+          {/* Freeform entries have no notion of "done", so this card gets the date filter only. */}
+          <TimelineFilterToggle
+            label="Past"
+            title="Show entries whose date has already passed"
+            checked={showPast}
+            onChange={(v) => {
+              setShowPast(v);
+              writeShowPastTimelineItems(v);
+            }}
+          />
         </div>
       )}
       {items.length === 0 ? (

@@ -7,12 +7,13 @@ import {
   calendarOverview,
   listIcsFeeds,
   removeIcsFeed,
+  setCalendarKind,
   syncCalendar,
 } from "../lib/ipc";
-import type { CalendarOverview, IcsFeedInfo } from "../lib/types";
+import type { CalendarOverview, EventKind, IcsFeedInfo } from "../lib/types";
 import { formatWhen } from "../lib/format";
 import { useBusyRun } from "../lib/useBusyRun";
-import { Button, ConfirmDialog, Input } from "./ui";
+import { Button, ConfirmDialog, Input, Select } from "./ui";
 
 /**
  * The **zero-auth calendar subscription**: paste a calendar's private "secret address in iCal format".
@@ -78,6 +79,26 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
       await refresh();
     });
 
+  // Type a subscribed calendar work/personal. A feed registers exactly ONE calendar whose id IS the
+  // feed id (`calendar::register_feed_source`), so the feed row can carry the calendar's setting
+  // directly — no separate calendar picker is needed for a subscription, and none would have
+  // anything extra to show. Optimistic, like the OAuth list: the write is a local annotation, so
+  // making the control wait on a round-trip would only make it feel broken.
+  const setKind = (calendarId: string, kind: EventKind | null) =>
+    run("kind", async () => {
+      setOverview((o) =>
+        o
+          ? { ...o, calendars: o.calendars.map((c) => (c.id === calendarId ? { ...c, kind } : c)) }
+          : o,
+      );
+      try {
+        await setCalendarKind(calendarId, kind);
+      } catch (e) {
+        await refresh();
+        throw e;
+      }
+    });
+
   // Scoped (Apple) shows just that provider's feeds; the general section shows everything NOT owned by
   // a dedicated provider group (Apple has its own), so each feed lives in exactly one place.
   const shown = scoped
@@ -124,22 +145,42 @@ export function IcsFeedSubscription({ provider }: { provider?: "apple" } = {}) {
 
       {shown.length > 0 && (
         <ul className="mt-2 divide-y divide-rule rounded-[var(--radius)] border border-border">
-          {shown.map((f) => (
-            <li
-              key={f.id}
-              className="flex items-center justify-between px-3 py-1.5 text-sm text-ink"
-            >
-              <span className="truncate">{f.label}</span>
-              <Button
-                variant="tertiary"
-                onClick={() => setConfirm({ id: f.id, label: f.label })}
-                disabled={busy != null}
-                className="shrink-0 px-2 py-0.5 text-xs hover:text-st-due"
+          {shown.map((f) => {
+            // The feed's calendar row, present once a sync has registered it. Until then there is
+            // nothing to type, so the control is simply absent rather than disabled-and-mysterious.
+            const cal = overview?.calendars.find((c) => c.id === f.id);
+            return (
+              <li
+                key={f.id}
+                className="flex items-center justify-between gap-2 px-3 py-1.5 text-sm text-ink"
               >
-                Remove
-              </Button>
-            </li>
-          ))}
+                <span className="min-w-0 flex-1 truncate">{f.label}</span>
+                {cal && (
+                  <Select
+                    compact
+                    value={cal.kind ?? ""}
+                    disabled={busy != null}
+                    aria-label={`Is ${f.label} a work or personal calendar?`}
+                    title="Whether this calendar's events count as work or personal."
+                    onChange={(e) => setKind(f.id, (e.target.value || null) as EventKind | null)}
+                    className="shrink-0 text-[0.625rem]"
+                  >
+                    <option value="">Untyped</option>
+                    <option value="work">Work</option>
+                    <option value="personal">Personal</option>
+                  </Select>
+                )}
+                <Button
+                  variant="tertiary"
+                  onClick={() => setConfirm({ id: f.id, label: f.label })}
+                  disabled={busy != null}
+                  className="shrink-0 px-2 py-0.5 text-xs hover:text-st-due"
+                >
+                  Remove
+                </Button>
+              </li>
+            );
+          })}
         </ul>
       )}
 

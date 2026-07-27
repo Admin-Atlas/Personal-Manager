@@ -266,29 +266,56 @@ function AnswerRatingControls({ messageId }: { messageId: number }) {
   return (
     <div className="flex justify-start" data-help="chat-answer-rating">
       <div className="flex items-center gap-0.5">
-        {(["up", "down"] as const).map((v) => (
-          <IconButton
-            key={v}
-            variant="subtle"
-            aria-pressed={rating === v}
-            label={v === "up" ? "This answer was helpful" : "This answer missed"}
-            title={
-              rating === v
-                ? "Clear this rating"
-                : v === "up"
-                  ? "This answer was helpful"
-                  : "This answer missed"
-            }
-            onClick={() => choose(v)}
-            className={`px-1 py-0.5 text-xs ${
-              rating === v ? "text-accent-text" : "text-faint hover:text-ink3"
-            }`}
-          >
-            {v === "up" ? "👍" : "👎"}
-          </IconButton>
-        ))}
+        {(["up", "down"] as const).map((v) => {
+          const on = rating === v;
+          return (
+            <IconButton
+              key={v}
+              // Chosen state is carried by the VARIANT, not by a colour in `className` — see the
+              // `pressed` entry in IconButton for why the ad-hoc version silently did nothing. The
+              // old control paired that dead class with a 👍 emoji, a full-colour glyph that ignores
+              // `color` anyway, so a rating wrote to the database and showed no sign of it.
+              variant={on ? "pressed" : "ghost"}
+              aria-pressed={on}
+              label={v === "up" ? "This answer was helpful" : "This answer missed"}
+              title={
+                on
+                  ? "Clear this rating"
+                  : v === "up"
+                    ? "This answer was helpful"
+                    : "This answer missed"
+              }
+              onClick={() => choose(v)}
+              className="px-1.5 py-0.5"
+            >
+              <ThumbIcon down={v === "down"} />
+            </IconButton>
+          );
+        })}
       </div>
     </div>
+  );
+}
+
+/** A thumb, drawn rather than typed. Inline SVG inherits `currentColor`, which is the whole point:
+ *  it lets the selected state actually show, and it renders the same on all three webview engines
+ *  instead of leaving each platform's emoji font to decide what a thumb looks like. */
+function ThumbIcon({ down }: { down: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className="h-3.5 w-3.5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      // One path, flipped for the thumbs-down, so the two can never drift out of proportion.
+      style={down ? { transform: "rotate(180deg)" } : undefined}
+    >
+      <path d="M4.5 14V6.8L8.2 1.6a1.6 1.6 0 0 1 2.6 1.8L9.6 6.2h3.2a1.6 1.6 0 0 1 1.55 2l-1.35 4.6A2 2 0 0 1 11.05 14H4.5Z" />
+      <path d="M4.5 6.8H2.6A1.1 1.1 0 0 0 1.5 7.9v5A1.1 1.1 0 0 0 2.6 14h1.9" />
+    </svg>
   );
 }
 

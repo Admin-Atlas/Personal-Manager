@@ -58,6 +58,33 @@ export function writeShowPastTimelineItems(show: boolean): void {
   }
 }
 
+const SHOW_COMPLETED_KEY = "pm.pinboard.timeline.showCompleted";
+
+/** Show milestones marked Done on a project-linked timeline card? True by default, for the same
+ *  reason as its two siblings: opening a card must not look like it lost data.
+ *
+ *  This is the "what's left to do" question the project panel's "Completed" checkbox answers, asked
+ *  again on the board — and it is a SEPARATE pref from that checkbox on purpose. The panel and a
+ *  board card are looked at in different moods, and sharing one switch would mean tidying the board
+ *  silently tidied the project page too. It is also separate from `showPast` above, which keys on
+ *  the DATE: a milestone can be done but still ahead of you, or long past and never ticked, so one
+ *  switch could not express both. Freeform timelines have no notion of done and get no such toggle. */
+export function readShowCompletedTimelineItems(): boolean {
+  try {
+    return localStorage.getItem(SHOW_COMPLETED_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+export function writeShowCompletedTimelineItems(show: boolean): void {
+  try {
+    localStorage.setItem(SHOW_COMPLETED_KEY, show ? "true" : "false");
+  } catch {
+    /* best-effort */
+  }
+}
+
 /**
  * Whether a timeline entry's date is already behind us. Compared as `YYYY-MM-DD` STRINGS against
  * today's local calendar day rather than by constructing a `Date`: a bare date parsed by `new Date`
