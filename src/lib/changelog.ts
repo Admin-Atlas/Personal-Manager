@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.93.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "Subscribed calendars now show who else is invited. Google and Outlook events have listed their guests since the event pop-up arrived, but calendars you subscribe to by link — including Apple ones — were quietly dropping that, so those events always looked like you were the only person going. They don’t any more.",
+      "You can now mark each calendar as work or personal, next to its Quiet setting. Nothing acts on it yet — it’s there so PM can eventually tell a 3pm standup from a 3pm dentist appointment, which today it genuinely cannot. Your choice sticks through a re-sync, and calendars you don’t label stay unlabelled rather than being guessed at.",
+    ],
+  },
+  {
     version: "3.92.0-alpha",
     date: "2026-07-27",
     highlights: [

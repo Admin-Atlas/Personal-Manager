@@ -4117,6 +4117,21 @@ pub fn set_calendar_selected(
     calendar::set_calendar_selected(&conn, &calendar_id, selected)
 }
 
+/// Type one calendar as work or personal, or clear it with `None` (v45).
+///
+/// Per-calendar rather than per-event because the user has already drawn that line by connecting the
+/// accounts separately. Nothing consumes the typing yet — the Work-context score and the
+/// person-context flags are its first readers.
+#[tauri::command]
+pub fn set_calendar_kind(
+    state: State<'_, AppState>,
+    calendar_id: String,
+    kind: Option<String>,
+) -> Result<()> {
+    let conn = state.conn()?;
+    calendar::set_calendar_kind(&conn, &calendar_id, kind.as_deref())
+}
+
 /// Mark one calendar (by its `calendars.id`) quiet, or not: keep it on the Calendar tab but exclude
 /// its events from the assistant (briefing, flags/reminders, chat agenda, focus upcoming).
 /// No re-sync needed — the events stay mirrored; only the assistant query path filters them.

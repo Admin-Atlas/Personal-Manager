@@ -10,13 +10,14 @@ import {
   disconnectOutlookCalendar,
   setCalendarSelected,
   setCalendarQuiet,
+  setCalendarKind,
   syncCalendar,
 } from "../lib/ipc";
-import type { Calendar, CalendarAccount, CalendarOverview } from "../lib/types";
+import type { Calendar, CalendarAccount, CalendarOverview, EventKind } from "../lib/types";
 import { useDevMode } from "../lib/capabilities";
 import { formatWhen } from "../lib/format";
 import { useBusyRun } from "../lib/useBusyRun";
-import { Button, ConfirmDialog, Skeleton } from "./ui";
+import { Button, ConfirmDialog, Select, Skeleton } from "./ui";
 import { DevPanel } from "./dev/DevPanel";
 import { GoogleOwnProjectConnect } from "./GoogleOwnProjectConnect";
 
@@ -178,6 +179,26 @@ export function CalendarConnection({
       }
     });
 
+  // Type a calendar work/personal. Like Quiet this is PM's own annotation rather than upstream data,
+  // so no re-sync is needed — and it survives one, because the upsert only refreshes provider fields.
+  const setKind = (cal: Calendar, kind: EventKind | null) =>
+    run("kind", async () => {
+      setOverview((o) =>
+        o
+          ? {
+              ...o,
+              calendars: o.calendars.map((c) => (c.id === cal.id ? { ...c, kind } : c)),
+            }
+          : o,
+      );
+      try {
+        await setCalendarKind(cal.id, kind);
+      } catch (e) {
+        await refresh();
+        throw e;
+      }
+    });
+
   const sync = () =>
     run("sync", async () => {
       const n = await syncCalendar();
@@ -223,6 +244,7 @@ export function CalendarConnection({
                     busy={busy != null}
                     onToggle={toggle}
                     onToggleQuiet={toggleQuiet}
+                    onSetKind={setKind}
                     onDisconnect={() => setConfirmEmail(a.email)}
                   />
                 </li>
@@ -384,6 +406,7 @@ function AccountBlock({
   busy,
   onToggle,
   onToggleQuiet,
+  onSetKind,
   onDisconnect,
 }: {
   account: CalendarAccount;
@@ -391,6 +414,7 @@ function AccountBlock({
   busy: boolean;
   onToggle: (cal: Calendar, on: boolean) => void;
   onToggleQuiet: (cal: Calendar, on: boolean) => void;
+  onSetKind: (cal: Calendar, kind: EventKind | null) => void;
   onDisconnect: () => void;
 }) {
   const unreachable = account.state !== "ok";
@@ -433,19 +457,34 @@ function AccountBlock({
                   <span className="font-mono text-[0.625rem] text-ink4">primary</span>
                 )}
                 {c.selected && (
-                  <label
-                    className="ml-auto flex shrink-0 cursor-pointer items-center gap-1 text-[0.625rem] text-ink4"
-                    title="Keep this calendar on the Calendar tab, but leave it out of reminders, the daily briefing, and chat."
-                  >
-                    <input
-                      type="checkbox"
-                      checked={c.quiet}
+                  <span className="ml-auto flex shrink-0 items-center gap-2">
+                    <Select
+                      compact
+                      value={c.kind ?? ""}
                       disabled={busy}
-                      onChange={(e) => onToggleQuiet(c, e.target.checked)}
-                      className="accent-[var(--accent)]"
-                    />
-                    Quiet
-                  </label>
+                      aria-label={`Is ${c.name} a work or personal calendar?`}
+                      title="Whether this calendar's events count as work or personal."
+                      onChange={(e) => onSetKind(c, (e.target.value || null) as EventKind | null)}
+                      className="text-[0.625rem]"
+                    >
+                      <option value="">Untyped</option>
+                      <option value="work">Work</option>
+                      <option value="personal">Personal</option>
+                    </Select>
+                    <label
+                      className="flex cursor-pointer items-center gap-1 text-[0.625rem] text-ink4"
+                      title="Keep this calendar on the Calendar tab, but leave it out of reminders, the daily briefing, and chat."
+                    >
+                      <input
+                        type="checkbox"
+                        checked={c.quiet}
+                        disabled={busy}
+                        onChange={(e) => onToggleQuiet(c, e.target.checked)}
+                        className="accent-[var(--accent)]"
+                      />
+                      Quiet
+                    </label>
+                  </span>
                 )}
               </li>
             ))}

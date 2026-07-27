@@ -1239,6 +1239,32 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX idx_retrieval_feedback_click
         ON retrieval_feedback(message_id, document_id) WHERE signal = 'citation_click';
     "#,
+    // v45 (Stage-4 card 11): work-vs-personal typing for calendar events.
+    //
+    // Required by the Work-context score and the person-context flags, neither of which can tell a
+    // 3pm standup from a 3pm dentist appointment today. The interim proxy — "any event in progress"
+    // — treats those identically, which is precisely the distinction the feature needs.
+    //
+    // Typing is declared PER CALENDAR, not inferred per event. Someone who connects a work account
+    // and a personal one has already made the distinction; asking the model to re-derive it from
+    // event titles would be slower, cost tokens, and be wrong in exactly the ambiguous cases that
+    // matter. `calendars.kind` sits beside `selected`/`color`/`quiet` — the per-calendar preferences
+    // that already exist — and events inherit it at read time.
+    //
+    // `calendar_events.kind_override` is the escape hatch for the event that doesn't match its
+    // calendar (the dentist appointment on the work calendar). Nothing writes it yet; it exists now
+    // because adding it later would mean a second calendar migration, and the whole point of this
+    // card is to bank the column while a migration is already being written. Resolution is
+    // `COALESCE(event.kind_override, calendar.kind)` — the event wins when it disagrees.
+    //
+    // Both NULL-by-default and NULLABLE: NULL means "not typed", which is honest and distinct from
+    // either value. No backfill guesses a kind from a calendar's name.
+    r#"
+    ALTER TABLE calendars ADD COLUMN kind TEXT
+        CHECK (kind IN ('work','personal') OR kind IS NULL);  -- NULL = untyped
+    ALTER TABLE calendar_events ADD COLUMN kind_override TEXT
+        CHECK (kind_override IN ('work','personal') OR kind_override IS NULL);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1294,7 +1320,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 44,
+            version, 45,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1315,7 +1341,8 @@ mod tests {
              preferences.source admits 'imported' is v41; \
              project_milestones status + source_type/external_id is v42; \
              corrections filing-pipeline version stamp is v43; \
-             retrieval-relevance feedback capture is v44)"
+             retrieval-relevance feedback capture is v44; \
+             calendar work/personal typing is v45)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

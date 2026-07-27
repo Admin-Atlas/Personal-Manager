@@ -1406,6 +1406,7 @@ pub fn run() {
             commands::calendar_overview,
             commands::set_calendar_selected,
             commands::set_calendar_quiet,
+            commands::set_calendar_kind,
             commands::connect_google_calendar_account,
             commands::disconnect_google_calendar_account,
             commands::connect_outlook_calendar,
