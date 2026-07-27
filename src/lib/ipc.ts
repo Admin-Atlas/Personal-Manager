@@ -89,7 +89,10 @@ import type {
   ProtonCliStatus,
   ProtonConnStatus,
   ReviewDecision,
+  RetagEvent,
+  RetagScope,
   ReviewEvent,
+  TagProposalRow,
   RestoreSummary,
   SemanticLayout,
   Settings,
@@ -664,6 +667,29 @@ export function proposeMetadata(
 /** Confirm a review pass — writes the metadata and logs every correction. */
 export const commitReview = (decisions: ReviewDecision[]) =>
   invoke<void>("commit_review", { decisions });
+
+// --- Whole-library re-tag (#580) ---
+
+/** How many documents a re-tag pass would cover, and how many model calls that is. Read-only. */
+export const retagScope = () => invoke<RetagScope>("retag_scope");
+
+/** Run a re-tag pass: derive one vocabulary for the whole store, then label every document from
+ *  it. STAGES proposals only — nothing is written until `commitRetag`. */
+export function proposeRetag(onEvent: (event: RetagEvent) => void): Promise<void> {
+  const channel = new Channel<RetagEvent>();
+  channel.onmessage = onEvent;
+  return invoke<void>("propose_retag", { onEvent: channel });
+}
+
+/** The staged proposals that would actually change something. */
+export const listTagProposals = () => invoke<TagProposalRow[]>("list_tag_proposals");
+
+/** Throw a staged pass away without applying any of it. */
+export const discardTagProposals = () => invoke<void>("discard_tag_proposals");
+
+/** Apply the staged tags for these documents — tags only; project and importance are untouched. */
+export const commitRetag = (documentIds: number[]) =>
+  invoke<number>("commit_retag", { documentIds });
 
 /**
  * Edit one already-reviewed document's metadata (an after-the-fact correction).

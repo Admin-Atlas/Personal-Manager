@@ -74,6 +74,7 @@ mod project_activity;
 mod projects;
 mod python_fetch;
 mod registry;
+mod retag;
 mod retrieval;
 mod retrieval_config;
 mod retrieval_diag;
@@ -1378,6 +1379,11 @@ pub fn run() {
             commands::get_document,
             commands::transcribe_audio,
             commands::list_projects,
+            commands::retag_scope,
+            commands::propose_retag,
+            commands::list_tag_proposals,
+            commands::discard_tag_proposals,
+            commands::commit_retag,
             commands::list_tags,
             commands::review_queue,
             commands::review_queue_count,
