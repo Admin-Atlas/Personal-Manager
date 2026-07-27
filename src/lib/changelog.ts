@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.93.1-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "Under-the-hood tidying: PM now keeps a written record of which parts of your data are genuinely yours — the things that would have to travel with you to a second computer — and which are just working copies it can rebuild. Nothing changes in the app. It matters because PM has quietly grown past “your notes live in the vault”: your preferences, your corrections, your resolved reminders and your project history all live in the database now, and a future version that syncs between machines could have left every one of them behind on the old one without anyone noticing. There is also a new check that stops that list going out of date.",
+    ],
+  },
+  {
     version: "3.93.0-alpha",
     date: "2026-07-27",
     highlights: [

@@ -20,7 +20,7 @@ default:
 # --- aggregates -----------------------------------------------------------
 
 # The fast subset (formatting, types, lint, bespoke gates) — what pre-commit runs.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -171,6 +171,11 @@ license-subset:
 # skip CI until pr.yml is separately edited (T-04).
 ci-membership:
     node scripts/check-ci-membership.mjs
+
+# Every table the schema creates is classified in SYNC-SET.md (truth / derived / device /
+# mixed), so a new table can't land without a declared owner of truth for a future sync.
+sync-set:
+    node scripts/check-sync-set.mjs
 
 # --- release-only ---------------------------------------------------------
 

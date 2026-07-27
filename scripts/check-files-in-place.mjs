@@ -89,9 +89,11 @@ const ALLOWED_ROOT = new Set([
   "CLAUDE.md",
   "CONTRIBUTING.md",
   "ERROR_CODES.md",
+  "INVARIANTS.md", // cross-change contracts register (AGENTS.md points at it)
   "LICENCE.txt",
   "README.md",
   "RELEASING.md",
+  "SYNC-SET.md", // per-table owner-of-truth register (gated by check-sync-set.mjs)
   "design-system-docs",
   "eslint.config.js",
   "index.html",
