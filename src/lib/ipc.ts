@@ -660,13 +660,27 @@ export function proposeMetadata(
 export const commitReview = (decisions: ReviewDecision[]) =>
   invoke<void>("commit_review", { decisions });
 
-/** Edit one already-reviewed document's metadata (an after-the-fact correction). */
+/**
+ * Edit one already-reviewed document's metadata (an after-the-fact correction).
+ *
+ * `alsoProjects` is the document's non-primary memberships (#275). It is REPLACED wholesale, not
+ * merged, so a caller that only means to change the importance must pass the current list back —
+ * `doc.linked_projects` — exactly as it already has to for `tags`.
+ */
 export const setDocumentMetadata = (
   documentId: number,
   project: string,
+  alsoProjects: string[],
   tags: string[],
   importance: Importance,
-) => invoke<Document>("set_document_metadata", { documentId, project, tags, importance });
+) =>
+  invoke<Document>("set_document_metadata", {
+    documentId,
+    project,
+    alsoProjects,
+    tags,
+    importance,
+  });
 
 // --- Canonical entities (the Teach tab; entity-resolution foundation) ---
 

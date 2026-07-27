@@ -389,6 +389,13 @@ export interface Document {
   ingested_at: string;
   /** Organisation metadata (Step 4). */
   project: string;
+  /**
+   * The OTHER projects this document belongs to (#275) — never including `project`, which is the
+   * PRIMARY (home) project. A document is primary in exactly one place and linked into the rest:
+   * the home is what owns its filing activity and its pull on the Map, so the distinction is real
+   * and the UI shows it.
+   */
+  linked_projects: string[];
   tags: string[];
   importance: Importance;
   reviewed: boolean;

@@ -14,8 +14,9 @@ import { useSidebarSplit } from "../lib/useSidebarSplit";
 import { idleSince } from "../lib/chatSession";
 import type { ProjectChat } from "../lib/useProjectChat";
 import type { Document, LocalLlmStatus, Milestone } from "../lib/types";
-import { Button, Input } from "./ui";
+import { Button } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
+import { LinkedBadge, ProjectPicker, projectsOf } from "./ProjectPicker";
 import { MilestoneList } from "./MilestoneList";
 import { TagEditor } from "./TagEditor";
 import { ChatBadge } from "./ChatBadge";
@@ -208,9 +209,13 @@ export function ProjectView({
 
   // Reload just this project's documents — shared by the project-change effect and the delete
   // dialog, so a deleted file leaves the list immediately rather than lingering until a tab switch.
+  // Membership, not just home (#275): a document linked into this project belongs in its file list
+  // and in its chat's grounding, and this one predicate is what decides both for the panel.
+  const belongsHere = (d: Document) => d.project === project || d.linked_projects.includes(project);
+
   const refreshDocuments = () => {
     listDocuments()
-      .then((all) => setDocuments(all.filter((d) => d.project === project)))
+      .then((all) => setDocuments(all.filter(belongsHere)))
       .catch((e) => chat.setError(String(e)));
   };
 
@@ -247,15 +252,30 @@ export function ProjectView({
    *  document to a different project, it leaves this project's panel. */
   async function saveMeta(
     doc: Document,
-    patch: Partial<Pick<Document, "project" | "tags" | "importance">>,
+    patch: Partial<Pick<Document, "project" | "linked_projects" | "tags" | "importance">>,
   ) {
-    const nextProject = patch.project ?? doc.project;
+    // The memberships are replaced wholesale by the backend, so every edit — even one that only
+    // touches the importance — must pass the current list back or it would unlink the document.
+    const nextProjects = patch.linked_projects
+      ? [patch.project ?? doc.project, ...patch.linked_projects]
+      : patch.project
+        ? [patch.project, ...doc.linked_projects.filter((p) => p !== patch.project)]
+        : projectsOf(doc);
+    const [nextProject, ...nextAlso] = nextProjects;
     const nextTags = patch.tags ?? doc.tags;
     const nextImportance = patch.importance !== undefined ? patch.importance : doc.importance;
     try {
-      const updated = await setDocumentMetadata(doc.id, nextProject, nextTags, nextImportance);
+      const updated = await setDocumentMetadata(
+        doc.id,
+        nextProject,
+        nextAlso,
+        nextTags,
+        nextImportance,
+      );
+      // Leaves the panel only when it no longer belongs here AT ALL. Testing `project !== project`
+      // would drop every linked document on any edit, since its home is elsewhere by definition.
       setDocuments((docs) =>
-        updated.project !== project
+        !belongsHere(updated)
           ? docs.filter((d) => d.id !== updated.id)
           : docs.map((d) => (d.id === updated.id ? updated : d)),
       );
@@ -332,6 +352,9 @@ export function ProjectView({
                 >
                   {d.title}
                 </span>
+                {/* Only when this project is NOT the document's home: otherwise every row in a
+                    single-project store would carry a badge that told the user nothing. */}
+                {d.project !== project && <LinkedBadge home={d.project} />}
                 <DeleteDocumentButton onClick={() => setDeleting(d)} />
               </div>
               {teachVisible ? (
@@ -340,19 +363,18 @@ export function ProjectView({
                 // Stop clicks here from bubbling to the row's open-reader handler.
                 <div className="mt-1.5 flex flex-col gap-1.5" onClick={(e) => e.stopPropagation()}>
                   {showPower && (
-                    <label className="flex items-center gap-1.5 text-xs text-ink4">
-                      <span className="shrink-0">Project</span>
-                      <Input
-                        key={d.project}
-                        list={PROJECT_LIST_ID}
-                        defaultValue={d.project}
-                        onBlur={(e) => {
-                          const v = e.target.value.trim();
-                          if (v && v !== d.project) void saveMeta(d, { project: v });
+                    <div className="flex items-start gap-1.5 text-xs text-ink4">
+                      <span className="shrink-0 pt-1">Projects</span>
+                      <ProjectPicker
+                        value={projectsOf(d)}
+                        onChange={(projects) => {
+                          const [home, ...also] = projects;
+                          void saveMeta(d, { project: home, linked_projects: also });
                         }}
-                        className="h-6 w-full text-xs"
+                        suggestions={projectNames}
+                        listId={PROJECT_LIST_ID}
                       />
-                    </label>
+                    </div>
                   )}
                   <ImportancePicker
                     value={d.importance}

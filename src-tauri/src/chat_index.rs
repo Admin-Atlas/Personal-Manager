@@ -564,6 +564,10 @@ fn chat_doc_meta(plan: &SessionPlan, last_at: &str) -> DocMeta {
         created_at: Some(plan.created_at.clone()),
         ingested_at: last_at.to_string(),
         project,
+        // Birth only: this feeds `insert_document_row`, so the chat has no memberships to carry
+        // yet. A chat linked into other projects later keeps them through `write_document_truth`
+        // like any document, and restores them from its own front-matter on Rebuild.
+        linked_projects: Vec::new(),
         tags: Vec::new(),
         importance: is_project.then(|| "high".to_string()),
         reviewed: is_project,

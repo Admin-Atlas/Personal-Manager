@@ -431,6 +431,7 @@ fn render_chat_frontmatter(
          chat_scope: {scope}\n\
          chat_source_id: {sid}\n\
          project: {project}\n\
+         linked_projects: []\n\
          tags: []\n\
          importance: {importance}\n\
          reviewed: {reviewed}\n\

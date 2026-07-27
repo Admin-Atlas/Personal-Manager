@@ -1265,6 +1265,76 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE calendar_events ADD COLUMN kind_override TEXT
         CHECK (kind_override IN ('work','personal') OR kind_override IS NULL);
     "#,
+    // v46 (Stage-4 card 15, #275): the tag registry, and with it many-to-many project membership.
+    //
+    // Until now a tag had no identity at all. `documents.tags` is a JSON blob, so there was no way
+    // to list, count or rename a tag without scanning every document — and nothing consumed tags
+    // for retrieval, search or scoring. Projects, meanwhile, were single-valued: `documents.project`
+    // is one string, so a document that genuinely belonged to two initiatives had to pick one.
+    //
+    // Both problems are the same missing table. Bobby's framing is that **every project IS a tag**,
+    // so M:N membership falls out of multi-tagging rather than needing its own parallel machinery,
+    // and a single `@tag` grammar can later reach projects and labels alike (#276).
+    //
+    // `kind` keeps the two populations apart where they differ. A `project` tag mirrors a real
+    // project and keeps the user's verbatim casing — `projects.name` is a primary key and
+    // `entities.canonical_name` is the alias key, so lowercasing here would collide with both. A
+    // `group` tag is the free-form label the tag editor already writes, and stays lowercase. Only
+    // project-kind rows ever touch the entity/alias space; that separation is what preserved #275's
+    // original "tags must not enter the project alias space" constraint.
+    //
+    // `norm` is the matching key, stored rather than expressed as COLLATE NOCASE. That follows
+    // `preferences`, which learned the same lesson: SQLite's `lower()` is ASCII-only with no ICU,
+    // so the normalisation has to be visible and applied identically on both sides rather than
+    // hidden inside a collation the Rust side can't see.
+    //
+    // `documents.project` is KEPT and still means the HOME project — the one that owns filing
+    // activity, the semantic Map's centroid pull, and the entity link. The join adds the OTHER
+    // memberships; it does not replace the home. Nothing about the single-project path changes.
+    //
+    // The backfill makes the new table a faithful restatement of what the store already says, so
+    // every membership-aware query is provably equivalent to its predecessor until a user actually
+    // links a document somewhere. `INSERT OR IGNORE` throughout because two documents may carry the
+    // same project under different casing (pre-entity vaults can), and the norm index would
+    // otherwise abort the whole migration on a store that is merely untidy.
+    r#"
+    CREATE TABLE tags (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind       TEXT NOT NULL CHECK (kind IN ('project','group')),
+        name       TEXT NOT NULL,   -- display form; project tags keep the user's casing
+        norm       TEXT NOT NULL,   -- lower(trim(name)); the matching key
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    -- Per KIND, not global: a project called "Research" and a label called "research" are
+    -- different things and must be able to coexist.
+    CREATE UNIQUE INDEX idx_tags_kind_norm ON tags(kind, norm);
+
+    CREATE TABLE document_tags (
+        document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+        PRIMARY KEY (document_id, tag_id)
+    );
+    CREATE INDEX idx_document_tags_tag ON document_tags(tag_id);
+
+    -- Every project a document is filed under becomes a project tag...
+    INSERT OR IGNORE INTO tags (kind, name, norm)
+        SELECT 'project', project, lower(trim(project))
+        FROM documents
+        WHERE trim(COALESCE(project,'')) <> '';
+    -- ...as does every project that exists only as a triage row (deadlines, milestones, a
+    -- last_touched stamp) with no documents filed under it yet.
+    INSERT OR IGNORE INTO tags (kind, name, norm)
+        SELECT 'project', name, lower(trim(name))
+        FROM projects
+        WHERE trim(COALESCE(name,'')) <> '';
+
+    -- ...and every document's home project becomes its first membership.
+    INSERT OR IGNORE INTO document_tags (document_id, tag_id)
+        SELECT d.id, t.id
+        FROM documents d
+        JOIN tags t ON t.kind = 'project' AND t.norm = lower(trim(d.project))
+        WHERE trim(COALESCE(d.project,'')) <> '';
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1320,7 +1390,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 45,
+            version, 46,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1342,7 +1412,8 @@ mod tests {
              project_milestones status + source_type/external_id is v42; \
              corrections filing-pipeline version stamp is v43; \
              retrieval-relevance feedback capture is v44; \
-             calendar work/personal typing is v45)"
+             calendar work/personal typing is v45; \
+             tag registry + M:N project membership is v46)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -2425,5 +2496,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(model, "BAAI/bge-small-en-v1.5");
+    }
+    /// v46's backfill must restate what the store already says, so every membership-aware query is
+    /// equivalent to its predecessor on an existing vault. A user who upgrades and opens Focus must
+    /// see the same projects with the same file counts — the migration is not the moment to
+    /// discover a project has gone missing.
+    #[test]
+    fn v46_backfills_a_project_tag_and_a_membership_for_every_existing_document() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open_keyed(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        apply_through(&conn, 45);
+
+        // Two documents in one project, one in another, and — the untidy case a real pre-entity
+        // vault can hold — a third spelling that differs only by case. Plus a project that exists
+        // as triage only, with no documents at all.
+        for (vp, hash, project) in [
+            ("a.md", "ha", "Atlas, Inc."),
+            ("b.md", "hb", "Atlas, Inc."),
+            ("c.md", "hc", "atlas, inc."),
+            ("d.md", "hd", "Research"),
+        ] {
+            conn.execute(
+                "INSERT INTO documents(vault_path, content_hash, project) VALUES (?1, ?2, ?3)",
+                rusqlite::params![vp, hash, project],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO projects(name, deadline) VALUES ('Dormant', '2026-12-01')",
+            [],
+        )
+        .unwrap();
+
+        // `run` resumes from the stored `user_version`, so this applies v46 and nothing else — the
+        // upgrade an existing store actually experiences.
+        super::run(&conn).unwrap();
+        assert_eq!(user_version(&conn), 46);
+
+        // One tag per project, case-folded — the differently-cased spelling did NOT mint a second.
+        let tags: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM tags WHERE kind = 'project'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, 3, "Atlas (either spelling), Research, and Dormant");
+
+        // Every document is bound to exactly one project.
+        let bindings: i64 = conn
+            .query_row("SELECT count(*) FROM document_tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bindings, 4, "one home membership per document");
+
+        let atlas: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM document_tags dt JOIN tags t ON t.id = dt.tag_id                  WHERE t.norm = 'atlas, inc.'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            atlas, 3,
+            "a case variant is the SAME project, so its documents join the same tag"
+        );
+
+        // A project with a deadline and no files is still offerable in a picker.
+        let dormant: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM tags WHERE kind = 'project' AND norm = 'dormant'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dormant, 1);
     }
 }

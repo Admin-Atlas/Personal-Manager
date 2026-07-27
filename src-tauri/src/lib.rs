@@ -99,6 +99,7 @@ mod sidecar_stage;
 mod smart_app_control;
 mod splitter;
 mod spreadsheets;
+mod tags;
 mod tray;
 mod update_delivery;
 mod vault;

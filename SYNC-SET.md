@@ -35,7 +35,9 @@ Two rules that fall out of the classes:
 
 | Table | Class | Notes |
 |---|---|---|
-| `documents` | truth | Filing is truth: `project`, `tags`, `importance`, `reviewed`, `entity_id`. Device-local columns: `source_path`, `vault_path`, `source_id` (a local connector row). The body is in the vault, not here. |
+| `documents` | truth | Filing is truth: `project` (the HOME project), `tags`, `importance`, `reviewed`, `entity_id`. Device-local columns: `source_path`, `vault_path`, `source_id` (a local connector row). The body is in the vault, not here. A document's *other* project memberships are in `document_tags`. |
+| `tags` | derived | The tag registry. Project-kind rows are re-derived from the vault (`project:` + `linked_projects:` front-matter) and the index-only manifest by `ingest::rebuild`; nothing here is authored. Rebuild is free — no model call. The `group` kind is unpopulated today (#276). |
+| `document_tags` | derived | Which documents belong to which projects. Same rebuild path as `tags`, from the same front-matter; `ingest::write_document_truth` is its only writer, so it cannot diverge from the vault it indexes. |
 | `chunks` | derived | Rebuilt by `ingest::rebuild` from the vault body. For index-only rows the content is a placeholder summary — see INVARIANTS.md I-10. |
 | `chunk_vec` | derived | Embeddings. Already has a rebuild-on-mismatch path via the retrieval config stamp. Never portable: dimension and model must match the local registry. |
 | `chunks_fts` | derived | FTS5 index over chunk text. |
