@@ -72,6 +72,7 @@ import type {
   OneDriveSyncState,
   Preference,
   Milestone,
+  MilestoneStatus,
   PlaintextExportOutcome,
   ProjectOverview,
   ProjectProposalEvent,
@@ -751,6 +752,11 @@ export const setMilestoneEvent = (id: number, eventUid: string | null, cachedDat
 /** Mark a milestone met or unmet. */
 export const setMilestoneState = (id: number, met: boolean) =>
   invoke<void>("set_milestone_state", { id, met });
+
+/** Set a milestone's progress status. The backend carries met/unmet along with it, so this and
+ *  `setMilestoneState` can't leave the two disagreeing. */
+export const setMilestoneStatus = (id: number, status: MilestoneStatus) =>
+  invoke<void>("set_milestone_status", { id, status });
 
 /** Delete a milestone. */
 export const deleteMilestone = (id: number) => invoke<void>("delete_milestone", { id });

@@ -21,7 +21,22 @@ use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+/// The progress values `project_milestones.status` admits (v42), coarsest-first. Deliberately a
+/// small closed set mirrored by the migration's CHECK constraint — a value not in here is rejected
+/// at the setter so the DB constraint is a backstop, not the error surface the user meets.
+pub const STATUSES: [&str; 4] = ["not_started", "in_progress", "almost_done", "done"];
+
+/// The one `status` value that means the milestone is finished, and therefore the only one that
+/// maps to `state = "met"`. Named because three places key off it and a typo in any of them would
+/// silently desynchronise `status` from `state`.
+pub const STATUS_DONE: &str = "done";
+
+/// The `status` a milestone falls back to when a met one is un-ticked — see `set_state`. Un-ticking
+/// means "not finished after all", and "in progress" is the only non-terminal value that stays true
+/// whether the user had it at `almost_done` or never set one at all.
+const STATUS_REOPENED: &str = "in_progress";
 
 /// One milestone as the frontend sees it: a stored row with its date *resolved*
 /// (calendar-linked dates taken from the live calendar mirror) and a couple of derived
@@ -44,13 +59,48 @@ pub struct Milestone {
     pub event_missing: bool,
     /// `"met"`, `"unmet"`, or `None` (untracked — treated as unmet in derivation).
     pub state: Option<String>,
+    /// Richer progress (v42): one of [`STATUSES`], or `None` when the user has never set one (a
+    /// pre-v42 row). Additive beside `state`, which remains what `is_met` — and so `governing` and
+    /// every deadline flag — actually reads; the two setters write both so they cannot contradict.
+    pub status: Option<String>,
+    /// Where an externally-owned milestone came from (`"sheets"`, `"notion"`, …); `None` = PM-native
+    /// (v42). Paired with `external_id` as the durable anchor, the same pattern `event_uid` uses for
+    /// calendar-linked rows.
+    pub source_type: Option<String>,
+    /// The source's own stable row id for an externally-owned milestone; `None` = PM-native (v42).
+    pub external_id: Option<String>,
     pub sort_order: i64,
 }
 
 impl Milestone {
     /// A milestone counts as met only when explicitly marked so; NULL/`"unmet"` are unmet.
+    /// Deliberately still reads `state`, not `status` — v42 added `status` beside it without moving
+    /// any shipped derivation, and the setters keep the pair consistent.
     pub fn is_met(&self) -> bool {
         self.state.as_deref() == Some("met")
+    }
+}
+
+/// The `state` that must accompany a given `status` so the pair can never disagree: `done` is the
+/// only finished value, everything else is explicitly unmet.
+fn state_for_status(status: &str) -> &'static str {
+    if status == STATUS_DONE {
+        "met"
+    } else {
+        "unmet"
+    }
+}
+
+/// Reject a `status` outside [`STATUSES`] before it reaches SQL, so a bad value surfaces as a plain
+/// message instead of a CHECK-constraint failure.
+fn validate_status(status: &str) -> Result<()> {
+    if STATUSES.contains(&status) {
+        Ok(())
+    } else {
+        Err(Error::Other(format!(
+            "unknown milestone status {status:?} (expected one of {})",
+            STATUSES.join(", ")
+        )))
     }
 }
 
@@ -71,6 +121,9 @@ struct Row {
     due_date: Option<String>,
     event_uid: Option<String>,
     state: Option<String>,
+    status: Option<String>,
+    source_type: Option<String>,
+    external_id: Option<String>,
     sort_order: i64,
 }
 
@@ -195,6 +248,9 @@ fn resolve(row: Row, uid_dates: &HashMap<String, String>) -> Milestone {
         calendar_linked,
         event_missing,
         state: row.state,
+        status: row.status,
+        source_type: row.source_type,
+        external_id: row.external_id,
         sort_order: row.sort_order,
     }
 }
@@ -208,10 +264,14 @@ fn load_rows(conn: &Connection, project: Option<&str>) -> Result<Vec<Row>> {
             due_date: r.get(3)?,
             event_uid: r.get(4)?,
             state: r.get(5)?,
-            sort_order: r.get(6)?,
+            status: r.get(6)?,
+            source_type: r.get(7)?,
+            external_id: r.get(8)?,
+            sort_order: r.get(9)?,
         })
     };
-    let sql_cols = "id, project_name, label, due_date, event_uid, state, sort_order";
+    let sql_cols = "id, project_name, label, due_date, event_uid, state, \
+                    status, source_type, external_id, sort_order";
     let rows = match project {
         Some(name) => {
             let mut stmt = conn.prepare(&format!(
@@ -354,15 +414,106 @@ pub fn set_event(
     Ok(())
 }
 
-/// Mark a milestone met or unmet.
+/// Mark a milestone met or unmet (the row's tick-box). Also carries `status` along so the pair
+/// stays consistent: ticking means `done`; un-ticking a `done` milestone reopens it at
+/// `in_progress`, while a milestone that was already unfinished keeps whatever progress value the
+/// user had chosen (un-ticking an already-unticked row must not wipe `almost_done`).
 pub fn set_state(conn: &Connection, id: i64, met: bool) -> Result<()> {
     let state = if met { "met" } else { "unmet" };
     conn.execute(
-        "UPDATE project_milestones SET state = ?2, \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-        params![id, state],
+        "UPDATE project_milestones \
+         SET state  = ?2, \
+             status = CASE \
+                        WHEN ?2 = 'met'      THEN ?3 \
+                        WHEN status = ?3     THEN ?4 \
+                        ELSE status \
+                      END, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE id = ?1",
+        params![id, state, STATUS_DONE, STATUS_REOPENED],
     )?;
     Ok(())
+}
+
+/// Set a milestone's progress `status` (v42), carrying `state` with it so the pair can never
+/// disagree — `done` is met, every other value is unmet. This is the richer counterpart to
+/// `set_state`; both write both columns, which is what lets `is_met` keep reading `state` alone
+/// while the UI shows four levels of progress.
+pub fn set_status(conn: &Connection, id: i64, status: &str) -> Result<()> {
+    validate_status(status)?;
+    conn.execute(
+        "UPDATE project_milestones \
+         SET status = ?2, state = ?3, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE id = ?1",
+        params![id, status, state_for_status(status)],
+    )?;
+    Ok(())
+}
+
+/// Create-or-update the milestone owned by an external source, keyed on its own durable
+/// `(source_type, external_id)` anchor.
+///
+/// **This is the only supported way for an external sync to write milestones, and the reason the
+/// v42 anchor exists.** Flags anchor on `project_milestones.id`, so a sync that cleared its rows
+/// and re-inserted them would mint fresh ids and silently orphan every flag pointing at the old
+/// ones — the failure is invisible until a flag that should have fired doesn't. Upserting keeps the
+/// id stable for the life of the external row; the partial UNIQUE index behind the `ON CONFLICT`
+/// makes the delete-and-recreate alternative fail loudly instead of corrupting the anchor space.
+///
+/// Returns the milestone's stable id — the same value on every later call for that external row.
+///
+/// No caller yet: the first is the Tracked Spreadsheet & Database Sync card this one unblocks. It
+/// ships now, with the columns and the index, because the invariant is only cheap to guarantee
+/// while there is still nothing writing external milestones — the same reason `Source::LocalPath`
+/// is a forward seam in `registry.rs`. Exercised by the tests below.
+#[allow(dead_code)]
+pub fn upsert_external(
+    conn: &Connection,
+    project: &str,
+    source_type: &str,
+    external_id: &str,
+    label: &str,
+    due_date: Option<String>,
+    status: Option<&str>,
+) -> Result<i64> {
+    if let Some(s) = status {
+        validate_status(s)?;
+    }
+    let label = clean(Some(label.to_string())).unwrap_or_else(|| "deadline".to_string());
+    let due_date = clean(due_date);
+    let state = status.map(state_for_status);
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO projects(name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+        params![project],
+    )?;
+    // The `ON CONFLICT` target repeats the partial index's own predicate — SQLite requires the two
+    // to match before it will use a partial index to resolve an upsert.
+    tx.execute(
+        "INSERT INTO project_milestones \
+             (project_name, label, due_date, source_type, external_id, status, state, sort_order) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                 (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM project_milestones WHERE project_name = ?1)) \
+         ON CONFLICT(source_type, external_id) \
+                  WHERE source_type IS NOT NULL AND external_id IS NOT NULL \
+         DO UPDATE SET \
+             project_name = excluded.project_name, \
+             label        = excluded.label, \
+             due_date     = excluded.due_date, \
+             status       = COALESCE(excluded.status, status), \
+             state        = COALESCE(excluded.state,  state), \
+             updated_at   = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        params![project, label, due_date, source_type, external_id, status, state],
+    )?;
+    let id: i64 = tx.query_row(
+        "SELECT id FROM project_milestones WHERE source_type = ?1 AND external_id = ?2",
+        params![source_type, external_id],
+        |r| r.get(0),
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Delete a milestone by id.
@@ -447,6 +598,9 @@ mod tests {
             calendar_linked: false,
             event_missing: false,
             state: Some(if met { "met" } else { "unmet" }.into()),
+            status: Some(if met { "done" } else { "in_progress" }.into()),
+            source_type: None,
+            external_id: None,
             sort_order: id,
         }
     }
@@ -500,5 +654,205 @@ mod tests {
     fn days_until_handles_datetime_and_garbage() {
         assert_eq!(days_until(TODAY, "2026-06-28T09:00:00Z"), Some(0.0));
         assert_eq!(days_until(TODAY, "not-a-date"), None);
+    }
+
+    // --- v42: status / external anchor ------------------------------------------------------
+
+    /// A store with the full migration ladder applied, for the v42 column tests.
+    fn store() -> (tempfile::TempDir, Connection) {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        (dir, conn)
+    }
+
+    fn row(conn: &Connection, id: i64) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT state, status FROM project_milestones WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// The whole point of writing both columns at each setter: no reachable sequence of calls
+    /// leaves `status` saying one thing and `state` (what `is_met`/`governing` read) another.
+    #[test]
+    fn status_and_state_never_contradict() {
+        let (_dir, conn) = store();
+        let id = add(&conn, "P", "pitch", Some("2026-08-01".into()), None).unwrap();
+
+        set_status(&conn, id, "almost_done").unwrap();
+        assert_eq!(
+            row(&conn, id),
+            (Some("unmet".into()), Some("almost_done".into())),
+            "an unfinished status must leave the milestone unmet"
+        );
+
+        set_status(&conn, id, "done").unwrap();
+        assert_eq!(
+            row(&conn, id),
+            (Some("met".into()), Some("done".into())),
+            "done is the one status that marks the milestone met"
+        );
+
+        // Back down from done via the status control.
+        set_status(&conn, id, "in_progress").unwrap();
+        assert_eq!(
+            row(&conn, id),
+            (Some("unmet".into()), Some("in_progress".into()))
+        );
+
+        // ...and via the tick-box, from both directions.
+        set_state(&conn, id, true).unwrap();
+        assert_eq!(
+            row(&conn, id),
+            (Some("met".into()), Some("done".into())),
+            "ticking the box carries status to done"
+        );
+        set_state(&conn, id, false).unwrap();
+        assert_eq!(
+            row(&conn, id),
+            (Some("unmet".into()), Some("in_progress".into())),
+            "un-ticking a done milestone reopens it at in_progress"
+        );
+    }
+
+    /// Un-ticking an already-unfinished milestone must not clobber a deliberate `almost_done`.
+    #[test]
+    fn unticking_an_unfinished_milestone_keeps_its_progress() {
+        let (_dir, conn) = store();
+        let id = add(&conn, "P", "pitch", Some("2026-08-01".into()), None).unwrap();
+        set_status(&conn, id, "almost_done").unwrap();
+        set_state(&conn, id, false).unwrap();
+        assert_eq!(
+            row(&conn, id),
+            (Some("unmet".into()), Some("almost_done".into()))
+        );
+    }
+
+    #[test]
+    fn unknown_status_is_rejected_before_sql() {
+        let (_dir, conn) = store();
+        let id = add(&conn, "P", "pitch", None, None).unwrap();
+        let err = set_status(&conn, id, "nearly").unwrap_err().to_string();
+        assert!(err.contains("nearly"), "message names the bad value: {err}");
+        assert_eq!(
+            row(&conn, id).1,
+            None,
+            "a rejected status leaves the row untouched"
+        );
+    }
+
+    /// The card's load-bearing invariant: re-syncing an external row UPDATES it in place, so the
+    /// milestone id — which is the flag anchor — survives. A regression here orphans flags silently.
+    #[test]
+    fn external_upsert_keeps_the_id_stable_across_resyncs() {
+        let (_dir, conn) = store();
+        let first = upsert_external(
+            &conn,
+            "Atlas",
+            "sheets",
+            "row-7",
+            "pitch",
+            Some("2026-08-01".into()),
+            Some("in_progress"),
+        )
+        .unwrap();
+        let second = upsert_external(
+            &conn,
+            "Atlas",
+            "sheets",
+            "row-7",
+            "pitch (final)",
+            Some("2026-08-09".into()),
+            Some("done"),
+        )
+        .unwrap();
+        assert_eq!(
+            first, second,
+            "the id is the flag anchor and must not be re-minted"
+        );
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM project_milestones WHERE external_id = 'row-7'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "upsert updated in place rather than inserting a second row"
+        );
+
+        let ms = list_for_project(&conn, "Atlas", TODAY).unwrap();
+        let m = ms.iter().find(|m| m.id == first).unwrap();
+        assert_eq!(m.label, "pitch (final)");
+        assert_eq!(m.due_date.as_deref(), Some("2026-08-09"));
+        assert_eq!(m.source_type.as_deref(), Some("sheets"));
+        assert_eq!(m.external_id.as_deref(), Some("row-7"));
+        assert!(
+            m.is_met(),
+            "status=done carried state to met through the upsert"
+        );
+    }
+
+    /// Two different sources may legitimately use the same row id; the anchor is the PAIR.
+    #[test]
+    fn external_anchor_is_scoped_by_source_type() {
+        let (_dir, conn) = store();
+        let a = upsert_external(&conn, "Atlas", "sheets", "1", "a", None, None).unwrap();
+        let b = upsert_external(&conn, "Atlas", "notion", "1", "b", None, None).unwrap();
+        assert_ne!(
+            a, b,
+            "same external_id under a different source is a different milestone"
+        );
+    }
+
+    /// PM-native rows carry NULL for both anchor columns; the index is partial so any number of
+    /// them coexist (a plain UNIQUE index over the pair would still allow this in SQLite, but the
+    /// predicate states the intent — this pins that the many-NULL case really is unconstrained).
+    #[test]
+    fn native_milestones_are_unconstrained_by_the_external_index() {
+        let (_dir, conn) = store();
+        for i in 0..3 {
+            add(
+                &conn,
+                "P",
+                &format!("m{i}"),
+                Some("2026-08-01".into()),
+                None,
+            )
+            .unwrap();
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM project_milestones WHERE project_name = 'P' AND source_type IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    /// The migration stamps `done` on rows already marked met, so no pre-v42 row starts life in the
+    /// contradictory state the setters are built to prevent.
+    #[test]
+    fn migration_backfills_status_for_already_met_milestones() {
+        let (_dir, conn) = store();
+        let id = add(&conn, "P", "pitch", Some("2026-08-01".into()), None).unwrap();
+        // Simulate a pre-v42 row: met, with no status yet.
+        conn.execute(
+            "UPDATE project_milestones SET state = 'met', status = NULL WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE project_milestones SET status = 'done' WHERE state = 'met'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(row(&conn, id), (Some("met".into()), Some("done".into())));
     }
 }

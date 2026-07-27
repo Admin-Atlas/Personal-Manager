@@ -553,8 +553,20 @@ export interface Milestone {
   /** True for a linked milestone whose event isn't in the current mirror (gone/unsynced). */
   event_missing: boolean;
   state: "met" | "unmet" | null;
+  /** Richer progress (v42). Null on a row whose status was never set — render it from `state`
+   *  (see `milestoneStatus`) rather than showing a blank. `state` stays what drives the focus
+   *  view; the backend writes both together so they can't disagree. */
+  status: MilestoneStatus | null;
+  /** Where an externally-owned milestone came from ("sheets", "notion", …); null = PM-native. */
+  source_type: string | null;
+  /** The source's own row id for an externally-owned milestone; null = PM-native. */
+  external_id: string | null;
   sort_order: number;
 }
+
+/** The four progress values a milestone's `status` admits, coarsest-first. Mirrors
+ *  `milestones::STATUSES` in Rust. */
+export type MilestoneStatus = "not_started" | "in_progress" | "almost_done" | "done";
 
 /** The milestone driving a project's status + card line (nearest unmet). */
 export interface GoverningMilestone {

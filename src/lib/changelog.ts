@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.90.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "Milestones can now say how far along they are, not just whether they’re finished. Each one carries Not started, In progress, Almost done or Done, so a pitch you’re halfway through reads as halfway through instead of sitting in the same untouched-looking state as one you haven’t opened yet. The tick-box still works exactly as before for when you just want it off the list — the two stay in step, so ticking a milestone marks it Done and moving it off Done un-ticks it.",
+      "Under-the-hood tidying: milestones gained a durable place to record that they came from somewhere outside PM — a tracked spreadsheet row, say — so that when that connection arrives later, re-syncing updates the milestone you already have rather than quietly replacing it with a new one and losing anything attached to it.",
+    ],
+  },
+  {
     version: "3.89.0-alpha",
     date: "2026-07-26",
     highlights: [

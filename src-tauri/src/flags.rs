@@ -1208,6 +1208,9 @@ mod tests {
             calendar_linked: false,
             event_missing: false,
             state: Some(if met { "met" } else { "unmet" }.into()),
+            status: Some(if met { "done" } else { "in_progress" }.into()),
+            source_type: None,
+            external_id: None,
             sort_order: id,
         }
     }
