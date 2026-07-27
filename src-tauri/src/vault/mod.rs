@@ -1535,4 +1535,105 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn convert_markdown_rekeys_the_chats_folder_and_repoints_both_tables() {
+        // The v3.19.2 photo bug, re-run for chats — and the reason `convert_vault_files` exists at all.
+        // A key migration that walked only the vault root would leave every chat encrypted under the
+        // PREVIOUS key: unreadable by the very app that wrote them, with no error anywhere.
+        //
+        // The second half is a defect this test was written to pin after finding it in the #281 audit.
+        // `chat::record_turn_pair` appends the next turn to whatever `chat_sessions.vault_path` holds.
+        // The rename used to update `documents` alone, so the next message created a SECOND file under
+        // the pre-rename name and split the transcript in two — both stamped with the same
+        // `chat_conversation_id`, which a later Rebuild then fights over on `documents.vault_path`'s
+        // UNIQUE. Both tables have to follow the file.
+        let dir = tempfile::tempdir().unwrap();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), key).unwrap();
+        conn.execute("INSERT INTO conversations(title) VALUES ('A chat')", [])
+            .unwrap();
+        let conv = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type) \
+             VALUES ('chats/chat-01-01-2026-a.md', 'A chat', 'h', 'chat')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope, vault_path) \
+             VALUES (?1, 'general', 'chats/chat-01-01-2026-a.md')",
+            rusqlite::params![conv],
+        )
+        .unwrap();
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("chats")).unwrap();
+        std::fs::write(
+            vault.join("chats").join("chat-01-01-2026-a.md"),
+            "---\nsource_type: chat\n---\n\nhello",
+        )
+        .unwrap();
+
+        let c = enc_cipher();
+        assert_eq!(
+            crate::ingest::convert_markdown(&conn, &vault, &c, &c).unwrap(),
+            1,
+            "the chat is reached at all"
+        );
+
+        // It stayed in `chats/` — a rekey that hoisted it back to the root would collide with the
+        // relocation pass, which refuses to touch a name that exists in both places.
+        let enc = vault.join("chats").join("chat-01-01-2026-a.md.pmenc");
+        assert!(crypto::is_encrypted(&std::fs::read(&enc).unwrap()));
+        assert_eq!(
+            c.read(&enc).unwrap(),
+            "---\nsource_type: chat\n---\n\nhello"
+        );
+        assert!(!vault.join("chats").join("chat-01-01-2026-a.md").exists());
+
+        let doc_path: String = conn
+            .query_row("SELECT vault_path FROM documents", [], |r| r.get(0))
+            .unwrap();
+        let session_path: String = conn
+            .query_row("SELECT vault_path FROM chat_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(doc_path, "chats/chat-01-01-2026-a.md.pmenc");
+        assert_eq!(
+            session_path, "chats/chat-01-01-2026-a.md.pmenc",
+            "the session row follows too, or the next turn splits the transcript"
+        );
+    }
+
+    #[test]
+    fn export_plaintext_frees_the_chats_too_and_keeps_them_foldered() {
+        // "Never locked in" has to include the conversations. A root-only walk would hand the user an
+        // export that LOOKS complete — documents present, no error — with every chat silently missing.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("chats")).unwrap();
+        let c = enc_cipher();
+        c.write_to(&vault.join(c.on_disk_name("a.md")), "# A\nalpha")
+            .unwrap();
+        c.write_to(
+            &vault
+                .join("chats")
+                .join(c.on_disk_name("chat-01-01-2026-a.md")),
+            "# Chat\nhello",
+        )
+        .unwrap();
+
+        let dest = dir.path().join("export");
+        let n = crate::ingest::export_plaintext(&vault, &c, &dest).unwrap();
+        assert_eq!(n, 2, "the document AND the chat");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("chats").join("chat-01-01-2026-a.md")).unwrap(),
+            "# Chat\nhello",
+            "decrypted, still foldered, no .pmenc suffix"
+        );
+        assert!(!dest
+            .join("chats")
+            .join("chat-01-01-2026-a.md.pmenc")
+            .exists());
+    }
 }

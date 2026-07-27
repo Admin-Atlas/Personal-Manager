@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.102.0-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "Your conversations now live in their own folder. Open your vault and you\u2019ll find a chats folder beside your documents instead of hundreds of chat files mixed in among them.",
+      "Existing chats move themselves the next time PM opens \u2014 a plain rename, nothing re-encrypted, nothing re-indexed. If PM is interrupted halfway it picks up where it left off, and if it ever finds two files claiming the same name it leaves both alone and says so rather than guessing.",
+      "There is no project in the path, deliberately: a chat can belong to several projects now, so the folder keeps your chats together and PM keeps track of which projects they belong to.",
+      "Under the hood: rebuilding, changing your passphrase, and exporting to plaintext Markdown all reach the new folder. Turning encryption on used to leave a chat\u2019s next message in a second file \u2014 that\u2019s fixed too.",
+    ],
+  },
+  {
     version: "3.101.0-alpha",
     date: "2026-07-27",
     highlights: [

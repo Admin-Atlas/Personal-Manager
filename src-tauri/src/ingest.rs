@@ -51,12 +51,30 @@ const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic"];
 /// Legacy `.xls` was dropped with the xlrd parser surface (H-1 subset) — only modern `.xlsx` and `.csv`.
 const SPREADSHEET_EXTS: &[&str] = &["xlsx", "csv"];
 
-/// The one subfolder of the Markdown vault: opt-in saved photo originals, content-addressed and
-/// written with the same cipher as the Markdown around them. The vault is otherwise flat, so every
-/// walk that enumerates documents (`rebuild`, [`convert_markdown`], [`export_plaintext`]) is
-/// non-recursive and skips this by construction — which is exactly why the photo half of a key
-/// migration ([`convert_photo_originals`]) and of the plaintext export are separate, explicit steps.
+/// Saved photo originals: opt-in, content-addressed, written with the same cipher as the Markdown
+/// around them. **Byte** files, not Markdown — and because encryption suffixes them (`h.png.pmenc`),
+/// [`is_vault_markdown`] says yes to every one of them. That is precisely why [`MARKDOWN_SUBDIRS`]
+/// is an allow-list rather than a blind recursion: a walk that descended everywhere would hand a
+/// JPEG to the document pipeline. The photo half of a key migration ([`convert_photo_originals`])
+/// and of the plaintext export stay separate, explicit steps for the same reason.
 const PHOTOS_SUBDIR: &str = "photos";
+
+/// Where every chat transcript lives (#281). Chats outnumber documents in an active store and read
+/// as noise beside them, so they get one folder of their own — flat, with no project in the path.
+///
+/// **No project in the path is the load-bearing part.** A document belongs to many projects (#577),
+/// so "which folder" would have no answer; and filing by project would mean renaming files inside
+/// `merge_projects` / `delete_project` / a project rename — file moves in the riskiest phase of an
+/// entity transaction, to buy nothing the DB does not already answer. Membership lives in the DB;
+/// the vault just keeps chats together.
+pub(crate) const CHATS_SUBDIR: &str = "chats";
+
+/// The subfolders of the Markdown vault that hold **indexable Markdown**, and the reason every walk
+/// in this module can be recursive without becoming dangerous. An allow-list, deliberately: see
+/// [`PHOTOS_SUBDIR`] for what a blind recursion would swallow. Adding a folder here opts it into the
+/// rebuild sweep, the key migration and the plaintext export in one move — which is the point, since
+/// those three are exactly the walks that silently strand files when they disagree.
+const MARKDOWN_SUBDIRS: &[&str] = &[CHATS_SUBDIR];
 
 /// Per-run ingest options threaded from the command. `copy_photos_to_vault` is the drag-drop opt-in
 /// to save an original image into `vault/photos/` (default off).
@@ -1540,25 +1558,17 @@ pub fn rebuild(
     // (`.md.pmenc`) files; the cipher decides per file how to read them (read-by-magic). An
     // unreadable dir entry no longer just disappears: it makes the picture PARTIAL, which withholds the
     // final sweep (see [`may_reap`]) — "we never saw it" must never be mistaken for "the user deleted it".
-    let mut complete = true;
-    let mut files: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(&vault)? {
-        match entry {
-            Ok(e) => {
-                let path = e.path();
-                if is_vault_markdown(&path) {
-                    files.push(path);
-                }
-            }
-            Err(_) => complete = false,
-        }
-    }
+    let (files, complete) = walk_vault_markdown(&vault)?;
     on_event.send(IngestEvent::Counted {
         total: files.len() + extra_total,
     });
     let (mut ingested, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-    for path in files {
-        let name = file_name(&path);
+    for file in files {
+        let VaultFile { rel: name, path } = file;
+        // `name` is the vault-ROOT-relative path (`chats/chat-….md` for a chat), which is exactly what
+        // `documents.vault_path` stores — so the resume stamp below and the sweep further down agree
+        // with the row they are keying on. A bare file name would silently rebuild every chat from
+        // scratch on every resumed pass.
         // The resume check, taken BEFORE any read/split/embed — this is where an interrupted run's saved
         // work is actually banked, so it must gate the expensive part, not merely the write.
         let already = {
@@ -1572,7 +1582,7 @@ pub fn rebuild(
         // a nameless row. Every other ingest path announces then completes; this one must too.
         on_event.send(IngestEvent::Started {
             path: path.to_string_lossy().into(),
-            name,
+            name: name.clone(),
         });
         if already {
             skipped += 1;
@@ -1589,7 +1599,7 @@ pub fn rebuild(
         let outcome = if is_chat_vault_file(&cipher, &path) {
             rebuild_chat(&state, &cipher, &path, pass)
         } else {
-            rebuild_one(&state, &gateway, &cipher, &path, pass).map(Some)
+            rebuild_one(&state, &gateway, &cipher, &path, &name, pass).map(Some)
         };
         match outcome {
             Ok(Some(document)) => {
@@ -1699,6 +1709,10 @@ fn rebuild_one(
     gateway: &ModelGateway<'_>,
     cipher: &MarkdownCipher,
     vault_file: &Path,
+    // The file's path relative to the vault root, `/`-separated — what `documents.vault_path`
+    // stores. Passed in rather than re-derived from `vault_file`, so a `.md` that is not a chat but
+    // sits in a Markdown subfolder is filed under the path the sweep will look for it at.
+    vault_rel: &str,
     pass: &str,
 ) -> Result<Document> {
     let raw = cipher.read(vault_file)?;
@@ -1752,7 +1766,7 @@ fn rebuild_one(
         .unwrap_or_else(|| "Unsorted".into());
     let meta = DocMeta {
         source_path: fields.get("source_path").cloned(),
-        vault_path: file_name(vault_file),
+        vault_path: vault_rel.to_string(),
         title,
         content_hash,
         ext: fields.get("ext").cloned(),
@@ -3676,6 +3690,86 @@ pub(crate) fn is_supported_source(path: &Path) -> bool {
     }
 }
 
+/// One Markdown file in the vault: the `/`-separated path **relative to the vault root** — the exact
+/// value `documents.vault_path` stores — plus the absolute path to read it at.
+pub(crate) struct VaultFile {
+    pub rel: String,
+    pub path: PathBuf,
+}
+
+/// Every Markdown file in the vault, and whether the walk **provably saw all of them**.
+///
+/// The one enumeration of the vault, shared by the three walks that must never disagree about what
+/// the vault contains: the rebuild sweep, the key migration ([`convert_markdown`]) and the plaintext
+/// export ([`export_plaintext`]). They used to each `read_dir` the root separately and
+/// non-recursively, which was correct only while the vault was flat — the moment chats moved into
+/// [`CHATS_SUBDIR`] the same three would have failed in three different ways: the sweep would see
+/// every chat as deleted and **reap the lot**, the migration would strand them under the old key,
+/// and the export would quietly omit them. One walk makes that class unrepresentable.
+///
+/// Recursion is an explicit allow-list ([`MARKDOWN_SUBDIRS`]), never "descend everywhere" — see
+/// [`PHOTOS_SUBDIR`].
+///
+/// The completeness flag is the sweep's data-loss guard ([`may_reap`]) and is **conservative in one
+/// direction only**: any dir entry that fails to read makes it `false`, because "we never saw it"
+/// must never be read as "the user deleted it". A missing subfolder is not incompleteness — a vault
+/// with no chats yet simply has no `chats/`.
+pub(crate) fn walk_vault_markdown(vault: &Path) -> Result<(Vec<VaultFile>, bool)> {
+    let mut files = Vec::new();
+    let mut complete = true;
+    // The root's own failure propagates: an unreadable vault root is not a partial picture, it is a
+    // broken vault, and every caller wants to hear about that rather than act on nothing.
+    collect_markdown_dir(vault, None, &mut files, &mut complete)?;
+    for sub in MARKDOWN_SUBDIRS {
+        let dir = vault.join(sub);
+        if !dir.is_dir() {
+            continue;
+        }
+        // A subfolder that exists but won't open is exactly the "couldn't tell" case: withhold the
+        // sweep rather than propagate, so a locked folder costs one deferred reap, never a deletion.
+        if collect_markdown_dir(&dir, Some(sub), &mut files, &mut complete).is_err() {
+            complete = false;
+        }
+    }
+    Ok((files, complete))
+}
+
+/// One directory's Markdown files, appended to `out` with `prefix` (if any) joined by `/`. An
+/// unreadable entry clears `complete` instead of failing the walk.
+fn collect_markdown_dir(
+    dir: &Path,
+    prefix: Option<&str>,
+    out: &mut Vec<VaultFile>,
+    complete: &mut bool,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else {
+            *complete = false;
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_file() || !is_vault_markdown(&path) {
+            continue;
+        }
+        let name = file_name(&path);
+        let rel = match prefix {
+            Some(p) => format!("{p}/{name}"),
+            None => name,
+        };
+        out.push(VaultFile { rel, path });
+    }
+    Ok(())
+}
+
+/// Swap the file name in a `/`-separated relative vault path, keeping its folder. `chats/a.md` +
+/// `a.md.pmenc` -> `chats/a.md.pmenc`; a root file just becomes the new name.
+fn rel_with_name(rel: &str, name: &str) -> String {
+    match rel.rfind('/') {
+        Some(i) => format!("{}/{name}", &rel[..i]),
+        None => name.to_string(),
+    }
+}
+
 /// Bring every Markdown file in `dir` into `write_with`'s policy, in place: decode each
 /// file with `read_with` (read-by-magic, so it handles plaintext or the prior key),
 /// re-encode with `write_with`, rename to the target on-disk name (`.md` <-> `.md.pmenc`),
@@ -3686,6 +3780,16 @@ pub(crate) fn is_supported_source(path: &Path) -> bool {
 /// For a plaintext -> encrypted conversion the two ciphers can be the same (decoding
 /// plaintext needs no key). This is the Markdown half of a sharing/key migration; the
 /// caller owns the DB transaction.
+///
+/// Walks the whole allow-listed tree ([`walk_vault_markdown`]), so chats under [`CHATS_SUBDIR`]
+/// are re-keyed with everything else rather than stranded under the previous key.
+///
+/// A renamed file re-points **both** tables that name it. `chat_sessions.vault_path` is not
+/// bookkeeping: `chat::record_turn_pair` appends the next turn to whatever path that column holds,
+/// so leaving it on the pre-rename name made the next message create a SECOND file under the old
+/// name and split the transcript in two — both stamped with the same `chat_conversation_id`, which
+/// a later Rebuild then fights over on `documents.vault_path`'s UNIQUE. Found auditing #281; the
+/// same statement pair fixes it.
 pub(crate) fn convert_markdown(
     conn: &Connection,
     dir: &Path,
@@ -3693,14 +3797,11 @@ pub(crate) fn convert_markdown(
     write_with: &MarkdownCipher,
 ) -> Result<usize> {
     let mut changed = 0usize;
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if !path.is_file() || !is_vault_markdown(&path) {
-            continue;
-        }
-        let old_name = file_name(&path);
+    let (files, _complete) = walk_vault_markdown(dir)?;
+    for file in files {
+        let old_name = file_name(&file.path);
         let new_name = write_with.on_disk_name(&MarkdownCipher::logical_name(&old_name));
-        let raw = std::fs::read(&path)?;
+        let raw = std::fs::read(&file.path)?;
         // Already in the exact target form? Nothing to do (idempotent). "Exact" means the
         // same name, the same encryption state, AND the same key — a passphrase change
         // keeps the name but moves the subkey, so those files must still be re-encoded.
@@ -3710,13 +3811,22 @@ pub(crate) fn convert_markdown(
         {
             continue;
         }
-        let content = read_with.decode(&raw, &path)?;
-        write_with.write_to(&dir.join(&new_name), &content)?;
+        let content = read_with.decode(&raw, &file.path)?;
+        // Write beside the original, never back at the vault root — a chat must stay in `chats/`.
+        // The AAD binds the file NAME only (`MarkdownCipher::aad_stem`), so which folder a file
+        // sits in never enters the ciphertext.
+        let parent = file.path.parent().unwrap_or(dir);
+        write_with.write_to(&parent.join(&new_name), &content)?;
         if new_name != old_name {
-            std::fs::remove_file(&path)?;
+            std::fs::remove_file(&file.path)?;
+            let new_rel = rel_with_name(&file.rel, &new_name);
             conn.execute(
                 "UPDATE documents SET vault_path = ?1 WHERE vault_path = ?2",
-                params![new_name, old_name],
+                params![new_rel, file.rel],
+            )?;
+            conn.execute(
+                "UPDATE chat_sessions SET vault_path = ?1 WHERE vault_path = ?2",
+                params![new_rel, file.rel],
             )?;
         }
         changed += 1;
@@ -3801,6 +3911,11 @@ pub(crate) fn convert_photo_originals(
 /// encrypted files with `cipher` and dropping the `.pmenc` suffix. Returns the count
 /// written. The core of the "never locked in" escape hatch — kept here (next to the
 /// rebuild walk it mirrors) so it is unit-testable without a running app.
+///
+/// The vault's folder structure is reproduced, so chats come out under `chats/` rather than
+/// avalanching into one directory beside the documents. An escape hatch that silently dropped
+/// every chat — which is what a root-only walk would now do — would be worse than no hatch:
+/// it looks complete.
 pub(crate) fn export_plaintext(
     vault: &Path,
     cipher: &MarkdownCipher,
@@ -3808,15 +3923,19 @@ pub(crate) fn export_plaintext(
 ) -> Result<usize> {
     std::fs::create_dir_all(dest)?;
     let mut written = 0usize;
-    for entry in std::fs::read_dir(vault)? {
-        let path = entry?.path();
-        if !path.is_file() || !is_vault_markdown(&path) {
-            continue;
+    let (files, _complete) = walk_vault_markdown(vault)?;
+    for file in files {
+        // Decrypt-if-needed, then write under the logical `.md` name (no `.pmenc`), in the same
+        // relative folder it came from.
+        let content = cipher.read(&file.path)?;
+        let out = dest.join(rel_with_name(
+            &file.rel,
+            &MarkdownCipher::logical_name(&file_name(&file.path)),
+        ));
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        // Decrypt-if-needed, then write under the logical `.md` name (no `.pmenc`).
-        let content = cipher.read(&path)?;
-        let out_name = MarkdownCipher::logical_name(&file_name(&path));
-        std::fs::write(dest.join(out_name), content)?;
+        std::fs::write(out, content)?;
         written += 1;
     }
     // The saved photo originals live one level down and are encrypted with the same subkey, so the
@@ -4479,30 +4598,98 @@ mod tests {
 
     #[test]
     fn rebuild_sweep_collects_a_chat_vault_file() {
-        // Guards the sweep ROOT + predicate together: the exact `read_dir(&vault).filter(is_vault_markdown)`
-        // expression rebuild uses must pick up chat files sitting in the flat vault dir, plaintext and
-        // encrypted alike. If someone re-scopes rebuild to a documents subdir, this fails.
+        // THE #281 data-loss guard. `rebuild`'s walk feeds two things: the list it re-embeds, and — via
+        // `plan_reap` — the set of documents it considers still to exist. A walk that missed `chats/`
+        // would not merely skip those files: it would see every chat as deleted and reap the lot on the
+        // next complete pass. So assert the chats are FOUND, plaintext and encrypted alike, and that
+        // each comes back under the `chats/…` relative path `documents.vault_path` stores — a bare name
+        // here would resume-skip and reap by the wrong key.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join(CHATS_SUBDIR)).unwrap();
+        std::fs::write(vault.join("report-01-07-2026-ff00.md"), "doc").unwrap();
+        std::fs::write(
+            vault
+                .join(CHATS_SUBDIR)
+                .join("chat-28-06-2026-abc123def456.md"),
+            "chat",
+        )
+        .unwrap();
+        std::fs::write(
+            vault
+                .join(CHATS_SUBDIR)
+                .join("chat-28-06-2026-def456abc123.md.pmenc"),
+            b"enc",
+        )
+        .unwrap();
+        std::fs::write(vault.join("scratch.tmp"), "ignore").unwrap();
+
+        let (files, complete) = walk_vault_markdown(&vault).unwrap();
+        let collected: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+
+        assert!(complete, "nothing unreadable ⇒ the sweep may run");
+        assert!(collected.contains(&"report-01-07-2026-ff00.md".to_string()));
+        assert!(collected.contains(&"chats/chat-28-06-2026-abc123def456.md".to_string()));
+        assert!(collected.contains(&"chats/chat-28-06-2026-def456abc123.md.pmenc".to_string()));
+        assert!(!collected.iter().any(|n| n.ends_with(".tmp")));
+        assert_eq!(collected.len(), 3, "two chats + one document, not the .tmp");
+    }
+
+    #[test]
+    fn vault_walk_never_descends_into_the_photo_originals() {
+        // The trap that makes `MARKDOWN_SUBDIRS` an allow-list rather than a blind recursion: encryption
+        // suffixes a saved photo original `h.png.pmenc`, and `is_vault_markdown` says yes to ANY `.pmenc`.
+        // A walk that descended everywhere would hand a JPEG to the document pipeline on every Rebuild,
+        // re-encode it as Markdown on every key change, and emit it as a `.png` full of ciphertext from
+        // the plaintext export.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join(PHOTOS_SUBDIR)).unwrap();
+        std::fs::create_dir_all(vault.join(CHATS_SUBDIR)).unwrap();
+        std::fs::write(vault.join(PHOTOS_SUBDIR).join("abc123.png.pmenc"), b"jpeg").unwrap();
+        std::fs::write(
+            vault.join(CHATS_SUBDIR).join("chat-01-01-2026-a.md"),
+            "chat",
+        )
+        .unwrap();
+
+        let (files, _) = walk_vault_markdown(&vault).unwrap();
+        let collected: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+        assert_eq!(collected, vec!["chats/chat-01-01-2026-a.md".to_string()]);
+        // Guard the predicate itself, so the next person sees WHY the allow-list is load-bearing rather
+        // than assuming the walk is safe because photos "obviously" aren't Markdown.
+        assert!(
+            is_vault_markdown(Path::new("abc123.png.pmenc")),
+            "the predicate really does accept a photo original — the allow-list is the only defence"
+        );
+    }
+
+    #[test]
+    fn vault_walk_is_complete_when_the_chats_folder_does_not_exist_yet() {
+        // A vault with no chats yet has no `chats/`. That is ABSENCE, not incompleteness — reading it as
+        // a partial walk would withhold the straggler sweep on every rebuild of every new store, so a
+        // document the user deleted could never be reaped.
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
         std::fs::write(vault.join("report-01-07-2026-ff00.md"), "doc").unwrap();
-        std::fs::write(vault.join("chat-28-06-2026-abc123def456.md"), "chat").unwrap();
-        std::fs::write(vault.join("chat-28-06-2026-def456abc123.md.pmenc"), b"enc").unwrap();
-        std::fs::write(vault.join("scratch.tmp"), "ignore").unwrap();
 
-        let collected: Vec<String> = std::fs::read_dir(&vault)
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|path| is_vault_markdown(path))
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let (files, complete) = walk_vault_markdown(&vault).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(complete, "a missing subfolder is not an unreadable one");
+        assert!(may_reap(complete));
+    }
 
-        assert!(collected
-            .iter()
-            .any(|n| n.starts_with("chat-") && n.ends_with(".md")));
-        assert!(collected.iter().any(|n| n.ends_with(".md.pmenc")));
-        assert!(!collected.iter().any(|n| n.ends_with(".tmp")));
-        assert_eq!(collected.len(), 3, "two chats + one document, not the .tmp");
+    #[test]
+    fn rel_with_name_keeps_the_folder() {
+        // The one string operation behind both the key migration's rename and the plaintext export's
+        // output path. Getting it wrong sends a re-keyed chat back to the vault root — where the next
+        // open's relocation pass would find a file already at the destination and refuse to touch either.
+        assert_eq!(
+            rel_with_name("chats/a.md", "a.md.pmenc"),
+            "chats/a.md.pmenc"
+        );
+        assert_eq!(rel_with_name("a.md", "a.md.pmenc"), "a.md.pmenc");
     }
 
     #[test]

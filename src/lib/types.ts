@@ -1383,6 +1383,8 @@ export interface ChatIdentityHeal {
   rows_restored: number;
   reindex_queued: number;
   relinked: number;
+  /** Chat files moved out of the vault root into `chats/` (#281). */
+  relocated: number;
   unrepaired: string[];
 }
 
