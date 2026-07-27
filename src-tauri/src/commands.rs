@@ -3543,12 +3543,39 @@ pub async fn set_document_metadata(
 
 // --- canonical-entity management (the Teach-tab backend; §1.3) ---
 
+/// What a mirror mutation did to the filesystem: files it REWROTE (snapshotted so a failed commit
+/// can put them back), and files it wants UNLINKED — but only once the commit is durable.
+///
+/// The two halves are deliberately asymmetric, and it is the same asymmetry `chat.rs` reasons
+/// about: a rewrite can be undone from its snapshot, so it happens before the commit and is
+/// restored on failure; a delete cannot be undone, so it waits until the DB is committed. Ordering
+/// it the other way round would let a failed commit leave the database pointing at truth that no
+/// longer exists on disk. A leftover file is harmless and self-healing; a dangling row is not.
+#[derive(Default)]
+struct MutationFiles {
+    written: Vec<(std::path::PathBuf, Vec<u8>)>,
+    unlink: Vec<std::path::PathBuf>,
+}
+
+impl From<Vec<(std::path::PathBuf, Vec<u8>)>> for MutationFiles {
+    /// The common case — a mutation that only rewrites. Lets every existing caller keep returning
+    /// a plain snapshot list.
+    fn from(written: Vec<(std::path::PathBuf, Vec<u8>)>) -> Self {
+        MutationFiles {
+            written,
+            unlink: Vec::new(),
+        }
+    }
+}
+
 /// Run a mirror mutation in a transaction, persist the encrypted rules file from the resulting
 /// mirror (file-first, so a rule is as durable as the commit), then commit — restoring any
-/// rewritten vault files + the rules file if the commit fails. The closure returns the vault-file
-/// snapshots it produced, for rollback. Off-runtime (file IO), like the review commands. This is
-/// the single write path the Teach tab (PR 2) drives, identical to the inline review correction.
-async fn spawn_entity_mutation<F>(app: AppHandle, work: F) -> Result<()>
+/// rewritten vault files + the rules file if the commit fails, and unlinking any files the mutation
+/// asked to delete only once that commit succeeded. Off-runtime (file IO), like the review
+/// commands. This is the single write path the Teach tab drives, identical to the inline review
+/// correction — and now also the path project deletion (#573) rides, so the rules file, the
+/// rollback and the delete-after-commit rule all stay defined in exactly one place.
+async fn spawn_entity_mutation<F, R>(app: AppHandle, work: F) -> Result<()>
 where
     F: FnOnce(
             &Connection,
@@ -3556,9 +3583,10 @@ where
             &vault::MarkdownCipher,
             &std::path::Path,
             &index_only::ManifestCipher,
-        ) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>>
+        ) -> Result<R>
         + Send
         + 'static,
+    R: Into<MutationFiles>,
 {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let state = app.state::<AppState>();
@@ -3568,8 +3596,8 @@ where
         let mut conn = state.conn()?;
         let tx = conn.transaction()?;
 
-        let written = match work(&tx, &vault, &cipher, &vault_root, &manifest_cipher) {
-            Ok(w) => w,
+        let files: MutationFiles = match work(&tx, &vault, &cipher, &vault_root, &manifest_cipher) {
+            Ok(w) => w.into(),
             Err(e) => {
                 drop(tx);
                 return Err(e);
@@ -3583,14 +3611,19 @@ where
             Ok(prior) => prior,
             Err(e) => {
                 drop(tx);
-                ingest::restore_vault_files(written);
+                ingest::restore_vault_files(files.written);
                 return Err(e);
             }
         };
         if let Err(e) = tx.commit() {
             entities::restore_rules_file(&vault_root, &prior_rules);
-            ingest::restore_vault_files(written);
+            ingest::restore_vault_files(files.written);
             return Err(e.into());
+        }
+        // Committed: the deletions are now safe to make real. Best-effort by contract — see the
+        // `MutationFiles` note; a file that outlives its row is reclaimed by the next Rebuild.
+        for path in files.unlink {
+            let _ = std::fs::remove_file(&path);
         }
         Ok(())
     })
@@ -3612,16 +3645,55 @@ fn rewrite_entity_documents(
     entity_id: i64,
     canonical: &str,
 ) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
-    let mut stmt = tx.prepare(
-        "SELECT id, tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
-         FROM documents WHERE entity_id = ?1",
-    )?;
-    let rows: Vec<(i64, String, Option<String>, i64, String)> = stmt
-        .query_map(params![entity_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?
+    let mut stmt = tx.prepare("SELECT id FROM documents WHERE entity_id = ?1")?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![entity_id], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     drop(stmt);
+    rewrite_documents(
+        tx,
+        vault,
+        cipher,
+        vault_root,
+        manifest_cipher,
+        &ids,
+        canonical,
+    )
+}
+
+/// The id-scoped half of [`rewrite_entity_documents`]: rewrite exactly these documents' frontmatter
+/// + `project` cache to `canonical`, preserving tags/importance/reviewed/last_activity.
+///
+/// Split out for project deletion (#573), which re-homes only the documents it moved. Rewriting by
+/// entity there would touch every document already sitting in Unsorted — correct but pointlessly
+/// rewriting (and re-encrypting) a potentially large inbox to the name it already carries.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_documents(
+    tx: &Connection,
+    vault: &std::path::Path,
+    cipher: &vault::MarkdownCipher,
+    vault_root: &std::path::Path,
+    manifest_cipher: &index_only::ManifestCipher,
+    ids: &[i64],
+    canonical: &str,
+) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+    let mut rows: Vec<(i64, String, Option<String>, i64, String)> = Vec::with_capacity(ids.len());
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
+             FROM documents WHERE id = ?1",
+        )?;
+        for id in ids {
+            let row = stmt
+                .query_row(params![id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .optional()?;
+            if let Some(row) = row {
+                rows.push(row);
+            }
+        }
+    }
 
     let mut written = Vec::new();
     for (doc_id, tags_json, importance, reviewed, last_activity) in rows {
@@ -3766,6 +3838,36 @@ fn resolve_merge_pair(conn: &Connection, from: &str, into: &str) -> Result<(i64,
     Ok((from_id, into_id, into_canonical))
 }
 
+/// What a project holds, counted from the rows an operation will actually touch: documents by
+/// `entity_id`, milestones and chats by project *name*. Shared by the merge and delete previews so
+/// the two can never quote different numbers for the same project.
+///
+/// `files` EXCLUDES chat documents — a chat is a `documents` row too, so a raw count would report
+/// every chat twice in the one sentence a user reads before an irreversible action.
+fn project_content_counts(
+    conn: &Connection,
+    entity_id: i64,
+    canonical: &str,
+) -> Result<(i64, i64, i64)> {
+    let files: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents \
+         WHERE entity_id = ?1 AND COALESCE(source_type,'') <> 'chat'",
+        params![entity_id],
+        |r| r.get(0),
+    )?;
+    let chats: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM conversations WHERE project = ?1",
+        params![canonical],
+        |r| r.get(0),
+    )?;
+    let milestones: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM project_milestones WHERE project_name = ?1",
+        params![canonical],
+        |r| r.get(0),
+    )?;
+    Ok((files, chats, milestones))
+}
+
 /// Count what merging `from` into `into` would move. Read-only; safe to call on every keystroke
 /// of the target picker.
 #[tauri::command]
@@ -3777,23 +3879,7 @@ pub fn merge_project_preview(
     let conn = state.conn()?;
     let (from_id, _, into_canonical) = resolve_merge_pair(&conn, &from, &into)?;
     let from_canonical = entities::canonical_name(&conn, from_id)?;
-
-    let files: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM documents \
-         WHERE entity_id = ?1 AND COALESCE(source_type,'') <> 'chat'",
-        params![from_id],
-        |r| r.get(0),
-    )?;
-    let milestones: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM project_milestones WHERE project_name = ?1",
-        params![from_canonical],
-        |r| r.get(0),
-    )?;
-    let chats: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM conversations WHERE project = ?1",
-        params![from_canonical],
-        |r| r.get(0),
-    )?;
+    let (files, chats, milestones) = project_content_counts(&conn, from_id, &from_canonical)?;
     Ok(MergePreview {
         files,
         milestones,
@@ -3838,6 +3924,267 @@ pub async fn merge_projects(app: AppHandle, from: String, into: String) -> Resul
                 into_id,
                 &canonical,
             )
+        },
+    )
+    .await
+}
+
+// --- deleting a project (#573) --------------------------------------------------------------
+//
+// Deliberately built on the merge machinery rather than beside it: a delete IS a disposal of a
+// project's contents, and a merge is the special case where every disposition points at one target.
+// `resolve_*`, `project_content_counts`, `rename_project_satellites`, `rewrite_documents` and
+// `spawn_entity_mutation` are all shared, so the FK ordering, the rules-file durability and the
+// delete-after-commit rule are each defined exactly once.
+
+/// The always-present inbox. Documents re-homed by a delete land here, and it can never itself be
+/// the project being deleted.
+const UNSORTED: &str = "Unsorted";
+
+/// Where a deleted project's non-chat documents go.
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDisposition {
+    /// Re-file to `Unsorted`, keeping the files and their index.
+    Unsorted,
+    /// Destroy them: index rows AND the vault Markdown. For an index-only (cloud) document there is
+    /// no vault file and the remote is never touched — only PM's pointer + manifest entry go.
+    Delete,
+}
+
+/// Where a deleted project's chats go.
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatDisposition {
+    /// Un-scope them: the conversation survives as a general chat.
+    Global,
+    /// Destroy them, through the same cascade the per-chat delete uses.
+    Delete,
+}
+
+/// What happens to the project's NAME once its contents are dealt with.
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameDisposition {
+    /// The entity and all its aliases die, so the name is free to use again — a future document
+    /// naming it mints a fresh project. Matches what removing an alias chip in Teach does.
+    Free,
+    /// The name lives on as an alias of `Unsorted`, so anything later referring to it files to the
+    /// inbox instead of silently recreating the project. This is literally "merge into Unsorted".
+    Unsorted,
+}
+
+/// What deleting `project` would affect. Same counts as the merge preview (one shared query), plus
+/// the canonical name the user must type to confirm.
+#[derive(serde::Serialize)]
+pub struct DeletePreview {
+    pub files: i64,
+    pub chats: i64,
+    pub milestones: i64,
+    pub canonical: String,
+}
+
+/// Resolve a project that is allowed to be deleted, applying the guards up front so an impossible
+/// delete fails before the confirmation ceremony rather than during it.
+fn resolve_deletable_project(conn: &Connection, project: &str) -> Result<(i64, String)> {
+    let project = project.trim();
+    if project.is_empty() {
+        return Err(Error::Other("no project named".into()));
+    }
+    let id = entities::resolve_project(conn, project, false)?
+        .ok_or_else(|| Error::Other(format!("no project named \"{project}\"")))?;
+    // Same reasoning as the merge guard: Unsorted is the inbox every unfiled document lands in.
+    // Deleting it would destroy or strand the entire unreviewed queue.
+    if entities::resolve_project(conn, UNSORTED, false)? == Some(id) {
+        return Err(Error::Other(
+            "Unsorted is PM's inbox and can't be deleted".into(),
+        ));
+    }
+    Ok((id, entities::canonical_name(conn, id)?))
+}
+
+/// Count what deleting `project` would affect. Read-only.
+#[tauri::command]
+pub fn delete_project_preview(
+    state: State<'_, AppState>,
+    project: String,
+) -> Result<DeletePreview> {
+    let conn = state.conn()?;
+    let (id, canonical) = resolve_deletable_project(&conn, &project)?;
+    let (files, chats, milestones) = project_content_counts(&conn, id, &canonical)?;
+    Ok(DeletePreview {
+        files,
+        chats,
+        milestones,
+        canonical,
+    })
+}
+
+/// Delete a project, disposing of its contents as the user chose (#573).
+///
+/// **Milestones are always destroyed** — there is nowhere sensible to move a dated milestone whose
+/// project no longer exists, so the UI warns instead of offering a choice.
+///
+/// Ordering is load-bearing throughout, and each step exists because of a specific way this goes
+/// wrong; see the inline notes. The whole thing runs inside `spawn_entity_mutation`, which is not
+/// optional: `reconcile_on_open` rebuilds the entity mirror from `entities.pmrules` whenever the two
+/// disagree, so a delete that skipped the rules-file write would be **resurrected at the next
+/// launch**.
+#[tauri::command]
+pub async fn delete_project(
+    app: AppHandle,
+    project: String,
+    files: FileDisposition,
+    chats: ChatDisposition,
+    name: NameDisposition,
+) -> Result<()> {
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        resolve_deletable_project(&conn, &project)?;
+    }
+    spawn_entity_mutation(
+        app,
+        move |tx, vault, cipher, vault_root, manifest_cipher| {
+            let (entity_id, canonical) = resolve_deletable_project(tx, &project)?;
+            let unsorted_id = entities::resolve_project(tx, UNSORTED, true)?
+                .ok_or_else(|| Error::Other("could not resolve the Unsorted inbox".into()))?;
+            let mut out = MutationFiles::default();
+            // Documents that survive and move; rewritten to their new name after the moves, so the
+            // vault frontmatter and the DB never disagree about where a file is filed.
+            let mut moved: Vec<i64> = Vec::new();
+
+            // --- 1. CHATS ------------------------------------------------------------------
+            let conv_ids: Vec<i64> = {
+                let mut stmt = tx.prepare("SELECT id FROM conversations WHERE project = ?1")?;
+                let ids = stmt
+                    .query_map(params![canonical], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                ids
+            };
+            match chats {
+                ChatDisposition::Delete => {
+                    for id in conv_ids {
+                        // The same cascade the per-chat delete uses, minus its transaction.
+                        if let Some(rel) = chat::delete_conversation_rows(tx, id)? {
+                            out.unlink.push(vault.join(rel));
+                        }
+                    }
+                }
+                ChatDisposition::Global => {
+                    // A general chat is one with no project (`chat.rs` derives scope from exactly
+                    // this), so un-scoping is the whole move.
+                    tx.execute(
+                        "UPDATE conversations SET project = NULL WHERE project = ?1",
+                        params![canonical],
+                    )?;
+                    // A chat is also a `documents` row; it follows its conversation to the inbox.
+                    let mut stmt = tx.prepare(
+                        "SELECT id FROM documents WHERE entity_id = ?1 AND source_type = 'chat'",
+                    )?;
+                    let ids: Vec<i64> = stmt
+                        .query_map(params![entity_id], |r| r.get(0))?
+                        .collect::<std::result::Result<_, _>>()?;
+                    drop(stmt);
+                    for id in &ids {
+                        tx.execute(
+                            "UPDATE documents SET entity_id = ?2, project = ?3 WHERE id = ?1",
+                            params![id, unsorted_id, UNSORTED],
+                        )?;
+                    }
+                    moved.extend(ids);
+                }
+            }
+
+            // --- 2. FILES (everything that isn't a chat) -----------------------------------
+            type FileRow = (i64, Option<String>, Option<String>, Option<String>);
+            let file_rows: Vec<FileRow> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, vault_path, source_type, source_id FROM documents \
+                     WHERE entity_id = ?1 AND COALESCE(source_type,'') <> 'chat'",
+                )?;
+                let rows = stmt
+                    .query_map(params![entity_id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?
+                    .collect::<std::result::Result<Vec<FileRow>, _>>()?;
+                rows
+            };
+            match files {
+                FileDisposition::Unsorted => {
+                    for (id, _, _, _) in &file_rows {
+                        tx.execute(
+                            "UPDATE documents SET entity_id = ?2, project = ?3 WHERE id = ?1",
+                            params![id, unsorted_id, UNSORTED],
+                        )?;
+                        moved.push(*id);
+                    }
+                }
+                FileDisposition::Delete => {
+                    for (id, vault_path, source_type, source_id) in &file_rows {
+                        // An index-only document is a POINTER at someone else's file. Deleting it
+                        // must remove PM's row + its manifest entry and nothing else — PM never
+                        // deletes from Drive/OneDrive, and there is no vault file to unlink.
+                        let index_only = source_type.as_deref().is_some_and(|s| s != "vault");
+                        if index_only {
+                            if let Some(sid) = source_id.as_deref().filter(|s| !s.is_empty()) {
+                                index_only::forget_source(vault_root, manifest_cipher, sid)?;
+                            }
+                        } else if let Some(rel) =
+                            vault_path.as_deref().filter(|p| !p.trim().is_empty())
+                        {
+                            out.unlink.push(vault.join(rel));
+                        }
+                        ingest::delete_document(tx, *id)?;
+                    }
+                }
+            }
+
+            // --- 3. Re-home the survivors' vault truth -------------------------------------
+            out.written = rewrite_documents(
+                tx,
+                vault,
+                cipher,
+                vault_root,
+                manifest_cipher,
+                &moved,
+                UNSORTED,
+            )?;
+
+            // --- 4. Satellites: milestones (+ their flags), activity, pinboard, triage row --
+            projects::delete_project_satellites(tx, &canonical)?;
+
+            // --- 5. Project-scoped preferences ---------------------------------------------
+            // `preferences.entity_id` REFERENCES entities(id) ON DELETE CASCADE, and those records
+            // live ONLY in the database — no vault copy, nothing to re-derive them from. Dropping
+            // the entity below would silently destroy everything the user taught PM about this
+            // project. Go dormant instead (the same move `rebuild_mirror_from_rules` makes), so
+            // they stay listed in Teach.
+            tx.execute(
+                "UPDATE preferences SET entity_id = NULL WHERE entity_id = ?1",
+                params![entity_id],
+            )?;
+
+            // --- 6. The name ----------------------------------------------------------------
+            match name {
+                NameDisposition::Unsorted => {
+                    // Literally a merge into the inbox: the aliases (including this project's own
+                    // canonical) fold onto Unsorted, so the old name keeps resolving there forever.
+                    entities::merge_entities(tx, entity_id, unsorted_id)?;
+                }
+                NameDisposition::Free => {
+                    // Free the name. `documents.entity_id` REFERENCES entities(id) with NO ON
+                    // DELETE action and `PRAGMA foreign_keys = ON`, so this DELETE fails outright
+                    // while any row still points at the entity — which is exactly why it comes
+                    // after the document and preference steps above rather than before them.
+                    tx.execute(
+                        "DELETE FROM entity_aliases WHERE entity_id = ?1",
+                        params![entity_id],
+                    )?;
+                    tx.execute("DELETE FROM entities WHERE id = ?1", params![entity_id])?;
+                }
+            }
+            Ok(out)
         },
     )
     .await
@@ -5980,6 +6327,46 @@ mod merge_project_tests {
         assert!(resolve_merge_pair(&conn, "Ghost", "Marketing").is_err());
         assert!(resolve_merge_pair(&conn, "Marketing", "Ghost").is_err());
         assert!(resolve_merge_pair(&conn, "   ", "Marketing").is_err());
+    }
+
+    // --- delete guards (#573) ---------------------------------------------------
+
+    #[test]
+    fn delete_resolves_a_real_project_to_its_canonical() {
+        let conn = conn_with_projects(&["Marketing"]);
+        let (id, canonical) = super::resolve_deletable_project(&conn, "Marketing").unwrap();
+        assert!(id > 0);
+        assert_eq!(canonical, "Marketing");
+    }
+
+    /// Reached through an alias, the canonical is what comes back — which is what the dialog asks
+    /// the user to type, so confirming against the clicked label would be confirming the wrong name.
+    #[test]
+    fn delete_through_an_alias_reports_the_canonical_name() {
+        let conn = conn_with_projects(&["Personal Manager"]);
+        let id = entities::resolve_project(&conn, "Personal Manager", false)
+            .unwrap()
+            .unwrap();
+        entities::add_alias(&conn, id, "PM").unwrap();
+        let (resolved, canonical) = super::resolve_deletable_project(&conn, "PM").unwrap();
+        assert_eq!(resolved, id);
+        assert_eq!(canonical, "Personal Manager");
+    }
+
+    /// Deleting the inbox would destroy or strand every unreviewed document in it.
+    #[test]
+    fn refuses_to_delete_the_unsorted_inbox() {
+        let conn = conn_with_projects(&["Unsorted", "Marketing"]);
+        let err = super::resolve_deletable_project(&conn, "Unsorted").unwrap_err();
+        assert!(err.to_string().contains("inbox"), "unexpected error: {err}");
+        assert!(super::resolve_deletable_project(&conn, "Marketing").is_ok());
+    }
+
+    #[test]
+    fn refuses_to_delete_an_unknown_or_blank_project() {
+        let conn = conn_with_projects(&["Marketing"]);
+        assert!(super::resolve_deletable_project(&conn, "Ghost").is_err());
+        assert!(super::resolve_deletable_project(&conn, "   ").is_err());
     }
 }
 

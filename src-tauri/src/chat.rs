@@ -328,8 +328,31 @@ pub(crate) fn delete_conversation_inner(
     vault_dir: &Path,
     conversation_id: i64,
 ) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let vault_file = delete_conversation_rows(&tx, conversation_id)?;
+    tx.commit()?;
+
+    if let Some(rel) = vault_file {
+        let _ = std::fs::remove_file(vault_dir.join(rel));
+    }
+    Ok(())
+}
+
+/// The DB half of a conversation delete, **inside the caller's transaction**. Returns the session's
+/// vault path *relative to the vault dir*, for the caller to unlink once the commit is durable.
+///
+/// Split out of [`delete_conversation_inner`] so a caller that is already inside a transaction can
+/// reuse the exact same cascade — SQLite has no nested `BEGIN`, so the wrapper's own
+/// `unchecked_transaction` would fail there. Project deletion (#573) deletes many conversations
+/// inside one entity-mutation transaction and unlinks their files together after the commit, for
+/// the same reason this function doesn't unlink: a leftover file is harmless and self-healing,
+/// whereas removing it before a failed commit strands a live session pointing at truth that's gone.
+pub(crate) fn delete_conversation_rows(
+    tx: &Connection,
+    conversation_id: i64,
+) -> Result<Option<String>> {
     // The session row exists only once a turn-pair has been appended; a never-indexed chat has none.
-    let session: Option<(Option<i64>, Option<String>)> = conn
+    let session: Option<(Option<i64>, Option<String>)> = tx
         .query_row(
             "SELECT document_id, vault_path FROM chat_sessions WHERE conversation_id = ?1",
             params![conversation_id],
@@ -337,28 +360,21 @@ pub(crate) fn delete_conversation_inner(
         )
         .optional()?;
 
-    let tx = conn.unchecked_transaction()?;
     let vault_file = match session {
         Some((doc_id, vault_path)) => {
             if let Some(doc_id) = doc_id {
-                crate::ingest::delete_document(&tx, doc_id)?;
+                crate::ingest::delete_document(tx, doc_id)?;
             }
-            vault_path
-                .filter(|p| !p.trim().is_empty())
-                .map(|p| vault_dir.join(p))
+            vault_path.filter(|p| !p.trim().is_empty())
         }
         None => None,
     };
+    // Cascades `messages` and the `chat_sessions` satellite (both ON DELETE CASCADE).
     tx.execute(
         "DELETE FROM conversations WHERE id = ?1",
         params![conversation_id],
     )?;
-    tx.commit()?;
-
-    if let Some(path) = vault_file {
-        let _ = std::fs::remove_file(&path);
-    }
-    Ok(())
+    Ok(vault_file)
 }
 
 // --- rendering ---

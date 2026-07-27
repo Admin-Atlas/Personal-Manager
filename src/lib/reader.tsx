@@ -21,9 +21,13 @@ interface ReaderState {
   /** Open the reader onto a document already in hand (Documents tab, project file list). */
   openReader: (doc: Document) => void;
   /** Open the reader from just an id (a chat citation carries only `document_id`). Resolves the full
-   *  document from the list; a no-op if it's since been deleted. */
+   *  document; if it has since been deleted, surfaces {@link missing} instead of doing nothing. */
   openReaderById: (id: number) => void;
   closeReader: () => void;
+  /** Set when a citation pointed at a document that no longer exists — the answer's citations are a
+   *  JSON snapshot taken at answer time, so they outlive the file. Null when nothing is amiss. */
+  missing: string | null;
+  dismissMissing: () => void;
 }
 
 const ReaderContext = createContext<ReaderState | null>(null);
@@ -40,6 +44,8 @@ export function ReaderProvider({
   children: ReactNode;
 }) {
   const [current, setCurrent] = useState<Document | null>(null);
+  // Set when a citation resolved to nothing — see `openReaderById`.
+  const [missing, setMissing] = useState<string | null>(null);
   // Vault-level retrieval staleness (one global signal — never per-document) for the reader's chunk
   // overlay note. Read once; it only changes on a config change + rebuild, both of which are rare.
   const [stale, setStale] = useState(false);
@@ -59,18 +65,50 @@ export function ReaderProvider({
 
   const openReader = useCallback((doc: Document) => setCurrent(doc), []);
   const closeReader = useCallback(() => setCurrent(null), []);
+  const dismissMissing = useCallback(() => setMissing(null), []);
   const openReaderById = useCallback((id: number) => {
     // The reader needs the full Document (source type, external ref, project…); a citation carries only
     // the id, so fetch just that one document (F-48) rather than materialising the whole list — which
     // grows with connector estates — to find one row.
+    setMissing(null);
     getDocument(id)
       .then(setCurrent)
-      .catch(() => {});
+      .catch(() =>
+        // The citation outlived its document. `messages.citations` is a JSON snapshot written at
+        // answer time, so deleting a file (or the project holding it) leaves every past answer still
+        // listing it. This used to swallow the error, which read as a dead click on a real link.
+        setMissing(
+          "That file has been deleted. Re-ingest it to read it here — this answer still lists it because citations are recorded when the answer is written.",
+        ),
+      );
   }, []);
 
   return (
-    <ReaderContext.Provider value={{ current, openReader, openReaderById, closeReader }}>
+    <ReaderContext.Provider
+      value={{ current, openReader, openReaderById, closeReader, missing, dismissMissing }}
+    >
       {children}
+      {missing && (
+        <div
+          role="status"
+          className="fixed bottom-4 left-1/2 z-50 max-w-md -translate-x-1/2 rounded-[var(--radius)] border px-4 py-3 text-sm text-ink2 shadow-lg"
+          style={{
+            borderColor: "color-mix(in oklab, var(--st-look) 35%, transparent)",
+            background: "color-mix(in oklab, var(--st-look) 14%, var(--bg))",
+          }}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <span>{missing}</span>
+            <button
+              onClick={dismissMissing}
+              aria-label="Dismiss"
+              className="shrink-0 text-ink4 hover:text-ink"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
       {current && (
         <DocumentReader
           doc={current}
