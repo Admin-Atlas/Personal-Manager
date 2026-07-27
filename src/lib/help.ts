@@ -71,8 +71,8 @@ export const HELP: Record<string, HelpEntry> = {
     body: "PM keeps one canonical name per project, and remembers the other names you've filed things under as aliases. Here you manage them directly — merge, rename, and add names — so the same project never shows up two ways again.",
   },
   "teach-tags": {
-    title: "Re-tag your library",
-    body: 'Tags get proposed a few documents at a time, so they drift into one-off labels that only ever land on a single file — and a tag on one file groups nothing. This reads your whole library, picks one set of tags that suits it, and re-labels everything from that set, so a tag finally means "show me all of these". It costs model calls (roughly one per twelve documents), it changes tags only — never your projects or importance — and nothing is written until you look at the before/after and accept it.',
+    title: "Tags",
+    body: 'Your free-form labels, and the tools to fix them. Rename a tag and it changes on every document carrying it; remove one and it comes off all of them — in your vault too, so it sticks. PM points out labels that look like the same thing, tax and taxes, so you can fold them into one; a tag only helps if it groups things, and one that lands on a single file groups nothing. "Suggest tags" reads your whole library and proposes one set of labels for it: drop the ones you do not want, add the ones you know you need, and only then does PM re-label everything from your version. That costs model calls (roughly one per twelve documents), it never touches your projects or importance, and nothing is written until you see the before-and-after and accept it.',
   },
   "teach-entity": {
     title: "A project",

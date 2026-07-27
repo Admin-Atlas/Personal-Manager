@@ -3483,94 +3483,158 @@ pub fn retag_scope(state: State<'_, AppState>) -> Result<RetagScope> {
     })
 }
 
-/// Re-tag the whole library: derive one vocabulary for the store, then label every document from
-/// it. Proposals are STAGED, never applied — `commit_retag` is the only thing that writes (#580).
+/// One document as the re-tag passes see it.
+struct RetagDoc {
+    id: i64,
+    title: String,
+    body: String,
+}
+
+/// Every document with the text the re-tag passes judge it by, under ONE short lock (rule #4).
 ///
-/// Two passes on purpose. Re-running the existing per-document filing pass would have each batch
-/// invent labels for the documents in front of it, which is the failure being repaired, in fresh
-/// words. See `retag.rs` for the full argument.
+/// The body mirrors the filing pass's COALESCE: an index-only document's chunk content is a fixed
+/// placeholder, so its stored summary is the only real text there is.
+fn retag_documents(app: &AppHandle) -> Result<Vec<RetagDoc>> {
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    let mut stmt = conn.prepare(
+        "SELECT d.id, d.title, \
+                COALESCE( \
+                    CASE WHEN d.source_type = 'index_only' THEN NULLIF(d.stored_summary, '') END, \
+                    (SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), \
+                    '' \
+                ) \
+         FROM documents d ORDER BY d.id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(RetagDoc {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                body: r.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Pass 1 alone: propose a tag vocabulary for the whole library and hand it back UNUSED (#579).
 ///
-/// Runs on the background key and never holds the DB lock across a model call (rule #4).
+/// Split out from the labelling pass so the vocabulary is the user's to edit before anything is
+/// labelled from it. That ordering is the point: the vocabulary is the one decision the whole pass
+/// turns on, it is forty-odd words rather than a thousand documents, and reviewing it costs seconds
+/// — whereas reviewing the CONSEQUENCES of a bad vocabulary means reading every proposal. Teach
+/// exists to let someone correct how PM understands their things; this is that, for tags.
+///
+/// Nothing is written and nothing is staged. Runs on the background key.
 #[tauri::command]
-pub async fn propose_retag(app: AppHandle, on_event: Channel<RetagEvent>) -> Result<()> {
+pub async fn propose_retag_vocabulary(app: AppHandle) -> Result<Vec<String>> {
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
         return Err(Error::Other(llm_gateway::no_provider_message()));
     };
-
-    struct Doc {
-        id: i64,
-        title: String,
-        body: String,
-    }
-
-    // Everything the pass needs, under one short lock (rule #4). The body mirrors the filing
-    // pass's COALESCE: an index-only document's chunk content is a placeholder, so its stored
-    // summary is the only real text there is.
-    let docs: Vec<Doc> = {
-        let state = app.state::<AppState>();
-        let conn = state.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT d.id, d.title, \
-                    COALESCE( \
-                        CASE WHEN d.source_type = 'index_only' THEN NULLIF(d.stored_summary, '') END, \
-                        (SELECT content FROM chunks c WHERE c.document_id = d.id ORDER BY ordinal LIMIT 1), \
-                        '' \
-                    ) \
-             FROM documents d ORDER BY d.id",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(Doc {
-                    id: r.get(0)?,
-                    title: r.get(1)?,
-                    body: r.get(2)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows
-    };
-
+    let docs = retag_documents(&app)?;
     if docs.is_empty() {
-        let _ = on_event.send(RetagEvent::Finished { changed: 0 });
-        return Ok(());
+        return Ok(Vec::new());
     }
-
-    let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
-        Vec::new();
-
-    // ---- Pass 1: one vocabulary for the whole store, from its titles.
     let titles: Vec<String> = docs.iter().map(|d| d.title.clone()).collect();
-    let vocabulary = {
-        let max = retag::vocab_max(docs.len());
-        let messages = retag::vocabulary_messages(&retag::sample_titles(&titles), max);
-        // No cache_prefix: this call happens once per pass, so there is no prefix to reuse.
-        let outcome = llm_gateway::complete(&app, &plan, &messages, false).await?;
-        usage_rows.push((
+    let max = retag::vocab_max(docs.len());
+    let messages = retag::vocabulary_messages(&retag::sample_titles(&titles), max);
+    // No cache_prefix: one call per pass, so there is no prefix to reuse.
+    let outcome = llm_gateway::complete(&app, &plan, &messages, false).await?;
+    let vocabulary = retag::parse_vocabulary(&outcome.completion.text, max);
+    log_background_usage(
+        &app,
+        plan.models(),
+        &[(
             outcome.completion.model.clone(),
             outcome.completion.usage,
             outcome.meta,
-        ));
-        retag::parse_vocabulary(&outcome.completion.text, max)
-    };
+        )],
+    );
     if vocabulary.is_empty() {
-        log_background_usage(&app, plan.models(), &usage_rows);
         return Err(Error::Other(
             "the model did not return a usable tag vocabulary — nothing has been changed".into(),
         ));
     }
+    Ok(vocabulary)
+}
+
+/// Pass 2: label every document from the GIVEN vocabulary, staging the results (#580).
+///
+/// The vocabulary is a parameter rather than something this re-derives, so what labels the library
+/// is exactly what the user approved — including any tags they added and minus any they struck out.
+/// It is normalised and de-duplicated here rather than trusted verbatim: it has been through a text
+/// input, and `parse_assignments` matches against it, so a stray `Tax ` would silently match
+/// nothing.
+///
+/// Proposals are STAGED, never applied — `commit_retag` is the only thing that writes.
+/// Runs on the background key and never holds the DB lock across a model call (rule #4).
+#[tauri::command]
+pub async fn apply_retag_vocabulary(
+    app: AppHandle,
+    vocabulary: Vec<String>,
+    on_event: Channel<RetagEvent>,
+) -> Result<()> {
+    let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
+        return Err(Error::Other(llm_gateway::no_provider_message()));
+    };
+
+    let mut vocabulary: Vec<String> = {
+        let mut seen: Vec<String> = Vec::new();
+        for raw in &vocabulary {
+            let t = retag::normalize_tag(raw);
+            if !t.is_empty() && !seen.contains(&t) {
+                seen.push(t);
+            }
+        }
+        seen
+    };
+    if vocabulary.is_empty() {
+        return Err(Error::Other(
+            "a re-tag pass needs at least one tag to label documents with".into(),
+        ));
+    }
+
+    let docs = retag_documents(&app)?;
+    if docs.is_empty() {
+        let _ = on_event.send(RetagEvent::Finished { changed: 0 });
+        return Ok(());
+    }
+    // The cap still applies to a hand-edited list: it bounds the cached prefix, and an unbounded
+    // vocabulary is the failure this whole feature exists to undo.
+    vocabulary.truncate(retag::vocab_max(docs.len()));
     let _ = on_event.send(RetagEvent::Vocabulary {
         tags: vocabulary.clone(),
     });
 
-    // Starting a pass replaces any previous one: a half-reviewed set of proposals from an older
-    // vocabulary would mix two vocabularies in one accept, which is the thing being fixed.
+    let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
+        Vec::new();
+    retag_assign(&app, &plan, &docs, &vocabulary, &on_event, &mut usage_rows).await?;
+    log_background_usage(&app, plan.models(), &usage_rows);
+    Ok(())
+}
+
+/// Pass 2, shared: label every document from `vocabulary` and STAGE the result.
+///
+/// Starting a pass replaces any previous one — a half-reviewed set of proposals from an older
+/// vocabulary would mix two vocabularies in one accept, which is the thing being fixed.
+///
+/// Never holds the DB lock across a model call (rule #4): the staging write for each batch takes
+/// the lock and drops it before the next call goes out.
+async fn retag_assign(
+    app: &AppHandle,
+    plan: &llm_gateway::RoutePlan,
+    docs: &[RetagDoc],
+    vocabulary: &[String],
+    on_event: &Channel<RetagEvent>,
+    usage_rows: &mut Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)>,
+) -> Result<()> {
     {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         retag::clear(&conn, None)?;
     }
 
-    // ---- Pass 2: label every document from that fixed vocabulary.
     let total = docs.len();
     let mut done = 0usize;
     let mut changed = 0usize;
@@ -3582,17 +3646,17 @@ pub async fn propose_retag(app: AppHandle, on_event: Channel<RetagEvent>) -> Res
                 body: &d.body,
             })
             .collect();
-        let messages = retag::assign_messages(&inputs, &vocabulary);
+        let messages = retag::assign_messages(&inputs, vocabulary);
         // cache_prefix: the system message holds only the vocabulary + instructions, identical for
         // every call in the run, so the provider serves it from cache (#509).
-        let assignments = match llm_gateway::complete(&app, &plan, &messages, true).await {
+        let assignments = match llm_gateway::complete(app, plan, &messages, true).await {
             Ok(outcome) => {
                 usage_rows.push((
                     outcome.completion.model.clone(),
                     outcome.completion.usage,
                     outcome.meta,
                 ));
-                retag::parse_assignments(&outcome.completion.text, chunk.len(), &vocabulary)
+                retag::parse_assignments(&outcome.completion.text, chunk.len(), vocabulary)
             }
             // Best-effort, like the filing pass: a failed batch leaves those documents unproposed
             // rather than sinking the run. They keep the tags they have.
@@ -3613,7 +3677,6 @@ pub async fn propose_retag(app: AppHandle, on_event: Channel<RetagEvent>) -> Res
         let _ = on_event.send(RetagEvent::Progress { done, total });
     }
 
-    log_background_usage(&app, plan.models(), &usage_rows);
     let _ = on_event.send(RetagEvent::Finished { changed });
     Ok(())
 }
@@ -3659,38 +3722,15 @@ pub async fn commit_retag(app: AppHandle, document_ids: Vec<i64>) -> Result<usiz
 
         let result: Result<usize> = (|| {
             let staged = retag::staged_for(&tx, &document_ids)?;
-            let mut applied = 0usize;
-            for (doc_id, tags) in &staged {
-                let row: Option<(String, Option<String>, i64, String)> = tx
-                    .query_row(
-                        "SELECT project, importance, reviewed, \
-                                COALESCE(last_activity, ingested_at) \
-                         FROM documents WHERE id = ?1",
-                        params![doc_id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                    )
-                    .optional()?;
-                let Some((project, importance, reviewed, last_activity)) = row else {
-                    continue;
-                };
-                let linked = crate::tags::linked_projects(&tx, *doc_id, &project)?;
-                written.push(ingest::write_document_truth(
-                    &tx,
-                    &vault,
-                    &cipher,
-                    *doc_id,
-                    &project,
-                    &linked,
-                    tags,
-                    importance.as_deref(),
-                    reviewed != 0,
-                    &last_activity,
-                    &vault_root,
-                    &manifest_cipher,
-                    ingest::FilingActivity::Suppress,
-                )?);
-                applied += 1;
-            }
+            let applied = rewrite_document_tags(
+                &tx,
+                &vault,
+                &cipher,
+                &vault_root,
+                &manifest_cipher,
+                &staged,
+                &mut written,
+            )?;
             let ids: Vec<i64> = staged.iter().map(|(id, _)| *id).collect();
             retag::clear(&tx, Some(&ids))?;
             Ok(applied)
@@ -3713,6 +3753,212 @@ pub async fn commit_retag(app: AppHandle, document_ids: Vec<i64>) -> Result<usiz
     })
     .await
     .map_err(|e| Error::Other(format!("re-tag commit task panicked: {e}")))?
+}
+
+/// Rewrite these documents' TAGS and nothing else, through the one filing writer (I-02).
+///
+/// The single seam behind every bulk tag change — accepting a re-tag pass, deleting a label
+/// everywhere, folding two labels into one. Each document's own project / linked projects /
+/// importance / reviewed / last_activity are read and passed straight back, so the only field that
+/// can move is the one the caller asked to move. Going through `write_document_truth` is what makes
+/// the change stick: `documents.tags` is the DB mirror, the vault's `tags:` line is the truth, and a
+/// DB-only write is silently undone by the next Rebuild.
+///
+/// `FilingActivity::Suppress` throughout — tag maintenance is not per-project engagement, and one
+/// observation per document would read as a burst of it (B6-6).
+///
+/// Appends to `written` rather than returning it, so a caller that fails midway still has every
+/// file it touched available to roll back.
+fn rewrite_document_tags(
+    tx: &Connection,
+    vault: &std::path::Path,
+    cipher: &vault::MarkdownCipher,
+    vault_root: &std::path::Path,
+    manifest_cipher: &index_only::ManifestCipher,
+    updates: &[(i64, Vec<String>)],
+    written: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) -> Result<usize> {
+    let mut applied = 0usize;
+    for (doc_id, tags) in updates {
+        let row: Option<(String, Option<String>, i64, String)> = tx
+            .query_row(
+                "SELECT project, importance, reviewed, COALESCE(last_activity, ingested_at) \
+                 FROM documents WHERE id = ?1",
+                params![doc_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        // A document deleted since the caller read its id is skipped, not an error: these are bulk
+        // maintenance sweeps, and one missing row must not strand the rest.
+        let Some((project, importance, reviewed, last_activity)) = row else {
+            continue;
+        };
+        let linked = crate::tags::linked_projects(tx, *doc_id, &project)?;
+        written.push(ingest::write_document_truth(
+            tx,
+            vault,
+            cipher,
+            *doc_id,
+            &project,
+            &linked,
+            tags,
+            importance.as_deref(),
+            reviewed != 0,
+            &last_activity,
+            vault_root,
+            manifest_cipher,
+            ingest::FilingActivity::Suppress,
+        )?);
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// Remove a free-form tag from every document that carries it (#579).
+///
+/// "Everywhere" is the whole point, and it is three places, not one: the vault front-matter (the
+/// truth), `documents.tags` (its mirror), and the `tags`/`document_tags` registry that search and
+/// `@tag` read. Deleting only the registry row would leave the label in the vault, and the next
+/// Rebuild would bring it straight back.
+///
+/// All-or-nothing: the DB transaction and every vault file roll back together, so a failure partway
+/// through cannot leave half a library carrying a tag the other half has lost.
+#[tauri::command]
+pub async fn delete_tag(app: AppHandle, name: String) -> Result<usize> {
+    tokio::task::spawn_blocking(move || -> Result<usize> {
+        let state = app.state::<AppState>();
+        let (vault, cipher) = state.markdown_io()?;
+        let (vault_root, manifest_cipher) = state.manifest_io()?;
+        let mut conn = state.conn()?;
+        let tx = conn.transaction()?;
+        let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+
+        let result: Result<usize> = (|| {
+            let norm = crate::tags::normalize(&name);
+            let updates: Vec<(i64, Vec<String>)> =
+                crate::tags::documents_with_group_tag(&tx, &name)?
+                    .into_iter()
+                    .map(|(id, tags)| {
+                        let kept = tags
+                            .into_iter()
+                            .filter(|t| crate::tags::normalize(t) != norm)
+                            .collect();
+                        (id, kept)
+                    })
+                    .collect();
+            let applied = rewrite_document_tags(
+                &tx,
+                &vault,
+                &cipher,
+                &vault_root,
+                &manifest_cipher,
+                &updates,
+                &mut written,
+            )?;
+            // The registry row survives the rewrites (write_document_truth maintains the join, never
+            // the tag table), so it has to go explicitly or the label lingers in the `@` menu and in
+            // search as a tag that matches nothing.
+            crate::tags::prune_orphan_group_tags(&tx)?;
+            Ok(applied)
+        })();
+
+        finish_tag_rewrite(tx, written, result)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("tag delete task panicked: {e}")))?
+}
+
+/// Rename a free-form tag everywhere, FOLDING into `new` if that tag already exists (#579).
+///
+/// Rename and fold are deliberately one operation rather than two, because from where the user
+/// stands they are the same act — "these are the same thing, use this name" — and which one it is
+/// depends only on whether the other name happens to exist yet. Splitting them would mean the button
+/// changed meaning based on a fact the user has to look up first.
+///
+/// The fold arm has to deduplicate: a document carrying BOTH `tax` and `taxes` must come out with
+/// one `tax`, not two identical labels.
+#[tauri::command]
+pub async fn rename_tag(app: AppHandle, old: String, new: String) -> Result<usize> {
+    tokio::task::spawn_blocking(move || -> Result<usize> {
+        let state = app.state::<AppState>();
+        let (vault, cipher) = state.markdown_io()?;
+        let (vault_root, manifest_cipher) = state.manifest_io()?;
+        let mut conn = state.conn()?;
+        let tx = conn.transaction()?;
+        let mut written: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+
+        let result: Result<usize> = (|| {
+            let target = crate::retag::normalize_tag(&new);
+            let old_norm = crate::tags::normalize(&old);
+            if target.is_empty() || old_norm.is_empty() || old_norm == crate::tags::normalize(&new)
+            {
+                return Ok(0);
+            }
+            let updates: Vec<(i64, Vec<String>)> =
+                crate::tags::documents_with_group_tag(&tx, &old)?
+                    .into_iter()
+                    .map(|(id, tags)| {
+                        let mut out: Vec<String> = Vec::with_capacity(tags.len());
+                        for t in tags {
+                            let swapped = if crate::tags::normalize(&t) == old_norm {
+                                target.clone()
+                            } else {
+                                t
+                            };
+                            // The fold arm: a document already carrying both names must not come out
+                            // with the survivor twice.
+                            if !out.iter().any(|k| {
+                                crate::tags::normalize(k) == crate::tags::normalize(&swapped)
+                            }) {
+                                out.push(swapped);
+                            }
+                        }
+                        (id, out)
+                    })
+                    .collect();
+            let applied = rewrite_document_tags(
+                &tx,
+                &vault,
+                &cipher,
+                &vault_root,
+                &manifest_cipher,
+                &updates,
+                &mut written,
+            )?;
+            crate::tags::prune_orphan_group_tags(&tx)?;
+            Ok(applied)
+        })();
+
+        finish_tag_rewrite(tx, written, result)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("tag rename task panicked: {e}")))?
+}
+
+/// Commit a bulk tag rewrite, or roll back BOTH the DB and every vault file it touched.
+///
+/// Shared because getting this wrong is silent: a committed DB with reverted files (or the reverse)
+/// leaves the mirror and the truth disagreeing, and nothing reports it until a Rebuild quietly
+/// resurrects the old tags.
+fn finish_tag_rewrite(
+    tx: rusqlite::Transaction<'_>,
+    written: Vec<(std::path::PathBuf, Vec<u8>)>,
+    result: Result<usize>,
+) -> Result<usize> {
+    match result {
+        Ok(applied) => match tx.commit() {
+            Ok(()) => Ok(applied),
+            Err(e) => {
+                ingest::restore_vault_files(written);
+                Err(e.into())
+            }
+        },
+        Err(e) => {
+            drop(tx);
+            ingest::restore_vault_files(written);
+            Err(e)
+        }
+    }
 }
 
 /// Resolve a user-confirmed project name to its entity (creating a genuinely new one only if the

@@ -535,6 +535,52 @@ pub fn documents_tagged(conn: &Connection, name: &str) -> Result<Vec<i64>> {
     Ok(rows)
 }
 
+/// Every document carrying the free-form label `name`, with its FULL current tag list.
+///
+/// The whole list, not just the match, because the callers (delete / rename a tag everywhere, #579)
+/// have to hand `write_document_truth` the complete set the document should end up with — the truth
+/// is `documents.tags`, and a partial write would drop everything it did not mention.
+///
+/// Ordered by id so a bulk rewrite touches vault files in a stable order, which makes a failure
+/// midway reproducible rather than dependent on join order.
+pub fn documents_with_group_tag(conn: &Connection, name: &str) -> Result<Vec<(i64, Vec<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.id, d.tags FROM documents d \
+         JOIN document_tags dt ON dt.document_id = d.id \
+         JOIN tags t ON t.id = dt.tag_id AND t.kind = 'group' \
+         WHERE t.norm = ?1 ORDER BY d.id",
+    )?;
+    let rows = stmt
+        .query_map(params![normalize(name)], |r| {
+            let json: String = r.get(1)?;
+            Ok((
+                r.get::<_, i64>(0)?,
+                serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Drop group-tag registry rows no document carries any more.
+///
+/// [`set_document_group_tags`] already runs exactly this after every write, so the normal paths need
+/// no help: rewriting a document's tags heals any label that just lost its last document, anywhere
+/// in the store. This exists for the one case that write cannot reach — deleting a tag that is
+/// ALREADY carried by nothing, where there is no document to rewrite and so no write to piggyback
+/// on. Idempotent, so calling it after a bulk rewrite that already pruned costs one no-op statement.
+///
+/// Group rows only. A project tag legitimately exists with no documents (it can be created as a
+/// triage row before anything is filed into it), and `project_names` depends on that.
+pub fn prune_orphan_group_tags(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM tags WHERE kind = 'group' \
+           AND NOT EXISTS (SELECT 1 FROM document_tags dt WHERE dt.tag_id = tags.id)",
+        [],
+    )?;
+    Ok(n)
+}
+
 /// Point the project tag `old` at `new`, folding into `new`'s existing tag if there is one.
 ///
 /// The rename arm is a one-row update. The merge arm can't be: `document_tags` is keyed
@@ -877,6 +923,82 @@ mod tests {
         rename_project_tag(&conn, "Fold", "Keep").unwrap();
         assert_eq!(documents_tagged(&conn, "Keep").unwrap(), [1]);
         assert!(linked_projects(&conn, 1, "Keep").unwrap().is_empty());
+    }
+
+    /// The delete/rename paths hand `write_document_truth` the COMPLETE tag list a document should
+    /// end up with, so they need the whole list — a partial one would drop every label it did not
+    /// mention.
+    #[test]
+    fn documents_with_a_group_tag_come_back_with_their_whole_tag_list() {
+        let (_dir, conn) = store();
+        doc(&conn, 1, "Home");
+        doc(&conn, 2, "Home");
+        conn.execute(
+            r#"UPDATE documents SET tags = '["tax","invoice"]' WHERE id = 1"#,
+            [],
+        )
+        .unwrap();
+        set_document_group_tags(&conn, 1, &["tax".into(), "invoice".into()]).unwrap();
+        set_document_group_tags(&conn, 2, &["invoice".into()]).unwrap();
+
+        let got = documents_with_group_tag(&conn, "tax").unwrap();
+        assert_eq!(
+            got,
+            vec![(1, vec!["tax".to_string(), "invoice".to_string()])]
+        );
+        assert!(
+            documents_with_group_tag(&conn, "nothing")
+                .unwrap()
+                .is_empty(),
+            "a tag nobody carries matches nothing"
+        );
+    }
+
+    /// A label that loses its last document must stop being offered, or it lingers in the `@` menu
+    /// and in search matching nothing. `set_document_group_tags` already does this on every write —
+    /// asserted here because `delete_tag` RELIES on it rather than pruning per document.
+    #[test]
+    fn a_label_that_loses_its_last_document_is_dropped_by_the_write_itself() {
+        let (_dir, conn) = store();
+        doc(&conn, 1, "Home");
+        set_document_group_tags(&conn, 1, &["tax".into()]).unwrap();
+        set_document_group_tags(&conn, 1, &[]).unwrap();
+
+        let names: Vec<String> = list_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(!names.contains(&"tax".to_string()));
+        // ...so an explicit prune afterwards has nothing left to do.
+        assert_eq!(prune_orphan_group_tags(&conn).unwrap(), 0);
+    }
+
+    /// The case the write path cannot reach: a label already carried by nothing, where there is no
+    /// document to rewrite and so no write to piggyback the prune on. Deleting such a tag from the
+    /// Teach list has to work anyway.
+    #[test]
+    fn pruning_clears_a_label_no_write_can_reach_but_spares_an_empty_project() {
+        let (_dir, conn) = store();
+        intern(&conn, KIND_GROUP, "orphan").unwrap();
+        // An empty project exists legitimately — a triage row before anything is filed into it.
+        intern(&conn, KIND_PROJECT, "Empty Project").unwrap();
+
+        assert_eq!(prune_orphan_group_tags(&conn).unwrap(), 1);
+
+        let names: Vec<String> = list_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !names.contains(&"orphan".to_string()),
+            "orphan label pruned"
+        );
+        assert!(
+            names.contains(&"Empty Project".to_string()),
+            "an empty PROJECT must survive — project_names depends on it"
+        );
     }
 
     #[test]
