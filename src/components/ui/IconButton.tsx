@@ -12,7 +12,7 @@
 import type { ComponentPropsWithRef, ReactNode } from "react";
 import { cn } from "./cn";
 
-export type IconButtonVariant = "ghost" | "subtle" | "danger";
+export type IconButtonVariant = "ghost" | "subtle" | "danger" | "pressed";
 
 // Hover/active gated to :enabled so a disabled icon button never reacts to the pointer. All start at
 // --ink4 (the subtle resting colour icon controls across PM already use); they differ in hover.
@@ -24,6 +24,13 @@ const VARIANT: Record<IconButtonVariant, string> = {
   // Destructive — remove / delete.
   danger:
     "text-ink4 enabled:hover:bg-[color-mix(in_oklab,var(--st-due)_18%,transparent)] enabled:hover:text-st-due",
+  // A toggle currently ON — the same filled treatment SegmentedControl gives its active segment, so
+  // "this one is chosen" reads identically wherever it appears. Swap the VARIANT (not the class
+  // list) to show pressed state: `cn` is a plain joiner, not tailwind-merge, so a `text-*` passed
+  // through `className` does NOT replace the variant's own `text-ink4` — both survive and CSS
+  // source order silently decides. That is #469, and it is why an ad-hoc pressed colour looks like
+  // a control that does nothing.
+  pressed: "bg-accent text-accent-ink enabled:hover:brightness-110",
 };
 
 export interface IconButtonProps extends Omit<ComponentPropsWithRef<"button">, "aria-label"> {

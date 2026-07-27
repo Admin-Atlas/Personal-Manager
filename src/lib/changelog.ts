@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.94.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "Milestones now have one control instead of two. The tick-box is gone — set a milestone to Done in its progress dropdown and it crosses out exactly as before. Having both meant two things to keep in step and two places to look to learn one answer, and they could drift apart. Everything the tick-box did still happens, including bringing a deadline reminder back when you move a milestone off Done.",
+      "Project timelines on the pinboard now show progress too. In list view each milestone has the same progress dropdown as the project page; on the track view the dot on the line fills up as a milestone moves from Not started through to Done, so you can read the state of a project at a glance without opening it.",
+      "Rating an answer in chat now visibly does something. The thumbs up and down have always been recorded — but the only sign you had chosen one was a colour change that could never appear, because the buttons were emoji and emoji ignore colour. They are now drawn icons, and the one you pick fills in.",
+      "Apple and subscribed calendars can be marked work or personal, like the rest. The setting arrived last version for Google and Outlook calendars only, because subscriptions are managed in a different part of Settings and were missed.",
+    ],
+  },
+  {
     version: "3.93.1-alpha",
     date: "2026-07-27",
     highlights: [

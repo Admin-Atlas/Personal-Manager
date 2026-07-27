@@ -38,6 +38,7 @@ describe("isSettingWrite", () => {
       "set_conversation_project",
       "set_milestone_event",
       "set_milestone_state",
+      "set_milestone_status",
       "set_project_layout",
     ]) {
       expect(isSettingWrite(cmd)).toBe(false);
