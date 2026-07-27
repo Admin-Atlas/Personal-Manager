@@ -32,6 +32,7 @@ export function ProjectPicker({
   disabled,
   listId,
   inputClassName,
+  hidePrimary,
 }: {
   /** The document's projects, primary first. Never empty. */
   value: string[];
@@ -42,6 +43,15 @@ export function ProjectPicker({
   /** Shared `<datalist>` id, so one list can back several pickers on a page. */
   listId?: string;
   inputClassName?: string;
+  /**
+   * Omit the primary pill when it names this project — for a list rendered INSIDE a project, where
+   * "Primary <this project>" on every row only repeats the heading above them (Bobby, 2026-07-27).
+   *
+   * Only ever the primary, and only ever this one name. A pill for some OTHER project is the whole
+   * point of the field, and a pill for a project this document is merely LINKED into carries a
+   * remove control, so hiding either would take away information or a control rather than noise.
+   */
+  hidePrimary?: string;
 }) {
   const [draft, setDraft] = useState("");
   const fallbackId = useId();
@@ -67,6 +77,11 @@ export function ProjectPicker({
     <div className="flex flex-wrap items-center gap-1.5">
       {value.map((project, i) => {
         const primary = i === 0;
+        // Index, not position: `value[0]` is still the primary whether or not its pill is drawn, so
+        // hiding it never promotes the next pill into a Primary badge it hasn't earned.
+        if (primary && hidePrimary && project.toLowerCase() === hidePrimary.toLowerCase()) {
+          return null;
+        }
         return (
           <span
             key={project}

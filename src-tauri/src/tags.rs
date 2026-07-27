@@ -13,13 +13,12 @@
 //!   casing**, because `projects.name` is a primary key and `entities.canonical_name` is the alias
 //!   key — force-lowercasing here would collide with both. Only these rows touch the entity/alias
 //!   space.
-//! - `kind = 'group'` is the banked second kind: the free-form lowercase labels the tag editor
-//!   already writes into `documents.tags` and the vault's `tags:` line. **Nothing populates it
-//!   yet.** Those labels are inert today — no retrieval, search, filter or score reads them — so
-//!   migrating them now would move a population with no consumer. They land with #276, which is
-//!   the first thing that will actually read a tag. The `kind` column exists now because adding it
-//!   later would mean a second migration over the same table (the `calendar_events.kind_override`
-//!   precedent in v45).
+//! - `kind = 'group'` rows are the free-form lowercase labels the tag editor writes. Their TRUTH is
+//!   still `documents.tags` — the JSON blob the vault's `tags:` line round-trips — and these rows
+//!   are the queryable index over it, backfilled by v47 and kept in step by
+//!   `write_document_truth`. They exist because `@tag` (#276) has to answer "which documents carry
+//!   this tag" as a JOIN, to intersect with a chunk allow-set; the blob cannot answer that without
+//!   scanning every row.
 //!
 //! Matching is case-insensitive, via a stored `norm` column rather than `COLLATE NOCASE` — the
 //! same shape `preferences` already uses, and for the same reason recorded there: SQLite's
@@ -39,9 +38,11 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 
-/// A tag that mirrors a real project. Only these reach the entity/alias space, and only these are
-/// populated today — see the module doc for why `group` is banked rather than backfilled.
+/// A tag that mirrors a real project. Only these reach the entity/alias space.
 pub const KIND_PROJECT: &str = "project";
+/// A free-form label — what the tag editor writes. Populated from `documents.tags` by v47, and kept
+/// in step by [`crate::ingest::write_document_truth`].
+pub const KIND_GROUP: &str = "group";
 
 /// A subquery naming every `(document_id, name, norm)` project membership in the store.
 ///
@@ -170,6 +171,335 @@ fn gc_orphan_project_tags(conn: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+/// Replace a document's group-tag memberships.
+///
+/// The counterpart to [`set_document_projects`], called from the same seam and for the same reason:
+/// `documents.tags` stays the truth, and this keeps the queryable index over it from drifting.
+pub fn set_document_group_tags(conn: &Connection, doc_id: i64, tags: &[String]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM document_tags WHERE document_id = ?1 AND tag_id IN \
+         (SELECT id FROM tags WHERE kind = 'group')",
+        params![doc_id],
+    )?;
+    let mut seen: Vec<String> = Vec::new();
+    for name in tags {
+        let norm = normalize(name);
+        if norm.is_empty() || seen.contains(&norm) {
+            continue;
+        }
+        seen.push(norm);
+        let tag_id = intern(conn, KIND_GROUP, name)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO document_tags (document_id, tag_id) VALUES (?1, ?2)",
+            params![doc_id, tag_id],
+        )?;
+    }
+    // A label that just lost its last document should stop being offered. Unlike a project, a group
+    // tag has no triage row that could keep it alive, so "no memberships" is the whole test.
+    conn.execute(
+        "DELETE FROM tags WHERE kind = 'group' \
+           AND NOT EXISTS (SELECT 1 FROM document_tags dt WHERE dt.tag_id = tags.id)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// One tag as the pickers and the `@` autocomplete see it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagSummary {
+    pub name: String,
+    /// `"project"` or `"group"`. The two behave differently when pinned, and the UI says which.
+    pub kind: String,
+    /// How many documents carry it. The autocomplete orders by this, so tags someone actually uses
+    /// come before ones they typed once.
+    pub documents: i64,
+}
+
+/// Every tag in the registry with its kind and use count, most-used first.
+///
+/// Project rows count through [`MEMBERSHIPS_SQL`], so a project whose documents are all merely
+/// linked to it still counts honestly; group rows count through the join, which for them is the
+/// whole story.
+pub fn list_all(conn: &Connection) -> Result<Vec<TagSummary>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.name, t.kind, \
+                CASE WHEN t.kind = 'project' \
+                     THEN (SELECT COUNT(*) FROM ({MEMBERSHIPS_SQL}) m WHERE m.norm = t.norm) \
+                     ELSE (SELECT COUNT(*) FROM document_tags dt WHERE dt.tag_id = t.id) END \
+         FROM tags t ORDER BY 3 DESC, t.norm"
+    ))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(TagSummary {
+                name: r.get(0)?,
+                kind: r.get(1)?,
+                documents: r.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// How many established labels the filing prompt is shown. Enough that a real vocabulary is
+/// visible, few enough that the list stays a hint rather than a menu the model works through — and
+/// bounded, because unlike projects the label space has no natural ceiling.
+const PROMPT_TAG_LIMIT: usize = 60;
+
+/// The free-form labels already in use, most-used first, for the filing prompt.
+///
+/// Tags only earn their keep by GROUPING things (Bobby, 2026-07-27). The prompt has always named
+/// the existing projects and asked the model to prefer one; it said nothing at all about existing
+/// tags, so every batch invented its own vocabulary and `tax` / `taxes` / `taxation` accumulated
+/// side by side. Naming them is the cheap half of the fix — the half that stops new drift.
+///
+/// Only `kind = 'group'`: a project is reachable as a project, and offering project names here
+/// would invite the model to duplicate a document's filing as a label.
+///
+/// The order is deterministic (count, then normalised name) because this list goes in the CACHED
+/// system prefix (#509) — a set that reshuffled between calls in a run would silently cost the
+/// prompt cache on every document.
+pub fn common_group_tags(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.name FROM tags t \
+         WHERE t.kind = 'group' \
+         ORDER BY (SELECT COUNT(*) FROM document_tags dt WHERE dt.tag_id = t.id) DESC, t.norm \
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![PROMPT_TAG_LIMIT as i64], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The `@mentions` in a message, in the order written, deduplicated on the normalised form.
+///
+/// A bare mention ends at whitespace — a greedy rule would swallow the rest of the sentence — and
+/// trailing sentence punctuation is not part of the name. It must START a word, so
+/// `bob@example.com` mentions nothing.
+///
+/// A name with a space in it is quoted: `@"Atlas, Inc."`. Without that form the projects #275 went
+/// out of its way to allow would be the exact ones that could never be pinned, which is not a
+/// limitation worth shipping.
+///
+/// **Code is skipped** — fenced blocks and inline spans. Someone pasting a diff, a log or a commit
+/// trailer is quoting, not addressing, and a line-initial `@Something` in pasted code that happened
+/// to collide with a tag name would otherwise widen their retrieval scope with nothing to show for
+/// it. `chatMarkdown.ts` skips the same two constructs, for the same reason.
+///
+/// This returns CANDIDATES. Nothing is a tag until [`resolve_mentions`] finds it in the registry,
+/// so a stray `@` in prose widens no one's retrieval scope.
+pub fn parse_mentions(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for span in prose_spans(text) {
+        collect_mentions(span, &mut out);
+    }
+    out
+}
+
+/// The parts of `text` that are prose rather than code: everything outside a fenced block and
+/// outside a `backtick` span, in order.
+fn prose_spans(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // Inline code: keep the even-indexed runs, i.e. the text OUTSIDE the backtick spans.
+        for (i, piece) in line.split('`').enumerate() {
+            if i % 2 == 0 {
+                out.push(piece);
+            }
+        }
+    }
+    out
+}
+
+fn collect_mentions(text: &str, out: &mut Vec<String>) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '@' {
+            i += 1;
+            continue;
+        }
+        if i > 0 && !chars[i - 1].is_whitespace() && chars[i - 1] != '(' {
+            i += 1;
+            continue;
+        }
+        let (name, next) = read_mention(&chars, i);
+        if !name.is_empty() && !out.iter().any(|p| normalize(p) == normalize(&name)) {
+            out.push(name);
+        }
+        i = next.max(i + 1);
+    }
+}
+
+/// Read the mention starting at the `@` in `chars[at]`, returning its name and the index just past
+/// it. Shared by the parser and the stripper so the two can never disagree about where a mention
+/// ends — which would leave a fragment of a pin in the text that reaches the embedder.
+fn read_mention(chars: &[char], at: usize) -> (String, usize) {
+    let start = at + 1;
+    if chars.get(start) == Some(&'"') {
+        let open = start + 1;
+        let mut end = open;
+        while end < chars.len() && chars[end] != '"' {
+            end += 1;
+        }
+        // An unclosed quote is a quote the user is still typing, not a mention.
+        if end >= chars.len() {
+            return (String::new(), start);
+        }
+        return (chars[open..end].iter().collect(), end + 1);
+    }
+    let mut end = start;
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+    let raw: String = chars[start..end].iter().collect();
+    let trimmed = raw.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"']);
+    let kept = trimmed.chars().count();
+    (trimmed.to_string(), start + kept)
+}
+
+/// One resolved `@mention`: a specific row in the registry, not merely a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedTag {
+    pub id: i64,
+    /// The canonical spelling, so the highlight and the widening agree on one form.
+    pub name: String,
+    pub kind: String,
+}
+
+/// The mention candidates that are REAL tags, resolved to specific registry rows.
+///
+/// Resolution is to ONE row, by id — never to a name both kinds happen to share. A project called
+/// `Research` and a label called `research` are different things (that is what the per-kind unique
+/// index is for), and widening by name would quietly pull in both: someone pinning a free-form
+/// label would get an entire same-named project's documents, home and linked, with nothing
+/// anywhere saying so. The card's own discipline — no silent cross-project retrieval — rules it out.
+///
+/// A collision resolves to the PROJECT: it is the heavier concept and the likelier intent when a
+/// name is shared. The `kind` travels with the result, so a caller can say which was meant.
+pub fn resolve_mentions(conn: &Connection, candidates: &[String]) -> Result<Vec<PinnedTag>> {
+    let mut out: Vec<PinnedTag> = Vec::new();
+    // Explicit CASE, not `ORDER BY kind`: 'group' sorts before 'project', so ordering on the column
+    // alone would pick exactly the wrong row.
+    let mut stmt = conn.prepare(
+        "SELECT id, name, kind FROM tags WHERE norm = ?1 \
+         ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END LIMIT 1",
+    )?;
+    for c in candidates {
+        let norm = normalize(c);
+        if norm.is_empty() {
+            continue;
+        }
+        let found = stmt
+            .query_row(params![norm], |r| {
+                Ok(PinnedTag {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                })
+            })
+            .ok();
+        if let Some(tag) = found {
+            if !out.iter().any(|t| t.id == tag.id) {
+                out.push(tag);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Remove the RESOLVED mentions from a message, leaving the rest of the words intact.
+///
+/// This is what reaches the embedder and the keyword index. Leaving `@marketing` in would make the
+/// pin a relevance boost as well as a scope — the bare term is embedded, and `fts_query` splits on
+/// non-alphanumerics so it is OR-ed into the MATCH too. Scope-not-boost is the settled decision: a
+/// boost is worth adding only once the relevance-feedback corpus (#566) can calibrate one, and a
+/// boost applied silently now would be impossible to separate from the scoping in that data.
+///
+/// Only resolved mentions go. An unrecognised `@word` is ordinary prose, and removing it would
+/// change the question being asked. If stripping would leave nothing to search on, the original is
+/// kept — `@marketing` alone still means "what is in Marketing".
+pub fn strip_mentions(text: &str, pinned: &[PinnedTag]) -> String {
+    if pinned.is_empty() {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '@' && (i == 0 || chars[i - 1].is_whitespace() || chars[i - 1] == '(') {
+            let (name, next) = read_mention(&chars, i);
+            if !name.is_empty()
+                && pinned
+                    .iter()
+                    .any(|t| normalize(&t.name) == normalize(&name))
+            {
+                i = next;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    if out.trim().is_empty() {
+        return text.to_string();
+    }
+    out
+}
+
+/// The chunk ids of every document carrying any of `names` — what a pinned tag contributes to a
+/// retrieval allow-set.
+///
+/// Empty `names` yields an EMPTY set, never "everything". A widening that silently degraded to
+/// no-filter would break the guarantee a project chat rests on: it retrieves only what it was told
+/// to.
+pub fn tag_chunk_ids(
+    conn: &Connection,
+    pinned: &[PinnedTag],
+) -> Result<std::collections::HashSet<i64>> {
+    let mut out = std::collections::HashSet::new();
+    if pinned.is_empty() {
+        return Ok(out);
+    }
+    // A project tag reaches documents through MEMBERSHIPS_SQL (home + links, so a document linked
+    // into the project counts too); a group tag reaches them through the join alone. Both key on
+    // the tag's ID, so pinning one of two same-named tags widens by exactly the row that resolved.
+    let mut project_stmt = conn.prepare(&format!(
+        "SELECT c.id FROM chunks c WHERE c.document_id IN ( \
+             SELECT m.document_id FROM ({MEMBERSHIPS_SQL}) m \
+             WHERE m.norm = (SELECT norm FROM tags WHERE id = ?1) \
+         )"
+    ))?;
+    let mut group_stmt = conn.prepare(
+        "SELECT c.id FROM chunks c \
+         JOIN document_tags dt ON dt.document_id = c.document_id \
+         WHERE dt.tag_id = ?1",
+    )?;
+    for tag in pinned {
+        // The two statements' row iterators are distinct closure types, so each branch drains its
+        // own rather than trying to unify them behind one binding.
+        if tag.kind == KIND_PROJECT {
+            for id in project_stmt.query_map(params![tag.id], |r| r.get::<_, i64>(0))? {
+                out.insert(id?);
+            }
+        } else {
+            for id in group_stmt.query_map(params![tag.id], |r| r.get::<_, i64>(0))? {
+                out.insert(id?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A document's project memberships OTHER than `home`, in stable (name) order.
@@ -313,6 +643,161 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// The group-tag backfill reads `documents.tags` — a JSON array in a TEXT column — with
+    /// `json_each`. JSON1 is compiled into SQLite by default and rusqlite's bundled amalgamation
+    /// keeps it, but "by default" is not a guarantee this repo can afford to assume: a migration
+    /// that calls a missing function fails at OPEN, on the user's machine, with the store
+    /// half-migrated. Pin it here so the build tells us instead.
+    #[test]
+    fn a_mention_must_begin_a_word_and_ends_at_whitespace() {
+        assert_eq!(parse_mentions("ask @Marketing about it"), ["Marketing"]);
+        // Sentence punctuation is not part of the name.
+        assert_eq!(parse_mentions("see @Atlas, Inc. later"), ["Atlas"]);
+        // A name with a space in it needs quoting — otherwise the projects #275 went out of its
+        // way to allow would be exactly the ones that could never be pinned.
+        assert_eq!(
+            parse_mentions(r#"see @"Atlas, Inc." later"#),
+            ["Atlas, Inc."]
+        );
+        // A quote the user is still typing is not a mention yet.
+        assert!(parse_mentions(r#"see @"Atlas, Inc"#).is_empty());
+        assert_eq!(parse_mentions("(@Ops) handled it"), ["Ops"]);
+        // An address is not a mention.
+        assert!(parse_mentions("mail bob@example.com").is_empty());
+        // Deduplicated case-insensitively, first spelling kept.
+        assert_eq!(parse_mentions("@ops and @OPS"), ["ops"]);
+    }
+
+    #[test]
+    fn a_mention_inside_code_pins_nothing() {
+        // Someone pasting a diff or a log is quoting, not addressing. Widening their retrieval
+        // scope off a line of pasted code would be invisible and impossible to explain.
+        let fenced = "before @Real after\n```\n@Fake decorator\n```\n@Second";
+        assert_eq!(parse_mentions(fenced), ["Real", "Second"]);
+        assert_eq!(parse_mentions("use `@Fake` here but @Real too"), ["Real"]);
+    }
+
+    #[test]
+    fn a_name_shared_by_a_project_and_a_label_resolves_to_the_project_only() {
+        // The failure this prevents: pinning a free-form label and silently receiving an entire
+        // same-named PROJECT's documents, with nothing anywhere saying so.
+        let (_dir, conn) = store();
+        let project = intern(&conn, KIND_PROJECT, "Research").unwrap();
+        let group = intern(&conn, KIND_GROUP, "research").unwrap();
+        assert_ne!(project, group, "the kinds are separate namespaces");
+
+        let pinned = resolve_mentions(&conn, &["research".to_string()]).unwrap();
+        assert_eq!(pinned.len(), 1, "one mention resolves to exactly one row");
+        assert_eq!(pinned[0].id, project);
+        assert_eq!(pinned[0].kind, KIND_PROJECT);
+        assert_eq!(
+            pinned[0].name, "Research",
+            "the canonical spelling comes back"
+        );
+    }
+
+    #[test]
+    fn an_unknown_mention_resolves_to_nothing() {
+        let (_dir, conn) = store();
+        intern(&conn, KIND_PROJECT, "Sales").unwrap();
+        assert!(resolve_mentions(&conn, &["markting".to_string()])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn stripping_removes_the_pin_but_not_the_question() {
+        let (_dir, conn) = store();
+        intern(&conn, KIND_PROJECT, "Marketing").unwrap();
+        let pinned = resolve_mentions(&conn, &parse_mentions("@Marketing what shipped?")).unwrap();
+
+        // The pin has already chosen the corpus; leaving the word in would ALSO embed it and OR it
+        // into the FTS match, quietly making a scope into a relevance boost.
+        assert_eq!(
+            strip_mentions("@Marketing what shipped?", &pinned),
+            " what shipped?"
+        );
+        // An unresolved `@word` is ordinary prose and must survive — removing it would change the
+        // question being asked.
+        assert_eq!(
+            strip_mentions("@nobody what shipped?", &pinned),
+            "@nobody what shipped?"
+        );
+        // Stripping everything leaves nothing to search on, so the original stands.
+        assert_eq!(strip_mentions("@Marketing", &pinned), "@Marketing");
+    }
+
+    #[test]
+    fn a_pinned_group_tag_reaches_only_its_own_documents() {
+        let (_dir, conn) = store();
+        doc(&conn, 1, "Sales");
+        doc(&conn, 2, "Research");
+        // Doc 1 carries the LABEL "research"; doc 2 is homed in the PROJECT "Research".
+        set_document_group_tags(&conn, 1, &["research".into()]).unwrap();
+        set_document_projects(&conn, 2, "Research", &[]).unwrap();
+        for (doc_id, chunk_id) in [(1i64, 11i64), (2, 22)] {
+            conn.execute(
+                "INSERT INTO chunks(id, document_id, ordinal, content, char_count)                  VALUES (?1, ?2, 0, 'x', 1)",
+                params![chunk_id, doc_id],
+            )
+            .unwrap();
+        }
+
+        // Only the label exists under that exact name for a group pin...
+        let group = vec![PinnedTag {
+            id: lookup(&conn, KIND_GROUP, "research").unwrap().unwrap(),
+            name: "research".into(),
+            kind: KIND_GROUP.into(),
+        }];
+        assert_eq!(
+            tag_chunk_ids(&conn, &group).unwrap(),
+            std::collections::HashSet::from([11])
+        );
+
+        // ...and the project pin reaches the project's documents, not the label's.
+        let project = vec![PinnedTag {
+            id: lookup(&conn, KIND_PROJECT, "research").unwrap().unwrap(),
+            name: "Research".into(),
+            kind: KIND_PROJECT.into(),
+        }];
+        assert_eq!(
+            tag_chunk_ids(&conn, &project).unwrap(),
+            std::collections::HashSet::from([22])
+        );
+    }
+
+    #[test]
+    fn nothing_pinned_widens_nothing() {
+        // A widening that degraded to "no filter" would break the guarantee a project chat rests
+        // on, so the empty case must be an empty SET, never an absent one.
+        let (_dir, conn) = store();
+        doc(&conn, 1, "Sales");
+        assert!(tag_chunk_ids(&conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_group_tag_stops_being_offered_once_nothing_carries_it() {
+        let (_dir, conn) = store();
+        doc(&conn, 1, "Sales");
+        set_document_group_tags(&conn, 1, &["draft".into()]).unwrap();
+        assert!(list_all(&conn).unwrap().iter().any(|t| t.name == "draft"));
+        set_document_group_tags(&conn, 1, &[]).unwrap();
+        assert!(!list_all(&conn).unwrap().iter().any(|t| t.name == "draft"));
+    }
+
+    #[test]
+    fn the_bundled_sqlite_provides_json1() {
+        let (_dir, conn) = store();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM json_each('[\"a\", \"b\", \"c\"]')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("json_each must exist — the group-tag backfill is written in terms of it");
+        assert_eq!(n, 3);
     }
 
     #[test]

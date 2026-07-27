@@ -378,6 +378,17 @@ export interface CompressResult {
  *  sunk to the bottom of lists, still searchable); `null` is untriaged / unset — a distinct state. */
 export type Importance = "high" | "medium" | "low" | "archive" | null;
 
+/** One tag in the registry, as the `@` autocomplete and the tag pickers see it (#276). */
+export interface TagSummary {
+  name: string;
+  /** A project mirrors a real project; a group tag is a free-form label. Pinning either scopes a
+   *  chat, but the two are separate namespaces — a project called "Research" and a label called
+   *  "research" are different things. */
+  kind: "project" | "group";
+  /** How many documents carry it. The list is ordered by this, so tags in real use come first. */
+  documents: number;
+}
+
 export interface Document {
   id: number;
   title: string;
@@ -1443,6 +1454,9 @@ export interface DevRetrievalRow {
   /** 0-based rank in the keyword/FTS branch; null if vector-only. */
   keyword_rank: number | null;
   fused_score: number;
+  /** A `@tag` pin lifted this chunk: it was fused a second time through the pinned sub-branches,
+   *  which is why its fused score outruns what its two branch ranks alone would give. */
+  pinned: boolean;
   decay_factor: number;
   decayed_score: number;
   reranker_score: number | null;

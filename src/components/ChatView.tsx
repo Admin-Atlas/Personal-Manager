@@ -6,6 +6,7 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type MouseEvent,
@@ -23,6 +24,8 @@ import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
 import { Markdown } from "../lib/markdown";
 import { citationTarget, linkCitations } from "../lib/chatMarkdown";
+import { splitMentions } from "../lib/mentions";
+import { listTags } from "../lib/ipc";
 import { formatDate, formatDateLocal, shortModel } from "../lib/format";
 import {
   answerFeedback,
@@ -76,12 +79,43 @@ function resumeMarkerDate(messages: Message[], now: number): string | null {
   return formatDate(last.created_at);
 }
 
+/**
+ * A user's message with the `@mentions` that RESOLVED marked.
+ *
+ * Only real tags are marked, and that is the whole point of showing it: it is how someone sees that
+ * `@marketing` reached their Marketing files and that `@markting` did not — a pin that silently
+ * matched nothing is otherwise indistinguishable from one that worked. A message with no resolved
+ * mentions renders as one plain string, exactly as before.
+ */
+function MentionText({ text, known }: { text: string; known?: readonly string[] }) {
+  const segments = useMemo(() => splitMentions(text, known ?? []), [text, known]);
+  if (segments.length === 1 && !segments[0].tag) return <>{text}</>;
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.tag ? (
+          <span
+            key={i}
+            className="rounded-[var(--radius-sm)] bg-[color-mix(in_oklab,currentColor_18%,transparent)] px-1 font-medium"
+            title={`Pinned ${seg.tag} for this message — it also searched that tag's documents`}
+          >
+            {seg.text}
+          </span>
+        ) : (
+          <span key={i}>{seg.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
 function Bubble({
   role,
   content,
   citationCount = 0,
   onCite,
   markdown = false,
+  knownTags,
 }: {
   role: string;
   content: string;
@@ -90,6 +124,9 @@ function Bubble({
   /** Render the body as Markdown through the sanitizing boundary. Set for the model's answers, not
    *  for the user's own message — what someone typed should never be reinterpreted. */
   markdown?: boolean;
+  /** Tag names that exist, so a `@mention` that actually resolved can be marked (#276). Only the
+   *  user's own turns are checked; the model does not pin tags. */
+  knownTags?: readonly string[];
 }) {
   const isUser = role === "user";
   // A streaming reply sets `content` to the whole accumulated answer on EVERY token, and a Markdown
@@ -118,7 +155,11 @@ function Bubble({
   ) : markdown ? (
     <Markdown>{linkCitations(text, citationCount)}</Markdown>
   ) : (
-    text
+    // Plain React nodes, NOT a trip through the Markdown boundary. The user's own text is
+    // deliberately never reinterpreted as Markdown (see `markdown` above), and it does not need to
+    // be: splitting a string into spans introduces no HTML, so the sanitizer's allowlist — which
+    // permits neither `mark` nor a `class` on `span` — stays exactly as strict as it is.
+    <MentionText text={text} known={knownTags} />
   );
 
   return (
@@ -498,6 +539,7 @@ const MessageBlock = memo(function MessageBlock({
   onOpenChatCitation,
   highlight,
   registerBlock,
+  knownTags,
 }: {
   message: Message;
   prompt?: PromptMessage[];
@@ -508,6 +550,7 @@ const MessageBlock = memo(function MessageBlock({
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
   highlight?: boolean;
   registerBlock: (id: number, el: HTMLDivElement | null) => void;
+  knownTags?: readonly string[];
 }) {
   const { atLeast } = useDepth();
   const itemRefs = useRef<(HTMLLIElement | null)[]>([]);
@@ -537,6 +580,7 @@ const MessageBlock = memo(function MessageBlock({
         markdown={message.role === "assistant"}
         citationCount={showSources ? citations.length : 0}
         onCite={showSources ? jumpToSource : undefined}
+        knownTags={message.role === "user" ? knownTags : undefined}
       />
       {showSources && (
         <Sources
@@ -590,6 +634,21 @@ export function ChatView({
   // turn id, so re-clicking the *same* citation (fresh nonce) re-fires while streaming replies don't.
   const lastNonceRef = useRef<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Tag names that exist, so a `@mention` in a past turn can be shown as having resolved (#276).
+  // Fetched once per mount and only ever used for display — a chat whose tags fail to load renders
+  // its messages exactly as it did before the feature.
+  const [knownTags, setKnownTags] = useState<string[]>([]);
+  useEffect(() => {
+    let live = true;
+    listTags()
+      .then((t) => {
+        if (live) setKnownTags(t.map((x) => x.name));
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
 
   // Stable callbacks so memoised MessageBlocks don't re-render every streaming token (F-50). The
   // citation handler reads the latest prop through a ref, so it stays referentially stable even if the
@@ -669,6 +728,7 @@ export function ChatView({
             onOpenChatCitation={openCitation}
             highlight={flashMsg === m.id}
             registerBlock={registerBlock}
+            knownTags={knownTags}
           />
         ))}
         {streaming !== null && <Bubble role="assistant" content={streaming} markdown />}

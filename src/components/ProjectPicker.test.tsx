@@ -60,6 +60,49 @@ describe("ProjectPicker", () => {
     fireEvent.keyDown(input, { key: "," });
     expect(onChange).not.toHaveBeenCalled();
   });
+
+  // Inside a project's own file list, "Primary <that project>" on every row restates the heading
+  // above them. What it must NOT do is drop anything the user could not otherwise see or reach.
+  describe("hidePrimary", () => {
+    it("omits the primary pill when it names the project being viewed", () => {
+      render(
+        <ProjectPicker value={["Sales"]} onChange={vi.fn()} suggestions={[]} hidePrimary="sales" />,
+      );
+      expect(screen.queryByText(/Primary/)).toBeNull();
+      // The control to add another project stays: it is the only way to link one from here.
+      expect(screen.getByLabelText("Add a project")).toBeTruthy();
+    });
+
+    it("still shows the other projects, which are the part you cannot infer", () => {
+      render(
+        <ProjectPicker
+          value={["Sales", "Marketing"]}
+          onChange={vi.fn()}
+          suggestions={[]}
+          hidePrimary="Sales"
+        />,
+      );
+      expect(screen.queryByText(/Primary/)).toBeNull();
+      expect(screen.getByLabelText("Unlink from Marketing")).toBeTruthy();
+    });
+
+    // The document is homed elsewhere and merely LINKED here. Its primary names a different
+    // project, so hiding it would hide the answer to "where does this actually live?".
+    it("keeps a primary that names a different project", () => {
+      render(
+        <ProjectPicker
+          value={["Ops", "Sales"]}
+          onChange={vi.fn()}
+          suggestions={[]}
+          hidePrimary="Sales"
+        />,
+      );
+      expect(screen.getByText(/Primary/)).toBeTruthy();
+      expect(screen.getByText("Ops")).toBeTruthy();
+      // And this project's own pill keeps its remove control — the way to unlink from here.
+      expect(screen.getByLabelText("Unlink from Sales")).toBeTruthy();
+    });
+  });
 });
 
 describe("membership display", () => {

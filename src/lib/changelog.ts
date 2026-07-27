@@ -24,6 +24,21 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.99.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "You can now point a chat at a tag. Type @ in the message box and PM offers the projects and tags you have; pick one and that message searches it.",
+      "Pinning never shuts anything out — it adds and it leans. In a project chat it REACHES FURTHER: the project's own files stay, and the tagged ones join them, so you can ask the Marketing chat about something filed under Coding without leaving. In the main chat, which already searches everything, it LEANS: the tagged files are ranked up, and the rest of your library is still there. That is the difference between the two chats, and pinning a tag doesn't blur it.",
+      "It lasts exactly one message. Nothing is remembered, nothing is turned on: a chat scoped to a project still answers only from that project the moment you stop asking it not to.",
+      "Leaning is not forcing. A tag you pin only lifts files the question actually matched — asking about a tax deadline while pinning @marketing will not drag in marketing files that say nothing about tax.",
+      "The tag itself is taken out of the question before the search runs, so what PM matches on is what you actually asked, not the name of the tag you pinned.",
+      'The tags you pinned are highlighted in your sent message, so you can see which ones PM recognised and which were just words. A name with a space in it goes in quotes: @"Atlas, Inc.".',
+      "Your free-form tags now do something. They were labels PM stored and never used; they can now steer a chat, and searching (Ctrl-K) finds a file by any of its tags or projects, not just its name.",
+      "And they should group better from here: when PM files new documents it is now shown the tags you already have and asked to reuse them, instead of coining a near-duplicate. A label that only ever lands on one file is not doing anything.",
+      "In a project's file list, files no longer repeat the name of the project you are already looking at — you just see the OTHER projects a file belongs to, which is the part you cannot infer.",
+    ],
+  },
+  {
     version: "3.98.0-alpha",
     date: "2026-07-27",
     highlights: [

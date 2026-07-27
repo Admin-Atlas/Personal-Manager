@@ -44,6 +44,17 @@ export function RetrievalScoreTable({ rows }: { rows: DevRetrievalRow[] }) {
                   <div className="text-ink2">
                     {r.title}
                     {r.heading ? <span className="text-ink4"> §{r.heading}</span> : null}
+                    {/* A pinned chunk was fused twice (once globally, once through the pinned
+                        sub-branches), so without saying so its fused score reads as unexplainable
+                        against the vec/kw columns beside it. */}
+                    {r.pinned ? (
+                      <span
+                        className="ml-1 text-[0.625rem] uppercase tracking-wide text-accent-text"
+                        title="lifted by an @tag pin — fused through the pinned sub-branches too"
+                      >
+                        pinned
+                      </span>
+                    ) : null}
                   </div>
                   <div className="max-w-md whitespace-pre-wrap break-words text-ink4">
                     {r.preview}

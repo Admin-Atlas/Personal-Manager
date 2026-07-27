@@ -460,6 +460,7 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<bool> 
             ],
         )?;
         crate::tags::set_document_projects(conn, current.id, &it.project, &it.linked_projects)?;
+        crate::tags::set_document_group_tags(conn, current.id, &it.tags)?;
     }
     Ok(minted)
 }

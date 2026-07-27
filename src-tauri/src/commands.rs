@@ -1734,7 +1734,7 @@ pub async fn send_message(
     // Save the user turn and gather history + the learned profile + the
     // conversation's project scope. Scope the lock so the guard is dropped before
     // the network await below.
-    let (history, profile, scope, agenda, flag_ctx, summary, exclude_chat) = {
+    let (history, profile, scope, pinned_tags, agenda, flag_ctx, summary, exclude_chat) = {
         let conn = state.conn()?;
 
         let prior: i64 = conn.query_row(
@@ -1749,6 +1749,20 @@ pub async fn send_message(
             params![conversation_id],
             |row| row.get(0),
         )?;
+
+        // `@tag` (#276). Writing `@marketing` in a message pins that tag for THIS query: in a
+        // project chat it ADDS the tag's documents to the project's own (the explicit cross-scope
+        // pull), and in a global chat it NARROWS an otherwise unscoped search down to the tag (the
+        // tag-overview case). Deliberately per-message and never stored — the card's discipline is
+        // that broadening is user-invoked, never ambient, so a pin cannot outlive the turn that
+        // asked for it.
+        //
+        // Parsed here from the message the user actually sent, rather than taken as a payload from
+        // the webview: the text is the record of what was asked, so the scope and the transcript
+        // cannot disagree about it. Resolution is registry-backed, so an email address or a stray
+        // `@` widens nothing.
+        let pinned_tags =
+            crate::tags::resolve_mentions(&conn, &crate::tags::parse_mentions(&content))?;
 
         // Self-heal a wedged conversation (F-02 / B5-1): a previous send whose reply stream failed
         // (network/provider/timeout/over-window) — or a crash between persisting the user turn and its
@@ -1916,6 +1930,7 @@ pub async fn send_message(
             history,
             profile,
             scope,
+            pinned_tags,
             agenda,
             flag_ctx,
             summary,
@@ -1928,7 +1943,7 @@ pub async fn send_message(
     // If retrieval yields nothing (no docs / engine not ready), chat proceeds
     // exactly as before. A scoped chat draws only from its project.
     let (retrieved, top_score) =
-        retrieve_grounding(&app, content.clone(), scope, exclude_chat).await;
+        retrieve_grounding(&app, content.clone(), scope, pinned_tags, exclude_chat).await;
     let citations = retrieval::citations_from(&retrieved);
 
     // Confidence gate (card #402): when the best retrieved source scored below the active threshold —
@@ -2276,6 +2291,9 @@ async fn retrieve_grounding(
     app: &AppHandle,
     query: String,
     project: Option<String>,
+    // Tags the user pinned with `@tag` in this message (#276) — canonical registry names, already
+    // resolved against the registry by the caller, so an unrecognised `@word` never gets here.
+    pinned_tags: Vec<crate::tags::PinnedTag>,
     exclude_chat: Option<(i64, i64)>,
 ) -> GroundedChunks {
     let app = app.clone();
@@ -2309,6 +2327,11 @@ async fn retrieve_grounding(
             )
         };
 
+        // Search on the question, not on the pin. A resolved `@marketing` has already done its
+        // job — it chose the corpus — and leaving it in the text would ALSO embed it and OR it into
+        // the FTS MATCH, quietly turning a scope into a relevance boost. Scope-not-boost is the
+        // settled decision (a boost waits on #566's feedback corpus to calibrate it).
+        let query = crate::tags::strip_mentions(&query, &pinned_tags);
         let embeddings = gateway.embed_query(std::slice::from_ref(&query))?;
         let Some(query_vec) = embeddings.into_iter().next() else {
             return Ok((Vec::new(), None));
@@ -2320,6 +2343,7 @@ async fn retrieve_grounding(
             k,
             filters: retrieval::Filters {
                 project: project.clone(),
+                pinned_tags: pinned_tags.clone(),
                 exclude_chat,
                 ..Default::default()
             },
@@ -3118,6 +3142,15 @@ pub async fn transcribe_audio(app: AppHandle, audio_base64: String) -> Result<St
 
 // --- archivist: sorting review & organisation (Step 4) ---
 
+/// Every tag in the registry — projects and free-form labels alike — with its kind and how many
+/// documents carry it (#276). Feeds the composer's `@` autocomplete, which is the only way a user
+/// discovers that pinning a tag is possible at all.
+#[tauri::command]
+pub fn list_tags(state: State<'_, AppState>) -> Result<Vec<crate::tags::TagSummary>> {
+    let conn = state.conn()?;
+    crate::tags::list_all(&conn)
+}
+
 /// Distinct project labels across all documents — feeds the review project picker
 /// and biases the AI proposal toward projects that already exist.
 #[tauri::command]
@@ -3212,9 +3245,9 @@ pub async fn propose_metadata(
         folder: Option<String>,
     }
 
-    // Gather the documents + existing projects + learned profile under a short
+    // Gather the documents + existing projects + tags + learned profile under a short
     // lock, then drop it before any network call (rule #4).
-    let (pending, projects, profile) = {
+    let (pending, projects, tags, profile) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         // Global + context filing preferences only: the target project isn't chosen until the model
@@ -3224,6 +3257,10 @@ pub async fn propose_metadata(
         // Hand the model CANONICAL project names only (one per entity) — never the raw
         // `DISTINCT project`, which would offer variants like "PM"/"Atlas - PM" as co-equal.
         let projects = entities::canonical_project_names(&conn)?;
+        // The same courtesy for tags: name the vocabulary that exists so the model reuses it rather
+        // than coining a near-duplicate. Grouping is the entire point of a label, and a label that
+        // groups one document does nothing.
+        let tags = crate::tags::common_group_tags(&conn)?;
         let pending = {
             // Body sent to the filing model. For an index-only doc the chunks' `content` column is a
             // fixed placeholder (`INDEX_ONLY_BODY_PLACEHOLDER` — the body bytes are never stored), so
@@ -3275,7 +3312,7 @@ pub async fn propose_metadata(
                 .collect::<std::result::Result<Vec<_>, _>>()?
             }
         };
-        (pending, projects, profile)
+        (pending, projects, tags, profile)
     };
 
     let mut proposed = 0;
@@ -3297,7 +3334,7 @@ pub async fn propose_metadata(
             })
             .collect();
         let mut outcome =
-            review::propose_batch(&app, &plan, &docs, &projects, profile.as_deref()).await;
+            review::propose_batch(&app, &plan, &docs, &projects, &tags, profile.as_deref()).await;
         let batch_error = outcome.error.clone();
         // The served model per document, for the proposal cache's `model` column (UI/debug only).
         // Starts as whichever model answered the batch; a retried document overwrites its own slot,
@@ -3316,9 +3353,15 @@ pub async fn propose_metadata(
             if slot.is_some() {
                 continue;
             }
-            let mut retry =
-                review::propose_batch(&app, &plan, &docs[i..=i], &projects, profile.as_deref())
-                    .await;
+            let mut retry = review::propose_batch(
+                &app,
+                &plan,
+                &docs[i..=i],
+                &projects,
+                &tags,
+                profile.as_deref(),
+            )
+            .await;
             served[i] = retry.usage.as_ref().and_then(|(_, m, _)| m.clone());
             let retry_error = retry.error.clone();
             if let Some((usage, model, meta)) = retry.usage.take() {

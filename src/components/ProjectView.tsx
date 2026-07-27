@@ -366,6 +366,10 @@ export function ProjectView({
                     <div className="flex items-start gap-1.5 text-xs text-ink4">
                       <span className="shrink-0 pt-1">Projects</span>
                       <ProjectPicker
+                        // Inside this project, a "Primary <this project>" pill on every row just
+                        // restates the heading. What's left is what you don't already know: the
+                        // OTHER projects a file belongs to, and the input to add one.
+                        hidePrimary={project}
                         value={projectsOf(d)}
                         onChange={(projects) => {
                           const [home, ...also] = projects;
