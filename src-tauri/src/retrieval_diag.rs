@@ -162,12 +162,15 @@ fn render_rows(explain: &DevRetrievalExplain) -> String {
                 Some(h) if !h.trim().is_empty() => format!(" › {h}"),
                 _ => String::new(),
             };
+            // Named as a branch because that is exactly what it is: a pinned chunk was fused
+             // through two extra lists, which is why its score outruns its vector/keyword ranks.
+            let pinned = if r.pinned { "+pinned" } else { "" };
             let rerank = match r.reranker_score {
                 Some(s) => format!(", rerank {s:.3}"),
                 None => String::new(),
             };
             format!(
-                "{rank}. \"{title}{heading}\" [{branches}] fused {fused:.4}, decayed {decayed:.4}{rerank}",
+                "{rank}. \"{title}{heading}\" [{branches}{pinned}] fused {fused:.4}, decayed {decayed:.4}{rerank}",
                 rank = r.final_rank + 1,
                 title = r.title,
                 fused = r.fused_score,
@@ -195,6 +198,7 @@ mod tests {
             vector_distance: vector.then_some(0.2),
             keyword_rank: keyword.then_some(rank),
             fused_score: 0.5 - rank as f64 * 0.01,
+            pinned: false,
             decay_factor: 1.0,
             decayed_score: 0.5 - rank as f64 * 0.01,
             reranker_score: Some(0.9 - rank as f32 * 0.1),

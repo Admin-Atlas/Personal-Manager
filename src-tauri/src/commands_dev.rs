@@ -344,6 +344,13 @@ pub struct DevRetrievalRow {
     pub vector_distance: Option<f32>,
     pub keyword_rank: Option<usize>,
     pub fused_score: f64,
+    /// Whether a `@tag` pin lifted this chunk (#276). The fused score of a pinned chunk is larger
+    /// than its two branch ranks alone can account for, because it was fused a second time through
+    /// the pinned sub-branches; without this the panel would show an unexplainable number.
+    /// `serde(default)` so an explain payload captured before the flag existed still deserialises
+    /// when the in-chat diagnostic reads it back.
+    #[serde(default)]
+    pub pinned: bool,
     pub decay_factor: f64,
     pub decayed_score: f64,
     pub reranker_score: Option<f32>,
@@ -779,6 +786,7 @@ pub(crate) fn run_retrieval_explain(
                     vector_distance: c.vector_distance,
                     keyword_rank: c.keyword_rank,
                     fused_score: c.fused_score,
+                    pinned: c.pinned,
                     decay_factor: c.decay_factor,
                     decayed_score: c.decayed_score,
                     reranker_score,

@@ -210,7 +210,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "review-tags": {
     title: "Tags",
-    body: "Short, free-form labels for finding and grouping documents later — topics, people, or types like 'invoice', 'tax', 'spec', 'meeting'. They don't change a document's project or importance, but they are more than filing: type @tag in a chat and that message searches everything carrying the label, and search finds a file by its tags as well as its name. Keep them lowercase and short; press Enter or comma to add, × to remove. A document can have many; none is fine too.",
+    body: "Short, free-form labels for finding and grouping documents later — topics, people, or types like 'invoice', 'tax', 'spec', 'meeting'. They don't change a document's project or importance, but they are more than filing: type @tag in a chat and that message leans on everything carrying the label, and search finds a file by its tags as well as its name. Reuse a label you already have wherever it fits — a tag that only ever lands on one document isn't grouping anything. Keep them lowercase and short; press Enter or comma to add, × to remove. A document can have many; none is fine too.",
   },
 
   // Chat

@@ -1454,6 +1454,9 @@ export interface DevRetrievalRow {
   /** 0-based rank in the keyword/FTS branch; null if vector-only. */
   keyword_rank: number | null;
   fused_score: number;
+  /** A `@tag` pin lifted this chunk: it was fused a second time through the pinned sub-branches,
+   *  which is why its fused score outruns what its two branch ranks alone would give. */
+  pinned: boolean;
   decay_factor: number;
   decayed_score: number;
   reranker_score: number | null;

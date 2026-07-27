@@ -76,12 +76,17 @@ export function MentionSuggest({
           }`}
         >
           <span className="min-w-0 flex-1 truncate">{t.name}</span>
-          {/* Which namespace this is. Pinning a project reaches its files (including ones merely
-              linked into it); pinning a label reaches whatever carries the label. */}
+          {/* Which namespace this is — the only thing here that changes what picking it DOES, and
+              the one thing that tells two same-named entries apart. Pinning a project reaches its
+              files (including ones merely linked into it); pinning a label reaches whatever carries
+              the label.
+
+              The document count is deliberately NOT shown. It still orders the list — a tag you
+              actually use comes before one you typed once — but on screen it was a number nobody
+              was choosing by, competing for attention with the name and the kind, which are. */}
           <span className="shrink-0 text-[0.625rem] uppercase tracking-wide text-ink4">
             {t.kind === "project" ? "project" : "tag"}
           </span>
-          <span className="shrink-0 text-ink4">{t.documents}</span>
         </button>
       ))}
     </div>

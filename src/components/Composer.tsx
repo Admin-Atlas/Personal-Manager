@@ -47,11 +47,20 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
   // typed mention works with the panel closed, and a failure to load tags costs nothing.
   const [tags, setTags] = useState<TagSummary[]>([]);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  // Escape dismisses the list for the token the caret is sitting in. A REF, not state: the key-up
+  // for that very same Escape press has to see it, and by then React has already re-rendered with
+  // the list closed — so a guard that asked "is the list open?" would read the wrong value and let
+  // key-up re-read the token, putting the list straight back up. The caret has not moved, so
+  // without this Escape could never close the list at all.
+  const dismissed = useRef(false);
   const [active, setActive] = useState(0);
   const listboxId = useId();
   const optionId = (i: number) => `${listboxId}-opt-${i}`;
   const suggestions = mentionQuery === null ? [] : matchTags(tags, mentionQuery);
   const open = suggestions.length > 0;
+  // Clamped at the point of use: the highlight is reset by an effect, which runs after the render
+  // that shortened the list, so for one render `active` can point past the end.
+  const activeIndex = Math.min(active, Math.max(suggestions.length - 1, 0));
 
   // Loaded once per mount rather than per keystroke: the registry is small, and a fetch on every
   // `@` would put a round-trip between the keypress and the list.
@@ -70,11 +79,25 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
   }, []);
 
   // Re-read the token under the caret after any change to the text or the caret position.
+  //
+  // It deliberately does NOT reset the highlight. It runs on key-UP too, which is the same physical
+  // keypress the arrow keys were handled on in key-DOWN: resetting here put the highlight straight
+  // back to the first row every time someone pressed Down, so the list could not be walked at all.
+  // Resetting belongs with the thing that invalidates the highlight — the query changing — which is
+  // the effect below.
   const syncMention = useCallback((value: string, caret: number | null) => {
     const at = caret === null ? null : mentionAtCaret(value, caret);
-    setMentionQuery(at ? at.query : null);
-    setActive(0);
+    // Leaving the token ends the dismissal, so the next `@` gets a fresh list.
+    if (!at) dismissed.current = false;
+    setMentionQuery(at && !dismissed.current ? at.query : null);
   }, []);
+
+  // A new query means a new list, so the old highlight index means nothing (and may not even exist
+  // any more). Keyed on the query, so a keystroke that leaves the token unchanged leaves the
+  // highlight where the user put it.
+  useEffect(() => {
+    setActive(0);
+  }, [mentionQuery]);
 
   function pick(name: string) {
     const el = textareaRef.current;
@@ -164,7 +187,7 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
         <div className="relative flex items-end gap-2">
           <MentionSuggest
             items={suggestions}
-            active={active}
+            active={activeIndex}
             listboxId={listboxId}
             optionId={optionId}
             onPick={pick}
@@ -197,6 +220,9 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
             value={text}
             onChange={(e) => {
               setText(e.target.value);
+              // Typing more of the name asks for the list again; moving the caret around a token
+              // that was dismissed does not.
+              dismissed.current = false;
               syncMention(e.target.value, e.target.selectionStart);
               // Resize in the same event the value changes so the box grows AND shrinks immediately —
               // including when text is deleted or cleared, not just on the next layout pass.
@@ -214,21 +240,22 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
               if (open) {
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
-                  setActive((i) => Math.min(i + 1, suggestions.length - 1));
+                  setActive(Math.min(activeIndex + 1, suggestions.length - 1));
                   return;
                 }
                 if (e.key === "ArrowUp") {
                   e.preventDefault();
-                  setActive((i) => Math.max(i - 1, 0));
+                  setActive(Math.max(activeIndex - 1, 0));
                   return;
                 }
                 if (e.key === "Enter" || e.key === "Tab") {
                   e.preventDefault();
-                  pick(suggestions[active].name);
+                  pick(suggestions[activeIndex].name);
                   return;
                 }
                 if (e.key === "Escape") {
                   e.preventDefault();
+                  dismissed.current = true;
                   setMentionQuery(null);
                   return;
                 }
@@ -242,7 +269,7 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
             aria-expanded={open}
             aria-controls={open ? listboxId : undefined}
             aria-autocomplete="list"
-            aria-activedescendant={open ? optionId(active) : undefined}
+            aria-activedescendant={open ? optionId(activeIndex) : undefined}
             rows={1}
             placeholder="Ask anything…  (Enter to send, @ to pin a tag)"
             className="flex-1 px-4 py-2"

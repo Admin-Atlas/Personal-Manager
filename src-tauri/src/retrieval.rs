@@ -324,14 +324,21 @@ fn hybrid_core(
     multilingual: bool,
 ) -> Result<Vec<RetrievedChunk>> {
     let branch_limit = BRANCH_LIMIT.max(k);
-    let allowed = scope_allow_set(conn, project, pinned_tags)?;
+    let pinned_chunks = if pinned_tags.is_empty() {
+        None
+    } else {
+        Some(crate::tags::tag_chunk_ids(conn, pinned_tags)?)
+    };
+    let allowed = scope_allow_set(conn, project, pinned_chunks.as_ref())?;
     let excluded = match exclude_chat {
         Some((doc_id, turn_floor)) => Some(in_window_chat_chunk_ids(conn, doc_id, turn_floor)?),
         None => None,
     };
-    // Over-fetch when either filter is active so the surviving chunks fill the top-k even after the
-    // allow/deny passes; otherwise fetch exactly the branch limit.
-    let scoped = allowed.is_some() || excluded.is_some();
+    // Over-fetch whenever anything reweights or filters the raw branches; otherwise fetch exactly
+    // the branch limit. A pin needs this even in a global chat, where it adds no allow-set at all:
+    // the boost can only lift candidates that are IN the pool, so fetching a bare `branch_limit`
+    // would leave a pinned tag with nothing to lift and the pin doing visibly nothing.
+    let scoped = allowed.is_some() || excluded.is_some() || pinned_chunks.is_some();
     let fetch = if scoped {
         SCOPED_POOL.max(branch_limit)
     } else {
@@ -357,7 +364,12 @@ fn hybrid_core(
         vec_hits.truncate(widened);
         fts_hits.truncate(widened);
     }
-    let fused = fuse_scored(&[vec_hits, fts_hits]);
+    let mut lists = vec![vec_hits, fts_hits];
+    if let Some(pinned) = &pinned_chunks {
+        let boosted = pinned_branches(&lists[0], &lists[1], pinned, branch_limit);
+        lists.extend(boosted);
+    }
+    let fused = fuse_scored(&lists);
     // Return the recency-decayed candidate POOL (up to `branch_limit`, ~20 at the default k), not a
     // pre-truncated top-k: the caller reranks this whole pool and only then selects the final top-k
     // (`rerank_and_select` → `select_top_k`), so the cross-encoder judges every candidate and can
@@ -369,41 +381,72 @@ fn hybrid_core(
 }
 
 /// The chunk allow-set for one query: the project's own documents, plus anything the user pinned
-/// with `@tag` (#276).
+/// with `@tag` (#276). A global chat has no allow-set at all.
 ///
-/// `None` means "no filter" and is reserved for exactly one case — a global chat with nothing
-/// pinned. Every other combination produces a set, because every other combination is the user
-/// having said what they want searched:
-///
-/// | project | pinned | allow-set                    | what the user asked for              |
-/// |---------|--------|------------------------------|--------------------------------------|
-/// | set     | none   | the project                  | the default, unchanged               |
-/// | set     | some   | the project ∪ the tags       | "also search X" — cross-scope pull   |
-/// | none    | some   | the tags                     | "search all of X" — tag overview     |
-/// | none    | none   | `None`                       | an ordinary global chat              |
+/// | project | pinned | allow-set              | what the user asked for                       |
+/// |---------|--------|------------------------|-----------------------------------------------|
+/// | set     | none   | the project            | the default, unchanged                        |
+/// | set     | some   | the project ∪ the tags | "also search X" — the cross-scope pull        |
+/// | none    | some   | `None`                 | "lean on X" — a preference, not a restriction |
+/// | none    | none   | `None`                 | an ordinary global chat                       |
 ///
 /// The project-chat case UNIONS rather than intersects, which is the point: pinning a tag in a
 /// project chat is a request to reach further, not to filter down what is already there.
 ///
-/// A pinned tag that matches no documents contributes an empty set rather than disappearing, so a
-/// typo'd `@tag` in a global chat narrows to nothing and returns no grounding — visibly wrong,
-/// rather than silently searching everything the user believed they had scoped away.
+/// **The global case does not narrow** (Bobby, 2026-07-27, correcting this PR's first cut). A pin
+/// that restricted the global chat to one tag made it a slower way to do what opening that
+/// project's own chat already does, and left the global chat unable to answer the one question only
+/// it can: "using everything I have, but leaning on X". Restricting is what a project chat IS; the
+/// only difference between the two surfaces is that one restricts and the other does not, so a pin
+/// must never turn one into the other.
+///
+/// A pin still does its work in a global chat — in the RANKING, via [`pinned_branches`]. The rule
+/// across both surfaces is one sentence: *pinning a tag adds its documents to what can be searched
+/// and ranks them ahead of equally relevant others; it never removes anything.*
 fn scope_allow_set(
     conn: &Connection,
     project: Option<&str>,
-    pinned_tags: &[crate::tags::PinnedTag],
+    pinned_chunks: Option<&std::collections::HashSet<i64>>,
 ) -> Result<Option<std::collections::HashSet<i64>>> {
-    if project.is_none() && pinned_tags.is_empty() {
+    let Some(project) = project else {
         return Ok(None);
-    }
-    let mut allowed = match project {
-        Some(p) => project_chunk_ids(conn, p)?,
-        None => std::collections::HashSet::new(),
     };
-    if !pinned_tags.is_empty() {
-        allowed.extend(crate::tags::tag_chunk_ids(conn, pinned_tags)?);
+    let mut allowed = project_chunk_ids(conn, project)?;
+    if let Some(pinned) = pinned_chunks {
+        allowed.extend(pinned.iter().copied());
     }
     Ok(Some(allowed))
+}
+
+/// The pinned-tag boost (#276): the same two branches restricted to the pinned documents, to be
+/// fused alongside the unrestricted ones.
+///
+/// RRF sums `1/(RRF_K + rank)` across lists, so a chunk that also appears in a pinned sub-list earns
+/// a SECOND contribution on top of whatever it earned globally — and the best match *within* the tag
+/// earns the largest one. That is what "weight these more" means mechanically, and expressing it in
+/// the fusion the ranking already uses means there is no magic multiplier and no second scale to
+/// keep calibrated.
+///
+/// It is a preference, not an injection. These lists are derived from candidates the query already
+/// matched, so a pinned document that is simply not relevant never enters a branch and is never
+/// lifted: asking a global chat about a tax deadline while pinning `@marketing` must not drag in
+/// Marketing files that say nothing about tax.
+fn pinned_branches(
+    vec_hits: &[i64],
+    fts_hits: &[i64],
+    pinned: &std::collections::HashSet<i64>,
+    limit: usize,
+) -> Vec<Vec<i64>> {
+    [vec_hits, fts_hits]
+        .into_iter()
+        .map(|hits| {
+            hits.iter()
+                .copied()
+                .filter(|id| pinned.contains(id))
+                .take(limit)
+                .collect()
+        })
+        .collect()
 }
 
 /// The chunk ids belonging to a project's documents — the allow-set for a scoped
@@ -768,6 +811,11 @@ pub struct ExplainCandidate {
     pub keyword_rank: Option<usize>,
     /// RRF fused score (post-fusion, pre-decay).
     pub fused_score: f64,
+    /// True when this chunk belongs to a tag the turn pinned with `@tag`, and so was fused a second
+    /// time through the pinned sub-branches. Without it the panel would show a fused score larger
+    /// than its two per-branch ranks can account for, with nothing on screen to say why — a
+    /// diagnostic that hides the reason for a ranking is worse than no diagnostic.
+    pub pinned: bool,
     /// Document age in days (`None` when undated), the recency multiplier applied, and the final
     /// decayed score the top-k cut ranks by.
     pub age_days: Option<f64>,
@@ -797,9 +845,15 @@ pub fn explain(
     use std::collections::HashMap;
 
     let branch_limit = BRANCH_LIMIT.max(k);
-    // The same seam `hybrid_core` uses, so the two can never drift.
-    let allowed = scope_allow_set(conn, project, pinned_tags)?;
-    let fetch = if allowed.is_some() {
+    // The same seams `hybrid_core` uses, so the two can never drift.
+    let pinned_chunks = if pinned_tags.is_empty() {
+        None
+    } else {
+        Some(crate::tags::tag_chunk_ids(conn, pinned_tags)?)
+    };
+    let allowed = scope_allow_set(conn, project, pinned_chunks.as_ref())?;
+    let scoped = allowed.is_some() || pinned_chunks.is_some();
+    let fetch = if scoped {
         SCOPED_POOL.max(branch_limit)
     } else {
         branch_limit
@@ -810,8 +864,13 @@ pub fn explain(
     if let Some(allowed) = &allowed {
         vec_scored.retain(|(id, _)| allowed.contains(id));
         fts_hits.retain(|id| allowed.contains(id));
-        vec_scored.truncate(branch_limit);
-        fts_hits.truncate(branch_limit);
+    }
+    if scoped {
+        // The same widening production applies — this panel is only worth having if the pool it
+        // explains is the pool the answer came from.
+        let widened = branch_limit.saturating_mul(1 + pinned_tags.len());
+        vec_scored.truncate(widened);
+        fts_hits.truncate(widened);
     }
 
     // Per-branch rank + (vector) distance, keeping the best (first) rank for any duplicate id.
@@ -826,9 +885,16 @@ pub fn explain(
         keyword_rank.entry(*id).or_insert(rank);
     }
 
-    // Fuse with the SAME function production uses, so the ranking can't drift.
+    // Fuse with the SAME function production uses, so the ranking can't drift — including the
+    // pinned sub-branches, without which a pinned chunk's fused score here would not match the one
+    // that actually ranked it.
     let vec_hits: Vec<i64> = vec_scored.iter().map(|(id, _)| *id).collect();
-    let fused = fuse_scored(&[vec_hits, fts_hits]);
+    let mut lists = vec![vec_hits, fts_hits];
+    if let Some(pinned) = &pinned_chunks {
+        let boosted = pinned_branches(&lists[0], &lists[1], pinned, branch_limit);
+        lists.extend(boosted);
+    }
+    let fused = fuse_scored(&lists);
     let fused_score: HashMap<i64, f64> = fused.iter().copied().collect();
 
     // Recency: age + factor per candidate, then the top-k cut by decayed score (mirrors apply_recency).
@@ -880,6 +946,7 @@ pub fn explain(
             vector_distance: vector_distance.get(&id).copied(),
             keyword_rank: keyword_rank.get(&id).copied(),
             fused_score: fused_score.get(&id).copied().unwrap_or(0.0),
+            pinned: pinned_chunks.as_ref().is_some_and(|p| p.contains(&id)),
             age_days: age,
             decay_factor: factor,
             decayed_score,
@@ -1717,6 +1784,171 @@ mod tests {
         let scoped = search(&conn, "agenda", &unit_vec(0), 6, Some("Beta"));
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].title, "Beta note");
+    }
+
+    /// Put `title` under a free-form label and return the pin that names it.
+    fn tag_doc(conn: &Connection, title: &str, tag: &str) -> crate::tags::PinnedTag {
+        let doc_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE title = ?1",
+                params![title],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::tags::set_document_group_tags(conn, doc_id, &[tag.to_string()]).unwrap();
+        crate::tags::resolve_mentions(conn, &[tag.to_string()])
+            .unwrap()
+            .remove(0)
+    }
+
+    fn search_pinned(
+        conn: &Connection,
+        text: &str,
+        embedding: &[f32],
+        k: usize,
+        project: Option<&str>,
+        pinned: &[crate::tags::PinnedTag],
+    ) -> Vec<RetrievedChunk> {
+        let q = RetrieveQuery {
+            text,
+            embedding,
+            k,
+            filters: Filters {
+                project: project.map(str::to_string),
+                pinned_tags: pinned.to_vec(),
+                ..Default::default()
+            },
+            strategy: Strategy::HybridRrf,
+            multilingual: false,
+        };
+        retrieve(conn, &q, None).unwrap()
+    }
+
+    /// The correction Bobby made to this PR's first cut (2026-07-27): a pin in a GLOBAL chat must
+    /// rank, not restrict. Restricting is what a project chat is for — a global chat that narrowed
+    /// to one tag would just be a slower way of switching to that project's chat, and the one
+    /// question only a global chat can answer ("using everything, but leaning on X") would have had
+    /// no way to be asked at all.
+    #[test]
+    fn a_pin_in_a_global_chat_ranks_up_without_shutting_anything_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(
+            &dir.path().join("t.sqlite"),
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+
+        // Two equally good matches, inserted so that the UNTAGGED one wins the unpinned ordering —
+        // asserted just below, so the premise cannot rot silently. The pin then has to overturn a
+        // real ranking rather than agree with one that was already going its way.
+        insert_doc_in_project(
+            &conn,
+            "Tagged note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Beta",
+        );
+        insert_doc_in_project(
+            &conn,
+            "Plain note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Alpha",
+        );
+        let pin = tag_doc(&conn, "Tagged note", "ops");
+
+        let unpinned = search(&conn, "agenda", &unit_vec(0), 6, None);
+        assert_eq!(
+            unpinned
+                .iter()
+                .map(|c| c.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Plain note", "Tagged note"],
+            "premise: with nothing pinned, the untagged document ranks first"
+        );
+
+        let pinned = search_pinned(&conn, "agenda", &unit_vec(0), 6, None, &[pin]);
+        assert_eq!(
+            pinned.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            vec!["Tagged note", "Plain note"],
+            "the pinned document is ranked up, and the untagged one is still there"
+        );
+    }
+
+    /// A pin is a preference, not an injection: it lifts what the query already matched. A tagged
+    /// document with nothing to do with the question must not be dragged in by the pin alone.
+    #[test]
+    fn a_pin_does_not_inject_a_document_the_query_never_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(
+            &dir.path().join("t.sqlite"),
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+
+        insert_doc_in_project(&conn, "Agenda", "the meeting agenda", &unit_vec(0), "Alpha");
+        insert_doc_in_project(
+            &conn,
+            "Unrelated",
+            "sourdough starter",
+            &unit_vec(5),
+            "Beta",
+        );
+        let pin = tag_doc(&conn, "Unrelated", "ops");
+
+        let hits = search_pinned(&conn, "agenda", &unit_vec(0), 1, None, &[pin]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].title, "Agenda",
+            "pinning a tag must not promote a document the query did not reach"
+        );
+    }
+
+    /// The project case is unchanged and stays a UNION: the pin reaches further without letting the
+    /// rest of the store in.
+    #[test]
+    fn a_pin_in_a_project_chat_reaches_the_tag_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(
+            &dir.path().join("t.sqlite"),
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+
+        insert_doc_in_project(
+            &conn,
+            "Alpha note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Alpha",
+        );
+        insert_doc_in_project(
+            &conn,
+            "Beta note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Beta",
+        );
+        insert_doc_in_project(
+            &conn,
+            "Gamma note",
+            "the meeting agenda",
+            &unit_vec(0),
+            "Gamma",
+        );
+        let pin = tag_doc(&conn, "Beta note", "ops");
+
+        let hits = search_pinned(&conn, "agenda", &unit_vec(0), 6, Some("Alpha"), &[pin]);
+        let titles: Vec<&str> = hits.iter().map(|c| c.title.as_str()).collect();
+        assert!(
+            titles.contains(&"Alpha note"),
+            "the project's own file stays"
+        );
+        assert!(titles.contains(&"Beta note"), "the pinned file is reached");
+        assert!(
+            !titles.contains(&"Gamma note"),
+            "an untagged file outside the project is still out of scope"
+        );
     }
 
     /// A test reranker that flips the order (scores ascending by position, so the last passage

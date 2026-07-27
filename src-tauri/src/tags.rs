@@ -242,6 +242,37 @@ pub fn list_all(conn: &Connection) -> Result<Vec<TagSummary>> {
     Ok(rows)
 }
 
+/// How many established labels the filing prompt is shown. Enough that a real vocabulary is
+/// visible, few enough that the list stays a hint rather than a menu the model works through — and
+/// bounded, because unlike projects the label space has no natural ceiling.
+const PROMPT_TAG_LIMIT: usize = 60;
+
+/// The free-form labels already in use, most-used first, for the filing prompt.
+///
+/// Tags only earn their keep by GROUPING things (Bobby, 2026-07-27). The prompt has always named
+/// the existing projects and asked the model to prefer one; it said nothing at all about existing
+/// tags, so every batch invented its own vocabulary and `tax` / `taxes` / `taxation` accumulated
+/// side by side. Naming them is the cheap half of the fix — the half that stops new drift.
+///
+/// Only `kind = 'group'`: a project is reachable as a project, and offering project names here
+/// would invite the model to duplicate a document's filing as a label.
+///
+/// The order is deterministic (count, then normalised name) because this list goes in the CACHED
+/// system prefix (#509) — a set that reshuffled between calls in a run would silently cost the
+/// prompt cache on every document.
+pub fn common_group_tags(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.name FROM tags t \
+         WHERE t.kind = 'group' \
+         ORDER BY (SELECT COUNT(*) FROM document_tags dt WHERE dt.tag_id = t.id) DESC, t.norm \
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![PROMPT_TAG_LIMIT as i64], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// The `@mentions` in a message, in the order written, deduplicated on the normalised form.
 ///
 /// A bare mention ends at whitespace — a greedy rule would swallow the rest of the sentence — and

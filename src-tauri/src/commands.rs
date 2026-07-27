@@ -3245,9 +3245,9 @@ pub async fn propose_metadata(
         folder: Option<String>,
     }
 
-    // Gather the documents + existing projects + learned profile under a short
+    // Gather the documents + existing projects + tags + learned profile under a short
     // lock, then drop it before any network call (rule #4).
-    let (pending, projects, profile) = {
+    let (pending, projects, tags, profile) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         // Global + context filing preferences only: the target project isn't chosen until the model
@@ -3257,6 +3257,10 @@ pub async fn propose_metadata(
         // Hand the model CANONICAL project names only (one per entity) — never the raw
         // `DISTINCT project`, which would offer variants like "PM"/"Atlas - PM" as co-equal.
         let projects = entities::canonical_project_names(&conn)?;
+        // The same courtesy for tags: name the vocabulary that exists so the model reuses it rather
+        // than coining a near-duplicate. Grouping is the entire point of a label, and a label that
+        // groups one document does nothing.
+        let tags = crate::tags::common_group_tags(&conn)?;
         let pending = {
             // Body sent to the filing model. For an index-only doc the chunks' `content` column is a
             // fixed placeholder (`INDEX_ONLY_BODY_PLACEHOLDER` — the body bytes are never stored), so
@@ -3308,7 +3312,7 @@ pub async fn propose_metadata(
                 .collect::<std::result::Result<Vec<_>, _>>()?
             }
         };
-        (pending, projects, profile)
+        (pending, projects, tags, profile)
     };
 
     let mut proposed = 0;
@@ -3330,7 +3334,7 @@ pub async fn propose_metadata(
             })
             .collect();
         let mut outcome =
-            review::propose_batch(&app, &plan, &docs, &projects, profile.as_deref()).await;
+            review::propose_batch(&app, &plan, &docs, &projects, &tags, profile.as_deref()).await;
         let batch_error = outcome.error.clone();
         // The served model per document, for the proposal cache's `model` column (UI/debug only).
         // Starts as whichever model answered the batch; a retried document overwrites its own slot,
@@ -3349,9 +3353,15 @@ pub async fn propose_metadata(
             if slot.is_some() {
                 continue;
             }
-            let mut retry =
-                review::propose_batch(&app, &plan, &docs[i..=i], &projects, profile.as_deref())
-                    .await;
+            let mut retry = review::propose_batch(
+                &app,
+                &plan,
+                &docs[i..=i],
+                &projects,
+                &tags,
+                profile.as_deref(),
+            )
+            .await;
             served[i] = retry.usage.as_ref().and_then(|(_, m, _)| m.clone());
             let retry_error = retry.error.clone();
             if let Some((usage, model, meta)) = retry.usage.take() {

@@ -199,12 +199,15 @@ pub fn batches<T>(docs: &[T]) -> impl Iterator<Item = &[T]> {
 ///
 /// `profile` is the distilled Learning-You preamble (Step 4b) biasing proposals toward how this
 /// user already files things; `None` before any profile exists. It is run-wide, never
-/// per-document, so it can live in the cached system prefix.
+/// per-document, so it can live in the cached system prefix. `existing_tags` is run-wide for the
+/// same reason, and exists for the same purpose as `existing_projects`: to make the model reuse the
+/// vocabulary the store already has instead of coining a near-duplicate of it.
 pub async fn propose_batch(
     app: &tauri::AppHandle,
     plan: &crate::llm_gateway::RoutePlan,
     docs: &[DocInput<'_>],
     existing_projects: &[String],
+    existing_tags: &[String],
     profile: Option<&str>,
 ) -> BatchOutcome {
     if docs.is_empty() {
@@ -214,7 +217,7 @@ pub async fn propose_batch(
             error: None,
         };
     }
-    let messages = build_messages(docs, existing_projects, profile);
+    let messages = build_messages(docs, existing_projects, existing_tags, profile);
     // cache_prefix: the system message carries only run-wide context (instructions, canonical
     // projects, the global profile), so it is byte-identical for every call in a run and the
     // provider can serve it from cache. Per-document context belongs in the user message, AFTER the
@@ -251,12 +254,22 @@ pub async fn propose_batch(
 fn build_messages(
     docs: &[DocInput<'_>],
     existing_projects: &[String],
+    existing_tags: &[String],
     profile: Option<&str>,
 ) -> Vec<ChatMessage> {
     let projects = if existing_projects.is_empty() {
         "(none yet)".to_string()
     } else {
         existing_projects.join(", ")
+    };
+    // The same treatment projects have always had, extended to tags (Bobby, 2026-07-27). A tag is
+    // only worth anything if it GROUPS documents, and a model shown no vocabulary invents a fresh
+    // one per batch — which is how a store ends up with `tax`, `taxes` and `taxation` all meaning
+    // the same thing and none of them collecting more than a couple of files.
+    let tags = if existing_tags.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        existing_tags.join(", ")
     };
     // The learned profile (if any) goes right after the role so the model files
     // the way the user has corrected it to before — the reuse half of learning.
@@ -272,7 +285,12 @@ fn build_messages(
          Existing projects: {projects}\n\
          Prefer an existing project if one fits; only invent a new project name if none do. \
          importance is \"high\", \"medium\", or \"low\" (or null if unclear). Use at most 5 short, \
-         lowercase tags.\n\n\
+         lowercase tags.\n\
+         Tags already in use: {tags}\n\
+         REUSE an existing tag whenever it fits, exactly as spelled above, rather than coining a \
+         near-duplicate — a tag is only useful if it groups documents together, and \"tax\", \
+         \"taxes\" and \"taxation\" sitting side by side group nothing. Only invent a tag when the \
+         document is genuinely about something none of these cover.\n\n\
          The next message holds one or more documents, each opening with a line \
          \"=== Document N ===\". Judge every one of them on its own.\n\n\
          Reply with ONLY a JSON object, no prose or code fences:\n\
@@ -616,6 +634,10 @@ mod tests {
         vec!["Finances".to_string(), "Atlas".to_string()]
     }
 
+    fn tags() -> Vec<String> {
+        vec!["invoice".to_string(), "tax".to_string()]
+    }
+
     fn doc<'a>(title: &'a str, body: &'a str, folder: Option<&'a str>) -> DocInput<'a> {
         DocInput {
             title,
@@ -633,6 +655,7 @@ mod tests {
         let a = build_messages(
             &[doc("Invoice.pdf", "body a", Some("Taxes"))],
             &projects(),
+            &tags(),
             profile,
         );
         let b = build_messages(
@@ -641,6 +664,7 @@ mod tests {
                 doc("Deck.pdf", "body c", None),
             ],
             &projects(),
+            &tags(),
             profile,
         );
         assert_eq!(a[0].role, "system");
@@ -652,6 +676,22 @@ mod tests {
         assert_ne!(a[1].content, b[1].content);
     }
 
+    /// Tags earn their keep by grouping, and a model shown no vocabulary invents a fresh one per
+    /// batch — which is how a store ends up with `tax`, `taxes` and `taxation` each holding two
+    /// documents. The existing labels are named in the cached prefix and reuse is asked for
+    /// explicitly, exactly as it already is for projects.
+    #[test]
+    fn the_existing_tag_vocabulary_is_offered_and_reuse_is_asked_for() {
+        let sys = &build_messages(&[doc("t", "b", None)], &projects(), &tags(), None)[0].content;
+        assert!(sys.contains("Tags already in use: invoice, tax"));
+        assert!(sys.contains("REUSE an existing tag"));
+
+        // A fresh store says so rather than showing an empty list, which would read as "no tags
+        // are allowed" instead of "there are none yet".
+        let empty = &build_messages(&[doc("t", "b", None)], &projects(), &[], None)[0].content;
+        assert!(empty.contains("Tags already in use: (none yet)"));
+    }
+
     /// A folder name is ingested content, so it belongs in the user message as DATA (rule #6) —
     /// never in instructions position. Since "Shared with me" is indexed, the name can be chosen
     /// by someone other than the user.
@@ -661,6 +701,7 @@ mod tests {
         let m = build_messages(
             &[doc("q4.pdf", "quarterly figures", Some(hostile))],
             &projects(),
+            &tags(),
             None,
         );
         assert!(
@@ -680,8 +721,8 @@ mod tests {
     /// No folder (a vault / chat / photo document) adds no line and no stray blank.
     #[test]
     fn absent_or_blank_folder_adds_nothing() {
-        let none = build_messages(&[doc("t", "b", None)], &projects(), None);
-        let blank = build_messages(&[doc("t", "b", Some("   "))], &projects(), None);
+        let none = build_messages(&[doc("t", "b", None)], &projects(), &tags(), None);
+        let blank = build_messages(&[doc("t", "b", Some("   "))], &projects(), &tags(), None);
         assert_eq!(
             none[1].content,
             "=== Document 1 ===\nTitle: t\n\nDocument:\nb\n"
@@ -696,7 +737,12 @@ mod tests {
     /// this seam, so the old hardcoded "Drive folder" wording was wrong for two of the three.
     #[test]
     fn folder_is_trimmed_and_named_without_a_connector() {
-        let m = build_messages(&[doc("t", "b", Some("  Taxes 2025  "))], &projects(), None);
+        let m = build_messages(
+            &[doc("t", "b", Some("  Taxes 2025  "))],
+            &projects(),
+            &tags(),
+            None,
+        );
         assert!(m[1].content.contains("Found in folder: Taxes 2025\n"));
         assert!(!m[1].content.contains("Drive"));
     }
@@ -705,7 +751,7 @@ mod tests {
     #[test]
     fn body_is_truncated_to_the_excerpt_cap() {
         let long = "x".repeat(EXCERPT_CHARS * 2);
-        let m = build_messages(&[doc("t", &long, None)], &projects(), None);
+        let m = build_messages(&[doc("t", &long, None)], &projects(), &tags(), None);
         assert!(m[1].content.matches('x').count() == EXCERPT_CHARS);
     }
 
@@ -719,6 +765,7 @@ mod tests {
                 doc("c.pdf", "ccc", None),
             ],
             &projects(),
+            &tags(),
             None,
         );
         let u = &m[1].content;
