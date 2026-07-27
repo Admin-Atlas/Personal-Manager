@@ -935,7 +935,12 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "ALTER TABLE usage_log DROP COLUMN provider; \
+            // v43: `corrections` predates the rewind point, so unlike `project_milestones` (dropped
+            // wholesale below) its added column has to come off explicitly — and its index first,
+            // since SQLite won't drop an indexed column.
+            "DROP INDEX idx_corrections_pipeline; \
+             ALTER TABLE corrections DROP COLUMN pipeline_version; \
+             ALTER TABLE usage_log DROP COLUMN provider; \
              ALTER TABLE usage_log DROP COLUMN latency_ms; \
              ALTER TABLE usage_log DROP COLUMN fallback_reason; \
              ALTER TABLE documents DROP COLUMN rebuild_pass; \
@@ -1100,7 +1105,12 @@ mod tests {
         let conn = open(&path, KEY).unwrap();
 
         conn.execute_batch(
-            "ALTER TABLE usage_log DROP COLUMN provider; \
+            // v43: `corrections` predates the rewind point, so unlike `project_milestones` (dropped
+            // wholesale below) its added column has to come off explicitly — and its index first,
+            // since SQLite won't drop an indexed column.
+            "DROP INDEX idx_corrections_pipeline; \
+             ALTER TABLE corrections DROP COLUMN pipeline_version; \
+             ALTER TABLE usage_log DROP COLUMN provider; \
              ALTER TABLE usage_log DROP COLUMN latency_ms; \
              ALTER TABLE usage_log DROP COLUMN fallback_reason; \
              ALTER TABLE documents DROP COLUMN rebuild_pass; \

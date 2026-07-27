@@ -1177,6 +1177,25 @@ const MIGRATIONS: &[&str] = &[
     -- guard:allow — preserving backfill: fills the freshly-added, all-NULL status; overwrites nothing.
     UPDATE project_milestones SET status = 'done' WHERE state = 'met';
     "#,
+    // v43 (Stage-4 card 9): stamp each logged correction with the version of the FILING PIPELINE that
+    // produced the proposal being corrected (`review::FILING_PIPELINE_VERSION`).
+    //
+    // Why this column has to exist before it has a reader: per-source filing accuracy is measured by
+    // counting corrections against filings, and that number is only meaningful WITHIN one pipeline
+    // version. Every improvement to the filing AI silently invalidates the accumulated stats — the
+    // proven case is #360, where the filing AI was near-blind on index-only connector documents, so
+    // every correction logged before 2026-07-14 understates connector accuracy against a pipeline
+    // that no longer exists. Nothing in the data says so, and nothing ever can: the rows are already
+    // written and unlabelable. Stamping from here on is the only point at which the history stays
+    // interpretable, which is why the column lands ahead of the consumer that will window on it.
+    //
+    // Deliberately NULLable with no backfill. A pre-v43 row genuinely does not know which pipeline
+    // wrote it, and inventing a version for it would assert something false about exactly the rows
+    // this column exists to distinguish. NULL reads as "unlabelable — predates the stamp".
+    r#"
+    ALTER TABLE corrections ADD COLUMN pipeline_version INTEGER;  -- NULL = logged before v43
+    CREATE INDEX idx_corrections_pipeline ON corrections(pipeline_version, created_at);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1232,7 +1251,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 42,
+            version, 43,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1251,7 +1270,8 @@ mod tests {
              Review AI-proposal cache is v39; \
              calendar event popup detail columns is v40; \
              preferences.source admits 'imported' is v41; \
-             project_milestones status + source_type/external_id is v42)"
+             project_milestones status + source_type/external_id is v42; \
+             corrections filing-pipeline version stamp is v43)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
