@@ -3720,6 +3720,129 @@ pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> 
     .await
 }
 
+/// What a project merge will move — the honest, computed preview behind the type-to-confirm
+/// ceremony (#279). The counts are cheap because they are exactly the predicates the merge
+/// itself runs: documents move by `entity_id`, milestones and chats by project *name*.
+///
+/// `files` deliberately EXCLUDES chat documents. A chat is a `documents` row too, so counting
+/// the table raw would report every chat twice — once as a file and once as a chat — in the
+/// one sentence the user reads before an irreversible action.
+#[derive(serde::Serialize)]
+pub struct MergePreview {
+    pub files: i64,
+    pub milestones: i64,
+    pub chats: i64,
+    /// The target's canonical name, resolved through the alias table. This is what the source's
+    /// documents end up filed under, so it is also the string the user must type to confirm —
+    /// typing the alias they happened to click would confirm a name that never appears again.
+    pub into_canonical: String,
+}
+
+/// Resolve the two project names a merge names, applying the same guards `merge_projects` will,
+/// so the UI can refuse an impossible merge before the ceremony rather than after it.
+fn resolve_merge_pair(conn: &Connection, from: &str, into: &str) -> Result<(i64, i64, String)> {
+    let (from, into) = (from.trim(), into.trim());
+    if from.is_empty() || into.is_empty() {
+        return Err(Error::Other("both projects must be named".into()));
+    }
+    let from_id = entities::resolve_project(conn, from, false)?
+        .ok_or_else(|| Error::Other(format!("no project named \"{from}\"")))?;
+    let into_id = entities::resolve_project(conn, into, false)?
+        .ok_or_else(|| Error::Other(format!("no project named \"{into}\"")))?;
+    if from_id == into_id {
+        return Err(Error::Other(
+            "that is the same project — pick a different one to merge into".into(),
+        ));
+    }
+    // Mirror `entities::merge_entities`' guard here rather than letting the merge fail after the
+    // user has typed the confirmation: Unsorted is the inbox, and merging FROM it would sweep
+    // every unreviewed document into another project.
+    if entities::resolve_project(conn, "Unsorted", false)? == Some(from_id) {
+        return Err(Error::Other(
+            "Unsorted is PM's inbox and can't be merged into another project".into(),
+        ));
+    }
+    let into_canonical = entities::canonical_name(conn, into_id)?;
+    Ok((from_id, into_id, into_canonical))
+}
+
+/// Count what merging `from` into `into` would move. Read-only; safe to call on every keystroke
+/// of the target picker.
+#[tauri::command]
+pub fn merge_project_preview(
+    state: State<'_, AppState>,
+    from: String,
+    into: String,
+) -> Result<MergePreview> {
+    let conn = state.conn()?;
+    let (from_id, _, into_canonical) = resolve_merge_pair(&conn, &from, &into)?;
+    let from_canonical = entities::canonical_name(&conn, from_id)?;
+
+    let files: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents \
+         WHERE entity_id = ?1 AND COALESCE(source_type,'') <> 'chat'",
+        params![from_id],
+        |r| r.get(0),
+    )?;
+    let milestones: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM project_milestones WHERE project_name = ?1",
+        params![from_canonical],
+        |r| r.get(0),
+    )?;
+    let chats: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM conversations WHERE project = ?1",
+        params![from_canonical],
+        |r| r.get(0),
+    )?;
+    Ok(MergePreview {
+        files,
+        milestones,
+        chats,
+        into_canonical,
+    })
+}
+
+/// Fold one project into another **by name** — the project-level *Merge into* (#279), and the
+/// replacement for the `parent` field #278 retired.
+///
+/// This is deliberately a thin resolver over [`merge_entities`] rather than a second merge
+/// implementation. A project's identity IS its entity, so "merge Landing Page Redesign into
+/// Marketing" and "merge these two name variants" are the same operation reached from two
+/// surfaces; duplicating the engine would mean two places to keep the satellite re-keying,
+/// the alias fold and the vault rewrite correct.
+#[tauri::command]
+pub async fn merge_projects(app: AppHandle, from: String, into: String) -> Result<()> {
+    // Resolve OUTSIDE the mutation so a bad pair fails fast with a clear message, then re-resolve
+    // inside the transaction (below) — ids can't be trusted across the lock boundary.
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        resolve_merge_pair(&conn, &from, &into)?;
+    }
+    spawn_entity_mutation(
+        app,
+        move |tx, vault, cipher, vault_root, manifest_cipher| {
+            let (from_id, into_id, _) = resolve_merge_pair(tx, &from, &into)?;
+            // Identical ordering to `merge_entities`: capture the folded name BEFORE the entity
+            // row dies, fold the entity, then re-key the name-keyed satellites onto the survivor.
+            let old = entities::canonical_name(tx, from_id)?;
+            entities::merge_entities(tx, from_id, into_id)?;
+            let canonical = entities::canonical_name(tx, into_id)?;
+            projects::rename_project_satellites(tx, &old, &canonical)?;
+            rewrite_entity_documents(
+                tx,
+                vault,
+                cipher,
+                vault_root,
+                manifest_cipher,
+                into_id,
+                &canonical,
+            )
+        },
+    )
+    .await
+}
+
 /// Merge `from_id` into `into_id`: fold aliases, repoint every document, rewrite their frontmatter
 /// + cache to the target canonical, and delete the empty source — the headline action that fixes
 /// the variant pain in one move and stops it recurring.
@@ -3770,7 +3893,6 @@ pub fn set_project_metadata(
     deadline: Option<String>,
     size: Option<String>,
     blocked_by: Option<String>,
-    parent: Option<String>,
     // Manual priority override ("high"/"medium"/"low"); None / "auto" / blank = Auto (no tag).
     // Optional on the wire so an older caller that omits it still deserializes (serde → None).
     importance: Option<String>,
@@ -3780,10 +3902,10 @@ pub fn set_project_metadata(
         return Err(Error::Other("project name is empty".into()));
     }
     let conn = state.conn()?;
-    projects::set_metadata(&conn, name, deadline, size, blocked_by, parent, importance)
+    projects::set_metadata(&conn, name, deadline, size, blocked_by, importance)
 }
 
-/// Propose triage metadata (size/parent/blocked-by/deadline) for projects, on
+/// Propose triage metadata (size/blocked-by/deadline) for projects, on
 /// demand — the AI-proposes-you-confirm half of the focus view, mirroring
 /// `propose_metadata`. `names` limits it to specific projects (default: all).
 /// Proposals stream over `on_event`; the user confirms via `set_project_metadata`.
@@ -5782,6 +5904,82 @@ mod reader_tests {
             classify_source_ref("file:///home/me/x"),
             SourceRefKind::LocalPath
         );
+    }
+}
+
+/// The guards on the project-level *Merge into* (#279). Every one of these refuses BEFORE the
+/// user types a confirmation, which is the point: a merge that fails halfway through the
+/// ceremony reads as a bug, and one of these cases (merging out of Unsorted) would sweep the
+/// whole inbox into another project if it ever got through.
+#[cfg(test)]
+mod merge_project_tests {
+    use super::resolve_merge_pair;
+    use crate::entities;
+
+    const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn conn_with_projects(names: &[&str]) -> rusqlite::Connection {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite"), DB_KEY).unwrap();
+        // Leak the tempdir: the Connection must outlive it, and these are short-lived tests.
+        std::mem::forget(dir);
+        for n in names {
+            entities::resolve_project(&conn, n, true).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn resolves_a_real_pair_and_reports_the_target_canonical() {
+        let conn = conn_with_projects(&["Landing Page Redesign", "Marketing"]);
+        let (from, into, canonical) =
+            resolve_merge_pair(&conn, "Landing Page Redesign", "Marketing").unwrap();
+        assert_ne!(from, into);
+        // The canonical is what the documents end up filed under — and so what the user types.
+        assert_eq!(canonical, "Marketing");
+    }
+
+    #[test]
+    fn refuses_merging_a_project_into_itself() {
+        let conn = conn_with_projects(&["Atlas"]);
+        let err = resolve_merge_pair(&conn, "Atlas", "Atlas").unwrap_err();
+        assert!(
+            err.to_string().contains("same project"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An ALIAS of the target resolves to the same entity, so this is the self-merge case wearing
+    /// a different name — and the one a user is most likely to reach by accident.
+    #[test]
+    fn refuses_a_self_merge_reached_through_an_alias() {
+        let conn = conn_with_projects(&["Personal Manager"]);
+        let id = entities::resolve_project(&conn, "Personal Manager", false)
+            .unwrap()
+            .unwrap();
+        entities::add_alias(&conn, id, "PM").unwrap();
+        let err = resolve_merge_pair(&conn, "PM", "Personal Manager").unwrap_err();
+        assert!(
+            err.to_string().contains("same project"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn refuses_merging_out_of_the_unsorted_inbox() {
+        let conn = conn_with_projects(&["Unsorted", "Marketing"]);
+        let err = resolve_merge_pair(&conn, "Unsorted", "Marketing").unwrap_err();
+        assert!(err.to_string().contains("inbox"), "unexpected error: {err}");
+        // Merging INTO Unsorted stays allowed — a deliberate "these belong back in the inbox".
+        assert!(resolve_merge_pair(&conn, "Marketing", "Unsorted").is_ok());
+    }
+
+    #[test]
+    fn refuses_an_unknown_or_blank_project() {
+        let conn = conn_with_projects(&["Marketing"]);
+        assert!(resolve_merge_pair(&conn, "Ghost", "Marketing").is_err());
+        assert!(resolve_merge_pair(&conn, "Marketing", "Ghost").is_err());
+        assert!(resolve_merge_pair(&conn, "   ", "Marketing").is_err());
     }
 }
 

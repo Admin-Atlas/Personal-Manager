@@ -59,6 +59,7 @@ import type {
   LocalFolder,
   LocalFolderSyncState,
   LocalSubfolder,
+  MergePreview,
   Message,
   ChatIdentityReport,
   IngestJobState,
@@ -688,6 +689,17 @@ export const renameEntity = (entityId: number, newName: string) =>
 export const mergeEntities = (fromId: number, intoId: number) =>
   invoke<void>("merge_entities", { fromId, intoId });
 
+/** What merging `from` into `into` would move — the live counts behind the type-to-confirm
+ *  ceremony. Read-only and cheap; safe to call whenever the target changes. Rejects the same
+ *  impossible pairs the merge itself would (same project, out of Unsorted, unknown name). */
+export const mergeProjectPreview = (from: string, into: string) =>
+  invoke<MergePreview>("merge_project_preview", { from, into });
+
+/** Fold `from` into `into` by project name: move its files, chats, milestones and activity
+ *  history to the target, then permanently delete the source project. Irreversible. */
+export const mergeProjects = (from: string, into: string) =>
+  invoke<void>("merge_projects", { from, into });
+
 // --- Personal Assistant: focus view & projects (Step 5, spec §4) ---
 
 /** Every active project with its triage metadata and derived status. */
@@ -701,7 +713,6 @@ export const setProjectMetadata = (
     deadline?: string | null;
     size?: ProjectSize;
     blockedBy?: string | null;
-    parent?: string | null;
     /** Manual priority ("high"/"medium"/"low"); null = Auto (no tag). */
     importance?: Importance;
   },
@@ -711,7 +722,6 @@ export const setProjectMetadata = (
     deadline: meta.deadline ?? null,
     size: meta.size ?? null,
     blockedBy: meta.blockedBy ?? null,
-    parent: meta.parent ?? null,
     importance: meta.importance ?? null,
   });
 

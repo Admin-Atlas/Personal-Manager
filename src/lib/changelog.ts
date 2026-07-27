@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.95.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "You can now merge one project into another. If a project turns out to have always been part of a bigger one — a landing page redesign that was really just Marketing — open it in Focus, choose “Merge into…”, and everything it holds moves across: its files, its chats, its milestones, and its history of when you worked on it. The old project is then deleted. Because that can’t be undone, PM counts up exactly what will move and tells you before you commit — “12 files, 5 chats and 3 milestones will move to Marketing” — and asks you to type the name of the project you’re keeping. PM also remembers the old name, so if it turns up in a document later it files it under the project you kept rather than quietly recreating the one you just merged away.",
+      "“Part of” has been removed. It looked like a way to group projects together, but it did close to the opposite: naming a parent hid the project’s own status and showed “Part of X” in its place, so a project with a deadline next week could sit there looking like a footnote. Grouping projects properly is coming separately; the one thing “Part of” was genuinely useful for — a project that never deserved to be its own project — is what the new merge does, and it does it honestly by actually moving everything and deleting the source instead of leaving a half-project behind. If you had set a parent on anything, nothing is lost: the project simply shows its real status now.",
+      "Projects with others waiting on them still stand out. PM works out a priority on its own for any project you haven’t set one for, by looking at how many other projects depend on it. That used to count both “is blocked by this” and “is part of this”; now it counts only what’s genuinely waiting on it, which is a sharper signal and, in practice, the one people actually set.",
+    ],
+  },
+  {
     version: "3.94.0-alpha",
     date: "2026-07-27",
     highlights: [

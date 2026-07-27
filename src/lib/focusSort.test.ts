@@ -22,7 +22,6 @@ function proj(over: {
     importance: over.importance ?? null,
     auto_importance: over.auto ?? null,
     blocked_by: null,
-    parent: null,
     last_activity: over.active ?? null,
     milestones: [],
     governing_milestone: over.due ? { due_date: over.due } : null,
