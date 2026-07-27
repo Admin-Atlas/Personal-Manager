@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.91.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "Under-the-hood tidying: when you correct where PM filed something, it now records which version of its filing brain made the mistake. PM judges how well it’s sorting your files by counting those corrections, and every time its filing gets smarter the older marks stop being a fair comparison — without a note of which version each one belongs to, one improvement quietly drags down the score for years. Nothing changes in how you use it; it just means PM can tell its past self apart from its present one.",
+    ],
+  },
+  {
     version: "3.90.0-alpha",
     date: "2026-07-27",
     highlights: [

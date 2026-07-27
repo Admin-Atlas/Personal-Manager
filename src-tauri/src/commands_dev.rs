@@ -149,6 +149,7 @@ const TABLES: &[Table] = &[
             trunc("before_val", 60),
             trunc("after_val", 60),
             trunc("title", 60),
+            plain("pipeline_version"),
             plain("created_at"),
         ],
     },

@@ -22,6 +22,21 @@ use crate::openrouter::{self, ChatMessage};
 /// almost always enough to place a document, and bounding it caps token cost.
 const EXCERPT_CHARS: usize = 2000;
 
+/// The version of the FILING PIPELINE — everything that shapes a proposal the user then accepts or
+/// corrects: the prompt, the excerpt bound, the model's role config, and crucially what text the
+/// model can actually see for a given source.
+///
+/// **Bump this whenever a change could plausibly move filing accuracy**, and say so in the PR. It is
+/// stamped onto every row `log_corrections` writes, so that a later per-source accuracy readout can
+/// window on one pipeline instead of averaging across incomparable ones. Without the stamp, each
+/// improvement quietly poisons the accumulated stats and nobody can tell — the #360 case, where the
+/// filing AI was near-blind on index-only connector documents, is the proof: corrections logged
+/// before 2026-07-14 describe a pipeline that no longer exists, and no query can separate them.
+///
+/// Version 1 is the pipeline as of #360 (2026-07-14) — the first one whose numbers are trustworthy.
+/// Rows written before this column existed carry NULL: unlabelable, deliberately not backfilled.
+pub const FILING_PIPELINE_VERSION: i64 = 1;
+
 /// The AI's proposed organisation for a document, shown in the Review view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
@@ -461,10 +476,20 @@ fn insert_correction(
     after: &str,
     title: &str,
 ) -> Result<()> {
+    // Stamped from the constant rather than passed in: every correction logged by this build was, by
+    // construction, produced by this build's filing pipeline, and threading it through the call sites
+    // would only create a way for them to disagree.
     conn.execute(
-        "INSERT INTO corrections(document_id, field, before_val, after_val, title) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![document_id, field, before, after, title],
+        "INSERT INTO corrections(document_id, field, before_val, after_val, title, pipeline_version) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            document_id,
+            field,
+            before,
+            after,
+            title,
+            FILING_PIPELINE_VERSION
+        ],
     )?;
     Ok(())
 }
@@ -515,6 +540,67 @@ mod tests {
             normalize_importance(Some("Low".into())).as_deref(),
             Some("low")
         );
+    }
+
+    /// Every row `log_corrections` writes carries the current pipeline version. A regression here is
+    /// invisible — the corrections still log, they just become unattributable, which is the exact
+    /// failure the column exists to prevent.
+    #[test]
+    fn corrections_are_stamped_with_the_pipeline_version() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash) \
+             VALUES (1, 'vault/a.md', 'A', 'h')",
+            [],
+        )
+        .unwrap();
+
+        // The user changed all three fields away from what the model proposed.
+        let d = ReviewDecision {
+            document_id: 1,
+            project: "Atlas".into(),
+            tags: vec!["tax".into()],
+            importance: Some("high".into()),
+            proposed_project: "Finances".into(),
+            proposed_tags: vec![],
+            proposed_importance: None,
+        };
+        assert_eq!(log_corrections(&conn, &d, "A").unwrap(), 3);
+
+        let (n, stamped): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), count(pipeline_version) FROM corrections \
+                 WHERE pipeline_version = ?1",
+                params![FILING_PIPELINE_VERSION],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((n, stamped), (3, 3), "every logged field carries the stamp");
+    }
+
+    /// A row predating the column stays NULL — "unlabelable", never silently attributed to a
+    /// pipeline that didn't write it. Windowing by version must be able to exclude these.
+    #[test]
+    fn pre_stamp_rows_stay_null_and_are_separable() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO corrections(document_id, field, before_val, after_val, title) \
+             VALUES (NULL, 'project', '\"a\"', '\"b\"', 'legacy')",
+            [],
+        )
+        .unwrap();
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM corrections WHERE pipeline_version IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 1, "no backfill invented a version for an old row");
     }
 
     #[test]
