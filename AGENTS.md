@@ -4,6 +4,17 @@ Orientation for any coding agent (or person) working in this repo. Read this,
 then the canonical spec and the decision log in the `docs/` folder, before
 making changes.
 
+Two companion registers hold the rules that span changes rather than living in one
+module — read them before touching anything they cover:
+
+- **[INVARIANTS.md](INVARIANTS.md)** — contracts that only hold if two or more separate
+  pieces of work agree to them (retrieval filters vs scores, identity keys, the connector
+  contract, the vault walks, accounting). Each entry says whether it is enforced by a gate
+  or held by convention, and what a PR has to do to co-sign it.
+- **[SYNC-SET.md](SYNC-SET.md)** — who owns each unit of truth: every table classified
+  truth / derived / device / mixed, plus the non-database surfaces. **Adding a table means
+  adding a row** — `just sync-set` fails otherwise.
+
 ## What PM is
 
 A local-first desktop "personal manager" with two pillars: **the Archivist**

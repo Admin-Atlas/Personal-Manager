@@ -290,3 +290,5 @@ jobs:
         run: just license-subset
       - name: CI membership (justfile ⊆ pr.yml)
         run: just ci-membership
+      - name: Sync-set register covers every table
+        run: just sync-set
