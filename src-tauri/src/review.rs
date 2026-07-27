@@ -35,7 +35,15 @@ const EXCERPT_CHARS: usize = 2000;
 ///
 /// Version 1 is the pipeline as of #360 (2026-07-14) — the first one whose numbers are trustworthy.
 /// Rows written before this column existed carry NULL: unlabelable, deliberately not backfilled.
-pub const FILING_PIPELINE_VERSION: i64 = 1;
+///
+/// Version 2 (2026-07-27) is the tag-vocabulary work, and covers BOTH halves of it: #578 started
+/// naming the existing tags in the prompt and asking for reuse, and #580/#581 seeds that list from
+/// a store-wide vocabulary call when a fresh store has nothing established to reuse. Either one
+/// alone plausibly moves which tags come back, so proposals from before and after are not
+/// comparable. #578 should have bumped this and did not — caught here rather than left, since a
+/// missed bump silently mixes two pipelines in one accuracy readout and no later query can
+/// separate them.
+pub const FILING_PIPELINE_VERSION: i64 = 2;
 
 /// The AI's proposed organisation for a document, shown in the Review view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -286,8 +294,8 @@ fn build_messages(
          Prefer an existing project if one fits; only invent a new project name if none do. \
          importance is \"high\", \"medium\", or \"low\" (or null if unclear). Use at most 5 short, \
          lowercase tags.\n\
-         Tags already in use: {tags}\n\
-         REUSE an existing tag whenever it fits, exactly as spelled above, rather than coining a \
+         Tags to use: {tags}\n\
+         REUSE one of these whenever it fits, exactly as spelled above, rather than coining a \
          near-duplicate — a tag is only useful if it groups documents together, and \"tax\", \
          \"taxes\" and \"taxation\" sitting side by side group nothing. Only invent a tag when the \
          document is genuinely about something none of these cover.\n\n\
@@ -683,13 +691,13 @@ mod tests {
     #[test]
     fn the_existing_tag_vocabulary_is_offered_and_reuse_is_asked_for() {
         let sys = &build_messages(&[doc("t", "b", None)], &projects(), &tags(), None)[0].content;
-        assert!(sys.contains("Tags already in use: invoice, tax"));
-        assert!(sys.contains("REUSE an existing tag"));
+        assert!(sys.contains("Tags to use: invoice, tax"));
+        assert!(sys.contains("REUSE one of these"));
 
         // A fresh store says so rather than showing an empty list, which would read as "no tags
         // are allowed" instead of "there are none yet".
         let empty = &build_messages(&[doc("t", "b", None)], &projects(), &[], None)[0].content;
-        assert!(empty.contains("Tags already in use: (none yet)"));
+        assert!(empty.contains("Tags to use: (none yet)"));
     }
 
     /// A folder name is ingested content, so it belongs in the user message as DATA (rule #6) —

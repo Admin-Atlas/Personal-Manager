@@ -3319,6 +3319,42 @@ pub async fn propose_metadata(
     let mut proposed = 0;
     let mut usage_rows: Vec<(Option<String>, openrouter::Usage, llm_gateway::CallMeta)> =
         Vec::new();
+
+    // A store with NO tags yet has no vocabulary to reuse — and the list above is fixed for the
+    // whole run, because it lives in the cached system prefix and must stay byte-identical (#509).
+    // So a first import of any size would have every batch invent its own labels with only the five
+    // documents in front of it in view: exactly the fragmentation #580 exists to repair, produced
+    // on day one, and repairable only by a paid pass the user has to know to run.
+    //
+    // Seeding closes that. One cheap titles-only call — the same one the re-tag pass uses — chooses
+    // a vocabulary with ALL the pending documents in view, and the run files against it. Only when
+    // there is nothing established to reuse: an existing vocabulary is the user's, and replacing it
+    // with a freshly-invented one would be the opposite of the point.
+    //
+    // Best-effort: a failed or unusable seed leaves the run exactly as it behaved before this
+    // existed. Below the threshold it is not worth a call — a handful of documents cannot show a
+    // theme, and the labels would be as one-off as the ones being avoided.
+    const SEED_VOCAB_MIN_DOCS: usize = 20;
+    let tags = if tags.is_empty() && pending.len() >= SEED_VOCAB_MIN_DOCS {
+        let titles: Vec<String> = pending.iter().map(|p| p.title.clone()).collect();
+        let max = retag::vocab_max(pending.len());
+        let messages = retag::vocabulary_messages(&retag::sample_titles(&titles), max);
+        match llm_gateway::complete(&app, &plan, &messages, false).await {
+            Ok(outcome) => {
+                let seeded = retag::parse_vocabulary(&outcome.completion.text, max);
+                usage_rows.push((
+                    outcome.completion.model.clone(),
+                    outcome.completion.usage,
+                    outcome.meta,
+                ));
+                seeded
+            }
+            Err(_) => Vec::new(),
+        }
+    } else {
+        tags
+    };
+
     // Documents are classified a batch at a time: one call proposes for several, which is where
     // most of the saving is (the instructions + canonical projects + profile are sent once per call,
     // not once per document). The global profile goes in as its own argument so it stays in the
@@ -3505,7 +3541,8 @@ pub async fn propose_retag(app: AppHandle, on_event: Channel<RetagEvent>) -> Res
     // ---- Pass 1: one vocabulary for the whole store, from its titles.
     let titles: Vec<String> = docs.iter().map(|d| d.title.clone()).collect();
     let vocabulary = {
-        let messages = retag::vocabulary_messages(&retag::sample_titles(&titles));
+        let max = retag::vocab_max(docs.len());
+        let messages = retag::vocabulary_messages(&retag::sample_titles(&titles), max);
         // No cache_prefix: this call happens once per pass, so there is no prefix to reuse.
         let outcome = llm_gateway::complete(&app, &plan, &messages, false).await?;
         usage_rows.push((
@@ -3513,7 +3550,7 @@ pub async fn propose_retag(app: AppHandle, on_event: Channel<RetagEvent>) -> Res
             outcome.completion.usage,
             outcome.meta,
         ));
-        retag::parse_vocabulary(&outcome.completion.text)
+        retag::parse_vocabulary(&outcome.completion.text, max)
     };
     if vocabulary.is_empty() {
         log_background_usage(&app, plan.models(), &usage_rows);

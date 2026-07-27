@@ -32,6 +32,8 @@ export const CHANGELOG: ChangelogEntry[] = [
       "The difference is that the vocabulary is chosen FIRST, with your whole library in view, and then everything is labelled from that one set. Choosing tags a few documents at a time cannot do better than the few documents it saw \u2014 which is how you ended up here.",
       "Nothing is written until you say so. You get a before-and-after per document, you can untick any you disagree with, and PM only touches tags \u2014 your projects and importance levels are left exactly as they are.",
       "It tells you what it will cost before it starts, because it does cost: it re-reads your library through the model, roughly one call per twelve documents.",
+      "New vaults get this for free. Until now the very first sorting run had no tags to work from, so it coined labels a few documents at a time \u2014 the same mess, on day one. It now picks a vocabulary for everything waiting first, and files against that, so you only need the Teach \u2192 Tags pass if you already have a library to repair.",
+      "How many tags PM picks now depends on how much you have \u2014 about one per five documents, so a small library isn\u2019t crushed into a handful of vague buckets and a big one isn\u2019t forced through forty.",
     ],
   },
   {
