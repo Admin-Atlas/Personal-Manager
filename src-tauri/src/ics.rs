@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz as ChronoTz;
 
-use crate::calendar::CalendarEvent;
+use crate::calendar::{Attendee, CalendarEvent};
 
 /// Defensive caps for a hostile or oversized feed: bound how many VEVENT blocks we
 /// parse and how many expanded occurrences we keep. The 10 MiB body cap (see
@@ -167,8 +167,7 @@ fn expand_vevent(
     }
 
     // v40 detail fields for the event popup — parsed once from the VEVENT block (constant across a
-    // recurring series' occurrences), then stamped on each event below. ICS attendees (multi-line
-    // ATTENDEE properties) are a follow-up: read-only subscription feeds rarely carry them.
+    // recurring series' occurrences), then stamped on each event below.
     let show_as = Some(
         if find(block, "TRANSP") == Some("TRANSPARENT") {
             "free"
@@ -184,6 +183,7 @@ fn expand_vevent(
                 .to_string()
         })
     });
+    let attendees = ics_attendees(block);
     let recurring = block.iter().any(|l| is_prop(l, "RRULE"));
     let recurrence_summary = find(block, "RRULE").map(str::to_string);
     let status = find(block, "STATUS").map(str::to_string);
@@ -209,6 +209,7 @@ fn expand_vevent(
             );
             ev.show_as = show_as.clone();
             ev.organizer = organizer.clone();
+            ev.attendees = attendees.clone();
             ev.recurring = recurring;
             ev.recurrence_summary = recurrence_summary.clone();
             ev.status = status.clone();
@@ -520,6 +521,26 @@ fn find<'a>(block: &'a [String], name: &str) -> Option<&'a str> {
     find_prop(block, name).map(|(_, v)| v)
 }
 
+/// Every (parameters, value) pair for property `name`, in feed order.
+///
+/// [`find_prop`] stops at the first match, which is right for the single-valued properties but wrong
+/// for `ATTENDEE`: RFC 5545 allows one line per attendee, so taking only the first would report a
+/// twelve-person meeting as having one guest.
+fn find_props<'a>(block: &'a [String], name: &str) -> Vec<(&'a str, &'a str)> {
+    block
+        .iter()
+        .filter_map(|line| {
+            let colon = line.find(':')?;
+            let (head, value) = (&line[..colon], &line[colon + 1..]);
+            let (prop, params) = match head.find(';') {
+                Some(i) => (&head[..i], &head[i + 1..]),
+                None => (head, ""),
+            };
+            prop.eq_ignore_ascii_case(name).then_some((params, value))
+        })
+        .collect()
+}
+
 /// The (parameters, value) of property `name`: `NAME;p=v:value` → `("p=v", "value")`.
 fn find_prop<'a>(block: &'a [String], name: &str) -> Option<(&'a str, &'a str)> {
     block.iter().find_map(|line| {
@@ -568,6 +589,55 @@ fn param<'a>(params: &'a str, key: &str) -> Option<&'a str> {
         let (k, v) = p.split_once('=')?;
         k.eq_ignore_ascii_case(key).then_some(v)
     })
+}
+
+/// ICS `ATTENDEE` lines → the shared [`Attendee`] shape (empty when the VEVENT lists none).
+///
+/// One line per attendee, e.g.
+/// `ATTENDEE;CN=Ada Lovelace;ROLE=OPT-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:ada@example.com`.
+///
+/// Every field is optional because feeds vary wildly in what they emit — a bare
+/// `ATTENDEE:mailto:x@y` is valid and common, so an entry with only an email still round-trips.
+/// `PARTSTAT` is normalised to the same vocabulary Google and Graph are mapped onto, so the popup
+/// renders one set of terms whatever the source.
+fn ics_attendees(block: &[String]) -> Vec<Attendee> {
+    find_props(block, "ATTENDEE")
+        .into_iter()
+        .map(|(params, value)| {
+            let email = value
+                .trim()
+                .strip_prefix("mailto:")
+                .or_else(|| value.trim().strip_prefix("MAILTO:"))
+                .unwrap_or(value.trim());
+            Attendee {
+                name: param(params, "CN").map(unescape).filter(|s| !s.is_empty()),
+                email: (!email.is_empty()).then(|| email.to_string()),
+                response: param(params, "PARTSTAT").map(partstat),
+                // RFC 5545 §3.2.16: OPT-PARTICIPANT is the optional role; everything else is
+                // required or non-participating, neither of which is "optional" in the UI's sense.
+                optional: param(params, "ROLE")
+                    .is_some_and(|r| r.eq_ignore_ascii_case("OPT-PARTICIPANT")),
+                // An ICS feed carries no notion of "this is the connected account", and CHAIR is a
+                // role rather than a claim of organisership — ORGANIZER is its own property and is
+                // parsed separately. Leaving both false is honest; guessing would mislabel guests.
+                organizer: false,
+                is_self: false,
+            }
+        })
+        .collect()
+}
+
+/// ICS `PARTSTAT` → the response vocabulary Google/Graph are normalised onto, so one set of terms
+/// reaches the UI. An unrecognised value is passed through lowercased rather than dropped: a feed
+/// using an `X-` extension still says something, and inventing "needsAction" for it would not.
+fn partstat(v: &str) -> String {
+    match v.to_ascii_uppercase().as_str() {
+        "ACCEPTED" => "accepted".to_string(),
+        "DECLINED" => "declined".to_string(),
+        "TENTATIVE" => "tentative".to_string(),
+        "NEEDS-ACTION" => "needsAction".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
 }
 
 /// Unescape ICS text (`\n`, `\,`, `\;`, `\\`).
@@ -860,5 +930,72 @@ mod tests {
         assert_eq!(parse_duration("-PT30M"), Some(Duration::minutes(-30)));
         assert_eq!(parse_duration("P"), None);
         assert_eq!(parse_duration("PT1X"), None);
+    }
+
+    // --- ATTENDEE parsing (card 11 audit) -------------------------------------------------------
+    //
+    // Google and Graph have populated attendees since v40; ICS did not, so every Apple/ICS
+    // subscription mirrored an empty guest list. These pin the gap closed.
+
+    fn block(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// One ATTENDEE line per guest — taking only the first would report a meeting as having one.
+    #[test]
+    fn every_attendee_line_is_parsed() {
+        let b = block(&[
+            "ATTENDEE;CN=Ada Lovelace;PARTSTAT=ACCEPTED:mailto:ada@example.com",
+            "ATTENDEE;CN=Alan Turing;ROLE=OPT-PARTICIPANT;PARTSTAT=TENTATIVE:mailto:alan@example.com",
+            "ATTENDEE:mailto:bare@example.com",
+        ]);
+        let got = ics_attendees(&b);
+        assert_eq!(got.len(), 3);
+
+        assert_eq!(got[0].name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(got[0].email.as_deref(), Some("ada@example.com"));
+        assert_eq!(got[0].response.as_deref(), Some("accepted"));
+        assert!(!got[0].optional);
+
+        assert_eq!(got[1].response.as_deref(), Some("tentative"));
+        assert!(got[1].optional, "OPT-PARTICIPANT is the optional role");
+
+        // A bare `ATTENDEE:mailto:…` is valid and common — it must still round-trip.
+        assert_eq!(got[2].email.as_deref(), Some("bare@example.com"));
+        assert_eq!(got[2].name, None);
+        assert_eq!(got[2].response, None);
+    }
+
+    /// PARTSTAT lands in the same vocabulary Google/Graph are mapped onto, and an unknown value is
+    /// passed through rather than silently becoming "needsAction".
+    #[test]
+    fn partstat_normalises_to_the_shared_vocabulary() {
+        assert_eq!(partstat("NEEDS-ACTION"), "needsAction");
+        assert_eq!(partstat("declined"), "declined");
+        assert_eq!(partstat("X-WEIRD"), "x-weird");
+    }
+
+    /// Property names are case-insensitive per RFC 5545, and a VEVENT with no guests is empty
+    /// rather than a phantom entry.
+    #[test]
+    fn attendee_matching_is_case_insensitive_and_absence_is_empty() {
+        let b = block(&["attendee;cn=Grace:MAILTO:grace@example.com"]);
+        let got = ics_attendees(&b);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name.as_deref(), Some("Grace"));
+        assert_eq!(got[0].email.as_deref(), Some("grace@example.com"));
+
+        assert!(ics_attendees(&block(&["SUMMARY:Solo work"])).is_empty());
+    }
+
+    /// An ICS feed can't say which guest is the connected account, and CHAIR is a role rather than
+    /// a claim of organisership — guessing either would mislabel real people in the popup.
+    #[test]
+    fn ics_never_claims_self_or_organizer() {
+        let b = block(&["ATTENDEE;CN=Chair;ROLE=CHAIR:mailto:chair@example.com"]);
+        let got = ics_attendees(&b);
+        assert!(!got[0].is_self);
+        assert!(!got[0].organizer);
+        assert!(!got[0].optional, "CHAIR is required, not optional");
     }
 }

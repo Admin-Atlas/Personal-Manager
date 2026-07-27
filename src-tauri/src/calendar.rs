@@ -17,7 +17,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -879,6 +879,12 @@ pub struct Calendar {
     /// (briefing, flags/reminders, chat agenda, focus upcoming). Independent of `selected` — a quiet
     /// calendar still syncs and renders; only the assistant query path (`agenda_query`) filters it.
     pub quiet: bool,
+    /// Work or personal (v45), or `None` when the user hasn't typed this calendar. Declared per
+    /// calendar rather than inferred per event: someone who connects a work account and a personal
+    /// one has already drawn the line, and asking a model to re-derive it from event titles would
+    /// cost tokens to be wrong in exactly the ambiguous cases that matter. Events inherit it, and an
+    /// individual event may override it (`calendar_events.kind_override`).
+    pub kind: Option<String>,
 }
 
 /// A provider-neutral calendar descriptor for registration (a Google `calendarList` item or a Graph
@@ -1022,8 +1028,8 @@ pub fn remove_source(conn: &Connection, id: &str) -> Result<()> {
 /// re-sync must not silently re-tick a calendar the user unticked, nor un-quiet one they quieted.
 pub fn upsert_calendar(conn: &Connection, cal: &Calendar) -> Result<()> {
     conn.execute(
-        "INSERT INTO calendars(id, source_id, provider, remote_id, name, color, selected, is_primary, quiet) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+        "INSERT INTO calendars(id, source_id, provider, remote_id, name, color, selected, is_primary, quiet, kind) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color, \
              remote_id = excluded.remote_id, is_primary = excluded.is_primary",
         params![
@@ -1035,7 +1041,8 @@ pub fn upsert_calendar(conn: &Connection, cal: &Calendar) -> Result<()> {
             cal.color,
             cal.selected as i64,
             cal.is_primary as i64,
-            cal.quiet as i64
+            cal.quiet as i64,
+            cal.kind
         ],
     )?;
     Ok(())
@@ -1051,6 +1058,7 @@ type CalendarRow = (
     i64,
     i64,
     i64,
+    Option<String>,
 );
 
 fn row_to_calendar(r: &rusqlite::Row) -> rusqlite::Result<CalendarRow> {
@@ -1064,11 +1072,12 @@ fn row_to_calendar(r: &rusqlite::Row) -> rusqlite::Result<CalendarRow> {
         r.get(6)?,
         r.get(7)?,
         r.get(8)?,
+        r.get(9)?,
     ))
 }
 
 fn calendar_from_row(row: CalendarRow) -> Calendar {
-    let (id, source_id, provider, remote_id, name, color, selected, is_primary, quiet) = row;
+    let (id, source_id, provider, remote_id, name, color, selected, is_primary, quiet, kind) = row;
     Calendar {
         id,
         source_id,
@@ -1079,11 +1088,12 @@ fn calendar_from_row(row: CalendarRow) -> Calendar {
         selected: selected != 0,
         is_primary: is_primary != 0,
         quiet: quiet != 0,
+        kind,
     }
 }
 
-const CALENDAR_COLS: &str =
-    "id, source_id, provider, remote_id, name, color, selected, is_primary, quiet FROM calendars";
+const CALENDAR_COLS: &str = "id, source_id, provider, remote_id, name, color, selected, \
+                             is_primary, quiet, kind FROM calendars";
 
 /// Every registered calendar, across all accounts/subscriptions (for the unified picker + 6B view).
 pub fn list_calendars(conn: &Connection) -> Result<Vec<Calendar>> {
@@ -1143,6 +1153,55 @@ pub fn set_calendar_quiet(conn: &Connection, calendar_id: &str, on: bool) -> Res
     Ok(())
 }
 
+/// The event kinds `calendars.kind` / `calendar_events.kind_override` admit (v45).
+pub const EVENT_KINDS: [&str; 2] = ["work", "personal"];
+
+/// Type a calendar as work or personal, or clear the typing with `None` (v45).
+///
+/// Like [`set_calendar_quiet`] this needs no re-sync: typing is PM's own annotation, not upstream
+/// data, and the mirror is untouched. It's preserved across re-syncs for the same reason `selected`
+/// and `quiet` are — `upsert_calendar`'s conflict clause only refreshes provider-owned fields.
+pub fn set_calendar_kind(conn: &Connection, calendar_id: &str, kind: Option<&str>) -> Result<()> {
+    if let Some(k) = kind {
+        if !EVENT_KINDS.contains(&k) {
+            return Err(crate::error::Error::Other(format!(
+                "unknown calendar kind {k:?} (expected one of {})",
+                EVENT_KINDS.join(", ")
+            )));
+        }
+    }
+    conn.execute(
+        "UPDATE calendars SET kind = ?2 WHERE id = ?1",
+        params![calendar_id, kind],
+    )?;
+    Ok(())
+}
+
+/// Whether an event reads as work or personal: its own override if it has one, else its calendar's
+/// typing, else `None` (untyped).
+///
+/// The single place this precedence is expressed, so the Work-context score and the person-context
+/// flags can't drift apart on it. `None` is a real answer — an untyped calendar's events are
+/// genuinely unclassified, and a consumer must decide what to do with that rather than be handed a
+/// guess.
+///
+/// No caller yet — the Work-context score and the person-context flags are the first readers. It
+/// ships with the columns so the precedence is settled and tested once, rather than being invented
+/// (possibly differently) by each consumer that arrives.
+#[allow(dead_code)]
+pub fn event_kind(conn: &Connection, event_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT COALESCE(e.kind_override, c.kind) \
+               FROM calendar_events e JOIN calendars c ON c.id = e.calendar_id \
+              WHERE e.id = ?1",
+            params![event_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// All currently-selected calendars (the set a sync refreshes; everything else is pruned).
 pub fn selected_calendars(conn: &Connection) -> Result<Vec<Calendar>> {
     Ok(list_calendars(conn)?
@@ -1185,6 +1244,7 @@ pub fn register_calendars(
                 selected: select(it),
                 is_primary: it.is_primary,
                 quiet: false, // new calendars are surfaced to the assistant until the user quiets them
+                kind: None,   // untyped until the user says work or personal (v45)
             },
         )?;
     }
@@ -1209,6 +1269,7 @@ pub fn register_feed_source(conn: &Connection, feed: &IcsFeed) -> Result<()> {
             selected: true,
             is_primary: false,
             quiet: false,
+            kind: None,
         },
     )
 }
@@ -1996,5 +2057,111 @@ mod tests {
         assert!(focus.iter().find(|a| a.event.id == "past").unwrap().ended);
         assert!(!focus.iter().find(|a| a.event.id == "future").unwrap().ended);
         assert!(!focus.iter().find(|a| a.event.id == "today").unwrap().ended);
+    }
+
+    // --- v45: work/personal typing --------------------------------------------------------------
+
+    fn typing_store() -> (tempfile::TempDir, Connection) {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        upsert_source(&conn, "src", "google", Some("a@b.com"), "a@b.com").unwrap();
+        upsert_calendar(
+            &conn,
+            &Calendar {
+                id: "cal".into(),
+                source_id: "src".into(),
+                provider: "google".into(),
+                remote_id: Some("r".into()),
+                name: "Work".into(),
+                color: None,
+                selected: true,
+                is_primary: true,
+                quiet: false,
+                kind: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events(id, calendar_id, summary, start) \
+             VALUES ('ev', 'cal', 'standup', '2026-08-01T09:00:00Z')",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    /// An event inherits its calendar's typing, and its own override outranks it. Untyped stays
+    /// untyped — a consumer must handle "don't know" rather than be handed a guess.
+    #[test]
+    fn an_event_inherits_its_calendars_kind_and_an_override_wins() {
+        let (_d, conn) = typing_store();
+        assert_eq!(event_kind(&conn, "ev").unwrap(), None, "untyped by default");
+
+        set_calendar_kind(&conn, "cal", Some("work")).unwrap();
+        assert_eq!(event_kind(&conn, "ev").unwrap().as_deref(), Some("work"));
+
+        conn.execute(
+            "UPDATE calendar_events SET kind_override = 'personal' WHERE id = 'ev'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            event_kind(&conn, "ev").unwrap().as_deref(),
+            Some("personal"),
+            "the dentist appointment on the work calendar"
+        );
+
+        set_calendar_kind(&conn, "cal", None).unwrap();
+        assert_eq!(
+            event_kind(&conn, "ev").unwrap().as_deref(),
+            Some("personal"),
+            "clearing the calendar's typing leaves the event's own override standing"
+        );
+    }
+
+    /// Typing is PM's annotation, not provider data — a re-sync must not wipe it, exactly as it
+    /// must not un-quiet or re-tick a calendar.
+    #[test]
+    fn a_resync_preserves_the_users_typing() {
+        let (_d, conn) = typing_store();
+        set_calendar_kind(&conn, "cal", Some("personal")).unwrap();
+
+        // The provider reports the calendar again, renamed; `kind` must survive the upsert.
+        upsert_calendar(
+            &conn,
+            &Calendar {
+                id: "cal".into(),
+                source_id: "src".into(),
+                provider: "google".into(),
+                remote_id: Some("r".into()),
+                name: "Renamed upstream".into(),
+                color: Some("#fff".into()),
+                selected: true,
+                is_primary: true,
+                quiet: false,
+                kind: None, // a fresh registration carries no typing
+            },
+        )
+        .unwrap();
+
+        let cal = list_calendars(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == "cal")
+            .unwrap();
+        assert_eq!(cal.name, "Renamed upstream", "provider fields do refresh");
+        assert_eq!(
+            cal.kind.as_deref(),
+            Some("personal"),
+            "the user's typing survived the re-sync"
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_is_rejected() {
+        let (_d, conn) = typing_store();
+        assert!(set_calendar_kind(&conn, "cal", Some("hobby")).is_err());
+        assert_eq!(event_kind(&conn, "ev").unwrap(), None);
     }
 }

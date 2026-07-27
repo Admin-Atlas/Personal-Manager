@@ -73,6 +73,7 @@ import type {
   Preference,
   AnswerFeedback,
   AnswerRating,
+  EventKind,
   Milestone,
   MilestoneStatus,
   PlaintextExportOutcome,
@@ -799,6 +800,11 @@ export const setCalendarSelected = (calendarId: string, selected: boolean) =>
  *  (briefing, flags/reminders, chat agenda, focus upcoming). No re-sync — events stay mirrored. */
 export const setCalendarQuiet = (calendarId: string, quiet: boolean) =>
   invoke<void>("set_calendar_quiet", { calendarId, quiet });
+
+/** Type a calendar as work or personal, or pass null to clear it. Its events inherit the typing.
+ *  Nothing consumes it yet — the Work-context score and person-context flags are its first readers. */
+export const setCalendarKind = (calendarId: string, kind: EventKind | null) =>
+  invoke<void>("set_calendar_kind", { calendarId, kind });
 
 /** Connect a Google Calendar account (multi-account) — opens the browser; resolves on sign-in.
  *  Pass an account's own project `clientId`/`clientSecret` to sign in with it (Advanced-Protection

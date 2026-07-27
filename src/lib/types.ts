@@ -650,7 +650,12 @@ export interface Calendar {
   /** Shown on the Calendar tab but its events are kept out of the assistant (briefing, flags, chat,
    *  focus). Independent of `selected` — a quiet calendar still syncs and renders. */
   quiet: boolean;
+  /** Work or personal, or null when untyped. Events inherit this; an event may override it. */
+  kind: EventKind | null;
 }
+
+/** How an event reads: work or personal (v45). Declared per calendar, inherited by its events. */
+export type EventKind = "work" | "personal";
 
 /** The whole calendar surface in one read (every provider). */
 export interface CalendarOverview {

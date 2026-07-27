@@ -959,6 +959,7 @@ mod tests {
              ALTER TABLE projects DROP COLUMN importance; \
              DROP INDEX idx_calendar_events_uid; \
              DROP INDEX idx_calendar_events_entity; \
+             ALTER TABLE calendar_events DROP COLUMN kind_override; \
              DROP INDEX idx_calendar_events_calendar; \
              DROP TABLE calendars; \
              ALTER TABLE calendar_events DROP COLUMN uid; \
@@ -1131,6 +1132,7 @@ mod tests {
              ALTER TABLE projects DROP COLUMN importance; \
              DROP INDEX idx_calendar_events_uid; \
              DROP INDEX idx_calendar_events_entity; \
+             ALTER TABLE calendar_events DROP COLUMN kind_override; \
              DROP INDEX idx_calendar_events_calendar; \
              DROP TABLE calendars; \
              ALTER TABLE calendar_events DROP COLUMN uid; \
