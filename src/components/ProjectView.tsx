@@ -19,6 +19,7 @@ import { ImportancePicker } from "./ImportancePicker";
 import { MilestoneList } from "./MilestoneList";
 import { TagEditor } from "./TagEditor";
 import { ChatBadge } from "./ChatBadge";
+import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDialog";
 import { CollapseTab } from "./CollapseTab";
 import { rankImportance } from "../lib/importance";
 import { useReader } from "../lib/reader";
@@ -88,6 +89,8 @@ export function ProjectView({
   const { openReader, current: readerDoc } = useReader();
   // How the Files panel is ordered. Name A→Z by default; clicking a key again reverses it.
   const [sort, setSort] = useState<FileSort>({ key: "name", dir: "asc" });
+  // The document whose delete is being confirmed, or null.
+  const [deleting, setDeleting] = useState<Document | null>(null);
   // How the Milestones panel is ordered — deadline (soonest first) by default, remembered per device
   // FOR THIS PROJECT. Display-only: the backend sort_order is untouched (governing() reads it).
   //
@@ -203,12 +206,18 @@ export function ProjectView({
       .catch(() => {});
   };
 
-  useEffect(() => {
-    // Load this project's documents and milestones. The chat session (App-owned) re-inits itself on
-    // the same project change.
+  // Reload just this project's documents — shared by the project-change effect and the delete
+  // dialog, so a deleted file leaves the list immediately rather than lingering until a tab switch.
+  const refreshDocuments = () => {
     listDocuments()
       .then((all) => setDocuments(all.filter((d) => d.project === project)))
       .catch((e) => chat.setError(String(e)));
+  };
+
+  useEffect(() => {
+    // Load this project's documents and milestones. The chat session (App-owned) re-inits itself on
+    // the same project change.
+    refreshDocuments();
     refreshMilestones();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
@@ -307,7 +316,7 @@ export function ProjectView({
                   openReader(d);
                 }
               }}
-              className={`cursor-pointer rounded-[var(--radius-sm)] px-2 py-1.5 transition-colors hover:bg-surface ${
+              className={`group cursor-pointer rounded-[var(--radius-sm)] px-2 py-1.5 transition-colors hover:bg-surface ${
                 flashId === d.id
                   ? "bg-surface ring-1 ring-[color-mix(in_oklab,var(--accent)_50%,transparent)]"
                   : readerDoc?.id === d.id
@@ -323,6 +332,7 @@ export function ProjectView({
                 >
                   {d.title}
                 </span>
+                <DeleteDocumentButton onClick={() => setDeleting(d)} />
               </div>
               {teachVisible ? (
                 // Manual triage, same controls as the Review tab. Everyone gets the importance
@@ -365,6 +375,13 @@ export function ProjectView({
             </li>
           ))}
         </ul>
+      )}
+      {deleting && (
+        <DeleteDocumentDialog
+          doc={deleting}
+          onClose={() => setDeleting(null)}
+          onDeleted={refreshDocuments}
+        />
       )}
     </>
   );

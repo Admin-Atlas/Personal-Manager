@@ -1529,6 +1529,67 @@ pub fn delete_conversation(state: State<'_, AppState>, conversation_id: i64) -> 
     chat::delete_conversation_inner(&conn, &vault_dir, conversation_id)
 }
 
+/// Delete ONE document (#575): its index rows, and the file behind it where PM owns one.
+///
+/// The three source kinds are genuinely different deletions, which is why this dispatches rather
+/// than doing one thing:
+///
+/// * **A chat** is routed to the conversation delete instead. `chat_sessions.document_id` is
+///   `ON DELETE SET NULL`, so purging the document alone would leave a live conversation whose
+///   transcript index had silently vanished, plus an orphaned vault file. A saved chat and its
+///   document are one object to the user, so deleting either deletes both.
+/// * **An index-only document is a POINTER** at a file in Drive/OneDrive. PM drops its own row and
+///   its `.pmindex` manifest entry; the file at the provider is never touched.
+/// * **A vault document** loses its `documents`/`chunks` rows and its Markdown.
+///
+/// Side effects land only AFTER the commit — the same rule `MutationFiles` encodes for project
+/// deletion: a file or manifest entry that outlives its row is harmless and self-healing, whereas
+/// removing either before a failed commit strands the database pointing at truth that is gone.
+#[tauri::command]
+pub fn delete_document(state: State<'_, AppState>, document_id: i64) -> Result<()> {
+    let (vault_dir, _cipher) = state.markdown_io()?;
+    let (vault_root, _rules_cipher) = state.rules_io()?;
+    let (_, manifest_cipher) = state.manifest_io()?;
+    let conn = state.conn()?;
+
+    // A chat document belongs to a conversation — delete that instead (see above).
+    let conversation_id: Option<i64> = conn
+        .query_row(
+            "SELECT conversation_id FROM chat_sessions WHERE document_id = ?1",
+            params![document_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(cid) = conversation_id {
+        return chat::delete_conversation_inner(&conn, &vault_dir, cid);
+    }
+
+    let (vault_path, source_type, source_id): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT vault_path, source_type, source_id FROM documents WHERE id = ?1",
+            params![document_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Other("that document no longer exists".into()))?;
+
+    // `source_type` is NULL/'vault' for a document PM owns the file for; anything else is a pointer.
+    let index_only = source_type.as_deref().is_some_and(|s| s != "vault");
+
+    let tx = conn.unchecked_transaction()?;
+    ingest::delete_document(&tx, document_id)?;
+    tx.commit()?;
+
+    if index_only {
+        if let Some(sid) = source_id.as_deref().filter(|s| !s.trim().is_empty()) {
+            let _ = index_only::forget_source(&vault_root, &manifest_cipher, sid);
+        }
+    } else if let Some(rel) = vault_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        let _ = std::fs::remove_file(vault_dir.join(rel));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, conversation_id: i64) -> Result<Vec<Message>> {
     let conn = state.conn()?;
@@ -3555,6 +3616,12 @@ pub async fn set_document_metadata(
 struct MutationFiles {
     written: Vec<(std::path::PathBuf, Vec<u8>)>,
     unlink: Vec<std::path::PathBuf>,
+    /// Index-only `source_id`s whose `.pmindex` manifest entries should be forgotten. Same
+    /// after-commit rule as `unlink`, and for the same reason: #574 originally dropped these from
+    /// the manifest *inside* the transaction, so a failed commit would have left the manifest
+    /// missing entries for documents that still existed — un-restorable by a rebuild-from-manifest
+    /// until the next connector sync happened to re-add them.
+    forget_sources: Vec<String>,
 }
 
 impl From<Vec<(std::path::PathBuf, Vec<u8>)>> for MutationFiles {
@@ -3563,7 +3630,7 @@ impl From<Vec<(std::path::PathBuf, Vec<u8>)>> for MutationFiles {
     fn from(written: Vec<(std::path::PathBuf, Vec<u8>)>) -> Self {
         MutationFiles {
             written,
-            unlink: Vec::new(),
+            ..MutationFiles::default()
         }
     }
 }
@@ -3624,6 +3691,9 @@ where
         // `MutationFiles` note; a file that outlives its row is reclaimed by the next Rebuild.
         for path in files.unlink {
             let _ = std::fs::remove_file(&path);
+        }
+        for source_id in files.forget_sources {
+            let _ = index_only::forget_source(&vault_root, &manifest_cipher, &source_id);
         }
         Ok(())
     })
@@ -4128,7 +4198,9 @@ pub async fn delete_project(
                         let index_only = source_type.as_deref().is_some_and(|s| s != "vault");
                         if index_only {
                             if let Some(sid) = source_id.as_deref().filter(|s| !s.is_empty()) {
-                                index_only::forget_source(vault_root, manifest_cipher, sid)?;
+                                // Queued, not applied here — the manifest must not lose an entry
+                                // for a document whose row survives a failed commit.
+                                out.forget_sources.push(sid.to_string());
                             }
                         } else if let Some(rel) =
                             vault_path.as_deref().filter(|p| !p.trim().is_empty())

@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.97.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "You can now delete a single document. A Delete option appears on each row in the Documents tab and in a project's file list, so you can remove something from wherever you happened to find it. It always asks first, and it tells you exactly what will go — because that differs: deleting a file removes it from your vault and from search; deleting a saved chat removes the conversation and its messages too, not just the searchable transcript; and deleting something indexed from Google Drive or OneDrive only removes PM's copy of the index, never the original in your cloud account.",
+      "The Delete option stays out of the way until you hover a row, so it can't be hit by accident, but it's still reachable by keyboard.",
+    ],
+  },
+  {
     version: "3.96.0-alpha",
     date: "2026-07-27",
     highlights: [

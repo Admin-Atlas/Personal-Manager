@@ -704,6 +704,12 @@ export const mergeProjectPreview = (from: string, into: string) =>
 export const mergeProjects = (from: string, into: string) =>
   invoke<void>("merge_projects", { from, into });
 
+/** Delete ONE document. A saved chat routes to the conversation delete (they are one object); an
+ *  index-only document loses PM's pointer + manifest entry only, never the file at the provider;
+ *  a vault document loses its rows and its Markdown. Irreversible. */
+export const deleteDocument = (documentId: number) =>
+  invoke<void>("delete_document", { documentId });
+
 /** What deleting `project` would affect — the live counts behind its confirmation ceremony. */
 export const deleteProjectPreview = (project: string) =>
   invoke<DeletePreview>("delete_project_preview", { project });

@@ -32,6 +32,7 @@ import { useDepth, useTheme } from "../theme";
 import { Button, Card, Collapsible, ConfirmDialog, Input } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { ImportancePicker } from "./ImportancePicker";
+import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDialog";
 import { IngestProgress } from "./IngestProgress";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
 import { useReader } from "../lib/reader";
@@ -124,6 +125,8 @@ export function DocumentsView({ onReviewClick }: Props) {
   // saves (project onBlur + importance onChange) would race and silently drop one field, since a
   // blur-then-click sends each with the other's stale value.
   const [editingId, setEditingId] = useState<number | null>(null);
+  // The document whose delete is being confirmed, or null (#575).
+  const [deletingDoc, setDeletingDoc] = useState<Document | null>(null);
   const [editDraft, setEditDraft] = useState<{
     project: string;
     importance: Document["importance"];
@@ -955,7 +958,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                         // virtualized and grows with connector estates). `contain-intrinsic-size` reserves
                         // a row-height placeholder so the scrollbar stays stable.
                         style={{ contentVisibility: "auto", containIntrinsicSize: "auto 41px" }}
-                        className={`cursor-pointer border-b border-rule hover:bg-surface ${
+                        className={`group cursor-pointer border-b border-rule hover:bg-surface ${
                           readerDoc?.id === doc.id ? "bg-accent-soft" : ""
                         }`}
                       >
@@ -965,6 +968,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                               {doc.title}
                             </div>
                             {doc.source_type === "index_only" && <SourceBadge doc={doc} />}
+                            <DeleteDocumentButton onClick={() => setDeletingDoc(doc)} />
                             {teachVisible && (
                               <button
                                 type="button"
@@ -1171,6 +1175,14 @@ export function DocumentsView({ onReviewClick }: Props) {
         busy={busy}
         onRetry={doSetup}
       />
+
+      {deletingDoc && (
+        <DeleteDocumentDialog
+          doc={deletingDoc}
+          onClose={() => setDeletingDoc(null)}
+          onDeleted={() => void refresh()}
+        />
+      )}
     </div>
   );
 }
