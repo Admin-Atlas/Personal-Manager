@@ -5,7 +5,7 @@ import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import type { CalendarOverview, Conversation, LocalLlmStatus } from "../lib/types";
 import { calendarOverview, listProjects } from "../lib/ipc";
 import { shortModel } from "../lib/format";
-import { readHidden, writeHidden } from "../lib/calendarPrefs";
+import { readHidden, readRosterOpen, writeHidden, writeRosterOpen } from "../lib/calendarPrefs";
 import { localEndpointState, LOCAL_STATE_TOKEN } from "../lib/localStatus";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth, useTheme, sourceColors, sourceShapeIndex } from "../theme";
@@ -138,7 +138,14 @@ interface Props {
   /** Move a conversation into a project, or back to global with `null` (card B). The parent owns the
    *  mutation + list refresh (and, in a project pane, resetting if the open chat leaves the project). */
   onMove: (id: number, project: string | null) => void;
+  /** Start a new GLOBAL conversation — always, from any tab. Deliberately not context-sensitive:
+   *  this hangs off the Chats row, and a button there can only honestly mean "a new chat in Chats".
+   *  Making it quietly project-scoped whenever a project happened to be open is what made its
+   *  predecessor unreadable — you could not tell from looking at it what it would make. */
   onNew: () => void;
+  /** Start a new conversation IN THE OPEN PROJECT. Separate from `onNew` because they make
+   *  different things, and each sits above the list it adds to. */
+  onNewProjectChat: () => void;
   /** Open a project's scoped view from the Chats tab's Projects section. App owns the navigation
    *  (the same `openProject` the Focus cards and the command palette use). */
   onOpenProject: (project: string) => void;
@@ -175,6 +182,7 @@ export function Sidebar({
   onDelete,
   onMove,
   onNew,
+  onNewProjectChat,
   onOpenProject,
   onOpenSettings,
   onOpenWhatsNew,
@@ -239,6 +247,7 @@ export function Sidebar({
   // sidebar never unmounts, so rendering it always would make it a permanent app-wide widget.
   const [calOverview, setCalOverview] = useState<CalendarOverview | null>(null);
   const [calHidden, setCalHidden] = useState<Set<string>>(readHidden);
+  const [rosterOpen, setRosterOpen] = useState(readRosterOpen);
   useEffect(() => {
     if (view !== "calendar") return;
     let alive = true;
@@ -292,23 +301,15 @@ export function Sidebar({
           resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
         }`}
       />
-      {/* The name-and-Alpha badge that used to sit here is gone: the window chrome carries both a
-          few pixels above it, now with the version number attached, and two of them side by side
-          was the same fact stated twice. The row stays as the New button's home and as the gap
-          between the chrome and the nav. */}
-      <div className="flex shrink-0 items-center justify-end px-4 py-3">
-        {(view === "chat" || view === "project") && (
-          <button
-            onClick={onNew}
-            title="New conversation"
-            className="rounded-[var(--radius-sm)] px-2 py-1 text-sm text-ink3 hover:bg-surface hover:text-ink"
-          >
-            + New
-          </button>
-        )}
-      </div>
-
-      <div className="shrink-0 px-2 pb-2">
+      {/* Search sits directly under the window chrome. The name-and-Alpha badge that used to be
+          above it is gone — the chrome carries both a few pixels higher, now with the version
+          number attached, and two of them side by side was the same fact stated twice. What that
+          left behind was a row rendered UNCONDITIONALLY to hold the New button, which only appears
+          on two tabs: every other tab paid its full height as blank space between the chrome and
+          Search, and on the two tabs that did show it, one control pushed the whole sidebar down to
+          claim a line of its own. New now lives on the Chats row below, where it belongs, and the
+          padding here is even with the nav (`p-2` here, `px-2` there). */}
+      <div className="shrink-0 p-2">
         <button
           onClick={onOpenPalette}
           data-help="sidebar-search"
@@ -316,7 +317,7 @@ export function Sidebar({
           className="flex w-full items-center justify-between rounded-[var(--radius-sm)] border border-border bg-surface px-3 py-1.5 text-left text-sm text-ink4 hover:text-ink2"
         >
           <span>Search…</span>
-          <span className="font-mono text-xs text-faint">{SHORTCUT_HINT}</span>
+          <span className="ml-2 shrink-0 font-mono text-xs text-faint">{SHORTCUT_HINT}</span>
         </button>
       </div>
 
@@ -334,9 +335,34 @@ export function Sidebar({
           >
             Focus
           </NavItem>
-          <NavItem active={view === "chat"} onClick={() => onNavigate("chat")} helpId="nav-chat">
-            Chats
-          </NavItem>
+          {/* New sits on the Chats row because that is what it makes — not in the chrome above,
+              where it had no subject and cost the whole sidebar a line. A SIBLING of NavItem, never
+              its `trailing` slot: NavItem is itself a <button>, so a button inside it would be
+              invalid markup and every New click would also fire the navigate underneath.
+
+              It makes a GLOBAL chat from every tab, including while a project is open. A button on
+              the Chats row reads as "new chat in Chats" no matter what is on screen behind it, so
+              scoping it to the open project silently — as its predecessor did — meant the same
+              control made two different things with nothing to tell them apart. A project's own
+              New sits over that project's conversation list below. */}
+          <div className="flex items-center gap-1">
+            <NavItem
+              active={view === "chat"}
+              onClick={() => onNavigate("chat")}
+              helpId="nav-chat"
+              className="min-w-0 flex-1"
+            >
+              Chats
+            </NavItem>
+            <button
+              onClick={onNew}
+              title="New conversation"
+              aria-label="New conversation"
+              className="shrink-0 rounded-[var(--radius-sm)] px-1.5 py-1.5 text-xs text-ink4 transition hover:bg-surface hover:text-ink"
+            >
+              + New
+            </button>
+          </div>
           <NavItem
             active={view === "calendar"}
             onClick={() => onNavigate("calendar")}
@@ -454,9 +480,23 @@ export function Sidebar({
           )}
           {view === "project" && (
             <div data-help="conversations-list">
-              <p className="px-2 pb-1 pt-2 font-mono text-xs uppercase tracking-wide text-faint">
-                Conversations
-              </p>
+              {/* The project's own New, over the project's own list. Until now the ONLY unconditional
+                  way to start a project chat was the sidebar's top New button, which read as a global
+                  control; the only other route was the "this conversation has been idle — start a new
+                  one?" prompt in ProjectView, which by definition isn't there when you want it. */}
+              <div className="flex items-center justify-between gap-1 px-2 pb-1 pt-2">
+                <p className="min-w-0 truncate font-mono text-xs uppercase tracking-wide text-faint">
+                  Conversations
+                </p>
+                <button
+                  onClick={onNewProjectChat}
+                  title="New conversation in this project"
+                  aria-label="New conversation in this project"
+                  className="shrink-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-xs text-ink4 transition hover:bg-surface hover:text-ink"
+                >
+                  + New
+                </button>
+              </div>
               {conversations.length === 0 && (
                 <p className="px-2 py-2 text-xs text-faint">No conversations yet.</p>
               )}
@@ -516,12 +556,20 @@ export function Sidebar({
             one, which is far more conspicuous inline than it was inside a popover. */}
         {view === "calendar" && calOverview && (
           <div className="mb-1 border-b border-border pb-2" data-help="calendar-filter">
+            {/* Controlled, not `defaultOpen`: this block unmounts whenever you leave the Calendar
+                tab, so an uncontrolled fold reseeded itself open on the way back. The state lives in
+                Sidebar (which never unmounts) AND in localStorage, so the choice survives both a tab
+                change and a restart. */}
             <Collapsible
               title="Calendars"
               meta={`${calOverview.calendars.filter((c) => c.selected && !calHidden.has(c.id)).length}/${
                 calOverview.calendars.filter((c) => c.selected).length
               }`}
-              defaultOpen
+              open={rosterOpen}
+              onOpenChange={(o) => {
+                setRosterOpen(o);
+                writeRosterOpen(o);
+              }}
             >
               <div className="max-h-64 overflow-y-auto">
                 <CalendarSourceList

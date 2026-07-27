@@ -90,95 +90,103 @@ export function DateField({
   }
 
   return (
-    <div
-      className={cn("flex min-w-0 items-center gap-1", disabled && "opacity-60", wrapperClassName)}
+    <Popover
+      align="left"
+      // Prefer ABOVE the field. These fields sit low in short containers (a pinboard timeline row, a
+      // milestone list), where dropping down put the picker under the window edge; Popover flips it
+      // back below when there's no room above.
+      side="top"
+      // The field lives inside `overflow-hidden` pinboard cards and `overflow-auto` scrollers, which
+      // clipped an absolutely-positioned panel out of existence. See Popover's `escapeClipping`.
+      escapeClipping
+      ariaLabel="Pick a date"
+      panelClassName="w-auto min-w-0"
+      rootClassName={cn("flex min-w-0 items-center", disabled && "opacity-60", wrapperClassName)}
+      trigger={({ open, toggle }) => (
+        <input
+          ref={inputRef}
+          id={id}
+          type="text"
+          inputMode="numeric"
+          autoComplete="off"
+          role="combobox"
+          aria-expanded={open}
+          value={draft}
+          disabled={disabled}
+          placeholder={placeholder}
+          aria-label={ariaLabel}
+          aria-invalid={invalid || undefined}
+          title={title ?? "Type a date as dd-mm-yyyy, or click to pick one"}
+          onChange={(e) => {
+            setDraft(e.currentTarget.value);
+            // Live-flag nonsense so the border reacts as you type, but never rewrite the text — the
+            // whole point is that a half-typed date survives.
+            setInvalid(parseDisplay(e.currentTarget.value) === null);
+          }}
+          // Clicking the field IS how the picker opens now — the separate 📅 button is gone, because
+          // a control whose only job is "show me the thing I just clicked on" is a second control for
+          // one intent. Click rather than focus: opening on focus would pop a picker at every tab
+          // through a form, and typing is still the primary path on Linux (see the note above).
+          onClick={() => {
+            if (!open) toggle();
+          }}
+          onBlur={commitDraft}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commitDraft();
+              inputRef.current?.blur();
+              return;
+            }
+            // The keyboard route to the picker, replacing the button that used to be tab-reachable.
+            if (e.key === "ArrowDown" && !open) {
+              e.preventDefault();
+              toggle();
+            }
+          }}
+          className={cn(
+            "min-w-0 flex-1 rounded-[var(--radius-sm)] border bg-surface outline-none transition placeholder:text-ink4 focus:border-accent",
+            invalid ? "border-st-due" : "border-border2",
+            className,
+          )}
+        />
+      )}
     >
-      <input
-        ref={inputRef}
-        id={id}
-        type="text"
-        inputMode="numeric"
-        autoComplete="off"
-        value={draft}
-        disabled={disabled}
-        placeholder={placeholder}
-        aria-label={ariaLabel}
-        aria-invalid={invalid || undefined}
-        title={title ?? "Type a date as dd-mm-yyyy, or pick one from the calendar"}
-        onChange={(e) => {
-          setDraft(e.currentTarget.value);
-          // Live-flag nonsense so the border reacts as you type, but never rewrite the text — the
-          // whole point is that a half-typed date survives.
-          setInvalid(parseDisplay(e.currentTarget.value) === null);
-        }}
-        onBlur={commitDraft}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commitDraft();
-            inputRef.current?.blur();
-          }
-        }}
-        className={cn(
-          "min-w-0 flex-1 rounded-[var(--radius-sm)] border bg-surface outline-none transition placeholder:text-ink4 focus:border-accent",
-          invalid ? "border-st-due" : "border-border2",
-          className,
-        )}
-      />
-      <Popover
-        align="right"
-        ariaLabel="Pick a date"
-        panelClassName="w-auto min-w-0"
-        trigger={({ open, toggle }) => (
-          <button
-            type="button"
-            onClick={toggle}
-            disabled={disabled}
-            aria-expanded={open}
-            aria-label="Open the date picker"
-            title="Pick a date"
-            className="shrink-0 rounded-[var(--radius-sm)] px-1 text-ink4 transition hover:bg-surface hover:text-ink disabled:opacity-40"
-          >
-            <span aria-hidden="true">📅</span>
-          </button>
-        )}
-      >
-        {({ close }) => (
-          <MonthPicker
-            selected={selected}
-            onPick={(d) => {
-              pick(dateToIso(d));
-              close();
-            }}
-            footer={
-              <div className="mt-1 flex items-center justify-between border-t border-border px-1 pt-1">
+      {({ close }) => (
+        <MonthPicker
+          selected={selected}
+          onPick={(d) => {
+            pick(dateToIso(d));
+            close();
+          }}
+          footer={
+            <div className="mt-1 flex items-center justify-between border-t border-border px-1 pt-1">
+              <button
+                type="button"
+                onClick={() => {
+                  pick(todayIso());
+                  close();
+                }}
+                className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-accent-text hover:bg-surface"
+              >
+                Today
+              </button>
+              {clearable && (
                 <button
                   type="button"
                   onClick={() => {
-                    pick(todayIso());
+                    pick("");
                     close();
                   }}
-                  className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-accent-text hover:bg-surface"
+                  className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 hover:bg-surface hover:text-ink"
                 >
-                  Today
+                  Clear
                 </button>
-                {clearable && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      pick("");
-                      close();
-                    }}
-                    className="rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-ink4 hover:bg-surface hover:text-ink"
-                  >
-                    Clear
-                  </button>
-                )}
-              </div>
-            }
-          />
-        )}
-      </Popover>
-    </div>
+              )}
+            </div>
+          }
+        />
+      )}
+    </Popover>
   );
 }

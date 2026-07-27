@@ -488,6 +488,21 @@ export default function App() {
     if (aiReady) void refreshReviewCount();
   }, [aiReady, view, refreshReviewCount]);
 
+  // Re-read the conversation roster on the way INTO the Chats tab, for the same reason as the badge
+  // above: it is the only thing that keeps the tab's per-project chat counts honest.
+  //
+  // A chat started inside a project is created by `useProjectChat`, which refreshes its OWN scoped
+  // list and has no way to reach this one — so the count beside that project sat stale until
+  // something unrelated (a delete, a move, a restart) happened to refresh the roster. Re-reading on
+  // entry fixes every such path at once rather than just the one we happen to have found, and the
+  // counts are only rendered on this tab, so there is nowhere else for them to be wrong.
+  useEffect(() => {
+    if (aiReady && view === "chat") void refreshConversations();
+    // `refreshConversations` is redeclared every render, so listing it here would re-fire the effect
+    // on every render rather than on arrival. Keyed on the tab, which is the actual trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiReady, view]);
+
   const refreshBetterFit = useCallback(async () => {
     try {
       setBetterFit((await localBetterFitNotice()) !== null);
@@ -974,14 +989,17 @@ export default function App() {
                   }
                   onDelete={inProject ? projectChat.deleteConversation : handleDeleteConversation}
                   onMove={inProject ? projectChat.moveConversation : handleMoveConversation}
-                  onNew={
-                    inProject
-                      ? projectChat.newChat
-                      : () => {
-                          setView("chat");
-                          newConversation();
-                        }
-                  }
+                  // Two handlers, because the sidebar now has two New buttons that make two
+                  // different things. `onNew` (the Chats row) is ALWAYS a global conversation and
+                  // navigates there, even with a project open — it used to switch to
+                  // `projectChat.newChat` whenever one was, so the same button quietly made a
+                  // project chat with nothing on screen to say so. `onNewProjectChat` sits over the
+                  // project's own conversation list, where the scope is not in question.
+                  onNew={() => {
+                    setView("chat");
+                    newConversation();
+                  }}
+                  onNewProjectChat={projectChat.newChat}
                   onOpenSettings={() => setShowSettings(true)}
                   onOpenWhatsNew={() => setShowWhatsNew(true)}
                   onOpenPalette={() => setShowPalette(true)}

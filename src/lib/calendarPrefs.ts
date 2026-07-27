@@ -82,6 +82,33 @@ export function writeHidden(hidden: Set<string>): void {
   }
 }
 
+const ROSTER_OPEN_KEY = "pm.calendar.rosterOpen";
+
+/** Is the sidebar's "Calendars" roster folded open? Open until the user says otherwise.
+ *
+ *  Persisted because that block is gated on `view === "calendar"` and so UNMOUNTS on every tab
+ *  switch. Left uncontrolled it reseeded from `defaultOpen` each time it came back, which meant a
+ *  collapsed roster silently reopened the moment you looked at anything else — the same
+ *  unmount-reseeds-the-fold bug the Chats-tab sections already fixed via lib/chatPrefs.
+ *
+ *  A plain boolean, not chatPrefs' tri-state: that seed is derived from Depth, so it has to tell
+ *  "never chosen" from "chose closed". This one just starts open. */
+export function readRosterOpen(): boolean {
+  try {
+    return localStorage.getItem(ROSTER_OPEN_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+export function writeRosterOpen(open: boolean): void {
+  try {
+    localStorage.setItem(ROSTER_OPEN_KEY, open ? "true" : "false");
+  } catch {
+    // Best-effort; a failed write just means the fold isn't remembered on this device.
+  }
+}
+
 /** The last time-grid range the user chose (Week/Day). Defaults to the everyday whole-day grid. */
 export function readRange(): CalendarRange {
   try {

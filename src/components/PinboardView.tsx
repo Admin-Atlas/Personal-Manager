@@ -45,8 +45,10 @@ import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinbo
 import {
   isPastTimelineDate,
   readConfirmDelete,
+  readShowCompletedTimelineItems,
   readShowPastTimelineItems,
   writeConfirmDelete,
+  writeShowCompletedTimelineItems,
   writeShowPastTimelineItems,
 } from "../lib/pinboard/prefs";
 import { todayIso } from "../lib/dateField";
@@ -877,33 +879,36 @@ function WidgetHeader({
   );
 }
 
-/** "Past" — the timeline card's counterpart to the project panel's "Completed" checkbox. Writes
- *  through on change so every timeline card on the board agrees, and so the choice survives a
- *  remount (a tab switch unmounts the whole board). */
-function ShowPastToggle({
+/** One of a timeline card's filter checkboxes — "Past" (by date) or "Done" (by status). One
+ *  component rather than two near-identical ones, so the two read and behave identically; the
+ *  caller owns the pref write, since each answers a different question and they persist separately.
+ *
+ *  `onChange` is expected to write through as well as set state, so every timeline card on the board
+ *  agrees and the choice survives a remount (a tab switch unmounts the whole board). */
+function TimelineFilterToggle({
+  label,
+  title,
   checked,
   onChange,
 }: {
+  label: string;
+  title: string;
   checked: boolean;
   onChange: (v: boolean) => void;
 }) {
   return (
     <label
       className="flex shrink-0 items-center gap-1 text-[0.625rem] uppercase tracking-wide text-ink4"
-      title="Show entries whose date has already passed"
+      title={title}
       onPointerDown={(e) => e.stopPropagation()}
     >
       <input
         type="checkbox"
         checked={checked}
-        onChange={(e) => {
-          const next = e.currentTarget.checked;
-          onChange(next);
-          writeShowPastTimelineItems(next);
-        }}
+        onChange={(e) => onChange(e.currentTarget.checked)}
         className="accent-[var(--accent)]"
       />
-      Past
+      {label}
     </label>
   );
 }
@@ -1858,6 +1863,7 @@ function BoundTimeline({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showPast, setShowPast] = useState(readShowPastTimelineItems);
+  const [showCompleted, setShowCompleted] = useState(readShowCompletedTimelineItems);
   const today = todayIso();
 
   const refresh = useCallback(() => {
@@ -1887,8 +1893,13 @@ function BoundTimeline({
     if (!db) return -1;
     return da.localeCompare(db);
   });
+  // Each filter is offered only when it has something to hide — on a card this size a checkbox that
+  // does nothing is worse than no checkbox (the same rule the Past toggle already followed).
   const hasPast = sorted.some((m) => isPastTimelineDate(msDate(m), today));
-  const ordered = showPast ? sorted : sorted.filter((m) => !isPastTimelineDate(msDate(m), today));
+  const hasCompleted = sorted.some((m) => m.state === "met");
+  const ordered = sorted
+    .filter((m) => showPast || !isPastTimelineDate(msDate(m), today))
+    .filter((m) => showCompleted || m.state !== "met");
 
   async function add() {
     await runMutation(async () => {
@@ -1905,7 +1916,28 @@ function BoundTimeline({
         </span>
         {/* Only offered when there is something to hide — on a card this size an always-present
             checkbox that does nothing is worse than no checkbox. */}
-        {hasPast && <ShowPastToggle checked={showPast} onChange={setShowPast} />}
+        {hasPast && (
+          <TimelineFilterToggle
+            label="Past"
+            title="Show entries whose date has already passed"
+            checked={showPast}
+            onChange={(v) => {
+              setShowPast(v);
+              writeShowPastTimelineItems(v);
+            }}
+          />
+        )}
+        {hasCompleted && (
+          <TimelineFilterToggle
+            label="Done"
+            title="Show milestones already marked Done"
+            checked={showCompleted}
+            onChange={(v) => {
+              setShowCompleted(v);
+              writeShowCompletedTimelineItems(v);
+            }}
+          />
+        )}
         <button
           onClick={onUnlink}
           title="Unlink this project (its milestones stay in the project)"
@@ -2119,15 +2151,18 @@ function MilestoneColumn({ m, onChanged, onError, showPower }: MilestoneItemProp
   );
 }
 
-/** One milestone as a list row: status dot · date · label · progress · remove — the same edits as
- *  the column view, laid out horizontally, plus the progress dropdown the narrow track can't hold.
- *  This is where a status is CHANGED; the dot beside it is the same readout the track shows. */
+/** One milestone as a list row: date · label · progress · remove — the same edits as the column
+ *  view, laid out horizontally, plus the progress dropdown the narrow track can't hold. This is
+ *  where a status is CHANGED.
+ *
+ *  No status dot here. The track view keeps one because it is the marker showing where a milestone
+ *  sits on the line and the only place its status is stated; in a list row the dropdown right there
+ *  already says it in words, so the dot was a second, vaguer copy of the same fact. */
 function MilestoneRow({ m, onChanged, onError, showPower }: MilestoneItemProps) {
   const { label, setLabel, date, setDate, met, status, persist, setStatus, remove } =
     useMilestoneEditor(m, onChanged, onError);
   return (
     <div className="flex items-center gap-1">
-      <MilestoneDot status={status} />
       {m.calendar_linked ? (
         <span
           className="flex h-6 w-[6.25rem] shrink-0 items-center gap-0.5 font-mono text-[0.5625rem] text-accent-text"
@@ -2254,7 +2289,16 @@ function FreeformTimeline({
     <div className="flex h-full flex-col px-2 py-1">
       {hasPast && (
         <div className="mb-1 flex shrink-0 justify-end">
-          <ShowPastToggle checked={showPast} onChange={setShowPast} />
+          {/* Freeform entries have no notion of "done", so this card gets the date filter only. */}
+          <TimelineFilterToggle
+            label="Past"
+            title="Show entries whose date has already passed"
+            checked={showPast}
+            onChange={(v) => {
+              setShowPast(v);
+              writeShowPastTimelineItems(v);
+            }}
+          />
         </div>
       )}
       {items.length === 0 ? (

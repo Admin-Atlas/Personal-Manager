@@ -201,6 +201,10 @@ function MilestoneRow({
   // dropdown and the ↑/↓ reorder arrows — so line 1 leaves the label its full width. Every text
   // field is `min-w-0 flex-1` so it shrinks rather than forcing horizontal overflow.
   //
+  // The two lines share one left edge. Line 2 used to be indented `pl-6` to clear the done tick-box
+  // that led line 1; with the tick-box gone that indent hung the date field off nothing, which read
+  // as a gap in the card rather than as alignment.
+  //
   // There is deliberately no done tick-box beside the dropdown. It and the dropdown's "Done" were
   // two controls writing the same fact, which meant two things to keep in step and two places to
   // look to learn one answer. The dropdown is the single writer; `set_milestone_status` carries
@@ -236,7 +240,7 @@ function MilestoneRow({
         </Button>
       </div>
 
-      <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-6">
+      <div className="mt-1 flex flex-wrap items-center gap-2">
         {m.calendar_linked ? (
           <span
             className={`flex min-w-0 flex-1 items-center gap-1 text-xs text-accent-text ${
