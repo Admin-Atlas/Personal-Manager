@@ -22,6 +22,7 @@ import type { Entity } from "../lib/types";
 import { useDevMode } from "../lib/capabilities";
 import { useDepth } from "../theme";
 import { TeachPreferences } from "./TeachPreferences";
+import { TeachTags } from "./TeachTags";
 import { DevRaw } from "./dev/DevRaw";
 import { Button, Card, Input, Modal, Select, Skeleton } from "./ui";
 
@@ -231,6 +232,11 @@ export function TeachView() {
               </ul>
             </>
           )}
+
+          {/* Re-tag the library from one store-wide vocabulary (#580). Shown regardless of whether
+              any projects exist — tags are a separate axis, and a library with everything in
+              Unsorted is exactly the one whose tags need the most help. */}
+          {showPower && <TeachTags />}
 
           {/* Structured preferences (§4.5) live here too — shown even with no projects yet, since a
               global/context preference (or one migrated from the old profile) needs no project. */}

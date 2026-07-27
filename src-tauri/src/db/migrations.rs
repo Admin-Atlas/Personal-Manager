@@ -1373,6 +1373,25 @@ const MIGRATIONS: &[&str] = &[
         JOIN tags t ON t.kind = 'group' AND t.norm = lower(trim(je.value))
         WHERE je.type = 'text' AND trim(je.value) <> '';
     "#,
+    // v48 (Stage-4 card 16.iii, #580): a staging area for a whole-library re-tag pass.
+    //
+    // Deliberately NOT `document_proposals`, which is the Review queue's cache. That table is read
+    // through `WHERE d.reviewed = 0` and committed by `commit_review`, which writes project +
+    // importance + tags together and logs corrections. Re-tagging touches ALREADY-REVIEWED
+    // documents and must change tags ONLY: routed through the review queue it would re-propose
+    // filing the user has curated, land blanks in Unsorted, and write corrections the user never
+    // made into the learning corpus. A separate table is the isolation.
+    //
+    // Regenerable and empty in the steady state: rows exist only between proposing a pass and
+    // accepting or discarding it. `ON DELETE CASCADE` so a document deleted mid-review takes its
+    // pending proposal with it rather than stranding a row pointing at nothing.
+    r#"
+    CREATE TABLE IF NOT EXISTS tag_proposals (
+        document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+        tags        TEXT NOT NULL,
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1428,7 +1447,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 47,
+            version, 48,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1452,7 +1471,7 @@ mod tests {
              retrieval-relevance feedback capture is v44; \
              calendar work/personal typing is v45; \
              tag registry + M:N project membership is v46; \
-             group tags join the registry is v47)"
+             group tags join the registry is v47;              whole-library re-tag staging is v48)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

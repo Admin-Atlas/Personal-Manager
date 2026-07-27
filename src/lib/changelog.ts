@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.100.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "You can re-tag your whole library in one go. Teach \u2192 Tags reads everything you have, picks one set of tags that actually suits it, and re-labels every document from that set.",
+      "This fixes something that was quietly broken. Tags were proposed a few documents at a time, so PM kept coining labels for whatever was in front of it \u2014 'ammun', 'chair-application', 'placement'. Each is a fair description of one file and useless as a tag, because a tag that lands on one document groups nothing.",
+      "The difference is that the vocabulary is chosen FIRST, with your whole library in view, and then everything is labelled from that one set. Choosing tags a few documents at a time cannot do better than the few documents it saw \u2014 which is how you ended up here.",
+      "Nothing is written until you say so. You get a before-and-after per document, you can untick any you disagree with, and PM only touches tags \u2014 your projects and importance levels are left exactly as they are.",
+      "It tells you what it will cost before it starts, because it does cost: it re-reads your library through the model, roughly one call per twelve documents.",
+    ],
+  },
+  {
     version: "3.99.0-alpha",
     date: "2026-07-27",
     highlights: [

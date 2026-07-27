@@ -492,6 +492,31 @@ export type ReviewEvent =
   | { type: "proposed"; document_id: number; proposal: MetadataProposal }
   | { type: "finished"; proposed: number };
 
+// --- Whole-library re-tag (#580) ---
+
+/** What a re-tag pass would cover, so its cost can be stated before anything is billed. */
+export interface RetagScope {
+  documents: number;
+  /** Model calls: one for the vocabulary, then one per batch of documents. */
+  calls: number;
+}
+
+export type RetagEvent =
+  /** The vocabulary the first call settled on — shown while the rest of the pass runs, so a bad
+   *  vocabulary can be seen (and the pass abandoned) without waiting for every document. */
+  | { type: "vocabulary"; tags: string[] }
+  | { type: "progress"; done: number; total: number }
+  | { type: "finished"; changed: number };
+
+/** One document's staged re-tag: what it carries now, and what the pass proposes instead.
+ *  Only documents whose tags would actually change are returned. */
+export interface TagProposalRow {
+  document_id: number;
+  title: string;
+  current_tags: string[];
+  proposed_tags: string[];
+}
+
 // --- Canonical entities (the Teach tab; entity-resolution foundation) ---
 
 /** A canonical entity with its known aliases — the unit the Teach tab manages. `type` is
