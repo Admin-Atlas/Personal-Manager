@@ -29,10 +29,11 @@ import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { interactiveProps } from "../lib/interactiveProps";
 import { useDepth, useTheme } from "../theme";
-import { Button, Card, Collapsible, ConfirmDialog, Input } from "./ui";
+import { Button, Card, Collapsible, ConfirmDialog } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { ImportancePicker } from "./ImportancePicker";
 import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDialog";
+import { ProjectPicker, ProjectSummary, projectsOf } from "./ProjectPicker";
 import { IngestProgress } from "./IngestProgress";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
 import { useReader } from "../lib/reader";
@@ -127,10 +128,13 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [editingId, setEditingId] = useState<number | null>(null);
   // The document whose delete is being confirmed, or null (#575).
   const [deletingDoc, setDeletingDoc] = useState<Document | null>(null);
+  // `projects[0]` is the primary; the rest are links (#275). Held as one ordered list so a single
+  // Save writes the whole membership, for the same reason project and importance already share a
+  // draft: two independent optimistic writes race and silently drop one.
   const [editDraft, setEditDraft] = useState<{
-    project: string;
+    projects: string[];
     importance: Document["importance"];
-  }>({ project: "", importance: null });
+  }>({ projects: [], importance: null });
   const [savingEdit, setSavingEdit] = useState(false);
   const [projectNames, setProjectNames] = useState<string[]>([]);
   // Developer mode (issue #78): an in-place chunk inspector. Clicking a document's chunk count
@@ -174,11 +178,19 @@ export function DocumentsView({ onReviewClick }: Props) {
   // A metadata edit rewrites front-matter only (no re-embed), reusing the `set_document_metadata`
   // seam. An empty project field falls back to the document's current project (never blanks it).
   async function saveMeta(doc: Document) {
-    const project = editDraft.project.trim() || doc.project;
+    // Never blank the filing: an emptied editor falls back to where the document already is.
+    const projects = editDraft.projects.length ? editDraft.projects : projectsOf(doc);
+    const [project, ...alsoProjects] = projects;
     setSavingEdit(true);
     setError(null);
     try {
-      const updated = await setDocumentMetadata(doc.id, project, doc.tags, editDraft.importance);
+      const updated = await setDocumentMetadata(
+        doc.id,
+        project,
+        alsoProjects,
+        doc.tags,
+        editDraft.importance,
+      );
       setDocuments((docs) => docs.map((d) => (d.id === updated.id ? updated : d)));
       setEditingId(null);
     } catch (e) {
@@ -600,6 +612,7 @@ export function DocumentsView({ onReviewClick }: Props) {
           c = a.title.localeCompare(b.title);
           break;
         case "project":
+          // The PRIMARY project: the column shows it, so it is what the header sorts by.
           c = a.project.localeCompare(b.project);
           break;
         case "importance":
@@ -978,7 +991,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                                     setEditingId(null);
                                   } else {
                                     setEditDraft({
-                                      project: doc.project,
+                                      projects: projectsOf(doc),
                                       importance: doc.importance,
                                     });
                                     setEditingId(doc.id);
@@ -1032,7 +1045,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                                 title="Awaiting review"
                               />
                             )}
-                            {doc.project}
+                            <ProjectSummary doc={doc} />
                           </span>
                         </td>
                         <td className="py-2 pr-3 capitalize text-ink3">{doc.importance ?? "—"}</td>
@@ -1084,18 +1097,19 @@ export function DocumentsView({ onReviewClick }: Props) {
                         <tr>
                           <td colSpan={showPower ? 5 : 4} className="pb-3">
                             <div className="flex flex-col gap-2 rounded-[var(--radius-sm)] border border-border bg-surface p-3">
-                              <label className="flex items-center gap-2 text-xs text-ink3">
-                                <span className="w-20 shrink-0">Project</span>
-                                <Input
-                                  autoFocus
-                                  list={RECLASSIFY_PROJECTS_LIST_ID}
-                                  value={editDraft.project}
-                                  onChange={(e) =>
-                                    setEditDraft((d) => ({ ...d, project: e.target.value }))
-                                  }
-                                  className="h-7 max-w-xs flex-1 text-xs"
+                              <div
+                                className="flex items-start gap-2 text-xs text-ink3"
+                                data-help="review-project"
+                              >
+                                <span className="w-20 shrink-0 pt-1">Projects</span>
+                                <ProjectPicker
+                                  value={editDraft.projects}
+                                  onChange={(projects) => setEditDraft((d) => ({ ...d, projects }))}
+                                  suggestions={projectNames}
+                                  listId={RECLASSIFY_PROJECTS_LIST_ID}
+                                  disabled={savingEdit}
                                 />
-                              </label>
+                              </div>
                               <div className="flex items-center gap-2 text-xs text-ink3">
                                 <span className="w-20 shrink-0">Importance</span>
                                 <ImportancePicker
@@ -1118,7 +1132,13 @@ export function DocumentsView({ onReviewClick }: Props) {
                                   onClick={() => void saveMeta(doc)}
                                   disabled={
                                     savingEdit ||
-                                    (editDraft.project.trim() === doc.project &&
+                                    // NUL as the separator: a project name may contain any
+                                    // printable character (commas are explicitly allowed),
+                                    // so an ordinary delimiter could make two different
+                                    // lists compare equal and leave Save disabled on a real
+                                    // change.
+                                    (editDraft.projects.join("\u0000") ===
+                                      projectsOf(doc).join("\u0000") &&
                                       editDraft.importance === doc.importance)
                                   }
                                   className="px-2 py-1 text-xs"

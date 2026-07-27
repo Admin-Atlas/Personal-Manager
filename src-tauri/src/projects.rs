@@ -197,16 +197,27 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     // were pruned as stale. UNION in the document-less projects that still have a reason to surface (a
     // milestone or a `last_touched` engagement stamp) with `doc_count = 0`; their milestones attach via
     // the same `milestones_by_project` pass below (that pass was never document-gated).
-    let mut stmt = conn.prepare(
-        "SELECT d.project AS name, \
+    // #275: the roster is driven by MEMBERSHIP, not by `documents.project` alone, so a project that
+    // exists only as somewhere documents are linked still appears in Focus with an honest file
+    // count. Every home membership has a join row (the v46 backfill guarantees it, and
+    // `write_document_truth` maintains it), so on a store where nothing has been linked yet this
+    // returns exactly what the `GROUP BY d.project` version returned, row for row.
+    //
+    // `last_activity` counts every member, home or linked, because it answers "when was there last
+    // anything going on in this project" and a linked document is content in it. That is a
+    // different question from the activity LOG, which stays home-only so N memberships can't
+    // inflate engagement heat in N places (B6-6).
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.name AS name, \
                 COUNT(*) AS doc_count, \
                 max(MAX(COALESCE(d.last_activity, d.ingested_at)), COALESCE(p.last_touched,'')) AS last_activity, \
                 p.deadline, p.size, p.blocked_by, p.importance, \
                 julianday(:today) - julianday(date(replace( \
                     max(MAX(COALESCE(d.last_activity, d.ingested_at)), COALESCE(p.last_touched,'')),'Z',''))) AS days_since \
-         FROM documents d \
-         LEFT JOIN projects p ON p.name = d.project \
-         GROUP BY d.project \
+         FROM ({memberships}) m \
+         JOIN documents d ON d.id = m.document_id \
+         LEFT JOIN projects p ON p.name = m.name \
+         GROUP BY m.norm \
          UNION ALL \
          SELECT p.name AS name, \
                 0 AS doc_count, \
@@ -214,11 +225,13 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
                 p.deadline, p.size, p.blocked_by, p.importance, \
                 julianday(:today) - julianday(date(replace(COALESCE(p.last_touched,''),'Z',''))) AS days_since \
          FROM projects p \
-         WHERE p.name NOT IN (SELECT project FROM documents WHERE project IS NOT NULL) \
+         WHERE NOT EXISTS (SELECT 1 FROM ({memberships}) m2 \
+                           WHERE m2.norm = lower(trim(p.name))) \
            AND (p.last_touched IS NOT NULL \
-                OR EXISTS (SELECT 1 FROM project_milestones m WHERE m.project_name = p.name)) \
+                OR EXISTS (SELECT 1 FROM project_milestones pm WHERE pm.project_name = p.name)) \
          ORDER BY name",
-    )?;
+        memberships = crate::tags::MEMBERSHIPS_SQL
+    ))?;
 
     let rows = stmt.query_map(named_params![":today": today], |row| {
         let name: String = row.get(0)?;
@@ -463,6 +476,12 @@ pub fn rename_project_satellites(conn: &Connection, old: &str, new: &str) -> Res
             crate::db::set_setting(conn, "pinboard", &rekeyed)?;
         }
     }
+    // 8. The project's own tag (#275), carrying every membership of it — including documents HOMED
+    //    somewhere else that merely list this project. A rename is one row; a merge folds into the
+    //    destination tag, skipping documents already in both rather than colliding on the join's
+    //    (document_id, tag_id) key. The caller then rewrites those documents' vault files, which is
+    //    what makes the fold survive a Rebuild.
+    crate::tags::rename_project_tag(conn, old, new)?;
     Ok(())
 }
 
@@ -571,6 +590,12 @@ pub fn delete_project_satellites(conn: &Connection, name: &str) -> Result<()> {
     }
     // 5. The triage row last — this is what cascades `project_milestones`.
     conn.execute("DELETE FROM projects WHERE name = ?1", params![name])?;
+    // 6. The project's own tag (#275). The join cascades from it, so this unlinks the project from
+    //    every document at once — including ones homed elsewhere that merely listed it, which no
+    //    `entity_id` query in the delete path can see. It must run BEFORE the caller rewrites those
+    //    documents' vault files, since those rewrites re-derive `linked_projects:` from this join.
+    //    Deliberately after the triage row, so the `projects`-row check in the tag GC can't resurrect it.
+    crate::tags::delete_project_tag(conn, name)?;
     Ok(())
 }
 

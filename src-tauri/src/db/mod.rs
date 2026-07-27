@@ -938,7 +938,12 @@ mod tests {
             // v43/v44: `corrections` and `messages` both predate the rewind point, so unlike
             // `project_milestones` (dropped wholesale below) their added columns have to come off
             // explicitly — and their indexes first, since SQLite won't drop an indexed column.
-            "DROP TABLE retrieval_feedback; \
+            // v46: the join drops before the tags it points at — `document_tags.tag_id REFERENCES
+            // tags(id)` under `PRAGMA foreign_keys = ON`, so the parent cannot go first (the same
+            // rule the `preferences`/`entities` pair below follows).
+            "DROP TABLE document_tags; \
+             DROP TABLE tags; \
+             DROP TABLE retrieval_feedback; \
              ALTER TABLE messages DROP COLUMN retrieved_chunk_ids; \
              DROP INDEX idx_corrections_pipeline; \
              ALTER TABLE corrections DROP COLUMN pipeline_version; \
@@ -1111,7 +1116,12 @@ mod tests {
             // v43/v44: `corrections` and `messages` both predate the rewind point, so unlike
             // `project_milestones` (dropped wholesale below) their added columns have to come off
             // explicitly — and their indexes first, since SQLite won't drop an indexed column.
-            "DROP TABLE retrieval_feedback; \
+            // v46: the join drops before the tags it points at — `document_tags.tag_id REFERENCES
+            // tags(id)` under `PRAGMA foreign_keys = ON`, so the parent cannot go first (the same
+            // rule the `preferences`/`entities` pair below follows).
+            "DROP TABLE document_tags; \
+             DROP TABLE tags; \
+             DROP TABLE retrieval_feedback; \
              ALTER TABLE messages DROP COLUMN retrieved_chunk_ids; \
              DROP INDEX idx_corrections_pipeline; \
              ALTER TABLE corrections DROP COLUMN pipeline_version; \

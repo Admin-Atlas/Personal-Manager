@@ -70,6 +70,15 @@ pub struct ManifestItem {
     pub title: String,
     /// CANONICAL project name (never a variant) — re-resolved to an `entity_id` on reconcile.
     pub project: String,
+    /// The item's OTHER project memberships (#275) — the manifest's counterpart to a vault file's
+    /// `linked_projects:` line, so an index-only document can belong to several projects exactly
+    /// like a stored one.
+    ///
+    /// `#[serde(default)]` because this file is the portable truth and manifests written before
+    /// #275 have no such key. Without it, every pre-existing `.pmindex` would fail to parse — and
+    /// this is the file a restore reads, so that is not a cosmetic failure.
+    #[serde(default)]
+    pub linked_projects: Vec<String>,
     pub tags: Vec<String>,
     pub importance: Option<String>,
     pub reviewed: bool,
@@ -216,9 +225,13 @@ fn mirror_has_unfiled(conn: &Connection, manifest: &Manifest) -> Result<bool> {
 /// Serialize the index-only documents in the DB mirror into manifest items (canonical names; integer
 /// ids stay out of the file).
 fn mirror_items(conn: &Connection) -> Result<Vec<ManifestItem>> {
+    // Memberships come from the join, in one pass rather than a query per item — an estate of
+    // connected files is the case this path is built for, and per-item lookups would scale with it.
+    let memberships = crate::tags::all_project_memberships(conn)?;
     let mut stmt = conn.prepare(
         "SELECT source_id, title, project, tags, importance, reviewed, last_activity, \
-                external_ref, source_modified_at, source_content_hash, source_state, stored_summary \
+                external_ref, source_modified_at, source_content_hash, source_state, stored_summary, \
+                id \
          FROM documents \
          WHERE source_type = ?1 AND source_id IS NOT NULL \
          ORDER BY source_id",
@@ -226,10 +239,24 @@ fn mirror_items(conn: &Connection) -> Result<Vec<ManifestItem>> {
     let rows = stmt
         .query_map(params![ingest::SOURCE_TYPE_INDEX_ONLY], |r| {
             let tags_json: String = r.get(3)?;
+            let project: String = r.get(2)?;
+            let doc_id: i64 = r.get(12)?;
+            let home_norm = crate::tags::normalize(&project);
+            let linked_projects = memberships
+                .get(&doc_id)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter(|n| crate::tags::normalize(n) != home_norm)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             Ok(ManifestItem {
                 source_id: r.get(0)?,
                 title: r.get(1)?,
-                project: r.get(2)?,
+                project,
+                linked_projects,
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
                 importance: r.get(4)?,
                 reviewed: r.get::<_, i64>(5)? != 0,
@@ -328,6 +355,7 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<bool> 
         stored_summary: Option<String>,
         title: Option<String>,
         entity_id: Option<i64>,
+        id: i64,
     }
     // F-04 ("mirror ⊆ rules after any mint"). The loop's `resolve_project(.., true)` below MINTS a
     // project entity when the manifest names one the mirror lacks — but nothing here pushed it to
@@ -356,7 +384,7 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<bool> 
             .query_row(
                 "SELECT project, tags, importance, reviewed, last_activity, external_ref, \
                         source_modified_at, source_content_hash, source_state, stored_summary, \
-                        title, entity_id \
+                        title, entity_id, id \
                  FROM documents WHERE source_id = ?1 AND source_type = ?2",
                 params![it.source_id, ingest::SOURCE_TYPE_INDEX_ONLY],
                 |r| {
@@ -373,6 +401,7 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<bool> 
                         stored_summary: r.get(9)?,
                         title: r.get(10)?,
                         entity_id: r.get(11)?,
+                        id: r.get(12)?,
                     })
                 },
             )
@@ -388,7 +417,12 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<bool> 
             .map_err(|e| Error::Other(format!("encode tags: {e}")))?;
         // Compares EVERY column the UPDATE writes, so any drift still rewrites exactly as before;
         // the every-boot in-sync case becomes read-only.
+        // Memberships join the drift comparison: a link added on another machine arrives only in
+        // the manifest, and without this the every-boot in-sync shortcut below would skip it
+        // forever.
+        let current_linked = crate::tags::linked_projects(conn, current.id, &it.project)?;
         let unchanged = current.project.as_deref() == Some(it.project.as_str())
+            && current_linked == it.linked_projects
             && current.tags.as_deref() == Some(tags_json.as_str())
             && current.importance == it.importance
             && current.reviewed == Some(it.reviewed as i64)
@@ -425,6 +459,7 @@ fn apply_classification(conn: &Connection, manifest: &Manifest) -> Result<bool> 
                 entity_id,
             ],
         )?;
+        crate::tags::set_document_projects(conn, current.id, &it.project, &it.linked_projects)?;
     }
     Ok(minted)
 }
@@ -586,6 +621,7 @@ pub fn register_pointer(
         created_at: input.source_modified_at.clone(),
         ingested_at: now.clone(),
         project: "Unsorted".into(),
+        linked_projects: Vec::new(),
         tags: Vec::new(),
         importance: None,
         reviewed: false,
@@ -792,6 +828,8 @@ fn restore_item(
         created_at: item.source_modified_at.clone(),
         ingested_at: ingested_at.clone(),
         project: item.project.clone(),
+        // The manifest is this document's portable truth, so its memberships restore from it.
+        linked_projects: item.linked_projects.clone(),
         tags: item.tags.clone(),
         importance: item.importance.clone(),
         reviewed: item.reviewed,
@@ -1663,6 +1701,7 @@ mod tests {
                 source_id: "drive:42".into(),
                 title: "Quarterly plan".into(),
                 project: "Project Falcon".into(),
+                linked_projects: Vec::new(),
                 tags: vec!["plan".into()],
                 importance: Some("high".into()),
                 reviewed: true,
@@ -1736,6 +1775,7 @@ mod tests {
             source_id: source_id.into(),
             title: "T".into(),
             project: project.into(),
+            linked_projects: Vec::new(),
             tags: vec![],
             importance: None,
             reviewed: false,
@@ -2346,6 +2386,7 @@ mod tests {
             source_id: source_id.into(),
             title: "T".into(),
             project: project.into(),
+            linked_projects: Vec::new(),
             tags: Vec::new(),
             importance: None,
             reviewed: false,

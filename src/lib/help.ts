@@ -202,7 +202,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "review-project": {
     title: "Project",
-    body: "Which body of work this document belongs to — the bucket it's filed and found under (one document, one project). Start typing to reuse an existing project; a new name creates one. Projects are what the Focus and Map views group by, so consistent names matter more than perfect ones.",
+    body: "Which body of work this document belongs to — the bucket it's filed and found under. Start typing to reuse an existing project; a new name creates one. The first project is the PRIMARY one: it owns the document's filing activity and where it sits on the Map. Add more to link the same document into other projects, so each of their chats can draw on it. Projects are what the Focus and Map views group by, so consistent names matter more than perfect ones.",
   },
   "review-importance": {
     title: "Importance",
@@ -565,7 +565,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "project-files": {
     title: "Project files",
-    body: "Every document filed under this project. This is the grounding the scoped chat answers from.",
+    body: "Every document in this project — the ones filed here plus any linked in from elsewhere, marked Linked with their own primary project. This is the grounding the scoped chat answers from.",
   },
 
   // Pinboard (spec §4) — a free-form planning board

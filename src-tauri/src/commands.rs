@@ -3123,7 +3123,11 @@ pub async fn transcribe_audio(app: AppHandle, audio_base64: String) -> Result<St
 #[tauri::command]
 pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<String>> {
     let conn = state.conn()?;
-    db::distinct_projects(&conn)
+    // The tag registry, not `SELECT DISTINCT project FROM documents` (#275). A superset of the old
+    // answer in two ways that both matter to a picker: a project whose documents are all merely
+    // LINKED to it has no `documents.project` row to be distinct over, and a project that exists as
+    // triage only — a deadline or a milestone, no files yet — never appeared at all.
+    crate::tags::project_names(&conn)
 }
 
 /// Documents still awaiting the sorting review (`reviewed = 0`).
@@ -3437,12 +3441,18 @@ pub async fn commit_review(app: AppHandle, decisions: Vec<ReviewDecision>) -> Re
                 // Resolve the confirmed project to its entity (creating a genuinely new one), and
                 // write its CANONICAL name to the vault + DB cache — never a variant (invariant #2).
                 let (canonical, entity_id) = resolve_canonical(&tx, &d.project)?;
+                // Review confirms ONE project — the model proposes one, and extra memberships are
+                // added by hand elsewhere — so this surface carries the existing ones across rather
+                // than passing an empty list, which would silently unlink a document from
+                // everywhere else the moment it was re-reviewed.
+                let linked = crate::tags::linked_projects(&tx, d.document_id, &canonical)?;
                 let w = ingest::write_document_truth(
                     &tx,
                     &vault,
                     &cipher,
                     d.document_id,
                     &canonical,
+                    &linked,
                     &d.tags,
                     importance.as_deref(),
                     true,
@@ -3510,6 +3520,7 @@ pub async fn set_document_metadata(
     app: AppHandle,
     document_id: i64,
     project: String,
+    also_projects: Vec<String>,
     tags: Vec<String>,
     importance: Option<String>,
 ) -> Result<Document> {
@@ -3553,12 +3564,31 @@ pub async fn set_document_metadata(
             // Resolve to the canonical name + entity (a typed-in new project creates one), write the
             // canonical to the vault + DB cache, and repoint `entity_id`.
             let (canonical, entity_id) = resolve_canonical(&tx, &project)?;
+            // The extra memberships are resolved through the SAME seam as the home, so a project
+            // typed into the pill editor mints (or matches) exactly one entity however it is cased,
+            // and the vault only ever records canonical names — never a variant (invariant #2).
+            // Anything that resolves back to the home is dropped rather than stored twice.
+            let mut linked: Vec<String> = Vec::new();
+            for name in &also_projects {
+                if name.trim().is_empty() {
+                    continue;
+                }
+                let (other, _) = resolve_canonical(&tx, name)?;
+                if crate::tags::normalize(&other) != crate::tags::normalize(&canonical)
+                    && !linked
+                        .iter()
+                        .any(|p| crate::tags::normalize(p) == crate::tags::normalize(&other))
+                {
+                    linked.push(other);
+                }
+            }
             written.push(ingest::write_document_truth(
                 &tx,
                 &vault,
                 &cipher,
                 document_id,
                 &canonical,
+                &linked,
                 &tags,
                 importance.as_deref(),
                 true,
@@ -3727,7 +3757,7 @@ fn rewrite_entity_documents(
         vault_root,
         manifest_cipher,
         &ids,
-        canonical,
+        Some(canonical),
     )
 }
 
@@ -3745,18 +3775,26 @@ fn rewrite_documents(
     vault_root: &std::path::Path,
     manifest_cipher: &index_only::ManifestCipher,
     ids: &[i64],
-    canonical: &str,
+    canonical: Option<&str>,
 ) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
-    let mut rows: Vec<(i64, String, Option<String>, i64, String)> = Vec::with_capacity(ids.len());
+    let mut rows: Vec<(i64, String, String, Option<String>, i64, String)> =
+        Vec::with_capacity(ids.len());
     {
         let mut stmt = tx.prepare(
-            "SELECT id, tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
+            "SELECT id, project, tags, importance, reviewed, COALESCE(last_activity, ingested_at) \
              FROM documents WHERE id = ?1",
         )?;
         for id in ids {
             let row = stmt
                 .query_row(params![id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
                 })
                 .optional()?;
             if let Some(row) = row {
@@ -3766,14 +3804,22 @@ fn rewrite_documents(
     }
 
     let mut written = Vec::new();
-    for (doc_id, tags_json, importance, reviewed, last_activity) in rows {
+    for (doc_id, project, tags_json, importance, reviewed, last_activity) in rows {
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        // `None` = leave this document where it is. That is the case for a document merely LINKED
+        // to the project being renamed/merged/deleted: its home is elsewhere and must not move, but
+        // its vault file still names the old project in `linked_projects:`, so it has to be
+        // rewritten or the next Rebuild reads the dead name straight back in and re-mints it.
+        let home = canonical.unwrap_or(project.as_str());
+        // Read AFTER the tag itself has been re-keyed or dropped, so this is already the new truth.
+        let linked = crate::tags::linked_projects(tx, doc_id, home)?;
         written.push(ingest::write_document_truth(
             tx,
             vault,
             cipher,
             doc_id,
-            canonical,
+            home,
+            &linked,
             &tags,
             importance.as_deref(),
             reviewed != 0,
@@ -3834,6 +3880,63 @@ pub async fn remove_entity_alias(app: AppHandle, entity_id: i64, alias: String) 
     .await
 }
 
+/// Rewrite every vault file the rename/merge of a project touched — its own documents AND the ones
+/// that merely LINKED to it (#275).
+///
+/// The second population is the one that is easy to miss: those documents are homed in some other
+/// project, so no `entity_id` query in the rename/merge path reaches them. Their front-matter still
+/// names the old project in `linked_projects:`, and the next Rebuild would read that back and
+/// re-mint the project that was just renamed away or folded in.
+///
+/// `members` must be captured BEFORE `rename_project_satellites` re-keys the tag, since that is what
+/// moves the join rows. They are rewritten with `None` — keep each where it is — because only their
+/// membership changed, not their home.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_after_project_rekey(
+    tx: &Connection,
+    vault: &std::path::Path,
+    cipher: &vault::MarkdownCipher,
+    vault_root: &std::path::Path,
+    manifest_cipher: &index_only::ManifestCipher,
+    entity_id: i64,
+    canonical: &str,
+    members: &[i64],
+) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+    let mut written = rewrite_entity_documents(
+        tx,
+        vault,
+        cipher,
+        vault_root,
+        manifest_cipher,
+        entity_id,
+        canonical,
+    )?;
+    let elsewhere: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT 1 FROM documents WHERE id = ?1 AND entity_id IS ?2")?;
+        let mut out = Vec::new();
+        for id in members {
+            let homed_here = stmt
+                .query_row(params![id, entity_id], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !homed_here {
+                out.push(*id);
+            }
+        }
+        out
+    };
+    written.extend(rewrite_documents(
+        tx,
+        vault,
+        cipher,
+        vault_root,
+        manifest_cipher,
+        &elsewhere,
+        None,
+    )?);
+    Ok(written)
+}
+
 /// Rename a canonical project — a one-row identity update plus a frontmatter/cache rewrite of its
 /// documents to the new canonical name (the payoff of identity-not-name).
 #[tauri::command]
@@ -3846,9 +3949,11 @@ pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> 
             // renamed project silently loses all of them (F-05). Runs before the document rewrite,
             // whose truth-writer would otherwise lazily upsert a bare new-name projects row.
             let old = entities::canonical_name(tx, entity_id)?;
+            // Captured before the satellites (and with them the project tag) are re-keyed.
+            let members = crate::tags::documents_tagged(tx, &old)?;
             let canonical = entities::rename_entity(tx, entity_id, &new_name)?;
             projects::rename_project_satellites(tx, &old, &canonical)?;
-            rewrite_entity_documents(
+            rewrite_after_project_rekey(
                 tx,
                 vault,
                 cipher,
@@ -3856,6 +3961,7 @@ pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> 
                 manifest_cipher,
                 entity_id,
                 &canonical,
+                &members,
             )
         },
     )
@@ -3982,10 +4088,12 @@ pub async fn merge_projects(app: AppHandle, from: String, into: String) -> Resul
             // Identical ordering to `merge_entities`: capture the folded name BEFORE the entity
             // row dies, fold the entity, then re-key the name-keyed satellites onto the survivor.
             let old = entities::canonical_name(tx, from_id)?;
+            // Captured before the satellites (and with them the project tag) are folded.
+            let members = crate::tags::documents_tagged(tx, &old)?;
             entities::merge_entities(tx, from_id, into_id)?;
             let canonical = entities::canonical_name(tx, into_id)?;
             projects::rename_project_satellites(tx, &old, &canonical)?;
-            rewrite_entity_documents(
+            rewrite_after_project_rekey(
                 tx,
                 vault,
                 cipher,
@@ -3993,6 +4101,7 @@ pub async fn merge_projects(app: AppHandle, from: String, into: String) -> Resul
                 manifest_cipher,
                 into_id,
                 &canonical,
+                &members,
             )
         },
     )
@@ -4123,6 +4232,14 @@ pub async fn delete_project(
             // Documents that survive and move; rewritten to their new name after the moves, so the
             // vault frontmatter and the DB never disagree about where a file is filed.
             let mut moved: Vec<i64> = Vec::new();
+            // Documents deleted outright, so the rewrite pass below can skip them.
+            let mut deleted: Vec<i64> = Vec::new();
+            // Every document carrying this project as a tag — home OR merely linked — captured NOW,
+            // because step 3 drops the tag and takes the join rows with it. The linked-elsewhere
+            // ones are invisible to every `entity_id` query in this function (their entity is their
+            // own home project), and they are exactly the files that would otherwise keep the
+            // deleted name in their front-matter.
+            let linked_members = crate::tags::documents_tagged(tx, &canonical)?;
 
             // --- 1. CHATS ------------------------------------------------------------------
             let conv_ids: Vec<i64> = {
@@ -4208,11 +4325,26 @@ pub async fn delete_project(
                             out.unlink.push(vault.join(rel));
                         }
                         ingest::delete_document(tx, *id)?;
+                        deleted.push(*id);
                     }
                 }
             }
 
-            // --- 3. Re-home the survivors' vault truth -------------------------------------
+            // --- 3. Satellites: milestones (+ their flags), activity, pinboard, triage row,
+            //        and the project's own tag (which cascades every membership of it) ---------
+            //
+            // Ahead of the vault rewrites below, not after them as it used to be: the rewrites
+            // re-derive each document's `linked_projects:` line FROM the membership join, so the
+            // dying project's tag has to be gone by then or every rewritten file would name it
+            // again — and the next Rebuild would read it back and re-mint the project just deleted.
+            projects::delete_project_satellites(tx, &canonical)?;
+
+            // --- 4. Rewrite the vault truth of everything the deletion touched ---------------
+            //
+            // Two populations, and they move differently. `moved` are documents HOMED here, re-homed
+            // to Unsorted. `linked_elsewhere` are documents homed in another project that merely
+            // carried this one as an extra membership: they stay where they are (hence `None`), but
+            // their files still name the dead project and must be rewritten too.
             out.written = rewrite_documents(
                 tx,
                 vault,
@@ -4220,11 +4352,21 @@ pub async fn delete_project(
                 vault_root,
                 manifest_cipher,
                 &moved,
-                UNSORTED,
+                Some(UNSORTED),
             )?;
-
-            // --- 4. Satellites: milestones (+ their flags), activity, pinboard, triage row --
-            projects::delete_project_satellites(tx, &canonical)?;
+            let linked_elsewhere: Vec<i64> = linked_members
+                .into_iter()
+                .filter(|id| !moved.contains(id) && !deleted.contains(id))
+                .collect();
+            out.written.extend(rewrite_documents(
+                tx,
+                vault,
+                cipher,
+                vault_root,
+                manifest_cipher,
+                &linked_elsewhere,
+                None,
+            )?);
 
             // --- 5. Project-scoped preferences ---------------------------------------------
             // `preferences.entity_id` REFERENCES entities(id) ON DELETE CASCADE, and those records
@@ -4274,10 +4416,12 @@ pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Resul
             // its name-keyed satellites into the survivor's name (F-05). `rename_project_satellites`
             // keeps the survivor's own triage (INSERT OR IGNORE) and sums the daily rollup on collision.
             let old = entities::canonical_name(tx, from_id)?;
+            // Captured before the satellites (and with them the project tag) are folded.
+            let members = crate::tags::documents_tagged(tx, &old)?;
             entities::merge_entities(tx, from_id, into_id)?;
             let canonical = entities::canonical_name(tx, into_id)?;
             projects::rename_project_satellites(tx, &old, &canonical)?;
-            rewrite_entity_documents(
+            rewrite_after_project_rekey(
                 tx,
                 vault,
                 cipher,
@@ -4285,6 +4429,7 @@ pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Resul
                 manifest_cipher,
                 into_id,
                 &canonical,
+                &members,
             )
         },
     )

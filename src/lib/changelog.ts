@@ -24,6 +24,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.98.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "A document can now belong to more than one project. The Project field is a list you build like the To: line of an email — type a name to add it, and a name PM hasn't seen creates a new project. The first one is the primary project, and the rest are links.",
+      "The primary project is the one that owns the document: it's where the document counts as activity, and where it sits on the Map. Everywhere a document appears you can see which project is its primary and which are links, so if it's filed somewhere you didn't expect, you can see that and change it on the spot.",
+      "A project's chat can now answer from documents linked into it, not just the ones filed there — which is the point of linking one in. A project's file list shows them too, marked Linked with the project they're really filed under.",
+      'Project names now behave like names. "Atlas, Inc." stays exactly that instead of being torn in two at the comma, and a project matches however you capitalise it while keeping the spelling you chose.',
+      "Existing vaults carry over untouched: every document keeps the project it was already in, and nothing needs re-filing. Merging, renaming or deleting a project moves or removes its links along with everything else.",
+    ],
+  },
+  {
     version: "3.97.0-alpha",
     date: "2026-07-27",
     highlights: [

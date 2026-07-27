@@ -353,12 +353,25 @@ fn hybrid_core(
 /// The chunk ids belonging to a project's documents — the allow-set for a scoped
 /// search. Materializes the whole set in memory; fine at personal scale, but if
 /// stores grow large, push this filter into the SQL of the two search branches.
+///
+/// "Belonging to" means MEMBERSHIP, not just home (#275): a document linked into this project is in
+/// scope for its chat. Without that, adding a document to a second project would be decorative —
+/// the user would see it in the file list and then find the project's chat unable to cite it.
+///
+/// Every home membership has a join row (the v46 backfill guarantees it, and
+/// `write_document_truth` maintains it), so on a store where nothing has been linked yet this
+/// returns exactly what the old `d.project = ?1` returned.
 fn project_chunk_ids(conn: &Connection, project: &str) -> Result<std::collections::HashSet<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.project = ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT c.id FROM chunks c \
+         JOIN ({memberships}) m ON m.document_id = c.document_id \
+         WHERE m.norm = ?1",
+        memberships = crate::tags::MEMBERSHIPS_SQL
+    ))?;
     let ids = stmt
-        .query_map(params![project], |row| row.get::<_, i64>(0))?
+        .query_map(params![crate::tags::normalize(project)], |row| {
+            row.get::<_, i64>(0)
+        })?
         .collect::<std::result::Result<std::collections::HashSet<i64>, _>>()?;
     Ok(ids)
 }

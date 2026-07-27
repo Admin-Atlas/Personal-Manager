@@ -79,6 +79,10 @@ pub struct Document {
     /// Organisation metadata (Step 4). `reviewed` is false until the user has
     /// confirmed the sorting; `last_activity` drives retrieval recency decay.
     pub project: String,
+    /// The OTHER projects this document belongs to (#275) — never including `project`, which is the
+    /// home. Filled by a single join pass in the list readers rather than by a column, so
+    /// `row_to_document`'s positional `row.get(n)` indices stay exactly where they are.
+    pub linked_projects: Vec<String>,
     pub tags: Vec<String>,
     pub importance: Option<String>,
     pub reviewed: bool,
@@ -458,6 +462,7 @@ fn ingest_one(
         created_at: &created_at,
         ingested_at: &ingested_at,
         project: "Unsorted",
+        linked_projects: &[],
         tags: &[],
         importance: None,
         last_activity: &ingested_at,
@@ -482,6 +487,7 @@ fn ingest_one(
         last_activity: Some(ingested_at.clone()),
         ingested_at,
         project: "Unsorted".into(),
+        linked_projects: Vec::new(),
         tags: Vec::new(),
         importance: None,
         reviewed: false,
@@ -607,6 +613,7 @@ fn ingest_photo(
         created_at: &capture_date,
         ingested_at: &ingested_at,
         project: "Unsorted",
+        linked_projects: &[],
         tags: &[],
         importance: None,
         last_activity: &ingested_at,
@@ -631,6 +638,7 @@ fn ingest_photo(
         last_activity: Some(ingested_at.clone()),
         ingested_at,
         project: "Unsorted".into(),
+        linked_projects: Vec::new(),
         tags: Vec::new(),
         importance: None,
         reviewed: false,
@@ -706,6 +714,7 @@ fn ingest_spreadsheet(
         created_at: &created_at,
         ingested_at: &ingested_at,
         project: "Unsorted",
+        linked_projects: &[],
         tags: &[],
         importance: None,
         last_activity: &ingested_at,
@@ -730,6 +739,7 @@ fn ingest_spreadsheet(
         last_activity: Some(ingested_at.clone()),
         ingested_at,
         project: "Unsorted".into(),
+        linked_projects: Vec::new(),
         tags: Vec::new(),
         importance: None,
         reviewed: false,
@@ -787,6 +797,7 @@ pub fn promote_spreadsheet(
         title,
         created_at,
         now,
+        linked_projects,
     ): (
         String,
         Option<String>,
@@ -797,9 +808,20 @@ pub fn promote_spreadsheet(
         String,
         Option<String>,
         String,
+        Vec<String>,
     ) = {
         let conn = state.conn()?;
-        let (source_type, source_id, external_ref, project, tags_json, importance, reviewed, title, created_at): (
+        let (
+            source_type,
+            source_id,
+            external_ref,
+            project,
+            tags_json,
+            importance,
+            reviewed,
+            title,
+            created_at,
+        ): (
             String,
             Option<String>,
             Option<String>,
@@ -833,6 +855,9 @@ pub fn promote_spreadsheet(
                 "This document is already imported locally.".into(),
             ));
         }
+        // Promotion preserves the user's filing, and that now includes which OTHER projects the
+        // item was linked into. Read here, beside the rest of it, while the connection is open.
+        let linked_projects = crate::tags::linked_projects(&conn, doc_id, &project)?;
         let source_id = source_id.ok_or_else(|| {
             Error::Other("This indexed item has no source pointer to import from.".into())
         })?;
@@ -848,6 +873,7 @@ pub fn promote_spreadsheet(
             title,
             created_at,
             now,
+            linked_projects,
         )
     };
 
@@ -898,6 +924,7 @@ pub fn promote_spreadsheet(
         created_at: created,
         ingested_at: &now,
         project: &project,
+        linked_projects: &linked_projects,
         tags: &tags,
         importance: importance.as_deref(),
         last_activity: &now,
@@ -1096,6 +1123,16 @@ pub fn ingest_note_document(
             None,
         ),
     };
+    // Editing a note re-writes its whole vault file, so its other project memberships have to be
+    // carried across with the rest of the filing or the edit quietly unlinks it. A brand-new note
+    // has none.
+    let linked_projects = match &existing {
+        Some(e) => {
+            let conn = state.conn()?;
+            crate::tags::linked_projects(&conn, e.doc_id, &project)?
+        }
+        None => Vec::new(),
+    };
 
     // The note is named by its widget id, which arrives over IPC. Restrict it to a conservative id
     // charset so the derived name is always a single, ordinary filename inside the vault and can't
@@ -1132,6 +1169,7 @@ pub fn ingest_note_document(
         created_at: &created_at,
         ingested_at: &now,
         project: &project,
+        linked_projects: &linked_projects,
         tags: &tags,
         importance: importance.as_deref(),
         last_activity: &now,
@@ -1174,6 +1212,7 @@ pub fn ingest_note_document(
                     last_activity: Some(now.clone()),
                     ingested_at: now.clone(),
                     project: project.clone(),
+                    linked_projects: linked_projects.clone(),
                     tags: tags.clone(),
                     importance: importance.clone(),
                     reviewed,
@@ -1707,6 +1746,10 @@ fn rebuild_one(
     // Organisation metadata round-trips from the vault so a rebuild reproduces
     // the organised store (spec §3 acceptance). Missing fields fall back to the
     // fresh-ingest defaults, so pre-Step-4 vault files rebuild cleanly.
+    let project = fields
+        .get("project")
+        .cloned()
+        .unwrap_or_else(|| "Unsorted".into());
     let meta = DocMeta {
         source_path: fields.get("source_path").cloned(),
         vault_path: file_name(vault_file),
@@ -1715,10 +1758,8 @@ fn rebuild_one(
         ext: fields.get("ext").cloned(),
         byte_size: None,
         created_at: fields.get("created_at").cloned(),
-        project: fields
-            .get("project")
-            .cloned()
-            .unwrap_or_else(|| "Unsorted".into()),
+        linked_projects: linked_projects_from_fields(&fields, &project),
+        project,
         tags: fields
             .get("tags")
             .map(|s| parse_yaml_list(s))
@@ -1918,6 +1959,14 @@ fn rebuild_chat(
             entity_id,
             id
         ],
+    )?;
+    // A chat is a document like any other, so its extra project memberships restore from its own
+    // front-matter here rather than only for the `rebuild_one` path.
+    crate::tags::set_document_projects(
+        &conn,
+        id,
+        &project,
+        &linked_projects_from_fields(&fields, &project),
     )?;
     // Claim it for this pass, so a resume skips this chat instead of re-indexing every turn again — and so
     // the sweep reads it as rebuilt rather than as a leftover.
@@ -2159,6 +2208,9 @@ fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<(
             doc_id,
         ],
     )?;
+    // The row and the membership join move together: this is the rebuild-from-vault path, so the
+    // file's `linked_projects:` line is the truth being restored, not an edit being applied.
+    crate::tags::set_document_projects(tx, doc_id, &meta.project, &meta.linked_projects)?;
     Ok(())
 }
 
@@ -2220,7 +2272,9 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
             source_account,
         ],
     )?;
-    Ok(tx.last_insert_rowid())
+    let doc_id = tx.last_insert_rowid();
+    crate::tags::set_document_projects(tx, doc_id, &meta.project, &meta.linked_projects)?;
+    Ok(doc_id)
 }
 
 /// Insert one leaf's keyword-search row into `chunks_fts`. On a multilingual vault the text is run
@@ -2473,14 +2527,39 @@ const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_path, d.ext, d.byte_size
      d.source_type, d.source_state, d.external_ref, d.source_id, \
      d.source_parent_folder_id, d.source_parent_folder_name";
 
+/// Fill in each document's extra project memberships from the join, in ONE query for the whole
+/// list. A lookup per document would be an N+1 across the entire library — which is exactly the
+/// size this list grows to.
+fn attach_memberships(conn: &Connection, docs: &mut [Document]) -> Result<()> {
+    if docs.is_empty() {
+        return Ok(());
+    }
+    let memberships = crate::tags::all_project_memberships(conn)?;
+    for doc in docs.iter_mut() {
+        let home = crate::tags::normalize(&doc.project);
+        doc.linked_projects = memberships
+            .get(&doc.id)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter(|n| crate::tags::normalize(n) != home)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    Ok(())
+}
+
 /// All documents, most-recent first, with their chunk counts.
 pub fn list_documents(conn: &Connection) -> Result<Vec<Document>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {DOCUMENT_COLUMNS} FROM documents d ORDER BY d.ingested_at DESC, d.id DESC"
     ))?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map([], row_to_document)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    attach_memberships(conn, &mut rows)?;
     Ok(rows)
 }
 
@@ -2490,9 +2569,10 @@ pub fn review_queue(conn: &Connection) -> Result<Vec<Document>> {
         "SELECT {DOCUMENT_COLUMNS} FROM documents d WHERE d.reviewed = 0 \
          ORDER BY d.ingested_at DESC, d.id DESC"
     ))?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map([], row_to_document)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    attach_memberships(conn, &mut rows)?;
     Ok(rows)
 }
 
@@ -2507,11 +2587,13 @@ pub fn review_queue_count(conn: &Connection) -> Result<i64> {
 }
 
 pub fn load_document(conn: &Connection, id: i64) -> Result<Document> {
-    Ok(conn.query_row(
+    let mut doc = conn.query_row(
         &format!("SELECT {DOCUMENT_COLUMNS} FROM documents d WHERE d.id = ?1"),
         params![id],
         row_to_document,
-    )?)
+    )?;
+    doc.linked_projects = crate::tags::linked_projects(conn, doc.id, &doc.project)?;
+    Ok(doc)
 }
 
 fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
@@ -2527,6 +2609,10 @@ fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
         created_at: row.get(6)?,
         ingested_at: row.get(7)?,
         project: row.get(8)?,
+        // Filled by the caller (see `attach_memberships`). This reader is positional, and inserting
+        // a column here would shift every index after it — silently, because `tags` is parsed with
+        // `unwrap_or_default()` and would simply come back empty.
+        linked_projects: Vec::new(),
         tags: serde_json::from_str(&tags_json).unwrap_or_default(),
         importance: row.get(10)?,
         reviewed: reviewed != 0,
@@ -2593,6 +2679,7 @@ pub fn write_document_truth(
     cipher: &MarkdownCipher,
     doc_id: i64,
     project: &str,
+    linked_projects: &[String],
     tags: &[String],
     importance: Option<&str>,
     reviewed: bool,
@@ -2601,6 +2688,16 @@ pub fn write_document_truth(
     manifest_cipher: &crate::index_only::ManifestCipher,
     activity: FilingActivity,
 ) -> Result<(std::path::PathBuf, Vec<u8>)> {
+    // The membership join is a queryable index over what the truth file is about to say, so it is
+    // written here — inside the caller's transaction — and nowhere else. This is what INVARIANTS
+    // I-02 ("one writer owns a document's filing") buys: a new filing surface gets correct
+    // memberships by construction rather than by remembering to.
+    //
+    // BEFORE the dispatch, not after: the index-only arm regenerates the encrypted manifest from
+    // the DB mirror, and that mirror reads this join. Written afterwards, the manifest would carry
+    // the PREVIOUS membership set and only catch up at the next unrelated edit.
+    crate::tags::set_document_projects(tx, doc_id, project, linked_projects)?;
+
     let written = match truth_source(tx, doc_id)? {
         TruthSource::VaultFrontmatter => rewrite_vault_metadata(
             tx,
@@ -2608,6 +2705,7 @@ pub fn write_document_truth(
             cipher,
             doc_id,
             project,
+            linked_projects,
             tags,
             importance,
             reviewed,
@@ -2790,6 +2888,11 @@ fn rewrite_photo_vault_block(
         .get("tags")
         .map(|s| parse_yaml_list(s))
         .unwrap_or_default();
+    let project = fields
+        .get("project")
+        .map(String::as_str)
+        .unwrap_or("Unsorted");
+    let linked = linked_projects_from_fields(&fields, project);
     let importance = nullable(fields.get("importance"));
     let front = Frontmatter {
         title: fields
@@ -2804,10 +2907,8 @@ fn rewrite_photo_vault_block(
         content_hash,
         created_at: fields.get("created_at").map(String::as_str).unwrap_or(""),
         ingested_at: fields.get("ingested_at").map(String::as_str).unwrap_or(""),
-        project: fields
-            .get("project")
-            .map(String::as_str)
-            .unwrap_or("Unsorted"),
+        project,
+        linked_projects: &linked,
         tags: &tags,
         importance: importance.as_deref(),
         last_activity: fields
@@ -2868,6 +2969,30 @@ pub(crate) fn chat_from_fields(
     })
 }
 
+/// Read a document's ADDITIONAL project memberships back out of parsed front-matter (#275).
+///
+/// The same shape as [`photo_from_fields`] / [`chat_from_fields`], and called from the same three
+/// places for the same reason: every writer that rebuilds a vault file from a `Frontmatter` must
+/// round-trip this or the next unrelated organisation write silently deletes it.
+///
+/// Tolerant by design, because a vault file is the user's to edit. A missing key (every file
+/// written before this shipped) is "no extras". The `home` is filtered out case-insensitively, so
+/// someone who hand-writes the home project into the list too gets what they meant rather than a
+/// document linked to itself.
+pub(crate) fn linked_projects_from_fields(
+    fields: &std::collections::HashMap<String, String>,
+    home: &str,
+) -> Vec<String> {
+    let home_norm = crate::tags::normalize(home);
+    fields
+        .get("linked_projects")
+        .map(|s| parse_yaml_list(s))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| crate::tags::normalize(p) != home_norm)
+        .collect()
+}
+
 /// Reconstruct a spreadsheet's satellite record from parsed front-matter fields, or `None` if this
 /// isn't a spreadsheet document. Shared by the rebuild walk and the metadata-edit rewrite so both
 /// preserve the block identically. Missing counts default to 0, so a hand-edited file still rebuilds.
@@ -2909,6 +3034,7 @@ fn rewrite_vault_metadata(
     cipher: &MarkdownCipher,
     doc_id: i64,
     project: &str,
+    linked_projects: &[String],
     tags: &[String],
     importance: Option<&str>,
     reviewed: bool,
@@ -2952,6 +3078,7 @@ fn rewrite_vault_metadata(
         created_at: fields.get("created_at").map(String::as_str).unwrap_or(""),
         ingested_at: fields.get("ingested_at").map(String::as_str).unwrap_or(""),
         project,
+        linked_projects,
         tags,
         importance,
         last_activity,
@@ -3006,6 +3133,9 @@ fn rewrite_manifest_metadata(
     reviewed: bool,
     last_activity: &str,
 ) -> Result<(std::path::PathBuf, Vec<u8>)> {
+    // No `linked_projects` argument, unlike the vault arm: this document has no front-matter to
+    // write it into. Its portable truth is the manifest, which `write_synced` regenerates from the
+    // membership join that `write_document_truth` has already updated before dispatching here.
     let tags_json =
         serde_json::to_string(tags).map_err(|e| Error::Other(format!("encode tags: {e}")))?;
     tx.execute(
@@ -3053,6 +3183,16 @@ struct Frontmatter<'a> {
     /// Organisation metadata (Step 4). The vault is the source of truth, so these
     /// round-trip: `rebuild` reads them back to reproduce the organised store.
     project: &'a str,
+    /// The document's **other** project memberships (#275) — everything except `project`, which
+    /// stays the home. Emitted as `linked_projects:`, deliberately NOT `projects:`: a file showing
+    /// `project: "Sales"` next to `projects: [...]` reads either as "home plus these" or as "no,
+    /// THESE are its projects", and a vault file is a thing users open and hand-edit. The key uses
+    /// the same word the UI does — a document is *primary* in one project and *linked* into the
+    /// rest.
+    ///
+    /// Writers pass the extras only; readers drop the home if a hand-edited file repeats it, so a
+    /// human writing the obvious thing can't create a double membership.
+    linked_projects: &'a [String],
     tags: &'a [String],
     importance: Option<&'a str>,
     last_activity: &'a str,
@@ -3080,6 +3220,10 @@ struct Frontmatter<'a> {
 /// (`["a", "b"]`) so the flat parser reads it back as a single field.
 fn render_markdown(f: &Frontmatter, body: &str) -> String {
     let tags = render_yaml_list(f.tags);
+    // Always emitted, even empty, matching `tags:`. A key that is present-or-absent has to be read
+    // as two states ("no extras" vs "written by a build that didn't know about extras") at every
+    // call site; a key that is always there has one.
+    let linked = render_yaml_list(f.linked_projects);
     let importance = f.importance.unwrap_or("null");
     format!(
         "---\n\
@@ -3090,6 +3234,7 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
          created_at: {}\n\
          ingested_at: {}\n\
          project: {}\n\
+         linked_projects: {}\n\
          tags: {}\n\
          importance: {}\n\
          last_activity: {}\n\
@@ -3102,6 +3247,7 @@ fn render_markdown(f: &Frontmatter, body: &str) -> String {
         f.created_at,
         f.ingested_at,
         yaml_quote(f.project),
+        linked,
         tags,
         importance,
         f.last_activity,
@@ -3218,18 +3364,54 @@ pub(crate) fn parse_frontmatter(
 }
 
 /// Parse a YAML flow list (`["a", "b"]`) back into its elements. Tolerant: a
-/// non-list value (or `[]`) yields an empty vec. Tags must not contain commas
-/// (they're short labels) — the naive split assumes that.
-fn parse_yaml_list(value: &str) -> Vec<String> {
+/// non-list value (or `[]`) yields an empty vec.
+///
+/// The split is quote-aware. It used to be a plain `split(',')`, which was fine while the only
+/// flow list was `tags` (the tag editor strips commas) but is wrong for `projects` — a project
+/// name is a real name the user typed, and "Atlas, Inc." is exactly the case that motivated
+/// allowing commas there. A naive split tore that back out of the vault as two projects called
+/// `Atlas` and `Inc.`, silently, on the next rebuild.
+pub(crate) fn parse_yaml_list(value: &str) -> Vec<String> {
     let v = value.trim();
     let Some(inner) = v.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
         return Vec::new();
     };
-    inner
-        .split(',')
+    split_flow_items(inner)
+        .into_iter()
         .map(|s| yaml_unquote(s.trim()))
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Split a YAML flow-sequence body on the commas that SEPARATE items, leaving commas inside a
+/// quoted scalar alone. `yaml_quote` always quotes, so every item we write is quoted and every
+/// embedded comma is inside quotes.
+///
+/// A hand-edited file with an unbalanced quote yields one long item rather than an error: this
+/// parser's whole contract is tolerance (a vault file is the user's, and they may edit it), and a
+/// too-long project name is visible and fixable where a panic on open is neither.
+fn split_flow_items(inner: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, ch) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                items.push(&inner[start..i]);
+                start = i + 1; // ',' is one byte, so this stays on a char boundary
+            }
+            _ => {}
+        }
+    }
+    items.push(&inner[start..]);
+    items
 }
 
 /// Read a front-matter scalar that may be the literal `null` → `None`.
@@ -3380,6 +3562,10 @@ pub(crate) struct DocMeta {
     pub created_at: Option<String>,
     pub ingested_at: String,
     pub project: String,
+    /// The document's OTHER project memberships (#275) — never including `project`, which is the
+    /// home. Empty for every fresh ingest: a document arrives in one place and is linked elsewhere
+    /// later, by hand.
+    pub linked_projects: Vec<String>,
     pub tags: Vec<String>,
     pub importance: Option<String>,
     pub reviewed: bool,
@@ -4086,6 +4272,7 @@ mod tests {
             created_at: None,
             ingested_at: "2026-07-16T00:00:00Z".into(),
             project: "Unsorted".into(),
+            linked_projects: Vec::new(),
             tags: vec![],
             importance: None,
             reviewed: false,
@@ -4137,6 +4324,7 @@ mod tests {
             created_at: None,
             ingested_at: "2026-07-16T00:00:00Z".into(),
             project: "Unsorted".into(),
+            linked_projects: Vec::new(),
             tags: vec![],
             importance: None,
             reviewed: false,
@@ -4349,6 +4537,7 @@ mod tests {
             &crate::vault::MarkdownCipher::plaintext("vault-test"),
             index_id,
             "Project X",
+            &[],
             &["urgent".to_string()],
             Some("high"),
             true,
@@ -4411,6 +4600,7 @@ mod tests {
                 index_id,
                 project,
                 &[],
+                &[],
                 None,
                 true,
                 "2026-06-26T00:00:00Z",
@@ -4469,6 +4659,7 @@ mod tests {
             index_id,
             "Project X", // a real project — would log under Record, but we Suppress
             &[],
+            &[],
             None,
             true,
             "2026-06-26T00:00:00Z",
@@ -4497,6 +4688,7 @@ mod tests {
             created_at: "2026-06-01T00:00:00.000Z",
             ingested_at: "2026-06-17T00:00:00.000Z",
             project: "Finances",
+            linked_projects: &[],
             tags: &tags,
             importance: Some("high"),
             last_activity: "2026-06-17T00:00:00.000Z",
@@ -4552,6 +4744,7 @@ mod tests {
             created_at: &rec.capture_date, // capture_date round-trips via created_at
             ingested_at: "2026-06-28T00:00:00.000Z",
             project: "Unsorted",
+            linked_projects: &[],
             tags: &[],
             importance: None,
             last_activity: "2026-06-28T00:00:00.000Z",
@@ -4581,6 +4774,7 @@ mod tests {
                 created_at: "",
                 ingested_at: "",
                 project: "Unsorted",
+                linked_projects: &[],
                 tags: &[],
                 importance: None,
                 last_activity: "",
@@ -4616,6 +4810,7 @@ mod tests {
             created_at: "2026-07-01",
             ingested_at: "2026-07-01T00:00:00.000Z",
             project: "Unsorted",
+            linked_projects: &[],
             tags: &[],
             importance: None,
             last_activity: "2026-07-01T00:00:00.000Z",
@@ -4650,6 +4845,7 @@ mod tests {
                 created_at: "",
                 ingested_at: "",
                 project: "Unsorted",
+                linked_projects: &[],
                 tags: &[],
                 importance: None,
                 last_activity: "",
@@ -4684,6 +4880,7 @@ mod tests {
             created_at: "2026-07-01",
             ingested_at: "2026-07-03T00:00:00.000Z",
             project: "Finances",
+            linked_projects: &[],
             tags: &[],
             importance: None,
             last_activity: "2026-07-03T00:00:00.000Z",
@@ -4840,6 +5037,7 @@ mod tests {
             created_at: &rec.capture_date,
             ingested_at: "2026-06-28T00:00:00.000Z",
             project: "Receipts",
+            linked_projects: &["Tax 2026".to_string()],
             tags: &["scan".to_string()],
             importance: Some("high"),
             last_activity: "2026-06-28T00:00:00.000Z",
@@ -4999,6 +5197,7 @@ mod tests {
             created_at: "",
             ingested_at: "",
             project: "Unsorted",
+            linked_projects: &[],
             tags: &[],
             importance: None,
             last_activity: "",
@@ -5014,6 +5213,171 @@ mod tests {
         assert!(parse_yaml_list(fields.get("tags").unwrap()).is_empty());
         assert_eq!(nullable(fields.get("importance")), None);
         assert_eq!(fields.get("reviewed").map(|s| s.trim()), Some("false"));
+    }
+
+    #[test]
+    fn a_project_name_with_a_comma_survives_the_membership_list() {
+        // The flow list is comma-separated, and `parse_yaml_list` used to split on every comma —
+        // fine for tags (the editor strips them) but wrong for project names, which are names the
+        // user typed. "Atlas, Inc." came back as `Atlas` and `Inc."`: corrupted, not lost, so a
+        // happy-path test with simple names would never have shown it.
+        let linked = vec!["Atlas, Inc.".to_string(), "R&D".to_string()];
+        let front = Frontmatter {
+            title: "Contract",
+            source_path: "",
+            ext: Some("pdf"),
+            content_hash: "h",
+            created_at: "2026-06-01",
+            ingested_at: "2026-06-01",
+            project: "Legal, EU",
+            linked_projects: &linked,
+            tags: &[],
+            importance: None,
+            last_activity: "2026-06-01",
+            reviewed: true,
+            photo: None,
+            spreadsheet: None,
+            chat: None,
+            source_id: None,
+            external_ref: None,
+        };
+        let rendered = render_markdown(&front, "body");
+        let (fields, _) = parse_frontmatter(&rendered).unwrap();
+        assert_eq!(fields.get("project").map(String::as_str), Some("Legal, EU"));
+        assert_eq!(
+            parse_yaml_list(fields.get("linked_projects").unwrap()),
+            linked
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_file_repeating_the_home_yields_no_self_link() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "linked_projects".to_string(),
+            r#"["sales", "Ops"]"#.to_string(),
+        );
+        assert_eq!(linked_projects_from_fields(&fields, "Sales"), ["Ops"]);
+        // And a file written before #275 has no such key at all.
+        assert!(linked_projects_from_fields(&std::collections::HashMap::new(), "Sales").is_empty());
+    }
+
+    #[test]
+    fn rewrite_vault_metadata_round_trips_project_membership() {
+        // The INVARIANTS I-03 co-signer for the new key. `rewrite_vault_metadata` REBUILDS the file
+        // from a fresh `Frontmatter`, so a key it does not re-emit is silently deleted by the next
+        // unrelated organisation write — how the chat identity block was lost until 3.81.2 and the
+        // photo copy flag until 3.19.2. This proves the write lands AND that a later edit which
+        // changes something else entirely leaves it alone.
+        let dir = tempfile::tempdir().unwrap();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut conn = crate::db::open(&dir.path().join("t.sqlite"), key).unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let cipher = MarkdownCipher::plaintext("test-vault");
+
+        // A file written by a build that predates #275: no `linked_projects:` line at all.
+        let born = "---\ntitle: Q3\nsource_path: \next: md\ncontent_hash: h\n\
+                    created_at: 2026-01-01\ningested_at: 2026-01-01\nproject: \"Sales\"\n\
+                    tags: []\nimportance: null\nlast_activity: 2026-01-01\nreviewed: true\n\
+                    ---\n\nBody.\n";
+        cipher.write_to(&vault.join("q3.md"), born).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash, project, tags, reviewed) \
+             VALUES (1, 'q3.md', 'Q3', 'h', 'Sales', '[]', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Link it into two more projects, through the real filing seam so the membership join is
+        // written alongside the file exactly as it is in production.
+        let manifest = crate::index_only::ManifestCipher::from_master("v", &[7u8; 32]);
+        {
+            let tx = conn.transaction().unwrap();
+            write_document_truth(
+                &tx,
+                &vault,
+                &cipher,
+                1,
+                "Sales",
+                &["Marketing".into(), "Atlas, Inc.".into()],
+                &[],
+                None,
+                true,
+                "2026-06-20",
+                dir.path(),
+                &manifest,
+                FilingActivity::Suppress,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let raw = cipher.read(&vault.join("q3.md")).unwrap();
+        let (fields, _) = parse_frontmatter(&raw).unwrap();
+        assert_eq!(
+            linked_projects_from_fields(&fields, "Sales"),
+            ["Marketing", "Atlas, Inc."]
+        );
+        drop(fields);
+
+        // Now an edit that changes only the importance. The membership must survive it, which is
+        // the whole point: it is passed as an argument, so a caller that forgot would blank it.
+        {
+            let tx = conn.transaction().unwrap();
+            // What every rewrite path does: re-derive the membership from the join rather than
+            // being told it. A caller that passed `&[]` here would silently unlink the document.
+            let linked = crate::tags::linked_projects(&tx, 1, "Sales").unwrap();
+            write_document_truth(
+                &tx,
+                &vault,
+                &cipher,
+                1,
+                "Sales",
+                &linked,
+                &[],
+                Some("high"),
+                true,
+                "2026-06-21",
+                dir.path(),
+                &manifest,
+                FilingActivity::Suppress,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let raw = cipher.read(&vault.join("q3.md")).unwrap();
+        let (fields, body) = parse_frontmatter(&raw).unwrap();
+        assert_eq!(nullable(fields.get("importance")).as_deref(), Some("high"));
+        let mut survived = linked_projects_from_fields(&fields, "Sales");
+        survived.sort();
+        assert_eq!(
+            survived,
+            ["Atlas, Inc.", "Marketing"],
+            "an unrelated organisation edit must not unlink the document"
+        );
+        assert_eq!(body.trim_end(), "Body.");
+    }
+
+    #[test]
+    fn rewriting_a_photo_block_leaves_project_membership_alone() {
+        // The second rebuild-the-whole-file writer, which fires on a dedupe-hit photo save and
+        // during every Rebuild via `heal_photo_copy`. It reads the organisation fields back OUT of
+        // the file to preserve them, so the new key needs the same treatment or photo documents
+        // alone would lose their memberships — during the operation users trust to be lossless.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let cipher = MarkdownCipher::for_test_encrypted("vault-1");
+        write_photo_vault_file(&vault, &cipher, "photo.md.pmenc", "imghash", None);
+
+        rewrite_photo_vault_block(&vault, &cipher, "photo.md.pmenc", "photos/imghash.png").unwrap();
+
+        let raw = cipher.read(&vault.join("photo.md.pmenc")).unwrap();
+        let (fields, _) = parse_frontmatter(&raw).unwrap();
+        assert_eq!(
+            linked_projects_from_fields(&fields, "Receipts"),
+            ["Tax 2026"]
+        );
     }
 
     #[test]
@@ -5052,6 +5416,7 @@ mod tests {
                 &cipher,
                 1,
                 "Renamed Project",
+                &[],
                 &["notes".into()],
                 Some("high"),
                 true,
@@ -5110,6 +5475,7 @@ mod tests {
             created_at: "",
             ingested_at: "",
             project: "Unsorted",
+            linked_projects: &[],
             tags: &[],
             importance: None,
             last_activity: "",
@@ -5143,6 +5509,7 @@ mod tests {
                     &cipher,
                     1,
                     "Finances",
+                    &[],
                     &["tax".into()],
                     Some("high"),
                     true,
@@ -5151,8 +5518,19 @@ mod tests {
                 .unwrap(),
             );
             assert!(
-                rewrite_vault_metadata(&tx, &vault, &cipher, 2, "X", &[], None, true, "2026-06-20")
-                    .is_err(),
+                rewrite_vault_metadata(
+                    &tx,
+                    &vault,
+                    &cipher,
+                    2,
+                    "X",
+                    &[],
+                    &[],
+                    None,
+                    true,
+                    "2026-06-20"
+                )
+                .is_err(),
                 "missing doc should error"
             );
             // Caller abandons the batch: drop the tx (DB rollback) + restore files.
@@ -5188,6 +5566,7 @@ mod tests {
             created_at: "",
             ingested_at: "",
             project: "Unsorted",
+            linked_projects: &[],
             tags: &[],
             importance: None,
             last_activity: "",
