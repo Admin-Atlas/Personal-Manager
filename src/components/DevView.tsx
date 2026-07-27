@@ -333,8 +333,9 @@ export function DevView() {
                   <p className="mt-1 text-xs text-ink3">
                     <span className="text-ink4">this run: </span>
                     {chatId.live.restamped} file(s) restamped, {chatId.live.rows_restored} row(s)
-                    restored, {chatId.live.relinked} re-linked, {chatId.live.reindex_queued} queued
-                    for re-index (of {chatId.live.scanned} scanned)
+                    restored, {chatId.live.relinked} re-linked, {chatId.live.relocated} moved into
+                    chats/, {chatId.live.reindex_queued} queued for re-index (of{" "}
+                    {chatId.live.scanned} scanned)
                   </p>
                   {chatId.stored && (
                     <p className="mt-1 text-xs text-ink4">

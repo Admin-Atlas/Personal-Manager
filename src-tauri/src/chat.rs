@@ -11,8 +11,9 @@
 //!     assistant reply exists. [`completed_turn_pairs_after`] is the read primitive card B/C consume; it
 //!     never returns an incomplete trailing user turn. [`assert_user_turn_allowed`] enforces strict
 //!     alternation (user → assistant → user) so a turn-pair is always unambiguous.
-//!   * **Vault-is-truth write ordering.** A chat session has a real Markdown vault file — flat in the same
-//!     `vault/` dir as documents, so a Rebuild glob and the deletion cascade (card G) cover it for free.
+//!   * **Vault-is-truth write ordering.** A chat session has a real Markdown vault file, in `vault/chats/`
+//!     (#281) — one flat folder, with no project in the path, since a chat can belong to several. The
+//!     Rebuild walk and the deletion cascade (card G) reach it by the same relative path the DB stores.
 //!     [`record_turn_pair`] appends each completed pair to that file **first and authoritatively** (the
 //!     embed + cursor-advance is a separate, later step in card B). The append is idempotent, keyed on the
 //!     turn id, so a re-run never duplicates a turn — and if the process dies after the vault append but
@@ -164,20 +165,35 @@ pub(crate) fn completed_turn_pairs_after(
 /// The session's vault filename: `chat-<DD-MM-YYYY>-<short>.md`, DD-MM per the house date style and
 /// `<short>` the first 12 chars of the stable [`content_hash`] (collision-resistant + stable across
 /// appends). Analogous to `ingest::vault_filename` for documents.
+///
+/// The bare **name**, not the stored path — see [`chat_vault_path`]. The two are separate because the
+/// ciphertext AAD binds the name alone (`MarkdownCipher::aad_stem`), so a chat that moves between
+/// folders keeps decrypting; only the name may never change under it.
 pub(crate) fn chat_vault_filename(conversation_id: i64, created_at: &str) -> String {
     let date = ddmmyyyy(created_at);
     let short: String = content_hash(conversation_id).chars().take(12).collect();
     format!("chat-{date}-{short}.md")
 }
 
+/// Where a chat's on-disk file lives, relative to the vault root and `/`-separated: `chats/<name>`
+/// (#281). The one place that prefix is applied, so `chat_sessions.vault_path`,
+/// `documents.vault_path` and the file itself can never disagree about it.
+pub(crate) fn chat_vault_path(on_disk_name: &str) -> String {
+    format!("{}/{on_disk_name}", ingest::CHATS_SUBDIR)
+}
+
 /// Append one completed turn-pair to a session's vault file, **idempotently**. Creates the file with chat
 /// front-matter on the first pair; on a re-run for a turn already present (keyed on the turn-id anchor) it
 /// is a no-op. The file is the authoritative source of truth — written before any embedding.
+///
+/// `vault_rel` is the path relative to the vault root — `chats/<name>` for anything born since #281,
+/// and a bare name for a store the relocation pass has not reached yet. Both are joined the same way;
+/// the folder is created on demand, since this is the first writer to touch it in a fresh vault.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append_turn_pair(
     vault_dir: &Path,
     cipher: &MarkdownCipher,
-    on_disk_name: &str,
+    vault_rel: &str,
     title: &str,
     conversation_id: i64,
     scope: &str,
@@ -186,7 +202,10 @@ pub(crate) fn append_turn_pair(
     ingested_at: &str,
     pair: &TurnPair,
 ) -> Result<()> {
-    let path = vault_dir.join(on_disk_name);
+    let path = vault_dir.join(vault_rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut content = if path.exists() {
         let bytes = std::fs::read(&path)?;
         cipher.decode(&bytes, &path)?
@@ -285,8 +304,12 @@ pub(crate) fn record_turn_pair(
     } else {
         "general"
     };
-    let on_disk = existing_path
-        .unwrap_or_else(|| cipher.on_disk_name(&chat_vault_filename(conversation_id, &created_at)));
+    // An existing session keeps whatever path it already has — including a pre-#281 bare name, which the
+    // relocation pass moves on the next vault open rather than here. Changing it mid-append would leave the
+    // file in one place and the row naming another until the write landed.
+    let on_disk = existing_path.unwrap_or_else(|| {
+        chat_vault_path(&cipher.on_disk_name(&chat_vault_filename(conversation_id, &created_at)))
+    });
     let pair = TurnPair {
         user: user.to_string(),
         assistant: assistant.to_string(),
@@ -507,6 +530,10 @@ pub struct ChatIdentityHeal {
     pub reindex_queued: usize,
     /// Sessions whose `document_id` link was re-attached by `vault_path` after a wipe-arm Rebuild.
     pub relinked: usize,
+    /// Chat files moved out of the vault root into `chats/` (#281). `serde(default)` so a heal report
+    /// persisted by an older build still deserializes.
+    #[serde(default)]
+    pub relocated: usize,
     /// Sessions that could not be repaired (file missing/unreadable), with a short reason each.
     pub unrepaired: Vec<String>,
 }
@@ -514,8 +541,98 @@ pub struct ChatIdentityHeal {
 impl ChatIdentityHeal {
     /// Whether this pass changed anything — the gate for logging and for surfacing it to the user.
     pub fn touched_anything(&self) -> bool {
-        self.restamped > 0 || self.rows_restored > 0 || self.relinked > 0
+        self.restamped > 0 || self.rows_restored > 0 || self.relinked > 0 || self.relocated > 0
     }
+}
+
+/// Move every chat file still sitting at the vault root into `chats/`, re-pointing the two tables
+/// that name it (#281). Returns how many files moved.
+///
+/// Runs at the head of [`reconcile_vault_identity`], so it inherits that function's three call sites
+/// — every vault open and the Rebuild precondition — rather than needing a fourth one someone can
+/// forget. It must run BEFORE the identity pass, which reads each file at the path its row gives.
+///
+/// **Ordering is the whole design: the file moves first, the rows follow.** Interrupted the other way
+/// round, a row would name `chats/x.md` while the file still sat in the root — and because the pass
+/// only ever looks at rows with no folder in them, it would never look at that row again. The file
+/// would be orphaned and the chat would read as empty. Interrupted THIS way round, the next open sees
+/// "source gone, destination present" and finishes the job. That is why each file commits its own
+/// transaction, too: an interruption leaves a consistent prefix, never a half-moved store.
+///
+/// Deliberately keyed on `instr(vault_path,'/') = 0` — *provably* at the vault root — rather than
+/// "not already in chats/". A path with any folder in it is left alone, whatever folder that is.
+///
+/// A rename is all it takes: the ciphertext AAD binds the file NAME
+/// (`MarkdownCipher::aad_stem`), never its folder, so a moved chat decrypts unchanged and no key is
+/// involved at any point. Same volume, so the rename is atomic.
+///
+/// Cheap enough for every open: on a migrated store both queries return nothing and no file is
+/// touched. Best-effort per file — a conflict or an IO error is recorded and the pass continues.
+pub(crate) fn relocate_chat_files(
+    conn: &mut Connection,
+    vault: &Path,
+    unrepaired: &mut Vec<String>,
+) -> Result<usize> {
+    // Union, because the two tables can disagree: a wipe-arm Rebuild severs `chat_sessions.
+    // document_id` and leaves a `documents` row owning the path on its own.
+    let stale: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT vault_path FROM chat_sessions \
+              WHERE vault_path IS NOT NULL AND vault_path <> '' AND instr(vault_path, '/') = 0 \
+             UNION \
+             SELECT vault_path FROM documents \
+              WHERE COALESCE(source_type,'') = ?1 AND vault_path IS NOT NULL \
+                AND vault_path <> '' AND instr(vault_path, '/') = 0",
+        )?;
+        let rows = stmt.query_map(params![ingest::SOURCE_TYPE_CHAT], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    if stale.is_empty() {
+        return Ok(0);
+    }
+
+    let mut moved = 0usize;
+    for old_rel in stale {
+        let new_rel = chat_vault_path(&old_rel);
+        let (src, dst) = (vault.join(&old_rel), vault.join(&new_rel));
+        // Four states, and only one of them moves a file. `src` present + `dst` present is a genuine
+        // conflict (a stale root file alongside a moved one); leave BOTH untouched and say so — losing
+        // a transcript to tidy up a folder would be a bad trade at any odds.
+        match (src.exists(), dst.exists()) {
+            (true, true) => {
+                unrepaired.push(format!(
+                    "{old_rel}: a file already exists at {new_rel}; left both in place"
+                ));
+                continue;
+            }
+            (true, false) => {
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if let Err(e) = std::fs::rename(&src, &dst) {
+                    unrepaired.push(format!("{old_rel}: could not move into chats/ ({e})"));
+                    continue;
+                }
+                moved += 1;
+            }
+            // Already moved by a run that died before committing the rows — finish it.
+            (false, true) => {}
+            // No file either side: the chat never had substance, or the user deleted it. There is
+            // nothing to lose and the row should still point at where a future turn will be written.
+            (false, false) => {}
+        }
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE chat_sessions SET vault_path = ?1 WHERE vault_path = ?2",
+            params![new_rel, old_rel],
+        )?;
+        tx.execute(
+            "UPDATE documents SET vault_path = ?1 WHERE vault_path = ?2",
+            params![new_rel, old_rel],
+        )?;
+        tx.commit()?;
+    }
+    Ok(moved)
 }
 
 /// Insert the chat-identity lines back into a stripped front-matter fence, in place.
@@ -598,6 +715,15 @@ pub fn reconcile_vault_identity(
     cipher: &MarkdownCipher,
 ) -> Result<ChatIdentityHeal> {
     let mut report = ChatIdentityHeal::default();
+    // FIRST: bring any pre-#281 chat file into `chats/`, so every path read below is current. A
+    // failure here is recorded like any other, never fatal — the identity pass is still worth running
+    // over the files that did not move.
+    match relocate_chat_files(conn, vault, &mut report.unrepaired) {
+        Ok(moved) => report.relocated = moved,
+        Err(e) => report
+            .unrepaired
+            .push(format!("chat folder relocation skipped: {e}")),
+    }
     let sessions: Vec<(i64, String, String, Option<i64>)> = {
         let mut stmt = conn.prepare(
             "SELECT conversation_id, vault_path, scope, document_id FROM chat_sessions \
@@ -1276,6 +1402,8 @@ mod tests {
     // --- chat vault identity: the strip repair (3.81.2) ---------------------------------------
 
     /// Seed a session whose vault file exists, plus the `documents` row card B would have created.
+    /// Filed in `chats/` — a store as PM writes it today, so the identity tests below measure the
+    /// identity repair alone and never the #281 relocation.
     fn seed_chat_session(
         conn: &Connection,
         dir: &Path,
@@ -1284,8 +1412,9 @@ mod tests {
         scope: &str,
         source_type: &str,
     ) -> (i64, String) {
-        let vault_path = format!("chat-01-01-2026-{conv}.md");
+        let vault_path = chat_vault_path(&format!("chat-01-01-2026-{conv}.md"));
         let file = dir.join(&vault_path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         cipher
             .write_to(
                 &file,
@@ -1313,6 +1442,216 @@ mod tests {
         )
         .unwrap();
         (doc_id, vault_path)
+    }
+
+    // --- #281: the chats folder, and moving a pre-#281 store into it -------------------------
+
+    /// Seed a chat the way a pre-#281 build did: file flat in the vault root, both rows naming it.
+    fn seed_legacy_chat(conn: &Connection, dir: &Path, conv: i64) -> String {
+        let vault_path = format!("chat-01-01-2026-{conv}.md");
+        std::fs::write(
+            dir.join(&vault_path),
+            "---\nsource_type: chat\n---\n\nhello",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type, source_id) \
+             VALUES (?1, 'A chat', ?2, 'chat', ?3)",
+            params![vault_path, content_hash(conv), source_id(conv)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, scope, vault_path) VALUES (?1, 'general', ?2)",
+            params![conv, vault_path],
+        )
+        .unwrap();
+        vault_path
+    }
+
+    fn paths_of(conn: &Connection) -> (String, String) {
+        (
+            conn.query_row("SELECT vault_path FROM documents", [], |r| r.get(0))
+                .unwrap(),
+            conn.query_row("SELECT vault_path FROM chat_sessions", [], |r| r.get(0))
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn chat_vault_path_is_the_one_place_the_folder_prefix_is_applied() {
+        // The name and the stored path are deliberately separate: the ciphertext AAD binds the NAME
+        // (`MarkdownCipher::aad_stem`), which is exactly why a chat can change folders without
+        // re-encryption — and why the name must never pick up the prefix.
+        let name = chat_vault_filename(7, "2026-06-28T10:00:00.000Z");
+        assert!(!name.contains('/'), "the filename stays a bare name");
+        assert_eq!(chat_vault_path(&name), format!("chats/{name}"));
+        assert_eq!(
+            chat_vault_path("chat-x.md.pmenc"),
+            "chats/chat-x.md.pmenc",
+            "the encrypted on-disk name is prefixed identically"
+        );
+    }
+
+    #[test]
+    fn relocation_moves_a_legacy_chat_into_the_folder_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_conversation(&conn);
+        let old = seed_legacy_chat(&conn, dir.path(), conv);
+
+        let mut unrepaired = Vec::new();
+        assert_eq!(
+            relocate_chat_files(&mut conn, dir.path(), &mut unrepaired).unwrap(),
+            1
+        );
+        assert!(unrepaired.is_empty());
+
+        // The file moved, byte-for-byte — a rename, not a re-encode.
+        assert!(!dir.path().join(&old).exists());
+        let moved = dir.path().join("chats").join(&old);
+        assert_eq!(
+            std::fs::read_to_string(&moved).unwrap(),
+            "---\nsource_type: chat\n---\n\nhello"
+        );
+        // BOTH rows follow. `documents` alone would leave the next turn appending to the root.
+        assert_eq!(
+            paths_of(&conn),
+            (format!("chats/{old}"), format!("chats/{old}"))
+        );
+
+        // Idempotent, and cheap: the query that drives the pass now matches nothing.
+        let mut again = Vec::new();
+        assert_eq!(
+            relocate_chat_files(&mut conn, dir.path(), &mut again).unwrap(),
+            0
+        );
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn relocation_finishes_a_run_that_died_between_the_rename_and_the_commit() {
+        // The interruption the file-first ordering exists for. The rename landed; the transaction did
+        // not. Next open must see "source gone, destination present" and finish the job — the state is
+        // indistinguishable from a store where the file was moved by hand.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_conversation(&conn);
+        let old = seed_legacy_chat(&conn, dir.path(), conv);
+        std::fs::create_dir_all(dir.path().join("chats")).unwrap();
+        std::fs::rename(dir.path().join(&old), dir.path().join("chats").join(&old)).unwrap();
+
+        let mut unrepaired = Vec::new();
+        // Nothing MOVED — there was nothing left to move — but the rows are repaired.
+        assert_eq!(
+            relocate_chat_files(&mut conn, dir.path(), &mut unrepaired).unwrap(),
+            0
+        );
+        assert!(unrepaired.is_empty());
+        assert_eq!(
+            paths_of(&conn),
+            (format!("chats/{old}"), format!("chats/{old}"))
+        );
+    }
+
+    #[test]
+    fn relocation_refuses_a_conflict_and_destroys_neither_file() {
+        // A file at BOTH paths is not something the pass can resolve: one of them is a transcript and
+        // it cannot tell which. Losing a conversation to tidy up a folder would be a bad trade at any
+        // odds, so both survive and the conflict is reported.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_conversation(&conn);
+        let old = seed_legacy_chat(&conn, dir.path(), conv);
+        std::fs::create_dir_all(dir.path().join("chats")).unwrap();
+        std::fs::write(
+            dir.path().join("chats").join(&old),
+            "a different transcript",
+        )
+        .unwrap();
+
+        let mut unrepaired = Vec::new();
+        assert_eq!(
+            relocate_chat_files(&mut conn, dir.path(), &mut unrepaired).unwrap(),
+            0
+        );
+        assert_eq!(unrepaired.len(), 1);
+        assert!(unrepaired[0].contains("left both in place"));
+        assert!(dir.path().join(&old).exists(), "the root file survives");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("chats").join(&old)).unwrap(),
+            "a different transcript",
+            "and so does the one already in the folder"
+        );
+        // The rows are left naming the root file, which is the one they describe.
+        assert_eq!(paths_of(&conn), (old.clone(), old));
+    }
+
+    #[test]
+    fn relocation_repoints_a_row_whose_file_is_already_gone() {
+        // A chat the user deleted, or one that never had substance, leaves a row pointing at nothing.
+        // There is no file to lose, and the row should name where a future turn will be written —
+        // otherwise `record_turn_pair` recreates it in the root and the pass churns forever.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let conv = new_conversation(&conn);
+        let old = seed_legacy_chat(&conn, dir.path(), conv);
+        std::fs::remove_file(dir.path().join(&old)).unwrap();
+
+        let mut unrepaired = Vec::new();
+        assert_eq!(
+            relocate_chat_files(&mut conn, dir.path(), &mut unrepaired).unwrap(),
+            0
+        );
+        assert!(unrepaired.is_empty());
+        assert_eq!(
+            paths_of(&conn),
+            (format!("chats/{old}"), format!("chats/{old}"))
+        );
+    }
+
+    #[test]
+    fn relocation_leaves_a_document_that_is_not_a_chat_where_it_is() {
+        // The pass is keyed on chat rows and on paths with NO folder at all. An ordinary vault document
+        // lives in the root by design and must never be swept into `chats/`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        std::fs::write(dir.path().join("report-01-07-2026-ff00.md"), "doc").unwrap();
+        conn.execute(
+            "INSERT INTO documents(vault_path, title, content_hash, source_type) \
+             VALUES ('report-01-07-2026-ff00.md', 'Report', 'h', 'vault')",
+            [],
+        )
+        .unwrap();
+
+        let mut unrepaired = Vec::new();
+        assert_eq!(
+            relocate_chat_files(&mut conn, dir.path(), &mut unrepaired).unwrap(),
+            0
+        );
+        assert!(dir.path().join("report-01-07-2026-ff00.md").exists());
+        assert!(!dir.path().join("chats").exists(), "no folder is even made");
+    }
+
+    #[test]
+    fn heal_reports_the_relocation_so_it_can_be_read_rather_than_assumed() {
+        // The relocation rides on `reconcile_vault_identity`'s three call sites rather than needing a
+        // fourth, and must run BEFORE the identity pass — which reads each file at the path its row
+        // gives, and would otherwise report every legacy chat as missing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(dir.path());
+        let cipher = MarkdownCipher::plaintext("vault-test");
+        let conv = new_conversation(&conn);
+        let old = seed_legacy_chat(&conn, dir.path(), conv);
+
+        let report = reconcile_vault_identity(&mut conn, dir.path(), &cipher).unwrap();
+        assert_eq!(report.relocated, 1);
+        assert!(report.touched_anything());
+        assert!(
+            report.unrepaired.is_empty(),
+            "the identity pass found the file at its NEW path: {:?}",
+            report.unrepaired
+        );
+        assert!(dir.path().join("chats").join(&old).exists());
     }
 
     /// Reproduce the bug: drop every identity line the way the generic front-matter rewriter used to.
