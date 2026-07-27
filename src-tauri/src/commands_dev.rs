@@ -705,7 +705,20 @@ pub(crate) fn run_retrieval_explain(
     // does (F-33) — otherwise the diagnostic would show hits the real chat path wouldn't.
     let candidates = {
         let conn = state.conn()?;
-        retrieval::explain(&conn, query, &query_vec, k, project, embedder.multilingual)?
+        // The panel seeds its query from the last user message, so it may well contain an
+        // `@mention`. Resolve it the same way the live turn does, or the explanation would be of a
+        // narrower corpus than the answer it is explaining.
+        let pinned = crate::tags::resolve_mentions(&conn, &crate::tags::parse_mentions(query))?;
+        let query = crate::tags::strip_mentions(query, &pinned);
+        retrieval::explain(
+            &conn,
+            &query,
+            &query_vec,
+            k,
+            project,
+            &pinned,
+            embedder.multilingual,
+        )?
     };
 
     // Off-lock reranking: capture each candidate's score and reorder, mirroring production but

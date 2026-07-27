@@ -1968,6 +1968,7 @@ fn rebuild_chat(
         &project,
         &linked_projects_from_fields(&fields, &project),
     )?;
+    crate::tags::set_document_group_tags(&conn, id, &tags)?;
     // Claim it for this pass, so a resume skips this chat instead of re-indexing every turn again — and so
     // the sweep reads it as rebuilt rather than as a leftover.
     stamp_rebuild_pass(&conn, id, pass)?;
@@ -2211,6 +2212,7 @@ fn update_document_row(tx: &Connection, doc_id: i64, meta: &DocMeta) -> Result<(
     // The row and the membership join move together: this is the rebuild-from-vault path, so the
     // file's `linked_projects:` line is the truth being restored, not an edit being applied.
     crate::tags::set_document_projects(tx, doc_id, &meta.project, &meta.linked_projects)?;
+    crate::tags::set_document_group_tags(tx, doc_id, &meta.tags)?;
     Ok(())
 }
 
@@ -2274,6 +2276,7 @@ pub(crate) fn insert_document_row(tx: &Connection, meta: &DocMeta) -> Result<i64
     )?;
     let doc_id = tx.last_insert_rowid();
     crate::tags::set_document_projects(tx, doc_id, &meta.project, &meta.linked_projects)?;
+    crate::tags::set_document_group_tags(tx, doc_id, &meta.tags)?;
     Ok(doc_id)
 }
 
@@ -2697,6 +2700,10 @@ pub fn write_document_truth(
     // the DB mirror, and that mirror reads this join. Written afterwards, the manifest would carry
     // the PREVIOUS membership set and only catch up at the next unrelated edit.
     crate::tags::set_document_projects(tx, doc_id, project, linked_projects)?;
+    // Group tags ride the same seam (#276). `documents.tags` stays their truth — it is what the
+    // vault's `tags:` line round-trips and what a Rebuild restores from — and this keeps the
+    // queryable index over it from drifting, so `@tag` can scope by a label without a full scan.
+    crate::tags::set_document_group_tags(tx, doc_id, tags)?;
 
     let written = match truth_source(tx, doc_id)? {
         TruthSource::VaultFrontmatter => rewrite_vault_metadata(

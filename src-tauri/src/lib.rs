@@ -1378,6 +1378,7 @@ pub fn run() {
             commands::get_document,
             commands::transcribe_audio,
             commands::list_projects,
+            commands::list_tags,
             commands::review_queue,
             commands::review_queue_count,
             commands::cached_proposals,

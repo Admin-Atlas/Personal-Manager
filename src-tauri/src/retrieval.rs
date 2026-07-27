@@ -112,6 +112,19 @@ pub struct Filters {
     pub source: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
+    /// Tags the user PINNED with `@tag` in this message (#276) — canonical registry names, already
+    /// resolved, so an unrecognised `@word` never reaches here.
+    ///
+    /// A per-query widening, never a stored setting: the card's discipline is that broadening is
+    /// always user-invoked and never ambient, so this lives on the request and nowhere else.
+    ///
+    /// It composes with `project` in the two ways the card describes, and the asymmetry is the
+    /// whole feature:
+    ///   - **In a project chat** (`project` set) the pinned tags are ADDED to the project's own
+    ///     documents — "also search Coding", the explicit cross-scope pull.
+    ///   - **In a global chat** (`project` None) they NARROW an otherwise unscoped search down to
+    ///     the tag — "give me the highest-level picture of PM", the tag-scoped overview.
+    pub pinned_tags: Vec<crate::tags::PinnedTag>,
     /// Context-assembly dedup (board card 7C): `(document_id, turn_floor)` of the current chat session.
     /// Chunks of that document whose `chat_turn_id > turn_floor` are excluded, because those turns are
     /// already sent VERBATIM in the recency window (everything past the summary cursor) — retrieving a
@@ -158,6 +171,7 @@ pub fn retrieve_fused(conn: &Connection, q: &RetrieveQuery) -> Result<Vec<Retrie
             q.embedding,
             q.k,
             q.filters.project.as_deref(),
+            &q.filters.pinned_tags,
             q.filters.exclude_chat,
             q.multilingual,
         ),
@@ -298,20 +312,19 @@ fn apply_reranker(
 /// Fusion, recency-decayed, top-k. The query embedding is supplied by the caller, so this is
 /// unit-testable without Python. Only leaf chunks are ever returned (parents aren't in the
 /// vector/keyword indexes).
+#[allow(clippy::too_many_arguments)]
 fn hybrid_core(
     conn: &Connection,
     query_text: &str,
     query_embedding: &[f32],
     k: usize,
     project: Option<&str>,
+    pinned_tags: &[crate::tags::PinnedTag],
     exclude_chat: Option<(i64, i64)>,
     multilingual: bool,
 ) -> Result<Vec<RetrievedChunk>> {
     let branch_limit = BRANCH_LIMIT.max(k);
-    let allowed = match project {
-        Some(p) => Some(project_chunk_ids(conn, p)?),
-        None => None,
-    };
+    let allowed = scope_allow_set(conn, project, pinned_tags)?;
     let excluded = match exclude_chat {
         Some((doc_id, turn_floor)) => Some(in_window_chat_chunk_ids(conn, doc_id, turn_floor)?),
         None => None,
@@ -336,8 +349,13 @@ fn hybrid_core(
         fts_hits.retain(|id| !excluded.contains(id));
     }
     if scoped {
-        vec_hits.truncate(branch_limit);
-        fts_hits.truncate(branch_limit);
+        // One extra branch-limit's worth of candidates per pinned tag. Without it a tag pinned
+        // inside a large project competes for the SAME `branch_limit` slots as the project's own
+        // chunks, so the pin can contribute nothing at all — and nothing would say so. The pool is
+        // still bounded, and the reranker still selects the final top-k from it.
+        let widened = branch_limit.saturating_mul(1 + pinned_tags.len());
+        vec_hits.truncate(widened);
+        fts_hits.truncate(widened);
     }
     let fused = fuse_scored(&[vec_hits, fts_hits]);
     // Return the recency-decayed candidate POOL (up to `branch_limit`, ~20 at the default k), not a
@@ -348,6 +366,44 @@ fn hybrid_core(
     // none of this is part of the retrieval-config stamp and it triggers no Rebuild.
     let pool = apply_recency(conn, fused, branch_limit)?;
     load_chunks(conn, &pool)
+}
+
+/// The chunk allow-set for one query: the project's own documents, plus anything the user pinned
+/// with `@tag` (#276).
+///
+/// `None` means "no filter" and is reserved for exactly one case — a global chat with nothing
+/// pinned. Every other combination produces a set, because every other combination is the user
+/// having said what they want searched:
+///
+/// | project | pinned | allow-set                    | what the user asked for              |
+/// |---------|--------|------------------------------|--------------------------------------|
+/// | set     | none   | the project                  | the default, unchanged               |
+/// | set     | some   | the project ∪ the tags       | "also search X" — cross-scope pull   |
+/// | none    | some   | the tags                     | "search all of X" — tag overview     |
+/// | none    | none   | `None`                       | an ordinary global chat              |
+///
+/// The project-chat case UNIONS rather than intersects, which is the point: pinning a tag in a
+/// project chat is a request to reach further, not to filter down what is already there.
+///
+/// A pinned tag that matches no documents contributes an empty set rather than disappearing, so a
+/// typo'd `@tag` in a global chat narrows to nothing and returns no grounding — visibly wrong,
+/// rather than silently searching everything the user believed they had scoped away.
+fn scope_allow_set(
+    conn: &Connection,
+    project: Option<&str>,
+    pinned_tags: &[crate::tags::PinnedTag],
+) -> Result<Option<std::collections::HashSet<i64>>> {
+    if project.is_none() && pinned_tags.is_empty() {
+        return Ok(None);
+    }
+    let mut allowed = match project {
+        Some(p) => project_chunk_ids(conn, p)?,
+        None => std::collections::HashSet::new(),
+    };
+    if !pinned_tags.is_empty() {
+        allowed.extend(crate::tags::tag_chunk_ids(conn, pinned_tags)?);
+    }
+    Ok(Some(allowed))
 }
 
 /// The chunk ids belonging to a project's documents — the allow-set for a scoped
@@ -725,21 +781,24 @@ pub struct ExplainCandidate {
 /// → [`select_top_k`]), so the panel reflects exactly what the chat path grounds on. This is a
 /// parallel, instrumented read used only by the Developer-mode panel. Pure SQL + a supplied
 /// embedding, like [`hybrid_core`], so it is unit-testable without Python.
+#[allow(clippy::too_many_arguments)]
 pub fn explain(
     conn: &Connection,
     query_text: &str,
     query_embedding: &[f32],
     k: usize,
     project: Option<&str>,
+    // The same pins the live turn had. Without them this panel would explain a strictly narrower,
+    // differently-ranked corpus than the answer it claims to explain — and it seeds its query from
+    // the last user message, which is exactly where the `@mention` is.
+    pinned_tags: &[crate::tags::PinnedTag],
     multilingual: bool,
 ) -> Result<Vec<ExplainCandidate>> {
     use std::collections::HashMap;
 
     let branch_limit = BRANCH_LIMIT.max(k);
-    let allowed = match project {
-        Some(p) => Some(project_chunk_ids(conn, p)?),
-        None => None,
-    };
+    // The same seam `hybrid_core` uses, so the two can never drift.
+    let allowed = scope_allow_set(conn, project, pinned_tags)?;
     let fetch = if allowed.is_some() {
         SCOPED_POOL.max(branch_limit)
     } else {
@@ -1909,7 +1968,7 @@ mod tests {
         );
 
         // A query matching the first chunk in BOTH branches (semantically + the word "purr").
-        let rows = explain(&conn, "purr", &unit_vec(0), 6, None, false).unwrap();
+        let rows = explain(&conn, "purr", &unit_vec(0), 6, None, &[], false).unwrap();
         assert!(rows.len() >= 2, "both chunks should be candidates");
 
         // The best match leads and carries scores from both branches.

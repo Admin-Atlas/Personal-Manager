@@ -109,6 +109,7 @@ import type {
   VaultOpOutcome,
   VaultStatus,
   SmartAppControlState,
+  TagSummary,
   WipeReport,
   WipeSelection,
 } from "./types";
@@ -630,6 +631,10 @@ export const retrievalDiagnose = (symptom: string, query: string, explain: DevRe
   invoke<string>("retrieval_diagnose", { symptom, query, explain });
 
 // --- Archivist: sorting review & organisation (Step 4) ---
+
+/** Every tag in the registry — projects and free-form labels — with its kind and use count (#276).
+ *  Feeds the composer's `@` autocomplete, which is how anyone discovers that pinning a tag exists. */
+export const listTags = () => invoke<TagSummary[]>("list_tags");
 
 /** Distinct project labels across all documents. */
 export const listProjects = () => invoke<string[]>("list_projects");

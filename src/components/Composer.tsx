@@ -1,8 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useRecorder } from "../lib/useRecorder";
+import { listTags } from "../lib/ipc";
+import { completeMention, matchTags, mentionAtCaret } from "../lib/mentions";
+import type { TagSummary } from "../lib/types";
+import { MentionSuggest } from "./MentionSuggest";
 import { Button, Textarea } from "./ui";
 
 // The mic·input·send cluster is capped to exactly the conversation column width (ChatView's
@@ -29,6 +41,55 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
   // draft never buries most of the history. Measured from the enclosing chat <main> (the composer
   // root's parent) so it adapts to the global chat and the narrower per-project chat alike.
   const [maxHeight, setMaxHeight] = useState<number>();
+
+  // `@tag` (#276). Typing `@` offers the tags that exist; picking one inserts it. The pin itself is
+  // read server-side from the sent message, so this list is discovery, never the mechanism — a
+  // typed mention works with the panel closed, and a failure to load tags costs nothing.
+  const [tags, setTags] = useState<TagSummary[]>([]);
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [active, setActive] = useState(0);
+  const listboxId = useId();
+  const optionId = (i: number) => `${listboxId}-opt-${i}`;
+  const suggestions = mentionQuery === null ? [] : matchTags(tags, mentionQuery);
+  const open = suggestions.length > 0;
+
+  // Loaded once per mount rather than per keystroke: the registry is small, and a fetch on every
+  // `@` would put a round-trip between the keypress and the list.
+  useEffect(() => {
+    let live = true;
+    listTags()
+      .then((t) => {
+        if (live) setTags(t);
+      })
+      .catch(() => {
+        /* discovery sugar — a chat that cannot list tags still sends fine */
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  // Re-read the token under the caret after any change to the text or the caret position.
+  const syncMention = useCallback((value: string, caret: number | null) => {
+    const at = caret === null ? null : mentionAtCaret(value, caret);
+    setMentionQuery(at ? at.query : null);
+    setActive(0);
+  }, []);
+
+  function pick(name: string) {
+    const el = textareaRef.current;
+    if (!el) return;
+    const at = mentionAtCaret(text, el.selectionStart ?? text.length);
+    if (!at) return;
+    const next = completeMention(text, at, name);
+    setText(next.text);
+    setMentionQuery(null);
+    // The caret has to be restored after React has painted the new value, or it lands at the end.
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(next.caret, next.caret);
+    });
+  }
 
   // Voice input (spec §4 P1): a dictated clip is transcribed on-device and
   // appended to the box for the user to review/edit — never auto-sent.
@@ -74,6 +135,7 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
     if (!trimmed || disabled) return;
     onSend(trimmed);
     setText("");
+    setMentionQuery(null);
   }
 
   function toggleMic() {
@@ -97,8 +159,17 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
             flooring its track wider than the empty side), so the cluster stays centered under the column. */}
         <div className="flex min-w-0 items-center justify-end">{leftTools}</div>
 
-        {/* Center — mic·input·send, exactly the conversation column width and centered under it. */}
-        <div className="flex items-end gap-2">
+        {/* Center — mic·input·send, exactly the conversation column width and centered under it.
+            `relative` anchors the `@` suggestion panel to this cluster. */}
+        <div className="relative flex items-end gap-2">
+          <MentionSuggest
+            items={suggestions}
+            active={active}
+            listboxId={listboxId}
+            optionId={optionId}
+            onPick={pick}
+            onHover={setActive}
+          />
           <button
             type="button"
             onClick={toggleMic}
@@ -126,18 +197,54 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
             value={text}
             onChange={(e) => {
               setText(e.target.value);
+              syncMention(e.target.value, e.target.selectionStart);
               // Resize in the same event the value changes so the box grows AND shrinks immediately —
               // including when text is deleted or cleared, not just on the next layout pass.
               autosize(maxHeight ?? Infinity);
             }}
+            // Arrow keys and clicks move the caret without changing the value, so the suggestion
+            // list has to follow them too — otherwise it would keep offering completions for a
+            // token the caret has already left.
+            onKeyUp={(e) => syncMention(e.currentTarget.value, e.currentTarget.selectionStart)}
+            onClick={(e) => syncMention(e.currentTarget.value, e.currentTarget.selectionStart)}
+            onBlur={() => setMentionQuery(null)}
             onKeyDown={(e) => {
+              // While the list is open it owns the arrow keys, Enter, Tab and Escape. Enter is the
+              // one that matters: it must complete the mention rather than send a half-typed one.
+              if (open) {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setActive((i) => Math.min(i + 1, suggestions.length - 1));
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setActive((i) => Math.max(i - 1, 0));
+                  return;
+                }
+                if (e.key === "Enter" || e.key === "Tab") {
+                  e.preventDefault();
+                  pick(suggestions[active].name);
+                  return;
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setMentionQuery(null);
+                  return;
+                }
+              }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 submit();
               }
             }}
+            role="combobox"
+            aria-expanded={open}
+            aria-controls={open ? listboxId : undefined}
+            aria-autocomplete="list"
+            aria-activedescendant={open ? optionId(active) : undefined}
             rows={1}
-            placeholder="Ask anything…  (Enter to send, Shift+Enter for a new line)"
+            placeholder="Ask anything…  (Enter to send, @ to pin a tag)"
             className="flex-1 px-4 py-2"
           />
           <Button

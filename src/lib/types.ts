@@ -378,6 +378,17 @@ export interface CompressResult {
  *  sunk to the bottom of lists, still searchable); `null` is untriaged / unset — a distinct state. */
 export type Importance = "high" | "medium" | "low" | "archive" | null;
 
+/** One tag in the registry, as the `@` autocomplete and the tag pickers see it (#276). */
+export interface TagSummary {
+  name: string;
+  /** A project mirrors a real project; a group tag is a free-form label. Pinning either scopes a
+   *  chat, but the two are separate namespaces — a project called "Research" and a label called
+   *  "research" are different things. */
+  kind: "project" | "group";
+  /** How many documents carry it. The list is ordered by this, so tags in real use come first. */
+  documents: number;
+}
+
 export interface Document {
   id: number;
   title: string;

@@ -128,7 +128,10 @@ export function CommandPalette({
       kind: "file",
       label: d.title,
       sublabel: d.project,
-      search: `${d.title} ${d.project}`.toLowerCase(),
+      // Every project it belongs to and every tag it carries (#276), so the same `@tag` a chat
+      // scopes by also finds files here.
+      search:
+        `${d.title} ${d.project} ${d.linked_projects.join(" ")} ${d.tags.join(" ")}`.toLowerCase(),
       activate: () => {
         cbRef.current.onOpenProject(d.project, d.id);
         cbRef.current.onClose();
@@ -181,7 +184,9 @@ export function CommandPalette({
   // each group is ordered by match score (best first); empty query keeps the
   // natural order so the palette doubles as a browse-everything list.
   const { groups, flat } = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    // A leading `@` is the chat's pin syntax; here it is just how someone types a tag they are
+    // looking for, so it must not defeat the match (#276).
+    const q = query.trim().replace(/^@/, "").toLowerCase();
     const scored = items
       .map((item) => ({ item, score: q ? fuzzyScore(q, item.search) : 0 }))
       .filter((s): s is { item: PaletteItem; score: number } => s.score !== null);

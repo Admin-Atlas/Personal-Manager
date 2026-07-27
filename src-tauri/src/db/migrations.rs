@@ -1335,6 +1335,44 @@ const MIGRATIONS: &[&str] = &[
         JOIN tags t ON t.kind = 'project' AND t.norm = lower(trim(d.project))
         WHERE trim(COALESCE(d.project,'')) <> '';
     "#,
+    // v47 (Stage-4 card 16, #276): group tags join the registry, so a tag can finally be SCOPED BY.
+    //
+    // v46 created `tags` with both kinds and deliberately populated only `project`. Group tags — the
+    // free-form labels the tag editor writes — stayed in the `documents.tags` JSON blob, because
+    // nothing read them: no retrieval, no search, no filter, no score. Moving a population with no
+    // consumer would have been churn.
+    //
+    // #276 is that consumer. `@tag` widens a chat's retrieval scope, which needs to answer "which
+    // documents carry this tag" — a question the blob cannot answer without scanning every row, and
+    // one that has to be a JOIN if it is to intersect with the chunk allow-set.
+    //
+    // `documents.tags` is KEPT as the truth (it is what the vault's `tags:` line round-trips, and
+    // what a Rebuild restores from); the join is the queryable index over it, exactly as
+    // `document_tags` already is for projects. `ingest::write_document_truth` writes both.
+    //
+    // `json_each` over a CASE-guarded value rather than a WHERE filter: SQLite expands the
+    // table-valued function before the WHERE is applied, so a row holding malformed JSON — a
+    // hand-edited store, a partial write — would abort the whole migration rather than be skipped.
+    // Substituting an empty array for anything `json_valid` rejects makes the bad row a no-op.
+    //
+    // `je.type = 'text'` is the other half of that guard: a numeric element in a
+    // hand-edited array would otherwise be coerced into a tag literally named `1`. And the display
+    // name is TRIMMED — `intern` is find-first, so a legacy blob entry of " urgent" would mint a
+    // row keeping the leading space that no later write would ever correct. A migration runs once.
+    r#"
+    INSERT OR IGNORE INTO tags (kind, name, norm)
+        SELECT 'group', trim(je.value), lower(trim(je.value))
+        FROM documents d,
+             json_each(CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END) je
+        WHERE je.type = 'text' AND trim(je.value) <> '';
+
+    INSERT OR IGNORE INTO document_tags (document_id, tag_id)
+        SELECT d.id, t.id
+        FROM documents d,
+             json_each(CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END) je
+        JOIN tags t ON t.kind = 'group' AND t.norm = lower(trim(je.value))
+        WHERE je.type = 'text' AND trim(je.value) <> '';
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1390,7 +1428,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 46,
+            version, 47,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1413,7 +1451,8 @@ mod tests {
              corrections filing-pipeline version stamp is v43; \
              retrieval-relevance feedback capture is v44; \
              calendar work/personal typing is v45; \
-             tag registry + M:N project membership is v46)"
+             tag registry + M:N project membership is v46; \
+             group tags join the registry is v47)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -2497,6 +2536,79 @@ mod tests {
             .unwrap();
         assert_eq!(model, "BAAI/bge-small-en-v1.5");
     }
+    /// v47 moves the free-form labels into the registry so `@tag` can scope by one. Same contract
+    /// as v46: restate what the store already says, and survive a store that is merely untidy.
+    #[test]
+    fn v47_backfills_group_tags_from_the_json_blob() {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open_keyed(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        apply_through(&conn, 46);
+
+        for (vp, hash, project, tags) in [
+            ("a.md", "ha", "Sales", r#"["tax", "2026"]"#),
+            ("b.md", "hb", "Sales", r#"["Tax"]"#),
+            // The untidy cases a real store can hold: whitespace, a non-string element, and a
+            // blob that is not valid JSON at all.
+            ("c.md", "hc", "Ops", r#"[" urgent ", 7, ""]"#),
+            ("d.md", "hd", "Ops", "not json at all"),
+        ] {
+            conn.execute(
+                "INSERT INTO documents(vault_path, content_hash, project, tags) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![vp, hash, project, tags],
+            )
+            .unwrap();
+        }
+
+        super::run(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::MIGRATIONS.len() as i64,
+            "run resumes from the stored version and climbs to the top"
+        );
+
+        // "tax" and "Tax" are one label; the numeric and empty entries minted nothing.
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM tags WHERE kind = 'group' ORDER BY norm")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(names, ["2026", "tax", "urgent"]);
+
+        // The display name is trimmed — `intern` is find-first, so a stored " urgent " would
+        // otherwise be the spelling every picker showed forever.
+        assert!(names.iter().any(|n| n == "urgent"));
+
+        // Both documents carrying the label (however cased) are bound to the one tag.
+        let tax: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM document_tags dt JOIN tags t ON t.id = dt.tag_id \
+                 WHERE t.kind = 'group' AND t.norm = 'tax'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tax, 2);
+
+        // The malformed row was skipped, not fatal — the migration completed, which is the point.
+        let ops: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM document_tags dt JOIN documents d ON d.id = dt.document_id \
+                 JOIN tags t ON t.id = dt.tag_id WHERE d.vault_path = 'd.md' AND t.kind = 'group'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ops, 0);
+    }
+
     /// v46's backfill must restate what the store already says, so every membership-aware query is
     /// equivalent to its predecessor on an existing vault. A user who upgrades and opens Focus must
     /// see the same projects with the same file counts — the migration is not the moment to
@@ -2532,7 +2644,11 @@ mod tests {
         // `run` resumes from the stored `user_version`, so this applies v46 and nothing else — the
         // upgrade an existing store actually experiences.
         super::run(&conn).unwrap();
-        assert_eq!(user_version(&conn), 46);
+        assert_eq!(
+            user_version(&conn),
+            super::MIGRATIONS.len() as i64,
+            "run resumes from the stored version and climbs to the top"
+        );
 
         // One tag per project, case-folded — the differently-cased spelling did NOT mint a second.
         let tags: i64 = conn

@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.99.0-alpha",
+    date: "2026-07-27",
+    highlights: [
+      "You can now point a chat at a tag. Type @ in the message box and PM offers the projects and tags you have; pick one and that message searches it.",
+      "What that does depends on where you are, and it's the difference that makes it useful. In a project chat, pinning a tag REACHES FURTHER — it keeps the project's own files and adds the tagged ones, so you can ask the Marketing chat about something filed under Coding without leaving. In the main chat, pinning a tag NARROWS — @PM gives you an overview of everything tagged PM and nothing else.",
+      "It lasts exactly one message. Nothing is remembered, nothing is turned on: a chat scoped to a project still answers only from that project the moment you stop asking it not to.",
+      "Pinning a tag chooses where PM looks — it doesn't quietly make those files rank higher. The tag is taken out of the question before the search runs, so you get an honest answer to what you actually asked.",
+      'The tags you pinned are highlighted in your sent message, so you can see which ones PM recognised and which were just words. A name with a space in it goes in quotes: @"Atlas, Inc.".',
+      "Your free-form tags now do something. They were labels PM stored and never used; they can now scope a chat, and searching (Ctrl-K) finds a file by any of its tags or projects, not just its name.",
+    ],
+  },
+  {
     version: "3.98.0-alpha",
     date: "2026-07-27",
     highlights: [
