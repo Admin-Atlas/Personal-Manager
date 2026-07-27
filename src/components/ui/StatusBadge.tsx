@@ -16,7 +16,6 @@ const STATUS_KEY: Record<ProjectStatus, StatusKey> = {
   blocked: "blocked",
   quick_win: "quick",
   take_a_look: "look",
-  part_of: "part",
   on_track: "track",
 };
 
@@ -25,13 +24,12 @@ export const STATUS_LABEL: Record<ProjectStatus, string> = {
   blocked: "Blocked",
   quick_win: "Quick win",
   take_a_look: "Take a look",
-  part_of: "Part of",
   on_track: "On track",
 };
 
 export interface StatusBadgeProps {
   status: ProjectStatus;
-  /** Override the label (e.g. "Part of <parent>"). */
+  /** Override the label, when a caller has more context than the status name alone. */
   label?: string;
   className?: string;
 }

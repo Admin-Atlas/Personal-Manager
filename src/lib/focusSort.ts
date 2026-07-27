@@ -23,7 +23,6 @@ export const STATUS_ORDER = [
   "blocked",
   "quick_win",
   "take_a_look",
-  "part_of",
   "on_track",
 ] as const;
 

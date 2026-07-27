@@ -531,9 +531,12 @@ export interface DraftPreference {
 
 // --- Personal Assistant: focus view & projects (Step 5, spec §4.1) ---
 
-/** The one status a project shows in the focus view. Exactly one applies. */
-export type ProjectStatus =
-  "due_soon" | "blocked" | "quick_win" | "take_a_look" | "part_of" | "on_track";
+/** The one status a project shows in the focus view. Exactly one applies.
+ *
+ *  `part_of` was retired with the `parent` field (#278) — it described a project's
+ *  relationship rather than whether it wants attention, and it hid the project's real
+ *  status behind it. Folding a project into another is now an explicit *Merge into*. */
+export type ProjectStatus = "due_soon" | "blocked" | "quick_win" | "take_a_look" | "on_track";
 
 /** A rough effort estimate for a project ("quick" → Quick win), or unset. */
 export type ProjectSize = "quick" | "standard" | "large" | null;
@@ -594,7 +597,6 @@ export interface ProjectOverview {
   deadline: string | null;
   size: ProjectSize;
   blocked_by: string | null;
-  parent: string | null;
   importance: Importance;
   /** Computed structural auto-importance — the value "Auto" resolves to (independent of
    *  the manual `importance` override). `null` when nothing depends on this project. */
@@ -608,10 +610,20 @@ export interface ProjectOverview {
   governing_milestone: GoverningMilestone | null;
 }
 
+/** What a *Merge into* would move, counted live from the rows the merge will touch (#279).
+ *  `files` excludes chat documents so the confirmation sentence doesn't count a chat twice. */
+export interface MergePreview {
+  files: number;
+  milestones: number;
+  chats: number;
+  /** The target's canonical name — what the source's documents end up filed under, and so the
+   *  exact string the user must type to confirm. */
+  into_canonical: string;
+}
+
 /** The AI's proposed triage metadata for a project (AI-proposes-you-confirm). */
 export interface ProjectProposal {
   size: ProjectSize;
-  parent: string | null;
   blocked_by: string | null;
   deadline: string | null;
   reasoning: string;

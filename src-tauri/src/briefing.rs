@@ -273,7 +273,6 @@ pub fn build_flag_snapshot(
     let mut quick = Vec::new();
     let mut stale = Vec::new();
     let mut on_track = 0usize;
-    let mut part_of = 0usize;
     for p in projects {
         match p.status {
             // Due-soon is now expressed by the milestone-anchored flags above, not a project line.
@@ -291,7 +290,6 @@ pub fn build_flag_snapshot(
                 ),
                 None => p.name.clone(),
             }),
-            ProjectStatus::PartOf => part_of += 1,
             ProjectStatus::OnTrack => on_track += 1,
         }
     }
@@ -305,10 +303,11 @@ pub fn build_flag_snapshot(
     push_group(&mut out, "Blocked", &blocked);
     push_group(&mut out, "Quick wins (≈ an hour each)", &quick);
     push_group(&mut out, "Gone quiet — take a look", &stale);
-    if on_track > 0 || part_of > 0 {
-        out.push_str(&format!(
-            "Otherwise: {on_track} project(s) on track, {part_of} part of a bigger one.\n"
-        ));
+    // "N part of a bigger one" retired with `parent` (#278) — a project folded into another is
+    // now merged away rather than left standing with a suppressed status, so there is no such
+    // group left to count.
+    if on_track > 0 {
+        out.push_str(&format!("Otherwise: {on_track} project(s) on track.\n"));
     }
 
     Some(out)
@@ -555,7 +554,6 @@ mod tests {
             deadline: None,
             size: None,
             blocked_by: None,
-            parent: None,
             importance: None,
             auto_importance: None,
             calendar_event: None,

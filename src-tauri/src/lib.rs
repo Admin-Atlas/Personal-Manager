@@ -1388,6 +1388,8 @@ pub fn run() {
             commands::remove_entity_alias,
             commands::rename_entity,
             commands::merge_entities,
+            commands::merge_project_preview,
+            commands::merge_projects,
             commands::list_project_overviews,
             commands::set_project_metadata,
             commands::propose_project_metadata,

@@ -15,6 +15,7 @@ import {
   syncCalendar,
 } from "../lib/ipc";
 import { MilestoneList } from "./MilestoneList";
+import { MergeProjectDialog } from "./MergeProjectDialog";
 import { FocusUpcoming } from "./FocusUpcoming";
 import { Briefing } from "./Briefing";
 import type {
@@ -601,14 +602,7 @@ function ProjectCard({
   onSaved: () => void;
 }) {
   const { minimal, showMeta } = useDepth();
-  const badge = (
-    <StatusBadge
-      status={project.status}
-      label={
-        project.status === "part_of" && project.parent ? `Part of ${project.parent}` : undefined
-      }
-    />
-  );
+  const badge = <StatusBadge status={project.status} />;
 
   return (
     <li data-help="focus-card">
@@ -708,7 +702,7 @@ function MetaEditor({
   const [size, setSize] = useState<ProjectSize>(project.size);
   const [importance, setImportance] = useState<Importance>(project.importance);
   const [blockedBy, setBlockedBy] = useState(project.blocked_by ?? "");
-  const [parent, setParent] = useState(project.parent ?? "");
+  const [merging, setMerging] = useState(false);
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -717,7 +711,6 @@ function MetaEditor({
     if (!proposal || applying) return;
     setSize(proposal.size);
     if (proposal.blocked_by) setBlockedBy(proposal.blocked_by);
-    if (proposal.parent) setParent(proposal.parent);
     // A proposed deadline becomes a milestone straight away (milestones persist live).
     if (!proposal.deadline) return;
     const due = proposal.deadline.slice(0, 10);
@@ -747,7 +740,6 @@ function MetaEditor({
         size,
         importance,
         blockedBy: blockedBy || null,
-        parent: parent || null,
       });
       onSaved();
     }, setError);
@@ -792,7 +784,6 @@ function MetaEditor({
           </div>
           <p className="text-ink3">
             {proposal.size ? `size ${proposal.size}` : "no size"}
-            {proposal.parent ? ` · part of ${proposal.parent}` : ""}
             {proposal.blocked_by ? ` · blocked by ${proposal.blocked_by}` : ""}
             {proposal.deadline ? ` · due ${formatDateOnly(proposal.deadline.slice(0, 10))}` : ""}
           </p>
@@ -835,10 +826,29 @@ function MetaEditor({
         <Field label="Blocked by">
           <ProjectSelect value={blockedBy} options={otherProjects} onChange={setBlockedBy} />
         </Field>
-        <Field label="Part of (parent)">
-          <ProjectSelect value={parent} options={otherProjects} onChange={setParent} />
-        </Field>
       </div>
+
+      {/* Where the "Part of (parent)" picker used to sit (#278). That field pretended to be
+          grouping while actually suppressing this project's status; the one real job it did —
+          "this was never its own project" — is now this explicit, irreversible action (#279). */}
+      {otherProjects.length > 0 && (
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <span className="text-xs text-ink4">
+            Turns out this was always part of another project?
+          </span>
+          <Button variant="tertiary" onClick={() => setMerging(true)}>
+            Merge into…
+          </Button>
+        </div>
+      )}
+      {merging && (
+        <MergeProjectDialog
+          project={project.name}
+          otherProjects={otherProjects}
+          onClose={() => setMerging(false)}
+          onMerged={onSaved}
+        />
+      )}
 
       <div className="mt-3">
         <span className="text-xs text-ink3">Milestones (the nearest unmet drives Due soon)</span>
