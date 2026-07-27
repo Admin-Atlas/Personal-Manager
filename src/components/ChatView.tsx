@@ -11,15 +11,28 @@ import {
   type MouseEvent,
   type RefObject,
 } from "react";
-import type { Citation, GroundingConfidence, Message, PromptMessage } from "../lib/types";
+import type {
+  AnswerRating,
+  Citation,
+  GroundingConfidence,
+  Message,
+  PromptMessage,
+} from "../lib/types";
 import { useDepth } from "../theme";
 import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
 import { Markdown } from "../lib/markdown";
 import { citationTarget, linkCitations } from "../lib/chatMarkdown";
 import { formatDate, formatDateLocal, shortModel } from "../lib/format";
-import { getSettings, ingestNote, setRetrievalConfidenceThreshold } from "../lib/ipc";
-import { VisuallyHidden } from "./ui";
+import {
+  answerFeedback,
+  getSettings,
+  ingestNote,
+  rateAnswer,
+  recordCitationClick,
+  setRetrievalConfidenceThreshold,
+} from "../lib/ipc";
+import { IconButton, VisuallyHidden } from "./ui";
 
 interface Props {
   messages: Message[];
@@ -152,11 +165,14 @@ function Sources({
   itemRefs,
   flash,
   onOpenChatCitation,
+  onCitationOpened,
 }: {
   citations: Citation[];
   itemRefs: RefObject<(HTMLLIElement | null)[]>;
   flash: number | null;
   onOpenChatCitation?: (conversationId: number, turnId: number | null) => void;
+  /** Opening a source is an implicit relevance signal (card 10) — logged, never blocking the open. */
+  onCitationOpened?: (documentId: number) => void;
 }) {
   // A document citation opens the shared reader onto that document (mounted at app scope), so the user
   // can see what the answer drew from without leaving the conversation.
@@ -195,7 +211,10 @@ function Sources({
                 ) : (
                   <button
                     type="button"
-                    onClick={() => openReaderById(c.document_id)}
+                    onClick={() => {
+                      onCitationOpened?.(c.document_id);
+                      openReaderById(c.document_id);
+                    }}
                     className="border-0 bg-transparent p-0 text-left align-baseline text-accent-text underline decoration-dotted underline-offset-2 transition hover:brightness-110 motion-reduce:transition-none"
                   >
                     {c.title}
@@ -205,6 +224,69 @@ function Sources({
             );
           })}
         </ol>
+      </div>
+    </div>
+  );
+}
+
+/** Was this answer any good? (Stage-4 card 10.)
+ *
+ *  Two quiet buttons under a grounded answer. Nothing reads the signal yet — it accrues locally so a
+ *  learned reranker has something to train on when that work lands, which it otherwise never would,
+ *  because PM records no query-time relevance judgements anywhere. Clicking an already-set rating
+ *  clears it, so the control is never a one-way door.
+ *
+ *  Deliberately unobtrusive: no prompt, no nag, no reward for answering. A rating that has to be
+ *  coaxed is worse than no rating, because it is a judgement about being asked rather than about the
+ *  answer. Only shown on answers that actually retrieved something — there is nothing to judge the
+ *  relevance of otherwise. */
+function AnswerRatingControls({ messageId }: { messageId: number }) {
+  const [rating, setRating] = useState<AnswerRating | null>(null);
+
+  // Reflect any rating already stored, so it survives reopening the conversation.
+  useEffect(() => {
+    let live = true;
+    void answerFeedback(messageId)
+      .then((f) => {
+        if (live) setRating(f.rating);
+      })
+      // A feedback readout is never worth surfacing an error over; the controls just render unset.
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [messageId]);
+
+  function choose(next: AnswerRating) {
+    const value = rating === next ? null : next;
+    setRating(value); // optimistic: the control must feel instant, and nothing depends on the write
+    void rateAnswer(messageId, value).catch(() => {});
+  }
+
+  return (
+    <div className="flex justify-start" data-help="chat-answer-rating">
+      <div className="flex items-center gap-0.5">
+        {(["up", "down"] as const).map((v) => (
+          <IconButton
+            key={v}
+            variant="subtle"
+            aria-pressed={rating === v}
+            label={v === "up" ? "This answer was helpful" : "This answer missed"}
+            title={
+              rating === v
+                ? "Clear this rating"
+                : v === "up"
+                  ? "This answer was helpful"
+                  : "This answer missed"
+            }
+            onClick={() => choose(v)}
+            className={`px-1 py-0.5 text-xs ${
+              rating === v ? "text-accent-text" : "text-faint hover:text-ink3"
+            }`}
+          >
+            {v === "up" ? "👍" : "👎"}
+          </IconButton>
+        ))}
       </div>
     </div>
   );
@@ -435,8 +517,12 @@ const MessageBlock = memo(function MessageBlock({
           itemRefs={itemRefs}
           flash={flash}
           onOpenChatCitation={onOpenChatCitation}
+          onCitationOpened={(documentId) => {
+            void recordCitationClick(message.id, documentId).catch(() => {});
+          }}
         />
       )}
+      {showSources && <AnswerRatingControls messageId={message.id} />}
       {showPrompt && message.role === "assistant" && prompt && prompt.length > 0 && (
         <PromptPanel messages={prompt} />
       )}

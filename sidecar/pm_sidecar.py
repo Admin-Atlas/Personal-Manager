@@ -176,6 +176,19 @@ def _pooling_type(name):
     )
 
 
+def _local_path_kwargs(spec):
+    """`specific_model_path` kwargs for a model that lives on disk, or `{}` for a hub model.
+
+    A locally-trained model (the Stage-4 learned reranker) has no Hugging Face repo to fetch from.
+    fastembed's `ModelSource` requires an `hf` or `url` regardless, so Rust registers a deliberate
+    placeholder — but `specific_model_path` short-circuits resolution before any source is consulted
+    (fastembed 0.8.0, `common/model_management.py`), so the placeholder is never fetched. Loading
+    still honours the offline posture: nothing here reaches the network either way.
+    """
+    path = (spec or {}).get("local_path")
+    return {"specific_model_path": path} if path else {}
+
+
 def get_embedder(model=None, spec=None):
     """The embedder for `model` (default: the English EMBED_MODEL), cached per id.
 
@@ -205,7 +218,10 @@ def get_embedder(model=None, spec=None):
         # cache_dir keeps the weights under the shared model root (issue #286).
         _embedders[model] = _load_model(
             lambda: TextEmbedding(
-                model_name=model, cache_dir=_fastembed_cache_dir(), local_files_only=_OFFLINE
+                model_name=model,
+                cache_dir=_fastembed_cache_dir(),
+                local_files_only=_OFFLINE,
+                **_local_path_kwargs(spec),
             )
         )
     return _embedders[model]
@@ -279,7 +295,10 @@ def get_reranker(model, spec=None):
             _registered.add(spec["model"])
         _rerankers[model] = _load_model(
             lambda: TextCrossEncoder(
-                model_name=model, cache_dir=_fastembed_cache_dir(), local_files_only=_OFFLINE
+                model_name=model,
+                cache_dir=_fastembed_cache_dir(),
+                local_files_only=_OFFLINE,
+                **_local_path_kwargs(spec),
             )
         )
     return _rerankers[model]

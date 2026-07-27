@@ -30,15 +30,34 @@ use serde_json::{json, Value};
 use crate::photos::ImageAnalysis;
 use crate::registry::{ModelEntry, Pooling, Source};
 
+/// The `hf` repo a locally-trained model is registered under.
+///
+/// fastembed's `ModelSource` accepts only `hf` or `url` and rejects a description with neither, so a
+/// disk-resident model still needs one — but it is never fetched: passing `specific_model_path` at
+/// construction short-circuits resolution before any source is consulted (verified against
+/// fastembed 0.8.0, `common/model_management.py`). The placeholder is deliberately not a real repo,
+/// so that if the short-circuit ever regressed the failure would be an immediate 404 on a
+/// nonexistent name rather than a silent download of somebody else's weights.
+const LOCAL_MODEL_SOURCE: &str = "pm-local/not-a-hub-model";
+
 /// Build the fastembed `add_custom_model` spec for a non-bundled model, as a JSON object the
-/// sidecar registers on first use. `None` for a bundled model (fastembed already knows it) or a
-/// local-path model (not used in PR 2). One shape serves both embedders and rerankers — the
-/// reranker registration ignores the pooling/normalize/dim fields.
+/// sidecar registers on first use. `None` for a bundled model (fastembed already knows it). One
+/// shape serves both embedders and rerankers — the reranker registration ignores the
+/// pooling/normalize/dim fields.
+///
+/// A [`Source::LocalPath`] model additionally carries `local_path` (its directory), which the
+/// sidecar passes as `specific_model_path` so the weights are loaded from disk instead of fetched.
+/// This is the Stage-4 learned-reranker seam: without it a locally-trained ONNX model could be
+/// described in the registry but never actually loaded.
 fn custom_spec(m: &ModelEntry) -> Option<Value> {
     let model_file = m.model_file?;
+    let mut local_path = None;
     let hf = match &m.source {
         Source::HuggingFace(repo) => *repo,
-        Source::LocalPath(_) => return None,
+        Source::LocalPath(dir) => {
+            local_path = Some(dir.to_string_lossy().into_owned());
+            LOCAL_MODEL_SOURCE
+        }
     };
     let pooling = match m.pooling {
         Pooling::Mean => "mean",
@@ -52,6 +71,8 @@ fn custom_spec(m: &ModelEntry) -> Option<Value> {
         "pooling": pooling,
         "normalize": m.normalize,
         "dim": m.dimension,
+        // Absent (null) for a hub model — the sidecar only passes `specific_model_path` when set.
+        "local_path": local_path,
     }))
 }
 
@@ -3477,5 +3498,54 @@ mod tests {
 
         let v = serde_json::to_value(SidecarStatus::NotInstalled).unwrap();
         assert_eq!(v["state"], "not_installed");
+    }
+
+    /// The Stage-4 learned-reranker seam: a disk-resident model must carry its directory across to
+    /// the sidecar as `local_path`, and must NOT name a real hub repo — if `specific_model_path`
+    /// ever stopped short-circuiting, a placeholder 404s loudly instead of silently downloading
+    /// somebody else's weights. Before this, `custom_spec` returned `None` for a local model, so
+    /// one could be described in the registry and never loaded.
+    #[test]
+    fn a_local_path_model_carries_its_directory_to_the_sidecar() {
+        use crate::registry::{Pooling, Role, Runtime, Source};
+        use std::path::PathBuf;
+
+        let entry = ModelEntry {
+            id: "pm-local-reranker",
+            role: Role::Reranker,
+            dimension: 0,
+            max_tokens: 512,
+            tokenizer: "pm-local-reranker",
+            runtime: Runtime::OnnxFastembed,
+            source: Source::LocalPath(PathBuf::from("/models/reranker")),
+            pooling: Pooling::None,
+            query_prefix: None,
+            passage_prefix: None,
+            normalize: false,
+            model_file: Some("model.onnx"),
+            multilingual: false,
+            label: "Local reranker",
+        };
+
+        let spec = custom_spec(&entry).expect("a local model still produces a registration spec");
+        assert_eq!(spec["local_path"], "/models/reranker");
+        assert_eq!(spec["model_file"], "model.onnx");
+        assert_eq!(
+            spec["hf"], LOCAL_MODEL_SOURCE,
+            "registered under the deliberate placeholder, never a real repo"
+        );
+    }
+
+    /// A hub model carries no `local_path`, so the sidecar passes no `specific_model_path` and the
+    /// normal download path is untouched.
+    #[test]
+    fn a_hub_model_carries_no_local_path() {
+        let entry = crate::registry::active_embedder();
+        if let Some(spec) = custom_spec(&entry) {
+            assert!(
+                spec["local_path"].is_null(),
+                "a hub model must not claim a disk location"
+            );
+        }
     }
 }

@@ -77,6 +77,7 @@ mod registry;
 mod retrieval;
 mod retrieval_config;
 mod retrieval_diag;
+mod retrieval_feedback;
 mod review;
 mod secret;
 mod secrets;
@@ -1397,6 +1398,9 @@ pub fn run() {
             commands::set_milestone_event,
             commands::set_milestone_state,
             commands::set_milestone_status,
+            commands::rate_answer,
+            commands::record_citation_click,
+            commands::answer_feedback,
             commands::delete_milestone,
             commands::reorder_milestones,
             commands::calendar_overview,
