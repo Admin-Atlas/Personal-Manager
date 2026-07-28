@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.106.2-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "The Local AI settings screen is now covered by tests. It is the biggest screen in PM and had none, which is how two recent problems reached you unnoticed: a saved endpoint token you could not remove, and embedding models offered as if you could chat with them. The new tests cover the places where the screen could tell you something untrue — that a token is gone when it is not, or that a model is usable when it is not.",
+      "Nothing about PM behaves differently here. This is a net under work that already shipped.",
+    ],
+  },
+  {
     version: "3.106.1-alpha",
     date: "2026-07-28",
     highlights: [
