@@ -11,6 +11,7 @@ import { FallbackStrip } from "./components/FallbackStrip";
 import { ConversationTitle } from "./components/ConversationTitle";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
+import { QueuedMessages } from "./components/QueuedMessages";
 import { ContextMeter } from "./components/ContextMeter";
 import { RetrievalExplainPanel } from "./components/RetrievalExplainPanel";
 import { DevView } from "./components/DevView";
@@ -43,6 +44,7 @@ import { installAxisScrollNormalizer } from "./lib/scrollAxis";
 import { useResizable } from "./lib/useResizable";
 import { CollapseTab } from "./components/CollapseTab";
 import { useChatStream } from "./lib/useChatStream";
+import { useSendQueue } from "./lib/useSendQueue";
 import { useProjectChat } from "./lib/useProjectChat";
 import { useLocalLlmStatus } from "./lib/useLocalLlmStatus";
 import { aiReady as deriveAiReady } from "./lib/aiGate";
@@ -175,6 +177,17 @@ export default function App() {
   // per-project chat can't drift apart (see useChatStream). The guard key is the
   // conversation currently on screen.
   const chat = useChatStream(() => activeIdRef.current);
+  // Type-ahead (#152). Wraps `handleSend` (hoisted below) so messages typed while a reply streams
+  // queue up and go one at a time — the backend's strict alternation is non-negotiable.
+  const queue = useSendQueue((text) => handleSend(text));
+
+  /** Leaving the conversation on screen: drop the in-flight stream's UI AND anything queued for it.
+   *  One function rather than two calls at each site — a queued message delivered into whatever chat
+   *  the user opened next is worse than losing it, and that is exactly what a missed call would do. */
+  function leaveConversation() {
+    chat.clearTransient();
+    queue.clear();
+  }
   // Live local-endpoint status for the chat provider surfaces (sidebar Local line, composer chip,
   // per-message provenance). One instance, shared down — the "subscribe once" rule (#297 PR6).
   const localAi = useLocalLlmStatus();
@@ -701,7 +714,7 @@ export default function App() {
   async function selectConversation(id: number) {
     activeIdRef.current = id; // adopt synchronously so a racing later selection wins the post-await guard
     setActiveId(id);
-    chat.clearTransient(); // drop any in-flight stream's UI from the conversation we're leaving
+    leaveConversation(); // drop the in-flight stream's UI + queue from the conversation we're leaving
     const msgs = await getMessages(id);
     if (activeIdRef.current !== id) return; // a newer selectConversation landed mid-fetch — don't clobber it
     chat.setMessages(msgs);
@@ -721,7 +734,7 @@ export default function App() {
 
   function newConversation() {
     setActiveId(null);
-    chat.clearTransient();
+    leaveConversation();
     chat.setMessages([]);
   }
 
@@ -757,12 +770,14 @@ export default function App() {
     await refreshConversations();
   }
 
-  async function handleSend(text: string) {
+  // Returns whether the exchange completed, so the type-ahead queue (#152) knows to continue or stop.
+  async function handleSend(text: string): Promise<boolean> {
     // Power-user parity with "+ New": /new · /done starts a fresh chat instead of sending, so the
-    // trigger never reaches the model or the vault (board card 7E).
+    // trigger never reaches the model or the vault (board card 7E). Not a failure — a queue behind it
+    // should carry on into the fresh chat, which is what "/new then my question" plainly means.
     if (isNewChatTrigger(text)) {
       newConversation();
-      return;
+      return true;
     }
     let convId = activeId;
     if (convId == null) {
@@ -773,11 +788,11 @@ export default function App() {
         setConversations((prev) => [created, ...prev]);
       } catch (e) {
         chat.setError(String(e));
-        return;
+        return false;
       }
     }
 
-    await chat.send(convId, text);
+    const ok = await chat.send(convId, text);
 
     // Reload persisted state. The conversation list (titles/order) always
     // refreshes; the messages are adopted only if the user is still here.
@@ -790,6 +805,7 @@ export default function App() {
     } catch {
       /* keep optimistic state on reload failure */
     }
+    return ok;
   }
 
   // Route a question typed in the focus box (board card 9) to a fresh general chat and send it — that
@@ -802,7 +818,7 @@ export default function App() {
       const created = await createConversation();
       setActiveId(created.id);
       setConversations((prev) => [created, ...prev]);
-      chat.clearTransient();
+      leaveConversation();
       chat.setMessages([]);
       await chat.send(created.id, text);
       const [msgs, convs] = await Promise.all([getMessages(created.id), listConversations()]);
@@ -1111,9 +1127,18 @@ export default function App() {
                     onOpenChatCitation={openChatCitation}
                     focusTurn={focusTurn}
                   />
+                  <QueuedMessages
+                    queued={queue.queued}
+                    stalled={queue.stalled}
+                    onRemove={queue.remove}
+                    onResume={queue.resume}
+                  />
                   <Composer
-                    disabled={chat.sending}
-                    onSend={handleSend}
+                    // Deliberately NOT `chat.sending`: typing ahead is the feature. The composer
+                    // only refuses when the queue is full, which is the one case where accepting
+                    // would silently drop what was typed.
+                    disabled={queue.full}
+                    onSend={(text) => queue.enqueue(text)}
                     leftTools={
                       <div className="flex items-center gap-2">
                         <ContextMeter

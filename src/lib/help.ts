@@ -407,6 +407,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Folder sync results",
     body: "A summary of the last folder scan — how many files were indexed, updated, or dropped, and any that couldn't be read (an unsupported type, or a permission error). Skipped files don't block the rest; sync again to retry. Files removed on disk are kept findable but marked 'source missing'.",
   },
+  "chat-queue": {
+    title: "Messages waiting to send",
+    body: "You can carry on typing while PM is still answering — press Enter and your message waits its turn instead of interrupting. PM sends them one at a time and only starts the next once the previous answer is finished, because a conversation has to alternate: your message, PM's reply, your message. Up to three can wait at once. Take one back with the × if the answer you were waiting for made it unnecessary. If a message fails to send, PM stops there rather than sending the rest on top of a broken turn — nothing is lost or reordered, and you can try again. Queued messages aren't kept if you close PM or switch to a different chat: they were written for the conversation you were in.",
+  },
   "settings-duplicates": {
     title: "Duplicate check",
     body: "Adds a 'Check for duplicates' action to your Documents list. It runs only when you ask, and looks two ways: it compares the opening of each document with capitals, punctuation and spacing ignored, so the same file that reached PM by two different routes still matches; and it compares what each document is about, which catches the same report saved as both a Word file and a PDF. It always shows you both documents, side by side, and never removes anything — removing is a separate click on one named document. Some pairs won't be duplicates at all: anything built from a template shares an opening, and a run of invoices reads very alike, which is why this is off unless you turn it on.",

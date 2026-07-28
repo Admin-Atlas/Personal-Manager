@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.104.0-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "You can keep typing while PM is still answering. Press Enter and your message waits its turn instead of being blocked — up to three can queue up, and they show above the box so you can see what’s coming.",
+      "They go one at a time, in order, each waiting for the previous answer to finish. Changed your mind because the answer covered it? Take one back with the ×.",
+      "If a message fails to send, PM stops there rather than firing the rest on top of it. Nothing is lost or reordered, and there’s a Try again.",
+      "Queued messages aren’t kept if you switch chats or close PM — they were written for the conversation you were in.",
+    ],
+  },
+  {
     version: "3.103.0-alpha",
     date: "2026-07-28",
     highlights: [

@@ -71,9 +71,16 @@ export function useChatStream(currentConvId: () => number | null) {
 
   /** Append the user's message optimistically and stream the assistant reply
    *  into `streaming`. Resolves once the exchange is persisted (whether or not
-   *  the user is still viewing it) so the caller can reload persisted state. */
-  const send = useCallback(async (convId: number, text: string) => {
+   *  the user is still viewing it) so the caller can reload persisted state.
+   *
+   *  Resolves **`true` only when the exchange actually completed** — the type-ahead queue (#152)
+   *  must stop rather than send a second user turn after a failed one, which the backend's
+   *  alternation guard would reject anyway. Tracked in a local, not from `error` state: an error
+   *  arriving for a conversation the user has since left never reaches `setError`, but it is still
+   *  a failure the queue has to respect. Never rejects. */
+  const send = useCallback(async (convId: number, text: string): Promise<boolean> => {
     const isCurrent = () => currentRef.current() === convId;
+    let ok = true;
     setError(null);
     setFallback(null);
     const optimistic: Message = {
@@ -120,13 +127,15 @@ export function useChatStream(currentConvId: () => number | null) {
                 to_model: event.to_model,
                 reason: event.reason,
               });
-          } else if (event.type === "error" && isCurrent()) {
-            setError(event.message);
+          } else if (event.type === "error") {
+            ok = false;
+            if (isCurrent()) setError(event.message);
           }
         },
         devModeRef.current,
       );
     } catch (e) {
+      ok = false;
       if (isCurrent()) setError(String(e));
     } finally {
       if (isCurrent()) {
@@ -134,6 +143,7 @@ export function useChatStream(currentConvId: () => number | null) {
         setStreaming(null);
       }
     }
+    return ok;
   }, []);
 
   return {
