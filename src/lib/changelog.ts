@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.103.0-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "PM can now look through your library for documents you have twice. Turn it on under Settings \u2192 Data & Security, and a \u201cCheck for duplicates\u201d action appears above your Documents list.",
+      "It looks two ways. It compares the opening of each document with capitals, punctuation and spacing ignored \u2014 so the same file that reached PM by two different routes still matches \u2014 and it compares what each document is about, which catches the same report saved as both a Word file and a PDF.",
+      "Every pair tells you why it was flagged, shows you both documents to open and read, and removes nothing on its own. When you do remove one, PM names the exact document and leaves the other alone; for something in a connected account it drops only its own pointer and never touches your file there.",
+      "It is off until you ask for it, because some pairs won\u2019t be duplicates at all \u2014 anything built from a template shares an opening, and a run of invoices reads very alike.",
+    ],
+  },
+  {
     version: "3.102.0-alpha",
     date: "2026-07-28",
     highlights: [

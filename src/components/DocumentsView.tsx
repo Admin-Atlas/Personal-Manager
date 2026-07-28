@@ -8,6 +8,7 @@ import {
   devApplyChangeEvent,
   devDocumentChunks,
   ensureSidecar,
+  getSettings,
   ingestPaths,
   installOptionalOcr,
   listDocuments,
@@ -19,12 +20,18 @@ import {
   rebuildIndex,
   rebuildStatus,
   setDocumentMetadata,
+  setDuplicateCheck,
   sidecarStatus,
   vaultStatus,
 } from "../lib/ipc";
 import type { Document, DevTablePage, IngestEvent, SidecarStatus } from "../lib/types";
 import { formatDate } from "../lib/format";
-import { readCopyPhotosToVault, writeCopyPhotosToVault } from "../lib/documentPrefs";
+import {
+  readCopyPhotosToVault,
+  readDuplicateNudgeSeen,
+  writeCopyPhotosToVault,
+  writeDuplicateNudgeSeen,
+} from "../lib/documentPrefs";
 import { rankImportance } from "../lib/importance";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { interactiveProps } from "../lib/interactiveProps";
@@ -36,6 +43,7 @@ import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDial
 import { ProjectPicker, ProjectSummary, projectsOf } from "./ProjectPicker";
 import { IngestProgress } from "./IngestProgress";
 import { DocumentEngineGuide } from "./DocumentEngineGuide";
+import { DuplicateNudge, DuplicatesPanel } from "./DuplicatesPanel";
 import { useReader } from "../lib/reader";
 
 // Datalist backing the inline-reclassify project field (existing project names for autocomplete).
@@ -155,6 +163,33 @@ export function DocumentsView({ onReviewClick }: Props) {
   // For an index-only item the reader now fetches the full live body itself, so there's no separate
   // "show full text" here anymore.
   const { openReader, current: readerDoc } = useReader();
+
+  // #282. `null` until the setting has loaded, so neither the panel nor the nudge flashes on before
+  // PM knows which one belongs here. The nudge's dismissal is per-machine UI state, not a preference
+  // about this library, so it lives in localStorage rather than the vault's settings.
+  const [duplicateCheck, setDuplicateCheckState] = useState<boolean | null>(null);
+  const [duplicateNudgeDismissed, setDuplicateNudgeDismissed] = useState(readDuplicateNudgeSeen);
+
+  useEffect(() => {
+    getSettings()
+      .then((s) => setDuplicateCheckState(s.duplicate_check))
+      .catch(() => setDuplicateCheckState(false));
+  }, []);
+
+  async function enableDuplicateCheck() {
+    setError(null);
+    try {
+      await setDuplicateCheck(true);
+      setDuplicateCheckState(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function dismissDuplicateNudge() {
+    writeDuplicateNudgeSeen();
+    setDuplicateNudgeDismissed(true);
+  }
 
   // Promote a Drive Sheet (index-only) to a full local spreadsheet import. Fetches the whole grid,
   // indexes it locally, and reloads so the row reflects its new source type.
@@ -901,6 +936,18 @@ export function DocumentsView({ onReviewClick }: Props) {
                 </p>
               )}
             </Card>
+          )}
+
+          {/* #282. When the check is on, its panel sits above the list it acts on — the one control,
+              one home rule: Settings owns whether it is offered, this view owns using it. When it is
+              off, a single dismissible nudge exists so the feature is discoverable at all; without
+              it, an off-by-default tool buried in a Settings tab is one nobody finds. */}
+          {duplicateCheck === true && <DuplicatesPanel />}
+          {duplicateCheck === false && !duplicateNudgeDismissed && documents.length > 0 && (
+            <DuplicateNudge
+              onEnable={() => void enableDuplicateCheck()}
+              onDismiss={dismissDuplicateNudge}
+            />
           )}
 
           <div className="mt-6">
