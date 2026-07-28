@@ -271,15 +271,23 @@ third-party package is allowed only as a named exception: an entry in `ALLOWED` 
 exception nothing imports any more, and on an exception that has drifted to a range pin or into
 `dependencies`.
 
+The exact-version half has one documented escape hatch: an entry may set **`pinExempt`**, whose
+value is the written reason the exact-pin rule does not apply to that package. The gate rejects an
+exemption with no real reason, so waiving the pin costs the same sentence that adding the package
+did. Nothing waives the `devDependency` half.
+
 **Why.** Two reasons, and the first is not a matter of taste. Six of these scripts are PR gates that
 run in pr.yml's `hygiene` job, and that job has **no `npm ci` step** — there is no `node_modules` on
 that runner. A gate that imported a package would work perfectly on the maintainer's machine and
 die only in CI. The second reason is that a build script is the easiest place for a dependency to
-arrive unnoticed: nothing about it looks like a product decision. The rule is not "never" — one
-exception is live and justified (`@huggingface/gguf`, for reading MoE expert counts out of a binary
-GGUF header) — it is that adding one means editing a file that states the bar.
+arrive unnoticed: nothing about it looks like a product decision. The rule is not "never" — two
+exceptions are live and justified (`@huggingface/gguf`, for reading MoE expert counts out of a
+binary GGUF header; and `vitest`, the repo's existing test runner, reached by a `scripts/` test the
+same way every other test reaches it, and the one entry carrying a `pinExempt` reason) — it is that
+adding one means editing a file that states the bar.
 
 **Co-signers.** A PR that adds an import to `scripts/` either keeps it inside `node:*` or adds the
 `ALLOWED` entry in the same PR, with the reason written where the next person will read it. A PR
-that removes the last use of an allowed package drops its entry too. Loosening the pin, or moving
-the package to `dependencies`, is a change to this invariant and needs its own argument.
+that removes the last use of an allowed package drops its entry too. Loosening the pin is provided
+for, but never silently — it takes a `pinExempt` reason in the same entry. Moving the package to
+`dependencies` is a change to this invariant and needs its own argument.
