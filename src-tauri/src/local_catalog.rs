@@ -127,6 +127,31 @@ pub fn match_installed(model_id: &str) -> Option<&'static CatalogEntry> {
         .map(|(_, e)| e)
 }
 
+/// Whether a model id names an embedding or reranking model rather than a chat model.
+///
+/// Embedders and rerankers cannot answer a chat turn, but every discovery path PM has hands them
+/// over as ordinary ids: Ollama and LM Studio serve them on the same `/v1/models` endpoint, and the
+/// on-disk crawl finds their `.gguf` files like any other. This is the one predicate that says so.
+///
+/// **Deliberately under-blocking.** The token list is narrower than the catalog generator's regex:
+/// it drops `bge-`, which is safe against curated Hugging Face repo ids but not against a free-form
+/// Ollama tag or an LM Studio publisher folder, and it never adds short tokens like `e5`, `gte` or
+/// `minilm` that collide with ordinary words. The asymmetry is on purpose — a false positive makes a
+/// legitimate chat model unselectable, while a false negative merely lets a chat attempt fail
+/// loudly. Callers must show-and-explain rather than silently drop, so a false positive is visible
+/// and self-correcting rather than a model that vanished.
+pub fn is_embedding_or_reranker(id: &str) -> bool {
+    const TOKENS: [&str; 5] = [
+        "embed",
+        "rerank",
+        "sentence-transformers",
+        "cross-encoder",
+        "text-embedding",
+    ];
+    let id = id.to_ascii_lowercase();
+    TOKENS.iter().any(|t| id.contains(t))
+}
+
 /// Bridge a catalog row into a `fit::ModelSpec` for scoring. Quant labels the fit calculator doesn't
 /// know are dropped (the catalog's curated quants are all known — pinned by a test).
 pub fn entry_to_spec(entry: &CatalogEntry) -> fit::ModelSpec {
@@ -294,10 +319,13 @@ mod tests {
                 e.repo
             );
 
-            // No embedding/reranker should ever leak into a chat-model catalog.
-            let hay = format!("{} {}", e.repo, e.architecture).to_lowercase();
+            // No embedding/reranker should ever leak into a chat-model catalog. Asserted through the
+            // same predicate the runtime gate uses, so the catalog invariant and the served-model
+            // gate cannot drift apart — and so this pins the generator's filter rather than a
+            // weaker two-token restatement of it.
+            let hay = format!("{} {}", e.repo, e.architecture);
             assert!(
-                !hay.contains("embed") && !hay.contains("rerank"),
+                !is_embedding_or_reranker(&hay),
                 "{}: embedding/reranker leaked into the catalog",
                 e.repo
             );
@@ -450,5 +478,50 @@ mod tests {
             Some(0),
             20 * day
         ));
+    }
+
+    #[test]
+    fn embedders_and_rerankers_are_told_apart_from_chat_models() {
+        // Real ids from the runners PM supports — Ollama tags, an LM Studio prefix, HF repo paths.
+        for id in [
+            "nomic-embed-text:latest",
+            "mxbai-embed-large:latest",
+            "embeddinggemma:latest",
+            "qwen3-embedding:0.6b",
+            "text-embedding-nomic-embed-text-v1.5",
+            "xitao/bge-reranker-v2-m3:latest",
+            "BAAI/bge-reranker-v2-m3/model.gguf",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        ] {
+            assert!(is_embedding_or_reranker(id), "{id} should be gated");
+        }
+
+        // Every shipped catalog model, plus the shapes the other runners produce, must pass through.
+        for id in [
+            "llama3.2:1b",
+            "qwen2.5:7b",
+            "gemma-3-4b-it-Q4_K_M.gguf",
+            "unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf",
+            "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            "unsloth/gemma-4-26B-A4B-it-GGUF",
+            "Phi-3.5-mini-instruct",
+        ] {
+            assert!(!is_embedding_or_reranker(id), "{id} is a chat model");
+        }
+
+        // Deliberately NOT gated: `bge-` and bare `e5`/`gte`/`minilm` are safe against curated HF
+        // repo ids but collide with free-form tags, and a false positive makes a real chat model
+        // unselectable. Under-blocking is the chosen direction — pinned so it stays a decision.
+        assert!(!is_embedding_or_reranker("bge-m3:latest"));
+        assert!(!is_embedding_or_reranker("all-minilm:l6-v2"));
+
+        for entry in catalog().entries.iter() {
+            assert!(
+                !is_embedding_or_reranker(&entry.repo),
+                "{}: a shipped catalog model must never be gated",
+                entry.repo
+            );
+        }
     }
 }

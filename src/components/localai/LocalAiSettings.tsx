@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import {
   checkLocalLlmEndpoint,
   clearLocalLlmEndpoint,
+  clearLocalLlmToken,
   dismissLocalBetterFit,
   getLocalLlmConfig,
   listLocalLlmModels,
@@ -36,10 +37,11 @@ import type {
   LocalRecommendation,
   LocalRecommendations,
   LocalRescanCadence,
+  LocalServedModel,
   PullProgress,
 } from "../../lib/types";
 import { ollamaGuide } from "../../lib/workbenchGuide";
-import { Button, Collapsible, Input, SectionInfo, Select } from "../ui";
+import { Button, Collapsible, ConfirmDialog, Input, SectionInfo, Select } from "../ui";
 
 /** The Local AI tab (#296): read this machine's hardware, size a curated model catalog against it,
  *  and turn on the local-endpoint provider (#297) — connect a local server, assign it to the chat /
@@ -52,7 +54,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const [rescanning, setRescanning] = useState(false);
   const [config, setConfig] = useState<LocalLlmConfig | null>(null);
   const [status, setStatus] = useState<LocalLlmStatus | null>(null);
-  const [served, setServed] = useState<string[]>([]);
+  const [served, setServed] = useState<LocalServedModel[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   // Endpoint form.
@@ -62,6 +64,7 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
   const [check, setCheck] = useState<EndpointCheck | null>(null);
   const [tokenInput, setTokenInput] = useState("");
   const [saving, setSaving] = useState(false);
+  const [confirmForgetToken, setConfirmForgetToken] = useState(false);
 
   // Model pull (Ollama only).
   const [pulling, setPulling] = useState<string | null>(null);
@@ -234,8 +237,11 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
     setSaving(true);
     setError(null);
     try {
-      if (tokenInput.trim()) await setLocalLlmToken(tokenInput.trim());
+      // URL FIRST, token second. `setLocalLlmEndpoint` refuses a public cleartext address, and
+      // writing the token before that refusal left a bearer token in the OS keychain with no
+      // endpoint to belong to — invisible, since `has_token` only renders once one is configured.
       const normalized = await setLocalLlmEndpoint(urlInput.trim());
+      if (tokenInput.trim()) await setLocalLlmToken(tokenInput.trim());
       setUrlInput(normalized);
       setTokenInput("");
       setCheck(null);
@@ -244,6 +250,20 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
       setError(String(e));
     } finally {
       setSaving(false);
+    }
+  }
+
+  /** Forget just the bearer token, keeping the endpoint and both role assignments. Disconnect is
+   *  the only other way to clear it, and that also wipes the base URL and both models. */
+  async function forgetToken() {
+    setError(null);
+    try {
+      await clearLocalLlmToken();
+      // Nothing else refreshes `config`, so without this the "(with a saved token)" line stays on
+      // screen after the token is gone.
+      await reloadConfig();
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -510,11 +530,31 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               Connected to <span className="break-all text-ink2">{config?.base_url}</span>
               {config?.has_token ? " (with a saved token)" : ""}.
             </p>
-            <div className="mt-2">
+            <div className="mt-2 flex flex-wrap items-center gap-2">
               <Button variant="tertiary" onClick={() => void disconnect()}>
                 Disconnect
               </Button>
+              {config?.has_token && (
+                <Button variant="tertiary" onClick={() => setConfirmForgetToken(true)}>
+                  Forget token
+                </Button>
+              )}
             </div>
+            <ConfirmDialog
+              open={confirmForgetToken}
+              title="Forget the saved token?"
+              danger
+              confirmLabel="Forget it"
+              onConfirm={() => {
+                setConfirmForgetToken(false);
+                void forgetToken();
+              }}
+              onClose={() => setConfirmForgetToken(false)}
+            >
+              PM deletes the bearer token for this endpoint from your keychain. The address and your
+              role assignments stay as they are. If the server requires a token, PM won't be able to
+              reach it until you connect again with a new one.
+            </ConfirmDialog>
           </div>
         ) : (
           <div className="mt-2 space-y-3">
@@ -653,6 +693,15 @@ export function LocalAiSettings({ onBetterFitChange }: { onBetterFitChange?: () 
               onModel={(m) => changeRoleModel("background", m)}
               onRouting={(p) => changeRouting("background", p)}
             />
+            {served.some((m) => m.embedding) && (
+              // Unfolded on purpose. The settings doctrine folds prose but never gating hints, and
+              // "this one is listed but you can't pick it" is exactly a gating hint (same call as
+              // the "already downloaded" list above).
+              <p className="text-xs text-ink4">
+                Embedding and reranking models are listed but can't be chosen — they turn text into
+                numbers for search, and can't hold a conversation. PM uses its own for search.
+              </p>
+            )}
           </div>
         )}
         <SectionInfo title="How routing & fallback work">
@@ -1165,12 +1214,20 @@ function RoleRow({
   hint: string;
   model: string;
   routing: string;
-  served: string[];
+  served: LocalServedModel[];
   onModel: (m: string) => void;
   onRouting: (p: string) => void;
 }) {
   // Keep the currently-saved model selectable even if the endpoint isn't serving it right now.
-  const options = model && !served.includes(model) ? [model, ...served] : served;
+  // The embedder gate is applied AFTER this line, not by filtering `served` before it — otherwise
+  // an embedder a user had already saved would slip back in through this branch.
+  // A saved model the endpoint isn't serving right now stays enabled: it is already the current
+  // value, disabling it would render the Select's own selection greyed out, and the gate's job is
+  // to stop a NEW bad assignment. That also keeps the embedder predicate in exactly one place
+  // (Rust), rather than a second copy here that could drift.
+  const saved = served.some((m) => m.id === model);
+  const options: LocalServedModel[] =
+    model && !saved ? [{ id: model, embedding: false }, ...served] : served;
   return (
     <div>
       <div className="flex items-baseline justify-between gap-3">
@@ -1185,8 +1242,11 @@ function RoleRow({
         >
           <option value="">— use cloud —</option>
           {options.map((m) => (
-            <option key={m} value={m}>
-              {m}
+            // Shown, not hidden: a model you can see in Ollama but not in PM reads as a PM bug,
+            // whereas one shown with its reason reads as an explanation — and it makes a
+            // mis-classification visible instead of a model that silently vanished.
+            <option key={m.id} value={m.id} disabled={m.embedding}>
+              {m.embedding ? `${m.id} — embedding model` : m.id}
             </option>
           ))}
         </Select>
