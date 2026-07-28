@@ -75,7 +75,7 @@ This release rolls up everything since v3.44.1 — here's the tour at a glance:
   whether it repeats, the full description — with buttons through to Google or Outlook, the
   linked project, or the Pinboard. Existing calendars fill in the new details on their next sync.
 - **Local AI is much better at sizing your machine.** PM now reads the **real memory** on a
-  dedicated AMD or Intel card (Windows, plus Intel Arc on Linux) instead of falling back to
+  dedicated AMD or Intel card on Windows instead of falling back to
   system RAM, looks up your card's actual memory bandwidth for its speed estimates, and sizes
   each model **two ways** where it helps. It also finds models **you've already downloaded** even
   when nothing is running them, and tells you when one of them would suit your machine better

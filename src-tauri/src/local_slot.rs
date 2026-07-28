@@ -9,7 +9,8 @@
 //! Everything that can be decided without a socket is a pure function tested below: the cooldown
 //! reducer ([`HealthState::observe`]), the failure→outcome mapping, and the endpoint classifier.
 //! The concurrency ([`LocalSlot`]) and its preemption are the thin async edge — real cancellation
-//! (a dropped reqwest future), verified on the epic's live rig, not in CI.
+//! (a dropped reqwest future) can only be exercised against a running server, which neither these
+//! tests nor CI do. The epic's live-rig checklist owns that check and still owes it.
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
