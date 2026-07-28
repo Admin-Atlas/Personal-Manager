@@ -41,21 +41,44 @@ const ALLOWED = [
 ];
 
 // ---------------------------------------------------------------------------------------------
-// Scan. Bias: OVER-match rather than under-match. A specifier written inside a comment is still
-// reported, because the dangerous direction is a false PASS — an import the scanner failed to see.
-// A false positive fails loudly and is one allowlist line away from resolved.
+// Scan. Matched at STATEMENT level, not by searching the file text for a quoted specifier.
+//
+// The text-search version of this scanner was wrong, and wrong in an instructive way: it flagged
+// this very file, because a gate that documents the syntax it matches necessarily contains that
+// syntax in its own prose. Any file explaining an import rule would trip it. So:
+//
+//   - static imports must begin a line (ESM requires top level, and prettier formats them that
+//     way here), which excludes every comment line for free;
+//   - the `from` clause is then found within the same statement, bounded by the terminating `;`,
+//     so a multi-line `import { … } from "node:fs"` is still caught while the match cannot run on
+//     past the statement into unrelated text;
+//   - dynamic `import(…)` can appear mid-expression, so it is matched per line, skipping lines
+//     that are comment continuations.
+//
+// The remaining bias is still toward over-matching: a dynamic import written inside a trailing
+// `/* … */` on a code line would be reported. That direction is safe — a false positive fails
+// loudly and is one allowlist line away — whereas a missed import is a gate that passes forever
+// while checking nothing.
 // ---------------------------------------------------------------------------------------------
 
-/** Every module specifier `src` references: `from "x"`, bare `import "x"`, and `import("x")`. */
+/** True for a line that is purely comment: `//…`, or a `*`/`/*` block continuation. */
+const isCommentLine = (line) => /^\s*(\/\/|\*|\/\*)/.test(line);
+
+/** Every module specifier `src` imports, static or dynamic. */
 function specifiersIn(src) {
   const found = [];
-  // `from "x"` — covers `import … from`, `export … from`, and multi-line import braces (the
-  // `from` clause lands on its own line in fetch-python.mjs, which a line-anchored regex misses).
-  for (const m of src.matchAll(/\bfrom\s*["']([^"']+)["']/g)) found.push(m[1]);
-  // Bare side-effect import: `import "x";`
-  for (const m of src.matchAll(/(?:^|[\n;])\s*import\s*["']([^"']+)["']/g)) found.push(m[1]);
-  // Dynamic: `import("x")` / `await import( "x" )`
-  for (const m of src.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) found.push(m[1]);
+  // Static: a line-initial `import`/`export`, up to that statement's `from "…"`. `[^;]*?` cannot
+  // cross a statement boundary; the `s` flag lets it cross newlines within one.
+  for (const m of src.matchAll(/^[ \t]*(?:import|export)\b[^;]*?\bfrom\s*["']([^"']+)["']/gms)) {
+    found.push(m[1]);
+  }
+  // Static side-effect: a line-initial bare `import "…"`.
+  for (const m of src.matchAll(/^[ \t]*import\s*["']([^"']+)["']/gm)) found.push(m[1]);
+  // Dynamic, per line so comment continuations can be skipped.
+  for (const line of src.split("\n")) {
+    if (isCommentLine(line)) continue;
+    for (const m of line.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) found.push(m[1]);
+  }
   return found;
 }
 
