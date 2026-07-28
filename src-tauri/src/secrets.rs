@@ -141,15 +141,22 @@ fn encode_bundle(present: &HashMap<String, Secret>) -> Zeroizing<String> {
     Zeroizing::new(serde_json::to_string(&ordered).unwrap_or_else(|_| "{}".to_string()))
 }
 
-/// Parse the bundle JSON back into the in-memory map. A missing/empty/corrupt/wrong-shape bundle
-/// reads as an empty map (best-effort — never an error), so a damaged item degrades to "nothing
-/// cached yet" (and any still-present legacy items re-migrate) rather than bricking secret access.
-fn decode_bundle(raw: &str) -> HashMap<String, Secret> {
-    serde_json::from_str::<HashMap<String, String>>(raw)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(k, v)| (k, Secret::from(v)))
-        .collect()
+/// Parse the bundle JSON back into the in-memory map, or `None` if it will not parse.
+///
+/// **The `None` case must never be flattened into an empty map.** An unreadable bundle and an empty
+/// one look identical to every caller downstream — "no secrets" — but they mean opposite things: one
+/// is a fresh install, the other is a keychain item whose contents we simply cannot see. Treating
+/// the second as the first is what would let [`get_or_create_db_key`] mint a replacement DB key over
+/// a vault that is perfectly intact. So the ambiguity is resolved HERE, once, and the caller carries
+/// it as [`BundleState::Untrusted`].
+fn decode_bundle(raw: &str) -> Option<HashMap<String, Secret>> {
+    Some(
+        serde_json::from_str::<HashMap<String, String>>(raw)
+            .ok()?
+            .into_iter()
+            .map(|(k, v)| (k, Secret::from(v)))
+            .collect(),
+    )
 }
 
 /// Fold a bundle written by an earlier build back out into one keychain item per secret, returning
@@ -178,9 +185,32 @@ fn adopt_bundle(bundled: &HashMap<String, Secret>) -> bool {
     all_recovered
 }
 
+/// What this process managed to establish about the bundle item, and therefore how much the
+/// "absent" answers below can be believed.
+///
+/// This exists because **every** failure mode of a bundle read — the keychain refusing us, the item
+/// being corrupt — presents downstream as "that secret isn't set". On the bundled platform that
+/// single ambiguity is load-bearing: `db_encryption_key` reads as absent, and the honest response to
+/// a genuinely absent DB key is to mint a new one, which overwrites the only key to the store. So the
+/// distinction is tracked explicitly rather than inferred from an empty map.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+enum BundleState {
+    /// No read attempted yet this process.
+    #[default]
+    Unread,
+    /// The bundle was read cleanly — [`SecretCache::present`] mirrors it — or there is genuinely no
+    /// bundle item, which on a fresh install is the normal case. "Absent" means absent.
+    Trusted,
+    /// The read failed, or the item is there but its JSON will not parse. Secrets may well exist and
+    /// simply be unreachable, so **"absent" means "unknown"** and no destructive write may proceed.
+    Untrusted,
+}
+
 #[derive(Default)]
 struct SecretCache {
     loaded: bool,
+    /// How much to trust an "absent" answer (see [`BundleState`]).
+    bundle: BundleState,
     /// Mirrors the persisted bundle: logical key -> value.
     present: HashMap<String, Secret>,
     /// Session-only negative cache: keys proven absent (bundle AND any legacy item), so a
@@ -200,30 +230,82 @@ impl SecretCache {
         if self.loaded {
             return Ok(());
         }
-        if let Some(raw) = kc_get(BUNDLE_KEY)? {
-            let raw = Zeroizing::new(raw);
-            let bundled = decode_bundle(&raw);
-            if BUNDLED {
-                self.present = bundled;
-            } else if adopt_bundle(&bundled) {
-                let _ = kc_delete(BUNDLE_KEY);
-            }
-        }
+        // Spend the one attempt BEFORE anything can fail. A keychain read is a consent prompt on
+        // macOS, and this used to bail out via `?` with `loaded` still false — so a single dismissed
+        // dialog sent every later accessor back through here, re-prompting once per feature as it
+        // loaded. That is precisely the storm the single-item bundle removed, re-entered by the back
+        // door, and it was invisible because the first caller discards this error (`lib.rs`'s
+        // `let _ = migrate_legacy_google_token()`). One attempt per process; then we work with what
+        // we have, and `bundle` records how much that is worth.
         self.loaded = true;
+        let raw = match kc_get(BUNDLE_KEY) {
+            Ok(raw) => raw,
+            Err(e) => {
+                // Unreachable keychain: secrets may exist and simply be unreadable.
+                self.bundle = BundleState::Untrusted;
+                eprintln!("secrets: could not read the keychain bundle: {e}");
+                return Err(e);
+            }
+        };
+        let Some(raw) = raw else {
+            // No bundle item at all — a fresh install (or, off macOS, one that never had one).
+            // Nothing is hiding, so an "absent" answer here is the truth.
+            self.bundle = BundleState::Trusted;
+            return Ok(());
+        };
+        let raw = Zeroizing::new(raw);
+        let Some(bundled) = decode_bundle(&raw) else {
+            // The item exists but will not parse. Degrade to "no secrets readable" rather than
+            // erroring every call — the app stays usable and can be wiped/restored — but mark the
+            // state so nothing overwrites the bytes we failed to read. Note what is NOT done here:
+            // the old code's promise that "any still-present legacy items re-migrate" cannot hold on
+            // the bundled platform, because the fold deletes each per-item entry once the bundle has
+            // it. There is no second copy to fall back to.
+            self.bundle = BundleState::Untrusted;
+            eprintln!(
+                "secrets: the keychain bundle is unreadable — refusing to overwrite it; \
+                 restore from a backup, or use Remove PM data to start clean"
+            );
+            return Ok(());
+        };
+        self.bundle = BundleState::Trusted;
+        if BUNDLED {
+            self.present = bundled;
+        } else if adopt_bundle(&bundled) {
+            let _ = kc_delete(BUNDLE_KEY);
+        }
         Ok(())
     }
 
     /// Write the whole map back to the single bundle item. Bundled platforms only — calling this
     /// elsewhere would re-create the very item [`load`](Self::load) just retired.
+    ///
+    /// **Refuses while the bundle is [`BundleState::Untrusted`].** `self.present` is then a partial
+    /// view at best, so writing it back would replace the real item with only what this session
+    /// happened to set — silently discarding every secret we could not read, the DB key included.
+    /// Failing the write keeps the original bytes on the keychain, where a restore or a deliberate
+    /// wipe can still act on them.
     fn persist(&self) -> Result<()> {
+        if self.bundle == BundleState::Untrusted {
+            return Err(Error::Other(
+                "PM can't read its saved keys from the keychain, so it won't overwrite them. \
+                 Restore from a backup, or use Settings → Data & Security → Remove PM data to \
+                 start clean."
+                    .into(),
+            ));
+        }
         let json = encode_bundle(&self.present);
         kc_set(BUNDLE_KEY, json.as_str())
     }
 
     /// Confirm the bundle on the keychain actually holds `name` after a write — the guard that lets
-    /// migration delete a legacy item without risk of orphaning its value.
+    /// migration delete a legacy item without risk of orphaning its value. An unparseable bundle
+    /// answers `false`, so the legacy item stays put.
     fn bundle_has(&self, name: &str) -> bool {
-        matches!(kc_get(BUNDLE_KEY), Ok(Some(raw)) if decode_bundle(&raw).contains_key(name))
+        matches!(
+            kc_get(BUNDLE_KEY),
+            Ok(Some(raw)) if decode_bundle(&raw).is_some_and(|b| b.contains_key(name))
+        )
     }
 
     fn get(&mut self, name: &str) -> Result<Option<String>> {
@@ -322,6 +404,11 @@ impl SecretCache {
         self.present.clear();
         self.absent.clear();
         self.loaded = false;
+        // Back to Unread, not Untrusted: the wipe has just deleted the bundle item, so the very
+        // condition that made "absent" ambiguous is gone. Leaving it Untrusted would make a wipe
+        // meant to recover from an unreadable bundle refuse to mint the DB key of the fresh vault
+        // that replaces it — turning the escape hatch into a dead end.
+        self.bundle = BundleState::Unread;
     }
 }
 
@@ -354,6 +441,23 @@ fn delete(name: &str) -> Result<()> {
 /// the invariant shouldn't depend on that timing).
 fn clear_cache() {
     cache().clear();
+}
+
+/// Whether a `None` from [`get`] might mean "unreadable" rather than "not set", making any
+/// create-if-missing response to it unsafe (see [`BundleState`]).
+///
+/// Bundled platforms only: everywhere else each secret is its own keychain item, so a leftover or
+/// damaged bundle cannot hide one — an absent item is genuinely absent, and a keychain that is
+/// unreachable fails the per-item read outright rather than answering "absent".
+fn absent_is_ambiguous() -> bool {
+    absent_is_ambiguous_for(BUNDLED, cache().bundle)
+}
+
+/// The rule behind [`absent_is_ambiguous`], split out as a pure function of the two inputs that
+/// decide it. The keychain has no test shim, so the guard on the one irreversible branch in this
+/// module is unit-tested here rather than left to be reasoned about at the call site.
+fn absent_is_ambiguous_for(bundled: bool, state: BundleState) -> bool {
+    bundled && state == BundleState::Untrusted
 }
 
 /// The stored backup passphrase for unattended (scheduled) backups, if the user opted in.
@@ -596,18 +700,33 @@ pub fn get_or_create_db_key() -> Result<Secret> {
     if let Some(key) = get(DB_KEY)? {
         return Ok(Secret::from(key));
     }
+    // FAIL CLOSED — the single most destructive branch in this module.
+    //
+    // Reaching here means "no DB key is stored", but on the bundled platform that answer is only as
+    // good as the bundle read behind it, and the response to it is irreversible: the fresh key is
+    // written straight back over the same item, taking the real key — and every other secret — with
+    // it, after which the encrypted store can never be opened again. A vault that is merely
+    // UNREACHABLE (a locked login keychain, a corrupt item) must never be silently converted into a
+    // vault that is UNRECOVERABLE. `persist` refuses the write too; refusing here is what turns that
+    // into an honest boot error the UI can offer Retry on, instead of a store quietly re-keyed.
+    if absent_is_ambiguous() {
+        return Err(Error::Other(
+            "PM can't read its saved keys from the keychain, so it won't create a new database key \
+             over the top of the existing one. Your vault hasn't been touched — unlock your login \
+             keychain and choose Retry."
+                .into(),
+        ));
+    }
     let mut bytes = Zeroizing::new([0u8; 32]);
     getrandom::fill(bytes.as_mut_slice()).map_err(|e| Error::Other(format!("rng failure: {e}")))?;
     let key = Zeroizing::new(hex::encode(*bytes));
     set(DB_KEY, &key)?;
-    // Defence-in-depth against a first-run race (belt-and-braces with the
-    // single-instance guard): if another launch stored a key between our `get` and
-    // `set`, return whatever the keychain now holds so we open the store with the
-    // persisted key — never a local one that an overwrite could have orphaned.
-    match get(DB_KEY)? {
-        Some(stored) => Ok(Secret::from(stored)),
-        None => Ok(Secret::from(key)),
-    }
+    // No read-back race guard here, deliberately. The one that used to sit at this spot re-read
+    // `DB_KEY` hoping to spot a key another launch had stored, but `set` populates the cache before
+    // it touches the keychain, so the re-read was always a cache hit and could never observe another
+    // process — it read as defence-in-depth while being a no-op. Concurrent first runs are prevented
+    // properly, one layer up, by the single-instance plugin in `lib.rs`.
+    Ok(Secret::from(key))
 }
 
 // --- Per-profile cache of a shareable vault's derived key (spec §2.2) ---
@@ -906,7 +1025,7 @@ mod tests {
             Secret::from("value-under-test-0002"),
         );
         let encoded = encode_bundle(&m);
-        let decoded = decode_bundle(&encoded);
+        let decoded = decode_bundle(&encoded).expect("our own output must parse");
         assert_eq!(decoded.len(), 2);
         assert_eq!(
             decoded.get("db_encryption_key").unwrap().expose(),
@@ -922,22 +1041,89 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_corrupt_bundle_reads_as_empty_never_an_error() {
-        // The safety valve: a damaged item must degrade to "nothing cached", not brick every read.
-        assert!(decode_bundle("").is_empty());
-        assert!(decode_bundle("not valid json {{{").is_empty());
+    fn a_corrupt_bundle_is_never_mistaken_for_an_empty_one() {
+        // THE distinction this module now turns on. An empty bundle means "no secrets stored"; an
+        // unparseable one means "secrets we cannot see". Flattening the second into the first is
+        // what let a fresh DB key be minted over a perfectly good vault.
         assert!(
-            decode_bundle("[1,2,3]").is_empty(),
-            "wrong shape reads as empty"
+            decode_bundle("").is_none(),
+            "empty string is not valid JSON"
         );
-        assert!(decode_bundle("null").is_empty());
+        assert!(decode_bundle("not valid json {{{").is_none());
+        assert!(decode_bundle("[1,2,3]").is_none(), "wrong shape is corrupt");
+        assert!(decode_bundle("null").is_none());
+        assert!(decode_bundle(r#"{"k":123}"#).is_none(), "non-string value");
+
+        // ...whereas a genuinely empty map parses, and is trusted.
+        assert_eq!(decode_bundle("{}").map(|b| b.len()), Some(0));
     }
 
     #[test]
     fn an_empty_map_encodes_to_an_empty_object() {
         let empty: HashMap<String, Secret> = HashMap::new();
         assert_eq!(encode_bundle(&empty).as_str(), "{}");
-        assert!(decode_bundle(&encode_bundle(&empty)).is_empty());
+        assert!(decode_bundle(&encode_bundle(&empty)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_an_untrusted_bundle_makes_absent_ambiguous() {
+        // The guard on the irreversible mint, as a truth table.
+        assert!(absent_is_ambiguous_for(true, BundleState::Untrusted));
+        assert!(
+            !absent_is_ambiguous_for(true, BundleState::Trusted),
+            "a clean read means absent really is absent — first run must still mint a key"
+        );
+        assert!(!absent_is_ambiguous_for(true, BundleState::Unread));
+        // Off the bundled platform each secret is its own item, so nothing can be hidden by a
+        // damaged bundle and the mint must never be blocked.
+        for state in [
+            BundleState::Unread,
+            BundleState::Trusted,
+            BundleState::Untrusted,
+        ] {
+            assert!(
+                !absent_is_ambiguous_for(false, state),
+                "per-item storage is never ambiguous ({state:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_bundle_is_never_written_over() {
+        // `persist` must refuse before it reaches the keychain, so the bytes we failed to read stay
+        // put for a restore. Only the refusing direction is asserted: the accepting one would write
+        // to the real OS keychain, which these tests deliberately never touch.
+        let mut cache = SecretCache {
+            bundle: BundleState::Untrusted,
+            ..Default::default()
+        };
+        cache.present.insert("k".into(), Secret::from("v"));
+        assert!(
+            cache.persist().is_err(),
+            "a partial view must not replace the real item"
+        );
+    }
+
+    #[test]
+    fn clearing_the_cache_forgets_that_the_bundle_was_unreadable() {
+        // The wipe deletes the bundle item, which removes the very reason "absent" was ambiguous.
+        // If `clear` left the state Untrusted, the fresh vault replacing it could never mint a key
+        // and the recovery path would dead-end.
+        let mut cache = SecretCache {
+            loaded: true,
+            bundle: BundleState::Untrusted,
+            ..Default::default()
+        };
+        cache.absent.insert("k".into());
+        cache.present.insert("j".into(), Secret::from("v"));
+        cache.clear();
+        assert_eq!(cache.bundle, BundleState::Unread);
+        assert!(!cache.loaded);
+        assert!(cache.present.is_empty() && cache.absent.is_empty());
+        assert!(
+            !absent_is_ambiguous_for(true, cache.bundle),
+            "a wiped keychain must be mintable again"
+        );
     }
 
     #[test]
