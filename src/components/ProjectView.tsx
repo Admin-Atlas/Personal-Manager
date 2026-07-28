@@ -523,6 +523,8 @@ export function ProjectView({
             queued={chat.queue.queued}
             stalled={chat.queue.stalled}
             onRemove={chat.queue.remove}
+            onEdit={chat.queue.edit}
+            onHold={chat.queue.hold}
             onResume={chat.queue.resume}
           />
           <Composer

@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.105.0-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "Queued messages can be edited before they go. Click one to change it, Enter to keep the change, Escape to leave it as it was — handy when PM’s answer half-covers what you were about to ask.",
+      "While you’re editing, nothing sends. PM waits until you’re done rather than firing off the version you were part-way through fixing.",
+    ],
+  },
+  {
     version: "3.104.1-alpha",
     date: "2026-07-28",
     highlights: [

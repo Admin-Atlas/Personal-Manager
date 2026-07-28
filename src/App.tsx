@@ -1131,6 +1131,8 @@ export default function App() {
                     queued={queue.queued}
                     stalled={queue.stalled}
                     onRemove={queue.remove}
+                    onEdit={queue.edit}
+                    onHold={queue.hold}
                     onResume={queue.resume}
                   />
                   <Composer

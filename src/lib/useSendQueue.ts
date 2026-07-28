@@ -52,6 +52,15 @@ export interface SendQueue {
   enqueue: (text: string) => boolean;
   /** Drop one waiting message. */
   remove: (id: number) => void;
+  /** Replace a waiting message's text. A no-op once it has gone out — a sent message cannot be
+   *  un-said, and silently rewriting the next one instead would be worse than doing nothing. */
+  edit: (id: number, text: string) => void;
+  /** Pause dispatch while an editor is open, and release it when the editor closes.
+   *
+   *  Not optional. Without it, a reply landing mid-edit sends the message as it was BEFORE the edit
+   *  and the row vanishes from under the cursor — the user's correction discarded and the version
+   *  they were fixing sent anyway. Nothing else in the queue is time-critical enough to justify that. */
+  hold: (on: boolean) => void;
   /** Try again after a failure, from the message that failed. */
   resume: () => void;
   /** Discard everything, without sending. Call when the conversation on screen changes — queued text
@@ -74,6 +83,9 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
   // between awaits, and state read through a closure would be whatever it was when the loop started.
   const pending = useRef<QueuedMessage[]>([]);
   const draining = useRef(false);
+  // Dispatch is paused while an editor is open. A ref, not state: the drain loop tests it between
+  // awaits, and a value captured when the loop started would be stale by exactly the moment it matters.
+  const held = useRef(false);
   const nextId = useRef(1);
   const sendRef = useRef(send);
   sendRef.current = send;
@@ -84,7 +96,7 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
     if (draining.current) return; // one loop, always — see the note on effects above
     draining.current = true;
     try {
-      while (pending.current.length > 0) {
+      while (pending.current.length > 0 && !held.current) {
         const [head, ...rest] = pending.current;
         // Removed BEFORE sending: from here on it is in flight, and the chips must show only what is
         // still waiting.
@@ -127,6 +139,30 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
     [publish],
   );
 
+  const edit = useCallback(
+    (id: number, text: string) => {
+      const trimmed = text.trim();
+      // An empty edit is a deletion by another name; treat it as one rather than queueing a blank
+      // message the backend would reject.
+      pending.current = trimmed
+        ? pending.current.map((m) => (m.id === id ? { ...m, text: trimmed } : m))
+        : pending.current.filter((m) => m.id !== id);
+      publish();
+      if (pending.current.length === 0) setStalled(false);
+    },
+    [publish],
+  );
+
+  const hold = useCallback(
+    (on: boolean) => {
+      held.current = on;
+      // Releasing restarts the loop, which the hold may have exited. Not on stall: a stalled queue
+      // waits for an explicit retry, and closing an editor is not one.
+      if (!on && !stalled) void drain();
+    },
+    [drain, stalled],
+  );
+
   const resume = useCallback(() => {
     setStalled(false);
     void drain();
@@ -136,6 +172,9 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
     pending.current = [];
     publish();
     setStalled(false);
+    // A hold belongs to an editor that is going away with the conversation; leaving it set would
+    // freeze the next chat's queue with nothing on screen to explain why.
+    held.current = false;
   }, [publish]);
 
   return {
@@ -144,6 +183,8 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
     full: queued.length >= QUEUE_LIMIT,
     enqueue,
     remove,
+    edit,
+    hold,
     resume,
     clear,
   };

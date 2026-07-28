@@ -409,7 +409,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "chat-queue": {
     title: "Messages waiting to send",
-    body: "You can carry on typing while PM is still answering — press Enter and your message waits its turn instead of interrupting. PM sends them one at a time and only starts the next once the previous answer is finished, because a conversation has to alternate: your message, PM's reply, your message. Up to three can wait at once. Take one back with the × if the answer you were waiting for made it unnecessary. If a message fails to send, PM stops there rather than sending the rest on top of a broken turn — nothing is lost or reordered, and you can try again. Queued messages aren't kept if you close PM or switch to a different chat: they were written for the conversation you were in.",
+    body: "You can carry on typing while PM is still answering — press Enter and your message waits its turn instead of interrupting. PM sends them one at a time and only starts the next once the previous answer is finished, because a conversation has to alternate: your message, PM's reply, your message. Up to three can wait at once. Click one to edit it before it goes — while you're editing, PM holds off sending so it can never fire the half-fixed version — or take it back with the × if the answer you were waiting for made it unnecessary. If a message fails to send, PM stops there rather than sending the rest on top of a broken turn — nothing is lost or reordered, and you can try again. Queued messages aren't kept if you close PM or switch to a different chat: they were written for the conversation you were in.",
   },
   "settings-duplicates": {
     title: "Duplicate check",

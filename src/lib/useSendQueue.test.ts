@@ -160,6 +160,108 @@ describe("a failure", () => {
   });
 });
 
+describe("editing a waiting message", () => {
+  it("sends the edited text, not the original", async () => {
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("in flight");
+      result.current.enqueue("teh typo");
+    });
+
+    act(() => {
+      result.current.edit(result.current.queued[0].id, "the typo, fixed");
+    });
+    expect(result.current.queued.map((m) => m.text)).toEqual(["the typo, fixed"]);
+
+    await c.settle();
+    await c.settle();
+    expect(c.calls).toEqual(["in flight", "the typo, fixed"]);
+  });
+
+  // THE reason `hold` exists. Without it a reply landing mid-edit dispatches the pre-edit text and
+  // the row disappears from under the cursor: the correction discarded, the version being corrected
+  // sent anyway.
+  it("does not send while an editor is open, then sends the edit", async () => {
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("in flight");
+      result.current.enqueue("being edited");
+    });
+
+    act(() => {
+      result.current.hold(true);
+    });
+    await c.settle(); // the reply lands mid-edit
+    expect(c.calls).toEqual(["in flight"]);
+    expect(result.current.queued.map((m) => m.text)).toEqual(["being edited"]);
+
+    act(() => {
+      result.current.edit(result.current.queued[0].id, "edited in time");
+      result.current.hold(false);
+    });
+    expect(c.calls).toEqual(["in flight", "edited in time"]);
+    await c.settle();
+  });
+
+  it("treats an emptied message as taking it back", async () => {
+    // A blank message is not something to send; queueing one would just be rejected downstream.
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("in flight");
+      result.current.enqueue("never mind");
+    });
+    act(() => {
+      result.current.edit(result.current.queued[0].id, "   ");
+    });
+    expect(result.current.queued).toEqual([]);
+    await c.settle();
+    expect(c.calls).toEqual(["in flight"]);
+  });
+
+  it("cannot rewrite a message that has already gone", async () => {
+    // A sent message can't be un-said, and silently rewriting the NEXT one instead would be worse
+    // than doing nothing.
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("first");
+      result.current.enqueue("second");
+    });
+    const goneId = result.current.queued[0].id - 1; // the in-flight one's id
+    act(() => {
+      result.current.edit(goneId, "too late");
+    });
+    await c.settle();
+    await c.settle();
+    expect(c.calls).toEqual(["first", "second"]);
+  });
+
+  it("does not strand a hold when the conversation changes", async () => {
+    // A hold belongs to an editor that is going away with the chat; leaving it set would freeze the
+    // next conversation's queue with nothing on screen to explain why.
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("in flight");
+      result.current.enqueue("being edited");
+      result.current.hold(true);
+    });
+    act(() => {
+      result.current.clear();
+    });
+    await c.settle();
+
+    act(() => {
+      result.current.enqueue("new chat");
+    });
+    expect(c.calls).toEqual(["in flight", "new chat"]);
+    await c.settle();
+  });
+});
+
 describe("the cap", () => {
   it("counts what is waiting, not what is in flight", async () => {
     const c = controllableSend();
