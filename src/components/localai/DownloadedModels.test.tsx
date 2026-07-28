@@ -40,6 +40,7 @@ const MODEL: LocalOnDiskModel = {
   source: "lm_studio",
   path: "/models/gemma-3-4b-it-Q4_K_M.gguf",
   size_gb: 2.5,
+  sidecar_gb: 0,
   quant: "Q4_K_M",
   shards: 1,
   matched_repo: "google/gemma-3-4b-it",

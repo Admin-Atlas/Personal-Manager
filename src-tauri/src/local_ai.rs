@@ -80,8 +80,13 @@ pub struct EndpointCheck {
     pub reachable: bool,
     /// The URL after normalisation (bare base, no trailing `/` or `/v1`).
     pub normalized_url: String,
-    /// The model ids it serves (empty when unreachable or refused).
+    /// The model ids it serves (empty when unreachable or refused). Reported verbatim, INCLUDING
+    /// embedding/reranking models — this is "what the server serves", and shrinking it would
+    /// misreport the endpoint in the reachability readout.
     pub models: Vec<String>,
+    /// The subset of `models` that can actually answer a chat turn — `models` minus the embedders.
+    /// Anything that binds a model to a role picks from HERE, never from `models[0]`.
+    pub assignable: Vec<String>,
     /// Where the resolved address sits: `"loopback"` | `"private"` | `"public"`.
     pub posture: String,
     /// The http/https verdict: `"ok"` | `"warn_unencrypted"` | `"refused_public_cleartext"`.
@@ -109,6 +114,7 @@ pub async fn check_local_llm_endpoint(url: String, token: Option<String>) -> Res
             reachable: false,
             normalized_url: normalized,
             models: Vec::new(),
+            assignable: Vec::new(),
             posture: class_str(class).to_string(),
             scheme_verdict: verdict_str(verdict).to_string(),
             exposed_on_network: false,
@@ -142,10 +148,16 @@ pub async fn check_local_llm_endpoint(url: String, token: Option<String>) -> Res
     };
 
     let message = build_check_message(verdict, exposed, reach_note);
+    let assignable: Vec<String> = models
+        .iter()
+        .filter(|id| !local_catalog::is_embedding_or_reranker(id))
+        .cloned()
+        .collect();
     Ok(EndpointCheck {
         reachable,
         normalized_url: normalized,
         models,
+        assignable,
         posture: class_str(class).to_string(),
         scheme_verdict: verdict_str(verdict).to_string(),
         exposed_on_network: exposed,
@@ -428,7 +440,7 @@ fn role_routing_key(role: &str) -> Result<&'static str> {
 /// The models the CONFIGURED endpoint currently serves (for the model pickers). Errors with a
 /// friendly message if nothing is configured or it can't be reached.
 #[tauri::command]
-pub async fn list_local_llm_models(app: AppHandle) -> Result<Vec<String>> {
+pub async fn list_local_llm_models(app: AppHandle) -> Result<Vec<ServedModel>> {
     let base_url = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -438,14 +450,19 @@ pub async fn list_local_llm_models(app: AppHandle) -> Result<Vec<String>> {
         return Err(Error::Other("no local endpoint is configured".into()));
     };
     let token = secrets::get_local_llm_endpoint_token()?;
-    openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
+    let ids = openai_compat::probe(&base_url, token.as_ref().map(|s| s.expose()))
         .await
         .map_err(|f| {
             Error::Other(format!(
                 "couldn't list models ({})",
                 crate::error::truncate_detail(&f.detail)
             ))
-        })
+        })?;
+    // Every id is returned — the picker shows an embedder DISABLED with the reason, rather than
+    // dropping it. A model the user can see in Ollama but not in PM's list reads as a PM bug; a
+    // model shown with "can't answer chats" reads as an explanation. It also makes a false positive
+    // from `is_embedding_or_reranker` visible instead of silent.
+    Ok(ids.into_iter().map(ServedModel::classify).collect())
 }
 
 /// Ask the user's own (loopback) Ollama to download `model` into itself, streaming progress on
@@ -837,6 +854,7 @@ pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendatio
                 source: m.source,
                 path: m.path.clone(),
                 size_gb: m.size_gb,
+                sidecar_gb: m.sidecar_gb,
                 quant: m.quant.clone(),
                 shards: m.shards,
                 matched_repo: matched.map(|e| e.repo.clone()),
@@ -992,6 +1010,12 @@ fn score_on_disk(
         quant,
         weight_gb: model.size_gb,
     }];
+    // The file set on THIS disk is ground truth for both terms, so the measured projector replaces
+    // the catalog's figure. `Some(0.0)`, never `None`: a multimodal spec with `projector_gb: None`
+    // is refused as fit-unknown (see `fit::fit_within`), and "no projector on disk" is a measurement,
+    // not a gap. Leaving the catalog value here while `weight_gb` came from disk was the
+    // double-count: `local_disk` had already folded the projector into `size_gb`.
+    spec.projector_gb = Some(model.sidecar_gb);
     fit::fit(&spec, hw)
 }
 
@@ -1044,13 +1068,36 @@ pub struct InstalledModel {
     pub fit: fit::FitResult,
 }
 
+/// One model the configured endpoint is serving, plus whether it can answer a chat turn.
+///
+/// The flag travels WITH the id rather than the id being filtered out, so the role pickers can show
+/// an embedder disabled-with-a-reason instead of silently omitting it — a model the user can see in
+/// Ollama but not in PM reads as a PM bug.
+#[derive(Serialize)]
+pub struct ServedModel {
+    pub id: String,
+    /// True when this is an embedding/reranking model, so nothing may bind it to a chat or
+    /// background role.
+    pub embedding: bool,
+}
+
+impl ServedModel {
+    fn classify(id: String) -> Self {
+        let embedding = local_catalog::is_embedding_or_reranker(&id);
+        Self { id, embedding }
+    }
+}
+
 /// A model found on disk that no endpoint is currently serving (#449), scored on its real file size.
 #[derive(Serialize)]
 pub struct OnDiskModel {
     pub name: String,
     pub source: local_disk::DiskSource,
     pub path: String,
+    /// Weights only — the projector is `sidecar_gb`, so this stays comparable with the catalog.
     pub size_gb: f64,
+    /// The projector that loads with it, measured on disk; `0.0` when there is none.
+    pub sidecar_gb: f64,
     pub quant: Option<String>,
     pub shards: u32,
     pub matched_repo: Option<String>,

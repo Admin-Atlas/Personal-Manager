@@ -54,6 +54,7 @@ import type {
   LocalLlmStatus,
   LocalRecommendations,
   LocalRescanCadence,
+  LocalServedModel,
   PullProgress,
   LanguageOptions,
   LayoutProgressEvent,
@@ -1549,7 +1550,7 @@ export const clearLocalLlmToken = () => invoke<void>("clear_local_llm_token");
 
 /** The models the configured endpoint currently serves (for the pickers). Rejects if none is
  *  configured or it can't be reached. */
-export const listLocalLlmModels = () => invoke<string[]>("list_local_llm_models");
+export const listLocalLlmModels = () => invoke<LocalServedModel[]>("list_local_llm_models");
 
 /** A live endpoint status snapshot (configured / reachable / cooldown). Self-debounced to at most
  *  one server probe per 30s, so a fast poll can't hammer the user's server. */

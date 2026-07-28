@@ -1597,7 +1597,10 @@ export interface LocalOnDiskModel {
   name: string;
   source: LocalDiskSource;
   path: string;
+  /** Weights only, in GB — the same base the catalog's per-quant size uses. */
   size_gb: number;
+  /** The vision projector that loads with it, measured on disk; 0 when there is none. */
+  sidecar_gb: number;
   /** null when PM couldn't tell which quantization the file is — the fit is then `unknown`. */
   quant: string | null;
   /** 1, or the shard count for a split GGUF. */
@@ -1657,7 +1660,12 @@ export interface DetectedEndpoint {
 export interface EndpointCheck {
   reachable: boolean;
   normalized_url: string;
+  /** Everything the server serves, verbatim — including embedders. This is the reachability
+   *  readout ("Reachable · N model(s)"); shrinking it would misreport the endpoint. */
   models: string[];
+  /** `models` minus the embedding/reranking models: the ones that can actually answer a chat
+   *  turn. Anything that BINDS a model to a role picks from here, never from `models[0]`. */
+  assignable: string[];
   /** "loopback" | "private" | "public". */
   posture: string;
   /** "ok" | "warn_unencrypted" | "refused_public_cleartext". */
@@ -1668,6 +1676,14 @@ export interface EndpointCheck {
 
 /** The saved local-endpoint config (local_ai.rs LocalLlmConfig). Routing is
  *  "cloud" | "local" | "local-then-cloud"; the token value never leaves Rust (`has_token` only). */
+/** One model the endpoint serves, with whether it can answer a chat turn (local_ai.rs
+ *  ServedModel). The flag travels with the id rather than the id being filtered out, so the role
+ *  pickers can show an embedder disabled-with-a-reason instead of silently omitting it. */
+export interface LocalServedModel {
+  id: string;
+  embedding: boolean;
+}
+
 export interface LocalLlmConfig {
   base_url: string | null;
   chat_model: string | null;

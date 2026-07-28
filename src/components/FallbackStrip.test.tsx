@@ -16,6 +16,20 @@ describe("fallbackCopy", () => {
     expect(fallbackCopy("hard_failure:timeout")).toContain("timed out");
     expect(fallbackCopy("hard_failure:refused")).toContain("reachable");
     expect(fallbackCopy("hard_failure:model_loading")).toContain("loading");
+    expect(fallbackCopy("hard_failure:reply_too_large")).toContain("too large");
+    expect(fallbackCopy("hard_failure:degenerate_stream")).toContain("unusable");
+  });
+
+  // The banked half of a contract whose other half is compiler-enforced. `FallbackReason::PowerPolicy`
+  // (llm_gateway.rs) has no producer yet and carries "Do not remove it or 'clean up' the unused
+  // variant" — in Rust, exhaustiveness makes that stick. It does NOT survive the IPC string boundary:
+  // delete the `power_policy` branch in FallbackStrip.tsx as apparently-dead code and the slug falls
+  // through to the generic clause, reporting a DELIBERATE power-saving switch as a local model
+  // FAILURE — with the whole suite still green, because the test below actively blesses that output
+  // for unrecognised slugs. This is the guard that makes it fail instead.
+  it("never reports a deliberate power-policy switch as a failure", () => {
+    expect(fallbackCopy("power_policy")).toContain("save power");
+    expect(fallbackCopy("power_policy")).not.toContain("couldn't answer");
   });
 
   it("degrades an unknown slug to a generic reason (never leaks the raw token)", () => {

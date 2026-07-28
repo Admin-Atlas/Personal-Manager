@@ -26,6 +26,9 @@ export function OnboardingLocalConnect({
   const [url, setUrl] = useState("");
   const [connecting, setConnecting] = useState(false);
   const [models, setModels] = useState<string[] | null>(null);
+  // The endpoint serves models, but every one of them is an embedder — a distinct state from
+  // "no models at all", and the user needs a different instruction.
+  const [embeddersOnly, setEmbeddersOnly] = useState(false);
   const [model, setModel] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -44,6 +47,7 @@ export function OnboardingLocalConnect({
   function resetConnection() {
     setModels(null);
     setModel("");
+    setEmbeddersOnly(false);
     onConfigured(false);
   }
 
@@ -80,8 +84,13 @@ export function OnboardingLocalConnect({
       }
       const saved = await setLocalLlmEndpoint(url);
       setUrl(saved);
-      setModels(check.models);
-      if (check.models.length > 0) await pick(check.models[0]);
+      // Offer — and auto-pick from — only what can actually answer a chat. `models` is everything
+      // the server serves, and Ollama/LM Studio serve embedding models on the same endpoint; binding
+      // one to both roles here would leave a first-run user with no cloud key silently unable to
+      // chat. `assignable` is that list minus the embedders.
+      setModels(check.assignable);
+      setEmbeddersOnly(check.assignable.length === 0 && check.models.length > 0);
+      if (check.assignable.length > 0) await pick(check.assignable[0]);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -140,6 +149,12 @@ export function OnboardingLocalConnect({
               ))}
             </Select>
           </label>
+        ) : embeddersOnly ? (
+          <p className="text-xs text-st-look">
+            Connected, but the only models that server has are embedding models — they turn text
+            into numbers for search and can't hold a conversation. Pull a chat model (e.g.{" "}
+            <code>ollama pull llama3</code>) and press Connect again.
+          </p>
         ) : (
           <p className="text-xs text-st-look">
             Connected, but that server has no models yet — pull one (e.g.{" "}

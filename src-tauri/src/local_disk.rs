@@ -70,8 +70,16 @@ pub struct DiskModel {
     pub source: DiskSource,
     /// Where it lives, for display. A directory for a sharded set, else the file.
     pub path: String,
-    /// Real bytes on disk (all shards summed), in GB — the same base the catalog uses.
+    /// WEIGHTS only, in GB — real bytes on disk, all shards summed. Deliberately excludes the
+    /// projector, so this is the same base the catalog's per-quant `file_gb` uses and the two are
+    /// substitutable. The projector is carried separately in [`DiskModel::sidecar_gb`]; folding it
+    /// in here made the on-disk footprint count it twice (once in the weight term, once from the
+    /// catalog's `projector_gb`) and made this field's "same base as the catalog" claim false.
     pub size_gb: f64,
+    /// The vision/audio projector (or MTP head) that loads WITH this model, in GB, measured on this
+    /// disk — `0.0` when there is none. Resident cost, but not weights: it maps to
+    /// `fit::ModelSpec::projector_gb`, never to a quant candidate's weight.
+    pub sidecar_gb: f64,
     /// The quantization label when it could be read from the name (or, for Ollama, its config), else
     /// `None` — which makes the fit `unknown` rather than guessed.
     pub quant: Option<String>,
@@ -384,15 +392,18 @@ fn ollama_model_from_manifest(root: &Path, manifests: &Path, tag: &Path) -> Opti
         source: DiskSource::Ollama,
         path: tag.display().to_string(),
         size_gb: bytes_to_gb(bytes),
+        sidecar_gb: bytes_to_gb(ollama_projector_bytes(&manifest)),
         quant,
         shards: 1,
     })
 }
 
-/// Total weight bytes in a manifest: the single GGUF `model` layer, or every `tensor` layer for a
-/// safetensors model, plus a vision projector when there is one. Returns `None` for a manifest with
-/// no weights at all — which is exactly a **cloud** model (`"layers": null`), and correctly means
-/// "nothing is on this disk" rather than "a zero-byte model".
+/// Total WEIGHT bytes in a manifest: the single GGUF `model` layer, or every `tensor` layer for a
+/// safetensors model. The projector is deliberately NOT included — it is resident cost but not
+/// weights, and [`ollama_projector_bytes`] carries it separately so the fit scorer can put each in
+/// the right term. Returns `None` for a manifest with no weights at all — which is exactly a
+/// **cloud** model (`"layers": null`), and correctly means "nothing is on this disk" rather than
+/// "a zero-byte model".
 fn ollama_weight_bytes(manifest: &OllamaManifest) -> Option<u64> {
     let layers = manifest.layers.as_ref()?;
     let total: i64 = layers
@@ -400,14 +411,27 @@ fn ollama_weight_bytes(manifest: &OllamaManifest) -> Option<u64> {
         .filter(|l| {
             matches!(
                 l.media_type.as_str(),
-                "application/vnd.ollama.image.model"
-                    | "application/vnd.ollama.image.tensor"
-                    | "application/vnd.ollama.image.projector"
+                "application/vnd.ollama.image.model" | "application/vnd.ollama.image.tensor"
             )
         })
         .map(|l| l.size.max(0))
         .sum();
     u64::try_from(total).ok().filter(|&b| b > 0)
+}
+
+/// The projector bytes a manifest declares, or `0`. Summed rather than picked, unlike the file-based
+/// runners: a manifest is an explicit list of what THIS tag loads, so a second projector layer in it
+/// would be a second projector actually loaded — not a spare precision sitting in a folder.
+fn ollama_projector_bytes(manifest: &OllamaManifest) -> u64 {
+    let Some(layers) = manifest.layers.as_ref() else {
+        return 0;
+    };
+    let total: i64 = layers
+        .iter()
+        .filter(|l| l.media_type.as_str() == "application/vnd.ollama.image.projector")
+        .map(|l| l.size.max(0))
+        .sum();
+    u64::try_from(total).unwrap_or(0)
 }
 
 /// The blob file for a digest. Ollama stores `sha256:<hex>` as `sha256-<hex>` because `:` is illegal
@@ -607,8 +631,10 @@ fn gguf_models_in_dir(
     let mut singles: Vec<(String, PathBuf, u64)> = Vec::new();
     // (shard prefix) → (total declared, files found, bytes)
     let mut shard_sets: Vec<(String, u32, u32, u64, PathBuf)> = Vec::new();
-    // Projector sidecars are part of a model's footprint but are not models themselves.
-    let mut sidecar_bytes: u64 = 0;
+    // Projector sidecars are part of a model's footprint but are not models themselves. Collected
+    // as CANDIDATES, not summed: a snapshot can hold several precisions of the same projector and a
+    // model loads exactly one of them. See `pick_sidecar_bytes`.
+    let mut sidecars: Vec<(String, u64)> = Vec::new();
 
     for path in read_dir_sorted(dir) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -628,7 +654,7 @@ fn gguf_models_in_dir(
             continue;
         }
         if is_sidecar_gguf(name) {
-            sidecar_bytes = sidecar_bytes.saturating_add(bytes);
+            sidecars.push((name.to_string(), bytes));
             continue;
         }
         match split_shard(name) {
@@ -645,6 +671,10 @@ fn gguf_models_in_dir(
         }
     }
 
+    // One choice per directory, applied to every model built from it — correct for a Hugging Face
+    // snapshot (one repo per directory), and the same scope the previous sum had.
+    let sidecar_gb = bytes_to_gb(pick_sidecar_bytes(&sidecars));
+
     let mut models = Vec::new();
     for (name, path, bytes) in singles {
         // Dedupe on the resolved target so one physical file shared between runners (a junctioned
@@ -658,7 +688,8 @@ fn gguf_models_in_dir(
             name: name.clone(),
             source,
             path: path.display().to_string(),
-            size_gb: bytes_to_gb(bytes.saturating_add(sidecar_bytes)),
+            size_gb: bytes_to_gb(bytes),
+            sidecar_gb,
             quant: quant_from_name(stem),
             shards: 1,
         });
@@ -676,7 +707,8 @@ fn gguf_models_in_dir(
             name: format!("{prefix}.gguf"),
             source,
             path: dir.display().to_string(),
-            size_gb: bytes_to_gb(bytes.saturating_add(sidecar_bytes)),
+            size_gb: bytes_to_gb(bytes),
+            sidecar_gb,
             quant: quant_from_name(&prefix),
             shards: declared,
         });
@@ -697,6 +729,38 @@ pub fn is_gguf_file(name: &str) -> bool {
 pub fn is_sidecar_gguf(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with("mmproj") || n.starts_with("mtp-")
+}
+
+/// Pick the ONE sidecar a model actually loads, out of everything found beside it. `0` when there
+/// is none.
+///
+/// This mirrors the catalog generator's `pickProjector` deliberately, because the two numbers are
+/// compared against each other: prefer an f16 `mmproj`, else take the **smallest** candidate.
+/// **Never the sum** — a Hugging Face snapshot commonly ships `mmproj-F16` *and* `mmproj-F32` of the
+/// same projector, a model loads exactly one, and summing them was inflating every model in that
+/// directory by roughly the size of a spare projector.
+///
+/// The f16 test is `mmproj` + an optional `-`/`.`/`_` + `f16`, matching the generator's regex
+/// character for character. Note it does NOT match the common `mmproj-model-f16.gguf` form (there is
+/// a `-model` in between) — such a file falls through to the smallest-candidate rule, which picks
+/// the f16 anyway whenever an f32 is its only rival. Kept strict so the two sides cannot disagree.
+pub fn pick_sidecar_bytes(candidates: &[(String, u64)]) -> u64 {
+    let is_f16 = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        n.split_once("mmproj").is_some_and(|(_, rest)| {
+            rest.strip_prefix(['-', '.', '_'])
+                .unwrap_or(rest)
+                .starts_with("f16")
+        })
+    };
+    if let Some((_, bytes)) = candidates.iter().find(|(name, _)| is_f16(name)) {
+        return *bytes;
+    }
+    candidates
+        .iter()
+        .map(|(_, bytes)| *bytes)
+        .min()
+        .unwrap_or(0)
 }
 
 /// Split a `gguf-split` shard filename into `(prefix, index, total)`. The convention is llama.cpp's
@@ -785,11 +849,18 @@ mod tests {
         let m: OllamaManifest = serde_json::from_str(local).unwrap();
         assert_eq!(ollama_weight_bytes(&m), Some(1_321_082_688));
 
-        // A vision projector is part of the resident footprint.
+        // A vision projector is part of the resident footprint, but it is NOT weights: it comes back
+        // in its own term so the fit scorer can put it where the catalog puts `projector_gb`.
+        // Folding it into the weight total double-counted it against a catalog-matched model.
         let vision = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"","size":4108916992},
                                    {"mediaType":"application/vnd.ollama.image.projector","digest":"","size":624434368}]}"#;
         let m: OllamaManifest = serde_json::from_str(vision).unwrap();
-        assert_eq!(ollama_weight_bytes(&m), Some(4_733_351_360));
+        assert_eq!(ollama_weight_bytes(&m), Some(4_108_916_992));
+        assert_eq!(ollama_projector_bytes(&m), 624_434_368);
+
+        // No projector layer is 0, not None — "this model has no projector" is a fact, not a gap.
+        let m: OllamaManifest = serde_json::from_str(local).unwrap();
+        assert_eq!(ollama_projector_bytes(&m), 0);
 
         // A cloud model has `"layers": null` — it must PARSE (a plain Vec would reject the whole
         // model) and report no local weights, because there are none on this disk.
@@ -889,6 +960,74 @@ mod tests {
         assert!(is_sidecar_gguf("mmproj-Qwen3.5-9B-BF16.gguf"));
         assert!(is_sidecar_gguf("mtp-head.gguf"));
         assert!(!is_sidecar_gguf("gemma-3-4b-it-Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn one_projector_is_chosen_and_precisions_are_never_summed() {
+        // The bug this pins: a snapshot shipping two precisions of the SAME projector had both
+        // folded into the model's size, inflating it by roughly a spare projector.
+        let two = [
+            ("mmproj-F32.gguf".to_string(), 2_000_000_000u64),
+            ("mmproj-F16.gguf".to_string(), 1_000_000_000u64),
+        ];
+        assert_eq!(pick_sidecar_bytes(&two), 1_000_000_000);
+
+        // f16 wins even when it is not the smallest, matching the generator's preference order.
+        let f16_is_bigger = [
+            ("mmproj-Q8_0.gguf".to_string(), 500_000_000u64),
+            ("mmproj.f16.gguf".to_string(), 900_000_000u64),
+        ];
+        assert_eq!(pick_sidecar_bytes(&f16_is_bigger), 900_000_000);
+
+        // The common real-world name has `-model-` in the middle, so it misses the strict f16 test
+        // (as it does in the generator) and falls to smallest — which is still the f16 here.
+        let real = [
+            ("mmproj-model-f16.gguf".to_string(), 800_000_000u64),
+            ("mmproj-model-f32.gguf".to_string(), 1_600_000_000u64),
+        ];
+        assert_eq!(pick_sidecar_bytes(&real), 800_000_000);
+
+        let one = [("mmproj-model-f16.gguf".to_string(), 42u64)];
+        assert_eq!(pick_sidecar_bytes(&one), 42);
+        assert_eq!(pick_sidecar_bytes(&[]), 0);
+    }
+
+    #[test]
+    fn a_projector_is_reported_beside_the_weights_not_inside_them() {
+        // GiB-scale fixtures on purpose: `bytes_to_gb` rounds to 2dp, so KiB-scale files would both
+        // round to 0.00 and the assertion would pass whatever the code did.
+        let gib = 1_073_741_824u64;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let folder = tmp.path().join("models");
+        std::fs::create_dir_all(home.join("empty")).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("gemma-3-4b-it-Q4_K_M.gguf"),
+            vec![0u8; (2 * gib) as usize],
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join("mmproj-model-f16.gguf"),
+            vec![0u8; gib as usize],
+        )
+        .unwrap();
+        // A second precision of the same projector: present on disk, never loaded alongside.
+        std::fs::write(
+            folder.join("mmproj-model-f32.gguf"),
+            vec![0u8; (2 * gib) as usize],
+        )
+        .unwrap();
+
+        let scan = scan(&home, Some(&folder));
+        assert_eq!(scan.models.len(), 1, "projectors are not models");
+        let m = &scan.models[0];
+        assert_eq!(m.quant.as_deref(), Some("Q4_K_M"));
+        // Weights only — the projector is NOT in here, so this is the same base as the catalog's
+        // per-quant `file_gb` and the two are substitutable in `fit::QuantCandidate`.
+        assert_eq!(m.size_gb, 2.0);
+        // Exactly ONE projector, the smaller of the two. 3.0 would mean they were summed.
+        assert_eq!(m.sidecar_gb, 1.0);
     }
 
     #[test]

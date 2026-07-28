@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.106.0-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "Local AI stops offering you models that can't hold a conversation. Ollama and LM Studio serve embedding models — the kind that turn text into numbers for search — from the same address as your chat models, and PM was listing them as though you could assign one. They're still listed, greyed out with the reason, rather than quietly removed: a model you can see in Ollama but not in PM looks like PM is broken. Setting PM up for the first time without an API key no longer risks binding one of them to everything by accident.",
+      "A downloaded vision model is sized correctly again. PM was counting the vision part of the model twice, so a multimodal model you already had could be reported as needing about a gigabyte more memory than it does — enough to be told to halve your context, or to stay on the cloud, when neither was necessary. It was also adding up every spare copy of that vision file sitting in the same folder instead of the one that actually loads.",
+      "You can remove a saved endpoint token without disconnecting. Until now the only way to get rid of one was Disconnect, which also wiped the address and both of your model assignments. There's a Forget token button beside it, and a saved token can no longer be left stranded in your keychain if the address it belonged to was rejected.",
+    ],
+  },
+  {
     version: "3.105.2-alpha",
     date: "2026-07-28",
     highlights: [
