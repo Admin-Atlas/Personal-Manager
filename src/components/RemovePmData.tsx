@@ -12,14 +12,20 @@
 //   5. a type-to-confirm ("Delete PM Data"),
 //   6. then, and only then, the removal runs.
 //
-// The three storage/secret classes go to the backend (`wipePmData`); browser preferences are cleared
-// here in the webview. Backups are deliberately NOT deletable here — the UI directs the user to the
-// backup destination (Proton / Google Drive) to remove those at the source.
+// All four classes go to the backend (`wipePmData`). Preferences are a two-part act: this webview
+// clears its own `localStorage` FIRST, then the backend removes the OS-level store behind it —
+// which on macOS is a set of real `~/Library` directories `localStorage.clear()` cannot reach.
+// Backups are deliberately NOT deletable here — the UI directs the user to the backup destination
+// (Proton / Google Drive) to remove those at the source.
+//
+// Finishing differs per platform and the backend says which (`report.finishStep`): Windows launches
+// the NSIS uninstaller, macOS has none (PM reveals the .app so the user can bin it, and never
+// deletes itself), Linux leaves the binary to the package manager.
 
 import { useEffect, useRef, useState } from "react";
 import { exit } from "@tauri-apps/plugin-process";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { confirmWipeIdentity, launchUninstaller, wipePmData } from "../lib/ipc";
+import { confirmWipeIdentity, launchUninstaller, revealAppInFinder, wipePmData } from "../lib/ipc";
 import { formatBytes } from "../lib/format";
 import type { WipeReport } from "../lib/types";
 import { Button, Input, Modal } from "./ui";
@@ -51,7 +57,7 @@ interface Selection {
   regenerable: boolean;
   vaultAndDb: boolean;
   keychain: boolean;
-  /** Cleared in the webview, not the backend. */
+  /** Cleared in the webview, then the OS-level store behind it is removed by the backend. */
   localStorage: boolean;
 }
 
@@ -103,9 +109,11 @@ const ITEMS: Item[] = [
   },
   {
     key: "localStorage",
-    label: "App preferences (this window)",
-    detail: "Theme, panel sizes, and other on-device interface preferences.",
-    consequence: "Resets the interface to its defaults.",
+    label: "App preferences",
+    detail:
+      "Theme, panel sizes, and other on-device interface preferences — and the webview data your system stores them in.",
+    consequence:
+      "Resets the interface to its defaults. On a Mac this also clears the files macOS keeps outside PM’s own folder, so a reinstall starts genuinely fresh.",
   },
 ];
 
@@ -116,9 +124,10 @@ export function RemovePmData({ biometricAvailable }: Props) {
   const [verifying, setVerifying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<WipeReport | null>(null);
-  // A full wipe ("remove PM completely") finishes by launching the Windows uninstaller and exiting.
-  // `uninstallHint` holds a fallback message if that can't run (a dev build / no installed
-  // uninstaller); `finishingRef` guards the auto-launch so it fires exactly once.
+  // On Windows a full wipe finishes by launching the NSIS uninstaller and exiting. `uninstallHint`
+  // holds a fallback message if that can't run (a dev build / no installed uninstaller) — or if
+  // revealing the app in Finder fails on macOS; `finishingRef` guards the auto-launch so it fires
+  // exactly once.
   const [uninstallHint, setUninstallHint] = useState<string | null>(null);
   const finishingRef = useRef(false);
 
@@ -134,6 +143,10 @@ export function RemovePmData({ biometricAvailable }: Props) {
   // unreachable Google grant is similar. When either is present, wait for the explicit click.
   const actionRequired =
     (report?.microsoftAccounts.length ?? 0) > 0 || (report?.googleRevokeFailures ?? 0) > 0;
+  // How this platform finishes removing PM itself. The backend decides — the UI used to assume the
+  // Windows answer, which is why a Mac (where there IS no uninstaller) got sent to Windows Settings.
+  const macFinish = report?.finishStep === "macosDragToTrash";
+  const manualFinish = report?.finishStep === "manualRemoval";
 
   function reset() {
     setSel(EMPTY_SELECTION);
@@ -180,21 +193,27 @@ export function RemovePmData({ biometricAvailable }: Props) {
     setStage("working");
     setError(null);
     try {
-      const backendSelected = sel.regenerable || sel.vaultAndDb || sel.keychain;
-      let rep: WipeReport | null = null;
-      if (backendSelected) {
-        rep = await wipePmData({
-          regenerable: sel.regenerable,
-          vaultAndDb: sel.vaultAndDb,
-          keychain: sel.keychain,
-        });
-      }
+      // Clear the webview's own store FIRST, before the backend removes the OS-level store behind
+      // it. The order matters on macOS: `~/Library/WebKit/<id>` is a live WKWebView store, and
+      // emptying it in here leaves nothing for the webview to flush back over the top of the
+      // directory the backend is about to delete. (Belt-and-braces — the app quits straight after —
+      // but the invariant shouldn't rest on that timing.)
       if (sel.localStorage) {
         try {
           localStorage.clear();
         } catch {
           /* a locked webview store just keeps its prefs — nothing sensitive there */
         }
+      }
+      const backendSelected = sel.regenerable || sel.vaultAndDb || sel.keychain || sel.localStorage;
+      let rep: WipeReport | null = null;
+      if (backendSelected) {
+        rep = await wipePmData({
+          regenerable: sel.regenerable,
+          vaultAndDb: sel.vaultAndDb,
+          keychain: sel.keychain,
+          localStorage: sel.localStorage,
+        });
       }
       setReport(rep);
       setStage("done");
@@ -226,12 +245,31 @@ export function RemovePmData({ biometricAvailable }: Props) {
     }
   }
 
-  // Auto-launch the uninstaller as soon as a full wipe reports success — unless there's a revoke
-  // reminder the user must read first, in which case wait for their "Finish uninstall" click.
+  // macOS has no uninstaller, so the last step is the user's: open Finder with PM selected and let
+  // them drag it to the Trash. PM deliberately doesn't delete itself (a self-delete fails invisibly
+  // under app translocation or from a read-only location), and it doesn't quit for them either —
+  // quitting would close the window holding the only instruction they still need.
+  async function revealApp() {
+    try {
+      await revealAppInFinder();
+    } catch (e) {
+      setUninstallHint(String(e));
+    }
+  }
+
+  // Auto-launch the uninstaller as soon as a full wipe reports success — but ONLY where an
+  // uninstaller exists. This used to fire on `fullPurge` alone, so on a Mac it always failed into
+  // the error hint, which then told the user to finish in "Windows Settings → Apps". It also waits
+  // when there's a revoke reminder they must read first.
   // finishUninstall is deliberately not a dep: it only closes over stable refs/setters, so
   // exhaustive-deps doesn't ask for it and listing it would re-fire the effect for nothing.
   useEffect(() => {
-    if (stage === "done" && report?.fullPurge && !uninstallHint && !actionRequired) {
+    if (
+      stage === "done" &&
+      report?.finishStep === "windowsUninstaller" &&
+      !uninstallHint &&
+      !actionRequired
+    ) {
       void finishUninstall();
     }
   }, [stage, report, uninstallHint, actionRequired]);
@@ -456,13 +494,21 @@ export function RemovePmData({ biometricAvailable }: Props) {
           ) : (
             <>
               <h2 className="font-head text-base font-semibold text-ink">
-                {report?.fullPurge ? "Removing PM from this machine…" : "PM data removed"}
+                {report?.fullPurge
+                  ? macFinish || manualFinish
+                    ? // Nothing further runs on its own here — the app bundle is the user's to
+                      // remove — so don't claim an in-progress removal that isn't happening.
+                      "PM removed from this machine"
+                    : "Removing PM from this machine…"
+                  : "PM data removed"}
               </h2>
               <ul className="mt-3 space-y-1 text-sm text-ink3">
                 {(report?.removed ?? []).map((r) => (
                   <li key={r}>• {r}</li>
                 ))}
-                {sel.localStorage && <li>• App preferences (this window)</li>}
+                {/* The backend lists this itself once it has removed the OS-level store behind the
+                    webview (macOS). Only fill in where it didn't, so it's never listed twice. */}
+                {sel.localStorage && !report?.osLeftoversRemoved && <li>• App preferences</li>}
               </ul>
               {report && (
                 <div className="mt-3 space-y-1 text-xs text-ink4">
@@ -496,9 +542,21 @@ export function RemovePmData({ biometricAvailable }: Props) {
                 </div>
               )}
               {report?.fullPurge &&
-                (uninstallHint ? (
+                (macFinish ? (
+                  // macOS: everything PM wrote is gone, but the .app is the user's to bin.
+                  <p className="mt-3 text-xs text-ink3">
+                    Everything PM stored on this Mac is gone. macOS has no uninstaller, so the last
+                    step is yours: drag <span className="font-medium text-ink2">PM</span> from
+                    Applications to the Trash.
+                  </p>
+                ) : manualFinish ? (
+                  <p className="mt-3 text-xs text-ink3">
+                    Everything PM stored is gone. Remove the app itself the way you installed it —
+                    your package manager, or by deleting the AppImage.
+                  </p>
+                ) : uninstallHint ? (
                   <p className="mt-3 text-xs text-st-due">
-                    Your data is removed. Finish uninstalling PM from Windows Settings → Apps to
+                    Your data is removed. Finish uninstalling PM through your operating system to
                     clear the last of it.
                   </p>
                 ) : actionRequired ? (
@@ -513,7 +571,20 @@ export function RemovePmData({ biometricAvailable }: Props) {
                   </p>
                 ))}
               <div className="mt-5 flex justify-end gap-2">
-                {report?.fullPurge ? (
+                {macFinish ? (
+                  <>
+                    <Button variant="secondary" onClick={() => void revealApp()}>
+                      Show PM in Finder
+                    </Button>
+                    <Button variant="primary" onClick={() => void quitApp()}>
+                      Close PM
+                    </Button>
+                  </>
+                ) : manualFinish ? (
+                  <Button variant="primary" onClick={() => void quitApp()}>
+                    Close PM
+                  </Button>
+                ) : report?.fullPurge ? (
                   <Button
                     variant="primary"
                     onClick={() => void (uninstallHint ? quitApp() : finishUninstall())}

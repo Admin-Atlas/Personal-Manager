@@ -1518,6 +1518,7 @@ pub fn run() {
             // Recover a bricked boot (store present, key lost) and finish a full self-uninstall.
             wipe::reset_after_open_error,
             wipe::launch_uninstaller,
+            wipe::reveal_app_in_finder,
             // Encrypted portable backup: local `.pmbackup` archive/restore, plus two off-machine
             // destinations that share the compress→encrypt core and the one schedule — Proton Drive
             // (via its CLI) and Google Drive (via the Drive v3 REST API).
