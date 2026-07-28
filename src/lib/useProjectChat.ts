@@ -10,6 +10,7 @@ import {
   setConversationProject,
 } from "./ipc";
 import { useChatStream } from "./useChatStream";
+import { useSendQueue } from "./useSendQueue";
 import { isNewChatTrigger } from "./chatSession";
 import type { Conversation } from "./types";
 
@@ -34,6 +35,18 @@ export function useProjectChat(project: string | null) {
   const convIdRef = useRef(convId);
   convIdRef.current = convId;
   const chat = useChatStream(() => convIdRef.current);
+  // Type-ahead (#152). `handleSend` is defined below and read through a ref inside the hook, so the
+  // arrow keeps this above it without a use-before-declare.
+  const queue = useSendQueue((text) => handleSend(text));
+
+  /** Leaving the chat on screen: drop the in-flight stream's UI AND anything queued for it. One
+   *  function rather than two calls at each site — a queued message delivered into whatever chat the
+   *  user opened next is worse than losing it, and a missed call would do exactly that. */
+  const leaveChat = useCallback(() => {
+    chat.clearTransient();
+    queue.clear();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- queue.clear is stable by construction
+  }, [chat]);
   // Latest open project, tracked synchronously so a slow `listConversations()` started for the
   // previous project can't resolve late and overwrite the list with the wrong project's chats.
   const projectRef = useRef(project);
@@ -58,7 +71,7 @@ export function useProjectChat(project: string | null) {
   useEffect(() => {
     setConvId(null);
     setDismissedIdleFor(null);
-    chat.clearTransient();
+    leaveChat();
     chat.setMessages([]);
     refreshConversations();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- re-init only on project change
@@ -74,7 +87,7 @@ export function useProjectChat(project: string | null) {
       convIdRef.current = id;
       setConvId(id);
       setDismissedIdleFor(null);
-      chat.clearTransient();
+      leaveChat();
       try {
         const msgs = await getMessages(id);
         if (convIdRef.current === id) chat.setMessages(msgs);
@@ -82,16 +95,16 @@ export function useProjectChat(project: string | null) {
         chat.setError(String(e));
       }
     },
-    [chat],
+    [chat, leaveChat],
   );
 
   /** Start a fresh chat in the pane (the sidebar "+ New" button / the /new trigger). The just-left
    *  chat is already persisted and shows in the sidebar, so this is a clean swap — nothing to save. */
   const newChat = useCallback(() => {
     setConvId(null);
-    chat.clearTransient();
+    leaveChat();
     chat.setMessages([]);
-  }, [chat]);
+  }, [chat, leaveChat]);
 
   /** Delete a past chat from the sidebar (card 7G). If it was the one open in the pane, reset to a
    *  fresh chat; then refresh this project's list. Irreversible — the caller confirms first. */
@@ -127,13 +140,14 @@ export function useProjectChat(project: string | null) {
   );
 
   const handleSend = useCallback(
-    async (text: string) => {
+    async (text: string): Promise<boolean> => {
       // /new · /done starts a fresh chat instead of sending — never reaches the model or the vault.
+      // Not a failure: a type-ahead queue behind it carries on into the fresh chat (#152).
       if (isNewChatTrigger(text)) {
         newChat();
-        return;
+        return true;
       }
-      if (project == null) return;
+      if (project == null) return false;
       let id = convIdRef.current;
       if (id == null) {
         try {
@@ -143,11 +157,11 @@ export function useProjectChat(project: string | null) {
           setConvId(id);
         } catch (e) {
           chat.setError(String(e));
-          return;
+          return false;
         }
       }
 
-      await chat.send(id, text);
+      const ok = await chat.send(id, text);
 
       // Adopt persisted messages only if we're still on this project's chat, then refresh the
       // sidebar so a just-created chat (and any background title/order) shows there.
@@ -157,6 +171,7 @@ export function useProjectChat(project: string | null) {
         /* keep optimistic state on reload failure */
       }
       refreshConversations();
+      return ok;
     },
     [project, chat, newChat, refreshConversations],
   );
@@ -181,6 +196,7 @@ export function useProjectChat(project: string | null) {
     deleteConversation,
     moveConversation,
     handleSend,
+    queue,
     refreshConversations,
   };
 }

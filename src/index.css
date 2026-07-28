@@ -91,6 +91,17 @@ body,
   height: 100%;
 }
 
+/* The app shell is a FIXED-HEIGHT surface: every pane sets its own `overflow-y-auto`, and nothing
+ * scrolls the document (no `window.scrollTo` anywhere). Without this, any element that briefly makes
+ * the page a pixel taller than the viewport turns the document into a scroll container — and the
+ * next `scrollIntoView` walks up into it and scrolls the whole UI out of the window, with no way back.
+ * Clipping is the correct failure here: a pane that overflows is a layout bug to fix, not something
+ * to hand a second scrollbar. */
+html,
+body {
+  overflow: hidden;
+}
+
 /* Accessibility: whole-UI text size. applyTheme() sets --font-scale (1 = 100%); scaling the root
  * font-size scales every rem-based size (type AND spacing) together, like the browser's own zoom.
  * Default 1 → the browser's 16px, so nothing changes until the user picks a larger size. */

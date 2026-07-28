@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Composer } from "./Composer";
+import { QueuedMessages } from "./QueuedMessages";
 import { ContextMeter } from "./ContextMeter";
 import { ProviderChip } from "./ProviderChip";
 import { FallbackStrip } from "./FallbackStrip";
@@ -518,9 +519,19 @@ export function ProjectView({
               </div>
             </div>
           )}
+          <QueuedMessages
+            queued={chat.queue.queued}
+            stalled={chat.queue.stalled}
+            onRemove={chat.queue.remove}
+            onEdit={chat.queue.edit}
+            onHold={chat.queue.hold}
+            onResume={chat.queue.resume}
+          />
           <Composer
-            disabled={chat.sending}
-            onSend={chat.handleSend}
+            // Deliberately NOT `chat.sending` — typing ahead is the feature (#152). The composer
+            // refuses only when the queue is full, the one case where accepting would drop the text.
+            disabled={chat.queue.full}
+            onSend={(text) => chat.queue.enqueue(text)}
             leftTools={
               <div className="flex items-center gap-2">
                 <ContextMeter

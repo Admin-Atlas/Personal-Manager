@@ -665,8 +665,14 @@ export function ChatView({
   }, []);
 
   // Snap to the newest turn when the message set changes (a new turn, or a conversation just opened).
+  //
+  // `block: "nearest"` is load-bearing, not a tidy-up. `scrollIntoView` scrolls EVERY scrollable
+  // ancestor, and the document is always one of them — so the moment anything makes the page taller
+  // than the viewport by even a pixel, the default `block: "start"` scrolls the whole app out of the
+  // window and nothing scrolls it back. "nearest" moves only what actually needs to move, which for a
+  // pinned-to-bottom transcript is the chat's own scroller and nothing else.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [messages]);
   // While a reply streams, only stay pinned to the bottom if the user is ALREADY near it — so they can
   // scroll up to read earlier turns mid-stream without being dragged back down every token (F-50).
@@ -674,7 +680,7 @@ export function ChatView({
     if (streaming === null) return;
     const el = scrollRef.current;
     if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 120) {
-      endRef.current?.scrollIntoView({ behavior: "auto" });
+      endRef.current?.scrollIntoView({ behavior: "auto", block: "nearest" });
     }
   }, [streaming]);
 
