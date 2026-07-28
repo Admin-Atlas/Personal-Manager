@@ -1061,6 +1061,11 @@ export default function App() {
                   {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
                   <DocumentsView
                     onReviewClick={teachVisible ? () => setView("review") : undefined}
+                    // From App's settings, which are re-read when the Settings overlay closes — this
+                    // view stays mounted underneath it, so its own mount-time read never saw the
+                    // toggle change (#282).
+                    duplicateCheck={settings ? settings.duplicate_check : null}
+                    onDuplicateCheckChange={refreshSettings}
                   />
                 </main>
               ) : view === "review" ? (
@@ -1130,6 +1135,7 @@ export default function App() {
                   <QueuedMessages
                     queued={queue.queued}
                     stalled={queue.stalled}
+                    failedId={queue.failedId}
                     onRemove={queue.remove}
                     onEdit={queue.edit}
                     onHold={queue.hold}
@@ -1138,8 +1144,10 @@ export default function App() {
                   <Composer
                     // Deliberately NOT `chat.sending`: typing ahead is the feature. The composer
                     // only refuses when the queue is full, which is the one case where accepting
-                    // would silently drop what was typed.
+                    // would silently drop what was typed. `sending` drives the WORDING instead —
+                    // what Enter does changes mid-answer, so the box has to say which it is.
                     disabled={queue.full}
+                    busy={chat.sending}
                     onSend={(text) => queue.enqueue(text)}
                     leftTools={
                       <div className="flex items-center gap-2">

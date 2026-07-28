@@ -184,9 +184,24 @@ export function CommandPalette({
   // each group is ordered by match score (best first); empty query keeps the
   // natural order so the palette doubles as a browse-everything list.
   const { groups, flat } = useMemo(() => {
-    // A leading `@` is the chat's pin syntax; here it is just how someone types a tag they are
-    // looking for, so it must not defeat the match (#276).
-    const q = query.trim().replace(/^@/, "").toLowerCase();
+    // The chat's pin syntax, typed here. There is no pinning in the palette — this is a text search
+    // over titles, projects and tags, not a retrieval scope — but every form the chat TEACHES has to
+    // come back with something, and two of them came back empty (#276):
+    //
+    //   `@"Atlas, Inc."` — what the chat's own @ menu inserts for a name with a space in it. The
+    //   quotes belong to the syntax, not to the name, so left on they searched for a string no
+    //   title contains.
+    //   `@marketing @sales` — only the FIRST @ was stripped, so the second one had to appear
+    //   literally in a title to match.
+    //
+    // Both now normalise to the words themselves. The sigil is dropped rather than honoured because
+    // pinning a tag as a filter here is a feature, not a parse — it is carded separately.
+    const q = query
+      .trim()
+      .replace(/@"([^"]*)"?/g, "$1")
+      .replace(/@/g, "")
+      .trim()
+      .toLowerCase();
     const scored = items
       .map((item) => ({ item, score: q ? fuzzyScore(q, item.search) : 0 }))
       .filter((s): s is { item: PaletteItem; score: number } => s.score !== null);

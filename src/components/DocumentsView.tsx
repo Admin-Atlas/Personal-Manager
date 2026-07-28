@@ -8,7 +8,6 @@ import {
   devApplyChangeEvent,
   devDocumentChunks,
   ensureSidecar,
-  getSettings,
   ingestPaths,
   installOptionalOcr,
   listDocuments,
@@ -86,9 +85,22 @@ function hasPhotos(paths: string[]): boolean {
 interface Props {
   /** Jump to the Review view (the sorting-review queue). */
   onReviewClick?: () => void;
+  /**
+   * Whether the duplicate check is switched on (#282), or `null` while settings are still loading.
+   *
+   * Passed in rather than read here, and that is the whole point: Settings is an overlay rendered
+   * as a SIBLING of this view, so this component stays mounted underneath it and a mount-time read
+   * never sees the toggle being flipped. Turning the check on and closing Settings left the user
+   * looking at a Documents tab with no "Check for duplicates" anywhere — exactly where the Settings
+   * copy had just told them to look. App re-reads settings when the overlay closes, so taking it
+   * from there fixes both directions at once.
+   */
+  duplicateCheck: boolean | null;
+  /** Re-read settings after this view turns the check on itself (from the nudge). */
+  onDuplicateCheckChange: () => void;
 }
 
-export function DocumentsView({ onReviewClick }: Props) {
+export function DocumentsView({ onReviewClick, duplicateCheck, onDuplicateCheckChange }: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [status, setStatus] = useState<SidecarStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -164,23 +176,22 @@ export function DocumentsView({ onReviewClick }: Props) {
   // "show full text" here anymore.
   const { openReader, current: readerDoc } = useReader();
 
-  // #282. `null` until the setting has loaded, so neither the panel nor the nudge flashes on before
-  // PM knows which one belongs here. The nudge's dismissal is per-machine UI state, not a preference
-  // about this library, so it lives in localStorage rather than the vault's settings.
-  const [duplicateCheck, setDuplicateCheckState] = useState<boolean | null>(null);
+  // #282. `duplicateCheck` is `null` until settings have loaded, so neither the panel nor the nudge
+  // flashes on before PM knows which one belongs here. The nudge's dismissal is per-machine UI
+  // state, not a preference about this library, so it lives in localStorage rather than the vault's
+  // settings.
   const [duplicateNudgeDismissed, setDuplicateNudgeDismissed] = useState(readDuplicateNudgeSeen);
-
-  useEffect(() => {
-    getSettings()
-      .then((s) => setDuplicateCheckState(s.duplicate_check))
-      .catch(() => setDuplicateCheckState(false));
-  }, []);
 
   async function enableDuplicateCheck() {
     setError(null);
     try {
       await setDuplicateCheck(true);
-      setDuplicateCheckState(true);
+      // Turning it on IS the nudge having done its job, so it is spent either way. Without this it
+      // would come back the next time the check was switched off in Settings — and a suggestion
+      // that returns after you have both seen it and acted on it is no longer a suggestion.
+      writeDuplicateNudgeSeen();
+      setDuplicateNudgeDismissed(true);
+      onDuplicateCheckChange();
     } catch (e) {
       setError(String(e));
     }

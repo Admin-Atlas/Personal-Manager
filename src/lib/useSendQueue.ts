@@ -45,6 +45,16 @@ export interface SendQueue {
   queued: QueuedMessage[];
   /** A send failed, so draining paused with everything still queued. */
   stalled: boolean;
+  /**
+   * The message whose send failed, while it is still waiting — otherwise null.
+   *
+   * It goes null when the user takes that message back, which is the second branch of what to do
+   * about a failure: forget it and send the rest. The queue deliberately does NOT resume by itself
+   * there (deleting a message is not the same as asking for the others to go), so this exists to
+   * keep the offer honest — a banner still saying "that didn't send" and a button still saying "try
+   * again" would both be naming a message that no longer exists anywhere on screen.
+   */
+  failedId: number | null;
   /** Whether another message would exceed [`QUEUE_LIMIT`]. */
   full: boolean;
   /** Queue `text` and start (or continue) draining. Returns false when the queue is full, so the
@@ -78,6 +88,7 @@ export interface SendQueue {
 export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueue {
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [stalled, setStalled] = useState(false);
+  const [failedId, setFailedId] = useState<number | null>(null);
 
   // The queue itself lives in a ref, with `queued` as its render mirror. The drain loop reads it
   // between awaits, and state read through a closure would be whatever it was when the loop started.
@@ -90,7 +101,13 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
   const sendRef = useRef(send);
   sendRef.current = send;
 
-  const publish = useCallback(() => setQueued(pending.current), []);
+  // Publish the render mirror, and drop the "this one failed" marker if that message is no longer
+  // waiting. Every mutation goes through here, so the marker cannot outlive its message — whether it
+  // left by being removed, by being emptied in the editor, or by the queue being cleared wholesale.
+  const publish = useCallback(() => {
+    setQueued(pending.current);
+    setFailedId((id) => (id !== null && pending.current.some((m) => m.id === id) ? id : null));
+  }, []);
 
   const drain = useCallback(async () => {
     if (draining.current) return; // one loop, always — see the note on effects above
@@ -108,6 +125,8 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
           pending.current = [head, ...pending.current];
           publish();
           setStalled(true);
+          // After `publish`, which would otherwise clear a marker set before the message was back.
+          setFailedId(head.id);
           return;
         }
       }
@@ -180,6 +199,7 @@ export function useSendQueue(send: (text: string) => Promise<boolean>): SendQueu
   return {
     queued,
     stalled,
+    failedId,
     full: queued.length >= QUEUE_LIMIT,
     enqueue,
     remove,

@@ -15,13 +15,17 @@
 //     vault's list encoding quotes each entry, so it round-trips.
 //   - There is no 5-item cap. That cap is on the model's proposed tags, not on how many projects a
 //     document may legitimately belong to.
-//   - The FIRST pill is the primary project and cannot be removed. Every other membership can go;
-//     the home cannot, because a document with no project is not a state the store has.
+//   - The FIRST pill is the primary project. It can be changed but never emptied: a document with
+//     no project is not a state the store has, so the LAST remaining pill is the one that cannot go.
 //
-// Order carries meaning: `value[0]` is the primary. Removing a middle pill leaves the primary
-// alone; there is no reordering control here — to change the primary, remove it from the list by
-// filing the document elsewhere (the Documents tab's editor), which is the deliberate act it
-// should be.
+// Order carries meaning: `value[0]` is the primary, and both call sites write it back as
+// `[project, ...also_projects]`, so reordering this list IS re-homing the document.
+//
+// Changing the primary is a first-class act here, not something you achieve sideways. It was
+// originally left out — the reasoning being that re-homing should be deliberate — but "deliberate"
+// had become "impossible": the primary pill carried no control at all, and the only instruction on
+// offer pointed back at this very component. A document filed somewhere you didn't intend is a
+// thing you must be able to correct where you notice it.
 
 import { useId, useState } from "react";
 
@@ -68,9 +72,16 @@ export function ProjectPicker({
   }
 
   function remove(project: string) {
-    // Never the primary: a document always belongs somewhere.
-    if (value.length <= 1 || project === value[0]) return;
+    // The guard is on COUNT, not on position: a document always belongs somewhere, so the last pill
+    // can't go — but the primary can, and dropping it promotes the next in line rather than
+    // refusing. Filtering preserves order, so `value[1]` becomes the new `value[0]` on its own.
+    if (value.length <= 1) return;
     onChange(value.filter((p) => p !== project));
+  }
+
+  function makePrimary(project: string) {
+    if (project === value[0]) return;
+    onChange([project, ...value.filter((p) => p !== project)]);
   }
 
   return (
@@ -88,7 +99,7 @@ export function ProjectPicker({
             title={
               primary
                 ? `${project} — the primary project. Its filing activity and Map position follow this one.`
-                : `${project} — linked. Remove to unlink.`
+                : `${project} — linked. Click the name to make it primary, × to unlink.`
             }
             className={`inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-2 py-0.5 text-xs ${
               primary
@@ -97,8 +108,24 @@ export function ProjectPicker({
             }`}
           >
             {primary && <span className="text-[0.625rem] uppercase tracking-wide">Primary</span>}
-            {project}
-            {!primary && (
+            {primary ? (
+              project
+            ) : (
+              <button
+                type="button"
+                onClick={() => makePrimary(project)}
+                disabled={disabled}
+                // The name IS the control. A separate "make primary" glyph on every linked pill
+                // would crowd a field that is one pill wide for almost every document, and the pill
+                // body is the largest target the row has to offer.
+                className="rounded-[var(--radius-sm)] underline-offset-2 hover:underline disabled:opacity-50"
+                aria-label={`Make ${project} the primary project`}
+                title={`Make ${project} the primary project`}
+              >
+                {project}
+              </button>
+            )}
+            {value.length > 1 && (
               <button
                 type="button"
                 onClick={() => remove(project)}
@@ -107,8 +134,12 @@ export function ProjectPicker({
                 // alias chips learned that the hard way — an under-sized target had people
                 // clicking the chip body and reporting that removal did nothing.
                 className="-mr-0.5 px-1 text-ink4 transition hover:text-ink disabled:opacity-50"
-                aria-label={`Unlink from ${project}`}
-                title={`Unlink from ${project}`}
+                aria-label={
+                  primary
+                    ? `Remove ${project}; ${value[1]} becomes the primary project`
+                    : `Unlink from ${project}`
+                }
+                title={primary ? `Remove — ${value[1]} becomes primary` : `Unlink from ${project}`}
               >
                 ×
               </button>

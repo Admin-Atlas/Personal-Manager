@@ -235,8 +235,14 @@ export function TeachView() {
 
           {/* Re-tag the library from one store-wide vocabulary (#580). Shown regardless of whether
               any projects exist — tags are a separate axis, and a library with everything in
-              Unsorted is exactly the one whose tags need the most help. */}
-          {showPower && <TeachTags />}
+              Unsorted is exactly the one whose tags need the most help.
+
+              NOT power-gated. It was, and that was a mistake: the default depth is `standard`, and
+              this section is the ONLY way to repair tag data that every vault built before v3.100
+              already has wrong — the release notes tell every user to come here by name. A repair
+              instruction pointing at a screen most installs don't render reaches nobody. Nothing
+              else on this tab is depth-gated either. */}
+          <TeachTags />
 
           {/* Structured preferences (§4.5) live here too — shown even with no projects yet, since a
               global/context preference (or one migrated from the old profile) needs no project. */}

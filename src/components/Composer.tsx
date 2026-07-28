@@ -24,6 +24,15 @@ const COMPOSER_GRID = "grid grid-cols-[1fr_minmax(0,48rem)_1fr] gap-2";
 
 interface Props {
   disabled: boolean;
+  /**
+   * A reply is still streaming, so pressing Enter QUEUES the message rather than sending it (#152).
+   *
+   * The box says so, rather than leaving the user to discover it. An input that silently changes
+   * what its Enter key does — and looks identical either way — is the thing people report as "it
+   * ignored me": the queue was built precisely so typing mid-answer is never refused, and an
+   * unchanged "Ask anything…" is the one remaining reason to believe it was.
+   */
+  busy?: boolean;
   onSend: (text: string) => void;
   /** Compact chat tool anchored at the FAR LEFT of the row (the context meter) — it and the
    *  matching {@link rightTools} bracket the mic·input·send cluster so the input stays visually
@@ -33,7 +42,7 @@ interface Props {
   rightTools?: ReactNode;
 }
 
-export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
+export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Props) {
   const [text, setText] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -271,7 +280,13 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
             aria-autocomplete="list"
             aria-activedescendant={open ? optionId(activeIndex) : undefined}
             rows={1}
-            placeholder="Ask anything…  (Enter to send, @ to pin a tag)"
+            placeholder={
+              disabled
+                ? "Waiting for the queue to clear…"
+                : busy
+                  ? "Queue a message…  (Enter to queue, @ to pin a tag)"
+                  : "Ask anything…  (Enter to send, @ to pin a tag)"
+            }
             className="flex-1 px-4 py-2"
           />
           <Button
@@ -280,7 +295,7 @@ export function Composer({ disabled, onSend, leftTools, rightTools }: Props) {
             disabled={disabled || !text.trim()}
             className="px-4 py-2"
           >
-            Send
+            {busy ? "Queue" : "Send"}
           </Button>
         </div>
 

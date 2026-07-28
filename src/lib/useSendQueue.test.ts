@@ -141,6 +141,49 @@ describe("a failure", () => {
     await c.settle();
   });
 
+  // The second branch of "what do I do about a failure": forget that message, send the rest. It is
+  // deliberately still two actions — deleting a message is not the same as asking for the others to
+  // go — so what has to be true is that the offer stops naming a message that no longer exists.
+  it("stops offering to retry a message the user has deleted", async () => {
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("fails");
+      result.current.enqueue("after");
+    });
+    await c.settle(false);
+    expect(result.current.failedId).toBe(result.current.queued[0].id);
+
+    act(() => {
+      result.current.remove(result.current.queued[0].id);
+    });
+    // Still stalled — nothing has been sent — but there is nothing left to RETRY, only to continue.
+    expect(result.current.stalled).toBe(true);
+    expect(result.current.failedId).toBeNull();
+    expect(result.current.queued.map((m) => m.text)).toEqual(["after"]);
+
+    act(() => {
+      result.current.resume();
+    });
+    expect(c.calls).toEqual(["fails", "after"]);
+    await c.settle();
+  });
+
+  it("keeps offering the retry when a message BEHIND the failed one is deleted", async () => {
+    // The failed message is still at the head and still un-sent, so the offer is unchanged.
+    const c = controllableSend();
+    const { result } = renderHook(() => useSendQueue(c.send));
+    act(() => {
+      result.current.enqueue("fails");
+      result.current.enqueue("after");
+    });
+    await c.settle(false);
+    act(() => {
+      result.current.remove(result.current.queued[1].id);
+    });
+    expect(result.current.failedId).toBe(result.current.queued[0].id);
+  });
+
   it("clears the stall when the failed message is taken back", async () => {
     // Nothing is blocking the queue any more, so a warning that says otherwise describes a state
     // that no longer exists.
