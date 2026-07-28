@@ -28,7 +28,7 @@
 import { gguf } from "@huggingface/gguf";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 const HF = "https://huggingface.co";
@@ -116,7 +116,7 @@ async function hfFetch(url, extraHeaders = {}) {
 }
 
 // Exponential backoff: 500ms, 1s, 2s. A dev tool, so a few seconds of waiting out a blip is fine.
-function backoffMs(attempt) {
+export function backoffMs(attempt) {
   return 500 * 2 ** (attempt - 1);
 }
 function sleep(ms) {
@@ -124,7 +124,7 @@ function sleep(ms) {
 }
 
 // The `RateLimit` header carries `t=<seconds>`; fall back to `Retry-After`, then a plain default.
-function parseRateLimit(headers) {
+export function parseRateLimit(headers) {
   const rl = headers.get("ratelimit") || headers.get("RateLimit") || "";
   const m = /(?:^|[;,\s])t=(\d+)/i.exec(rl);
   if (m) return Number(m[1]);
@@ -255,6 +255,13 @@ async function moeActiveParams(repo, shardPath, totalParams) {
       return null;
     }
   }
+  return activeFromHeader(metadata, totalParams);
+}
+
+/** The MoE active-parameter arithmetic, split out of the fetch so it can be tested without a network
+ *  call. Returns null whenever the header does not carry a usable, complete set of counts — decision
+ *  E: an unreadable MoE header EXCLUDES the model rather than guessing at its active size. */
+export function activeFromHeader(metadata, totalParams) {
   const arch = String(metadata["general.architecture"] || "");
   const key = (k) => Number(metadata[`${arch}.${k}`] ?? metadata[k]);
   const nExpert = key("expert_count");
@@ -279,7 +286,7 @@ async function moeActiveParams(repo, shardPath, totalParams) {
 
 // --- small pure helpers ------------------------------------------------------------------------
 
-function sumQuantShards(files, label) {
+export function sumQuantShards(files, label) {
   const parts = files.filter((f) => matchesQuant(f.path, label) && !/mmproj/i.test(f.path));
   if (parts.length === 0) return null;
   const bytes = parts.reduce((n, f) => n + (Number(f.size) || 0), 0);
@@ -289,7 +296,7 @@ function sumQuantShards(files, label) {
 // A file belongs to `label` only when the label is the EXACT quant token right before `.gguf` (or a
 // `-NNNNN-of-NNNNN.gguf` shard suffix), preceded by a separator — so "Q6_K" never also matches
 // "Q6_K_L"/"Q6_K_XL", the bug that inflated sizes. Also accepts a per-quant subfolder.
-function matchesQuant(path, label) {
+export function matchesQuant(path, label) {
   const l = label.toLowerCase();
   const segs = path.toLowerCase().split("/");
   const name = segs[segs.length - 1];
@@ -298,13 +305,13 @@ function matchesQuant(path, label) {
   return segs.slice(0, -1).includes(l);
 }
 
-function escapeRe(s) {
+export function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // A multimodal model needs ONE projector at load time — prefer the F16 mmproj (the common default),
 // else the smallest available. Never sum precisions. Returns bytes, or null if none/zero-sized.
-function pickProjector(files) {
+export function pickProjector(files) {
   if (files.length === 0) return null;
   const f16 = files.find((f) => /mmproj[-._]?f16/i.test(f.path));
   const chosen =
@@ -313,21 +320,21 @@ function pickProjector(files) {
   return bytes > 0 ? bytes : null;
 }
 
-function isEmbeddingOrReranker(repo, arch) {
+export function isEmbeddingOrReranker(repo, arch) {
   const s = `${repo} ${arch}`.toLowerCase();
   return /embed|embedding|rerank|reranker|sentence-transformers|bge-|cross-encoder/.test(s);
 }
 
-function isMoe(repo, arch) {
+export function isMoe(repo, arch) {
   return /moe/i.test(arch) || /\b[aA]\d+(\.\d+)?[bB]\b/.test(repo) || /gpt-oss/i.test(arch);
 }
 
 // Architectures whose fit math we don't trust (state-space / Mamba: the KV proxy is wrong).
-function isUnmodelledArch(arch) {
+export function isUnmodelledArch(arch) {
   return /mamba|ssm|rwkv|jamba/i.test(arch);
 }
 
-function prettyName(repo) {
+export function prettyName(repo) {
   return repo
     .split("/")
     .pop()
@@ -337,15 +344,15 @@ function prettyName(repo) {
     .trim();
 }
 
-function gib(bytes) {
+export function gib(bytes) {
   return round2(bytes / 1_073_741_824);
 }
-function round2(x) {
+export function round2(x) {
   return Math.round(x * 100) / 100;
 }
 
 // Hash over the entries only (not the timestamp), so re-runs are churn-free.
-function contentHash(entries) {
+export function contentHash(entries) {
   return "sha256:" + createHash("sha256").update(JSON.stringify(entries)).digest("hex");
 }
 
@@ -423,4 +430,10 @@ function todayUtc() {
   return new Date().toISOString().slice(0, 10);
 }
 
-await main();
+// Run only when invoked as a script. Without this guard, importing the module for its pure helpers
+// (the unit tests do) would fire 19 Hugging Face requests and could rewrite the tracked
+// src-tauri/local_models.json mid-`just check`. pathToFileURL, not import.meta.filename: the latter
+// needs Node >= 20.11 and pr.yml pins a floating `node-version: 20`.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
+}
