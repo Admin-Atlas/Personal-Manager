@@ -544,11 +544,20 @@ export function RemovePmData({ biometricAvailable }: Props) {
               {report?.fullPurge &&
                 (macFinish ? (
                   // macOS: everything PM wrote is gone, but the .app is the user's to bin.
-                  <p className="mt-3 text-xs text-ink3">
-                    Everything PM stored on this Mac is gone. macOS has no uninstaller, so the last
-                    step is yours: drag <span className="font-medium text-ink2">PM</span> from
-                    Applications to the Trash.
-                  </p>
+                  <>
+                    <p className="mt-3 text-xs text-ink3">
+                      Everything PM stored on this Mac is gone. macOS has no uninstaller, so the
+                      last step is yours: drag <span className="font-medium text-ink2">PM</span>{" "}
+                      from Applications to the Trash.
+                    </p>
+                    {/* A failed reveal must still say so — the instruction above is the real
+                        deliverable, and Finder is only a convenience on top of it. */}
+                    {uninstallHint && (
+                      <p className="mt-2 text-xs text-st-due">
+                        Couldn’t open Finder for you — find PM in Applications yourself.
+                      </p>
+                    )}
+                  </>
                 ) : manualFinish ? (
                   <p className="mt-3 text-xs text-ink3">
                     Everything PM stored is gone. Remove the app itself the way you installed it —
