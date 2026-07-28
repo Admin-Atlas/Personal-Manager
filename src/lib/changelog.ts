@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.105.2-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "PM's build scripts now have to justify every outside package they use. They were already meant to stay dependency-free, but that was a habit written in a comment, and nothing checked it. Now a check does: an outside package needs an entry saying which script uses it and why, it has to be development-only so it can never reach your installed copy, and it has to be pinned to one exact version rather than a range that can move underneath us.",
+      "This one is entirely under the bonnet — nothing about PM looks or behaves differently. It matters because the fewer outside packages sit near the machinery that builds and checks PM, the fewer ways something unwanted can arrive in a release.",
+    ],
+  },
+  {
     version: "3.105.1-alpha",
     date: "2026-07-28",
     highlights: [
