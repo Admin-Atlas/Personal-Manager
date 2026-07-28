@@ -13,8 +13,9 @@
 //! the degenerate-stream guard, URL normalisation, the `/v1/models` shape check, the request
 //! body's shape, and the context-window ladder's preference order — is a pure function, unit
 //! tested below. The network-touching entrypoints (`stream_chat`, `complete`, `probe`,
-//! `probe_window`) are the thin I/O edge, verified against real servers (the epic's live-rig
-//! checklist). "OpenAI-compatible" is a spectrum in practice, so the parser tolerates all three
+//! `probe_window`) are the thin I/O edge, and their behaviour against a real server is NOT
+//! covered here or in CI — the epic's live-rig checklist owns that check and still owes it.
+//! "OpenAI-compatible" is a spectrum in practice, so the parser tolerates all three
 //! named servers plus buffered/keepalive variants and never crashes on an unknown field.
 //!
 //! Live as of #297 PR3: the gateway ([`crate::llm_gateway`]) drives these entrypoints for a
@@ -954,8 +955,8 @@ mod tests {
     }
 
     // Representative transcripts modelled on each server's documented OpenAI-compatible output.
-    // Synthetic (Bobby diffs them against real captures — see the live-rig checklist); the parser
-    // must handle all three plus the buffered/keepalive/truncated variants below.
+    // Synthetic — the live-rig checklist still owes a diff against one real capture per server; the
+    // parser must handle all three plus the buffered/keepalive/truncated variants below.
 
     const OLLAMA: &[u8] = b"data: {\"model\":\"llama3.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: {\"model\":\"llama3.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\ndata: {\"model\":\"llama3.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
 
