@@ -292,3 +292,5 @@ jobs:
         run: just ci-membership
       - name: Sync-set register covers every table
         run: just sync-set
+      - name: scripts/ stays zero-dependency (allowlisted exceptions only)
+        run: just script-deps

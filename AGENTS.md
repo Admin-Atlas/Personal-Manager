@@ -9,8 +9,10 @@ module — read them before touching anything they cover:
 
 - **[INVARIANTS.md](INVARIANTS.md)** — contracts that only hold if two or more separate
   pieces of work agree to them (retrieval filters vs scores, identity keys, the connector
-  contract, the vault walks, accounting). Each entry says whether it is enforced by a gate
-  or held by convention, and what a PR has to do to co-sign it.
+  contract, the vault walks, accounting, build tooling). Each entry says whether it is
+  enforced by a gate or held by convention, and what a PR has to do to co-sign it.
+  **Importing an npm package from `scripts/` means adding an allowlist entry** (I-18) —
+  `just script-deps` fails otherwise, and so does CI, where there is no `node_modules`.
 - **[SYNC-SET.md](SYNC-SET.md)** — who owns each unit of truth: every table classified
   truth / derived / device / mixed, plus the non-database surfaces. **Adding a table means
   adding a row** — `just sync-set` fails otherwise.

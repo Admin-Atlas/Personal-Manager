@@ -20,7 +20,7 @@ default:
 # --- aggregates -----------------------------------------------------------
 
 # The fast subset (formatting, types, lint, bespoke gates) — what pre-commit runs.
-check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set
+check-fast: prettier eslint tsc cargo-fmt ruff ruff-fmt version files headers license-subset ci-membership sync-set script-deps
 
 # Everything a PR is gated on (adds the compile/test/supply-chain/security checks).
 check: check-fast frontend-test clippy cargo-check rust-test sidecar-test deny pip-audit npm-audit gitleaks gitleaks-history zizmor
@@ -176,6 +176,13 @@ ci-membership:
 # mixed), so a new table can't land without a declared owner of truth for a future sync.
 sync-set:
     node scripts/check-sync-set.mjs
+
+# scripts/ stays zero-dependency (INVARIANTS.md I-18): node: builtins and repo-relative paths only,
+# plus a small allowlist of justified exceptions inside the check itself. Not taste — pr.yml's
+# hygiene job runs no `npm ci`, so an unlisted import in a gate script passes locally and dies only
+# in CI. Also asserts each exception is still imported, dev-only, and exactly pinned.
+script-deps:
+    node scripts/check-script-deps.mjs
 
 # --- release-only ---------------------------------------------------------
 
