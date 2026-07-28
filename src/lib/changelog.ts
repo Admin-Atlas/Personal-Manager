@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.107.1-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "PM now stops instead of guessing when it can’t read your saved keys. If your login keychain is locked, or the entry PM keeps its secrets in is damaged, PM used to see “no keys saved” and helpfully create a new database key — writing over the only key to your vault. It now tells the difference between “nothing saved yet” and “can’t read what’s saved”, leaves your vault exactly as it is, and offers Retry. On a Mac it also no longer asks for your keychain password again and again if you dismiss the prompt once.",
+    ],
+  },
+  {
     version: "3.107.0-alpha",
     date: "2026-07-28",
     highlights: [
