@@ -522,6 +522,7 @@ export function ProjectView({
           <QueuedMessages
             queued={chat.queue.queued}
             stalled={chat.queue.stalled}
+            failedId={chat.queue.failedId}
             onRemove={chat.queue.remove}
             onEdit={chat.queue.edit}
             onHold={chat.queue.hold}
@@ -530,7 +531,9 @@ export function ProjectView({
           <Composer
             // Deliberately NOT `chat.sending` — typing ahead is the feature (#152). The composer
             // refuses only when the queue is full, the one case where accepting would drop the text.
+            // `sending` drives the WORDING instead: Enter queues rather than sends mid-answer.
             disabled={chat.queue.full}
+            busy={chat.sending}
             onSend={(text) => chat.queue.enqueue(text)}
             leftTools={
               <div className="flex items-center gap-2">

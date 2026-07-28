@@ -165,3 +165,29 @@ describe("the @ suggestion list", () => {
     expect(onSend).toHaveBeenCalledWith("just a question");
   });
 });
+
+// What Enter does changes mid-answer — it queues instead of sending (#152) — and for one release the
+// box said "Ask anything…" either way. An input that silently changes meaning and looks identical is
+// the thing people report as "it ignored me", so the wording is pinned here.
+describe("what the box says it will do", () => {
+  it("offers to queue while a reply is streaming", () => {
+    render(<Composer disabled={false} busy onSend={vi.fn()} />);
+    expect(screen.getByPlaceholderText(/Queue a message/)).toBeTruthy();
+    expect(screen.queryByPlaceholderText(/Ask anything/)).toBeNull();
+    // The button too: it is the other half of the same promise.
+    expect(screen.getByRole("button", { name: "Queue" })).toBeTruthy();
+  });
+
+  it("offers to send when nothing is in flight", () => {
+    render(<Composer disabled={false} onSend={vi.fn()} />);
+    expect(screen.getByPlaceholderText(/Ask anything/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+  });
+
+  // The one state where the box genuinely refuses. Saying "queue a message" into a disabled box
+  // would be an offer PM is not making.
+  it("says why it is refusing when the queue is full", () => {
+    render(<Composer disabled busy onSend={vi.fn()} />);
+    expect(screen.getByPlaceholderText(/Waiting for the queue to clear/)).toBeTruthy();
+  });
+});

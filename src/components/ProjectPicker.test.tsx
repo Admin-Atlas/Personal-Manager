@@ -23,9 +23,9 @@ function setup(value: string[]) {
 }
 
 describe("ProjectPicker", () => {
-  it("the primary project has no remove control, so a document can never end up with none", () => {
+  it("the only project has no remove control, so a document can never end up with none", () => {
     setup(["Sales"]);
-    expect(screen.queryByLabelText("Unlink from Sales")).toBeNull();
+    expect(screen.queryByLabelText(/Unlink from Sales|Remove Sales/)).toBeNull();
     // It is still labelled, so the user can see WHICH one is primary.
     expect(screen.getAllByText(/Primary/).length).toBeGreaterThan(0);
   });
@@ -34,6 +34,35 @@ describe("ProjectPicker", () => {
     const onChange = setup(["Sales", "Marketing"]);
     fireEvent.click(screen.getByLabelText("Unlink from Marketing"));
     expect(onChange).toHaveBeenCalledWith(["Sales"]);
+  });
+
+  // Changing where a document is really filed. The picker only reorders — `value[0]` is the home,
+  // and both call sites write the list back as `[project, ...also_projects]` — so these assertions
+  // are about ORDER, which is the whole mechanism.
+  describe("changing the primary", () => {
+    it("promotes a linked project when its name is clicked", () => {
+      const onChange = setup(["Sales", "Marketing"]);
+      fireEvent.click(screen.getByLabelText("Make Marketing the primary project"));
+      expect(onChange).toHaveBeenCalledWith(["Marketing", "Sales"]);
+    });
+
+    it("keeps the others, in order, when promoting from the middle", () => {
+      const onChange = setup(["Sales", "Marketing", "Ops"]);
+      fireEvent.click(screen.getByLabelText("Make Ops the primary project"));
+      expect(onChange).toHaveBeenCalledWith(["Ops", "Sales", "Marketing"]);
+    });
+
+    // What Bobby expected to already happen, and the reason the primary carries an × at all.
+    it("removing the primary promotes the next one rather than refusing", () => {
+      const onChange = setup(["Sales", "Marketing"]);
+      fireEvent.click(screen.getByLabelText("Remove Sales; Marketing becomes the primary project"));
+      expect(onChange).toHaveBeenCalledWith(["Marketing"]);
+    });
+
+    it("offers no promote control on the primary itself — it is already primary", () => {
+      setup(["Sales", "Marketing"]);
+      expect(screen.queryByLabelText("Make Sales the primary project")).toBeNull();
+    });
   });
 
   it("keeps the casing the user typed — downcasing would stop a name resolving to its project", () => {

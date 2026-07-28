@@ -24,13 +24,24 @@ import { Button } from "./ui";
 interface Props {
   queued: QueuedMessage[];
   stalled: boolean;
+  /** The message that failed, while it is still waiting — see `SendQueue.failedId`. Once the user
+   *  takes it back there is nothing left to retry, only the rest to get on with. */
+  failedId: number | null;
   onRemove: (id: number) => void;
   onEdit: (id: number, text: string) => void;
   onHold: (on: boolean) => void;
   onResume: () => void;
 }
 
-export function QueuedMessages({ queued, stalled, onRemove, onEdit, onHold, onResume }: Props) {
+export function QueuedMessages({
+  queued,
+  stalled,
+  failedId,
+  onRemove,
+  onEdit,
+  onHold,
+  onResume,
+}: Props) {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -127,11 +138,16 @@ export function QueuedMessages({ queued, stalled, onRemove, onEdit, onHold, onRe
       </ul>
       {stalled && (
         <div className="mt-1 flex items-center gap-2">
+          {/* Two different situations, and the same sentence would be wrong in one of them. While
+              the failed message is still here, the offer is to retry IT. Once the user has taken it
+              back, there is nothing that didn't send any more — only the rest, waiting on a word. */}
           <p className="flex-1 text-xs text-[var(--st-due)]">
-            That didn&rsquo;t send, so the rest are still waiting.
+            {failedId !== null
+              ? "That didn’t send, so the rest are still waiting."
+              : "The rest are still waiting."}
           </p>
           <Button variant="tertiary" onClick={onResume}>
-            Try again
+            {failedId !== null ? "Try again" : "Continue queue"}
           </Button>
         </div>
       )}

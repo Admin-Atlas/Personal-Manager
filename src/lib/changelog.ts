@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.107.0-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "You can change which project a document really belongs to. Click any linked project to make it the primary one, or remove the primary and the next in line takes over. The primary pill had no controls at all before, so a document filed somewhere you didn’t intend was something you could see and not correct.",
+      "Teach → Tags is back on the normal display setting. Renaming a tag, folding near-duplicates and the whole re-tag pass were only drawn on the Power setting — which isn’t the default — so the repair the last two updates asked you to run sat on a screen most people never see.",
+      "The message box says when it will queue. While PM is answering it reads “Queue a message…” and the button says Queue, so pressing Enter mid-answer looks like what it is rather than like being ignored.",
+      "Turning the duplicate check on now works from wherever you are. Switching it on in Settings while looking at Documents left that tab unchanged until you navigated away and came back; the “Check for duplicates” action now appears as soon as Settings closes. The one-time suggestion also stays gone once you’ve acted on it, instead of returning if you ever switch the check off.",
+      "If a message fails to send and you delete it, PM stops offering to try that message again. It says the rest are still waiting and offers Continue queue — the same two choices as before, worded for what is actually left.",
+      "Searching for a tag the way PM writes it now finds something. @“Atlas, Inc.” — the form PM’s own @ menu inserts for a name with a space in it — matched nothing in search, and only the first @ in a search was understood.",
+    ],
+  },
+  {
     version: "3.106.3-alpha",
     date: "2026-07-28",
     highlights: [
