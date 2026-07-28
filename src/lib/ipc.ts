@@ -34,6 +34,7 @@ import type {
   DriveAccount,
   DriveFolder,
   DriveScope,
+  DuplicateReport,
   DriveStatus,
   DriveSyncState,
   Entity,
@@ -198,6 +199,15 @@ export const packageManagedLinux = () => invoke<boolean>("package_managed_linux"
 /** Turn query-time reranking on/off (a cross-encoder re-scores search hits). Stateless — never
  *  triggers a Rebuild; the effect lands on the next query. */
 export const setReranking = (enabled: boolean) => invoke<void>("set_reranking", { enabled });
+
+/** Offer the duplicate check in the Documents view, or stop offering it (#282). Gates the offer
+ *  only — scanning is always something the user asks for, so turning this on starts nothing. */
+export const setDuplicateCheck = (enabled: boolean) =>
+  invoke<void>("set_duplicate_check", { enabled });
+
+/** Scan the whole library for documents held twice (#282), by identical opening text and by
+ *  near-identical embeddings. On demand only, and it reports — nothing is deleted or merged. */
+export const scanDuplicates = () => invoke<DuplicateReport>("scan_duplicates");
 
 /** Set the indexing-speed preference: "fast" (max throughput) or "gentle" (paced for low-end
  *  machines). Applies to the next Drive sync / file import. */

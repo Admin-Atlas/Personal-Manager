@@ -46,6 +46,9 @@ export interface Settings {
   /** The effective confidence-gate threshold — the minimum top rerank score for PM to trust its
    *  grounding — or null when a dev has disabled the gate. On by default; tuned in Developer mode (#402). */
   retrieval_confidence_threshold: number | null;
+  /** Whether the Documents view offers the duplicate check (#282). Default off; scanning is always
+   *  on demand, so this gates the offer, never a background pass. */
+  duplicate_check: boolean;
 }
 
 /** One search-language / embedder choice offered at vault creation. */
@@ -1697,4 +1700,25 @@ export interface PullProgress {
   completed_bytes: number | null;
   total_bytes: number | null;
   done: boolean;
+}
+
+/** Two documents PM believes are the same thing, and why; mirrors `duplicates::DuplicatePair`.
+ *  Each side is a full `Document` so a duplicate renders with the same row and badges as the list. */
+export interface DuplicatePair {
+  a: Document;
+  b: Document;
+  /** Their openings are identical once case, punctuation and whitespace are folded away. */
+  same_opening: boolean;
+  /** Cosine of their first-chunk embeddings, when it cleared the near-duplicate threshold. */
+  similarity: number | null;
+}
+
+/** What one duplicate scan found — and what it did not do; mirrors `duplicates::DuplicateReport`. */
+export interface DuplicateReport {
+  scanned: number;
+  pairs: DuplicatePair[];
+  /** The library was past `similarity_limit`, so only the opening-text signal ran. Surfaced rather
+   *  than swallowed: "nothing found" from a half-run scan is a claim PM hasn't earned. */
+  similarity_skipped: boolean;
+  similarity_limit: number;
 }

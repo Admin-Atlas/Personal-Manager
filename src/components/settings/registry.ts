@@ -131,6 +131,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
         Icon: DataIcon,
         sections: [
           { id: "sec-data-applock", label: "App lock" },
+          { id: "sec-data-duplicates", label: "Duplicate check" },
           { id: "sec-data-data", label: "Data" },
           { id: "sec-data-vault", label: "Vault" },
           { id: "sec-data-remove", label: "Remove data" },

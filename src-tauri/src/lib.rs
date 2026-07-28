@@ -26,6 +26,7 @@ mod context_budget;
 mod cost;
 mod db;
 mod drive;
+mod duplicates;
 mod entities;
 mod error;
 // Pure model-fit scoring (#296): sizes a model against a machine's memory and picks the best
@@ -1314,6 +1315,8 @@ pub fn run() {
             settings::set_background_auto_switch,
             settings::set_help_mode,
             settings::set_reranking,
+            settings::set_duplicate_check,
+            duplicates::scan_duplicates,
             settings::set_retrieval_k,
             settings::set_retrieval_confidence_threshold,
             settings::ai_provider_status,

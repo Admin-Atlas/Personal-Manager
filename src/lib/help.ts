@@ -407,6 +407,14 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Folder sync results",
     body: "A summary of the last folder scan — how many files were indexed, updated, or dropped, and any that couldn't be read (an unsupported type, or a permission error). Skipped files don't block the rest; sync again to retry. Files removed on disk are kept findable but marked 'source missing'.",
   },
+  "settings-duplicates": {
+    title: "Duplicate check",
+    body: "Adds a 'Check for duplicates' action to your Documents list. It runs only when you ask, and looks two ways: it compares the opening of each document with capitals, punctuation and spacing ignored, so the same file that reached PM by two different routes still matches; and it compares what each document is about, which catches the same report saved as both a Word file and a PDF. It always shows you both documents, side by side, and never removes anything — removing is a separate click on one named document. Some pairs won't be duplicates at all: anything built from a template shares an opening, and a run of invoices reads very alike, which is why this is off unless you turn it on.",
+  },
+  "documents-duplicates": {
+    title: "Checking for duplicates",
+    body: "Looks through your whole library for documents that appear twice — the same file imported more than once, or one you hold locally that also lives in a connected account. Each pair says why PM flagged it: 'start identically' is a fact about the text, 'read very alike' is a judgement, and both together is as sure as it gets. Open either document to check before you act. 'Remove this one' names the document it removes and leaves the other alone; for something in a connected account, PM drops only its own pointer and never touches the file at the provider. On a very large library PM compares openings only and tells you so, rather than reporting a clean result it didn't earn.",
+  },
   "settings-data": {
     title: "Data",
     body: "Everything you keep in PM lives in one folder named 'Personal Manager' — the Markdown vault of your documents plus the encrypted store (settings, pinboard, and the search index). Your documents in the vault are stored unencrypted so any tool can read them; their at-rest protection relies on your OS full-disk encryption (BitLocker on Windows, FileVault on macOS), so turn that on. 'Open data folder' reveals it in your file manager so you can copy or back it up by hand. 'Export all data' bundles the vault and the store into a single .zip you choose where to save; the regenerable runtime (the local model environment) is left out, and the store stays encrypted inside the archive.",

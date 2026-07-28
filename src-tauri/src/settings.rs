@@ -50,6 +50,13 @@ const APP_LOCK_ENABLED_KEY: &str = "app_lock_enabled";
 /// (settings is key/value). Existing keyed users never set it — they pass the gate on the cloud key.
 pub(crate) const ONBOARDING_DONE_KEY: &str = "onboarding_done";
 
+/// Whether the duplicate check is offered in the Documents view ("true"/"false", **default off**,
+/// #282). Off by default because both of its signals produce false pairs by construction — a
+/// templated document shares an opening, a run of invoices embeds alike — so PM should not put
+/// "these may be the same" in front of someone who never asked. Lives in `settings` rather than
+/// localStorage: it is about this library's contents, so it belongs to the vault, not the machine.
+const DUPLICATE_CHECK_KEY: &str = "duplicate_check_enabled";
+
 #[derive(Serialize)]
 pub struct Settings {
     /// Ordered preferred models for chat (user-facing) and background work
@@ -78,6 +85,9 @@ pub struct Settings {
     /// grounding — or `None` when a dev has disabled the gate. ON by default (card #402); the value and
     /// on/off are tuned by the Developer-mode control. See [`db::retrieval_confidence_threshold`].
     pub retrieval_confidence_threshold: Option<f32>,
+    /// Whether the Documents view offers the duplicate check (#282). Default off; scanning is always
+    /// on demand, so this gates the offer, never a background pass.
+    pub duplicate_check: bool,
 }
 
 impl Settings {
@@ -98,6 +108,7 @@ impl Settings {
             indexing_speed: "fast".to_string(),
             retrieval_k: crate::retrieval::DEFAULT_TOP_K,
             retrieval_confidence_threshold: Some(db::DEFAULT_CONFIDENCE_THRESHOLD),
+            duplicate_check: false,
         }
     }
 }
@@ -117,7 +128,16 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
             .unwrap_or_else(|| "fast".into()),
         retrieval_k: db::retrieval_k(&conn),
         retrieval_confidence_threshold: db::retrieval_confidence_threshold(&conn),
+        duplicate_check: db::get_bool(&conn, DUPLICATE_CHECK_KEY, false)?,
     })
+}
+
+/// Offer the duplicate check in the Documents view, or stop offering it (#282). Gates the offer
+/// only — scanning is always something the user asks for, so turning this on starts nothing.
+#[tauri::command]
+pub fn set_duplicate_check(state: State<'_, AppState>, enabled: bool) -> Result<()> {
+    let conn = state.conn()?;
+    db::set_bool(&conn, DUPLICATE_CHECK_KEY, enabled)
 }
 
 /// The out-of-the-box default for every setting — the values the reset-to-default flow (#445)
