@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.106.3-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "A rule PM enforces on itself now describes itself accurately. PM requires every outside package used by its build scripts to be named, justified, and pinned to one exact version. The written rule still said a single package had ever been allowed through — there are two — and it never mentioned that the second one carries an exemption from the exact-version part, or that an exemption has to state its own reason before the check will accept it. All of that is now written down. The automated check was right the whole time; only the description of it had fallen behind.",
+      "Nothing about PM behaves differently. It matters because a rule whose own wording can't be trusted is a rule that quietly stops being followed.",
+    ],
+  },
+  {
     version: "3.106.2-alpha",
     date: "2026-07-28",
     highlights: [
