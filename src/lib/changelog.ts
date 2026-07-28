@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.104.1-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "Fixed the whole window sliding up out of view after sending a message. Snapping to the newest reply was scrolling the entire app rather than just the conversation, and nothing scrolled it back.",
+    ],
+  },
+  {
     version: "3.104.0-alpha",
     date: "2026-07-28",
     highlights: [

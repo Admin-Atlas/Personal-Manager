@@ -24,7 +24,7 @@ interface Props {
 export function QueuedMessages({ queued, stalled, onRemove, onResume }: Props) {
   if (queued.length === 0) return null;
   return (
-    <div className="mx-auto w-full max-w-3xl px-2 pb-1" data-help="chat-queue">
+    <div className="mx-auto w-full max-w-3xl shrink-0 px-2 pb-1" data-help="chat-queue">
       {/* Polite, not assertive: these appear while a reply is streaming, and an assertive region
           would interrupt the reply being read out. */}
       <ul aria-live="polite" className="flex flex-col gap-1">
