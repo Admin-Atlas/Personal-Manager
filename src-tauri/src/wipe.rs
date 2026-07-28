@@ -17,8 +17,18 @@
 //!      selected, PM first **revokes** each Google grant at Google's end; Microsoft has no equivalent
 //!      revoke endpoint for a public desktop client, so its accounts are returned for a "finish at
 //!      account.microsoft.com" link and only the local tokens are deleted.
-//!   4. **Browser local storage** — handled entirely in the webview (`localStorage.clear()`), so it
-//!      isn't part of this backend command.
+//!   4. **Interface preferences & webview data** — the webview clears its own `localStorage`, then
+//!      this command removes the OS-level store behind it. On macOS that store is a set of real
+//!      directories the app never owned a handle to (`~/Library/WebKit/<id>`, plus caches, cookies,
+//!      saved window state and the `NSUserDefaults` plist — [`paths::macos_app_leftovers`]), so
+//!      `localStorage.clear()` alone left a reinstall remembering dev mode and the last-seen
+//!      version. Windows keeps the equivalent inside the webview folder, which is in use while PM
+//!      runs and is purged by the uninstaller instead.
+//!
+//! **Removing PM itself is not the same act on every platform**, and this module no longer pretends
+//! it is: Windows launches the NSIS uninstaller, macOS has none (the user moves the `.app` to the
+//! Trash — PM only offers to reveal it), and Linux leaves the binary to the package manager. See
+//! [`FinishStep`].
 //!
 //! Backups are intentionally NOT touched here: local `.pmbackup` files and any Proton/Google Drive
 //! destination are separate, and the UI directs the user to remove those at the source.
@@ -46,7 +56,6 @@ use crate::{google, paths, secrets, vault, AppState};
 pub const RESTORE_STAGING_DIR: &str = "restored-vaults";
 
 /// Which classes of data to remove. Mirrors the four checkboxes; `camelCase` to match the webview.
-/// `local_storage` is cleared in the frontend, so it isn't represented here.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WipeSelection {
@@ -56,6 +65,32 @@ pub struct WipeSelection {
     pub vault_and_db: bool,
     /// Every keychain secret; implies revoking Google grants + reporting Microsoft accounts.
     pub keychain: bool,
+    /// Interface preferences. The webview clears its own `localStorage` before calling in; this
+    /// flag is what lets the backend also remove the OS-level store BEHIND it, which on macOS is a
+    /// real directory (`~/Library/WebKit/<id>`) that `localStorage.clear()` cannot reach on its own.
+    /// A no-op on Windows/Linux, where the equivalent folder is in use while PM runs and is left to
+    /// the uninstaller.
+    #[serde(default)]
+    pub local_storage: bool,
+}
+
+/// What the user must still do to remove PM *itself* once its data is gone. The platforms diverge
+/// completely here, and the UI used to assume the Windows answer — so a Mac, where
+/// `launch_uninstaller` always fails, was told to "finish uninstalling PM from Windows Settings".
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum FinishStep {
+    /// Not a full purge — PM stays installed and there is nothing further to do.
+    #[default]
+    None,
+    /// Windows: PM launches the NSIS uninstaller, which removes the program files and the leftover
+    /// data + webview folders via the marker armed during the wipe.
+    WindowsUninstaller,
+    /// macOS: there is no uninstaller. Everything PM wrote is gone, but the `.app` bundle is the
+    /// user's to move to the Trash; PM offers to reveal it in Finder.
+    MacosDragToTrash,
+    /// Linux: the package manager (deb/rpm) or the AppImage file owns the binary.
+    ManualRemoval,
 }
 
 /// The outcome, surfaced in the "done" summary. All counts are best-effort.
@@ -83,6 +118,11 @@ pub struct WipeReport {
     /// NSIS uninstaller (which purges the leftover data + webview folders via the marker armed here)
     /// so nothing of PM remains on the machine.
     pub full_purge: bool,
+    /// How the user finishes removing PM itself — see [`FinishStep`]. Set only on a full purge.
+    pub finish_step: FinishStep,
+    /// OS-written leftovers removed from outside the data dir (macOS only). Reported so the summary
+    /// can be specific instead of implying a clean sweep it may not have made.
+    pub os_leftovers_removed: usize,
 }
 
 /// One connected OAuth account, reduced to what the wipe needs: its keychain token key, whether it's
@@ -403,12 +443,20 @@ async fn revoke_google_grants(plan: &KeychainWipePlan, report: &mut WipeReport) 
 /// marker, still keeps user data for a reinstall), remove the data dir now, and flag the report so
 /// the UI launches the uninstaller. Best-effort throughout — the uninstaller hook is the backstop.
 fn arm_full_uninstall(app: &AppHandle, report: &mut WipeReport) {
-    // The marker lives in the webview folder (which survives the app deleting its own data dir).
-    if let Ok(marker) = paths::uninstall_purge_marker(app) {
-        if let Some(parent) = marker.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    // The marker exists for exactly one reader: the NSIS uninstaller's post-uninstall hook. That
+    // hook is Windows-only, as is `launch_uninstaller`, so writing the marker anywhere else created
+    // a file nothing would ever read — on macOS it even re-created
+    // `~/Library/Application Support/org.itsatlas.pm/` moments after the wipe had removed it, then
+    // reported a full purge. Gated, so the leftover sweep below is the last word off Windows.
+    #[cfg(target_os = "windows")]
+    {
+        // The marker lives in the webview folder (which survives the app deleting its own data dir).
+        if let Ok(marker) = paths::uninstall_purge_marker(app) {
+            if let Some(parent) = marker.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&marker, b"PM full-uninstall purge marker\n");
         }
-        let _ = std::fs::write(&marker, b"PM full-uninstall purge marker\n");
     }
     // Remove the `Personal Manager` data dir itself — it's entirely PM-owned (a relocated vault
     // lives elsewhere and was handled by the vault branch), so unlike a user-chosen relocation root
@@ -418,6 +466,34 @@ fn arm_full_uninstall(app: &AppHandle, report: &mut WipeReport) {
         remove_dir_all_retrying(&data_dir);
     }
     report.full_purge = true;
+}
+
+/// Remove the OS-written leftovers that live outside the data dir (macOS only — see
+/// [`paths::macos_app_leftovers`]). Returns how many existed and were removed, so the summary can
+/// say something true rather than claiming a clean sweep it did not make.
+///
+/// Best-effort per entry, like the rest of the wipe: one stubborn path must not abort the others.
+fn remove_os_leftovers(app: &AppHandle, report: &mut WipeReport) -> usize {
+    let mut removed = 0usize;
+    for path in paths::macos_app_leftovers(app) {
+        if !path.exists() {
+            continue;
+        }
+        report.freed_bytes += if path.is_dir() {
+            dir_size(&path)
+        } else {
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+        };
+        if path.is_dir() {
+            remove_dir_all_retrying(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        if !path.exists() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Boot-time GC of abandoned restore staging. Each `restored-vaults/restore-*` folder holds a full,
@@ -562,14 +638,81 @@ pub async fn wipe_pm_data(
 
     // --- 5. A full wipe (every class) removes PM itself: arm the uninstaller to purge the leftover
     //        data + webview folders once PM exits, and clear the data dir now. ---
-    if selection.regenerable && selection.vault_and_db && selection.keychain {
+    let full = selection.regenerable && selection.vault_and_db && selection.keychain;
+    if full {
         arm_full_uninstall(&app, &mut report);
+    }
+
+    // --- 6. The OS-written leftovers outside the data dir (macOS). Driven by the preferences
+    //        checkbox — they ARE this app's preferences and webview store — and unconditionally on a
+    //        full purge, so "remove PM completely" means it. LAST, because `arm_full_uninstall`
+    //        recreates one of these paths on Windows and we must not race it, and because the
+    //        webview is still live: the frontend clears `localStorage` BEFORE calling in, so there
+    //        is nothing left for WKWebView to flush back over the top of this. ---
+    if selection.local_storage || full {
+        report.os_leftovers_removed = remove_os_leftovers(&app, &mut report);
+        if report.os_leftovers_removed > 0 {
+            report.removed.push("App preferences & webview data".into());
+            report.quit_required = true;
+        }
+    }
+
+    // How the user finishes removing PM itself. Resolved here, in the one place that knows the wipe
+    // was total, rather than left to the UI to infer from the platform.
+    if full {
+        report.finish_step = if cfg!(target_os = "windows") {
+            FinishStep::WindowsUninstaller
+        } else if cfg!(target_os = "macos") {
+            FinishStep::MacosDragToTrash
+        } else {
+            FinishStep::ManualRemoval
+        };
     }
 
     if report.removed.is_empty() {
         return Err(Error::Other("Nothing was selected to remove.".into()));
     }
     Ok(report)
+}
+
+/// Reveal PM's own `.app` bundle in Finder, selected, so the user can drag it to the Trash — the
+/// macOS end of a full wipe, where there is no uninstaller to launch.
+///
+/// PM deliberately does NOT delete itself. A self-delete is unrecoverable outside the Trash and
+/// fails in ways the user cannot see (app translocation, a bundle in a read-only location, or
+/// `/Applications` wanting admin), so the last step stays a deliberate act by the person doing it.
+#[tauri::command]
+pub fn reveal_app_in_finder() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // …/PM.app/Contents/MacOS/PM → …/PM.app
+        let exe = std::env::current_exe()
+            .map_err(|e| Error::Other(format!("couldn't locate the app: {e}")))?;
+        let bundle = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .filter(|p| p.extension().is_some_and(|e| e == "app"))
+            .ok_or_else(|| {
+                Error::Other(
+                    "PM isn't running from an app bundle, so there's nothing to reveal — your data \
+                     is already removed."
+                        .into(),
+                )
+            })?;
+        std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(bundle)
+            .spawn()
+            .map_err(|e| Error::Other(format!("couldn't open Finder: {e}")))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(Error::Other(
+            "Revealing the app in Finder is a macOS step.".into(),
+        ))
+    }
 }
 
 /// Whether a carried boot open-error message denotes a genuine, non-transient brick — a wrong key or
@@ -728,6 +871,58 @@ pub async fn confirm_wipe_identity(window: tauri::WebviewWindow) -> Result<bool>
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn macos_leftovers_name_every_place_the_os_writes_for_us() {
+        // These paths are the whole fix: each one is a place a wipe used to miss. Asserted by exact
+        // shape because nothing on Windows CI can observe them, and a typo here is silent — the
+        // wipe would simply skip a path that does not exist and report success.
+        let home = Path::new("/Users/someone");
+        let got = paths::macos_leftovers_in(home, "org.itsatlas.pm");
+        let want = [
+            "/Users/someone/Library/Application Support/org.itsatlas.pm",
+            "/Users/someone/Library/WebKit/org.itsatlas.pm",
+            "/Users/someone/Library/Caches/org.itsatlas.pm",
+            "/Users/someone/Library/HTTPStorages/org.itsatlas.pm",
+            "/Users/someone/Library/Preferences/org.itsatlas.pm.plist",
+            "/Users/someone/Library/Saved Application State/org.itsatlas.pm.savedState",
+        ];
+        let got: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(got, want, "the macOS leftover set must not drift");
+
+        // The three Bobby hit by hand, named individually so a regression says which one went.
+        for must in [
+            "Library/WebKit/org.itsatlas.pm",
+            "Library/Caches/org.itsatlas.pm",
+            "Library/Preferences/org.itsatlas.pm.plist",
+        ] {
+            assert!(
+                got.iter().any(|p| p.ends_with(must)),
+                "{must} must be removed by Remove PM data"
+            );
+        }
+    }
+
+    #[test]
+    fn leftovers_are_keyed_to_the_bundle_identifier_not_a_hardcoded_name() {
+        // The identifier is a one-way door (renaming it orphans the keychain), so the wipe reads it
+        // rather than repeating it — otherwise the two could drift and the sweep would miss silently.
+        let got = paths::macos_leftovers_in(Path::new("/h"), "com.example.other");
+        assert!(got
+            .iter()
+            .all(|p| p.to_string_lossy().contains("com.example.other")));
+        assert!(!got.iter().any(|p| p.to_string_lossy().contains("itsatlas")));
+    }
+
+    #[test]
+    fn the_finish_step_is_only_set_by_a_total_wipe() {
+        // Default must be None: a partial wipe leaves PM installed, and offering "drag me to the
+        // Trash" after clearing only the downloaded components would be wrong on every platform.
+        assert_eq!(WipeReport::default().finish_step, FinishStep::None);
+    }
 
     #[test]
     fn a_detached_shared_vaults_cached_key_is_named_by_the_wipe() {

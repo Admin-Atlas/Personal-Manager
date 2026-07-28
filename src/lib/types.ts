@@ -89,7 +89,23 @@ export interface WipeSelection {
   vaultAndDb: boolean;
   /** Every OS-keychain secret; implies revoking Google grants + reporting Microsoft accounts. */
   keychain: boolean;
+  /** Interface preferences. The webview clears its own `localStorage` first; this tells the backend
+   *  to also remove the OS-level store behind it (on macOS a set of real `~/Library` directories
+   *  `localStorage.clear()` can't reach). A no-op on Windows/Linux. */
+  localStorage: boolean;
 }
+
+/** What the user must still do to remove PM *itself* after a full wipe — the platforms diverge
+ *  completely, so the backend decides rather than the UI guessing. */
+export type FinishStep =
+  /** Not a full purge; PM stays installed. */
+  | "none"
+  /** Windows: launch the NSIS uninstaller, which clears the program files and the leftovers. */
+  | "windowsUninstaller"
+  /** macOS: no uninstaller exists — the user drags the `.app` to the Trash. */
+  | "macosDragToTrash"
+  /** Linux: the package manager or the AppImage file owns the binary. */
+  | "manualRemoval";
 
 /** What a wipe actually did, for the "done" summary. All counts are best-effort. */
 export interface WipeReport {
@@ -108,9 +124,12 @@ export interface WipeReport {
   keychainDeleted: number;
   /** True when the store or keychain was touched, so the app can't keep running and must close. */
   quitRequired: boolean;
-  /** True when EVERY class was removed — a "remove PM completely" wipe. The UI then launches the
-   *  Windows uninstaller so nothing of PM remains on the machine. */
+  /** True when EVERY class was removed — a "remove PM completely" wipe. */
   fullPurge: boolean;
+  /** How the user finishes removing PM itself; `"none"` unless this was a full purge. */
+  finishStep: FinishStep;
+  /** OS-written leftovers removed from outside the data dir (macOS only). */
+  osLeftoversRemoved: number;
 }
 
 // --- Shared & portable vaults (spec §2–6) ---

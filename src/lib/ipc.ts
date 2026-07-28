@@ -1357,6 +1357,12 @@ export const resetAfterOpenError = () => invoke<void>("reset_after_open_error");
  *  non-Windows or a dev build with no installed uninstaller — the data is already gone regardless. */
 export const launchUninstaller = () => invoke<void>("launch_uninstaller");
 
+/** Reveal PM's own `.app` bundle in Finder, selected, so the user can drag it to the Trash — the
+ *  macOS end of a full wipe, where there's no uninstaller to launch. PM never deletes itself: a
+ *  self-delete fails invisibly under app translocation or from a read-only location, so the last
+ *  step stays the user's. Rejects off macOS. */
+export const revealAppInFinder = () => invoke<void>("reveal_app_in_finder");
+
 // --- Encrypted backup (Proton Drive / user cloud) — PR1 local `.pmbackup` archive + restore ---
 
 /** Create an encrypted, portable `.pmbackup` at `destPath`, protected by `passphrase`. Runs detached;

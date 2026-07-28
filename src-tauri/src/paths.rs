@@ -61,12 +61,63 @@ pub fn venv_dir(app: &AppHandle) -> Result<PathBuf> {
 /// `localStorage`/IndexedDB). It sits OUTSIDE the "Personal Manager" data dir, under the
 /// bundle identifier, so a "remove PM completely" flow has to clear it too. The identifier is
 /// fixed (`org.itsatlas.pm`; renaming it orphans the keychain — see [`data_dir`]).
+///
+/// **Windows-shaped, despite resolving everywhere.** On macOS this is
+/// `~/Library/Application Support/<identifier>`, which is NOT the webview store — WKWebView keeps
+/// `localStorage` under `~/Library/WebKit/<identifier>` — and on Linux it is not the WebKitGTK one
+/// either. Treating this as "the webview folder" on those platforms is what left a Mac's
+/// `localStorage` intact through a full wipe; use [`macos_app_leftovers`] there.
 pub fn webview_data_dir(app: &AppHandle) -> Result<PathBuf> {
     let base = app
         .path()
         .local_data_dir()
         .map_err(|e| Error::Other(format!("could not resolve local data dir: {e}")))?;
     Ok(base.join(&app.config().identifier))
+}
+
+/// Everything macOS writes on PM's behalf OUTSIDE the data dir, keyed by the bundle identifier.
+///
+/// **Why this list has to exist at all.** [`webview_data_dir`] resolves to
+/// `~/Library/Application Support/<identifier>` on macOS — and its doc describes the *Windows*
+/// WebView2 layout (`%LOCALAPPDATA%\<identifier>\EBWebView`) as though it were universal. It is not:
+/// WKWebView keeps this app's `localStorage` under `~/Library/WebKit/<identifier>/WebsiteData`, and
+/// the OS scatters caches, cookies, saved window state and the `NSUserDefaults` plist across four
+/// more places. None of them was ever removed, so "Remove PM data" left the dev-mode flag and the
+/// last-seen-version marker behind and a reinstall did not look like a fresh install.
+///
+/// Pure and separated from the [`AppHandle`] so the path shapes — the part that can be wrong, and
+/// the part a Windows CI can still check — are unit-tested. Order is stable for the tests; the
+/// caller removes best-effort, so a path that does not exist is simply skipped.
+pub fn macos_leftovers_in(home: &Path, identifier: &str) -> Vec<PathBuf> {
+    let library = home.join("Library");
+    vec![
+        // PM-owned, and where the (Windows-only) uninstall marker used to be dropped.
+        library.join("Application Support").join(identifier),
+        // The WKWebView store: localStorage, IndexedDB, service workers. The actual reason a
+        // reinstall remembered dev mode.
+        library.join("WebKit").join(identifier),
+        library.join("Caches").join(identifier),
+        library.join("HTTPStorages").join(identifier),
+        library
+            .join("Preferences")
+            .join(format!("{identifier}.plist")),
+        library
+            .join("Saved Application State")
+            .join(format!("{identifier}.savedState")),
+    ]
+}
+
+/// [`macos_leftovers_in`] resolved against the real home dir and bundle identifier. Empty on every
+/// other platform, so callers need no `cfg` — Windows keeps these leftovers inside
+/// [`webview_data_dir`], which the NSIS uninstaller already purges, and Linux writes none of them.
+pub fn macos_app_leftovers(app: &AppHandle) -> Vec<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    match app.path().home_dir() {
+        Ok(home) => macos_leftovers_in(&home, &app.config().identifier),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Filename of the marker a full "remove PM completely" wipe drops in [`webview_data_dir`] so the

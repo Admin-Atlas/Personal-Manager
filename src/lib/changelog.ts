@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.108.0-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "On a Mac, “Remove PM data” now actually removes everything. macOS keeps a surprising amount on an app’s behalf outside its own folder — the window’s stored preferences, cached web data, cookies and saved window state — and PM had never cleared any of it. So a Mac reinstall quietly remembered things a fresh install shouldn’t, like whether you’d turned on developer mode. Tick “App preferences” and those are gone too.",
+      "PM also stops giving Mac users Windows instructions. It used to finish by telling you to uninstall from “Windows Settings → Apps”, which doesn’t exist on a Mac — and there’s no uninstaller there either. It now says what’s actually true: your data is gone, and the last step is to drag PM from Applications to the Trash. There’s a button to open Finder with it selected. PM won’t delete itself — that stays your call.",
+    ],
+  },
+  {
     version: "3.107.1-alpha",
     date: "2026-07-28",
     highlights: [
