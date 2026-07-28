@@ -49,8 +49,9 @@ tsc:
     npx tsc --noEmit
     npx tsc -p tsconfig.node.json --noEmit
 
-# Frontend unit tests (vitest, scoped to src/lib/** — the pure invariant-bearing modules the audit
-# flagged as guarded by nothing: date formatting, the markdown sanitize allowlist) (T-07).
+# Frontend unit tests (vitest). Started as T-07 over the pure src/lib/** modules the audit flagged as
+# guarded by nothing (date formatting, the markdown sanitize allowlist), and now also covers component
+# tests and scripts/**/*.test.mjs — so "frontend" undersells it; see vitest.config.ts for the globs.
 frontend-test:
     npx vitest run
 

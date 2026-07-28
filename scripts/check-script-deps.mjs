@@ -31,12 +31,22 @@ const read = (rel) => readFileSync(join(repoRoot, rel), "utf8").replace(/\r\n/g,
 
 // ---------------------------------------------------------------------------------------------
 // The allowlist. One entry per (file, specifier). Adding one is the decision; state why.
+//
+// `pinExempt` opts an entry out of the exact-version rule and REQUIRES a reason, so a loosened pin
+// is a visible decision rather than a silent one.
 // ---------------------------------------------------------------------------------------------
 const ALLOWED = [
   {
     file: "scripts/generate-local-catalog.mjs",
     specifier: "@huggingface/gguf",
     why: "Reads MoE expert counts out of a binary GGUF header over HTTP range requests. A maintained format library prevents a correctness bug we cannot cheaply verify by hand; dev-only, never shipped, and the generator is deliberately not part of `just check`.",
+  },
+  {
+    file: "scripts/generate-local-catalog.test.mjs",
+    specifier: "vitest",
+    why: "The repo's existing test runner, reached by a scripts/ test the same way 56 src/ tests reach it. It adds no new dependency — `just frontend-test` already runs this file via a vitest include glob.",
+    pinExempt:
+      "Exact-pinning is the right bar for a format library whose behaviour we cannot verify by hand. It is the wrong bar for the shared test runner: vitest is a repo-wide devDependency on `^`, governed by the normal npm/Dependabot flow and used by every other test in the tree. Pinning it here would let one scripts/ test dictate the whole repo's runner version.",
   },
 ];
 
@@ -138,7 +148,7 @@ for (const entry of ALLOWED) {
 // Direction 3: the exception must still meet the bar it was granted on.
 const pkg = JSON.parse(read("package.json"));
 const EXACT = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
-for (const { specifier } of ALLOWED) {
+for (const { specifier, pinExempt } of ALLOWED) {
   const dev = pkg.devDependencies?.[specifier];
   const prod = pkg.dependencies?.[specifier];
   if (prod !== undefined) {
@@ -148,9 +158,15 @@ for (const { specifier } of ALLOWED) {
   }
   if (dev === undefined && prod === undefined) {
     problems.push(`"${specifier}" is allowed for scripts/ but is not in package.json at all`);
-  } else if (dev !== undefined && !EXACT.test(dev)) {
+  } else if (dev !== undefined && !EXACT.test(dev) && !pinExempt) {
     problems.push(
-      `"${specifier}" is pinned "${dev}" — a scripts/ dependency takes an exact version, no range operator`,
+      `"${specifier}" is pinned "${dev}" — a scripts/ dependency takes an exact version, no range operator (or an explicit \`pinExempt\` reason)`,
+    );
+  }
+  // An exemption with no stated reason is not an exemption, it is an unexplained hole.
+  if (pinExempt !== undefined && String(pinExempt).trim().length < 20) {
+    problems.push(
+      `"${specifier}" sets pinExempt without a real reason — state why the exact-pin rule does not apply`,
     );
   }
 }

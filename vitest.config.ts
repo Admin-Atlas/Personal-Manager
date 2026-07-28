@@ -10,6 +10,10 @@ import react from "@vitejs/plugin-react";
 // The DEFAULT environment stays `node` so the pure suites keep their tiny footprint; the handful of
 // tests that need a DOM opt in per-file with `// @vitest-environment jsdom`, so jsdom is only ever
 // loaded for those. Kept separate from `vite.config.ts` so the Tauri dev/build config stays untouched.
+//
+// It also covers `scripts/**/*.test.mjs` — the build scripts are plain Node and can ride this runner,
+// so the catalog generator's correctness rules get tested without a second harness (and without the
+// extra justfile recipe + pr.yml step a `node --test` suite would have needed).
 export default defineConfig({
   plugins: [react()],
   test: {
@@ -18,6 +22,7 @@ export default defineConfig({
       "src/lib/**/*.test.tsx",
       "src/components/**/*.test.tsx",
       "src/theme/**/*.test.ts",
+      "scripts/**/*.test.mjs",
     ],
     environment: "node",
   },

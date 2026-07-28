@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.106.1-alpha",
+    date: "2026-07-28",
+    highlights: [
+      "The script that builds PM's model list is now tested. It decides the real size of every model PM recommends, and the fit calculator treats those numbers as measured fact — so an error there does not fail loudly, it quietly mis-sizes models against your machine. Nothing checked any of it until now, because the script needs the network and so never ran in CI. Its rules are now unit-tested without touching the network at all: 24 tests covering how it matches a quantization exactly (so “Q6_K” never also claims “Q6_K_L” and inflates a size), how it adds up a split model, how it picks a single vision projector rather than summing spare copies, how it works out a mixture-of-experts model's active size from the file header, and which models it refuses to guess about at all.",
+      "Nothing about PM behaves differently. This is coverage for machinery that already worked.",
+    ],
+  },
+  {
     version: "3.106.0-alpha",
     date: "2026-07-28",
     highlights: [
