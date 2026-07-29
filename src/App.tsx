@@ -101,7 +101,7 @@ import type {
   VaultStatus,
 } from "./lib/types";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { runProposalsAfterSync } from "./lib/reviewProposals";
+import { proposeOnArrival, runProposalsAfterSync } from "./lib/reviewProposals";
 import { onDocumentsLanded } from "./lib/documentFeed";
 import { VaultJoin } from "./components/VaultJoin";
 import { markJustJoinedVault } from "./lib/joinedVault";
@@ -707,16 +707,25 @@ export default function App() {
     }
   }, [aiReady]);
 
-  // When a connector sync finishes, propose filings for whatever it brought in — so the Review tab
-  // is ready when it's opened instead of starting its work then (#513). Triggered here rather than
-  // in the backend because the AI-suggestions switch is a localStorage preference with no backend
-  // consumer (see reviewPrefs.ts); `runProposalsAfterSync` re-reads it, so this listener costs
-  // nothing when suggestions are off. Silent and best-effort — it's a convenience the user didn't
-  // explicitly ask for, so it never raises an error of its own.
+  // Filing suggestions are paid model calls, so both of the things that trigger them live here, at
+  // app scope, where they run whatever tab is open. Triggered in the frontend rather than the backend
+  // because the AI-suggestions switch is a localStorage preference with no backend consumer (see
+  // reviewPrefs.ts); both entry points re-read it, so these listeners cost nothing when suggestions
+  // are off. Silent and best-effort throughout — it's a convenience the user didn't explicitly ask
+  // for at this moment, so it never raises an error of its own.
+  //
+  //   * EVERY DOCUMENT THAT LANDS is proposed for as it arrives, in small batches, so suggestions
+  //     keep pace with the files rather than appearing all at once at the end. This covers the live
+  //     filesystem watcher and drag-and-drop imports too — neither ends in a sync-finished event, so
+  //     under the old wiring those files waited for the next sync (or for Review to be opened)
+  //     before they got a suggestion, for no reason the user could perceive.
+  //   * A SYNC FINISHING sweeps whatever the live path missed — anything queued from a previous
+  //     session, files that landed before a model was linked, a batch that failed mid-drain.
   useEffect(() => {
     if (!aiReady) return;
     let cancelled = false;
     const unlisteners: UnlistenFn[] = [];
+    const offArrivals = onDocumentsLanded(proposeOnArrival);
     const onSync = (e: SyncEvent) => {
       // `finished` now arrives once per RUN, not once per pass, so a sync with a folded-in request
       // no longer proposes twice — the first time over a half-built index.
@@ -735,6 +744,7 @@ export default function App() {
     }
     return () => {
       cancelled = true;
+      offArrivals();
       for (const un of unlisteners) un();
     };
   }, [aiReady]);

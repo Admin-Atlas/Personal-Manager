@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Shared state for AI filing suggestions, lifted out of ReviewView so two things can drive them:
-// the Review tab (an explicit user action) and a connector sync finishing (background convenience).
+// Shared state for AI filing suggestions, lifted out of ReviewView so several things can drive them:
+// the Review tab (an explicit user action), a document LANDING (the live path — see
+// `proposeOnArrival`), and a connector sync finishing (the backstop sweep).
 //
 // Three pieces live here because both callers need all three:
 //   * `proposalCache` — module-level, so leaving and returning to the Review tab never re-bills.
@@ -16,7 +17,7 @@
 
 import { aiProviderStatus, cachedProposals, proposeMetadata, reviewQueue } from "./ipc";
 import { readReviewAiEnabled } from "./reviewPrefs";
-import type { Importance, MetadataProposal } from "./types";
+import type { Document, Importance, MetadataProposal } from "./types";
 
 /** Proposals by document id, for the life of the session. Survives unmounting the Review tab. */
 export const proposalCache = new Map<number, MetadataProposal>();
@@ -131,9 +132,137 @@ export function withProposalRun(fn: () => Promise<void>): Promise<void> {
   return run;
 }
 
+// --- the live path: propose as documents land -----------------------------------------------------
+
 /**
- * Propose for everything newly unreviewed, after a connector sync — so the Review tab is ready
- * when it's opened rather than starting its work then.
+ * How many arrivals one live proposal batch covers.
+ *
+ * Deliberately small. Proposing everything in one call at the end of a sync is cheaper per token —
+ * one big call reuses its cached prompt prefix better — but it means a long sync fills the Review
+ * queue with files that all say nothing until it finishes. Five keeps the suggestions visibly in
+ * step with the files arriving, which is the point of showing them arriving at all. The
+ * all-at-once mode is a usage-gated card, not the default.
+ */
+const ARRIVAL_BATCH_SIZE = 5;
+
+/** How long a partial batch waits for company before going anyway — so the tail of a sync, or a
+ *  single file dropped into a watched folder, doesn't sit unsuggested waiting for a fifth. */
+const ARRIVAL_FLUSH_MS = 1500;
+
+/** Landed document ids still owed a suggestion, oldest first. */
+let arrivalQueue: number[] = [];
+let arrivalTimer: ReturnType<typeof setTimeout> | null = null;
+let draining = false;
+
+function scheduleArrivalFlush(): void {
+  if (arrivalTimer !== null) return;
+  arrivalTimer = setTimeout(() => {
+    arrivalTimer = null;
+    void drainArrivals();
+  }, ARRIVAL_FLUSH_MS);
+}
+
+/**
+ * Note documents that just landed and propose for them, in small batches, as they arrive.
+ *
+ * Wired to `onDocumentsLanded` at app scope, so it covers EVERY way a document arrives — a Drive /
+ * OneDrive / local-folder sync, the live filesystem watcher, and a drag-and-drop import — not just
+ * the paths that end in a sync-finished event. Suggestions used to hang off that event alone, which
+ * meant a file the watcher picked up, or one dropped in by hand, waited for the next sync to
+ * complete (or for the Review tab to be opened) before it got one. Nothing about how a file reached
+ * PM should change whether PM offers to file it.
+ *
+ * Gated on the same AI-suggestions switch as every other paid call, re-read on each arrival — so
+ * turning suggestions off stops the spend at the next file, not at the end of the sync.
+ */
+export function proposeOnArrival(documents: Document[]): void {
+  if (!readReviewAiEnabled()) return;
+  for (const d of documents) {
+    // The backend already withholds reviewed rows before emitting. Re-checked because this is a
+    // spend gate: paying for a suggestion about a document the user has already filed is money for
+    // an answer nobody asked for.
+    if (d.reviewed || proposalCache.has(d.id) || arrivalQueue.includes(d.id)) continue;
+    arrivalQueue.push(d.id);
+  }
+  if (arrivalQueue.length === 0) return;
+  if (arrivalQueue.length >= ARRIVAL_BATCH_SIZE) {
+    if (arrivalTimer !== null) {
+      clearTimeout(arrivalTimer);
+      arrivalTimer = null;
+    }
+    void drainArrivals();
+  } else {
+    scheduleArrivalFlush();
+  }
+}
+
+/** Work the arrival queue down a batch at a time. One drainer at a time — documents landing while
+ *  it runs extend the queue rather than starting a second, racing drain. */
+async function drainArrivals(): Promise<void> {
+  if (draining) return;
+  draining = true;
+  try {
+    // Read once per drain rather than per batch. A burst of arrivals is one situation, and this
+    // reads the key store — checking it every five files would mean dozens of keychain probes
+    // across one sync for an answer that cannot meaningfully change mid-burst.
+    const status = await aiProviderStatus();
+    if (!status.has_cloud_key && !status.local_configured) {
+      // No model linked, so stay quiet — and drop the queue rather than let it grow for the length
+      // of a long sync. Nothing is stranded: both the post-sync sweep and the Review tab re-derive
+      // what still needs proposing from the store once a model is linked.
+      arrivalQueue = [];
+      return;
+    }
+    while (arrivalQueue.length > 0) {
+      const batch = arrivalQueue
+        .splice(0, ARRIVAL_BATCH_SIZE)
+        // An earlier batch, the post-sync sweep, or the Review tab's own run may have covered these
+        // while this one waited its turn in `withProposalRun`.
+        .filter((id) => !proposalCache.has(id));
+      if (batch.length === 0) continue;
+      try {
+        await withProposalRun(async () => {
+          await proposeMetadata((event) => {
+            if (event.type === "proposed") publishProposal(event.document_id, event.proposal);
+          }, batch);
+        });
+      } catch {
+        // Give up on the whole drain at the first failure instead of replaying it batch after batch
+        // against a model that is down — with a 200-file sync in flight that would be forty failed
+        // round-trips. Clearing the queue is what stops the `finally` below turning this into a
+        // retry loop; the post-sync sweep and the Review tab are the backstops that re-derive what
+        // is still unproposed.
+        arrivalQueue = [];
+        break;
+      }
+    }
+  } catch {
+    // Background convenience — never surfaced. (A failing `aiProviderStatus` lands here.)
+  } finally {
+    draining = false;
+    // Documents that landed as this drain was ending would otherwise sit with no drainer running
+    // and no timer armed.
+    if (arrivalQueue.length > 0) scheduleArrivalFlush();
+  }
+}
+
+/** Drop the pending arrival state. For tests, and for a vault lock — arrivals from a previous vault
+ *  must never be proposed into a different one. */
+export function resetArrivalProposals(): void {
+  if (arrivalTimer !== null) clearTimeout(arrivalTimer);
+  arrivalTimer = null;
+  arrivalQueue = [];
+  draining = false;
+}
+
+/**
+ * Propose for everything newly unreviewed, after a connector sync — the BACKSTOP to the live
+ * arrival path above, not the main event any more.
+ *
+ * Still worth running: it re-derives from the store, so it catches whatever the live path missed —
+ * documents already queued from a previous session, files that landed before a model was linked, and
+ * any batch that failed mid-drain. It costs nothing when there is nothing to do (everything already
+ * proposed is filtered out before the call, and it returns early on an empty set).
  *
  * Silent and best-effort by design: the user didn't ask for this at this moment, so a missing
  * model, no credits, or an unreachable endpoint produce no visible error at all. (The Review tab's

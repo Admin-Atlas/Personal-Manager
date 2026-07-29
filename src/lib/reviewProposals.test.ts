@@ -1,9 +1,26 @@
+// @vitest-environment jsdom
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { describe, expect, it } from "vitest";
-import { seedReviewEdit, withProposalRun } from "./reviewProposals";
-import type { MetadataProposal } from "./types";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  proposalCache,
+  proposeOnArrival,
+  resetArrivalProposals,
+  seedReviewEdit,
+  withProposalRun,
+} from "./reviewProposals";
+import { REVIEW_AI_KEY } from "./reviewPrefs";
+import type { Document, MetadataProposal } from "./types";
+
+const aiProviderStatus = vi.hoisted(() => vi.fn());
+const proposeMetadata = vi.hoisted(() => vi.fn());
+vi.mock("./ipc", () => ({
+  aiProviderStatus,
+  proposeMetadata,
+  cachedProposals: vi.fn(async () => []),
+  reviewQueue: vi.fn(async () => []),
+}));
 
 const proposal: MetadataProposal = {
   project: "BIMUN 2026",
@@ -96,5 +113,101 @@ describe("withProposalRun", () => {
     });
     await expect(bad).rejects.toThrow("boom");
     await expect(withProposalRun(async () => {})).resolves.toBeUndefined();
+  });
+});
+
+// Suggestions used to be triggered by a sync FINISHING and nothing else, so a file the live watcher
+// picked up — or one dropped in by hand — waited for the next sync (or for Review to be opened)
+// before it got one, for no reason a user could perceive. They are now driven by the arrival itself.
+describe("proposeOnArrival", () => {
+  const landed = (id: number, reviewed = false) => ({ id, reviewed }) as unknown as Document;
+  /** The ids each `proposeMetadata` call was asked to propose for, in call order. */
+  const batches = () => proposeMetadata.mock.calls.map((c) => c[1]);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetArrivalProposals();
+    proposalCache.clear();
+    localStorage.setItem(REVIEW_AI_KEY, "true");
+    aiProviderStatus.mockResolvedValue({ has_cloud_key: true, local_configured: false });
+    proposeMetadata.mockResolvedValue(undefined);
+  });
+  afterEach(() => {
+    resetArrivalProposals();
+    localStorage.clear();
+  });
+
+  it("proposes in batches of five so suggestions keep pace with the files", async () => {
+    proposeOnArrival(Array.from({ length: 12 }, (_, i) => landed(i + 1)));
+    await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalledTimes(3));
+    expect(batches()).toEqual([
+      [1, 2, 3, 4, 5],
+      [6, 7, 8, 9, 10],
+      [11, 12],
+    ]);
+  });
+
+  it("reads the key store once per burst, not once per batch", async () => {
+    // It probes the keychain, and forty probes across one sync is a real cost for an answer that
+    // cannot meaningfully change mid-burst.
+    proposeOnArrival(Array.from({ length: 12 }, (_, i) => landed(i + 1)));
+    await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalledTimes(3));
+    expect(aiProviderStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("spends nothing when AI suggestions are switched off", async () => {
+    localStorage.setItem(REVIEW_AI_KEY, "false");
+    proposeOnArrival(Array.from({ length: 12 }, (_, i) => landed(i + 1)));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(aiProviderStatus).not.toHaveBeenCalled();
+    expect(proposeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("stays quiet when no model is linked", async () => {
+    aiProviderStatus.mockResolvedValue({ has_cloud_key: false, local_configured: false });
+    proposeOnArrival(Array.from({ length: 6 }, (_, i) => landed(i + 1)));
+    await vi.waitFor(() => expect(aiProviderStatus).toHaveBeenCalled());
+    expect(proposeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("never re-bills a document that already has a suggestion, or one already filed", async () => {
+    proposalCache.set(2, proposal);
+    const docs = [landed(1), landed(2), landed(3, true), landed(4)];
+    docs.push(...[5, 6, 7, 8].map((id) => landed(id)));
+    proposeOnArrival(docs);
+    await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalled());
+    // 2 is cached and 3 is already reviewed; only the rest are worth paying for.
+    expect(batches().flat()).toEqual([1, 4, 5, 6, 7, 8]);
+  });
+
+  it("proposes for a lone file once the batch stops waiting for company", async () => {
+    // The watcher case: drop one file into a tracked folder and a fifth may never arrive. A batch
+    // that only ever fires at five would leave it unsuggested indefinitely.
+    vi.useFakeTimers();
+    try {
+      proposeOnArrival([landed(1)]);
+      expect(proposeMetadata).not.toHaveBeenCalled(); // still waiting
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(batches()).toEqual([[1]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not queue the same document twice when a sync re-announces it", async () => {
+    proposeOnArrival([landed(1), landed(2), landed(1)]);
+    proposeOnArrival([landed(2), landed(3), landed(4), landed(5)]);
+    await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalled());
+    expect(batches().flat()).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("abandons the drain when a batch fails rather than retrying it per batch", async () => {
+    // A model that is down would otherwise mean one failed round-trip per five files for the whole
+    // sync. The post-sync sweep and the Review tab re-derive what is still unproposed.
+    proposeMetadata.mockRejectedValueOnce(new Error("no credits"));
+    proposeOnArrival(Array.from({ length: 12 }, (_, i) => landed(i + 1)));
+    await vi.waitFor(() => expect(proposeMetadata).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(proposeMetadata).toHaveBeenCalledTimes(1);
   });
 });

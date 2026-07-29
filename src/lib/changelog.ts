@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.110.0-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "Filing suggestions now arrive with the files, a few at a time, instead of all at once at the end. Start a sync with AI suggestions on and each file turns up in Review already carrying a proposed project, importance and tags — so you can approve the first handful while the rest are still being indexed, rather than waiting for the whole sync to finish before anything is suggested.",
+      "Every file gets suggestions now, however it arrived. Suggestions used to be triggered only when a sync finished, so a file picked up by the folder watcher, or one you dragged in by hand, sat without any until the next sync completed or you opened Review. Nothing about how a file reached PM should change whether PM offers to file it.",
+      "None of this spends anything you haven't opted into: it's the same AI-suggestions switch, re-read as each file lands, and PM never asks twice about a file it has already suggested for.",
+    ],
+  },
+  {
     version: "3.109.3-alpha",
     date: "2026-07-29",
     highlights: [
