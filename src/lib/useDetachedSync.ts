@@ -111,8 +111,23 @@ export function useDetachedSync<S extends DetachedSyncSnapshot>(
     let mounted = true;
     const unlistenP = optsRef.current.subscribe((ev) => {
       if (!mounted) return;
-      if (ev.type === "counted") setProgress({ processed: 0, total: ev.total });
-      else if (ev.type === "item") setProgress({ processed: ev.processed, total: ev.total });
+      if (ev.type === "counted") {
+        setProgress({ processed: 0, total: ev.total });
+        // Each PASS announces its own target, and a run sweeps the targets queued mid-run one at a
+        // time — so this is where a row flips "Queued" → "Syncing…". Without it the backend moved on
+        // to the queued account while its row sat on "Queued" for the rest of the run.
+        const tgt = ev.target;
+        setTarget(tgt);
+        setQueued((q) => {
+          if (q.size === 0) return q;
+          // An all-targets sweep covers everything that was waiting, so nothing stays queued.
+          if (tgt == null) return new Set();
+          if (!q.has(tgt)) return q;
+          const next = new Set(q);
+          next.delete(tgt);
+          return next;
+        });
+      } else if (ev.type === "item") setProgress({ processed: ev.processed, total: ev.total });
       else if (ev.type === "finished") {
         setProgress(null);
         setStartedAt(null);

@@ -104,7 +104,7 @@ describe("useDetachedSync", () => {
     const { result } = renderHook(() => useDetachedSync(opts));
     await waitFor(() => expect(result.current.startedAt).toBe(startedAt));
 
-    await emit({ type: "counted", total: 9 });
+    await emit({ type: "counted", total: 9, target: null });
     expect(result.current.startedAt).toBe(startedAt);
     await emit({ type: "item", processed: 4, total: 9, name: "f.md" });
     expect(result.current.startedAt).toBe(startedAt);
@@ -125,7 +125,7 @@ describe("useDetachedSync", () => {
     const { result } = renderHook(() => useDetachedSync(opts));
     await waitFor(() => expect(opts.subscribe).toHaveBeenCalled());
 
-    await emit({ type: "counted", total: 8 });
+    await emit({ type: "counted", total: 8, target: null });
     expect(result.current.progress).toEqual({ processed: 0, total: 8 });
 
     await emit({ type: "item", processed: 3, total: 8, name: "f.md" });
@@ -161,6 +161,43 @@ describe("useDetachedSync", () => {
     await act(() => result.current.sync("c@d.com")); // mid-run → queued, not a new start
     expect(result.current.queued.has("c@d.com")).toBe(true);
     expect(result.current.target).toBe("a@b.com");
+  });
+
+  it("moves a queued target from Queued to Syncing when its own pass starts", async () => {
+    // The reported bug: queue a second account mid-sync and its row said "Queued" for the rest of the
+    // run. The backend now sweeps each queued target in its own pass and announces it on `counted`.
+    const { opts, emit } = makeOpts();
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(opts.subscribe).toHaveBeenCalled());
+
+    await act(() => result.current.sync("a@b.com"));
+    await emit({ type: "counted", total: 5, target: "a@b.com" });
+    await act(() => result.current.sync("c@d.com"));
+    expect(result.current.queued.has("c@d.com")).toBe(true);
+
+    // The first account's pass ends and the queued one's begins — same run, no `finished` yet.
+    await emit({ type: "counted", total: 2, target: "c@d.com" });
+    expect(result.current.target).toBe("c@d.com");
+    expect(result.current.queued.has("c@d.com")).toBe(false);
+    expect(result.current.syncing).toBe(true);
+  });
+
+  it("clears every queued row when a pass sweeps all targets", async () => {
+    // An all-targets request subsumes the queued ones backend-side (one sweep covers them), so no row
+    // may be left claiming it is still waiting for a pass that will never come.
+    const { opts, emit } = makeOpts();
+    const { result } = renderHook(() => useDetachedSync(opts));
+    await waitFor(() => expect(opts.subscribe).toHaveBeenCalled());
+
+    await act(() => result.current.sync("a@b.com"));
+    await emit({ type: "counted", total: 5, target: "a@b.com" });
+    await act(() => result.current.sync("c@d.com"));
+    await act(() => result.current.sync("e@f.com"));
+    expect(result.current.queued.size).toBe(2);
+
+    await emit({ type: "counted", total: 4, target: null });
+    expect(result.current.target).toBeNull();
+    expect(result.current.queued.size).toBe(0);
   });
 
   it("rolls back the optimistic bar when start() rejects", async () => {

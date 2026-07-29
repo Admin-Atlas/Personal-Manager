@@ -68,8 +68,14 @@ pub struct CloudSyncReport {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CloudSyncEvent {
-    /// The total number of files/changes this run will work through (sent once, before the items).
-    Counted { total: usize },
+    /// The total number of files/changes this PASS will work through (sent once, before its items),
+    /// and which account it is for (`None` = every account). A run can span several passes — each
+    /// request folded in mid-run gets its own — so this is also how the UI learns that the queued
+    /// account it is showing as "Queued" has come up: see `useDetachedSync`.
+    Counted {
+        total: usize,
+        target: Option<String>,
+    },
     /// One item processed (1-based `processed` of `total`).
     Item {
         processed: usize,
@@ -141,7 +147,7 @@ enum Resolved<'a, F> {
 ///
 /// Module-private: the two `*_sync_core` entry points below hide it entirely (they don't name it), so
 /// nothing outside this file needs to see the driver seam.
-trait CloudDriver: Send + Sync {
+trait CloudDriver: Send + Sync + Clone {
     /// The fetchable file (`drive::DriveFile` / `onedrive::DriveItem`) — carries the name + builds the
     /// pointer + is passed to `fetch_body`.
     type File: Send + Sync;
@@ -160,6 +166,14 @@ trait CloudDriver: Send + Sync {
     const SOURCE_KIND: &'static str;
     /// Human label for the user-facing issue/error text (`Drive` / `OneDrive`).
     const PROVIDER_LABEL: &'static str;
+
+    /// The driver for ONE pass of a run. A run spans several passes whenever requests arrive mid-sync
+    /// (each queued target gets its own sweep), and those requests are not recorded individually — so
+    /// `rerun` is all a pass knows about why it exists. A connector that varies what a pass covers
+    /// decides here; the default keeps the run's driver unchanged, and only Drive overrides it.
+    fn for_pass(&self, _rerun: bool) -> Self {
+        self.clone()
+    }
 
     /// This connector's live-sync snapshot field on [`AppState`] (`drive_sync` / `onedrive_sync`).
     fn snapshot(state: &AppState) -> &Mutex<crate::CloudSyncState>;
@@ -247,7 +261,7 @@ fn with_cloud_snap<C: CloudDriver>(app: &AppHandle, f: impl FnOnce(&mut crate::C
 /// progress reaches whatever component is mounted, not just the starter.
 fn emit_progress<C: CloudDriver>(app: &AppHandle, ev: CloudSyncEvent) {
     with_cloud_snap::<C>(app, |snap| match &ev {
-        CloudSyncEvent::Counted { total } => {
+        CloudSyncEvent::Counted { total, .. } => {
             snap.total = Some(*total);
             snap.processed = 0;
         }
@@ -456,7 +470,13 @@ async fn run_cloud_sync<C: CloudDriver>(
         C::cancel_flag(st),
         C::PENDING_KEY,
         account,
-        |target| run_cloud_pass(app, &driver, target),
+        |req: connector_sync::PassRequest| {
+            // The driver is rebuilt per PASS, not per run: a follow-up sweep answers a request that
+            // was folded into this run without being recorded, so what it should cover can differ
+            // from what the run's first pass covered (see `DriveDriver::for_pass`).
+            let pass_driver = driver.for_pass(req.rerun);
+            async move { run_cloud_pass(app, &pass_driver, req.target).await }
+        },
         || emit_run_finished::<C>(app),
     )
     .await
@@ -484,8 +504,8 @@ async fn run_cloud_pass<C: CloudDriver>(
     let emails: Vec<String> = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        match account {
-            Some(e) => vec![e],
+        match &account {
+            Some(e) => vec![e.clone()],
             None => C::account_emails(&conn)?,
         }
     };
@@ -505,7 +525,13 @@ async fn run_cloud_pass<C: CloudDriver>(
     }
 
     let total: usize = work.iter().map(|w| w.items.len()).sum();
-    emit_progress::<C>(app, CloudSyncEvent::Counted { total });
+    emit_progress::<C>(
+        app,
+        CloudSyncEvent::Counted {
+            total,
+            target: account,
+        },
+    );
 
     // Phase 2 — process each item: react → fetch body only when needed → apply (embed off the lock).
     let (mut indexed, mut updated, mut removed, mut skipped, mut failed) = (0, 0, 0, 0, 0usize);
@@ -1115,6 +1141,7 @@ async fn gather_shared_with_me(
 /// uses the efficient delta cursor (first sync enumerates everything, later syncs the changes feed);
 /// **shared drives** the account opted into are re-enumerated + reconciled each pass (whole drive, or
 /// selected folders), de-duplicated across accounts via `claim_or_skip_shared_drive`.
+#[derive(Clone, Copy)]
 struct DriveDriver {
     /// Whether this pass also re-walks "Shared with me".
     ///
@@ -1132,6 +1159,20 @@ impl CloudDriver for DriveDriver {
     type File = drive::DriveFile;
     type Item = DriveItem;
     type FolderCache = std::collections::HashMap<String, Option<String>>;
+
+    /// A follow-up sweep always re-walks Shared with me.
+    ///
+    /// Only the background poller ever opts out, and the requests folded into a running run are not
+    /// recorded with the options they were made under — so a user's "Sync now" landing mid-poll would
+    /// otherwise be answered by a sweep that silently skips the corpus they pressed the button for,
+    /// with no sign anything was left out. Widening is a superset, so the poller's own folded-in
+    /// request loses nothing by being answered more thoroughly, and this only costs the extra
+    /// enumeration when a pass outlives the poll interval — which is exactly when it is warranted.
+    fn for_pass(&self, rerun: bool) -> Self {
+        Self {
+            include_shared_with_me: self.include_shared_with_me || rerun,
+        }
+    }
 
     const PENDING_KEY: &'static str = DRIVE_SYNC_PENDING_KEY;
     const EVENT_NAME: &'static str = "drive://sync";
@@ -1504,6 +1545,7 @@ async fn gather_onedrive_folders(
 /// uses the efficient Graph delta cursor (first sync enumerates everything, later syncs apply only
 /// changes); a folder-scoped account is re-enumerated + reconciled each pass. No shared-drive concept,
 /// so `extra_cursors` stays empty.
+#[derive(Clone, Copy)]
 struct OneDriveDriver;
 
 impl CloudDriver for OneDriveDriver {

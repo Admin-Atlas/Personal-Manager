@@ -812,7 +812,9 @@ export interface SyncReport {
 
 /** Streamed progress while a sync runs (mapped onto the shared IngestProgress bar). */
 export type SyncEvent =
-  | { type: "counted"; total: number }
+  /** A pass is starting: how many items it will work through, and which target it is for (`null` =
+   *  every target). One run can emit several — each request folded in mid-run gets its own pass. */
+  | { type: "counted"; total: number; target: string | null }
   | { type: "item"; processed: number; total: number; name: string }
   | { type: "finished"; report: SyncReport };
 
