@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.109.2-alpha",
+    date: "2026-07-29",
+    highlights: [
+      "The briefing panel gets the resize cursor too. It draws its own frame like the main window, so on Linux its edges could be dragged but never showed it — the fix in the last update only reached the main window, because the panel deliberately doesn’t share its chrome.",
+    ],
+  },
+  {
     version: "3.109.1-alpha",
     date: "2026-07-29",
     highlights: [

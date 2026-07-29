@@ -24,8 +24,15 @@ import { BriefingProvider } from "./lib/briefing";
 import { Briefing } from "./components/Briefing";
 import { closeBriefingWindow, showMainWindow } from "./lib/ipc";
 import { ThemeProvider, UserTimeProvider } from "./theme";
+import { useEdgeResizeCursor } from "./components/ui/useEdgeResizeCursor";
 
 export function PopoverRoot() {
+  // This window is frameless AND resizable, so on Linux it had the same invisible edges the main
+  // window did — the GTK path performs the resize but never sets a cursor. It does not mount
+  // TitleBar, so it did not inherit the fix. The hook's `isMaximized` read is the one extra plugin
+  // permission granted in capabilities/briefing.json; `onResized` rides the listen permission that
+  // was already there.
+  useEdgeResizeCursor();
   return (
     <ThemeProvider>
       <UserTimeProvider>
